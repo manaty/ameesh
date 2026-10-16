@@ -749,6 +749,79 @@ class MergeSweepTest(_Base):
         self.assertIn("CLOSED", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
+    # --- #1825 : une fusion annulée par un revert n'est pas une livraison ---
+
+    def test_1825_fusion_annulee_par_revert_reste_ouverte(self):
+        """La pointe de la branche reste ancêtre de develop après le revert de
+        sa fusion, mais le contenu n'y est plus : le lot n'est pas fermé."""
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-garde" % n, "Merge branch 'lot/%d-garde' into develop" % n)
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(entry["how"], "reverted")
+        self.assertIn("revert", entry["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_1825_revert_annule_puis_reapplique_ferme(self):
+        """Le revert du revert remet le contenu dans develop : la livraison
+        est de nouveau constatée."""
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-garde" % n, "Merge branch 'lot/%d-garde' into develop" % n)
+        tip = _git(self.repo, "rev-parse", "lot/%d-garde" % n)
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        _git(self.repo, "revert", "--no-edit", "HEAD")
+        report = self.sync()
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(self.merged_milestone(n)["sha"], tip)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+
+    def test_1825_revert_d_un_autre_lot_ne_retient_pas(self):
+        """Un revert étranger ne retient pas un lot livré avant lui."""
+        premier = self.lot("premier")
+        second = self.lot("second")
+        self.merge("lot/%d-un" % premier["id"],
+                   "Merge branch 'lot/%d-un' into develop" % premier["id"])
+        self.merge("lot/%d-deux" % second["id"],
+                   "Merge branch 'lot/%d-deux' into develop" % second["id"])
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        report = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(report[premier["id"]]["result"], "merged")
+        self.assertEqual(report[second["id"]]["result"], "open")
+        self.assertEqual(work.get(self.db, premier["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, second["id"])["state"], "intake")
+
+    def test_1825_fusion_citante_annulee_ne_ferme_pas(self):
+        """La PR citante a bien fusionné la branche, mais la fusion a été
+        annulée : la citation seule ne ferme plus (#1825)."""
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-garde" % n,
+                   "Merge pull request #7 from manaty/lot/%d-garde" % n)
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        _git(self.repo, "branch", "-q", "-D", "lot/%d-garde" % n)
+        entry = self.sync(pr_body=lambda repo, num: "Livraison complète.")["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("reverted", entry["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_1825_branche_disparue_fusion_annulee_ne_ferme_pas(self):
+        """La branche enregistrée n'existe plus ; la fusion qui la cite a été
+        annulée : la citation seule ne ferme pas non plus (#1825)."""
+        lot = self.lot()
+        n = lot["id"]
+        nom = "lot/%d-garde" % n
+        self.merge(nom, "Merge pull request #7 from manaty/%s" % nom)
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        _git(self.repo, "branch", "-q", "-D", nom)
+        work.set_branch(self.db, n, nom, actor="orch", source="test")
+        entry = self.sync(pr_body=lambda repo, num: "Livraison complète.")["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("reverted", entry["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
 
 class RealTargetTest(_Base):
     """#746 : la cible RÉELLE du dépôt (`develop`) est suivie quand ni le lot
@@ -929,13 +1002,14 @@ class RealTargetTest(_Base):
 
 
 class ContentDeliveryTest(_Base):
-    """#1005 : `sync-merges` sans `--target` suit la cible réelle du clone —
-    celle du lot (`branch_target`), sinon `ameesh.target` du dépôt, sinon sa
-    branche par défaut, puis les refs d'intégration — au lieu d'`origin/main`
-    par défaut (cas #560 et #905, restés « waiting for merge » sur `develop`).
+    """#1005 : un lot livré sur la branche d'intégration (`develop`) par une
+    fusion `--no-ff` qui ne cite pas le lot (cas #560 et #905, restés
+    « waiting for merge ») est fermé par le relevé automatique de l'exécuteur
+    (dernier gel ancêtre de la ref) et par `sync-merges` sans `--target`, qui
+    suivent la cible réelle du clone au lieu d'`origin/main` par défaut.
 
-    Le relevé automatique du lot (branche ou citation) n'est pas modifié ici ;
-    le patch-id exact (cherry-pick, rebase, squash) reste le travail de
+    Le relevé automatique borne la preuve à l'ancêtre (une commande git) ; le
+    patch-id exact (cherry-pick, rebase, squash) reste le travail de
     `sync-merges`. Une cible déclarée ne ferme jamais ailleurs."""
 
     def setUp(self):
@@ -971,9 +1045,41 @@ class ContentDeliveryTest(_Base):
              _git(self.repo, "rev-parse", "HEAD"))
         return sha
 
+    def livrer_imbrique(self):
+        """B2 R2 (cx3) : le gel entre dans develop par une fusion IMBRIQUÉE —
+        une fusion locale `--no-ff` sur la branche porteuse `agent/carrier`,
+        puis la fusion de cette branche (la PR GitHub #627). La fusion locale
+        n'est PAS sur la chaîne première-parente de develop : le porteur est
+        la PR #627."""
+        _git(self.repo, "checkout", "-q", "-b", "frozen", "develop")
+        sha = self.commit("frozen")
+        _git(self.repo, "checkout", "-q", "-b", "agent/carrier", "develop")
+        self.commit("carrier")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch 'frozen' into agent/carrier", "frozen")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge pull request #627 from manaty/agent/carrier", "agent/carrier")
+        self.publish_develop()
+        return sha
+
     def publish_develop(self):
         _git(self.repo, "update-ref", "refs/remotes/origin/develop",
              _git(self.repo, "rev-parse", "develop"))
+
+    def gel_vide(self, branch, message="composition"):
+        """#1776 : une branche dont le gel est un commit vide
+        (`--allow-empty`) — son diff propre ne porte rien, le contenu du lot
+        est dans ses ancêtres. Le gel est fusionné en `--no-ff` sur la cible
+        (develop), publiée."""
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit(branch.replace("/", "-"))
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "gel vide")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", message, branch)
+        self.publish_develop()
+        return sha
 
     def lot(self, sha):
         """Un lot gelé en qa, sans branche ni cible déclarée (#905)."""
@@ -986,6 +1092,206 @@ class ContentDeliveryTest(_Base):
     def sync(self, **kw):
         return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
 
+    def test_1005_gel_ancetre_de_develop_ferme_le_lot(self):
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num:
+                          lus.append(num) or "Livraison complète.")["results"][0]
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(entry["target"], "origin/develop")
+        self.assertEqual(entry["off_target"], "origin/main")
+        self.assertEqual(entry["how"], "content-ancestor")
+        self.assertEqual(lus, [627])   # le corps de la PR PORTEUSE est lu (B2)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        jalon = self.merged_milestone(lot["id"])
+        self.assertEqual(jalon["sha"], sha)
+        self.assertIn("origin/develop", jalon["note"])
+        self.assertIn("declare `git config ameesh.target", jalon["note"])
+
+    def test_1005_corps_porteur_partiel_retient_le_lot(self):
+        """B2 : la PR porteuse du gel (PR627, branche agent/…) déclare le lot
+        partiel : le contenu est bien ancêtre, mais le lot reste ouvert."""
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+        entry = self.sync(pr_body=lambda repo, num:
+                          "Première partie.\n\nameesh-work-partial: %d"
+                          % lot["id"])["results"][0]
+        self.assertEqual(entry["how"], "partial")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("ameesh-work-partial: %d" % lot["id"], entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_corps_porteur_illisible_retient_le_lot(self):
+        """B2 : sans citation, le corps de la PR porteuse est illisible : on ne
+        ferme pas sans savoir."""
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+
+        def illisible(repo, num):
+            raise plan_git.GitError("gh: not logged in")
+
+        entry = self.sync(pr_body=illisible)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("unreadable", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_fusion_imbriquee_porteur_partiel_retient(self):
+        """B2 R2 (cx3) : le gel entre par une fusion IMBRIQUÉE (fusion locale
+        `--no-ff` dans la branche porteuse, puis PR GitHub #627). Le porteur
+        est la fusion de la CIBLE (chaîne première-parente), pas la fusion
+        locale : le corps de la PR #627 est lu, et partiel il retient le lot
+        (avant correctif, la fusion locale était retenue, son message local
+        n'a pas de PR, et le lot fermait indûment)."""
+        sha = self.livrer_imbrique()
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "ameesh-work-partial: %d" % lot["id"])["results"][0]
+        self.assertEqual(lus, [627])           # la PR porteuse, pas la fusion locale
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(entry["how"], "partial")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("ameesh-work-partial: %d" % lot["id"], entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_fusion_imbriquee_porteur_complet_ferme(self):
+        """B2 R2 : même fusion imbriquée, corps de la PR porteuse complet : la
+        preuve par le contenu est retenue APRÈS lecture de #627, et le gel
+        examiné est bien celui qui ferme (B1)."""
+        sha = self.livrer_imbrique()
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "Livraison complète.")["results"][0]
+        self.assertEqual(lus, [627])
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
+
+    def test_1005_fusion_imbriquee_porteur_illisible_retient(self):
+        """B2 R2 : la PR porteuse d'une fusion imbriquée est illisible : on ne
+        ferme pas sans savoir, même si la fusion locale n'a pas de PR."""
+        sha = self.livrer_imbrique()
+        lot = self.lot(sha)
+
+        def illisible(repo, num):
+            raise plan_git.GitError("gh: not logged in")
+
+        entry = self.sync(pr_body=illisible)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("unreadable", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_porteur_hors_fenetre_citations_est_lu(self):
+        """B2 R2 (cx3, scène old-carrier) : le porteur est cherché sur la cible
+        SANS le `since_all` des citations ; une PR porteuse antérieure à la
+        fenêtre des citations est quand même lue (partielle : lot ouvert)."""
+        vieux = "2020-01-02T03:04:05+00:00"
+        env = {"GIT_AUTHOR_DATE": vieux, "GIT_COMMITTER_DATE": vieux}
+        _git(self.repo, "checkout", "-q", "-b", "agent/vieux", "develop")
+        sha = self.commit("vieux")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge pull request #627 from manaty/agent/vieux", "agent/vieux", env=env)
+        self.publish_develop()
+        lot = self.lot(sha)                    # création du lot : bien après la PR
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "ameesh-work-partial: %d" % lot["id"])["results"][0]
+        self.assertEqual(lus, [627])
+        self.assertEqual(entry["how"], "partial")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_poussee_directe_ferme_sans_lecture(self):
+        """B2 R2 contrôle : un gel poussé directement sur develop (sans fusion)
+        n'a pas de porteur : aucun corps à lire, la preuve par le contenu vaut."""
+        sha = self.commit("direct")            # commit direct sur develop
+        self.publish_develop()
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
+        self.assertEqual(lus, [])
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1005_avance_rapide_ferme_sans_lecture(self):
+        """B2 R2 contrôle : une avance rapide reste fermée, même quand la
+        chaîne première-parente porte des fusions ANTÉRIEURES au gel : elles
+        ne le portent pas, aucune n'est le porteur. Une fenêtre tronquée reste
+        concluante ici : si la fusion la plus récente ne porte pas le gel,
+        aucune fusion plus ancienne ne le porte (monotonie)."""
+        self.livrer("agent/pre", "Merge pull request #1 from manaty/agent/pre")
+        self.livrer("agent/pre2", "Merge pull request #2 from manaty/agent/pre2")
+        _git(self.repo, "checkout", "-q", "-b", "agent/ff", "develop")
+        sha = self.commit("ff")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--ff-only", "agent/ff")
+        self.publish_develop()
+        lot = self.lot(sha)
+        lus = []
+        with mock.patch.object(plan_git, "MAX_CARRIER_SCAN", 1):
+            entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
+        self.assertEqual(lus, [])
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1005_porteur_hors_fenetre_lecture_reste_ouvert(self):
+        """B2 R2 : la fenêtre de lecture de la chaîne première-parente est
+        bornée (limite + 1, pour voir la troncature) ; quand elle s'arrête
+        avant le porteur, le lot reste OUVERT au lieu de conclure à l'absence
+        de PR — puis la fenêtre complète lit #627 et ferme."""
+        sha = self.livrer("agent/carrier",
+                          "Merge pull request #627 from manaty/agent/carrier")
+        for rang in range(3):                  # trois fusions plus récentes
+            self.livrer("agent/apres%d" % rang,
+                        "Merge pull request #%d from manaty/agent/apres%d"
+                        % (630 + rang, rang))
+        lot = self.lot(sha)
+        lus = []
+        with mock.patch.object(plan_git, "MAX_CARRIER_SCAN", 2):
+            entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                              or "Livraison complète.")["results"][0]
+        self.assertEqual(lus, [])              # rien de lu : porteur indéterminé
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("carrier", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        # fenêtre complète : le porteur #627 est lu, le lot ferme
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "Livraison complète.")["results"][0]
+        self.assertEqual(lus, [627])
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1005_regel_concurrent_ne_ferme_pas(self):
+        """B1 : un gel déclaré pendant le relevé (après la lecture, avant
+        l'écriture) n'a pas été examiné : la fermeture est refusée."""
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        _git(self.repo, "checkout", "-q", "-b", "agent/regel", "develop")
+        nouveau = self.commit("regel")          # jamais fusionné
+        _git(self.repo, "checkout", "-q", "develop")
+
+        def lire(repo, num):
+            work.milestone(self.db, lot["id"], "frozen", sha=nouveau, actor="ouvrier")
+            return "Livraison complète."
+
+        entry = self.sync(pr_body=lire)["results"][0]
+        self.assertEqual(entry["result"], "refrozen")
+        self.assertIn("new freeze declared in the meantime", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        # le nouveau gel n'est pas ancêtre : le relevé suivant laisse ouvert
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
     def test_1005_gel_non_livre_laisse_le_lot_ouvert(self):
         _git(self.repo, "checkout", "-q", "-b", "agent/jamais", "develop")
         sha = self.commit("jamais")
@@ -995,6 +1301,25 @@ class ContentDeliveryTest(_Base):
         entry = self.sync()["results"][0]
         self.assertEqual(entry["result"], "open")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_cible_declaree_contenu_develop_note_sans_fermeture(self):
+        """B2 R2 contrôle : sur une ref qui ne ferme pas (cible déclarée), la
+        preuve par le contenu n'est qu'un résidu signalé : le corps du porteur
+        n'est pas lu (rien à qualifier)."""
+        _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "origin/main")
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
+        self.assertEqual(lus, [])              # closing=False : aucune lecture
+        self.assertEqual(entry["result"], "off-target")
+        self.assertIn("origin/develop", entry["detail"])
+        self.assertIn("declared target origin/main", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("origin/develop" in (n or "") for n in notes), notes)
+        self.sync()                    # le résidu ne se répète pas
+        self.assertEqual([e["note"] for e in work.events(self.db, lot["id"])], notes)
 
     def test_1005_sync_merges_sans_target_suit_develop(self):
         sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
@@ -1037,6 +1362,91 @@ class ContentDeliveryTest(_Base):
         self.assertEqual((entry["result"], entry["how"]), ("merged", "patch-id"))
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
+    # --- #1825 : une fusion annulée par un revert n'est pas une livraison ---
+
+    def test_1825_revert_de_la_fusion_du_gel_ne_ferme_pas(self):
+        """Le gel est entré dans develop par une fusion --no-ff, puis la
+        fusion a été annulée : la tête reste ancêtre de la cible, mais le
+        contenu n'y est plus ; le lot reste ouvert, et la PR porteuse n'est
+        pas lue (il n'y a rien à qualifier)."""
+        sha = self.livrer("agent/annule",
+                          "Merge pull request #627 from manaty/agent/annule")
+        lot = self.lot(sha)
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        self.publish_develop()
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "Livraison complète.")["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(entry["how"], "reverted")
+        self.assertIn("reverts", entry["detail"])
+        self.assertEqual(lus, [])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1825_revert_annule_puis_reapplique_ferme(self):
+        """Le revert du revert remet le contenu dans develop : la livraison
+        par le contenu est de nouveau constatée."""
+        sha = self.livrer("agent/annule",
+                          "Merge pull request #627 from manaty/agent/annule")
+        lot = self.lot(sha)
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        _git(self.repo, "revert", "--no-edit", "HEAD")
+        self.publish_develop()
+        entry = self.sync(pr_body=lambda repo, num: "Livraison complète.")["results"][0]
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1825_revert_direct_du_gel_ne_ferme_pas(self):
+        """Poussée directe du gel sur develop, puis revert de ce commit : le
+        gel a disparu de la cible, le lot reste ouvert."""
+        sha = self.commit("direct")
+        self.publish_develop()
+        lot = self.lot(sha)
+        _git(self.repo, "revert", "--no-edit", "HEAD")
+        self.publish_develop()
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(entry["how"], "reverted")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1825_patch_id_annule_par_revert_ne_ferme_pas(self):
+        """Le gel cherry-pické sur develop puis annulé : son patch-id est
+        encore dans l'historique, mais le contenu n'y est plus."""
+        _git(self.repo, "checkout", "-q", "-b", "agent/cherry", "develop")
+        sha = self.commit("cherry")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.commit("socle2")
+        _git(self.repo, "cherry-pick", sha)
+        _git(self.repo, "revert", "--no-edit", "HEAD")
+        self.publish_develop()
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(entry["how"], "reverted")
+        self.assertEqual(entry["target"], "origin/develop")
+        self.assertIn("reverts", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1825_fusion_citante_annulee_ne_ferme_pas(self):
+        """La branche `lot/<id>-…` est entrée par une PR qui la cite, puis la
+        fusion a été annulée : la pointe reste ancêtre, le lot reste ouvert."""
+        _git(self.repo, "checkout", "-q", "-b", "agent/tmp", "develop")
+        sha = self.commit("annule")
+        lot = self.lot(sha)
+        nom = "lot/%d-annule" % lot["id"]
+        _git(self.repo, "branch", nom, sha)
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "branch", "-q", "-D", "agent/tmp")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge pull request #627 from manaty/%s" % nom, nom)
+        self.publish_develop()
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        self.publish_develop()
+        entry = self.sync(pr_body=lambda repo, num: "Livraison complète.")["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(entry["how"], "reverted")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
     def test_1005_cli_sync_merges_cible_auto(self):
         sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
         lot = self.lot(sha)
@@ -1044,6 +1454,153 @@ class ContentDeliveryTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("closed by content", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    # --- #1776 : le gel vide et le paquet imbriqué, jugés par le contenu ---
+
+    def test_1776_gel_vide_reverte_ne_ferme_pas(self):
+        """Un gel vide (`commit --allow-empty`) dont la fusion est annulée par
+        un revert : la tête reste ancêtre de la cible, mais le contenu n'y est
+        plus — le lot reste ouvert (probe et sync-merges)."""
+        sha = self.gel_vide("agent/1776")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        self.publish_develop()
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertFalse(found["merged"])
+        self.assertEqual(found["how"], "reverted")
+        self.assertIn("revert", found["detail"])
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1776_gel_vide_conserve_reste_fusionne(self):
+        """Le contenu du lot est toujours là, l'arbre a évolué depuis : pas de
+        retrait — l'ascendance reste la preuve."""
+        sha = self.gel_vide("agent/1776")
+        with open(os.path.join(self.repo, "agent-1776"), "a") as fh:
+            fh.write("suite\n")
+        _git(self.repo, "commit", "-q", "-am", "suite sur le meme fichier")
+        self.publish_develop()
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertTrue(found["merged"])
+        self.assertEqual(found["how"], "ancestor")
+
+    def test_1776_gel_vide_dans_paquet_reverte(self):
+        """Le lot entre dans une branche de paquet, elle-même fusionnée, puis
+        la fusion du paquet est annulée : le gel vide reste ancêtre, le
+        contenu a disparu — la livraison n'est pas constatée."""
+        sha = self.gel_vide("agent/1776-nested")
+        _git(self.repo, "branch", "-m", "develop", "packet1776")
+        _git(self.repo, "checkout", "-q", "-b", "develop", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "packet1776")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        self.publish_develop()
+        self.assertFalse(plan_git.probe(self.repo, sha, "origin/develop")["merged"])
+
+
+class ProbePartialCloneTest(_Base):
+    """#1772 : dans un clone partiel, le commit d'un gel absent localement est
+    rapatrié par un fetch explicite borné, au lieu de se lire « not in the
+    repository » (#1749 coupe le fetch paresseux des sondes de présence).
+
+    Hors clone partiel (aucun remote *promisor*), aucun fetch n'est tenté :
+    la cible reste lue telle que le clone la connaît."""
+
+    def setUp(self):
+        super().setUp()
+        self.remote = os.path.join(self.tmp, "remote1772")
+        os.makedirs(self.remote)
+        _git(self.remote, "init", "-q", "-b", "main")
+        self.commit(self.remote, "socle")
+        # le serveur local doit servir le filtre (clone partiel) et un objet
+        # par son sha (fetch explicite d'un commit)
+        _git(self.remote, "config", "uploadpack.allowFilter", "true")
+        _git(self.remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.repo = os.path.join(self.tmp, "clone1772")
+        _git(self.tmp, "clone", "-q", "--filter=blob:none", "--no-local",
+             "file://" + self.remote, self.repo)
+        # un second clone partiel, intact : les têtes publiées ensuite n'y sont
+        # pas encore (preuve du best-effort sans toucher au premier clone)
+        self.autre = os.path.join(self.tmp, "clone1772-bis")
+        _git(self.tmp, "clone", "-q", "--filter=blob:none", "--no-local",
+             "file://" + self.remote, self.autre)
+        self.agent("claude1", cwd=self.repo)
+
+    def commit(self, repo, name):
+        with open(os.path.join(repo, name), "w") as fh:
+            fh.write(name + "\n")
+        _git(repo, "add", name)
+        _git(repo, "commit", "-q", "-m", "ajoute %s" % name)
+        return _git(repo, "rev-parse", "HEAD")
+
+    def publish(self):
+        """Une tête publiée sur une branche du remote, PAS rapatriée par le
+        clone : la branche existe, le commit est absent localement."""
+        _git(self.remote, "checkout", "-q", "-b", "agent/libre", "main")
+        sha = self.commit(self.remote, "libre")
+        _git(self.remote, "checkout", "-q", "main")
+        return sha
+
+    def test_1772_gel_absent_rapatrie_par_un_fetch_explicite(self):
+        sha = self.publish()
+        self.assertIsNone(plan_git._commit(self.repo, sha))      # absent du clone
+        found = plan_git.probe(self.repo, sha, "origin/main")
+        self.assertFalse(found["merged"], found)
+        self.assertNotIn("not in the repository", found["detail"])
+        self.assertIn("missing from origin/main", found["detail"])
+        self.assertIsNotNone(plan_git._commit(self.repo, sha))   # rapatrié
+        self.assertEqual(plan_git._promisor_remote(self.repo, "origin/main"), "origin")
+
+    def test_1772_sha_introuvable_reste_une_absence_dite(self):
+        found = plan_git.probe(self.repo, "c" * 40, "origin/main")
+        self.assertIn("not in the repository", found["detail"])
+        self.assertIn("explicit fetch from origin brought nothing", found["detail"])
+
+    def test_1772_clone_complet_ne_fetch_pas(self):
+        complet = os.path.join(self.tmp, "complet1772")
+        _git(self.tmp, "clone", "-q", "--no-local", "file://" + self.remote, complet)
+        sha = self.publish()
+        found = plan_git.probe(complet, sha, "origin/main")
+        self.assertIn("not in the repository", found["detail"])
+        self.assertNotIn("explicit fetch", found["detail"])
+        self.assertIsNone(plan_git._commit(complet, sha))
+
+    def test_1772_commit_present_aucun_acces_au_remote(self):
+        # une sonde sur un commit présent ne touche pas le remote : même avec
+        # une URL cassée elle conclut, le fetch paresseux compris
+        head = _git(self.repo, "rev-parse", "origin/main")
+        _git(self.repo, "remote", "set-url", "origin",
+             "file://" + os.path.join(self.tmp, "nulle-part"))
+        found = plan_git.probe(self.repo, head, "origin/main")
+        self.assertTrue(found["merged"], found)
+
+    def test_1772_fetch_borne_et_best_effort(self):
+        sha = self.publish()
+        real = plan_git._git
+        vus = []
+
+        def espion(repo, *args, **kw):
+            vus.append((args, kw))
+            return real(repo, *args, **kw)
+
+        with mock.patch.object(plan_git, "_git", side_effect=espion):
+            plan_git.probe(self.repo, sha, "origin/main")
+        fetches = [kw for args, kw in vus if args and args[0] == "fetch"]
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0].get("timeout"), plan_git.FETCH_TIMEOUT)
+
+        # un fetch qui échoue (réseau) ne casse pas la sonde : l'absence est dite
+        def sans_reseau(repo, *args, **kw):
+            if args and args[0] == "fetch":
+                raise plan_git.GitError("git fetch: timed out")
+            return real(repo, *args, **kw)
+
+        with mock.patch.object(plan_git, "_git", side_effect=sans_reseau):
+            found = plan_git.probe(self.autre, sha, "origin/main")
+        self.assertIn("not in the repository", found["detail"])
+        self.assertIn("explicit fetch from origin brought nothing", found["detail"])
 
 
 class CurrentLotTest(_Base):

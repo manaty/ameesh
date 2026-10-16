@@ -221,6 +221,19 @@ def remember_liaison(cfg: Config, name: str, harness: str, session_id: str,
     })
 
 
+def forget_liaison(cfg: Config, harness: str, session_id: str) -> None:
+    """#1689 (N4) : une liaison qui change (bind, unbind) ne doit pas survivre
+    dans le cache local du chemin rapide — sinon cette session garde l'ancien
+    nom jusqu'à `AMEESH_LIAISON_TTL` (600 s). Best-effort : un cache absent ou
+    illisible ne fait pas échouer le geste."""
+    if not session_id:
+        return
+    try:
+        os.unlink(liaison_path(cfg, harness, session_id))
+    except OSError:
+        pass
+
+
 def _nom_liaison(cfg: Config, harness: str, session_id: str,
                  ttl: float | None = None) -> str:
     row = _lire_json(liaison_path(cfg, harness, session_id))

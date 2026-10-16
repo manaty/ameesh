@@ -16,10 +16,13 @@
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
-#               6 parts, sur push vers main ou release/**, sur une PR de
-#               release (sans liste pilote), à la main (workflow_dispatch) et
-#               sur l'appel du portier de paquet (workflow_call).
-# Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#               9 parts (#1692 : 6 → 9, parts de ~30 min sous saturation), sur
+#               push vers main ou release/**, sur une PR de
+#               release (sans liste pilote), à la main (workflow_dispatch, hors
+#               tête de PR ouverte, #1635) et sur l'appel du portier de paquet
+#               (workflow_call).
+# Le job final « tests » agrège les parts : c'est le nom de vérification stable
+# hors lancement manuel, qui publie « tests (dispatch) » (#1635).
 #
 # §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
 # `pull_request` de sa PR porte le check requis `tests` ; le portier
@@ -96,6 +99,16 @@
 # lue à l'exécution) : un test qui ne tient que sur la classe ordinaire
 # (horodatages, renommage entre périphériques, inodes, blocs) se révèle là. Le
 # job « autre système de fichiers » est alors exigé par le check agrégé.
+#
+# #856 — un runner arrêté (saturation #747) tue le publisher et l'étape
+# `close` : le check restait `in_progress` pour toujours. Le job `tests`
+# (indépendant des publishers) conclut les orphelins en relisant l'état
+# terminal réel du job et de l'exécution (`ci-flow.py sweep`, par
+# l'`external_id` du check #1393, sinon par le `details_url` ou, à défaut, par
+# le `check_suite`) : `cancelled`, jamais `success` sans ligne `fin`, et aucun
+# check actif n'est touché. D'où `actions: read` et `checks: write` sur le job
+# `tests`. #1393 : le balayage est borné (`timeout 120`, `--max-duration 100`)
+# sous le plafond de 5 min du job — il ne change jamais le verdict requis.
 name: tests
 
 on:
@@ -150,9 +163,23 @@ env:
 # asks for `ameesh-ci`, as before. The routing only picks the runner: no
 # `if:`, no part, no required check depends on it, and no hosted runner is
 # ever added (a fork PR keeps ubuntu-latest, as before). The job-level
-# expression is the same everywhere (tests/test_1468_ci_prio.py);
+# expression is the same everywhere (tests/test_1468_ci_prio.py), sauf
+# `bilan` qui porte en plus le repli prêté de #1256 ci-dessous ;
 # docs/EXPLOITATION.md, « Runners prioritaires », gives the activation and
 # rollback steps; scripts/ci-queue-wait.py measures the queue wait per class.
+#
+# Borrowed capacity (lot #1256, option A of the R2 B1 arbitration): a lending
+# host runs SINGLE-USE runners under the DISTINCT label `ameesh-lent`, never
+# `ameesh-ci`, so no job of the fleet — in particular the required check
+# `tests` and everything it needs — can land there. Only a job that is not
+# the required check, is not needed by it, holds no write permission and
+# feeds nothing the required path reads may target that label; the admissible
+# list and the residual risk are in deploy/guest/PILOT-ci-nexlink.md §3.
+# `vars.AMEESH_LENT_RUNS_ON` is set to `["self-hosted","linux","ameesh-lent"]`
+# only while a loan is armed (a single-use configuration deposited and the
+# slot armed); unset, the job stays on the fleet. The one job routed below
+# (`bilan`, after the priority pool of #1468) is `continue-on-error` and is
+# NOT in the `needs` of `tests`.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # lot PR only; merge commit against its target), the branch context
@@ -161,6 +188,10 @@ jobs:
     name: plan
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    # #1635 : dispatch-guard.py lit les PR ouvertes
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       # #833 : sur une poussée, le diff va du commit d'avant la poussée
       # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
@@ -178,13 +209,45 @@ jobs:
       psql: ${{ steps.plan.outputs.psql }}
       psql_parts: ${{ steps.plan.outputs.psql_parts }}
       release: ${{ steps.release.outputs.release }}
+      # the digest of the uploaded plan.json, read by every required consumer
+      # before it runs a part: the run's runtime token also serves the
+      # artifact API, so a job of the borrowed label could delete and replace
+      # this artifact before a "re-run failed jobs" (R1 Claude B4, #1256).
+      # A job output is written by this job alone and cannot be rewritten by
+      # another one, so it is the reference the parts check against.
+      plan_sha256: ${{ steps.plan_digest.outputs.sha256 }}
     steps:
+      # #1635 : un lancement à la main publie le check requis `tests` sur le
+      # commit lancé (check lié au commit, pas à l'évènement) ; sur la tête
+      # d'une PR ouverte, il satisferait le check de cette PR sans merge-ref ni
+      # porte de gel. La référence est contrôlée avant tout checkout (main,
+      # release/**, integration/**, validation/**), puis
+      # scripts/dispatch-guard.py refuse un commit qui est la tête d'une PR
+      # ouverte. Un refus fait échouer `plan` : `tests` rougit sans tests. La
+      # référence passe par l'environnement, jamais interpolée (#1237).
+      - name: lancement à la main (main, release/**, integration/**, validation/** — #1635)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          case "$DISPATCH_REF" in
+            refs/heads/main|refs/heads/release/?*|refs/heads/integration/?*|refs/heads/validation/?*)
+              echo "workflow_dispatch on $DISPATCH_REF: branch admitted" ;;
+            *)
+              echo "::error::workflow_dispatch on '$DISPATCH_REF': only main, release/**, integration/** and validation/** may be run by hand (#1635); a lot branch gets its CI through its pull request, nothing run"
+              exit 1 ;;
+          esac
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # the map commit, and whether it is an ancestor
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: lancement à la main sur la tête d'une PR ouverte (#1635)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/dispatch-guard.py
       # the most recent map of main (a PR reads the caches of its base branch)
       - uses: actions/cache/restore@v4
         with:
@@ -220,6 +283,9 @@ jobs:
           case "$BASE_REF" in release/*) release=true ;; esac
           case "$HEAD_REF" in release/*) release=true ;; esac
           echo "release=$release" >> "$GITHUB_OUTPUT"
+      - id: plan_digest
+        name: empreinte du plan (canal artefacts, #1256 B4)
+        run: echo "sha256=$(sha256sum plan.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: plan
@@ -299,15 +365,22 @@ jobs:
       # pilote psql ne l'installe pas, d'où le saut là-bas). La clé de cache
       # ci-dessus porte `-cov-` : un venv en cache sans coverage ne doit pas
       # être réutilisé pour ces témoins (#1257).
+      #
+      # #1958 : cette étape est l'unique source de la liste pour les deux jobs
+      # qui partagent ce venv, psycopg et fs-class. L'ancre `&deps_venv` est
+      # reprise telle quelle par fs-class : installation et contrôle d'import
+      # ne peuvent plus diverger de la clé partagée.
       - id: deps
         name: dépendances (pilote psycopg)
-        run: |
-          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, coverage' >/dev/null 2>&1; then
+        run: &deps_venv |
+          # Les deux besoins du venv : `coverage` pour les témoins de
+          # scripts/map.py (#1257), `yaml` pour la CI pyyaml (#1511).
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, coverage, yaml' >/dev/null 2>&1; then
             echo "venv restauré du cache : valide"
           else
             rm -rf .venv-ci
             python -m venv .venv-ci
-            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10'
+            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10' 'pyyaml>=6'
             echo "reconstruit=1" >> "$GITHUB_OUTPUT"
           fi
       # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
@@ -341,6 +414,15 @@ jobs:
         with:
           name: plan
           path: ${{ runner.temp }}
+      - &plan_empreinte
+        name: le plan téléchargé est celui du plan (empreinte, #1256 B4)
+        run: |
+          # the run's runtime token also serves the artifact API, and a job of
+          # the borrowed label runs after `plan`: it could delete this
+          # artifact and publish a forged one before a "re-run failed jobs".
+          # The digest comes from the plan job's own output, which no other
+          # job can rewrite; a part that does not match runs nothing.
+          echo "${{ needs.plan.outputs.plan_sha256 }}  $RUNNER_TEMP/plan.json" | sha256sum -c -
       - &publier
         name: publication du flux en direct (check run)
         env:
@@ -382,8 +464,9 @@ jobs:
     # #880 : sur une PR, la part psql est une seule part « pilote » ; mesurée
     # 21,7-26,1 min au repos et 30,4-31,0 min sous saturation (8/8 runners),
     # elle était annulée par le plafond de 30 min sans échec de test (PR #640,
-    # run 38381239685). 45 min laisse la marge sous charge et reste un plafond
-    # borné (§3 du processus de lot : aucun job ne retient un runner des heures).
+    # run 38381239685). 60 min laisse la marge sous charge (#1251 : 45 → 60) et
+    # reste un plafond borné (§3 du processus de lot : aucun job ne retient un
+    # runner des heures).
     # psycopg garde 30 min : ses parts tournent en 6-8 min, même à 3× plus lent
     # elles tiennent dans le plafond.
     timeout-minutes: 60
@@ -394,8 +477,8 @@ jobs:
         # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
         # une part, deux ou trois selon l'estimation (scripts/test-plan.py,
         # lot_part_count), trois au plus (#947 : sous saturation, une part
-        # unique atteignait le plafond de 30 min) ; suite complète en 6 parts
-        # sur push et sur une PR de release (sans liste pilote).
+        # unique atteignait le plafond de 30 min) ; suite complète en 9 parts
+        # (#1692) sur push et sur une PR de release (sans liste pilote).
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
@@ -425,9 +508,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # ManifestesTest (test_cluster, liste « toujours ») lit deploy/k8s avec
+      # PyYAML : sans lui il est sauté, donc jamais vérifié en CI (#1511).
+      - name: pyyaml (manifestes k8s)
+        run: python -m pip install -q 'pyyaml>=6'
       - *base
       - *git
       - *plan
+      - *plan_empreinte
       - *publier
       - name: part ${{ matrix.part }}
         run: >-
@@ -484,7 +572,7 @@ jobs:
       checks: write  # L161c : check run « tests (flux) »
     env:
       AMEESH_DRIVER: psycopg
-      FLUX_NOM: tests (flux) autre-FS ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+      FLUX_NOM: tests (flux) autre système de fichiers ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
       AMEESH_PLAFOND_MIN: "45"
     steps:
       - *debut
@@ -496,27 +584,28 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
+      # #1958 : même clé que le job psycopg — même runner, même Python, même
+      # pyproject.toml, et la classe de `TMPDIR` (posée plus bas) ne change pas
+      # le venv. Une clé distincte paierait deux constructions et laisserait le
+      # contrôle de fs-class plus étroit que le contenu déposé par psycopg.
       - id: venv
         uses: actions/cache/restore@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-
+            venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-
       # Le contrôle vaut aussi pour un cache de même runner devenu périmé (outil
       # Python déplacé) : un venv restauré n'est utilisé que s'il sait encore
       # importer ses dépendances, sinon il est reconstruit (#932, #1293).
+      #
+      # #1958 : ce contrôle et l'installation sont ceux du job psycopg (ancre
+      # `&deps_venv`), pas une seconde liste. Le raccord #1511 (pyyaml) profite
+      # ainsi aux deux jobs, et un contrôle plus étroit que le contenu de la
+      # clé partagée ne peut plus faire reconstruire le venv de l'autre.
       - id: deps
         name: dépendances (pilote psycopg)
-        run: |
-          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
-            echo "venv restauré du cache : valide"
-          else
-            rm -rf .venv-ci
-            python -m venv .venv-ci
-            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
-            echo "reconstruit=1" >> "$GITHUB_OUTPUT"
-          fi
+        run: *deps_venv
       # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
       # prochaine exécution retrouve par `restore-keys`. Un sauvetage refusé
       # (quota, course entre parts) ne fait pas rougir la part : la
@@ -526,10 +615,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
       - *base
       - *git
       - *plan
+      - *plan_empreinte
       - name: racine temporaire sur l'autre classe de système de fichiers
         run: |
           set -eu
@@ -648,12 +738,30 @@ jobs:
         run: python -m unittest -v ${{ needs.plan.outputs.doc_readers }}
 
   # L161f : leaks (failures of modules the map did not select) and the
-  # provisional green, for the two-week review (L161i); never required
+  # provisional green, for the two-week review (L161i); never required.
+  # Its result gates nothing and nothing required reads what it produces, so
+  # it is the job this lot routes to the borrowed label when a loan is armed
+  # (option A, #1256; plan §3): a forged green here costs the two-week tally,
+  # never a required check.
   bilan:
     name: bilan des impactés
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    # #876 : « always() » seul recrée le job après l'annulation de l'exécution
+    # (il reste queued des heures, puis la conclut en rouge) ; !cancelled() le saute.
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # Union #1256 x #1468 : le pool prioritaire d'abord, puis l'hôte prêté
+    # quand un prêt est armé, puis la flotte ordinaire. `bilan` est hors de la
+    # clôture du check requis (tests/test_1256_ci_runners.py), seul job routé
+    # du workflow avec `ui.yml/ui` ; c'est le seul job Linux dont l'expression
+    # diffère de celle des autres (tests/test_1468_ci_prio.py).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # Cache access is closed for a job that may run on the borrowed host: the
+    # cache service scopes the run's runtime token from this declaration, and
+    # `permissions:` does not bound it (R1 Codex B3, #1256). `none` here: this
+    # job reads no cache. A write mode is forbidden on every routed job — it
+    # could otherwise publish a `carte-*` or `.venv-ci` entry that `plan` and
+    # the psycopg parts restore, poisoning required checks.
+    cache-mode: none
     timeout-minutes: 5
     continue-on-error: true
     steps:
@@ -701,11 +809,22 @@ jobs:
   # #748 : la part « autre système de fichiers », quand elle tourne — release
   # ou exécution à la main — compte comme les autres)
   tests:
-    name: tests
+    # Une PR peut être ouverte sur ce SHA après la garde ou la fin du run :
+    # un dispatch ne doit jamais publier le contexte requis de cette PR.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'tests (dispatch)' || 'tests' }}
+    # #876 : seul check requis ; `always() && !cancelled()` le ferait passer
+    # skipped sur une exécution annulée, et GitHub compte un job sauté comme un
+    # succès — la PR redeviendrait fusionnable sans aucun test. Il garde donc
+    # `always()` (une exécution annulée le conclut en rouge) ; l'attente en file
+    # de cet agrégat après annulation est la saturation des runners (lot #828).
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # #856 : relire l'état terminal des jobs d'une exécution
+      checks: write   # #856 : conclure les checks « tests (flux) » orphelins
     steps:
       - name: bilan des parts
         run: |
@@ -741,3 +860,29 @@ jobs:
           # #748 : la part sur l'autre système de fichiers n'existe que pour une
           # release (ou à la main) ; quand elle a tourné, elle compte
           test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped
+      # #856 : réconciliation indépendante du publisher — un runner arrêté
+      # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
+      # restait in_progress pour toujours. On relit l'état terminal réel du job
+      # et de l'exécution qui l'ont publié (par l'`external_id` du check #1393,
+      # sinon par le `details_url`, sinon par le `check_suite` : GitHub laisse
+      # l'URL par défaut sur ces checks) ; jamais `success` sans ligne `fin`,
+      # aucun check dont l'exécution est encore active, ni d'une autre tête,
+      # n'est touché.
+      # `continue-on-error` : cette réconciliation ne change jamais le verdict
+      # requis « tests » (comme la publication, elle n'est pas une cause d'échec).
+      # `if: always()` : un bilan rouge (une part requise tombée) ne doit pas
+      # sauter le checkout — sinon `sweep`, lancé en `always()`, n'a plus son
+      # script et aucun check orphelin n'est conclu.
+      # #1393 : `timeout 120` et `--max-duration 100` bornent le balayage (les
+      # appels GitHub peuvent durer 20 s) sous le plafond de 5 min du job : un
+      # balayage lent ne peut pas faire expirer le job et rougir « tests » ; il
+      # s'arrête entre deux checks et les restants sont vus au passage suivant.
+      - uses: actions/checkout@v4
+        if: always()
+        continue-on-error: true
+      - name: conclusion des checks de flux orphelins
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: timeout 120 python3 scripts/ci-flow.py sweep --max-duration 100

@@ -4,7 +4,7 @@
 
     scripts/map.py install
     scripts/test-parts.py run … --measure DIR      (une part sous mesure)
-    scripts/map.py merge --output carte.json.gz [--previous F] DIR [DIR…]
+    scripts/map.py merge --output carte.json.gz [--previous F] [--attendu NOMS] DIR [DIR…]
     scripts/map.py show carte.json.gz [CHEMIN | table:NOM | test_module …]
     scripts/map.py blocks src/ameesh/x.py
 
@@ -33,9 +33,11 @@ de son fichier (il les a importés).
 
     commit, genere, outils     commit mesuré, date, versions (Python, coverage)
     measure, mesure            parts, processus mesurés (dont sans contexte),
-                               sous-processus Python lancés sans la mesure,
-                               surcoût (L148 stage 6 : les deux graphies,
-                               l'anglaise d'abord, une release)
+                               artefacts de mesure illisibles (jamais comptés
+                               comme mesure valide), sous-processus Python
+                               lancés sans la mesure, surcoût (L148 stage 6 :
+                               les deux graphies, l'anglaise d'abord, une
+                               release)
     modules.<m>                durations et durees (mêmes valeurs), échecs sous
                                mesure (14 jours)
     blocs.<fichier>.<bloc>     empreinte, lignes [début, fin], modules
@@ -49,6 +51,9 @@ de son fichier (il les a importés).
 
 Les noms de modules sont ceux de `tests/` sans préfixe (`test_cluster`).
 La carte n'est jamais bloquante : un échec sous mesure est noté, pas reporté.
+Avec `--attendu` (#1341 D), la fusion refuse au contraire de publier une carte
+quand une part attendue manque ou n'a pas écrit ses durées : une carte
+incomplète ne doit pas remplacer la précédente dans le cache.
 """
 from __future__ import annotations
 
@@ -65,6 +70,7 @@ import os
 import pathlib
 import platform
 import re
+import sqlite3
 import subprocess
 import sys
 import sysconfig
@@ -285,11 +291,12 @@ def _entete_sqlite(fichier: str) -> str | None:
     return None
 
 
-def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
+def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dict]]:
     """{fichier relatif: {ligne: {modules}}}, le nombre de processus mesurés,
     celui des processus sans contexte (environnement remplacé par le test :
-    leurs lignes ne sont attribuées à aucun module) et les couvertures
-    illisibles ignorées ({part, fichier, raison}).
+    leurs lignes ne sont attribuées à aucun module), les couvertures
+    illisibles ignorées ({part, fichier, raison}, #1257) et les artefacts de
+    mesure incomplets ({fichier, erreur}, #1690).
 
     Une couverture perdue est nommée, jamais silencieuse, et ne fait pas
     échouer la carte entière : un artefact corrompu ne rougit plus un check
@@ -300,32 +307,47 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
     contribution, construite à part, n'est versée qu'une fois le fichier
     entièrement exploité (aucune ligne partielle d'un fichier corrompu).
 
-    Un fichier de 0 octet (processus tué avant d'écrire sa mesure) se lit sans
-    erreur mais ne porte aucune mesure : il est écarté comme une perte, jamais
-    compté comme un processus mesuré à zéro (R1 B3 #1257) — sinon la carte
-    paraîtrait complète alors que la contribution du processus manque."""
+    Un fichier de 0 octet (processus tué avant d'écrire sa mesure) est écarté
+    avant tout import et toute lecture (#1707) : il ne porte aucune mesure, et
+    le compter comme un processus mesuré à zéro ferait paraître la carte
+    complète alors que sa contribution manque (R1 B3 #1257).
+
+    Une même perte alimente les deux projections sans double compteur : le
+    résumé (#1257) et le repli du plan (#1690/#1716) la voient tous les deux."""
     lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
     processus = sans_contexte = 0
     ignorees: list[dict] = []
+    incomplets: list[dict] = []
     for dossier in dossiers:
         part = os.path.basename(os.path.normpath(dossier)) or dossier
         for fichier in sorted(glob.glob(os.path.join(dossier, "cov", ".coverage*"))):
+            # #1707 : un fichier de 0 octet n'a jamais reçu son schéma SQLite :
+            # la part a été interrompue avant d'écrire (un processus réellement
+            # mesuré écrit toujours le schéma, même sans ligne tracée). Le
+            # constat précède l'import et la lecture : CoverageData.read()
+            # initialiserait le fichier et masquerait le vide.
+            try:
+                vide = os.path.getsize(fichier) == 0
+            except OSError:
+                vide = False  # disparu entre le glob et ici : la lecture tranchera
+            if vide:
+                # #1257 x #1690 : la perte alimente les deux projections.
+                raison = ("DataError: fichier de couverture vide (0 octet) : "
+                          "écriture interrompue avant le schéma")
+                ignorees.append({"part": part, "fichier": os.path.basename(fichier),
+                                 "raison": raison})
+                incomplets.append({"fichier": os.path.relpath(fichier, dossier),
+                                   "erreur": raison})
+                continue
             import sqlite3
 
             from coverage import CoverageData
-            from coverage.exceptions import DataError
+            from coverage.exceptions import CoverageException
 
             diagnostic = _entete_sqlite(fichier)
             contribution: dict = collections.defaultdict(
                 lambda: collections.defaultdict(set))
             try:
-                if os.path.getsize(fichier) == 0:
-                    # R1 B3 (#1257) : un fichier vide ne fait lever aucune
-                    # erreur à coverage et ne rend aucune mesure ; le compter
-                    # comme processus mesuré rendrait la carte complète alors
-                    # que sa contribution est perdue. Perte conservatrice,
-                    # nommée comme les autres.
-                    raise DataError("fichier de couverture vide (0 octet)")
                 donnees = CoverageData(basename=fichier)
                 donnees.read()
                 contextes = donnees.measured_contexts()
@@ -339,12 +361,26 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
                         modules = {m for m in map(context_module, ctx) if m}
                         if modules:
                             contribution[relatif][ligne] |= modules
-            except (DataError, sqlite3.DatabaseError, OSError) as exc:
+            except (CoverageException, sqlite3.DatabaseError, OSError) as exc:
+                # #1257 x #1690 : la perte alimente les deux projections, sans
+                # double compteur ; le diagnostic d'en-tête nomme la panne.
                 raison = f"{type(exc).__name__}: {exc}"
                 if diagnostic:
                     raison = f"{raison} ({diagnostic})"
                 ignorees.append({"part": part, "fichier": os.path.basename(fichier),
                                  "raison": raison})
+                incomplets.append({"fichier": os.path.relpath(fichier, dossier),
+                                   "erreur": raison})
+                # #1716 : un `read()` en échec laisse la connexion SQLite
+                # ouverte dans `CoverageData._dbs` (le `with` de coverage n'est
+                # jamais entré) ; on la ferme ici plutôt que de la laisser au
+                # ramasse-miettes (ResourceWarning, relecture du test L161e).
+                fermer = getattr(donnees, "close", None)
+                if fermer is not None:
+                    try:
+                        fermer(force=True)
+                    except Exception:  # noqa: BLE001 — la mesure reste illisible
+                        pass
                 continue
             processus += 1
             if sans_attribution:
@@ -352,7 +388,7 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
             for relatif, par_ligne in contribution.items():
                 for ligne, modules in par_ligne.items():
                     lignes[relatif][ligne] |= modules
-    return lignes, processus, sans_contexte, ignorees
+    return lignes, processus, sans_contexte, ignorees, incomplets
 
 
 def _version_coverage() -> str:
@@ -378,7 +414,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
               table_durees: dict | None = None) -> dict:
     """Les mesures des parts → la carte."""
     maintenant = maintenant or datetime.datetime.now(datetime.timezone.utc)
-    lignes, processus, sans_contexte, couverture_ignoree = _coverage(dossiers)
+    lignes, processus, sans_contexte, couverture_ignoree, incomplets = _coverage(dossiers)
 
     # blocs de tout src/, exécutés ou non
     carte_blocs: dict[str, dict] = {}
@@ -473,6 +509,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
     measure = {"parts": len(dossiers), "processus": processus,
                "processus_sans_contexte": sans_contexte,
                "couverture_ignoree": couverture_ignoree,
+               "artefacts_incomplets": incomplets,
                "sous_processus_sans_mesure": _per_module(sans_mesure),
                "surcout": surcout}
     return {
@@ -490,6 +527,97 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
         "migrations": migrations,
         "sans_test": sans_test,
     }
+
+
+def parts_incompletes(dossiers: list[str], attendus: list[str]) -> list[str]:
+    """#1341 D — les parts de mesure attendues absentes ou sans durée.
+
+    Une part annulée (plafond, runner perdu) publie son artefact sans
+    `durees.json` : `merge` la fusionnait alors silencieusement, et la carte
+    publiée perdait les durées de ses modules — la fusion n'hérite pas des
+    durées de la carte précédente, seulement des échecs. `attendus` vient de
+    la matrice du workflow (`jobs.mesure.strategy.matrix.include`), que
+    `tests/test_carte_parts_completes.py` tient en miroir.
+    """
+    presents = {os.path.basename(os.path.normpath(d)): d for d in dossiers}
+    problemes = []
+    for nom in attendus:
+        dossier = presents.get(nom)
+        if dossier is None:
+            problemes.append(f"{nom} : artefact absent")
+            continue
+        fichiers = sorted(glob.glob(os.path.join(dossier, "durees*.json")))
+        if not fichiers:
+            problemes.append(f"{nom} : aucune durée écrite (part annulée ?)")
+            continue
+        total = 0
+        lus = 0
+        for chemin in fichiers:
+            try:
+                donnees = json.loads(pathlib.Path(chemin).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                problemes.append(f"{nom} : {os.path.basename(chemin)} illisible ({exc})")
+                continue
+            lus += 1
+            if isinstance(donnees, dict):
+                total += sum(len(v) for v in donnees.values() if isinstance(v, dict))
+        if lus and not total:
+            problemes.append(f"{nom} : durées vides")
+    return problemes
+
+
+def couverture_incomplete(dossiers: list[str], plan: dict) -> list[str]:
+    """#1341 R1 — la couverture *effective* de la mesure, part par part.
+
+    Le plan de mesure est calculé une seule fois par run (job `plan-mesure`)
+    et lu par toutes les parts (`test-parts.py run --plan`). `merge` vérifie
+    ici que chaque part a mesuré exactement les modules que le plan lui
+    assigne : un module mesuré dans deux parts (doublon), mesuré hors de sa
+    part, ou un module du plan jamais mesuré, refuse la publication. Sans ce
+    contrôle, un cache changé entre deux jobs peut produire des parts
+    disjointes et une carte incomplète avec une matrice verte (témoin K1/K2
+    de la R1). `plan` est le JSON écrit par `scripts/test-parts.py plan`.
+    """
+    mesures: dict[str, set[str]] = {}
+    for dossier in dossiers:
+        nom = os.path.basename(os.path.normpath(dossier))
+        modules: set[str] = set()
+        for chemin in sorted(glob.glob(os.path.join(dossier, "durees*.json"))):
+            try:
+                donnees = json.loads(pathlib.Path(chemin).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue  # parts_incompletes a déjà refusé cette part
+            if isinstance(donnees, dict):
+                for durees in donnees.values():
+                    if isinstance(durees, dict):
+                        modules |= set(durees)
+        mesures[nom] = mesures.get(nom, set()) | modules
+    problemes = []
+    connues = {f"mesure-{pilote}-{entree.get('part')}"
+               for pilote, parts in plan.get("parts", {}).items() for entree in parts}
+    for dossier in dossiers:
+        nom = os.path.basename(os.path.normpath(dossier))
+        if nom.startswith("mesure-") and nom not in connues:
+            problemes.append(f"{nom} : part mesurée absente du plan")
+    for pilote, parts in sorted(plan.get("parts", {}).items()):
+        attendues = {f"mesure-{pilote}-{entree.get('part')}":
+                     set(entree.get("modules") or ())
+                     for entree in parts}
+        par_module: dict[str, list[str]] = collections.defaultdict(list)
+        for nom in attendues:
+            for module in mesures.get(nom, set()):
+                par_module[module].append(nom)
+        for module, noms in sorted(par_module.items()):
+            if len(noms) > 1:
+                problemes.append(f"{module} : mesuré dans plusieurs parts "
+                                 f"({', '.join(sorted(noms))})")
+        for nom, attendus in sorted(attendues.items()):
+            mesures_part = mesures.get(nom, set())
+            for module in sorted(attendus - mesures_part):
+                problemes.append(f"{nom} : module du plan non mesuré : {module}")
+            for module in sorted(mesures_part - attendus):
+                problemes.append(f"{nom} : module mesuré hors de sa part : {module}")
+    return problemes
 
 
 def write(carte: dict, chemin: str) -> None:
@@ -519,6 +647,10 @@ def summary(carte: dict) -> str:
         f"* {mesure['processus']} processus mesurés en {mesure['parts']} parts, dont "
         f"{mesure['processus_sans_contexte']} sans contexte de test",
     ]
+    if mesure.get("artefacts_incomplets"):
+        lignes.append("* artefacts de mesure illisibles, jamais comptés comme mesure valide : "
+                      + ", ".join(f"{i['fichier']} ({i['erreur']})"
+                                  for i in mesure["artefacts_incomplets"]))
     if mesure["surcout"]:
         lignes.append("* surcoût de la mesure : " + ", ".join(
             f"{p} ×{r}" for p, r in sorted(mesure["surcout"].items())))
@@ -580,6 +712,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--previous", help="carte précédente (historique des échecs)")
     p.add_argument("--commit", help="commit mesuré (défaut : HEAD)")
     p.add_argument("--summary", help="écrit aussi le résumé Markdown dans ce fichier")
+    p.add_argument("--attendu", help="parts de mesure attendues (noms d'artefacts, "
+                   "séparés par des espaces ou des virgules) : la fusion refuse de "
+                   "publier une carte si l'une manque ou n'a pas de durées (#1341 D)")
+    p.add_argument("--plan", help="plan.json du run (#1341 R1) : la fusion vérifie "
+                   "que chaque part a mesuré exactement les modules que le plan lui "
+                   "assigne — aucun module omis, doublé ou hors de sa part")
     p.add_argument("directories", nargs="+")
     p = sous.add_parser("show", help="lire une carte")
     p.add_argument("map")
@@ -590,6 +728,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.commande == "install":
         return install(args)
     if args.commande == "merge":
+        attendus = args.attendu.replace(",", " ").split() if args.attendu else []
+        problemes = parts_incompletes(args.directories, attendus)
+        if problemes:
+            for probleme in problemes:
+                print(f"::error::mesure incomplète : {probleme}")
+            print("carte non publiée : une part attendue manque ou n'a pas de durées",
+                  file=sys.stderr)
+            return 2
+        if args.plan:
+            try:
+                plan = json.loads(pathlib.Path(args.plan).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                print(f"::error::plan {args.plan} illisible ({exc})")
+                print("carte non publiée : le plan de mesure du run est illisible",
+                      file=sys.stderr)
+                return 2
+            problemes = couverture_incomplete(args.directories, plan)
+            if problemes:
+                for probleme in problemes:
+                    print(f"::error::couverture incomplète : {probleme}")
+                print("carte non publiée : la couverture effective du plan est "
+                      "incomplète (module omis, doublé ou hors de sa part)",
+                      file=sys.stderr)
+                return 2
         precedente = None
         if args.previous and os.path.exists(args.previous):
             try:

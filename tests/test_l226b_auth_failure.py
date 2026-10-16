@@ -206,22 +206,26 @@ class CapsAndOrderTest(_CapsBase):
         # the long window keeps the pace cap
         self.assertEqual(evs["secondaire"].limits["seven_day"][1], "pace cap")
 
-    def test_failover_order_primary_last(self):
+    def test_budget_criteria_before_the_declared_order(self):
+        """#1580 (propriétaire, 2026-10-15) : le choix ne suit plus l'ordre
+        déclaré — le compte qui a le plus de budget inutilisé passe d'abord,
+        même déclaré dernier ; l'ordre de bascule (L226b) ne départage plus que
+        des critères de budget à égalité."""
         now = 1_800_000_000.0
         items = self._items(tertiaire={"priority": 10})
-        # the primary is the least used, yet comes last
+        # the primary is the least used: it comes first, whatever its priority
         gauges = {"primaire": self._gauges(0.05, 0.05, now),
                   "secondaire": self._gauges(0.30, 0.30, now),
                   "tertiaire": self._gauges(0.60, 0.60, now)}
         evs = self._ev(items, gauges, now)
         ranked = accounts.rank(items, evs, now)
+        self.assertEqual([p.name for p in ranked], ["primaire", "secondaire", "tertiaire"])
+        # égalité de budget : l'ordre déclaré départage encore (L226b)
+        equal = {name: self._gauges(0.05, 0.05, now) for name in gauges}
+        evs = self._ev(items, equal, now)
+        ranked = accounts.rank(items, evs, now)
         self.assertEqual([p.name for p in ranked], ["tertiaire", "secondaire", "primaire"])
         self.assertIn("first in the failover order", accounts.reason_of(ranked, evs, now))
-        # without priorities, the pace decides among the others; primary still last
-        items = self._items()
-        evs = self._ev(items, gauges, now)
-        self.assertEqual([p.name for p in accounts.rank(items, evs, now)],
-                         ["secondaire", "tertiaire", "primaire"])
 
 
 class OverageReadingTest(unittest.TestCase):
@@ -668,8 +672,11 @@ class ForcedRaceTest(_AuthBase):
         store_type = type(storage.of(self.db).accounts)
         original = store_type.switch
 
-        def switch(store, host, harness, *, expected, to, kind, reason, agent, **kw):
+        def switch_guarded(store, host, harness, *, expected, to, kind, reason, agent,
+                           now, **kw):
             # the owner forces the primary between our read and our switch
+            # (#1883 : le choix bascule par `switch_guarded`, et le forçage
+            # manuel par `switch` — c'est ce couple que ce témoin enjambe)
             original(store, host, harness, expected=None, to="primaire", kind="manuel",
                      reason="forçage manuel", agent=None, forced=True)
             return False
@@ -677,7 +684,7 @@ class ForcedRaceTest(_AuthBase):
         with mock.patch.dict(os.environ, {"HOME": maison}):
             book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
             _codex_rollout(home, 60, now + 1800)  # above the primary cap (50 %)
-            with mock.patch.object(store_type, "switch", switch):
+            with mock.patch.object(store_type, "switch_guarded", switch_guarded):
                 choix = accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                         now=now)
         self.assertTrue(choix.forced)
@@ -874,7 +881,7 @@ class LegacySessionTest(_CapsBase):
                 mock.patch.object(accounts, "profiles", return_value=items), \
                 mock.patch.object(auth_failure, "failing", return_value=failing or {}), \
                 mock.patch.object(accounts, "gauges_of",
-                                  side_effect=lambda _b, p, _i, _e=None: (
+                                  side_effect=lambda _b, p, _i, _e=None, **_kw: (
                                       gauges or {}).get(p.name, quiet)), \
                 mock.patch.object(registry, "clear_session", return_value=False):
             account_turn.continuity(worker)
@@ -972,7 +979,7 @@ class UnpacedChoiceTest(_AuthBase):
         try:
             worker.rotation_forcee = "test"
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i, _e=None: self.overage), \
+                                   side_effect=lambda _b, _p, _i, _e=None, **_kw: self.overage), \
                     mock.patch.object(worker, "current_session", return_value="sess-1"), \
                     mock.patch.object(worker, "run_turn", return_value=False) as tour:
                 self.assertFalse(worker.budget_ok())
@@ -984,7 +991,7 @@ class UnpacedChoiceTest(_AuthBase):
             # out of overage: the guard lets it through, the pause is lifted
             worker.agent = registry.get(self.db, "ovr")  # as `pick` reloads it
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i, _e=None: self.paced):
+                                   side_effect=lambda _b, _p, _i, _e=None, **_kw: self.paced):
                 self.assertTrue(worker.budget_ok())
             self.assertEqual(registry.get(self.db, "ovr")["status"], "idle")
         finally:

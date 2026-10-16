@@ -157,7 +157,7 @@ class CheckRunTest(unittest.TestCase):
     """L'alerte se voit dans le check run et ne devient jamais un échec."""
 
     def test_visible_et_ignoree_par_ameesh(self):
-        sortie = ciflux.check_output([ev_debut()], alerte_a(1440.0))
+        sortie = ciflux.check_output([ev_debut()], alerte=alerte_a(1440.0))
         self.assertIn("80 %", sortie["title"])
         self.assertIn("80 % du plafond du job atteint", sortie["summary"])
         self.assertIn("24 min 00 s écoulées sur 30 min", sortie["summary"])
@@ -172,7 +172,7 @@ class CheckRunTest(unittest.TestCase):
 
     def test_conclusion_inchangee(self):
         """L'alerte ne porte aucune conclusion : elle ne fait pas échouer la part."""
-        sortie = ciflux.check_output([ev_debut(), ev_fin()], alerte_a(1440.0))
+        sortie = ciflux.check_output([ev_debut(), ev_fin()], alerte=alerte_a(1440.0))
         self.assertNotIn("conclusion", sortie)
 
     def test_texte(self):

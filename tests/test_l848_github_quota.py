@@ -12,15 +12,20 @@ propriétés du correctif, sans réseau ni base :
 * le quota épuisé est écrit sur disque : plus aucune requête avant le reset,
   le cache est servi, sinon `GithubRateLimited` — jamais de boucle ;
 * le relevé de CI passe par ce client, avec le cache de l'hôte ;
-* l'économie est mesurable (compteurs, `ameesh ci status`).
+* l'économie est mesurable (compteurs, `ameesh ci status`) ;
+* un incrément de compteur arrivé pendant l'écriture n'est jamais perdu
+  (#1927).
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import gc
 import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 import urllib.error
 from types import SimpleNamespace
@@ -203,6 +208,273 @@ class SharedReadsTest(unittest.TestCase):
         self.assertEqual(reads.quota("graphql")["remaining"], 0)
         self.assertEqual(sorted(reads.quotas()), ["core", "graphql"])
 
+    # -- N1, N3, N4 de la relecture Claude (#848) --------------------------
+
+    def test_lecture_ne_cree_aucun_dossier(self):
+        """N1 : une construction ou une lecture ne crée rien ; le cache naît
+        à sa première écriture, et la vue ne fabrique aucun chemin."""
+        github = os.path.join(self.dir.name, plan_github.READS_DIR)
+        reads = self.reads()
+        self.assertFalse(os.path.exists(github))
+        self.assertIsNone(reads.cached("repos/o/r"))
+        self.assertEqual(reads.quotas(), {})
+        self.assertEqual(reads.counters(), {})
+        self.assertEqual(plan_github.quota_stats(self.dir.name),
+                         {"quota": {}, "counters": {}})
+        self.assertFalse(os.path.exists(github), "une lecture a créé un dossier")
+        reads.store("repos/o/r", {"id": 1})
+        self.assertTrue(os.path.isdir(os.path.join(github, "reads")))
+
+    def test_state_dir_vide_refuse(self):
+        """N1 : un état vide est refusé, jamais transformé en `None/github`."""
+        for empty in (None, "", "   "):
+            with self.subTest(state_dir=empty):
+                with self.assertRaises(ValueError):
+                    plan_github.SharedReads(empty)
+        self.assertEqual(plan_github.quota_stats(None),
+                         {"quota": {}, "counters": {}})
+        self.assertEqual(plan_github.quota_stats(""), {"quota": {}, "counters": {}})
+
+    def test_compteurs_agreges_puis_ecrits_une_fois(self):
+        """N3 : aucun verrou ni écriture par hit ; une écriture au passage."""
+        reads = self.reads()
+        writes: list = []
+        real = plan_github._atomic_write
+
+        def spy(path, data):
+            writes.append(path)
+            return real(path, data)
+
+        with mock.patch.object(plan_github, "_atomic_write", spy):
+            for _ in range(5):
+                reads.count("hits")
+            self.assertEqual(writes, [], "un hit de cache a écrit quota.json")
+            self.assertEqual(reads.counters()["hits"], 5)     # agrégé en mémoire
+            self.assertFalse(os.path.exists(reads._quota_path))
+            reads.flush()
+            self.assertEqual(writes, [reads._quota_path])     # une seule écriture
+            self.assertEqual(self.reads().counters()["hits"], 5)
+            reads.flush()                                     # rien de neuf
+            self.assertEqual(len(writes), 1)
+
+    def test_compteurs_du_passage_ecrits_a_la_fin(self):
+        """N3 : le passage terminé (objet libéré), les compteurs sont sur disque."""
+        reads = self.reads()
+        reads.count("hits", 2)
+        self.assertFalse(os.path.exists(reads._quota_path))
+        del reads
+        gc.collect()
+        self.assertEqual(self.reads().counters()["hits"], 2)
+
+    def test_flush_reads_ecrit_les_compteurs_du_passage(self):
+        """#1813 : `flush_reads` (fin de passage du Watcher) écrit les compteurs
+        des caches vivants, sans attendre la requête réelle suivante."""
+        reads = self.reads()
+        reads.count("hits", 3)
+        self.assertFalse(os.path.exists(reads._quota_path))
+        self.assertGreaterEqual(plan_github.flush_reads(self.dir.name), 1)
+        self.assertEqual(self.reads().counters()["hits"], 3)
+        # un second passage sans nouveau hit n'écrit rien
+        before = os.path.getmtime(reads._quota_path)
+        plan_github.flush_reads(self.dir.name)
+        self.assertEqual(os.path.getmtime(reads._quota_path), before)
+
+    def test_flush_reads_ignore_un_autre_etat(self):
+        """#1813 : le passage d'un hôte ne vide pas les compteurs d'un autre."""
+        reads = self.reads()
+        reads.count("hits", 1)
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        self.assertEqual(plan_github.flush_reads(other.name), 0)
+        self.assertEqual(plan_github.flush_reads(""), 0)
+        self.assertFalse(os.path.exists(reads._quota_path))
+        self.assertEqual(reads.counters()["hits"], 1)
+
+    def test_count_atomique_entre_fils(self):
+        """#1813 : un client partagé entre fils ne perd pas de compteur."""
+        reads = self.reads()
+
+        def bump():
+            for _ in range(200):
+                reads.count("hits")
+
+        threads = [threading.Thread(target=bump) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(reads.counters()["hits"], 800)
+
+    # -- #1927 : un incrément concurrent ne se perd pas entre fusion et purge --
+
+    def _during_write(self, quota_path, trigger):
+        """Espionne `_atomic_write` et rejoue `trigger` pendant l'écriture.
+
+        Le déclencheur ne capture que `quota_path` : le test du finaliseur ne
+        doit garder aucune référence à l'objet qu'il fait collecter."""
+        real = plan_github._atomic_write
+        fired: list = []
+
+        def spy(path, data):
+            if path == quota_path and not fired:
+                fired.append(path)
+                trigger()
+            return real(path, data)
+
+        return spy
+
+    def test_increment_concurrent_pendant_le_flush_est_conserve(self):
+        """#1927 : l'incrément arrivé pendant l'écriture du flush reste visible.
+
+        L'ancien code fusionnait l'instantané vivant puis vidait `pending`
+        après coup : le `count` reçu pendant l'écriture était purgé sans avoir
+        été fusionné (disque 1 + mémoire 0 au lieu de 2)."""
+        reads = self.reads()
+        reads.count("hits")
+        spy = self._during_write(reads._quota_path, lambda: reads.count("hits"))
+        with mock.patch.object(plan_github, "_atomic_write", spy):
+            reads.flush()
+        self.assertEqual(reads.counters()["hits"], 2)      # disque + mémoire
+        self.assertEqual(self.reads().counters()["hits"], 2)
+
+    def test_increment_concurrent_pendant_le_note_est_conserve(self):
+        """#1927 : même garantie sur `note`, l'autre chemin de fusion."""
+        reads = self.reads()
+        reads.count("hits")
+        spy = self._during_write(reads._quota_path, lambda: reads.count("hits"))
+        with mock.patch.object(plan_github, "_atomic_write", spy):
+            reads.note(quota_headers(remaining="4990"), status=200)
+        self.assertEqual(reads.counters()["hits"], 2)
+        self.assertEqual(self.reads().counters()["hits"], 2)
+
+    def test_deux_flush_concurrents_somment_leurs_compteurs(self):
+        """#1927 : deux écritures concurrentes du même cache s'additionnent,
+        chacune fusionnant sous le verrou de fichier ; aucune ne bloque."""
+        one = self.reads()
+        two = self.reads()
+        one.count("hits", 3)
+        two.count("hits", 4)
+        errors: list = []
+
+        def flush(reads):
+            try:
+                reads.flush()
+            except BaseException as exc:                  # jamais bloquant
+                errors.append(exc)
+
+        threads = [threading.Thread(target=flush, args=(reads,))
+                   for reads in (one, two)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(self.reads().counters()["hits"], 7)
+
+    def test_panne_du_flush_rend_les_compteurs_au_passage_suivant(self):
+        """#1927 : l'écriture en panne ne perd rien — les compteurs retirés
+        reviennent en mémoire et repartent au passage suivant."""
+        reads = self.reads()
+        reads.count("hits", 2)
+        with mock.patch.object(plan_github, "_atomic_write",
+                               side_effect=OSError("disque plein")):
+            reads.flush()
+        self.assertEqual(reads.counters()["hits"], 2)
+        reads.flush()
+        self.assertEqual(self.reads().counters()["hits"], 2)
+
+    def test_panne_du_note_rend_les_compteurs_au_passage_suivant(self):
+        """#1927 : même garantie de retour arrière sur `note`."""
+        reads = self.reads()
+        reads.count("hits", 2)
+        with mock.patch.object(plan_github, "_atomic_write",
+                               side_effect=OSError("disque plein")):
+            self.assertIsNone(reads.note(quota_headers(remaining="4990"), status=200))
+        self.assertEqual(reads.counters()["hits"], 2)
+        reads.flush()
+        self.assertEqual(self.reads().counters()["hits"], 2)
+
+    def test_panne_inattendue_rend_aussi_les_compteurs(self):
+        """#1927 : une panne hors OSError/ValueError (un `quota.json` aux
+        valeurs d'un autre type lève TypeError dans la fusion) se propage
+        comme avant, mais ne perd pas les compteurs déjà retirés."""
+        for path in ("flush", "note"):
+            with self.subTest(path=path):
+                reads = self.reads()
+                reads.count("hits", 2)
+                with mock.patch.object(plan_github, "_atomic_write",
+                                       side_effect=TypeError("valeur illisible")):
+                    with self.assertRaises(TypeError):
+                        if path == "flush":
+                            reads.flush()
+                        else:
+                            reads.note(quota_headers(remaining="4990"), status=200)
+                self.assertEqual(reads._pending.get("hits"), 2)
+                reads._pending.clear()
+
+    def test_finaliseur_ne_perd_pas_un_increment_concurrent(self):
+        """#1927 : le finaliseur écrit par le même chemin ; un incrément reçu
+        d'une autre instance vivante pendant son écriture reste visible."""
+        dying = self.reads()
+        live = self.reads()
+        dying.count("hits")
+        live.count("hits", 2)
+        spy = self._during_write(dying._quota_path, lambda: live.count("hits"))
+        with mock.patch.object(plan_github, "_atomic_write", spy):
+            del dying
+            gc.collect()
+        self.assertEqual(self.reads().counters()["hits"], 4)
+
+    def test_panne_du_finaliseur_laisse_le_disque_intact(self):
+        """#1927 : un finaliseur dont l'écriture échoue ne corrompt rien et ne
+        fait pas échouer le passage : le disque reste tel quel."""
+        reads = self.reads()
+        reads.count("hits", 2)
+        with mock.patch.object(plan_github, "_atomic_write",
+                               side_effect=OSError("disque plein")):
+            del reads
+            gc.collect()
+            self.assertFalse(os.path.exists(os.path.join(
+                self.dir.name, plan_github.READS_DIR, "quota.json")))
+            self.assertEqual(self.reads().counters(), {})
+
+    def test_cle_de_cache_par_base_et_jeton(self):
+        """N4 : deux jetons (ou deux bases) ne partagent pas la même entrée,
+        et le jeton n'apparaît nulle part dans le cache."""
+        one = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope(BASE, "jeton-a"))
+        two = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope(BASE, "jeton-b"))
+        one.store("repos/o/r", {"id": 1})
+        self.assertIsNotNone(one.cached("repos/o/r"))
+        self.assertIsNone(two.cached("repos/o/r"), "un autre jeton partage l'entrée")
+        other_base = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope("https://ghe.test", "jeton-a"))
+        self.assertIsNone(other_base.cached("repos/o/r"), "une autre base partage l'entrée")
+        token = "jeton-secret-n4"
+        scoped = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope(BASE, token))
+        scoped.store("repos/o/r2", {"id": 2})
+        reads_dir = os.path.join(self.dir.name, plan_github.READS_DIR, "reads")
+        for name in os.listdir(reads_dir):
+            self.assertNotIn(token, name, "le jeton est dans un nom de fichier")
+            with open(os.path.join(reads_dir, name), encoding="utf-8") as fh:
+                self.assertNotIn(token, fh.read(), "le jeton est dans le cache")
+
+
+class WatcherFlushTest(unittest.TestCase):
+    """#1813 : le passage du Watcher écrit les compteurs du cache partagé."""
+
+    def test_le_passage_ecrit_les_compteurs_meme_sans_depot(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            reads = plan_github.SharedReads(state_dir)
+            reads.count("hits", 4)
+            cfg = SimpleNamespace(state_dir=state_dir, github={}, host="h")
+            watcher = ci.Watcher(cfg, api=lambda path: {})
+            with mock.patch.object(watcher, "repos", return_value=[]):
+                self.assertEqual(watcher.tick(None), [])
+            self.assertEqual(plan_github.SharedReads(state_dir).counters()["hits"], 4)
+
 
 class ApiTest(unittest.TestCase):
     def setUp(self):
@@ -235,6 +507,18 @@ class ApiTest(unittest.TestCase):
         self.assertEqual((counters["requests"], counters["not_modified"],
                           counters["hits"]), (2, 1, 1))
         self.assertEqual(api.reads.quota()["remaining"], 4999)
+
+    def test_deux_jetons_ne_partagent_pas_le_cache(self):
+        """N4 : la clé du cache porte la base et une empreinte du jeton."""
+        first = plan_github.Api(token="jeton-a", base=BASE, cache_dir=self.dir.name,
+                                ttl=60, clock=self.clock, opener=self.gh)
+        self.assertEqual(first.get("repos/o/r"), {"id": 1, "name": "r"})
+        self.assertEqual(self.gh.calls, ["repos/o/r"])
+        second = plan_github.Api(token="jeton-b", base=BASE, cache_dir=self.dir.name,
+                                 ttl=60, clock=self.clock, opener=self.gh)
+        self.assertEqual(second.get("repos/o/r"), {"id": 1, "name": "r"})
+        self.assertEqual(len(self.gh.calls), 2,
+                         "un autre jeton a été servi par le cache du premier")
 
     def test_quota_epuise_sert_le_cache_puis_attend_le_reset(self):
         api = self.api()
@@ -491,6 +775,68 @@ class DataclassCompatTest(unittest.TestCase):
         config = plan_github.Settings(projects={"a": "o/a"}, host="h")
         with self.assertRaises(dataclasses.FrozenInstanceError):
             config.ci_ttl = 1
+
+
+class JsonReportTest(unittest.TestCase):
+    """N2 #848 : la vue JSON de `ameesh ci status` dit les lectures partagées."""
+
+    def _run(self, cfg):
+        args = SimpleNamespace(json=True, id=7, limit=5)
+        out = io.StringIO()
+        with mock.patch.object(
+                ci, "status_of",
+                lambda db, item_id, limit=5: {"id": item_id, "runs": []}), \
+                mock.patch("ameesh.db.open_db", lambda cfg: None), \
+                contextlib.redirect_stdout(out):
+            code = ci.cmd_ci(cfg, args)
+        return code, json.loads(out.getvalue())
+
+    def test_json_porte_les_lectures_partagees(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reads = plan_github.SharedReads(directory)
+            reads.note(quota_headers(remaining="4997"), status=200)
+            reads.count("hits", 2)
+            reads.flush()
+            code, report = self._run(SimpleNamespace(state_dir=directory))
+            self.assertEqual(code, 0)
+            self.assertEqual(report["github_reads"]["counters"]["requests"], 1)
+            self.assertEqual(report["github_reads"]["counters"]["hits"], 2)
+            self.assertEqual(report["github_reads"]["quota"]["core"]["remaining"], 4997)
+
+    def test_json_sans_etat_ne_fabrique_pas_de_chemin(self):
+        code, report = self._run(SimpleNamespace(state_dir=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(report["github_reads"], {"quota": {}, "counters": {}})
+
+
+class RateLimitedPropagationTest(unittest.TestCase):
+    """N5 #848 : un quota épuisé n'est plus avalé par la découverte ni la garde."""
+
+    def setUp(self):
+        self.cfg = SimpleNamespace(host="h", state_dir="/state",
+                                   github={"projects": {"a": "o/a"}, "host": "h"})
+
+    def test_decouverte_ne_masque_pas_le_quota(self):
+        def api(path):
+            raise plan_github.GithubRateLimited(path, 1000)
+
+        watcher = ci.Watcher(self.cfg, api=api)
+        with self.assertRaises(plan_github.GithubRateLimited):
+            watcher.discovered_workflows("o/a")
+        self.assertEqual(watcher._workflows_cache, {},
+                         "un quota épuisé est gardé comme « pas de workflow »")
+
+    def test_garde_ne_masque_pas_le_quota(self):
+        logs: list = []
+        watcher = ci.Watcher(self.cfg, api=lambda path: {}, log=logs.append)
+
+        def guard_state(db, repo):
+            raise plan_github.GithubRateLimited(repo, 1000)
+
+        watcher._guard_state = guard_state
+        with self.assertRaises(plan_github.GithubRateLimited):
+            watcher._guard(None, "o/a")
+        self.assertEqual(logs, [], "le quota est journalisé comme échec de garde")
 
 
 if __name__ == "__main__":

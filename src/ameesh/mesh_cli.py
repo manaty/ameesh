@@ -20,7 +20,8 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work merged <id> --sha S [--note …]   merge done outside a PR: any open state → merged
-  agent-mesh work migration <id> [--number N | --release]   reserve the work item's migration number (L122)
+  agent-mesh work migration <id> [--number N | --release] [--skip-branch B]   reserve the work item's migration number (L122)
+  agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
@@ -58,6 +59,7 @@ from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
+from . import rebalance as rebalance_mod
 from . import fil, release, signing, storage, work
 from .config import Config
 from .db import Db
@@ -146,6 +148,14 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
     from . import exploitation
     exploitation.annotate(cfg, db, rows)
+    # #1070 : la pause budget, distincte du `state` « paused » d'un `blocked`
+    # hors budget (hôte non prêt, authentification) — un lecteur machine n'a
+    # pas à déchiffrer un `status_text` français. Posé ici plutôt que dans
+    # `exploitation.agent_view` (§8 prod) : `agent_rows` sert aussi
+    # `GET /api/v1/agents`, les deux chemins le portent sans toucher au prod.
+    from . import progress
+    for row in rows:
+        row["paused_on_budget"] = progress.paused_on_budget(row)
     return rows
 
 
@@ -216,6 +226,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
         # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
+        from . import progress
         from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
@@ -236,25 +247,48 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # regroupé par projet (tri stable : dans un projet, l'ordre de
         # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
         rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
-        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
+        # #1782 : la colonne HARNESS fait 10, pas 9 — la valeur étoilée d'un
+        # harnais vivant de 9 lettres (`(live or '?')[:9] + '*'`) en fait 10 ;
+        # à 9, la ligne entière se décalait d'un caractère.
+        print("%-20s %-12s %-10s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
             "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS", "BUDGET",
             "KEY", "SEEN"))
+        session_differs = False
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
                 status = "%s/%s" % (status, row["status_text"][:22])
+            if row.get("operator_paused") and row.get("status") not in ("stopped", "dead", "blocked"):
+                status = ("pause-next" if row.get("status") == "running" else "op-paused")
+            if progress.paused_on_budget(row):
+                # #1070 : le mot « pause » doit survivre à la troncature de la
+                # colonne — « blocked/bud » masquait les pauses budget (le
+                # bilan du bureau en comptait zéro).
+                status = "paused/%s" % row["status_text"][:22]
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
-            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+            # #1250 : la colonne dit le harnais de la session VIVANTE (L242b) ;
+            # une étoile signale qu'il diffère du harnais déclaré, et le pied
+            # explique la marque (la déclaration reste lisible dans `show`).
+            live = registry.live_harness(row)
+            declared = row.get("harness") or ""
+            starred = bool(live) and live != declared
+            if starred:
+                session_differs = True
+            print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
-                (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
+                ((live or "?")[:9] + ("*" if starred else "")),
+                (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
             ))
+        if session_differs:
+            print("* session harness: the live session runs under another "
+                  "harness than the declared one (L242b)")
         # Les lots sur la même vue (0018 point 5) : le compte par phase et ce
         # qui attend le plus, pour que `ameesh list` dise où en est le travail.
         if lots:
@@ -703,11 +737,13 @@ def _print_host_menage(menage: dict) -> None:
     if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
         ours = conteneurs.get("ameesh") or []
         autres = conteneurs.get("others") or []
+        total = conteneurs.get("others_total")
+        total = len(autres) if total is None else total
         print("  containers %d started by an ameesh turn%s; %d other(s) reported%s" % (
             len(ours),
             " (%s)" % "; ".join("%s: %s" % (c["path"], c.get("detail") or c["action"])
                                  for c in ours[:3]) if ours else "",
-            len(autres),
+            total,
             " (never removed: %s)" % "; ".join(c["command"] for c in autres[:5])
             if autres else ""))
     faits = menage.get("last_24h") or []
@@ -791,6 +827,12 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         print("harness  : %-9s host: %-12s status: %s%s" % (
             row.get("harness") or "?", row.get("host") or "—", row.get("status"),
             (" (%s)" % row["status_text"]) if row.get("status_text") else ""))
+        # L242b/#1250 : le harnais DÉCLARÉ ne dit pas sous lequel la session
+        # tourne (harnais emprunté) ; quand la session vivante en a un autre,
+        # la ligne le dit — c'est la lecture qui a produit le cas #1024.
+        live = registry.live_harness(row)
+        if live and live != (row.get("harness") or ""):
+            print("session harness: %s" % live)
         if row.get("stop_reason"):
             print("stopped  : %s" % row["stop_reason"])
         # L37 (0030) : mode explicite ; un agent externe exige un responsable
@@ -1208,7 +1250,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
         return
-    if args.work_command in (*_OWN_ACTOR, "set-app", "backfill-app") or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -1216,15 +1258,27 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
 
 
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
-              limit: int | None = None, threshold: float | None = None) -> list:
-    """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84)."""
-    from . import plan, stagnation
+              limit: int | None = None, threshold: float | None = None,
+              cfg=None, freeze: bool = False, repo: str | None = None,
+              target: str | None = None) -> list:
+    """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84).
+
+    `cfg` : le contexte de classe de revue (#1822), pour que la ligne d'un lot
+    léger attende la fusion, pas un verdict.
+
+    `freeze` ajoute à chaque ligne le gel effectif dérivé (#1756), en un seul
+    balayage de jalons : le composeur du paquet horaire lit ce champ au lieu
+    de JOINdre lui-même le dernier jalon `frozen`. `repo` (dépôt git local) et
+    `target` (défaut : la cible du lot, sinon `origin/main`) permettent en plus
+    de porter un avis sur un gel republié quand le delta du lot est
+    mécaniquement constant (#1905) ; sans `repo`, le champ est inchangé."""
+    from . import plan, plan_git, stagnation
     if threshold is None:
         threshold = stagnation.DEFAULT_THRESHOLD_S
 
     def lire(db):
         rows = work.list_items(db, state=state, assignee=assignee, limit=limit)
-        plan.annotate(db, rows, threshold=threshold)
+        plan.annotate(db, rows, threshold=threshold, cfg=cfg)
         # Les délais viennent d'un seul balayage, restreint aux lots
         # affichés (jamais une requête par ligne) ; le JSON les porte
         # aussi, pour la frise (L24). Le filtre porte sur les lignes
@@ -1234,15 +1288,25 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
                   work.delays(db, ids=[row["id"] for row in rows])}
         for row in rows:
             row["delays"] = delays.get(row["id"])
+        if freeze:
+            marks: dict = {}
+            for mark in storage.of(db).progress.lot_milestones(
+                    [row["id"] for row in rows]):
+                marks.setdefault(int(mark["work_item_id"]), []).append(mark)
+            for row in rows:
+                row["freeze"] = plan_git.freeze_candidate(
+                    marks.get(int(row["id"]), []), repo=repo,
+                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET)
         return rows
 
     # L61 : lectures regroupées — deux allers-retours en tout
     return db_mod.batched(db, lire)
 
 
-def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
+def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
+                target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import canon as canon_mod, plan
+    from . import canon as canon_mod, plan, stagnation
 
     def lire(db):
         item = work.get(db, lot_id)
@@ -1250,10 +1314,24 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
             return None
         item["events"] = work.events(db, lot_id)
         item["milestones"] = work.milestones(db, lot_id)
+        from . import plan_git
+        item["freeze"] = plan_git.freeze_candidate(
+            item["milestones"], repo=repo,
+            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET)
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
-        plan.annotate(db, [item])
+        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
+        # doute rend `sensitive` et le dit) — résolue avant l'annotation pour
+        # que #1822 la lise sans la relire.
+        from . import lot_class
+        try:
+            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
+                                    "why": "unreadable (%s)" % exc, "files": []}
+        plan.annotate(db, [item], cfg=cfg,
+                      review_class={lot_id: stagnation.class_value(item["review_class"])})
         # L96 : dates prévues (feuille de route)
         planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
         item["planned"] = {k: planned.get("planned_" + k)
@@ -1279,14 +1357,6 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
                                   if int(r["work_item_id"]) == lot_id), None)
         except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
             item["queue"] = None
-        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
-        # doute rend `sensitive` et le dit)
-        from . import lot_class
-        try:
-            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
-        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
-            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
-                                    "why": "unreadable (%s)" % exc, "files": []}
         # L157c: actual time by phase and merged diff size, once delivered
         from . import lot_measures
         item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
@@ -1393,11 +1463,21 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
-                              branch_target=args.target, force=args.force)
+                              branch_target=args.target, force=args.force,
+                              claim=args.claim, if_holder=args.if_holder)
             if out.get("queue_warning"):
                 print("lot #%d not assigned to %s (before: %s)" % (
                     out["item"]["id"], args.agent, out["previous"] or "nobody"))
+                if args.claim:
+                    # #1787 N2 : un claim qui retombe dans la file d'équipe
+                    # (#540) n'a pas pris : refus lisible, code 1.
+                    print("claim refused: %s" % out["queue_warning"], file=sys.stderr)
+                    return 1
                 print("warning: %s" % out["queue_warning"], file=sys.stderr)
+            elif out.get("noop"):
+                # #1787 N3 : le porteur qui re-claim son propre lot : no-op.
+                print("lot #%d already assigned to %s: claim is a no-op, nothing changed"
+                      % (out["item"]["id"], out["item"]["assignee"]))
             elif out["previous"] == out["item"]["assignee"]:
                 print("lot #%d: branch %s (assigned to %s)" % (
                     out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
@@ -1445,7 +1525,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
-                             threshold=stagnation.stale_after(args.stale_after))
+                             threshold=stagnation.stale_after(args.stale_after),
+                             cfg=cfg, freeze=getattr(args, "freeze", False),
+                             repo=getattr(args, "git_dir", None),
+                             target=getattr(args, "freeze_target", None))
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -1476,7 +1559,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "show":
             from . import estimates, lot_measures, resolutions
-            item = work_detail(cfg, db, args.id)
+            item = work_detail(cfg, db, args.id,
+                               repo=getattr(args, "git_dir", None),
+                               target=getattr(args, "freeze_target", None))
             if item is None:
                 print(USAGE_HINT % ("lot %s not found" % args.id), file=sys.stderr)
                 return 1
@@ -1490,7 +1575,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
-            if item.get("reviewer"):
+            if item.get("reviewer") == work.REVIEWER_NONE:
+                print("reviewer : — (verdict not required, #1979)")
+            elif item.get("reviewer"):
                 print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
@@ -1531,14 +1618,23 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("pr_ref"):
                 print("PR       : %s" % item["pr_ref"])
             if item.get("branch"):
+                # #1899 : `branch_head` est le dernier commit vu par le balayage,
+                # pas la tête réelle de la branche (elle peut avoir bougé depuis).
+                # Le dire comme un cache, avec son instant, évite les triages
+                # faux (qa-01, 16/10 : rebase cru fait, verdict demandé sur une
+                # tête périmée) ; le calcul de `waiting` n'est pas touché.
+                avance = ""
+                if item.get("branch_head"):
+                    vu = "tête en avance vue au dernier balayage : %s" % item["branch_head"][:12]
+                    if item.get("branch_head_ts"):
+                        vu += " le %s" % _fmt_moment(item["branch_head_ts"])
+                    avance = " (%s — vérifier à la forge)" % vu
                 print("branch   : %s → %s%s" % (
                     item["branch"], item.get("branch_target") or "repository default target",
-                    " (last commit seen ahead: %s)" % item["branch_head"][:12]
-                    if item.get("branch_head") else ""))
-            if item.get("migration"):
-                print("migration: %s reserved in %s (L122)" % (
-                    work.migration_layout(item, cfg).label(item["migration"]),
-                    item.get("migration_repo")))
+                    avance))
+            migration = work.migration_line(item, cfg)
+            if migration:
+                print("migration: %s" % migration)
             for mark in item["module_milestones"]:
                 print("module   : %s/%s · %s · by %s" % (
                     mark["module"], mark["kind"], mark["subject"], mark["actor"]))
@@ -1586,7 +1682,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "migration":
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
-                                          repo=args.repo, actor=args.actor, cfg=cfg)
+                                          repo=args.repo, actor=args.actor, cfg=cfg,
+                                          skip_branches=tuple(args.skip_branch or ()))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             elif item.get("migration") is None:
@@ -1610,16 +1707,41 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
             # sans aller-retour build/qa ; c'est la commande que l'alerte
             # `stale_lot` recommande à l'orchestrateur du projet.
-            item = work.designate_reviewer(cfg, db, args.id, args.agent, actor=args.actor)
-            print("lot #%d: reviewer %s (state %s, designated by %s)" % (
-                item["id"], item["reviewer"], item["state"],
-                args.actor or "the bound identity"))
+            # #1979 : `--remove` retire la désignation, `--no-verdict` marque
+            # « verdict non requis » (résolution de composition mécanique,
+            # canon §11 bis/#87) : l'attente passe à la fusion, sans rappel.
+            if args.agent and (args.remove or args.no_verdict):
+                print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
+                      "mutually exclusive", file=sys.stderr)
+                return 2
+            if not args.agent and not (args.remove or args.no_verdict):
+                print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
+                      file=sys.stderr)
+                return 2
+            if args.remove:
+                item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
+                print("lot #%d: reviewer designation removed (state %s, by %s)" % (
+                    item["id"], item["state"], args.actor or "the bound identity"))
+            elif args.no_verdict:
+                item = work.waive_review(cfg, db, args.id, actor=args.actor)
+                print("lot #%d: verdict not required (state %s, by %s)" % (
+                    item["id"], item["state"], args.actor or "the bound identity"))
+            else:
+                item = work.designate_reviewer(cfg, db, args.id, args.agent,
+                                               actor=args.actor)
+                print("lot #%d: reviewer %s (state %s, designated by %s)" % (
+                    item["id"], item["reviewer"], item["state"],
+                    args.actor or "the bound identity"))
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
-                               actor=args.actor)
+                               actor=args.actor, migration_landed=args.migration_landed,
+                               cfg=cfg)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
+            elif done["result"] == "landed":
+                print("lot #%d already %s: %s" % (
+                    args.id, done["item"]["state"], done["detail"]))
             else:
                 print("lot #%d → merged (commit %s, declared by %s)" % (
                     args.id, args.sha.strip().lower()[:12], args.actor))
@@ -1632,6 +1754,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import work_projects
             item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
             print("lot #%d: project %s" % (item["id"], item["app"]))
+            return 0
+        if args.work_command == "issue-ref":
+            if bool(args.ref) == bool(args.none):
+                raise work.WorkError("issue-ref: pass owner/repo#N, or --none to clear")
+            item = work.set_issue_ref(db, args.id, None if args.none else args.ref,
+                                      actor=args.actor, cfg=cfg)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            else:
+                print("lot #%d: issue_ref %s" % (item["id"], item.get("issue_ref") or "—"))
             return 0
         if args.work_command == "backfill-app":
             from . import work_projects
@@ -1824,12 +1956,14 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: interactive sessions (`ameesh attach`), also local; #408: lot_wake, on|off
 #: (rule 1, the runner's wake on an actionable lot), in the database; L76:
 #: resident (`on` | `off`) and resident_sleep, the resident process of the
-#: agent, local
+#: agent, local ; L81 : resident_reread_max (relu cumulé avant rotation)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode", "lot_wake", "resident", "resident_sleep")
+            "permission_mode", "lot_wake", "resident", "resident_sleep",
+            "resident_reread_max")
 #: L76: settings written in the local state of the agent's host only
-LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep")
+LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep",
+                  "resident_reread_max")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1921,7 +2055,7 @@ def cmd_set(cfg: Config, args) -> int:
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
-                      "resident=on|off resident_sleep=30m|0"
+                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1983,6 +2117,14 @@ def cmd_set(cfg: Config, args) -> int:
                 except ValueError:
                     print("invalid resident_sleep: %r (e.g. 30m, 1h, 0 = never asleep)"
                           % valeur, file=sys.stderr)
+                    return 2
+            if cle == "resident_reread_max" and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                except ValueError:
+                    print("invalid resident_reread_max: %r (e.g. 50M, 10M, "
+                          "0 = never rotate on the cumulative re-read)" % valeur,
+                          file=sys.stderr)
                     return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
@@ -2426,12 +2568,28 @@ def build_parser() -> argparse.ArgumentParser:
     pw_list.add_argument("--assignee", default=None)
     pw_list.add_argument("--limit", type=int, default=50)
     pw_list.add_argument("--json", action="store_true")
+    pw_list.add_argument("--freeze", action="store_true",
+                         help="#1756: add the effective freeze per row — the declared "
+                              "freeze, or the last favourable verdict's commit when it "
+                              "covers the head (origin, provenance, explicit causes)")
     pw_list.add_argument("--stale-after", default=None,
                          help="work item is stale with no activity for (default 6h, L29)")
+    pw_list.add_argument("--git-dir", default=None, metavar="D",
+                         help="#1905: local repository used to carry a verdict across a "
+                              "mechanically constant rebase (with --freeze)")
+    pw_list.add_argument("--freeze-target", default=None, metavar="REF",
+                         help="#1905: shared target of the rebase (default: the lot's "
+                              "target, else origin/main)")
     pw_list.set_defaults(func=cmd_work)
     pw_show = work_sub.add_parser("show")
     pw_show.add_argument("id", type=int)
     pw_show.add_argument("--json", action="store_true")
+    pw_show.add_argument("--git-dir", default=None, metavar="D",
+                         help="#1905: local repository used to carry a verdict across a "
+                              "mechanically constant rebase")
+    pw_show.add_argument("--freeze-target", default=None, metavar="REF",
+                         help="#1905: shared target of the rebase (default: the lot's "
+                              "target, else origin/main)")
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
@@ -2449,6 +2607,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "worktree and branches count (default: the clone declared in "
                              "radar.projects, else the current git repository; its origin "
                              "must be the lot's repository)")
+    pw_mig.add_argument("--skip-branch", action="append", default=None, metavar="BRANCH",
+                        help="also ignore this branch in the scan, in addition to the lot's own "
+                             "branch (repeatable): the integration branch of a package being "
+                             "composed, whose renumbered files must not count against the "
+                             "reservation (#1603)")
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
@@ -2473,8 +2636,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="#705: designate (or change) the reviewer of a lot already in qa, "
              "without a build/qa round trip")
     pw_reviewer.add_argument("id", type=int)
-    pw_reviewer.add_argument("agent", metavar="AGENT",
+    pw_reviewer.add_argument("agent", nargs="?", metavar="AGENT",
                              help="a registry agent, or human:<id>; never the lot's assignee")
+    pw_reviewer.add_argument("--remove", action="store_true",
+                             help="#1979: remove the designation (the review goes back to "
+                                  "« verdict from a reviewer (none designated) »)")
+    pw_reviewer.add_argument("--no-verdict", dest="no_verdict", action="store_true",
+                             help="#1979: mark « verdict not required » (mechanical composition "
+                                  "resolution, canon §11 bis/#87): the lot waits for its merge "
+                                  "and no reminder goes to a reviewer")
     pw_reviewer.add_argument("--actor", default="",
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
@@ -2484,6 +2654,10 @@ def build_parser() -> argparse.ArgumentParser:
                        "on the target): any open state → merged, merged milestone with the commit")
     pw_merged.add_argument("id", type=int)
     pw_merged.add_argument("--sha", required=True, help="the merge commit")
+    pw_merged.add_argument("--migration-landed", type=int, default=None, metavar="N",
+                           help="the migration number that actually landed (L122/#1567), when "
+                                "the landing renumbered the reservation; recorded with the "
+                                "merge, or corrected on an already merged lot")
     pw_merged.add_argument("--note", default="")
     pw_merged.add_argument("--actor", default="",
                            help="default: the session's bound identity (AGENT_MAIL_NAME)")
@@ -2498,6 +2672,12 @@ def build_parser() -> argparse.ArgumentParser:
     pw_assign.add_argument("--externe", action="store_true",
                            help="force assignment to an external agent that has a "
                                 "human responsible")
+    pw_assign.add_argument("--claim", action="store_true",
+                           help="assign only if the work item has no assignee (atomic "
+                                "claim); refused, naming its holder, if it is already taken")
+    pw_assign.add_argument("--if-holder", default=None, metavar="AGENT",
+                           help="#2016: refuse unless the current assignee is still AGENT "
+                                "(the holder read when the alert was written)")
     pw_assign.add_argument("--branch", default=None,
                            help="work item branch (L118); allowed on a work item already assigned "
                                 "to this agent")
@@ -2536,6 +2716,17 @@ def build_parser() -> argparse.ArgumentParser:
     pw_app.add_argument("--actor", default="",
                         help="human, orchestrator or design agent; default: bound session")
     pw_app.set_defaults(func=cmd_work)
+    pw_iref = work_sub.add_parser(
+        "issue-ref", help="correct a lot's issue reference (owner/repo#N), with a journal entry")
+    pw_iref.add_argument("id", type=int)
+    pw_iref.add_argument("ref", nargs="?", default=None,
+                         help="the new reference, owner/repo#N (default: keep, use --none to clear)")
+    pw_iref.add_argument("--none", action="store_true",
+                         help="clear the issue reference (the lot stays where it is)")
+    pw_iref.add_argument("--json", action="store_true")
+    pw_iref.add_argument("--actor", default="",
+                         help="human, orchestrator or design agent; default: bound session")
+    pw_iref.set_defaults(func=cmd_work)
     pw_backfill = work_sub.add_parser("backfill-app", help="fill uniquely inferred projects of open lots")
     pw_backfill.add_argument("--dry-run", action="store_true")
     pw_backfill.add_argument("--actor", default="")
@@ -2912,6 +3103,9 @@ def cmd_accounts(cfg: Config, args) -> int:
         for row in rows:
             for cle in ("_gauges", "_limits", "_ceilings"):
                 row.pop(cle, None)
+        # #1580 point 2 : la marge des forfaits et les agents déplaçables
+        # (lecture seule : aucune bascule n'est faite ici)
+        prop = rebalance_mod.proposal(cfg, db, book)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
             if declares else []
         if getattr(args, "json", False):
@@ -2921,10 +3115,11 @@ def cmd_accounts(cfg: Config, args) -> int:
                 sante = []  # base sans la migration 0060
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
                               "accounts": rows, "switches": bascules,
-                              "credentials": sante},
+                              "credentials": sante, "proposal": prop.as_dict()},
                              ensure_ascii=False, indent=2, default=str))
             return 0
         print(accounts_mod.format_rows(rows))
+        print(prop.text())
         if bascules:
             print()
             print("latest switches:")

@@ -3,9 +3,9 @@
 
 Chaque fichier est immuable : son empreinte SHA-256 est enregistrée dans
 `schema_migrations`. Modifier une migration déjà appliquée est une erreur, pas
-une mise à jour silencieuse. L'application d'un fichier est atomique
-(`psql -1` / transaction psycopg) et protégée par un verrou consultatif, pour
-que deux exécuteurs qui démarrent en même temps ne se marchent pas dessus.
+une mise à jour silencieuse. Une passe entière est atomique et protégée par
+un verrou consultatif de la base, acquis avant la lecture de l'inventaire.
+Le verrou et les écritures partagent la même transaction et connexion.
 """
 from __future__ import annotations
 
@@ -19,6 +19,21 @@ from .db import DbError, PsqlDriver, PsycopgDriver, quote_ident
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9._-]+)\.sql$")
 _LOCK = "ameesh_migrations"
+#: Attente maximale d'un verrou de table par une migration (L835) : la
+#: transaction lève le statement_timeout (une migration peut être longue),
+#: mais une migration qui attend ACCESS EXCLUSIVE fait la queue devant tous
+#: les lecteurs et écrivains de la table — sans borne, elle les bloque
+#: indéfiniment. Passé ce délai, la transaction est annulée : la migration
+#: échoue, reste en attente, et rien n'est enregistré (le DDL est
+#: transactionnel). Une migration qui doit attendre plus pose son propre
+#: `set local lock_timeout` : elle s'exécute après, son réglage l'emporte.
+#:
+#: Le verrou consultatif qui sérialise les migrations, lui, n'est pas borné
+#: (posé avant ce réglage) : deux `migrate` concurrents s'attendent au lieu de
+#: s'échouer l'un l'autre. Cette attente dure ce que dure la migration qui
+#: tient le verrou — une migration peut être longue (statement_timeout levé) ;
+#: c'est voulu, LOCK_TIMEOUT ne la borne pas.
+LOCK_TIMEOUT = "5s"
 
 BOOTSTRAP = """
 create table if not exists schema_migrations (
@@ -190,17 +205,34 @@ def origin_repo(checkout: str) -> str | None:
     return github_repo(_git(checkout, "remote", "get-url", "origin"))
 
 
+#: branches de tronc qu'un scan ne peut jamais ignorer (#1603), en plus de
+#: celle que désigne `origin/HEAD`
+TRUNK_BRANCHES = ("main", "master", "develop")
+
+
+def trunk_branches(checkout: str) -> set[str]:
+    """Les branches de tronc d'un clone : `TRUNK_BRANCHES` et la branche par
+    défaut de son `origin` (`refs/remotes/origin/HEAD`) quand elle est connue."""
+    default = _git(checkout, "symbolic-ref", "-q", "refs/remotes/origin/HEAD").strip()
+    names = set(TRUNK_BRANCHES)
+    if default.startswith("refs/remotes/origin/"):
+        names.add(default[len("refs/remotes/origin/"):])
+    return names
+
+
 def toplevel(path: str) -> str:
     return _git(path, "rev-parse", "--show-toplevel").strip()
 
 
 def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = None,
-                 package: str = MIGRATIONS_DIR) -> dict[int, list[str]]:
+                 also_skip: tuple[str, ...] = (), package: str = MIGRATIONS_DIR) -> dict[int, list[str]]:
     """Numéro → endroits où il existe dans le dépôt : l'arbre de travail et
     TOUTES les branches locales et distantes du clone (une PR ouverte compte,
     même sans réservation) ; pour ameesh, le paquet installé aussi. Les refs
-    de la branche `skip_branch` (celle du lot) ne comptent pas, ni l'arbre de
-    travail s'il est sur elle. Rien n'est récupéré (pas de fetch)."""
+    de la branche `skip_branch` (celle du lot) et de `also_skip` (les branches
+    à ignorer explicitement, p. ex. la branche d'intégration d'un paquet en
+    composition, #1603) ne comptent pas, ni l'arbre de travail s'il est sur
+    l'une d'elles. Rien n'est récupéré (pas de fetch)."""
     found: dict[int, list[str]] = {}
 
     def add(names, where):
@@ -212,7 +244,8 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
 
     if layout.repo == AMEESH_REPO and os.path.isdir(package):
         add(os.listdir(package), "package")
-    skip = {"refs/heads/" + skip_branch} if skip_branch else set()
+    names = {name for name in (skip_branch, *also_skip) if name}
+    skip = {"refs/heads/" + name for name in names}
     head = _git(checkout, "symbolic-ref", "-q", "HEAD").strip()
     directory = os.path.join(checkout, layout.directory)
     if os.path.isdir(directory) and head not in skip:
@@ -220,8 +253,8 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     refs = _git(checkout, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
     for ref in refs.split():
         if ref.endswith("/HEAD") or ref in skip or (
-                skip_branch and ref.startswith("refs/remotes/")
-                and ref.split("/", 3)[-1] == skip_branch):
+                names and ref.startswith("refs/remotes/")
+                and ref.split("/", 3)[-1] in names):
             continue
         add(_git(checkout, "ls-tree", "--name-only", ref, layout.directory + "/").split(),
             ref.split("/", 2)[-1])
@@ -229,7 +262,7 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
 
 
 def applied(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
-    db.script(BOOTSTRAP)
+    db.execute(BOOTSTRAP)
     rows = db.query("SELECT version, checksum, name FROM schema_migrations ORDER BY version")
     return {int(row["version"]): row["checksum"] for row in rows}
 
@@ -249,32 +282,44 @@ def pending(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR) -> 
     return out
 
 
-def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR, log=None) -> list[Migration]:
-    """Applique les migrations manquantes ; renvoie celles qui viennent de l'être."""
-    if db.cfg.schema != "public":
-        # `SET search_path` accepte un schéma inexistant : on le crée ici,
-        # explicitement, plutôt que d'échouer sur un « no schema has been
-        # selected to create in ».
-        db.execute("CREATE SCHEMA IF NOT EXISTS %s" % quote_ident(db.cfg.schema))
-    todo = pending(db, directory)
-    for migration in todo:
-        script = (
-            # Une migration peut être longue : on lève le délai le temps de la
-            # transaction (SET LOCAL retombe au commit), sinon le
-            # statement_timeout par défaut la couperait.
-            "SET LOCAL statement_timeout = 0;\n"
-            "select pg_advisory_xact_lock(hashtext('%s'));\n%s\n"
-            "insert into schema_migrations (version, name, checksum) values (%d, %s, %s);\n"
-            % (
-                _LOCK,
-                migration.sql,
-                migration.version,
-                _lit(migration.name),
-                _lit(migration.checksum),
-            )
-        )
-        db.script(script)
-        if log:
+class NonAdditiveMigration(DbError):
+    """The elected release worker found a migration outside its guard."""
+
+
+def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
+            log=None, *, additive_only: bool = False) -> list[Migration]:
+    """Elect one database worker, re-read inventory and commit the whole pass.
+
+    PostgreSQL scopes the existing lock key to the actual database, regardless
+    of schema, host or DSN alias. Retaining this key also excludes older workers
+    while they execute their individually locked migrations. Those older
+    workers must still be upgraded before relying on inventory reconciliation.
+    A separate lock connection could disappear while its writer continued;
+    this transaction owns both the lock and every migration write instead.
+    """
+    with db.transaction() as tx:
+        # The configured statement timeout bounds election. Only the elected
+        # worker lifts it for migration SQL, as the previous implementation did.
+        tx.query("SELECT pg_advisory_xact_lock(hashtext(%s))", (_LOCK,))
+        tx.execute("SET LOCAL statement_timeout = 0")
+        # ... puis on borne l'attente des verrous de table (L835) : sans cela
+        # une migration qui attend ACCESS EXCLUSIVE bloque derrière elle tous
+        # les lecteurs et écrivains de la table. Posé après le verrou
+        # consultatif : celui-ci doit pouvoir attendre son tour aussi longtemps
+        # que la migration qui le tient (LOCK_TIMEOUT ne le borne donc pas).
+        tx.execute("SET LOCAL lock_timeout = '%s'" % LOCK_TIMEOUT)
+        if db.cfg.schema != "public":
+            tx.execute("CREATE SCHEMA IF NOT EXISTS %s" % quote_ident(db.cfg.schema))
+        todo = pending(tx, directory)
+        if additive_only and any(non_additive(migration) for migration in todo):
+            raise NonAdditiveMigration("nothing applied (--additive-only)")
+        for migration in todo:
+            tx.script(migration.sql)
+            tx.execute("INSERT INTO schema_migrations (version, name, checksum) VALUES (%s,%s,%s)",
+                       (migration.version, migration.name, migration.checksum))
+    # Neither a failed SQL statement nor an uncertain COMMIT publishes success.
+    if log:
+        for migration in todo:
             log("%s applied" % migration.label)
     return todo
 

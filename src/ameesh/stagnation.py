@@ -10,9 +10,11 @@ jalon, action liée, message lié (`agent_mailbox.work_item_id`). Un lot
 (`closed`, L29) sans activité depuis un seuil (défaut 6 h ; `--stale-after`,
 `AMEESH_STALE_AFTER`).
 
-L368: a future planned start or an explicit open commitment/plan dependency
-on another open lot defers stagnation; `planned_waits` resolves those sources
-for all three views, without interpreting notes or changing activity.
+L368: a future planned start, an explicit open commitment/plan dependency on
+another open lot, or a dated external hold (`gate:<name>` in a commitment's
+`depends_on`, ended by its due day) defers stagnation; `planned_waits` resolves
+those sources for all three views, without interpreting notes or changing
+activity.
 
 **Attente** (`waiting`) : `{what, who, label}`, déduite de l'état, des jalons
 (L10, lus par `progress._jalons_de_lot`) et des actions, jamais inventée
@@ -84,10 +86,14 @@ def stale_after(text: str | None = None, env: dict | None = None) -> float:
 # --------------------------------------------------------------------------
 
 def last_activity(item: dict, events: Iterable[dict] = (), milestones: Iterable[dict] = (),
-                  actions: Iterable[dict] = (), messages_ts: float | None = None
-                  ) -> float | None:
-    """Dernière activité : ligne du lot, transition ou note, jalon, action, message."""
-    stamps = [item.get("updated_ts"), item.get("created_ts"), messages_ts]
+                  actions: Iterable[dict] = (), messages_ts: float | None = None,
+                  events_ts: float | None = None) -> float | None:
+    """Dernière activité : ligne du lot, transition ou note, jalon, action, message.
+
+    `events_ts` porte le dernier instant du journal quand `events` ne contient
+    que les transitions (`lot_transitions`) : une note récente ne doit pas
+    disparaître de l'activité (#1647)."""
+    stamps = [item.get("updated_ts"), item.get("created_ts"), messages_ts, events_ts]
     stamps += [e.get("created_ts") for e in events]
     stamps += [m.get("at_ts") for m in milestones]
     stamps += [a.get("updated_ts") or a.get("created_ts") for a in actions]
@@ -134,12 +140,30 @@ def _waiting(what: str, who) -> dict:
     return {"what": what, "who": who, "label": with_who % who if who else without}
 
 
+def _merge_wait(actions: list[dict], responsible, assignee) -> dict:
+    """L'attente d'une fusion : la dernière action `git-merge` tranche (L26)."""
+    merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
+    last = merges[-1] if merges else None
+    if last is not None:
+        if last.get("state") == "approved":
+            return _waiting("merge", last.get("proposed_by"))
+        if last.get("state") == "failed":
+            return _waiting("fix", assignee)
+    return _waiting("merge", responsible)
+
+
 def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
-            responsible: str | None = None) -> dict | None:
+            responsible: str | None = None,
+            review_class: str | None = None) -> dict | None:
     """Ce qu'attend un lot ouvert, et de qui : `{what, who, label}` (voir le module).
 
     `jalons` : la forme de `progress._jalons_de_lot` ; `responsible` : le
-    responsable humain de la fiche WorkPackage du lot, s'il en a une."""
+    responsable humain de la fiche WorkPackage du lot, s'il en a une.
+    `review_class` : la classe de revue du lot (`lot_class.LIGHT`, ...) quand
+    l'appelant l'a résolue ; la relecture d'un lot **léger** suit la fusion
+    (§2), donc un lot léger sans verdict courant attend la fusion, pas un
+    verdict (#1822). `None` (classe inconnue) garde l'attente prudente d'un
+    verdict, sans deviner aucune classe."""
     state = item.get("state") or ""
     assignee = item.get("assignee") or None
     if state in DONE_STATES:
@@ -166,18 +190,60 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         return _waiting("start", assignee)
     if state == "build":
         return _waiting("build", assignee)
-    # qa : en revue
-    if jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current"):
-        merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
-        last = merges[-1] if merges else None
-        if last is None or last.get("state") == "cancelled":
-            return _waiting("merge", responsible)
-        if last.get("state") == "approved":
-            return _waiting("merge", last.get("proposed_by"))
-        if last.get("state") == "failed":
-            return _waiting("fix", assignee)
-        return _waiting("merge", responsible)
+    # qa : en revue — approuvé par un verdict `ok` courant, ou dispensé de
+    # re-verdict par le pilote (#1979 : résolution de composition mécanique,
+    # canon §11 bis/#87), ou lot léger dont la relecture suit la fusion
+    # (#1822, §2) ; dans tous les cas la suite est la fusion, et aucun rappel
+    # ne part à un relecteur.
+    if (jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current")) \
+            or jalons.get("verdict_required", True) is False:
+        return _merge_wait(actions, responsible, assignee)
+    from . import lot_class  # import tardif : lot_class lit work et canon
+    if review_class == lot_class.LIGHT:
+        # §2 : la relecture d'un lot léger suit la fusion ; aucun verdict
+        # n'est dû avant, même si un relecteur est désigné (#1822).
+        return _merge_wait(actions, responsible, assignee)
     return _waiting("verdict", jalons.get("reviewer"))
+
+
+def class_value(reading: dict | None) -> str | None:
+    """La classe d'une lecture `lot_class.of_lot`, ou None au moindre doute.
+
+    Un doute (dépôt, gel ou politique illisibles) ne devine aucune classe :
+    l'appelant garde l'attente prudente (#1822)."""
+    if not isinstance(reading, dict) or reading.get("doubt"):
+        return None
+    return str(reading.get("class") or "") or None
+
+
+def review_class_of(db, row: dict, *, cfg=None, memo: dict | None = None,
+                    milestones: list | None = None) -> str | None:
+    """La classe de revue du lot `row`, lue une fois par passage (`memo`).
+
+    Les jalons préchargés et le canon partagé dans `memo` évitent une lecture
+    unitaire des jalons et un chargement du canon pour chaque lot.
+    `lot_class.of_lot` ne lève jamais ; la lecture reste donc sûre dans une vue
+    groupée, et tout doute rend None (attente prudente, #1822)."""
+    from . import lot_class, work
+
+    def read_canons():
+        if memo is None:
+            return work.configured_canons(cfg)
+        if "canons" not in memo:
+            memo["canons"] = work.configured_canons(cfg)
+        return memo["canons"]
+
+    rid = int(row["id"])
+    if memo is not None and rid in memo:
+        return memo[rid]
+    try:
+        value = class_value(lot_class.of_lot(db, rid, cfg=cfg, item=row,
+                                            milestones=milestones, canons=read_canons))
+    except Exception:  # noqa: BLE001 - une vue ne tombe pas sur la classe
+        value = None
+    if memo is not None:
+        memo[rid] = value
+    return value
 
 
 #: attentes dont le `who` est un agent qui doit travailler (L36)
@@ -269,31 +335,50 @@ def waiting_for(item: dict, events: Iterable[dict], milestones: Iterable[dict],
 # lecture groupée (alerte stale_lot, work list, progress)
 # --------------------------------------------------------------------------
 
-def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict]:
+def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict, dict]:
     events: dict = {}
     milestones: dict = {}
     actions: dict = {}
     messages: dict = {}
+    last_events: dict = {}
     if ids:
-        for ev in st.progress.lot_events(ids):
+        # #1647 : les vues groupées ne lisent que les transitions ; le texte
+        # des notes (des mégaoctets) n'est ni transféré ni recopié, et le
+        # dernier instant du journal vient d'une agrégation.
+        for ev in st.progress.lot_transitions(ids):
             events.setdefault(int(ev["work_item_id"]), []).append(ev)
+        for row in st.progress.lot_event_last(ids):
+            last_events[int(row["work_item_id"])] = float(row["last_ts"])
         for ms in st.progress.lot_milestones(ids):
             milestones.setdefault(int(ms["work_item_id"]), []).append(ms)
         for act in st.progress.lot_actions(ids):
             actions.setdefault(int(act["work_item"]), []).append(act)
         for row in st.progress.lot_messages(ids):
             messages[int(row["work_item_id"])] = row.get("last_ts")
-    return events, milestones, actions, messages
+    return events, milestones, actions, messages, last_events
 
 
 def describe(db, rows: list[dict], *, now: float | None = None,
              threshold: float = DEFAULT_THRESHOLD_S,
-             open_items: list[dict] | None = None) -> dict[int, dict]:
+             open_items: list[dict] | None = None,
+             cfg=None, review_class: dict | None = None) -> dict[int, dict]:
     """Pour chaque lot (lignes de `work_items`) : `{waiting, waiting_for,
     last_activity_ts, project, stale}`. `project` (#705, lu par
     `projects.lot_project`) : le projet du lot, dont l'orchestrateur est
     prévenu quand un lot en qa n'a pas de relecteur désigné. Une lecture
-    groupée, aucune requête par lot."""
+    groupée, aucune requête par lot.
+
+    `cfg` et `review_class` (#1822) : le contexte de résolution de la classe de
+    revue. La classe n'est lue — une fois par passage — que pour les lots dont
+    l'attente serait un verdict : un lot léger attend la fusion, pas un verdict
+    (§2). `review_class` porte les classes déjà résolues par l'appelant
+    (`{id: classe ou None}`) ; une classe absente ou douteuse garde l'attente
+    prudente d'un verdict, sans deviner.
+
+    `unreadable` (#1107) : un lot dont la ligne ne se lit pas (horodatage
+    textuel…) est isolé — l'erreur y est rendue, ses autres champs restent
+    vides (aucun instant ni attente inventés) et les autres lots sont décrits
+    normalement."""
     from . import progress  # import tardif : progress importe ce module
     from . import projects
 
@@ -304,43 +389,76 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     agents = st.progress.agents(None)
     states, externals = availability_of(agents)
     agent_projects = {r["name"]: projects.agent_project(r) for r in agents}
-    events, milestones, actions, messages = _grouped(st, ids)
+    events, milestones, actions, messages, last_events = _grouped(st, ids)
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
     holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items,
                               dependencies=[e for edges in dependencies.values() for e in edges])
     out: dict[int, dict] = {}
+    classes: dict = {}
+    known = review_class or {}
     for row in rows:
         rid = int(row["id"])
         acts = actions.get(rid, [])
         package = packages.get(row.get("package_id")) or {}
-        jalons = progress._jalons_de_lot(row, events.get(rid, []), acts, milestones.get(rid))
-        detail = with_availability(
-            waiting(row, jalons, acts,
-                    responsible=package.get("responsible")),
-            states, externals)
-        last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
-                             messages.get(rid))
+        try:
+            jalons = progress._jalons_de_lot(row, events.get(rid, []), acts,
+                                             milestones.get(rid))
+            detail = waiting(row, jalons, acts,
+                             responsible=package.get("responsible"))
+            # #1822 : la classe n'est lue que pour un lot qui attendrait un
+            # verdict ; déjà résolue par l'appelant, elle ne l'est pas relue.
+            if detail is not None and detail.get("what") == "verdict":
+                cls = known[rid] if rid in known else review_class_of(
+                    db, row, cfg=cfg, memo=classes, milestones=milestones.get(rid, []))
+                if cls:
+                    detail = waiting(row, jalons, acts,
+                                     responsible=package.get("responsible"),
+                                     review_class=cls)
+            detail = with_availability(detail, states, externals)
+            last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
+                                 messages.get(rid), events_ts=last_events.get(rid))
+            project = projects.lot_project(row, agent_projects,
+                                           package_team=package.get("team"))
+        except Exception as exc:  # noqa: BLE001 — un lot ne fait pas tomber la lecture
+            # #1107 : une ligne illisible (horodatage textuel…) est isolée ;
+            # aucun instant ni attente inventés, le consommateur la signale
+            out[rid] = {"waiting": None, "waiting_for": None, "last_activity_ts": None,
+                        "project": None, "planned_wait": holds.get(rid),
+                        "dependencies": dependencies.get(rid, []), "stale": None,
+                        "unreadable": unreadable(exc)}
+            continue
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
-                    "project": projects.lot_project(row, agent_projects,
-                                                    package_team=package.get("team")),
+                    "project": project,
                     "planned_wait": holds.get(rid),
                     "dependencies": dependencies.get(rid, []),
                     "stale": None if rid in holds else
-                             stale(row.get("state") or "", last, now, threshold)}
+                             stale(row.get("state") or "", last, now, threshold),
+                    "unreadable": None}
     return out
 
 
+def unreadable(exc: BaseException) -> str:
+    """L'erreur d'un lot illisible, telle que l'alerte `lot_unreadable` la cite."""
+    return "%s: %s" % (type(exc).__name__, exc)
+
+
 def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
-                  now: float | None = None, limit: int = 500) -> list[dict]:
+                  now: float | None = None, limit: int = 500,
+                  cfg=None, review_class: dict | None = None) -> list[dict]:
     """Les lots ouverts inactifs depuis au moins `threshold_s` secondes.
 
     Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
     `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26), `waiting`
     (`{what, who, label}`, L29) et `project` (#705 : le projet du lot, dont
-    l'orchestrateur est prévenu quand aucun relecteur n'est désigné)."""
+    l'orchestrateur est prévenu quand aucun relecteur n'est désigné).
+    `cfg`/`review_class` : le contexte de classe de revue (#1822), transmis à
+    `describe`.
+
+    `unreadable` (#1107) : l'erreur d'un lot illisible, rendu sans instant
+    ni inactivité (`last_activity_ts`, `idle_s` à None) ; None sinon."""
     from . import sous_utilisation
     now = time.time() if now is None else float(now)
     st = storage.of(db)
@@ -349,15 +467,27 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     # Read all open lots before filtering: deferred lots must not occupy the
     # render limit and hide an actionable stale lot or a dependency beyond it.
     open_items = st.operations.open_lots_activity(None)
-    rows = [r for r in open_items
-            if r.get("last_activity_ts") is not None
-            and now - float(r["last_activity_ts"]) >= float(threshold_s)
-            and not sous_utilisation.is_backlog_item(r)]
-    described = describe(db, rows, now=now, threshold=threshold_s, open_items=open_items)
+    rows = []
     out = []
+    for r in open_items:
+        if r.get("last_activity_ts") is None or sous_utilisation.is_backlog_item(r):
+            continue
+        try:
+            idle = now - float(r["last_activity_ts"])
+        except (TypeError, ValueError) as exc:
+            # #1107 : instant illisible, le lot est signalé sans durée inventée
+            out.append(_unreadable_line(r, unreadable(exc)))
+            continue
+        if idle >= float(threshold_s):
+            rows.append(r)
+    described = describe(db, rows, now=now, threshold=threshold_s, open_items=open_items,
+                         cfg=cfg, review_class=review_class)
     for row in rows:
         lot = int(row["id"])
         info = described[lot]
+        if info["unreadable"]:
+            out.append(_unreadable_line(row, info["unreadable"]))
+            continue
         if info["stale"] is None:
             continue
         out.append({
@@ -370,5 +500,15 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "waiting_for": info["waiting_for"],
             "waiting": info["waiting"],
             "project": info.get("project"),
+            "unreadable": None,
         })
     return out[:max(0, int(limit))]
+
+
+def _unreadable_line(row: dict, error: str) -> dict:
+    """Une ligne de `stagnant_lots` pour un lot illisible (#1107) : signalée,
+    sans instant ni inactivité inventés."""
+    return {"id": int(row["id"]), "title": row.get("title"), "state": row.get("state"),
+            "assignee": row.get("assignee") or None, "last_activity_ts": None,
+            "idle_s": None, "waiting_for": None, "waiting": None, "project": None,
+            "unreadable": error}

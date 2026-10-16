@@ -71,6 +71,7 @@ from typing import Iterable, Iterator, Protocol, Sequence
 
 from . import storage
 from .config import Config
+from .storage.interface import ThreadCensus
 
 DEFAULT_PROJECT = "default"
 #: nom de fichier du fil d'un projet (un lot assaini ne commence jamais par `_`)
@@ -211,7 +212,8 @@ class Entry:
 class Transport(Protocol):
     name: str
 
-    def post(self, thread: ThreadRef, entry: Entry) -> str: ...
+    def post(self, thread: ThreadRef, entry: Entry, *,
+             with_census: bool = True) -> str: ...
 
     def read(self, thread: ThreadRef, since: str | None = None) -> list[Entry]: ...
 
@@ -565,12 +567,31 @@ def parse(data: bytes, *, base: int = 0, key: str = "") -> list[Entry]:
     return entries
 
 
-def _repair(data: bytes) -> bytes:
+def _latest_entry(data: bytes, found: list, base: int, key: str) -> Entry | None:
+    """L'entrée la plus récente d'une marche déjà faite (`_walk`) : la plus
+    grande date, la dernière écrite à égalité de date, comme l'index la cite.
+
+    Seule cette entrée est relue (`parse` de sa tranche), là où le census
+    complet les décode toutes : l'appelant qui vient de marcher le fil pour le
+    réparer en profite (L361c)."""
+    if not found:
+        return None
+    at = max(reversed(range(len(found))),
+             key=lambda i: _parse_iso(found[i][1].group(1).decode("utf-8", "replace")))
+    start = found[at][0]
+    end = found[at + 1][0] if at + 1 < len(found) else len(data)
+    entries = parse(data[start:end], base=base + start, key=key)
+    return entries[0] if entries else None
+
+
+def _repair(data: bytes, fence: bytes | None) -> bytes:
     """Ce qu'il faut écrire avant une nouvelle entrée si la précédente a été
     interrompue (arrêt brutal en pleine écriture) : finir la ligne, fermer le
     bloc de code ou le commentaire resté ouvert. Sans cela, un lecteur
-    Markdown avalerait la suite du fil dans le bloc ouvert."""
-    fence = _walk(data)[1]
+    Markdown avalerait la suite du fil dans le bloc ouvert.
+
+    `fence` : la barrière restée ouverte (`_walk`), pour ne pas refaire la
+    marche du fil quand l'appelant l'a déjà faite."""
     tail = data[data.rfind(b"\n") + 1:]
     newline = b"\n" if tail else b""
     if fence is not None:
@@ -640,6 +661,23 @@ class FileTransport:
 
     def __init__(self, root: str):
         self.root = os.path.abspath(os.path.expanduser(root))
+        #: census laissé par le dernier `post` de cette instance, par fil :
+        #: (périphérique, inode, taille, mtime_ns, ctime_ns, entrées, dernière
+        #: ligne, fin logique). `census_after_post` ne le rend que si le fichier
+        #: est resté exactement celui-là.
+        self._posted: dict[str, tuple] = {}
+
+    #: #1764 N5 : borne du cache — il ne sert qu'au `post` qui précède
+    #: l'indexation, un processus de longue vie ne garde pas un census par fil.
+    _POSTED_MAX = 256
+
+    def _remember(self, key: str, census: tuple) -> None:
+        """Retient le census d'un fil, en oubliant le plus ancien au-delà de
+        `_POSTED_MAX` (#1764 N5 : `_posted` ne grandit pas sans borne)."""
+        self._posted.pop(key, None)     # un fil reposté passe en dernier
+        self._posted[key] = census
+        while len(self._posted) > self._POSTED_MAX:
+            self._posted.pop(next(iter(self._posted)))
 
     def location(self, thread: ThreadRef) -> str:
         """Chemin du fil, pour l'affichage et l'index.
@@ -749,18 +787,35 @@ class FileTransport:
             return False
         return True
 
-    def post(self, thread: ThreadRef, entry: Entry) -> str:
+    def post(self, thread: ThreadRef, entry: Entry, *,
+             with_census: bool = True) -> str:
+        """Écrit l'entrée à la fin du fil et retient son census (L361c).
+
+        La marche faite pour réparer une écriture interrompue sert aussi à
+        déduire le census du fil APRÈS l'ajout (`census_after_post`) : sur un
+        exécuteur médié, l'indexation n'a plus à relire tout le fil. Le census
+        n'est retenu que si le fil était neuf ou bien formé (rien à réparer) ;
+        tout doute (réparation, autre écrivain, expiration) le fait écarter.
+        `with_census=False` (#1764 N3) : l'indexation locale ne demande jamais
+        ce census — la marche de réparation reste faite, mais la plus récente
+        entrée n'est pas relue pour un census que personne ne demandera.
+        """
         data = format_entry(entry).encode("utf-8")
         fd, _ = self._locked(thread, fcntl.LOCK_EX, write=True)
+        census = None
+        self._posted.pop(thread.key, None)  # un post raté n'a pas de census
         try:
             size = os.fstat(fd).st_size
             shift = 0
+            found: list = []
+            current = b""
             if size == 0:
                 prefix = header(thread).encode("utf-8")
             else:
                 # une écriture précédente interrompue (arrêt brutal) : la clore
                 current = _pread_all(fd, size)
-                prefix = _repair(current)
+                found, fence = _walk(current)
+                prefix = _repair(current, fence)
                 shift = _expiry_of(current[:HEADER_SCAN])[0]
             try:
                 _write_all(fd, prefix + data)
@@ -772,10 +827,43 @@ class FileTransport:
                 except OSError:
                     pass
                 raise
+            if with_census and (size == 0 or not prefix):
+                try:
+                    census = self._census_after(thread, data, found, current,
+                                                size + len(prefix), shift, os.fstat(fd))
+                except Exception:
+                    # #1764 N2 : le fil est écrit ; un census illisible ne fait
+                    # pas échouer le post, l'appelant relira le fil entier.
+                    census = None
         finally:
             os.close(fd)  # libère le verrou
         entry.id = "%s#%d" % (thread.key, size + len(prefix) + shift)
+        if census is None:
+            self._posted.pop(thread.key, None)
+        else:
+            self._remember(thread.key, census)
         return entry.id
+
+    def _census_after(self, thread: ThreadRef, data: bytes, found: list,
+                      current: bytes, start: int, shift: int,
+                      st: os.stat_result) -> tuple:
+        """Le census du fil après l'ajout : entrées gardées, la plus récente
+        (ligne d'index), fin logique — et l'identité du fichier écrit.
+
+        `found`/`current` : la marche déjà faite du fichier d'avant, bien formé ;
+        `data` : l'entrée écrite, à la position logique `start + shift` (relue,
+        comme le ferait un census complet).
+        """
+        new_entries = parse(data, base=start + shift, key=thread.key)
+        new = new_entries[0] if new_entries else None
+        before = _latest_entry(current, found, shift, thread.key)
+        last = new if new is not None and (before is None or new.ts >= before.ts) else before
+        # #1764 N4 : le compte vient des entrées réellement lues, pas d'un « +1 »
+        # aveugle qui compterait une entrée que la relecture complète ignore.
+        # #1764 N1 : mtime/ctime_ns entrent dans l'identité — une réécriture de
+        # même taille (ou une réutilisation d'inode) les change, pas la taille.
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                len(found) + len(new_entries), _index_row(last), st.st_size + shift)
 
     def _offset(self, thread: ThreadRef, since: str) -> int:
         key, sep, offset = str(since).rpartition("#")
@@ -840,6 +928,34 @@ class FileTransport:
         if not all(isinstance(v, int) and not isinstance(v, bool) for v in (kept, end)):
             return None
         return kept, end
+
+    def census_after_post(self, thread: ThreadRef) -> tuple[int, dict | None, int] | None:
+        """Le census du fil tel que le dernier `post` de cette instance l'a
+        laissé : entrées gardées, la plus récente (ligne d'index), fin logique.
+
+        Le census complet relit et décode tout le fil ; ici il est déjà déduit
+        de la marche que `post` fait pour réparer une écriture interrompue
+        (L361c). Il n'est rendu que si le fichier est resté exactement celui
+        écrit — même fichier (périphérique, inode), même taille et mêmes
+        horodatages (une réécriture de même taille change mtime/ctime_ns,
+        #1764 N1) : un autre écrivain, une expiration ou un remplacement le
+        font écarter, et l'appelant relit le fil (`census`)."""
+        state = self._posted.get(thread.key)
+        if state is None:
+            return None
+        dev, ino, size, mtime_ns, ctime_ns, kept, last, end = state
+        try:
+            fd = self._open(thread, write=False)
+        except (OSError, ThreadError):
+            return None
+        try:
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns) != (
+                dev, ino, size, mtime_ns, ctime_ns):
+            return None
+        return kept, last, end
 
     def expire(self, thread: ThreadRef, before_ts: float, *, days: int,
                now: float | None = None, dry_run: bool = False) -> dict:
@@ -929,6 +1045,7 @@ class FileTransport:
             os.rename(tmp, thread.stem + ".md", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             tmp = None
             os.fsync(dir_fd)
+            self._posted.pop(thread.key, None)   # fichier réécrit : census caduc
             return report
         except BaseException:
             if tmp is not None:  # seulement le fichier que cet appel a créé
@@ -1088,7 +1205,11 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
         entry = Entry(author=member(cfg, sender),
                       recipient=", ".join(member(cfg, r) for r in recipients),
                       text=text, ts=float(ts) if ts else time.time(), meta=entry_meta)
-        external_id = transport.post(thread, entry)
+        # #1764 N3 : le census n'est calculé que pour un index médié, seul
+        # lecteur de `census_after_post` ; une indexation locale ne le demande
+        # jamais (le calcul relit la plus récente entrée à chaque post).
+        external_id = transport.post(
+            thread, entry, with_census=db is not None and storage.is_remote(db))
     except Exception as exc:
         _warn("thread write failed (%s) — message kept %s" % (
             " ".join(str(exc).split())[:200],
@@ -1107,17 +1228,31 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
 
 def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_id: str,
           mailbox_ids: Sequence[int] = ()) -> None:
-    """Met à jour `thread_index` et note l'id externe dans `agent_mailbox.meta`
-    (une seule écriture : `storage.of(db).threads.index`).
+    """Met à jour `thread_index` et note l'id externe dans `agent_mailbox.meta`.
 
-    L361 : sous le verrou de la ligne du fil (`threads.lock`), que `expire`
-    prend aussi. Une entrée expirée entre son écriture et son indexation
-    n'est ni comptée ni citée ; une entrée déjà dans le fil quand la base l'a
-    recompté (`counted_until`, écrit dans la transaction du recomptage) n'est
-    pas comptée deux fois. Le fichier ne prouve pas ce recomptage : après
-    une expiration sans base, ou dont le recomptage n'a pas été validé
-    (échec, arrêt brutal après le renommage), la base est en retard sur le
-    fichier et recompte d'abord depuis lui (`_recount_if_behind`).
+    Avec une connexion Postgres, une seule écriture (`threads.index`) : L361,
+    sous le verrou de la ligne du fil (`threads.lock`), que `expire` prend
+    aussi. Une entrée expirée entre son écriture et son indexation n'est ni
+    comptée ni citée ; une entrée déjà dans le fil quand la base l'a recompté
+    (`counted_until`, écrit dans la transaction du recomptage) n'est pas
+    comptée deux fois. Le fichier ne prouve pas ce recomptage : après une
+    expiration sans base, ou dont le recomptage n'a pas été validé (échec,
+    arrêt brutal après le renommage), la base est en retard sur le fichier et
+    recompte d'abord depuis lui (`_recount_if_behind`).
+
+    Sur une connexion médiée, L361c : l'indexation est le census absolu du
+    fichier (`threads.recount`, portée H), la même opération serveur que
+    l'expiration — un `+1` local ne peut plus compter en double une entrée
+    déjà reprise par un recomptage, ni être écrasé par un recomptage plus
+    court. Un census de même fin logique qu'un recomptage plus court est
+    périmé (le recount ne reprend pas un census qui rallonge la ligne) :
+    la trace de la boîte reste écrite par `threads.index` (`count` faux),
+    portée B et auteur membre du fil, quand l'entrée porte des messages ;
+    elle ne touche ni le compte ni `last_*`, donc une entrée expirée
+    entre-temps n'est jamais ressuscitée par sa trace. Le census vient du
+    `post` qui précède quand le fichier n'a pas bougé depuis
+    (`census_after_post` : la marche de la réparation est réutilisée, pas de
+    seconde lecture du fil) ; sinon il est relu en entier.
     """
     host = cfg.host if transport.name == "file" else ""
     key = dict(project=thread.project, lot=thread.lot or "", transport=transport.name,
@@ -1125,13 +1260,30 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
                                     if hasattr(transport, "location") else thread.key))
     if storage.is_remote(db):
         # exécuteur médié : un verrou ne tiendrait pas d'une requête à
-        # l'autre ; l'index d'avant L361, chaque entrée comptée. Une
-        # expiration y passe par `threads.recount` (L361b) : le recomptage du
-        # fichier fait foi et reprend l'index.
-        storage.of(db).threads.index(
-            **key, entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
-            excerpt=excerpt(entry.text), ts=float(entry.ts),
-            trace={"fil": {"transport": transport.name, "id": external_id, "host": host}})
+        # l'autre. L361c : le compte vient du census du fichier (à suivre ou
+        # à venir), par la même opération serveur que l'expiration
+        # (`threads.recount`, portée H), et non plus d'un `+1` local en
+        # course avec un recomptage. La trace de la boîte reste une écriture
+        # à part, sans comptage ni citation (`count` faux : ni `entries` ni
+        # `last_*`).
+        census = None
+        if hasattr(transport, "census"):
+            # Le post qui précède vient de marcher le fil : son census est
+            # rendu tel quel s'il n'a pas bougé depuis (`census_after_post`),
+            # sinon on relit le fil entier (L361c).
+            after_post = getattr(transport, "census_after_post", None)
+            census = after_post(thread) if after_post is not None else None
+            if census is None:
+                census = _census(transport, thread)
+        if census is None or mailbox_ids:
+            storage.of(db).threads.index(
+                **key, entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
+                excerpt=excerpt(entry.text), ts=float(entry.ts),
+                trace={"fil": {"transport": transport.name, "id": external_id, "host": host}},
+                count=census is None)
+        if census is not None:
+            kept, last, end = census
+            storage.of(db).threads.recount(**key, kept=kept, last=last, end=end)
         return
     with db.transaction() as tx:
         threads = storage.of(tx).threads
@@ -1157,11 +1309,19 @@ def _recount_if_behind(threads, key: dict, transport, thread: ThreadRef,
     """
     if bounds is None or (counted is not None and counted >= bounds[1]):
         return counted
+    kept, last, end = _census(transport, thread)
+    threads.expired(**{k: v for k, v in key.items() if k != "location"},
+                    kept=kept, last=last, end=end)
+    return end
+
+
+def _census(transport, thread: ThreadRef) -> tuple[int, dict | None, int]:
+    """Le census du fil, prêt pour l'index : entrées gardées, la plus récente
+    (ligne d'index), fin logique. Lu une seule fois, sous le verrou partagé du
+    fichier (`FileTransport.census`)."""
     entries, end = transport.census(thread)
     latest = max(reversed(entries), key=lambda e: e.ts) if entries else None
-    threads.expired(**{k: v for k, v in key.items() if k != "location"},
-                    kept=len(entries), last=_index_row(latest), end=end)
-    return end
+    return len(entries), _index_row(latest), end
 
 
 def _offset_of(entry_id: str) -> int | None:
@@ -1210,7 +1370,9 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
                 if storage.is_remote(db):
                     # L361b : le fichier d'abord (verrou local), puis UNE
                     # opération serveur (verrou de la ligne, recomptage,
-                    # expiration) : l'index ne peut pas rester en arrière.
+                    # expiration). Un recomptage perdu est rattrapé à
+                    # l'expiration suivante, depuis le fichier : l'index ne
+                    # reste pas en arrière.
                     report = run()
                     _recount_remote(db, transport, thread, key, location, report)
                 else:
@@ -1251,14 +1413,14 @@ def _recount_remote(db, transport, thread: ThreadRef, key: dict, location: str,
     bounds = transport.bounds(thread) if hasattr(transport, "bounds") else None
     if not report["dropped"] and bounds is None:
         return          # jamais expiré : l'index d'avant L361 suffit
-    entries, end = transport.census(thread)
-    last = max(reversed(entries), key=lambda e: e.ts) if entries else None
-    storage.of(db).threads.recount(**key, location=location, kept=len(entries),
-                                    last=_index_row(last), end=end)
+    kept, last, end = _census(transport, thread)
+    storage.of(db).threads.recount(**key, location=location, kept=kept, last=last, end=end)
 
 
-def _index_row(entry: Entry | None) -> dict | None:
-    """La plus récente entrée gardée, telle que l'index la cite."""
+def _index_row(entry: Entry | None) -> ThreadCensus | None:
+    """La plus récente entrée gardée, telle que l'index la cite (L361b, la
+    forme déclarée au contrat : `entry_id`, `author`, `excerpt`, `ts`,
+    `mailbox_id`)."""
     if entry is None:
         return None
     ids = [i for i in entry.meta.get("ids") or () if isinstance(i, int) and not isinstance(i, bool)]
@@ -1389,16 +1551,16 @@ def cmd_expire(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     db = None
     if not args.dry_run:
-        # L361b : un hôte médié expire par l'opération serveur (verrou,
-        # recomptage, expiration) ; c'est la connexion qui le dit. Sans elle,
-        # `expire` refuse et rien n'est touché.
+        # L361b: a mediated host expires through the server operation (lock,
+        # recount, expiry); the connection says whether it exists. Without it,
+        # `expire` refuses and nothing is touched.
         try:
             db = db_mod.connect(cfg)
         except db_mod.DbError as exc:
             message = " ".join(str(exc).split())[:200]
             if expiry_unavailable(cfg, None):
-                # L361b : sans index, un hôte médié n'expire pas ; le refus
-                # part d'ici, avant toute réécriture de fil
+                # L361b: without an index, a mediated host does not expire; the
+                # refusal starts here, before any thread rewrite
                 raise ExpiryUnavailable("%s (index unavailable: %s)" % (EXPIRY_UNAVAILABLE,
                                                                         message))
             print("thread index unavailable (%s): threads expire, the index is not updated"

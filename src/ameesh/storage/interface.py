@@ -56,7 +56,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
    pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
-   turn_costs      last_reading insert spent ledger correct
+   turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
                    pending_recipients_sorted unread_total dead_letters forward
@@ -71,7 +71,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    overdue_delegations returned_delegations backlog_add backlog
                    auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
-   packages       all get upsert retire
+   packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
                    launch settle replace cancel
@@ -88,8 +88,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    grants          register reserve release live_reservations candidates
                    revoke get
    placements      recorded
-   progress        lots lot_events lot_milestones lot_actions actions agents costs
-                   packages package_items lot_messages
+   progress        lots lot_events lot_transitions lot_event_last lot_milestones
+                   lot_actions actions agents costs packages package_items
+                   lot_messages
    projects        board
    decisions       create get pending history pending_for_lot close register_chat
    roadmap         plan_item item_plans plan_package items commitments
@@ -102,6 +103,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
    api_requests    reserve complete release
+   alert_acknowledgements live acknowledge invalidate clock
    watches         put delete list deliver
    events          record after readable waiting bounds count_before prune
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
@@ -159,7 +161,12 @@ from .conversations import Conversations
 from .work_dependencies import WorkDependencies
 
 import abc
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence, TypedDict
+
+#: #1654 : observation NON fournie au CAS `set_issue_ref` — le contrôle de la
+#: réservation (`migration_repo`) n'est alors pas appliqué, les appelants qui
+#: ne lisent pas la réservation gardent le CAS d'origine.
+UNCHECKED = object()
 
 
 class Domain(abc.ABC):
@@ -205,6 +212,15 @@ class Agents(Domain):
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """La ligne de l'agent, ou None."""
+
+    @abc.abstractmethod
+    def operator_pause(self, name: str, *, paused: bool, reason: str,
+                       actor: str, principal: str) -> dict | None:
+        """Native human hold: row lock, state and audit in one atomic statement.
+
+        No status/prompt/lease changes; repeated state has no new event.
+        External agents are returned unchanged. Not exposed to executors.
+        """
 
     @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:
@@ -320,7 +336,9 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def clear_session(self, name: str, owner: str, epoch: int) -> bool:
-        """Oublie la session, fencé par un bail valide."""
+        """Oublie la session, fencé par un bail valide ; l'oubli est durable
+        (`session_reset_at` posé dans la même écriture), pour qu'un fichier
+        local non retiré ne ressuscite pas la session (#794)."""
 
     @abc.abstractmethod
     def hold_note(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
@@ -490,6 +508,20 @@ class TurnCosts(Domain):
         cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
 
     @abc.abstractmethod
+    def last_before(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la dernière ligne écrite de `agent` à `ts` (epoch) ou avant :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. Lecture seule,
+        pour relire le harnais qui tournait avant un instant donné (le gel d'un
+        lot)."""
+
+    @abc.abstractmethod
+    def first_after(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
+        écrit la ligne d'un tour à sa fin : le tour qui a posé un gel est le
+        premier écrit APRÈS l'instant du gel. Lecture seule."""
+
+    @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
                session: str | None, usd: float, input_tokens: int,
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
@@ -613,6 +645,28 @@ class Budgets(Domain):
 # API idempotency (L87, migration 0440)
 # --------------------------------------------------------------------------
 
+class AlertAcknowledgements(Domain):
+    """L87c: native operator acknowledgements; expired rows retain the audit."""
+
+    @abc.abstractmethod
+    def live(self) -> list[dict]:
+        """Active rows: id, alert_key, severity, observation_host, actor, principal,
+        acknowledged_ts."""
+
+    @abc.abstractmethod
+    def acknowledge(self, key: str, severity: str, actor: str, principal: str, *,
+                    observation_host: str | None = None) -> dict:
+        """Atomically acknowledge once per key/principal/severity; row + changed."""
+
+    @abc.abstractmethod
+    def invalidate(self, id: int, *, reason: str, observed_ts: float) -> bool:
+        """Expire a row predating the observation, retaining actor/principal."""
+
+    @abc.abstractmethod
+    def clock(self) -> float:
+        """Database clock before collecting the snapshot, epoch seconds."""
+
+
 class ApiRequests(Domain):
     """The `Idempotency-Key` of the API's actions (`ameesh serve`): one row
     per (human, key), reserved before the action runs, completed with its
@@ -622,7 +676,8 @@ class ApiRequests(Domain):
     def reserve(self, human: str, key: str, fingerprint: str, *,
                 retention_s: int) -> dict | None:
         """Reserves (human, key) for the request `fingerprint`, in ONE
-        transaction, after purging the rows older than `retention_s`. None when
+        transaction, after purging the rows older than `retention_s` (a purge
+        that never waits on a locked row, #1497 N3). None when
         the key is new (the caller acts); otherwise the row in place:
         fingerprint, status, response (status and response None while the
         first request is still running)."""
@@ -692,14 +747,16 @@ class Events(Domain):
         most `limit` (a listing for humans: ids are not in commit order)."""
 
     @abc.abstractmethod
-    def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None]:
+    def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None, tuple]:
         """The reader's order: (the events after `position` = (tx, id) whose
         transaction is over for good (`tx` below the snapshot's xmin), by
         (tx, id), at most `limit`, each row also carrying `tx`; why events
         after `position` wait, None if none does: "xmin" for an older open
-        transaction, "restore" for rows of another cluster above the counter).
-        Both from ONE snapshot. Such a transaction can no longer add an event
-        before the last one read."""
+        transaction, "restore" for rows of another cluster above the counter;
+        the retention's watermark `(tx, id)`, `(0, 0)` when it never deleted).
+        All from ONE snapshot. Such a transaction can no longer add an event
+        before the last one read; a `position` below the watermark returned
+        with it may have lost events (reset)."""
 
     @abc.abstractmethod
     def bounds(self) -> dict:
@@ -707,19 +764,19 @@ class Events(Domain):
         empty); `head`: the position (tx, id) of the last readable event,
         `top`: of the last event written, `oldest`: of the first one kept
         ((0, 0) when none); `pruned`: the greatest position the retention
-        deleted ((0, 0) when none); `cluster`: the identity of the cluster
-        and timeline, outside which a position means nothing (None when its
-        functions are refused)."""
+        deleted ((0, 0) when none); `cluster`: the identity of the journal
+        (cluster, timeline and the log's own random identifier), outside which
+        a position means nothing (None when its functions are refused)."""
 
     @abc.abstractmethod
-    def count_before(self, before_ts: float) -> int:
-        """The number of events older than `before_ts`."""
+    def count_before(self, days: int) -> int:
+        """The number of events older than `days`, on the database's clock."""
 
     @abc.abstractmethod
-    def prune(self, before_ts: float, limit: int, timeout_s: float | None = None) -> int:
-        """Deletes at most `limit` events older than `before_ts` (the oldest
-        first) and raises the watermark `bounds()["pruned"]` in the same
-        statement; the number deleted.
+    def prune(self, days: int, limit: int, timeout_s: float | None = None) -> int:
+        """Deletes at most `limit` events older than `days` (the oldest first,
+        on the database's clock) and raises the watermark
+        `bounds()["pruned"]` in the same statement; the number deleted.
         `timeout_s`: lock and statement timeout of the deletion (DbError past
         it). The table refuses an event younger than 30 days."""
 
@@ -753,6 +810,33 @@ class Accounts(Domain):
         un autre worker a déjà basculé : rien n'est écrit."""
 
     @abc.abstractmethod
+    def switch_guarded(self, host: str, harness: str, *, expected: str | None, to: str,
+                       kind: str, reason: str, agent: str | None, now: float,
+                       hold_reason: str | None = None,
+                       hold_until: float | None = None) -> bool:
+        """#1883 : bascule validée contre les retenues, en UNE transaction.
+
+        Même contrat que `switch` (compare-and-changer `expected`, un forçage
+        manuel n'est pas défait par l'automate), PLUS, sous le **même verrou**
+        de la ligne `account_active` :
+
+        * une retenue **valide** de `to` (`until_ts > now`) refuse la bascule :
+          rien n'est écrit, l'appelant relit l'actif — c'est ce qui ferme la
+          course « classement sur un instantané, retenue publiée entre-temps »
+          (R1 auditeur, B2) ;
+        * quand `hold_reason` est donné, pose (ou rafraîchit) la retenue du
+          compte **quitté** dans la même transaction — le compte qu'on quitte
+          en dépassement devient indisponible pour les autres workers au même
+          instant où la bascule est visible ;
+        * les retenues **échues** de `to` sont nettoyées dans la même
+          transaction (R2 auditeur, B2) : un nettoyage APRÈS le commit
+          effacerait une retenue publiée entre-temps par la bascule d'un autre
+          runner, qui attend le même verrou.
+
+        Faux sans rien écrire : compte vu changé, forçage manuel en place,
+        aucun changement, ou retenue valide sur `to`."""
+
+    @abc.abstractmethod
     def set_auto(self, host: str, harness: str, *, reason: str,
                  expected: str | None = None) -> bool:
         """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
@@ -773,6 +857,35 @@ class Accounts(Domain):
     @abc.abstractmethod
     def release(self, host: str, harness: str, account: str) -> None:
         """Retire la retenue d'un compte (il redevient éligible)."""
+
+    @abc.abstractmethod
+    def identities(self, host: str, harness: str, since: float) -> dict[str, list[dict]]:
+        """#1883 : les empreintes de dossier publiées pour ce couple (hôte,
+        harnais), encore vivantes depuis `since` (epoch) :
+        {account: [{identity, last_ts}]}. Deux empreintes sous le même nom
+        sont deux dossiers résolus : le compte est refusé au placement. Jamais
+        un chemin, seulement une empreinte (secret d'hôte)."""
+
+    @abc.abstractmethod
+    def publish_identity(self, host: str, harness: str, account: str,
+                         identity: str) -> None:
+        """#1883 : publie (ou rafraîchit) l'empreinte du dossier résolu
+        `identity` du compte, pour que les autres processus de l'hôte
+        détectent un même nom déclaré vers deux dossiers différents."""
+
+    @abc.abstractmethod
+    def placement_state(self, host: str, harness: str, since: float) -> dict:
+        """#1883 (R3 auditeur, B1) : retenues ET identités d'un couple (hôte,
+        harnais), lues en UNE transaction sous le verrou de placement.
+
+        Rend `{"holds": {account: {until_ts, reason}}, "identities":
+        {account: [{identity, last_ts}]}}`, les identités encore vivantes
+        depuis `since` (epoch). Toute publication de retenue
+        (`switch_guarded`, `hold`) prend le même verrou : aucune retenue ne
+        peut être publiée entre la lecture des retenues et celle des
+        identités — c'est l'état cohérent sur lequel `accounts.choose` valide
+        son choix (R3 auditeur, B1). `holds` et `identities` seuls restent des
+        lectures d'un jeu, sans cohérence entre eux."""
 
     @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
@@ -855,7 +968,8 @@ class Mailbox(Domain):
 
     @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
-        """Messages non remis, du plus ancien au plus récent."""
+        """Messages non remis, du plus ancien au plus récent, avec leur lot
+        (`work_item_id`, #794 : le brief d'un lot ne montre que son fil)."""
 
     @abc.abstractmethod
     def unread_active(self, recipient: str, limit: int) -> list[dict]:
@@ -866,6 +980,14 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis marqués `payload.urgent`."""
+
+    @abc.abstractmethod
+    def unread_mid_turn(self, recipient: str, limit: int) -> list[dict]:
+        """L514/#885 : les messages non remis qu'une remise mi-tour peut
+        livrer — verdict, arbitrage, message d'un humain, urgent
+        (`mail.mid_turn`) —, du plus ancien au plus récent, sans s'arrêter
+        aux `UNREAD_LIMIT` premiers non-lus : un verdict derrière plus de 200
+        non-lus est vu au prochain point sûr, pas à la fin du tour."""
 
     @abc.abstractmethod
     def get(self, message_id: int) -> dict | None:
@@ -1274,7 +1396,7 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
-                          floor: int, *, note: str, actor: str,
+                          floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:
         """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
         ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
@@ -1282,13 +1404,26 @@ class WorkItems(Domain):
         l'index unique : deux réservations simultanées ne prennent jamais le
         même numéro ; la perdante réessaie avec une attente aléatoire croissante,
         dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
-        si le lot n'est plus ouvert ; DbError si `number` est pris par un autre
-        lot ; `ReservationContention` si le budget du prochain libre est
-        épuisé. `release` libère la réservation."""
+        si le lot n'est plus ouvert, ou si `issue_ref` — la référence lue par
+        l'appelant — a changé entre-temps (#1830 : NULL et chaîne vide
+        confondus) ; DbError si `number` est pris par un autre lot ;
+        `ReservationContention` si le budget du prochain libre est épuisé.
+        `release` libère la réservation, sans condition sur la référence."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
         """L122 : le lot (id, titre, état) qui a réservé ce numéro du dépôt."""
+
+    @abc.abstractmethod
+    def record_landed_migration(self, item_id: int, number: int, repo: str, *,
+                                note: str, actor: str) -> dict | None:
+        """#1567 : enregistre (ou corrige) le numéro atterri d'un lot déjà
+        fusionné ou promu, journalisé dans la même transaction ; None si le lot
+        n'est pas dans un état terminal. La réservation n'est pas touchée."""
+
+    @abc.abstractmethod
+    def migration_landed_holder(self, number: int, repo: str) -> dict | None:
+        """#1567 : le lot (id, titre, état) qui nomme déjà ce numéro atterri."""
 
     @abc.abstractmethod
     def record_resolution(self, item_id: int, other_id: int, *, commit: str, lot_tip: str,
@@ -1341,7 +1476,8 @@ class WorkItems(Domain):
         """L160e2 (0058): takes (or, with its `epoch`, renews) the merge lease
         of `key` (project and target) for `owner`; returns its epoch, None if
         another owner holds a lease that has not expired. Its own owner takes it
-        again at a new epoch (an executor restarted mid-landing)."""
+        again at a new epoch (an executor restarted mid-landing). Renewal with
+        an epoch never revives an expired lease (#1680)."""
 
     @abc.abstractmethod
     def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
@@ -1384,7 +1520,12 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
-        """Un lot, ou None."""
+        """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
+        révision Process pinnée, '' quand il n'y en a pas — y compris sur une
+        base d'avant la migration 0452). Les commandes historiques
+        (`work.move`/`close`/`close_merged`) lisent la garde par cette
+        interface, jamais par un SELECT brut : celui-ci est refusé sur une
+        connexion d'exécuteur médié."""
 
     @abc.abstractmethod
     def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
@@ -1402,11 +1543,17 @@ class WorkItems(Domain):
         fail (None) — the lot never ends waiting with no request."""
 
     @abc.abstractmethod
-    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str) -> dict | None:
+    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str,
+                           event: str | None = None) -> dict | None:
         """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
         et journalise ; None (rien d'écrit) si le lot n'est plus en `qa` ou si
         son assigné est devenu le relecteur (la règle est relue dans
         l'écriture, pas seulement avant : #705 r2, B1).
+
+        #1979 : `reviewer` vide efface la désignation et `event` remplace la
+        ligne de journal par défaut (« reviewer X designated ») — il porte
+        alors le retrait, ou la marque « verdict non requis » de
+        `work.waive_review` (`work.REVIEWER_NONE`).
 
         La colonne vient de la migration 0421 : avant elle, la lecture s'en
         passe (`item_columns`) et l'écriture est refusée avec la marche à
@@ -1449,13 +1596,15 @@ class WorkItems(Domain):
         même verrou, mais le lot reste où il est et `PendingLot` est levée.
         `ready_only` (L165) exige un lot intake sans assigné dont toutes les
         dépendances sont satisfaites ; vérifié sous verrou dans la même
-        transaction que l'attribution. La réservation manuelle garde son
-        comportement par défaut. #705 : si le nouvel assigné est le relecteur
-        désigné, la désignation tombe dans la même écriture (le journal la
-        nomme) — un relecteur ne relit pas son propre travail."""
+        transaction que l'attribution. `current` doit alors être NULL : toute
+        autre valeur est une erreur d'appel (`ValueError` immédiate, avant le
+        verrou) et non un None silencieux (#1696). La réservation manuelle
+        garde son comportement par défaut. #705 : si le nouvel assigné est le
+        relecteur désigné, la désignation tombe dans la même écriture (le
+        journal la nomme) — un relecteur ne relit pas son propre travail."""
 
     @abc.abstractmethod
-    def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
+    def handoff(self, item_id: int, assignee: str | None, *, current: str, state: str,
                 paused_prefix: str, note_prefix: str, window_s: float,
                 max_per_window: int, note: str, actor: str) -> dict | None:
         """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
@@ -1466,7 +1615,10 @@ class WorkItems(Domain):
         (`blocked`, `status_text` commençant par `paused_prefix`, ligne
         verrouillée jusqu'à la fin) ; `assignee` n'a aucun lot ouvert ; moins
         de `max_per_window` notes commençant par `note_prefix` dans les
-        `window_s` dernières secondes."""
+        `window_s` dernières secondes.
+
+        `assignee` None rend le lot à la file d'équipe (assigné NULL, L165) :
+        aucun contrôle du preneur n'a lieu, les autres tiennent."""
 
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
@@ -1568,11 +1720,14 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
-                     pr_ref: str | None, frozen_id: int | None = None) -> dict | None:
+                     pr_ref: str | None, frozen_id: int | None = None,
+                     landed: tuple[int, str] | None = None) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
         dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
-        `merged` (commit, auteur de la fusion) dans la même transaction."""
+        `merged` (commit, auteur de la fusion) dans la même transaction.
+        `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
+        écrit dans la même transaction."""
 
     @abc.abstractmethod
     def close(self, item_id: int, *, current: str, reason: str, superseded_by: int | None,
@@ -1654,11 +1809,17 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def set_issue_ref(self, item_id: int, issue_ref: str | None, *,
-                      current: str | None) -> bool:
+                      current: str | None,
+                      migration_repo: object = UNCHECKED) -> bool:
         """Pose `issue_ref` si le lot porte encore `current` (NULL et chaîne
         vide confondus) : faux si la valeur a changé entre-temps (un autre
         projecteur l'a posée). Ni journal ni `updated_at` : une projection
-        n'est pas une activité du lot."""
+        n'est pas une activité du lot.
+
+        #1654 : `migration_repo` est l'observation de l'appelant ; fournie,
+        elle resserre le CAS sur la réservation (`IS NOT DISTINCT FROM`, NULL
+        compris), pour qu'une réservation prise entre la lecture et l'écriture
+        ne passe pas en silence. `UNCHECKED` (défaut) garde le CAS d'origine."""
 
     @abc.abstractmethod
     def recent_or_cited(self, *, since_ts: float, ids: Sequence[int]) -> list[dict]:
@@ -1694,6 +1855,17 @@ class WorkPackages(Domain):
     @abc.abstractmethod
     def retire(self, idents: Sequence[str]) -> int:
         """Marque ces fiches retirées du canon (`present` faux, jamais effacées)."""
+
+    @abc.abstractmethod
+    def lock_sync(self) -> None:
+        """Verrou transactionnel des fiches, pris AVANT leur lecture (L42/0031) :
+        un par SCHÉMA, tous canons confondus — les identifiants de paquets sont
+        globaux, le premier canon qui en déclare un le garde — et le même pour
+        toute écriture de `canon` (`canon.rebase_default`). À appeler dans une
+        transaction ouverte : il tient jusqu'au COMMIT, comme
+        `authenticators.lock_registry`. L'attente du verrou ne compte pas dans
+        le délai de requête de la session (un premier sync long ne fait pas
+        échouer les suivants)."""
 
 
 # --------------------------------------------------------------------------
@@ -1829,6 +2001,14 @@ class Canon(Domain):
     @abc.abstractmethod
     def states(self, host: str) -> list[dict]:
         """Tous les états enregistrés pour l'hôte, un par canon (L42)."""
+
+    @abc.abstractmethod
+    def claim_commit(self, host: str, old: str, new: str, canon: str = "") -> bool:
+        """#793 : avance le repère d'envoi `process_commit` de `old` à `new`,
+        si aucune autre synchronisation ne l'a fait ; False sinon. NULL :
+        initialiser depuis `last_good_commit`. `record_state` ne touche jamais
+        ce repère. Dans la transaction de l'appelant, la ligne reste verrouillée
+        jusqu'à son commit."""
 
     @abc.abstractmethod
     def key_for_root(self, host: str, root: str) -> str | None:
@@ -2110,6 +2290,20 @@ class Grants(Domain):
 # index des fils lisibles (`thread_index`)
 # --------------------------------------------------------------------------
 
+class ThreadCensus(TypedDict):
+    """Census d'un fil d'hôte médié, porté par `threads.recount` (L361b) :
+    la plus récente entrée gardée, telle que l'index la cite.
+
+    `mailbox_id` est la dernière boîte citée par l'entrée, None si elle n'en
+    cite aucune. L'ordre des champs est celui du schéma du contrat."""
+
+    entry_id: str
+    author: str
+    excerpt: str
+    ts: float
+    mailbox_id: int | None
+
+
 class Threads(Domain):
     """Index des fils (le fil lui-même vit chez son transport, hors base)."""
 
@@ -2118,7 +2312,12 @@ class Threads(Domain):
               entry_id: str, mailbox_ids: Sequence[int], author: str, excerpt: str,
               ts: float, trace: dict, count: bool = True) -> None:
         """Compte l'entrée (sauf `count` faux) dans l'index du fil et, si elle porte des messages
-        de la boîte, y note `trace` (id externe) — en une seule écriture."""
+        de la boîte, y note `trace` (id externe) — en une seule écriture.
+
+        `count` faux (L361c) : la trace seule — la boîte est marquée et
+        `location` rafraîchie, jamais `entries` ni `last_*`. Le census du
+        fichier (`recount`) est alors le seul à écrire l'index : la trace d'une
+        entrée expirée entre-temps ne peut pas la ressusciter."""
 
     @abc.abstractmethod
     def indexed(self) -> list[dict]:
@@ -2134,7 +2333,7 @@ class Threads(Domain):
 
     @abc.abstractmethod
     def recount(self, *, project: str, lot: str, transport: str, host: str, location: str,
-                kept: int, last: dict | None, end: int) -> int:
+                kept: int, last: ThreadCensus | None, end: int) -> int:
         """L361b : verrou, recomptage et expiration de l'index en UNE
         transaction serveur, pour un fil dont le fichier vit sur l'hôte médié.
 
@@ -2142,8 +2341,10 @@ class Threads(Domain):
         récente, `end` la fin logique du fil) : sous le verrou de la ligne
         (`lock`), l'index reprend ce census (`expired`) si son `counted_until`
         n'est pas déjà AU-DELÀ de `end` — un recomptage plus récent fait foi.
-        Un `counted_until` égal à `end` est repris : à fin logique constante,
-        seule une expiration change le fil (moins d'entrées gardées). Rend le
+        Un `counted_until` égal à `end` n'est repris que si le census ne
+        rallonge pas la ligne (`kept <= entries`) : à fin logique constante,
+        seule une expiration change le fil (moins d'entrées gardées), donc un
+        census plus long a été lu avant elle et est périmé (L361c). Rend le
         `counted_until` retenu."""
 
     @abc.abstractmethod
@@ -2193,6 +2394,39 @@ class Progress(Domain):
     def lot_events(self, item_ids: Sequence[int]) -> list[dict]:
         """Journal COMPLET des transitions de ces lots (id, work_item_id,
         state, note, actor, created_ts), dans l'ordre d'écriture."""
+
+    def lot_transitions(self, item_ids: Sequence[int]) -> list[dict]:
+        """Transitions SEULES de ces lots (id, work_item_id, state, actor,
+        created_ts), dans l'ordre d'écriture : les lignes qui répètent l'état
+        précédent (notes) sont écartées, et leur texte n'est jamais lu. C'est
+        ce que demandent les vues groupées (`work list`, `progress`,
+        `roadmap`) : le journal complet ne sert qu'au détail d'un lot.
+
+        Lecture DÉRIVÉE (pas une opération du contrat médié) : le stockage
+        peut l'optimiser — agrégation SQL — sans changer ce que reçoit
+        l'appelant ; le repli ci-dessous lit `lot_events`."""
+        out: list[dict] = []
+        previous: dict[int, str] = {}
+        for ev in self.lot_events(item_ids):
+            lot = int(ev["work_item_id"])
+            state = ev.get("state")
+            if lot not in previous or previous[lot] != state:
+                out.append({key: value for key, value in ev.items() if key != "note"})
+            previous[lot] = state
+        return out
+
+    def lot_event_last(self, item_ids: Sequence[int]) -> list[dict]:
+        """Dernier instant d'événement de chacun de ces lots (work_item_id,
+        last_ts) : l'activité du journal sans en lire les lignes — la borne
+        que `stagnation.last_activity` ajoute aux transitions. Lecture
+        DÉRIVÉE, repli sur `lot_events`."""
+        last: dict[int, float] = {}
+        for ev in self.lot_events(item_ids):
+            lot = int(ev["work_item_id"])
+            ts = ev.get("created_ts")
+            if ts is not None:
+                last[lot] = max(last.get(lot, float("-inf")), float(ts))
+        return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
 
     @abc.abstractmethod
     def lot_milestones(self, item_ids: Sequence[int]) -> list[dict]:
@@ -2463,9 +2697,15 @@ class Operations(Domain):
         epoch, échéance recontrôlée). Faux si le bail n'est plus le nôtre."""
 
     @abc.abstractmethod
+    def set_dormant(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
+        """L76 T2 : le texte de statut d'un résident endormi, en une écriture
+        conditionnelle — seulement si l'agent est `idle` et que le bail
+        (owner, epoch, échéance) est encore le nôtre. Faux sinon."""
+
+    @abc.abstractmethod
     def listing(self, *, today: str | None = None) -> list[dict]:
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
-        `status_since_ts`, bail
+        `status_since_ts`, début du motif affiché (`status_reason_since_ts`), bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
         `turn_label` du marqueur comptable), non-lus qui ouvriront un tour
         (`unread`, `oldest_unread_ts` ; L125 : hors courrier passif, compté à
@@ -2544,8 +2784,10 @@ class Operations(Domain):
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee, `package_id`, type et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
-        son relecteur désigné). Les plus anciennement actifs d'abord. `limit=None`
-        lit toute la vérité avant le filtrage des attentes planifiées (L368)."""
+        son relecteur désigné), `workflow_ref` (#1922/N13 : la révision Process
+        qui pinne le lot, '' sur une base d'avant la 0452). Les plus
+        anciennement actifs d'abord. `limit=None` lit toute la vérité avant le
+        filtrage des attentes planifiées (L368)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
@@ -2774,6 +3016,13 @@ class TurnResources(Domain):
                   pgid: int | None, label: str | None,
                   containers: Sequence[str] | None = None) -> None:
         """Ouvre la ligne d'un tour (idempotent sur `turn_id`)."""
+
+    @abc.abstractmethod
+    def attach_cgroup(self, turn_id: str, cgroup: str) -> None:
+        """L498 : rattache le cgroup délégué du tour (chemin relatif à la
+        monture cgroup v2). Appelée juste après `open_turn` par l'exécuteur
+        qui a un cgroup ; un exécuteur médié ne l'a pas (opération refusée au
+        contrat, la ligne reste sans cgroup)."""
 
     @abc.abstractmethod
     def close_turn(self, turn_id: str, *, orphan: bool,
@@ -3044,7 +3293,11 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
-        sont plus assignés à leur agent ; rend les lignes supprimées."""
+        sont plus assignés à leur agent ; rend les lignes supprimées. Ne touche
+        pas au registre : la session ACTIVE d'un lot fini est fermée par
+        l'agent qui la détient, à son tour suivant, sous son bail (#794,
+        revue Claude B1 : ce balayage n'a pas le bail et peut tomber en plein
+        tour)."""
 
 
 # --------------------------------------------------------------------------
@@ -3061,10 +3314,12 @@ class CiResults(Domain):
     @abc.abstractmethod
     def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
                  base: str, work_item_id: int | None, url: str | None,
-                 workflow: str = "", created_at: str | None = None) -> dict:
+                 workflow: str = "", created_at: str | None = None,
+                 run_attempt: int = 1) -> dict:
         """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend.
         `workflow` : le fichier de workflow qui l'a produite (#1110).
-        `created_at` : la création de l'exécution chez GitHub (0422)."""
+        `created_at` : la création de l'exécution chez GitHub (0422).
+        `run_attempt` : l'essai GitHub de l'exécution (#901)."""
 
     @abc.abstractmethod
     def mark_started(self, repo: str, run_ids: Sequence[int]) -> None:
@@ -3072,9 +3327,14 @@ class CiResults(Domain):
         `started_at` prend l'heure du relevé (la fin de l'attente d'un runner)."""
 
     @abc.abstractmethod
-    def queued(self) -> list[dict]:
-        """#747 : les exécutions `running` jamais vues démarrées, de la plus
-        ancienne à la plus récente, tous dépôts."""
+    def reopen_run(self, repo: str, run_id: int, *, run_attempt: int) -> dict | None:
+        """Une exécution conclue que GitHub dit de nouveau en cours (relance,
+        #901 : même `run_id`, `run_attempt` strictement supérieur) repasse
+        `running`, note l'attempt et efface les messages de l'attempt
+        précédent. None si rien ne change : attempt non supérieur (une liste
+        en retard, #828, ne rouvre pas une exécution conclue au même attempt)
+        ou tête plus récente de la branche (la relance d'une exécution périmée
+        ne la ressuscite pas)."""
 
     @abc.abstractmethod
     def running(self, repo: str) -> list[dict]:
@@ -3102,26 +3362,33 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def failures(self, repo: str, run_id: int) -> list[dict]:
-        """Les tests en échec de l'exécution, dans l'ordre où ils ont échoué."""
+        """Les tests en échec de l'attempt courant de l'exécution, dans
+        l'ordre où ils ont échoué."""
 
     @abc.abstractmethod
-    def add_failure(self, repo: str, run_id: int, *, part: str, test: str, module: str,
-                    status: str, inherited: bool, excerpt: str, replay: str,
+    def add_failure(self, repo: str, run_id: int, *, run_attempt: int, part: str, test: str,
+                    module: str, status: str, inherited: bool, excerpt: str, replay: str,
                     duration_s: float | None, failed_at: str | None) -> bool:
-        """Enregistre un échec ; False s'il l'était déjà (même part, même test)."""
+        """Enregistre un échec de l'attempt `run_attempt` ; False s'il l'était
+        déjà (même part, même test, même attempt). Un échec de l'attempt
+        précédent re-vu à la relance reprend la ligne et compte comme nouveau ;
+        un événement d'un attempt antérieur ne réécrit jamais la ligne d'un
+        attempt postérieur (#901)."""
 
     @abc.abstractmethod
-    def set_failure_message(self, repo: str, run_id: int, tests: Sequence[tuple],
-                            message_id: int) -> None:
-        """Note le message qui a signalé ces échecs (`(part, test)`)."""
+    def set_failure_message(self, repo: str, run_id: int, run_attempt: int,
+                            tests: Sequence[tuple], message_id: int) -> None:
+        """Note le message qui a signalé ces échecs (`(part, test)`) de l'attempt."""
 
     @abc.abstractmethod
     def base_failures(self, repo: str, branch: str, *, workflow: str = "") -> dict:
-        """Dernière exécution conclue (verte ou rouge) de `branch` **pour ce
-        workflow** : `{run_id, head_sha, tests}` (tests en échec), ou {} sans
-        exécution. Le workflow évite de comparer deux suites étrangères ; les
-        lignes antérieures à la migration 0433, toutes de l'ancien filtre
-        global `tests.yml`, y sont nommées."""
+        """Dernière exécution conclue (verte ou rouge) de la **tête la plus récemment
+        poussée** de `branch`, pour ce workflow (#1683 : la conclusion la plus
+        récente peut être celle d'une tête plus ancienne) : `{run_id, head_sha,
+        tests}` (tests en échec de son attempt courant), ou {} sans exécution.
+        Le workflow évite de comparer deux suites étrangères ; les lignes
+        antérieures à la migration 0433, toutes de l'ancien filtre global
+        `tests.yml`, y sont nommées."""
 
     @abc.abstractmethod
     def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
@@ -3186,11 +3453,6 @@ class CiResults(Domain):
                           covered: int, complete: bool, reason: str | None = None) -> None:
         """Clôt le relevé : appels réellement consommés, exécutions listées et
         couvertes, et raison d'un relevé incomplet (qui n'a rien publié)."""
-
-    @abc.abstractmethod
-    def guard_runs(self, repo: str) -> dict:
-        """Le cache des relevés par exécution, clé `(run_id, attempt)` :
-        `{run_id, attempt, status, queued, oldest_id, oldest_at, runners}`."""
 
     @abc.abstractmethod
     def observe_guard_run(self, repo: str, *, run_id: int, attempt: int, status: str,
@@ -3323,6 +3585,7 @@ class Storage(abc.ABC):
     credentials: Credentials
     budgets: Budgets
     api_requests: ApiRequests
+    alert_acknowledgements: AlertAcknowledgements
     watches: Watches
     events: Events
     mailbox: Mailbox
