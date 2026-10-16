@@ -1015,9 +1015,9 @@ def _release(profile: Profile, depasses, hard, now: float,
 
     `ceilings` (#1176) : le plafond effectif de chaque fenêtre. Un relèvement
     de fin de fenêtre déjà prouvé peut libérer la fenêtre avant sa remise à
-    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro — mais
-    seulement quand le rythme y a rejoint l'usage ; sinon la fenêtre reste
-    tenue jusqu'au croisement du rythme sous le plafond relevé (#1227 N1).
+    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro — et pas
+    avant que le rythme ait rattrapé l'usage sous le plafond relevé
+    (#1506, qui reprend le contrat de #1227 N1).
     """
     dated = []
     for gauge in depasses:
@@ -1038,17 +1038,16 @@ def _release(profile: Profile, depasses, hard, now: float,
             if (ceiling is not None and ceiling.from_ts is not None
                     and ceiling.end is not None and ceiling.from_ts > now
                     and gauge.used_at(now) < ceiling.end - cut):
-                # #1227 (N1) : `from_ts` n'est annoncé que si le rythme y
-                # dépasse déjà l'usage ; sinon la fenêtre reste tenue après le
-                # relèvement, et l'heure est le croisement sous le plafond
-                # relevé (`free_at` avec `end`), qui tombe alors après
-                # `from_ts`. Un croisement déjà atteint avant le relèvement
-                # (`free < from_ts`) reste l'heure annoncée : `free_at` ne
-                # dépend pas du plafond tant que l'usage reste sous lui.
-                crossing = gauge.free_at(now, cut, profile.pace_multiplier,
-                                         ceiling.end)
-                if crossing is not None and free >= ceiling.from_ts:
-                    free = max(ceiling.from_ts, crossing)
+                # #1506 (reprend #1227 N1) : le relèvement ne libère qu'une
+                # fois le rythme rattrapé sous le plafond relevé. Annoncer
+                # `from_ts` seul promettait une pause que l'usage ne tenait pas
+                # encore à cette heure-là ; l'heure juste est la plus tardive
+                # des deux, sans jamais dépasser la libération calculée au
+                # plafond courant.
+                raised = gauge.free_at(now, cut, profile.pace_multiplier,
+                                       ceiling.end)
+                if raised is not None:
+                    free = min(free, max(float(ceiling.from_ts), raised))
         dated.append((free, gauge))
     return max(dated, key=lambda pair: pair[0])
 
