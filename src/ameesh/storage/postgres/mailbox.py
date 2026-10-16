@@ -155,15 +155,19 @@ class Mailbox(interface.Mailbox):
         return self.db.query(
             """
             SELECT %s
-            FROM agent_mailbox
+            FROM agent_mailbox m
             WHERE recipient = %%s AND delivered_at IS NULL
               AND (payload @> '{"urgent": true}'::jsonb
                    OR payload @> '{"human": true}'::jsonb
                    OR payload @> '{"verdict": true}'::jsonb
                    OR payload @> '{"arbitration": true}'::jsonb)
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_registry v
+                  WHERE v.name = m.recipient AND (%s)
+              )
             ORDER BY id
             LIMIT %%s
-            """ % MAIL_COLUMNS,
+            """ % (MAIL_COLUMNS, self.ACTIVE_SQL),
             (recipient, int(limit)),
         )
 

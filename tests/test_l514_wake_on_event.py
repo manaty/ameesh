@@ -138,6 +138,31 @@ class MidTurnHookTest(_Base):
                 self.assertEqual(self._touched(name), 0)
                 self.assertEqual(len(self._pending(name)), 3)
 
+    def test_active_reservations_do_not_hide_the_next_eligible_message(self):
+        worker = self._leased("reserved-codex", "codex")
+        ids = [int(row["id"]) for row in self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, payload)"
+            " SELECT 'review', %s, 'Reserved verdict ' || i, '{\"verdict\":true}'::jsonb"
+            " FROM generate_series(1, 200) i RETURNING id", (worker.name,))]
+        mail.reserve(self.db, worker.name, worker.runner.runner_id, worker.epoch,
+                     "other-token", ids=ids, porteur="consigne", ttl_seconds=3600)
+        last = mail.send(self.db, "review", worker.name, "Verdict after reservations",
+                         payload={"verdict": True})
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=1)], [last])
+        out = self._hook(worker, "codex", "PostToolUse")
+        self.assertIn("Verdict after reservations", out)
+        self.assertNotIn("Reserved verdict", out)
+        self.assertEqual(len(self._pending(worker.name)), 200)
+        # A reservation from an old lease or an expired one is reclaimable.
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,epoch}', to_jsonb(%s::bigint)) WHERE id = %s",
+                        (worker.epoch - 1, ids[0]))
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,expire}', '0'::jsonb) WHERE id = %s", (ids[1],))
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=2)], ids[:2])
+
     def test_owner_mail_alone_interrupts_a_dsh_turn(self):
         for harness in ("deepseek", "codex"):
             with self.subTest(harness=harness):
