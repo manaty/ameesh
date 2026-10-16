@@ -4248,6 +4248,7 @@
     "resume",
     "set_dormant",
     "set_settings",
+    "state_lots_activity",
     "turns"
    ],
    "packages": [
