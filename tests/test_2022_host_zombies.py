@@ -71,6 +71,13 @@ class ThresholdTest(unittest.TestCase):
         for bad in (0, -3, "many", True, 2.5, "\u00b2", "\u0663", 10 ** 400, "1" + "0" * 400):
             self.assertEqual(resources.thresholds({"resources": {"max_zombies": bad}})
                              ["max_zombies"], 200, bad)
+        # more digits than Python converts to an integer (4300 by default):
+        # refused, never a ValueError out of the policy reader
+        # (#2120, codex #459 r4)
+        too_long = "1" + "0" * (resources.bytes_digit_limit() or 4300)
+        self.assertIsNone(resources.parse_count(too_long))
+        self.assertEqual(resources.thresholds({"resources": {"max_zombies": too_long}})
+                         ["max_zombies"], 200)
         self.assertEqual(resources.thresholds({"resources": {"max_zombies": " 75 "}})
                          ["max_zombies"], 75)
         self.assertEqual(resources.fmt_value("max_zombies", 200), "200")

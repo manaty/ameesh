@@ -252,7 +252,13 @@ def parse_count(value) -> int | None:
         text = value.strip()
         if not (text.isascii() and text.isdigit()):
             return None
-        value = int(text)
+        try:
+            value = int(text)
+        except ValueError:
+            # plus de chiffres que la limite de conversion des entiers de
+            # Python (4300 par défaut) : aucun compte, jamais une exception
+            # hors du lecteur de politique (#2120, codex #459 r4)
+            return None
     if not isinstance(value, int) or value <= 0:
         return None
     return value if finite_float(value) is not None else None
