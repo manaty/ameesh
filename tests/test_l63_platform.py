@@ -249,6 +249,108 @@ class PlatformTest(unittest.TestCase):
                     else:
                         self.assertEqual(platform.holders(__file__, "x"), [])
 
+    def test_allow_des_processus_illisibles(self):
+        """L230 : un processus illisible dont le `comm` ET l'`argv[0]` sont
+        dans `allow` n'est plus un doute (le ménage de /tmp peut conclure que
+        personne ne tient l'entrée) ; un nom emprunté d'un seul côté, ou
+        absent de la liste, reste un doute."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        uid = "%d %d %d %d" % ((os.getuid(),) * 4)
+        cas = (("nommé et annoncé", "gpg-agent", None, ("gpg-agent",), False),
+               ("nom absent de la liste", "gpg-agent", None, ("ssh-agent",), True),
+               ("argv emprunté", "gpg-agent", "/usr/bin/malveillant",
+                ("gpg-agent",), True),
+               ("comm emprunté", "node", "/usr/bin/gpg-agent", ("gpg-agent",), True),
+               ("allow vide", "gpg-agent", None, (), True))
+        for nom, comm, argv0, allow, doute in cas:
+            with self.subTest(nom):
+                racine = self._faux_proc(comm, uid)
+                if argv0:
+                    with open(os.path.join(racine, "4242", "cmdline"), "w") as fh:
+                        fh.write(argv0 + "\0")
+                with mock.patch.object(platform, "psutil", None), \
+                        mock.patch.object(platform.process, "PROC", racine), \
+                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                        mock.patch.object(platform.process, "service_managers",
+                                          return_value=frozenset()), \
+                        mock.patch.object(platform, "SYSTEM", "linux"):
+                    if doute:
+                        with self.assertRaises(platform.NotAvailable):
+                            platform.holders(__file__, "x", allow=allow)
+                    else:
+                        self.assertEqual(platform.holders(__file__, "x", allow=allow), [])
+
+    def test_allow_ne_cache_pas_un_detenteur_constate(self):
+        """L230 : `allow` ne lève que le DOUTE ; un processus lisible qui tient
+        le fichier reste rapporté, même nommé dans la liste."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        uid = "%d %d %d %d" % ((os.getuid(),) * 4)
+        racine = self._faux_proc("gpg-agent", uid)
+        # le pid 4242 redevient lisible : ses `fd` pointent le fichier examiné
+        os.chmod(os.path.join(racine, "4242", "fd"), 0o700)
+        preuve = os.path.realpath(__file__)
+        os.symlink(preuve, os.path.join(racine, "4242", "fd", "3"))
+        with mock.patch.object(platform, "psutil", None), \
+                mock.patch.object(platform.process, "PROC", racine), \
+                mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                mock.patch.object(platform.process, "service_managers",
+                                  return_value=frozenset()), \
+                mock.patch.object(platform, "SYSTEM", "linux"):
+            found = platform.holders(preuve, "x", allow=("gpg-agent",))
+        self.assertEqual([h["pid"] for h in found], [4242])
+        self.assertEqual(found[0]["why"], "open file")
+
+    def test_doubt_psutil_allow(self):
+        """L230, hors Linux : `allow` lève le doute par nom ET `argv[0]`."""
+        process = platform.process
+
+        class Uids:
+            effective = os.getuid()
+
+        class P:
+            def __init__(self, name, argv0):
+                self._name, self._argv0 = name, argv0
+
+            def status(self):
+                return "running"
+
+            def uids(self):
+                return Uids()
+
+            def name(self):
+                return self._name
+
+            def exe(self):
+                return "/usr/local/bin/" + self._name
+
+            def cmdline(self):
+                return [self._argv0]
+
+        class PS:
+            STATUS_ZOMBIE = "zombie"
+            AccessDenied = type("AccessDenied", (Exception,), {})
+            ZombieProcess = type("ZombieProcess", (Exception,), {})
+            NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+
+            def __init__(self, proc):
+                self._proc = proc
+
+            def Process(self, pid):
+                return self._proc
+
+        cas = (("nommé et annoncé", P("gpg-agent", "/usr/bin/gpg-agent"),
+                ("gpg-agent",), None),
+               ("nom absent", P("gpg-agent", "/usr/bin/gpg-agent"),
+                ("ssh-agent",), "4242 gpg-agent"),
+               ("argv différent", P("gpg-agent", "/usr/bin/autre"),
+                ("gpg-agent",), "4242 gpg-agent"))
+        for nom, proc, allow, attendu in cas:
+            with self.subTest(nom):
+                self.assertEqual(process._doubt_psutil(PS(proc), 4242, os.getuid(),
+                                                       allow), attendu)
+
     def test_un_processus_qui_se_termine_n_est_pas_un_doute(self):
         """CI #377 r2 : un `git` en fin de vie refuse son `fd` avant d'être
         zombie ; relu, il est zombie ou parti. Un détenteur vivant, lui,
