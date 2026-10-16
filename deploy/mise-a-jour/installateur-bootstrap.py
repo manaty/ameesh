@@ -69,7 +69,12 @@ class LinuxHost(account.LinuxAccounts):
                 missing.append(parent); parent=parent.parent
             runtime.trusted(parent)
             for item in reversed(missing):
-                item.mkdir(mode=mode if item==path else 0o755)
+                wanted=mode if item==path else 0o755
+                item.mkdir(mode=wanted)
+                # L1631: mkdir(2) applies the caller's umask, so a directory
+                # this call just created gets its reviewed mode exactly; an
+                # existing directory is never repaired (comment above).
+                os.chmod(item,wanted)
                 runtime.fsync_directory(item.parent)
             runtime.trusted(path)
             info=path.stat()
