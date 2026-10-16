@@ -76,11 +76,19 @@ def _systemctl(*args: str) -> str | None:
 
 
 def served_agents(cfg, db) -> list[dict]:
-    """Les agents que l'hôte doit mener : cet hôte, mode `execute`, non arrêtés."""
+    """Les agents que l'hôte doit mener : cet hôte, mode `execute`, non arrêtés.
+
+    `veille` (`watch.SENDER`) est l'identité d'ENVOI de la consigne de veille,
+    pas un agent mené par un exécuteur : une ligne de registre à ce nom — mode
+    `execute`, jamais de session, de tour ni de bail — faisait conclure au
+    doctor un harnais `other` inconnu (incident staging b9a2, 16/10). Elle est
+    écartée nommément ; un vrai agent au harnais inconnu garde son KO."""
+    from . import watch  # l'identité d'envoi de la veille (L121)
     return [row for row in registry.overview(db)
             if (row.get("host") or "") == (cfg.host or "")
             and (row.get("mode") or "execute") == "execute"
-            and row.get("status") != "stopped"]
+            and row.get("status") != "stopped"
+            and row.get("name") != watch.SENDER]
 
 
 def harness_report(agents: list[dict] | None = None) -> list[dict]:
@@ -178,27 +186,74 @@ def hook_commands(document) -> list[tuple[str, str]]:
 
 
 def _hook_binary(command: str) -> str:
-    """Le premier mot d'une commande de hook (guillemets respectés)."""
+    """Le premier mot brut : conserver les quotes qui protègent un `$`."""
     try:
-        parts = shlex.split(command)
+        shlex.split(command)
     except ValueError:
         parts = command.split()
-    return parts[0] if parts else ""
+        return parts[0] if parts else ""
+    word = re.match(r'''(?:[^\s'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+''',
+                    command.lstrip(), re.DOTALL)
+    return word.group(0) if word else ""
 
 
-def _binary_missing(binary: str, *, path: str | None = None) -> bool:
+#: variables d'environnement d'un chemin de hook : `$HOME` et `${HOME}`.
+_HOOK_VARIABLE = re.compile(r"\$(?:\{(?P<accolade>[A-Za-z0-9_]+)\}|(?P<nu>[A-Za-z0-9_]+))")
+
+
+def _hook_path(binary: str, environ=None) -> str:
+    """Le chemin d'un binaire de hook : `~` et les variables d'environnement
+    développés **sans exécuter de shell** (`$HOME`, `${HOME}`).
+
+    Les hooks installés écrivent `$HOME/.local/bin/agent-mail` ; `expanduser`
+    seul laisse `$HOME` littéral, le binaire passait donc pour absent (faux KO
+    du doctor, incident staging b9a2 du 16/10). Une variable non définie reste
+    littérale : le chemin est contrôlé tel quel et reste signalé absent — un
+    vrai binaire manquant n'est jamais masqué. Les quotes simples et les
+    échappements protègent les dollars littéraux ; les quotes doubles
+    permettent le développement, sans réinterpréter la valeur obtenue."""
+    environ = os.environ if environ is None else environ
+    binary = os.path.expanduser(binary)
+    chemin, quote, i = [], "", 0
+    while i < len(binary):
+        char = binary[i]
+        if char in "\"'" and quote in ("", char):
+            quote = "" if quote else char
+            i += 1
+            continue
+        if char == "\\" and quote != "'" and i + 1 < len(binary):
+            suivant = binary[i + 1]
+            if quote != '"' or suivant in '\\$"`\n':
+                if suivant != "\n":
+                    chemin.append(suivant)
+                i += 2
+                continue
+        if char == "$" and quote != "'":
+            variable = _HOOK_VARIABLE.match(binary, i)
+            if variable:
+                chemin.append(environ.get(variable.group("accolade")
+                                          or variable.group("nu"), variable.group(0)))
+                i = variable.end()
+                continue
+        chemin.append(char)
+        i += 1
+    return "".join(chemin)
+
+
+def _binary_missing(binary: str, *, path: str | None = None, environ=None) -> bool:
     """Le binaire d'une commande de hook est-il introuvable ? Un chemin
     (absolu ou avec un séparateur) est contrôlé sur place ; un nom seul passe
     par `path` s'il est fourni, sinon par le PATH ambiant — c'est le cas de
     l'incident du 2026-10-12 (`/usr/local/bin/agent-mail` absent, tous les
-    hooks en 127)."""
-    chemin = os.path.expanduser(binary)
+    hooks en 127). `$HOME`/`${HOME}` sont développés avant le contrôle
+    (`environ`, celui du doctor par défaut)."""
+    chemin = _hook_path(binary, environ)
     if os.sep in chemin:
         return not (os.path.isfile(chemin) and os.access(chemin, os.X_OK))
     return shutil.which(chemin, path=path or None) is None
 
 
-def _binary_missing_where(binary: str, manager_path: str) -> str:
+def _binary_missing_where(binary: str, manager_path: str, environ=None) -> str:
     """Où le binaire d'un hook est introuvable : la raison lisible, sinon "".
 
     Un nom seul est cherché dans **deux** contextes : le PATH de la session
@@ -210,12 +265,12 @@ def _binary_missing_where(binary: str, manager_path: str) -> str:
     binaire absent d'un contexte peut y sortir en 127 (#1395, avis bloquant
     cx2 : la résolution « gestionnaire seul » rendait ok un hook introuvable
     sous le PATH réel). Un chemin est contrôlé sur place, sans contexte."""
-    if os.sep in os.path.expanduser(binary):
-        return "not found" if _binary_missing(binary) else ""
+    if os.sep in _hook_path(binary, environ):
+        return "not found" if _binary_missing(binary, environ=environ) else ""
     missing = []
-    if _binary_missing(binary):
+    if _binary_missing(binary, environ=environ):
         missing.append("this session's PATH")
-    if manager_path and _binary_missing(binary, path=manager_path):
+    if manager_path and _binary_missing(binary, path=manager_path, environ=environ):
         missing.append("the systemd manager PATH")
     return "not found under %s" % " or ".join(missing) if missing else ""
 
@@ -235,7 +290,9 @@ def hook_lines(cfg, ids, environ=None) -> dict:
     # systemd (`adapters.systemd_manager_path`) ; le PATH réel du service
     # reste celui de son unité, donc un binaire absent de l'un des deux est
     # signalé : le gestionnaire seul ne prouve pas que le hook tournera
-    # (#1395, avis bloquant cx2). Le doctor reste en lecture seule."""
+    # (#1395, avis bloquant cx2). `$HOME`/`${HOME}` d'un chemin de hook sont
+    # développés sans shell (`_hook_path`), comme le fait le hook lui-même.
+    # Le doctor reste en lecture seule."""
     environ = os.environ if environ is None else environ
     lines: list[str] = []
     ok = True
@@ -277,13 +334,13 @@ def hook_lines(cfg, ids, environ=None) -> dict:
                     binaries.append(binary)
                 if not binary:
                     continue
-                where = _binary_missing_where(binary, manager_path)
+                where = _binary_missing_where(binary, manager_path, environ)
                 if where:
                     ok = False
                     lines.append("hooks      : %s KO — %s calls %s: %s (the hook "
                                  "exits 127: no delivery between two tool calls, "
                                  "no Stop)" % (harness, path, command, where))
-            if binaries and all(not _binary_missing_where(binary, manager_path)
+            if binaries and all(not _binary_missing_where(binary, manager_path, environ)
                                 for binary in binaries):
                 lines.append("hooks      : %s → %d event(s) (%s), %s"
                              % (harness, len(events), ", ".join(events),
