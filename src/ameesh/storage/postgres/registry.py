@@ -46,6 +46,7 @@ AGENT_COLUMNS = """
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
     extract(epoch from status_since)::float8         as status_since_ts,
+    extract(epoch from status_reason_since)::float8  as status_reason_since_ts,
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,

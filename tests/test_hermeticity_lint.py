@@ -119,6 +119,32 @@ class RulesTest(unittest.TestCase):
             "    note = 'hermeticity: allow — dans une chaîne'\n"
             "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
 
+    def test_punctuation_only_reason_does_not_exempt(self):
+        for reason in ("—", "-", ".", "... !?", "_", "( )"):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.rules(
+                    "import time\n"
+                    "def test_x(self):\n"
+                    f"    # hermeticity: allow — {reason}\n"
+                    "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
+
+    def test_exemption_ascii_separator_and_unicode_reason(self):
+        for reason in ("échéance contrôlée", "(échéance contrôlée)", "... 5 s"):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.rules(
+                    "import time\n"
+                    "def test_x(self):\n"
+                    f"    # hermeticity: allow - {reason}\n"
+                    "    self.assertLess(time.time() - debut, 5)\n"), [])
+
+    def test_exemption_inside_a_multiline_assertion(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    self.assertTrue(\n"
+            "        # hermeticity: allow - le banc mesure la garde de 5 s\n"
+            "        time.time() - debut < 5)\n"), [])
+
     def test_exemption_on_a_multiline_assertion(self):
         self.assertEqual(self.rules(
             "import time\n"

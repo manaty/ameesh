@@ -177,8 +177,9 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
       plus récent), `merged`, `delivered` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
     * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : l'auteur du
-      verdict courant, sinon le relecteur désigné du lot (`work_items.reviewer`,
-      #705), sinon l'auteur du dernier verdict ;
+      verdict courant ; sinon le relecteur désigné du lot
+      (`work_items.reviewer`, #705) ; sinon None — un verdict périmé ne
+      désigne personne (#1318) ;
     * `verdict_current` : le verdict retenu porte-t-il sur le dernier gel ?
       Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
       renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
@@ -267,11 +268,11 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # #705 : avant tout verdict — ou après un regel, le verdict précédent ne
     # vaut plus — le relecteur DÉSIGNÉ (`work move … qa --reviewer`) est celui
     # qu'on attend ; quand un verdict courant existe, c'est son auteur qui a
-    # réellement relu.
+    # réellement relu. #1318 : un verdict périmé ne désigne personne — sans
+    # relecteur désigné on attend « un relecteur (non désigné) », pas l'auteur
+    # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
-    reviewer = last["actor"] if last else None
-    if designated and not verdict_current:
-        reviewer = designated
+    reviewer = (last["actor"] if last else None) if verdict_current else designated
     return {
         "requested": requested,
         "frozen": freezes[0]["at_ts"] if freezes else None,
@@ -357,6 +358,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               now: float | None = None,
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
               messages_ts: float | None = None,
+              events_ts: float | None = None,
               planned_wait: dict | None = None,
               dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
@@ -366,7 +368,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
                      None)
-    last = stagnation.last_activity(item, events, declared or [], actions, messages_ts)
+    # `events` peut ne porter que les transitions (#1647) : `events_ts` rend
+    # le dernier instant du journal, notes comprises.
+    last = stagnation.last_activity(item, events, declared or [], actions, messages_ts,
+                                    events_ts=events_ts)
     now = time.time() if now is None else float(now)
     return {
         "id": int(item["id"]),
@@ -517,6 +522,32 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
 # budget
 # --------------------------------------------------------------------------
 
+def _effective_pace(gauges: list, accounts: list[dict] | None) -> dict:
+    """{(harnais, fenêtre) : (multiplicateur, plafond effectif)} (#1227 N3).
+
+    `accounts.report` porte le plafond effectif par compte (#1176) ;
+    `book.gauges()` ne nomme pas le compte de son relevé. On ne s'en sert donc
+    que quand un seul compte déclaré du harnais porte la fenêtre : plusieurs
+    comptes, ou aucune information, gardent le défaut (90 %, ×1) — jamais un
+    plafond attribué au hasard.
+    """
+    keys = {(g.harness, g.key) for g in gauges}
+    found: dict = {}
+    for row in accounts or []:
+        harness = row.get("harness")
+        multiplier = float(row.get("pace_multiplier") or 1.0)
+        for gauge in row.get("gauges") or []:
+            key = (harness, gauge.get("key"))
+            if key not in keys:
+                continue
+            ceiling = float(gauge.get("pace_ceiling") or cost_mod.PACE_CEILING)
+            if key in found and found[key] != (multiplier, ceiling):
+                found[key] = None            # plusieurs comptes : ambigu
+            else:
+                found.setdefault(key, (multiplier, ceiling))
+    return found
+
+
 def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
                  paid_harnesses: Iterable[str] | None = None,
                  hourly_cap: float = cost_mod.DEFAULT_HOURLY_USD,
@@ -582,11 +613,25 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     # `pace_cap` et `exceeded` ne décriraient plus aucun compte (R1 #1028,
     # P2). Le rendu texte écarte ces harnais, déjà montrés compte par compte ;
     # le JSON garde la même valeur qu'`accounts.report`.
+    # #1227 N3 : le plafond effectif du compte (#1176, relèvement de fin de
+    # fenêtre compris) accompagne son rythme ; les jauges du dossier par
+    # défaut ne reçoivent le réglage déclaré que s'il n'est pas ambigu (un
+    # seul compte porte la fenêtre) — jamais un plafond attribué au hasard.
     actifs = {row["harness"]: row for row in (accounts or []) if row.get("active")}
-    plans = [_plan_view(g, now, 1.0) for g in gauges if g.harness not in actifs]
+    settings = _effective_pace(gauges, accounts)
+    plans = []
+    for g in gauges:
+        if g.harness in actifs:
+            continue                    # rendu compte par compte ci-dessous
+        multiplier, ceiling = (settings.get((g.harness, g.key))
+                               or (1.0, cost_mod.PACE_CEILING))
+        plans.append(_plan_view(g, now, multiplier, ceiling))
     for harness, row in actifs.items():
         multiplicateur = float(row.get("pace_multiplier") or 1.0)
-        plans.extend(_plan_view(g, now, multiplicateur)
+        ceilings = {g.get("key"): float(g.get("pace_ceiling") or cost_mod.PACE_CEILING)
+                    for g in row.get("gauges") or []}
+        plans.extend(_plan_view(g, now, multiplicateur,
+                                ceilings.get(g.key, cost_mod.PACE_CEILING))
                      for g in row.get("_gauges") or [])
     return {
         "currency": "USD",
@@ -600,16 +645,17 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     }
 
 
-def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float) -> dict:
+def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float,
+               ceiling: float = cost_mod.PACE_CEILING) -> dict:
     """Un plan de `budget.plans` : la jauge et le rythme du même compte."""
     return {
         "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
-        "pace_cap": round(g.pace_cap(now, multiplier), 4),
+        "pace_cap": round(g.pace_cap(now, multiplier, ceiling), 4),
         "elapsed": round(g.elapsed(now), 4),
         "resets_ts": _round(g.resets_at), "window_s": g.window_s,
         # #1561 : quand le relevé a été produit (None : source non datée)
         "read_at": _round(getattr(g, "read_at", None)),
-        "exceeded": g.exceeded(now, multiplier=multiplier),
+        "exceeded": g.exceeded(now, multiplier=multiplier, ceiling=ceiling),
     }
 
 
@@ -738,8 +784,12 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     items.sort(key=lambda i: (i.get("created_ts") or 0, int(i["id"])))
     ids = [int(i["id"]) for i in items]
     events: dict = {}
-    for ev in st.lot_events(ids):
+    # #1647 : transitions seules ; le dernier instant du journal vient d'une
+    # agrégation, jamais de la lecture des notes.
+    for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
+    last_events = {int(r["work_item_id"]): r.get("last_ts")
+                   for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
         by_item.setdefault(int(row["work_item"]), []).append(row)
@@ -757,7 +807,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
-                      messages_ts=messages.get(int(item["id"])), agent_states=states,
+                      messages_ts=messages.get(int(item["id"])),
+                      events_ts=last_events.get(int(item["id"])), agent_states=states,
                       planned_wait=holds.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)

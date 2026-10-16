@@ -87,10 +87,15 @@ SOCKET_TIMEOUT = 15.0
 RATE_PER_MINUTE = 600
 #: lots listed at most (`?limit=`)
 MAX_LOTS = 500
+#: conversation page of an agent card (L83): default and hard bound
+CHAT_PAGE = 100
+MAX_CHAT = 500
 LANGUAGES = ("fr", "en")
 #: an agent, host or project name; a lot id; a thread entry id; a duration
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:+-]{0,127}$")
 _LOT_RE = re.compile(r"^[0-9]{1,9}$")
+#: a conversation cursor or page size (`?after=`, `?limit=`)
+_SEQ_RE = re.compile(r"^(0|[1-9][0-9]{0,15})$")
 _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
 _SINCE_RE = re.compile(r"^[0-9]{1,6}[mhdj]$|^[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:+.Z-]{0,20}$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
@@ -237,6 +242,24 @@ def _agent(ctx: Context, db, params, query) -> dict:
     return {"schema": "ameesh-agent-detail/1", "agent": row}
 
 
+def _chat(ctx: Context, db, params, query) -> dict:
+    """An agent's shared conversation, ascending from `after` (L83): the same
+    `ameesh-conversation/1` history `ameesh chat` reads. No relation filter
+    yet: the API's token is the machine owner's; filtering by the 0033 §9
+    relations arrives with the OIDC tokens of team mode (L86)."""
+    from . import conversation, registry
+    if registry.get(db, params["agent"]) is None:
+        raise ApiError(404, "not_found", "unknown agent")
+    after = _checked(_one(query, "after"), _SEQ_RE, "after")
+    limit = _checked(_one(query, "limit"), _SEQ_RE, "limit")
+    try:
+        return conversation.history(
+            db, params["agent"], after=int(after) if after is not None else 0,
+            limit=min(int(limit), MAX_CHAT) if limit is not None else CHAT_PAGE)
+    except ValueError as exc:
+        raise ApiError(400, "bad_query", str(exc)) from exc
+
+
 def _lots(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli, stagnation
     limit = _checked(_one(query, "limit"), _LOT_RE, "limit")
@@ -336,6 +359,12 @@ ROUTES = (
     Route(API + "/agents", "ameesh-agents/1", "Agents (`ameesh list --json`)", _agents),
     Route(API + "/agents/{agent}", "ameesh-agent-detail/1", "One agent (`ameesh show --json`)",
           _agent),
+    Route(API + "/agents/{agent}/chat", "ameesh-conversation/1",
+          "An agent's shared conversation (`ameesh chat <agent>`, L78/L83)", _chat,
+          query=(("after", {"type": "integer", "minimum": 0},
+                  "entries after this sequence number (default 0)"),
+                 ("limit", {"type": "integer", "minimum": 1, "maximum": MAX_CHAT},
+                  "entries at most (default %d)" % CHAT_PAGE))),
     Route(API + "/lots", "ameesh-lots/1", "Lots (`ameesh work list --json`)", _lots,
           query=(("state", {"type": "string"}, "state of the lots"),
                  ("assignee", {"type": "string"}, "assignee of the lots"), _LIMIT)),
@@ -381,6 +410,13 @@ def match(path: str) -> tuple[Route, dict] | None:
         if m:
             return route, _params(m)
     return None
+
+
+def _has_shape(items, path: str) -> bool:
+    """Whether `path` has the shape of one of `items`, its parameters NOT
+    checked (#1497 N4): it decides a 405 (the route exists, not for this
+    method) — a parameter refused there would turn it into a 400 `bad_path`."""
+    return any(item.regex.match(path) for item in items)
 
 
 def match_action(path: str) -> tuple[serve_actions.Action, dict] | None:
@@ -436,6 +472,17 @@ SCHEMAS = {
     "ameesh-agent-detail/1": _obj("ameesh-agent-detail/1", ["agent"],
                                   agent=_obj(None, ["name", "key_ready"], name=_STR,
                                              key_ready={"type": "boolean"})),
+    "ameesh-conversation/1": _obj(
+        "ameesh-conversation/1",
+        ["agent", "entries", "last_seq", "oldest_seq", "next_seq", "more", "gap"],
+        agent=_STR,
+        entries={"type": "array", "items": _obj(
+            None, ["seq", "kind", "author", "text", "ts"],
+            seq={"type": "integer"}, kind=_STR, author=_STR, text=_STR, ts=_NUM,
+            truncated={"type": "boolean"}, session=_STR_NULL, turn=_STR_NULL,
+            event_id=_STR_NULL, project=_STR, lot=_STR_NULL, meta=_OBJ)},
+        last_seq={"type": "integer"}, oldest_seq={"type": ["integer", "null"]},
+        next_seq={"type": "integer"}, more={"type": "boolean"}, gap={"type": "boolean"}),
     "ameesh-lots/1": _obj("ameesh-lots/1", ["lots"], lots={
         "type": "array", "items": _obj(None, ["id", "title", "state", "delays"],
                                        id={"type": "integer"}, title=_STR, state=_STR)}),
@@ -618,7 +665,8 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
         if row["status"] is None:
             return 409, _err("idempotency_in_progress",
                              "the first request with this Idempotency-Key has not answered, "
-                             "or its outcome is unknown: check before acting again"), False
+                             "or its outcome is unknown: check before acting again, then "
+                             "release the key with `ameesh serve --release-key KEY`"), False
         return row["status"], row["response"], True
     try:
         result = action.build(ctx, db, params, body)
@@ -629,7 +677,9 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
                              "by": ctx.human, "for": serve_actions.principal(ctx),
                              "result": result}
     # any other exception leaves the key reserved: the action may have been
-    # done, a retry must not do it twice (409 above)
+    # done, a retry must not do it twice (409 above). Once the human has
+    # checked, `ameesh serve --release-key KEY` frees it (#1497 N2) instead of
+    # waiting for the 24 h purge.
     if status >= 500:
         requests.release(ctx.human, key)
         return status, data, False
@@ -882,7 +932,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         found = match(url.path)
         if found is None:
-            if match_action(url.path) is not None:
+            if _has_shape(ACTIONS, url.path):
                 self._error(405, "method_not_allowed", "this route acts: POST",
                             (("Allow", "POST"),))
                 return
@@ -918,7 +968,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         found = match_action(url.path)
         if found is None:
-            if (match(url.path) is not None or url.path == WELL_KNOWN or url.path == UI
+            if (_has_shape(ROUTES, url.path) or url.path == WELL_KNOWN or url.path == UI
                     or url.path.startswith(UI + "/")):
                 self._error(405, "method_not_allowed", "this route reads: GET or HEAD",
                             (("Allow", "GET, HEAD"),))
@@ -991,26 +1041,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             bounds = self.read(lambda db: storage.of(db).events.bounds())
+            # An empty retained log still has a logical position: resetting
+            # below its watermark would reset again on every resume/wakeup.
+            head = max(bounds["head"], bounds["pruned"])
             # None: the cluster's identity is refused to this role, so no
             # resume can be trusted
             self._cluster = cluster = bounds["cluster"] or events.UNKNOWN_CLUSTER
             reset = None
             if resume is None:
-                position = bounds["head"]
+                position = head
             elif resume[1] != cluster or cluster == events.UNKNOWN_CLUSTER:
                 # `tx` orders within one cluster and timeline only: a logical
                 # restore or a point-in-time recovery starts again lower,
                 # below a position of the old one
-                position, reset = bounds["head"], "another cluster or timeline"
-            elif resume[0] > bounds["top"]:
+                position, reset = head, "another cluster or timeline"
+            elif resume[0] > max(bounds["top"], bounds["pruned"]):
                 # a position this base never gave: rebuilt, or another mesh
-                position, reset = bounds["head"], "unknown position"
+                position, reset = head, "unknown position"
             else:
                 position = resume[0]
                 # below the retention's watermark (the greatest position it
                 # deleted), events after this one may be gone
                 if position < bounds["pruned"]:
-                    reset = "events lost (retention)"
+                    position, reset = head, "events lost (retention)"
             self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1040,11 +1093,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _drain(self, position: tuple) -> tuple:
         """Sends the readable events after `position`: (new position, whether
-        anything was written, whether events wait for an open transaction)."""
-        wrote = False
+        anything was written, whether events wait for an open transaction,
+        whether the retention's watermark passed the position — events after
+        it may be gone, the client must reset)."""
+        wrote, lost = False, False
         while True:
-            rows, waiting = self.read(
+            rows, waiting, pruned = self.read(
                 lambda db: storage.of(db).events.readable(position, EVENTS_BATCH))
+            if position < pruned:
+                # #928/F6: the retention deleted events after this cursor
+                # while the stream was open; the rows below would silently
+                # skip them, so the caller resets. One statement, one
+                # snapshot: watermark and rows agree.
+                lost = True
             for row in rows:
                 row["tx"] = int(row["tx"])
             out = "".join(event_message(row, self._cluster) for row in rows
@@ -1055,7 +1116,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if rows:
                 position = (rows[-1]["tx"], int(rows[-1]["id"]))
             if len(rows) < EVENTS_BATCH:
-                return position, wrote, waiting
+                return position, wrote, waiting, lost
 
     def _follow(self, position: tuple) -> None:
         hub = self.hub
@@ -1065,7 +1126,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not hub.stopped and time.monotonic() - start < STREAM_MAX_S:
             if pending or waiting:
                 try:
-                    position, wrote, waiting = self._drain(position)
+                    position, wrote, waiting, lost = self._drain(position)
+                    if lost:
+                        # same frame as a resume below the watermark: the
+                        # client reloads, then follows from the new head
+                        bounds = self.read(lambda db: storage.of(db).events.bounds())
+                        position = max(bounds["head"], bounds["pruned"])
+                        self._write("id: %s\nevent: reset\ndata: %s\n\n" % (
+                            events.format_position(position, self._cluster),
+                            json.dumps({"reason": "events lost (retention)",
+                                        "first": bounds["first"],
+                                        "last": bounds["last"]})))
+                        wrote = True
                 except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
                     log.warning("event stream: database unavailable: %s", type(exc).__name__)
                     self._write("event: error\ndata: %s\n\n" % json.dumps(
@@ -1246,7 +1318,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--organisation", help="organisation named by /.well-known/ameesh")
     parser.add_argument("--openapi", action="store_true",
                         help="print the OpenAPI 3.1 document and exit")
+    parser.add_argument("--release-key", metavar="KEY",
+                        help="release an Idempotency-Key of the human whose action never "
+                             "answered (409 idempotency_in_progress), once its outcome has "
+                             "been checked, and exit; an answered key is never released")
     return parser
+
+
+def release_key(cfg, human: str, key: str) -> int:
+    """#1497 N2 : frees a reservation left by an action that raised (outcome
+    unknown), so the same request can be sent again with its key. Only an
+    unanswered reservation goes: a stored response stays (it is the replay)."""
+    if not _IDEMPOTENCY_RE.match(key or ""):
+        print("ameesh serve: invalid Idempotency-Key", file=sys.stderr)
+        return 2
+    try:
+        released = db_writer(cfg)(
+            lambda db: storage.of(db).api_requests.release(human, key))
+    except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
+        print("ameesh serve: database unavailable: %s" % exc, file=sys.stderr)
+        return 1
+    if not released:
+        print("ameesh serve: no unanswered reservation of %s for this key" % human,
+              file=sys.stderr)
+        return 1
+    print("ameesh serve: Idempotency-Key released for %s" % human)
+    return 0
 
 
 def dump_openapi() -> str:
@@ -1264,6 +1361,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_mod.load()
     try:
         human = owner(cfg, args.human)
+        if args.release_key is not None:
+            # no token: the database is the authority here, not the HTTP API
+            return release_key(cfg, human, args.release_key)
         path = token_file(args.token_file)
         token = load_token(path)
     except ValueError as exc:

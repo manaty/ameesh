@@ -10,6 +10,11 @@ _COLUMNS = ("id, type, object, project, data,"
             " extract(epoch from created_at)::float8 as ts")
 
 
+def _position(text) -> tuple:
+    """A "<tx>:<id>" watermark as a position; (0, 0) when there is none."""
+    return (0, 0) if not text else tuple(int(part) for part in text.split(":"))
+
+
 class Events(interface.Events):
 
     def record(self, type, object, project, data) -> int:
@@ -38,12 +43,15 @@ class Events(interface.Events):
         # poll and every replay batch. Sorted by `tx`, the deliverable rows
         # (tx < xmin) come first: the first row at or above xmin is the
         # block; at or above xmax it is another cluster (logical restore).
+        # #928/F6: the retention's watermark travels in the SAME statement, so
+        # a reader that a concurrent prune passed cannot silently skip.
         tx, last_id = position
         pos = (str(int(tx)), int(last_id))
         rows = self.db.query(
             "with s as materialized (select pg_snapshot_xmin(pg_current_snapshot()) as x,"
             "   pg_snapshot_xmax(pg_current_snapshot()) as m)"
-            " select (select x from s)::text as xmin, (select m from s)::text as xmax, r.*"
+            " select (select x from s)::text as xmin, (select m from s)::text as xmax,"
+            " (select tx::text || ':' || id from ameesh_events_pruned) as pruned, r.*"
             " from (values (true)) w(one) left join (select " + _COLUMNS
             + ", tx::text as tx from ameesh_events"
             "   where (tx, id) > (%s::text::xid8, %s)"
@@ -51,8 +59,9 @@ class Events(interface.Events):
             " order by r.tx::xid8, r.id",
             pos + (int(limit) + 1,))
         if not rows:
-            return [], None
+            return [], None, (0, 0)
         xmin, xmax, waiting = int(rows[0]["xmin"]), int(rows[0]["xmax"]), None
+        pruned = _position(rows[0]["pruned"])
         kept = []
         for row in rows:
             if row["id"] is None:            # the left join's only row: empty log
@@ -62,8 +71,8 @@ class Events(interface.Events):
                 waiting = "restore" if value >= xmax else "xmin"
                 break
             kept.append(row)
-        return ([{k: v for k, v in row.items() if k not in ("xmin", "xmax")}
-                 for row in kept[:int(limit)]], waiting)
+        return ([{k: v for k, v in row.items() if k not in ("xmin", "xmax", "pruned")}
+                 for row in kept[:int(limit)]], waiting, pruned)
 
     def bounds(self) -> dict:
         row = self.db.query(
@@ -78,23 +87,23 @@ class Events(interface.Events):
             "   order by tx, id limit 1) as oldest,"
             " (select tx::text || ':' || id from ameesh_events_pruned) as pruned,"
             " ameesh_events_cluster() as cluster")[0]
-
-        def position(text):
-            return (0, 0) if not text else tuple(int(part) for part in text.split(":"))
         return {"first": None if row["first"] is None else int(row["first"]),
-                "last": int(row["last"]), "head": position(row["head"]),
-                "top": position(row["top"]), "oldest": position(row["oldest"]),
-                "pruned": position(row["pruned"]), "cluster": row["cluster"]}
+                "last": int(row["last"]), "head": _position(row["head"]),
+                "top": _position(row["top"]), "oldest": _position(row["oldest"]),
+                "pruned": _position(row["pruned"]), "cluster": row["cluster"]}
 
-    def count_before(self, before_ts) -> int:
-        return int(self.db.query("select count(*) as n from ameesh_events"
-                                 " where created_at < to_timestamp(%s)",
-                                 (float(before_ts),))[0]["n"])
+    def count_before(self, days) -> int:
+        # `now()` (the database's clock) is the clock of the table's own
+        # guard: a host ahead of the base cannot have its deletion refused
+        return int(self.db.query(
+            "select count(*) as n from ameesh_events"
+            " where created_at < now() - make_interval(days => %s::int)",
+            (int(days),))[0]["n"])
 
-    def prune(self, before_ts, limit, timeout_s=None) -> int:
-        # by `created_at` (an event kept never stops it); the greatest
-        # position deleted raises the watermark in the SAME transaction; no
-        # SKIP LOCKED: the lock waits, bounded by `timeout_s`
+    def prune(self, days, limit, timeout_s=None) -> int:
+        # by `created_at`, on the database's clock (same clock as the guard);
+        # the greatest position deleted raises the watermark in the SAME
+        # transaction; no SKIP LOCKED: the lock waits, bounded by `timeout_s`
         with self.db.transaction() as tx:
             if timeout_s is not None:
                 # local to this transaction: a lock or a slow delete never
@@ -104,9 +113,10 @@ class Events(interface.Events):
                          " set_config('statement_timeout', %s, true)", (ms, ms))
             gone = tx.query(
                 "delete from ameesh_events where id in ("
-                " select id from ameesh_events where created_at < to_timestamp(%s)"
+                " select id from ameesh_events"
+                " where created_at < now() - make_interval(days => %s::int)"
                 " order by created_at, id limit %s) returning tx::text as tx, id",
-                (float(before_ts), int(limit)))
+                (int(days), int(limit)))
             if gone:
                 top = max((int(row["tx"]), int(row["id"])) for row in gone)
                 tx.execute(

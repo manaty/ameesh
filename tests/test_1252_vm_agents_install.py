@@ -52,7 +52,13 @@ command = command.replace('@@VMTMP@@', str(vmtmp))
 command = command.replace('$HOME/.config/ameesh/env', str(vmhome / '.config/ameesh/env'))
 with (state / 'ssh.log').open('a') as f:
     f.write(command.replace('\n', ' ') + '\n')
-sys.exit(subprocess.call(['bash', '-c', command], env=dict(os.environ, FAKE_REMOTE='1')))
+# Le poste doit voir le chemin de la VM (/tmp), pas le TMPDIR physique du
+# harnais : celui-ci peut contenir des caractères refusés côté distant (~).
+result = subprocess.run(['bash', '-c', command],
+                        env=dict(os.environ, FAKE_REMOTE='1'),
+                        stdout=subprocess.PIPE, text=True)
+sys.stdout.write(result.stdout.replace(str(vmtmp), '/tmp'))
+sys.exit(result.returncode)
 '''
 
 SCP = r'''#!/usr/bin/env python3
@@ -194,7 +200,8 @@ class VmAgentsHarness(unittest.TestCase):
     maxDiff = None
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1252-')
+        # Exerce aussi la séparation des chemins locaux/distants sur tout hôte.
+        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1252-~')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.state = self.root / 'state'
