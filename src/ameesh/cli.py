@@ -1473,10 +1473,13 @@ def _sweep_failed(result: dict) -> list[dict]:
 
     Un refus n'est un échec que si le destinataire refusé n'a été ni renvoyé
     (à un autre successeur) ni expiré : un premier successeur arrêté suivi
-    d'un successeur vivant rend donc 0, et le refus reste dit au rapport."""
+    d'un successeur vivant rend donc 0, et le refus reste dit au rapport. Un
+    refus portant sur l'ancien relancé (`old_relaunched`) n'en est pas un non
+    plus : sa boîte est de nouveau lue, son courrier lui sera remis."""
     settled = {action.get("old") for action in result["forwarded"]}
     settled |= {action.get("recipient") for action in result["expired"]}
-    return [refused for refused in result["refused"] if refused.get("old") not in settled]
+    return [refused for refused in result["refused"]
+            if refused.get("old") not in settled and not refused.get("old_relaunched")]
 
 
 def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:

@@ -814,6 +814,11 @@ class SweepTest(_Base):
                          [("claude3", "a-mort")])
         self.assertEqual(report["expired"], [])
         self.assertEqual(self.pending("claude3"), ["Rapport."])
+        # Le courrier sera lu par l'ancien relancé : ce refus n'est pas un
+        # échec du balayage (retour 0), il reste dit au rapport.
+        from ameesh import cli
+        self.assertTrue(report["refused"][0].get("old_relaunched"))
+        self.assertEqual(cli._sweep_failed(report), [])
 
     def test_cli_sweep_ne_rend_pas_1_quand_un_successeur_a_repris(self):
         """#1615/N1 : un refus réparé par un successeur suivant (courrier remis)

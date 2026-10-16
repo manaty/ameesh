@@ -762,7 +762,10 @@ def sweep(cfg, db, *, days=None, now=None, dry_run=False, actor="ameesh:mail-swe
             try:
                 moved = forward(cfg, db, name, target, actor=actor, now=now, dry_run=dry_run)
             except RefusedOld as exc:
-                report["refused"].append({"old": name, "new": target, "reason": str(exc)})
+                # `old_relaunched` : le courrier sera lu par l'ancien, ce refus
+                # n'est pas un échec du balayage (`cli._sweep_failed`).
+                report["refused"].append({"old": name, "new": target, "reason": str(exc),
+                                          "old_relaunched": True})
                 ancien_relance = True
                 break
             except Refused as exc:
