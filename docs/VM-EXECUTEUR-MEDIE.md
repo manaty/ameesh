@@ -125,10 +125,24 @@ La suite dépend de la cause (#1402) :
   active : un arrêt du garde (niveau 4) la trouve, la note dans
   `guard.stopped` et la redémarre après `restart_after_seconds`. Une sortie du
   superviseur avant le `stop_guest` du garde la lui aurait cachée.
-- porte périmée (garde absent ou arrêté) ou signal : le superviseur sort 0,
-  et seul l'opérateur le redémarre. Avant son premier lancement, une porte
-  périmée le fait seulement attendre : au démarrage de la VM, le garde n'a
-  pas encore forcément renouvelé un battement expiré par le redémarrage.
+- porte périmée (garde absent ou arrêté) : le superviseur arrête le
+  conteneur (arrêt observé) puis laisse au garde `STALE_RESUME_MAX_S`
+  (600 s, l'ordre de grandeur du `restart_after_seconds` par défaut) pour
+  renouveler son battement. Une porte fraîche revenue dans ce délai relance
+  l'exécuteur sans opérateur ; aucun lancement n'a lieu tant qu'elle reste
+  périmée. Une porte observée fraîche après l'échéance, même `stopped`,
+  ne rouvre pas la fenêtre. Passé le délai, il sort 0 et seul l'opérateur le redémarre :
+  une garde durablement absente reste visible, unité inactive. Le délai
+  se mesure à l'horloge monotone : un saut de l'heure murale ne l'allonge
+  ni ne le raccourcit (#1971). Pendant la fenêtre, l'unité est active sans
+  conteneur ; le journal le dit à l'entrée (`guard gate stale, executor
+  stopped; resuming if the guard renews within 600s`), au retour de la
+  porte (`guard gate fresh again`) et à l'échéance (`guard gate still
+  stale after 600s, exiting`) (#1972).
+- signal : le superviseur sort 0, et seul l'opérateur le redémarre. Avant
+  son premier lancement, une porte périmée le fait seulement attendre : au
+  démarrage de la VM, le garde n'a pas encore forcément renouvelé un
+  battement expiré par le redémarrage.
 
 Le journal donne le code brut de l'exécuteur et, pour une fin par signal, le
 nom du signal (`-9 (SIGKILL)`). Une telle fin reste traitée comme une erreur

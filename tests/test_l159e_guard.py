@@ -1450,6 +1450,163 @@ class DrainStopTest(unittest.TestCase):
             ["kill", "--signal=SIGKILL", "ameesh-guest-runner@*.service", "ameesh-job-*.scope"],
             ["stop", "ameesh-guest.slice"]])
 
+    def test_level_4_stops_the_guest_users_slice_too(self):
+        # R2 N2 (#1416) : le gestionnaire de l'utilisateur invité vit dans
+        # user-<uid>.slice (linger, `systemd-run --user`), hors de la slice
+        # invitée : un processus qu'un job y a laissé survit à l'arrêt de la
+        # slice seule. Le niveau 4 arrête donc aussi cette slice, et le
+        # gestionnaire arrêté est enregistré pour repartir avec l'invité.
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"),
+                    stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        stops = [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"]
+        self.assertIn(["ameesh-guest.slice"], stops)
+        self.assertIn(["user-998.slice"], stops)
+        self.assertEqual(sorted(enforcer.stopped["units"]),
+                         ["ameesh-guest-runner@1.service", "user@998.service"])
+
+    def test_a_stopped_user_manager_restarts_with_the_guest(self):
+        # R2 N2 : le gestionnaire relancé garde rootless Podman utilisable
+        # pour le job suivant ; un gestionnaire qui ne tournait pas n'est pas
+        # démarré pour autant.
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"),
+                    stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "show":
+                return mock.Mock(returncode=0, stdout=(
+                    "ActiveState=inactive\nInactiveEnterTimestampMonotonic=1000000\n"),
+                    stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        self.calls.clear()
+        enforcer.restart_stopped(2000.0)
+        starts = [c[3] for c in self.calls if len(c) > 3 and c[1] == "start"]
+        self.assertIn("user@998.service", starts)
+        self.assertIn("ameesh-guest-runner@1.service", starts)
+
+    def test_an_inactive_user_manager_is_not_stopped_nor_restarted(self):
+        # Seul ce que l'arrêt fait tomber revient : un gestionnaire déjà
+        # inactif n'est ni arrêté ni relancé (pas d'état créé par le garde).
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"),
+                    stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=3, stdout="inactive\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        self.assertIn(["user-998.slice"],
+                      [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"])
+        self.assertEqual(enforcer.stopped["units"],
+                         {"ameesh-guest-runner@1.service": 2000.0})
+
+    def test_level_4_stops_sessions_even_when_the_user_manager_is_inactive(self):
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"))
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=3 if argv[-1] == "user@998.service" else 0)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0], monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        self.assertIn(["systemctl", "stop", "user-998.slice"], self.calls)
+        self.assertNotIn("user@998.service", enforcer.stopped["units"])
+
+    def test_ci_only_host_uses_the_required_covering_agent_pattern(self):
+        # ci-runners.sh refuses prepare/enable/check unless agent_units covers
+        # ameesh-guest-ci@1.service (guard_covers); this is the admitted config.
+        self.cfg = dataclasses.replace(self.cfg, agent_units="ameesh-guest-*.service")
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                self.assertEqual(argv[-1], "ameesh-guest-*.service")
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-ci@1.service loaded active running guest\n"))
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0], monotonic=lambda: self.clock[0])
+        self.assertTrue(enforcer.stop_guest())
+        self.assertIn(["systemctl", "stop", "user-998.slice"], self.calls)
+        self.assertIn("ameesh-guest-ci@1.service", enforcer.stopped["units"])
+
+    def test_a_failed_user_manager_stop_is_retried_after_the_units_are_gone(self):
+        # R2 N2 : si l'arrêt de user-UID.slice échoue, le nouvel essai ne
+        # conclut pas au succès parce que les unités ont disparu : le
+        # gestionnaire dû est gardé et arrêté au tour suivant.
+        state = {"lists": 0, "stop": 0}
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                state["lists"] += 1
+                stdout = ("ameesh-guest-runner@1.service loaded active running guest\n"
+                          if state["lists"] == 1 else "")
+                return mock.Mock(returncode=0, stdout=stdout, stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            if argv[1] == "stop" and argv[2] == "user-998.slice":
+                state["stop"] += 1
+                return mock.Mock(returncode=0 if state["stop"] > 1 else 1,
+                                 stdout="", stderr="busy")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.at(enforcer, 2000.0)
+        self.assertFalse(enforcer.stop_guest())
+        self.assertNotIn("user@998.service", enforcer.stopped["units"])
+        self.at(enforcer, 2010.0)
+        self.assertTrue(enforcer.stop_guest())
+        stops = [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"]
+        self.assertEqual(stops.count(["user-998.slice"]), 2)
+        self.assertEqual(enforcer.stopped["units"],
+                         {"ameesh-guest-runner@1.service": 2000.0,
+                          "user@998.service": 2010.0})
+
     def test_acknowledged_drain_never_stops_the_guest(self):
         g = self.guard()
         g.step()

@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -1123,6 +1124,18 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("deposited configurations: 0 (one job each)", res.stdout)
         self.assertIn("check: every line ok", res.stdout)
 
+    def test_check_names_the_runner_prefix_as_an_infra_cut(self):
+        # R2 N3 : un job repris par le garde (niveaux 3/4) échoue sous un
+        # runner nommé `ameesh-nxl-<hôte>-<slot>` ; `--check` nomme ce
+        # préfixe, pour qu'un tel échec se lise comme une coupure d'infra et
+        # non comme un rouge de test.
+        self.prepared(1)
+        res = self.run_script("--check", "--count", "1")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("runner prefix: ameesh-nxl-", res.stdout)
+        self.assertIn("a job the guard stops is an infra cut, not a test red",
+                      res.stdout)
+
     def test_check_refuses_a_dead_credential_left_on_disk(self):
         # un `.runner`/`.credentials` laissé par une exécution tuée est le
         # credential durable que l'option A supprime : KO, chemin nommé
@@ -1159,6 +1172,117 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("KO ameesh-guest can read /home/runner/r1/.credentials",
                       res.stderr)
+        # R2 N4 : la sonde éprouve que l'invité ne lit pas les secrets de
+        # l'application — un job ameesh ne peut pas se faire passer pour un
+        # runner Nexlink. La direction inverse (un job de l'application qui
+        # lirait les secrets ameesh) est le constat B1, pas cette sonde.
+        self.assertIn("an ameesh job could impersonate an application runner",
+                      res.stderr)
+        self.assertNotIn("an application job could impersonate the ameesh runner",
+                         res.stdout + res.stderr)
+
+    def test_check_refuses_a_directory_the_guest_can_traverse(self):
+        # R2 N5 : `test -r` sur un dossier n'éprouve pas la traversée. Un
+        # dossier non lisible mais traversable laisse atteindre ses chemins
+        # prévisibles : la sonde doit le refuser.
+        self.prepared(1)
+        self.write("home/runner/r1/_work/nexlink", "")
+        res = self.run_script("--check", "--count", "1",
+                              CI_RUNNERS_TEST_GUEST_TRAVERSES="/home/runner/r1/_work")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("KO ameesh-guest can read /home/runner/r1/_work", res.stderr)
+
+    def test_check_refuses_a_directory_the_test_user_can_only_traverse(self):
+        # Même constat, sans seam : un `_work` en 0311 (propriétaire : --x)
+        # n'est pas lisible mais reste traversable ; `test -r` seul le
+        # laissait passer. Run réel non-root, le shim `runuser` exécute la
+        # sonde pour de vrai.
+        self.prepared(1)
+        self.write("home/runner/r1/_work/nexlink", "")
+        os.chmod(os.path.join(self.host, "home/runner/r1/_work"), 0o311)
+        res = self.real_run("--check", "--count", "1")
+        self.assertIn("KO ameesh-guest can read /home/runner/r1/_work",
+                      res.stdout + res.stderr)
+
+    def test_check_probes_the_declared_runner_working_directories(self):
+        # R2 N6 : la sonde ne suppose plus /home/runner ; le WorkingDirectory
+        # déclaré par les unités `actions.runner.*` est sondé aussi.
+        self.prepared(1)
+        self.write("opt/app/runner/r7/.credentials", "secret\n", mode=0o600)
+        res = self.run_script("--check", "--count", "1",
+                              CI_RUNNERS_TEST_APP_DIRS="/opt/app/runner")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("ok ameesh-guest cannot read /opt/app/runner", res.stdout)
+        self.assertIn("ok ameesh-guest cannot read /opt/app/runner/r7/.credentials",
+                      res.stdout)
+        res = self.run_script("--check", "--count", "1",
+                              CI_RUNNERS_TEST_APP_DIRS="/opt/app/runner",
+                              CI_RUNNERS_TEST_GUEST_READS="/opt/app/runner/r7/.credentials")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("KO ameesh-guest can read /opt/app/runner/r7/.credentials",
+                      res.stderr)
+
+    def snapshot_block(self):
+        """Le bloc python de `snapshot` (R2 N1) : extrait du script pour
+        l'éprouver sur des sources que le banc ne peut pas planter sans root
+        (lien, FIFO, fichier qui grossit)."""
+        with open(SCRIPT, encoding="utf-8") as fh:
+            text = fh.read()
+        match = re.search(r"<<'PYSNAP'\n(.*?)\nPYSNAP\n", text, re.S)
+        self.assertIsNotNone(match, "the bounded snapshot block is missing")
+        # l'appel du cache passe bien par cette copie bornée
+        self.assertIn('snapshot "$(at "$tarball_in")" "$stage"', text)
+        return match.group(1)
+
+    def snap(self, block, src, dst, limit=1 << 20):
+        return subprocess.run([sys.executable, "-", src, dst, str(limit)],
+                              input=block, capture_output=True, text=True, timeout=20)
+
+    def test_the_archive_snapshot_refuses_a_link_a_device_and_an_oversize(self):
+        # R2 N1 : le cache vit sous $ROOT, que l'invité possède ; entre le
+        # contrôle de lien et un `cat`, il peut le remplacer par un lien
+        # (lecture root d'un fichier arbitraire) ou par /dev/zero. La copie
+        # ouvre la source en O_NOFOLLOW, n'accepte qu'un fichier régulier et
+        # borne ce qu'elle lit.
+        block = self.snapshot_block()
+        work = os.path.join(self.host, "snap")
+        os.makedirs(work)
+        real = os.path.join(work, "real.bin")
+        with open(real, "wb") as fh:
+            fh.write(b"archive-bytes")
+        dst = os.path.join(work, "out.bin")
+        res = self.snap(block, real, dst)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(dst, "rb") as fh:
+            self.assertEqual(fh.read(), b"archive-bytes")
+        link = os.path.join(work, "link.bin")
+        os.symlink(real, link)
+        res = self.snap(block, link, dst)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("without following a link", res.stderr)
+        fifo = os.path.join(work, "fifo.bin")
+        os.mkfifo(fifo)
+        res = self.snap(block, fifo, dst)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("not a regular file", res.stderr)
+        big = os.path.join(work, "big.bin")
+        with open(big, "wb") as fh:
+            fh.write(b"x" * 20)
+        res = self.snap(block, big, dst, limit=10)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("larger than 10 bytes", res.stderr)
+
+    def test_archive_snapshot_refuses_a_symlinked_parent(self):
+        # O_NOFOLLOW on the leaf alone still follows a replaced cache directory.
+        work = os.path.join(self.host, "snap-parent")
+        os.makedirs(os.path.join(work, "private"))
+        real = os.path.join(work, "private", "runner.tar.gz")
+        with open(real, "wb") as fh:
+            fh.write(b"private-bytes")
+        os.symlink(os.path.join(work, "private"), os.path.join(work, "cache"))
+        res = self.snap(self.snapshot_block(), os.path.join(work, "cache", "runner.tar.gz"),
+                        os.path.join(work, "out.bin"))
+        self.assertNotEqual(res.returncode, 0, "a substituted ancestor must be refused")
 
     def gate_document(self, state="stopped"):
         return self.write("run/ameesh-gate/state/state.json", json.dumps(
@@ -1412,7 +1536,15 @@ class WorkflowRoutingTest(unittest.TestCase):
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]
-        self.assertEqual(jobs[self.REQUIRED].get("name"), self.REQUIRED)
+        # #1635 : hors lancement à la main, le check requis garde le nom
+        # « tests » ; une exécution `workflow_dispatch` publie
+        # « tests (dispatch) », jamais le contexte requis d'une PR (nom
+        # dynamique admis par le pilote).
+        name = str(jobs[self.REQUIRED].get("name"))
+        if name.startswith("${{"):
+            self.assertIn("|| 'tests'", name)
+        else:
+            self.assertEqual(name, self.REQUIRED)
         closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
         self.assertEqual(closure, {"plan", "version", "psycopg", "psql",
                                    "platform-macos", "doc-readers", "fs-class", "tests"})

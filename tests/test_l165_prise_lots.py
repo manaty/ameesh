@@ -453,6 +453,26 @@ class PriseDeLotTest(_Lots):
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
         self.assertEqual(self.courriers(), [])
 
+    def test_assign_if_holder_refuse_un_titulaire_change(self):
+        """#2016 : la réassignation porte le titulaire lu (`if_holder`) ; si le
+        lot a changé de main depuis le relevé, elle est refusée en nommant le
+        porteur courant — deux agents partis du même brief ne se volent plus le
+        lot."""
+        self.agent("claude1", team="nexlink")
+        self.agent("claude2", team="nexlink")
+        lot = self.lot("course d'assignation", assignee="claude1")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.assign(self.db, lot["id"], "claude2", if_holder="claude3")
+        self.assertIn("changed holder since the reading", str(ctx.exception))
+        self.assertIn("now claude1 (expected claude3)", str(ctx.exception))
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "claude1")
+        # le titulaire attendu est bien celui du relevé : la réassignation passe
+        out = work.assign(self.db, lot["id"], "claude2", if_holder="claude1")
+        self.assertEqual(out["item"]["assignee"], "claude2")
+        # sans instantané, le geste explicite reste possible (comportement inchangé)
+        out = work.assign(self.db, lot["id"], "claude1")
+        self.assertEqual(out["item"]["assignee"], "claude1")
+
 
 class NotifyTest(_Lots):
     def test_passage_de_notify_et_reglages(self):
