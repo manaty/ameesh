@@ -1128,38 +1128,6 @@ class AgentWorker(threading.Thread):
                 self.stop_group_now("restart requested", grace=1.0)
                 return
 
-    def yield_to_host(self, reason: str) -> None:
-        """Porte d'hôte (L112) : l'échéance du retrait est atteinte, ou l'hôte
-        s'arrête — le tour en cours s'arrête (point de passage unique, grâce
-        brève) ; sa consigne repartira en attente, la session est gardée."""
-        self.host_yield = reason
-        self.wake.set()
-        threading.Thread(target=self.stop_group_now, args=("l'hôte se retire : %s" % reason,),
-                         kwargs={"grace": 1.0}, daemon=True,
-                         name="%s-retrait" % self.name).start()
-
-    def _leave_for_host(self) -> None:
-        """Porte d'hôte fermée (L112) : plus aucun tour ici. État de la
-        session écrit, consigne éventuelle remise en attente, statut dit ;
-        le bail est rendu par `run()` en sortant. Écritures au mieux : si le
-        réseau est déjà coupé, le bail échoit seul et le courrier sera
-        re-livré, signalé."""
-        gate = getattr(self.runner, "host_gate", None)
-        etat = gate.current if gate is not None else None
-        texte = "hôte indisponible (%s, %s) : reprise au retour de l'hôte" % (
-            etat.state if etat else "?", etat.reason if etat else "?")
-        log_async("[%s] l'hôte se retire : bail rendu (%s)" % (self.name, texte))
-        if self.lease_lost.is_set():
-            return
-        try:
-            if self._session_en_attente is not None:
-                self._enregistre_session()
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            row = registry.get(self.db, self.name) or {}
-            if row.get("status") in ("running", "idle", "queued"):
-                registry.set_status(self.db, self.name, "queued", status_text=texte)
-        except db_mod.DbError as exc:
-            log_async("[%s] état de retrait non écrit (%s)" % (self.name, db_mod.explain(exc)))
     def _audit_deadline_monitor(self, done: threading.Event, deadline: float) -> None:
         """L234 : échéance monotone indépendante du flux et de la base.
 
