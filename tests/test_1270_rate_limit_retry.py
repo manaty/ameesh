@@ -508,6 +508,37 @@ class TourDeRepriseTest(unittest.TestCase):
                 mock.patch("ameesh.runner.account_turn.continuity", return_value=True):
             return w._pick()
 
+    def _peek(self, w):
+        """#1593: the wake decision alone (`peek`), without `pick`/`_pick`.
+
+        Registry and mail neutralised, nothing pending, idle nudge not due
+        (`nudged`): only the retry deadline can wake the worker here."""
+        with mock.patch("ameesh.runner.registry.get", return_value={"status": "blocked"}), \
+                mock.patch("ameesh.runner.mail.unread_active", return_value=[]):
+            return w.peek()
+
+    def test_peek_wakes_at_the_retry_deadline(self):
+        # #1593: direct witness of the wake by `peek()` on `retry_due`. A
+        # regression that drops the deadline from `peek()` leaves the `pick()`
+        # and `_pick()` cases above green: only this one sees it.
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() - 1)
+        self.assertTrue(w.retry_due())
+        self.assertFalse(w.idle_due())  # nothing else can wake it here
+        self.assertTrue(self._peek(w))
+
+    def test_peek_does_not_wake_before_the_deadline(self):
+        # Counter-witness: a deadline still ahead does not wake it…
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() + 60)
+        self.assertFalse(w.retry_due())
+        self.assertFalse(self._peek(w))
+
+    def test_peek_does_not_wake_on_an_exhausted_quota(self):
+        # …and an exhausted quota, even past its deadline, does not either
+        # (L48): `peek` follows `retry_due`, not the cadence alone.
+        w = self._worker(rate_limit.QUOTA, time.time() - 1)
+        self.assertFalse(w.retry_due())
+        self.assertFalse(self._peek(w))
+
     def test_echeance_passee_lance_un_tour_de_reprise(self):
         w = self._worker(rate_limit.RATE_LIMITED, time.time() - 1)
         self.assertTrue(w.retry_due())
