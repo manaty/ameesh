@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #2097 — conclusion des checks « tests (flux) » quand l'agrégat n'a pas tourné.
+#
+# Le balayage #856 vit dans le job agrégé `tests` de tests.yml. GitHub ne
+# démarre jamais un job encore en file quand l'exécution est annulée :
+# `always()` n'y change rien. Un run annulé avant l'agrégat — poussée
+# remplacée, annulation à la main — laissait donc les checks « tests (flux)
+# <part> » dont l'étape `close` n'a pas tourné `in_progress` pour toujours
+# (run 38917093257, tête 7c0b34b195b9 : deux checks sur cinq encore en cours) ;
+# aucun jeton utilisateur ne peut les conclure (403 « You must authenticate via
+# a GitHub App. » : ils appartiennent à l'application GitHub Actions), et le
+# relevé d'exploitation les lit comme une CI encore active.
+#
+# Cette garde se déclenche APRÈS la conclusion du run (`workflow_run`), quand
+# plus rien ne peut être annulé, et rejoue le même balayage sur la tête du run
+# terminé. Elle couvre les deux porteurs de la suite : `tests` (push main ou
+# release, dispatch, PR) et `paquet` (workflow_call du portier #1410, dont
+# l'exécution ne produit aucun événement `tests`).
+#
+# Le balayage est celui de `scripts/ci-flow.py sweep` (#856) : il ne conclut
+# que les checks de flux dont le job et l'exécution sont terminaux, jamais
+# `success` sans ligne `fin`, ni un check d'une autre tête ou d'une tentative
+# vivante. Les checks de flux ne sont pas requis : la porte de fusion est
+# inchangée.
+#
+# Le fichier doit vivre sur la branche par défaut pour que `workflow_run` se
+# déclenche ; `actions/checkout` y prend donc le code de la branche par défaut,
+# jamais celui de la PR : le jeton `checks: write` n'exécute que du code de
+# confiance (même règle que relance-hosted, #987). Il tourne sur
+# `ubuntu-latest` : la flotte auto-hébergée est justement ce dont la
+# saturation (#747) a laissé les checks orphelins, une garde qui attendrait un
+# runner de la flotte ne s'exécuterait pas. Le dépôt est public : ce runner
+# standard n'est pas facturé (canon §3).
+name: flux orphelins
+
+on:
+  workflow_run:
+    workflows: ["tests", "paquet"]
+    types: [completed]
+
+# lecture seule au niveau du workflow ; le job ajoute ce qu'il lui faut.
+permissions:
+  contents: read
+
+# les gardes d'une même exécution ne se croisent pas (un événement `workflow_run`
+# peut être rejoué à la main, #1002) ; deux exécutions distinctes ont chacune
+# leur tête et leur balayage.
+concurrency:
+  group: flux-orphelins-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: conclusion des checks de flux orphelins
+    # un run vert a déjà balayé dans son agrégat (`if: always()`) ; on ne
+    # repasse que sur les conclusions qui peuvent avoir laissé un orphelin :
+    # `cancelled` (agrégat jamais démarré), `failure` ou `timed_out` (agrégat
+    # interrompu ou balayage incomplet).
+    if: github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read   # actions/checkout, branche par défaut
+      actions: read    # relire l'état terminal du job et de l'exécution
+      checks: write    # conclure les checks « tests (flux) » orphelins
+    steps:
+      - uses: actions/checkout@v4
+      - name: réconciliation des checks de flux
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `--sha` : la tête du run terminé, jamais `GITHUB_SHA` (la branche par
+        # défaut pour un événement `workflow_run`). Borné (`timeout 480`,
+        # `--max-duration 420`) sous le plafond de 10 min du job : un balayage
+        # lent s'arrête entre deux checks, les restants seront vus au passage
+        # suivant.
+        run: >-
+          timeout 480 python3 scripts/ci-flow.py sweep
+          --sha "${{ github.event.workflow_run.head_sha }}"
+          --max-duration 420
