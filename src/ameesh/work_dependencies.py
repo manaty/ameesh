@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from . import storage, work
 
@@ -169,7 +170,17 @@ def wait_label(wait):
     if wait["what"] == "scheduled":
         return "planned start %s" % wait["start"]
     if wait["what"] == "hold":
-        return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
+        if wait.get("gate"):
+            return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
+        # #1664 : le hold déclaré, avec son auteur et sa date (le pilote juge
+        # sur pièce s'il tient toujours).
+        label = "hold"
+        if wait.get("by"):
+            label += " by %s" % wait["by"]
+        if wait.get("since"):
+            label += " since %s" % time.strftime("%Y-%m-%d %H:%M",
+                                                 time.localtime(float(wait["since"])))
+        return label
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 

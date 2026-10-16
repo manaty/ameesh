@@ -2581,7 +2581,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_expire.add_argument("--actor", default="")
     pw_expire.set_defaults(func=cmd_work)
 
-    pw_note = work_sub.add_parser("note")
+    pw_note = work_sub.add_parser(
+        "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text")
     pw_note.add_argument("--actor", default="")
