@@ -3957,7 +3957,7 @@
   }
  ],
  "refused": {
-  "interface_total": 412,
+  "interface_total": 413,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4228,6 +4228,7 @@
     "adopt",
     "assigners",
     "gauge_history",
+    "gauge_latest",
     "latest_gauges",
     "listing",
     "open_lots_activity",
