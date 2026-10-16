@@ -1733,8 +1733,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
-                               actor=args.actor, migration_landed=args.migration_landed,
-                               cfg=cfg)
+                               actor=args.actor, repo=args.repo,
+                               migration_landed=args.migration_landed, cfg=cfg)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
             elif done["result"] == "landed":
@@ -1743,6 +1743,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             else:
                 print("lot #%d → merged (commit %s, declared by %s)" % (
                     args.id, args.sha.strip().lower()[:12], args.actor))
+                print("%s: %s" % (done["item"].get("app") or "?", done["item"]["title"]))
             return 0
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
@@ -2656,6 +2657,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="the migration number that actually landed (L122/#1567), when "
                                 "the landing renumbered the reservation; recorded with the "
                                 "merge, or corrected on an already merged lot")
+    pw_merged.add_argument("--repo", default=None,
+                           help="local clone of the lot's repository (origin verified); no fetch")
     pw_merged.add_argument("--note", default="")
     pw_merged.add_argument("--actor", default="",
                            help="default: the session's bound identity (AGENT_MAIL_NAME)")
