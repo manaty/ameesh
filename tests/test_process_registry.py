@@ -10,13 +10,20 @@ sélectionne psycopg ou psql par `AMEESH_DRIVER`) :
   bail échu, course avec une révocation (la ligne du registre est tenue
   `FOR SHARE` pendant toute la transaction) ;
 * retenues `blocked`/`waiting_human` (cette dernière exige une demande de
-  décision native ouverte), reprise, terminal jamais rouvert, boucle de
-  réparation bornée ;
-* transfert de révision explicite, jamais automatique, sans régression ;
+  décision native ouverte, et une réponse avant reprise) : entrée et sortie
+  passent par le vérificateur réservé `hold` (tranche C : `verify_hold`), une
+  avance depuis une retenue est refusée (`held`), terminal jamais rouvert
+  (même par adoption), boucle de réparation bornée ;
+* transfert de révision explicite, jamais automatique, sans régression ni
+  changement de cœur natif, sans injection de vérificateurs par l'appelant
+  (l'API publique ne lit que le registre installé) ;
 * annulation sans demi-événement (trigger qui casse l'UPDATE), historique
-  existant intact, lots sans workflow inchangés ;
-* contraintes de la migration additive 0452 (reçu complet, unicité partielle
-  (lot, clé)).
+  existant intact, lots sans workflow inchangés ; `work.move`/`work.close`/
+  `work.close_merged` refusent un lot pinné (le registre est la seule
+  écriture) ;
+* contraintes de la migration additive 0452 : reçu complet exigé `IS TRUE`
+  (toute clé absente ou `null` imbriqué est refusé), unicité partielle
+  (lot, clé).
 
 Les organisations et agents sont fictifs (`acme`). Aucune activation :
 `INSTALLED_VERIFIERS` est vide par défaut, les tests injectent leurs
@@ -32,6 +39,7 @@ import uuid
 from dataclasses import dataclass
 
 from ameesh import process_registry as pr
+from ameesh import storage
 from ameesh import work
 from ameesh.db import DbError
 
@@ -41,6 +49,11 @@ try:  # tranche A (#1918), pas encore fusionnée au moment d'écrire ces tests
     from ameesh import process_workflow as pw
 except ImportError:  # pragma: no cover - dépend de l'état de main
     pw = None
+
+try:  # tranche C (#1924), pas encore fusionnée au moment d'écrire ces tests
+    from ameesh import process_verifiers as pv
+except ImportError:  # pragma: no cover - dépend de l'état de main
+    pv = None
 
 ACME_REF = "acme/process-workflow@0f1e2d3c"
 ACME_VERSION = 3
@@ -130,6 +143,12 @@ class RegistryTest(PgTestCase):
             return pr.Verification(ok=True, reason="transfert relu")
 
         self.verifiers[pr.TRANSFER_VERIFIER] = transfer
+
+        def hold(context):
+            self.calls.append(pr.HOLD_VERIFIER)
+            return pr.Verification(ok=True, reason="retenue relue")
+
+        self.verifiers[pr.HOLD_VERIFIER] = hold
         self.agent(ACME_ACTOR, lease_owner=ACME_RUNNER, epoch=ACME_EPOCH)
 
     # -- fabriques ---------------------------------------------------------
@@ -187,8 +206,10 @@ class RegistryTest(PgTestCase):
             evidence=dict(facts or {}))
 
     def apply(self, command, *, spec=None, verifiers=None):
-        return pr.apply_command(self.db, command, spec=spec or self.spec,
-                                verifiers=self.verifiers if verifiers is None else verifiers)
+        # `_apply` : injection réservée au banc ; l'API publique ne prend que
+        # les vérificateurs installés (`install_verifier`).
+        return pr._apply(self.db, command, spec=spec or self.spec,
+                         verifiers=self.verifiers if verifiers is None else verifiers)
 
     @contextlib.contextmanager
     def refusal(self, code: str):
@@ -255,8 +276,8 @@ class RegistryTest(PgTestCase):
         first = self.apply(cmd)
         fresh = self.connect()                      # connexion neuve
         try:
-            again = pr.apply_command(fresh, cmd, spec=self.spec,
-                                     verifiers=self.verifiers)
+            again = pr._apply(fresh, cmd, spec=self.spec,
+                              verifiers=self.verifiers)
         finally:
             fresh.close()
         self.assertTrue(again.replayed)
@@ -292,7 +313,12 @@ class RegistryTest(PgTestCase):
     def test_ecriture_legacy_invalide_la_version(self):
         lot = self.pinned()
         first = self.apply(self.command(lot))
-        work.move(self.db, lot, "blocked", actor=ACME_ACTOR)   # journal legacy
+        # `work.move` refuse désormais un lot pinné (revue B3) : le banc écrit
+        # la ligne de journal legacy directement — c'est le journal, pas le
+        # compteur de reçus, qui fait foi pour la version attendue.
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " VALUES (%s, 'blocked', 'legacy', %s)", (lot, ACME_ACTOR))
         self.assertGreater(self.journal_version(lot), first.version)
         stale = self.command(lot, frm="implementation", to="review",
                              guard="review_requested", version=first.version)
@@ -321,6 +347,14 @@ class RegistryTest(PgTestCase):
         # le reçu existe, mais un acteur révoqué ne le récupère pas
         self.assertEqual(len(self.events(lot)), 1)
         self.assertEqual(first.event_id, self.events(lot)[0]["id"])
+
+    def test_acteur_dead_refuse(self):
+        lot = self.pinned()
+        self.db.execute("UPDATE agent_registry SET status = 'dead' WHERE name = %s",
+                        (ACME_ACTOR,))
+        with self.refusal("authority-revoked"):
+            self.apply(self.command(lot))
+        self.assertEqual(self.events(lot), [])
 
     def test_epoque_perimee_refuse_meme_un_rejeu(self):
         lot = self.pinned()
@@ -373,7 +407,7 @@ class RegistryTest(PgTestCase):
         def run():
             db = self.connect()
             try:
-                outcome.append(pr.apply_command(
+                outcome.append(pr._apply(
                     db, self.command(lot), spec=self.spec,
                     verifiers={"planning": blocking}))
             except Exception as exc:                     # pragma: no cover - diagnostic
@@ -480,7 +514,8 @@ class RegistryTest(PgTestCase):
         self.assertEqual(held.workflow_stage, "implementation")
         self.assertEqual(self.row(lot)["workflow_stage"], "implementation")
         evidence = self.events(lot)[-1]["evidence"]
-        self.assertFalse(evidence["verification"]["required"])
+        self.assertTrue(evidence["verification"]["required"])
+        self.assertEqual(evidence["verification"]["verifier"], pr.HOLD_VERIFIER)
         with self.refusal("hold-redundant"):
             self.apply(self.command(lot, action="hold", hold="blocked",
                                     frm="", to="", guard="", version=held.version))
@@ -488,6 +523,9 @@ class RegistryTest(PgTestCase):
                                            guard="", version=held.version))
         self.assertEqual(released.state, "build")
         self.assertEqual(released.workflow_stage, "implementation")
+        reprise = self.events(lot)[-1]["evidence"]
+        self.assertTrue(reprise["verification"]["required"])
+        self.assertEqual(reprise["verification"]["verifier"], pr.HOLD_VERIFIER)
 
     def test_reprise_sans_retenue_refusee(self):
         lot = self.pinned()
@@ -514,12 +552,147 @@ class RegistryTest(PgTestCase):
             self.apply(self.command(lot, action="hold", hold="waiting_human",
                                     frm="", to="", guard=""))
 
+    def test_retenue_exige_le_verificateur_installe(self):
+        lot = self.pinned(stage="implementation", state="build")
+        with self.refusal("verifier-uninstalled"):
+            self.apply(self.command(lot, action="hold", hold="blocked",
+                                    frm="", to="", guard=""), verifiers={})
+        self.assertEqual(self.events(lot), [])
+        self.assertEqual(self.row(lot)["state"], "build")
+
+    def test_reprise_exige_le_verificateur_installe(self):
+        lot = self.pinned(stage="implementation", state="build")
+        held = self.apply(self.command(lot, action="hold", hold="blocked",
+                                       frm="", to="", guard=""))
+        with self.refusal("verifier-uninstalled"):
+            self.apply(self.command(lot, action="release", frm="", to="", guard="",
+                                    version=held.version), verifiers={})
+        self.assertEqual(self.row(lot)["state"], "blocked")
+        self.assertEqual(len(self.events(lot)), 1)
+
+    def test_reprise_waiting_human_attend_la_reponse_et_le_verificateur(self):
+        lot = self.pinned(stage="implementation", state="build")
+        request = self.request_open_for(lot)
+        held = self.apply(self.command(lot, action="hold", hold="waiting_human",
+                                       frm="", to="", guard=""))
+        with self.refusal("decision-pending"):
+            self.apply(self.command(lot, action="release", frm="", to="", guard="",
+                                    version=held.version))
+        self.db.execute(
+            "UPDATE agent_mailbox SET delivered_at = now(), status = 'answered'"
+            " WHERE id = %s", (request,))
+        with self.refusal("verifier-uninstalled"):
+            self.apply(self.command(lot, action="release", frm="", to="", guard="",
+                                    version=held.version), verifiers={})
+        self.assertEqual(self.row(lot)["state"], "waiting_human")
+        released = self.apply(self.command(lot, action="release", frm="", to="",
+                                           guard="", version=held.version))
+        self.assertEqual(released.state, "build")
+
+    def test_avance_depuis_une_retenue_refusee(self):
+        for hold in pr.HOLDS:
+            with self.subTest(retenue=hold):
+                lot = self.pinned(stage="implementation", state="build")
+                if hold == "waiting_human":
+                    self.request_open_for(lot)
+                held = self.apply(self.command(lot, action="hold", hold=hold,
+                                               frm="", to="", guard=""))
+                with self.refusal("held"):
+                    self.apply(self.command(lot, frm="implementation", to="review",
+                                            guard="review_requested",
+                                            version=held.version))
+                self.assertEqual(self.row(lot)["state"], hold)
+                self.assertEqual(len(self.events(lot)), 1)
+
+    def test_verificateur_de_retenue_qui_refuse(self):
+        lot = self.pinned(stage="implementation", state="build")
+
+        def refuses(context):
+            return pr.Verification(ok=False, reason="retenue non prouvée")
+
+        verifiers = dict(self.verifiers)
+        verifiers[pr.HOLD_VERIFIER] = refuses
+        with self.refusal("verifier-refused"):
+            self.apply(self.command(lot, action="hold", hold="blocked",
+                                    frm="", to="", guard=""), verifiers=verifiers)
+        self.assertEqual(self.events(lot), [])
+
+    def test_booleen_de_retenue_refuse(self):
+        lot = self.pinned(stage="implementation", state="build")
+        verifiers = dict(self.verifiers)
+        verifiers[pr.HOLD_VERIFIER] = lambda context: True
+        with self.refusal("verifier-invalid"):
+            self.apply(self.command(lot, action="hold", hold="blocked",
+                                    frm="", to="", guard=""), verifiers=verifiers)
+        self.assertEqual(self.events(lot), [])
+
+    def test_contexte_du_verificateur_de_retenue(self):
+        lot = self.pinned(stage="implementation", state="build")
+        seen = []
+
+        def capture(context):
+            seen.append((context.command.action, context.command.hold,
+                         str(context.work_item["state"]), context.from_stage,
+                         context.to_stage))
+            return pr.Verification(ok=True, reason="vu")
+
+        verifiers = dict(self.verifiers)
+        verifiers[pr.HOLD_VERIFIER] = capture
+        held = self.apply(self.command(lot, action="hold", hold="blocked",
+                                       frm="", to="", guard=""), verifiers=verifiers)
+        self.apply(self.command(lot, action="release", frm="", to="", guard="",
+                                version=held.version), verifiers=verifiers)
+        self.assertEqual(
+            seen,
+            [("hold", "blocked", "build", "implementation", "implementation"),
+             ("release", "", "blocked", "implementation", "implementation")])
+
+    def test_reponse_et_retenue_ne_s_interbloquent_pas(self):
+        """N6 : `agent_mailbox` avant `work_items`, comme `decisions.answer`.
+
+        La retenue verrouille la demande ouverte AVANT le lot ; la réponse
+        ferme la demande (`decisions.close`) : les deux se sérialisent, aucune
+        ne se bloque sur l'autre, et l'issue reste cohérente (retenue acceptée
+        si elle a vu la demande, sinon `hold-no-decision`)."""
+        lot = self.pinned(stage="implementation", state="build")
+        request = self.request_open_for(lot)
+
+        def hold(db):
+            return pr._apply(db, self.command(lot, action="hold",
+                                              hold="waiting_human",
+                                              frm="", to="", guard=""),
+                             spec=self.spec, verifiers=self.verifiers)
+
+        def answer(db):
+            return storage.of(db).decisions.close(
+                request, status="answered",
+                record={"state": "answered",
+                        "answer": {"by": "human:acme", "channel": "terminal",
+                                   "text": "ok", "option": None}})
+
+        results, errors = self._concurrent([hold, answer])
+        self.assertEqual(len(results) + len(errors), 2)
+        self.assertEqual([e for e in errors
+                          if not isinstance(e, pr.RegistryRefusal)], [])
+        for exc in errors:
+            self.assertEqual(exc.code, "hold-no-decision")
+        closed = self.db.query(
+            "SELECT delivered_at FROM agent_mailbox WHERE id = %s",
+            (request,))[0]["delivered_at"]
+        self.assertIsNotNone(closed)
+        state = self.row(lot)["state"]
+        if errors:                       # la réponse est passée d'abord
+            self.assertEqual(state, "build")
+            self.assertEqual(self.events(lot), [])
+        else:                            # la retenue a vu la demande ouverte
+            self.assertEqual(state, "waiting_human")
+
     # -- transfert de révision --------------------------------------------
 
     def transfer(self, lot_id: int, *, ref: str | None = None, version: int = ACME_VERSION,
                  spec=None, expected: int | None = None, command_id: str | None = None,
                  verifiers=None):
-        return pr.transfer_revision(
+        return pr._transfer(
             self.db, work_item_id=lot_id, command_id=command_id or str(uuid.uuid4()),
             expected_version=self.journal_version(lot_id) if expected is None else expected,
             workflow_ref=ref or self.spec.workflow_ref, workflow_version=version,
@@ -543,6 +716,36 @@ class RegistryTest(PgTestCase):
                          pr.TRANSFER_VERIFIER)
         self.assertEqual(event["evidence"]["command"]["previous_ref"], None)
 
+    def test_adoption_refuse_un_lot_terminal(self):
+        for state in sorted(pr.TERMINAL_CORES):
+            with self.subTest(etat=state):
+                lot = self.lot()                   # aucun workflow
+                self.db.execute(
+                    "UPDATE work_items SET state = %s, close_reason = %s WHERE id = %s",
+                    (state, "abandoned" if state == "closed" else None, lot))
+                with self.refusal("terminal-reopened"):
+                    self.transfer(lot)
+                self.assertEqual(self.events(lot), [])
+                row = self.row(lot)
+                self.assertEqual(row["state"], state)
+                self.assertIsNone(row["workflow_ref"])
+                self.assertEqual(row["workflow_version"], 0)
+
+    def test_adoption_refuse_un_coeur_different(self):
+        # L'adoption ne recule pas l'état natif : l'étape initiale doit
+        # projeter le cœur courant (une retenue, elle, est conservée).
+        for state in ("build", "qa", "merged"):
+            with self.subTest(etat=state):
+                lot = self.lot(state=state)        # aucun workflow
+                with self.refusal("stage-mismatch"):
+                    self.transfer(lot)
+                self.assertEqual(self.events(lot), [])
+                self.assertEqual(self.row(lot)["state"], state)
+        held = self.lot(state="blocked")           # retenue conservée
+        receipt = self.transfer(held)
+        self.assertEqual(receipt.state, "blocked")
+        self.assertEqual(receipt.workflow_stage, "draft")
+
     def test_transfert_sans_verificateur_refuse(self):
         lot = self.lot()
         with self.refusal("verifier-uninstalled"):
@@ -561,6 +764,21 @@ class RegistryTest(PgTestCase):
         with self.refusal("revision-regression"):
             self.transfer(lot, version=ACME_VERSION, expected=self.journal_version(lot))
         self.assertEqual(self.row(lot)["workflow_version"], ACME_VERSION + 1)
+
+    def test_transfert_refuse_un_coeur_incoherent(self):
+        lot = self.pinned(stage="review", state="qa")
+        shifted = _Spec(stages=(
+            _Stage("draft", "intake"),
+            _Stage("implementation", "build"),
+            _Stage("review", "build"),          # même statut, autre cœur
+            _Stage("staging", "merged"),
+            _Stage("done", "promoted"),
+            _Stage("stopped", "closed"),
+        ))
+        with self.refusal("stage-mismatch"):
+            self.transfer(lot, spec=shifted)
+        self.assertEqual(self.row(lot)["workflow_ref"], self.spec.workflow_ref)
+        self.assertEqual(self.row(lot)["workflow_version"], ACME_VERSION)
 
     def test_apres_transfert_l_ancienne_revision_est_refusee(self):
         lot = self.pinned()
@@ -673,7 +891,7 @@ class RegistryTest(PgTestCase):
         cmd = self.command(lot)
 
         def run(db):
-            return pr.apply_command(db, cmd, spec=self.spec, verifiers=self.verifiers)
+            return pr._apply(db, cmd, spec=self.spec, verifiers=self.verifiers)
 
         results, errors = self._concurrent([run, run])
         self.assertEqual(errors, [])
@@ -689,10 +907,10 @@ class RegistryTest(PgTestCase):
         second = self.command(lot)
 
         def run_a(db):
-            return pr.apply_command(db, first, spec=self.spec, verifiers=self.verifiers)
+            return pr._apply(db, first, spec=self.spec, verifiers=self.verifiers)
 
         def run_b(db):
-            return pr.apply_command(db, second, spec=self.spec, verifiers=self.verifiers)
+            return pr._apply(db, second, spec=self.spec, verifiers=self.verifiers)
 
         results, errors = self._concurrent([run_a, run_b])
         self.assertEqual(len(results), 1)
@@ -751,6 +969,44 @@ class RegistryTest(PgTestCase):
         self.assertEqual(pr.receipt_of(self.db, lot, cmd.command_id)["id"],
                          receipt.event_id)
 
+    def test_migration_recu_complet_exige_chaque_champ(self):
+        """`IS TRUE` : toute omission — clé absente ou `null` imbriqué — est refusée."""
+        lot = self.pinned()
+        full = {"schema": pr.RECEIPT_SCHEMA, "intent": {"sha256": "0" * 64},
+                "command": {"action": "advance"},
+                "authority": {}, "verification": {}}
+
+        def insert(evidence):
+            self.db.execute(
+                "INSERT INTO work_item_events (work_item_id, state, command_id,"
+                "  workflow_stage, workflow_version, evidence)"
+                " VALUES (%s, 'build', %s::uuid, 'implementation', %s, %s::jsonb)",
+                (lot, str(uuid.uuid4()), ACME_VERSION, json.dumps(evidence)))
+
+        insert(full)                      # contrôle positif : la forme pleine passe
+        self.assertEqual(len(self.events(lot)), 1)
+        for field in ("schema", "intent", "command", "authority", "verification"):
+            with self.subTest(omission=field):
+                with self.assertRaises(DbError):
+                    insert({k: v for k, v in full.items() if k != field})
+        refusals = (
+            {},                                      # reçu vide, tous les champs NULL
+            {"schema": None, "intent": full["intent"], "command": full["command"],
+             "authority": {}, "verification": {}},
+            dict(full, intent=None),
+            dict(full, intent={}),                   # sha256 absent (imbriqué)
+            dict(full, intent={"sha256": None}),
+            dict(full, command={}),                  # action absente (imbriqué)
+            dict(full, command={"action": None}),
+            dict(full, authority=None),
+            dict(full, verification=None),
+        )
+        for evidence in refusals:
+            with self.subTest(evidence=json.dumps(evidence, sort_keys=True)):
+                with self.assertRaises(DbError):
+                    insert(evidence)
+        self.assertEqual(len(self.events(lot)), 1)
+
     def test_migration_etape_sans_reference_refusee(self):
         with self.assertRaises(DbError):
             self.db.execute(
@@ -799,6 +1055,132 @@ class RegistryTest(PgTestCase):
         pr.install_verifier("planning", _ok)          # idempotent, même objet
         self.assertEqual(list(pr.installed_verifiers()), ["planning"])
 
+    def test_api_publique_sans_injection_de_verificateurs(self):
+        """Le résultat d'une garde ne vient jamais de l'appelant (seam publié)."""
+        lot = self.pinned()
+        with self.assertRaises(TypeError):
+            pr.apply_command(self.db, self.command(lot), spec=self.spec,
+                             verifiers={"planning": _ok})
+        with self.assertRaises(TypeError):
+            pr.transfer_revision(
+                self.db, work_item_id=lot, command_id=str(uuid.uuid4()),
+                expected_version=0, workflow_ref=self.spec.workflow_ref,
+                workflow_version=ACME_VERSION, authority=self.authority(),
+                spec=self.spec, verifiers=self.verifiers)
+
+    def test_move_close_refusent_un_lot_pinne(self):
+        lot = self.pinned(stage="implementation", state="build")
+        with self.assertRaises(work.WorkError):
+            work.move(self.db, lot, "qa")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, lot, abandoned=True)
+        refused = work.close_merged(self.db, lot)
+        self.assertEqual(refused["result"], "refused")
+        self.assertIn("process_registry", refused["detail"])
+        self.assertEqual(self.row(lot)["state"], "build")
+        self.assertEqual(self.events(lot), [])
+
+    def test_read_sources_ne_declare_que_le_reel(self):
+        lot = self.pinned(stage="implementation", state="build")
+        receipt = self.apply(self.command(
+            lot, frm="implementation", to="review", guard="review_requested",
+            facts={"ticket": "ACME-7"}))
+        self.request_open_for(lot)
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, note)"
+            " VALUES (%s, 'delivered', %s, %s, 'livré hors cible')",
+            (lot, "a" * 40, ACME_ACTOR))
+        context = pr.VerificationContext(
+            db=self.db, work_item=self.row(lot),
+            command=self.command(lot, frm="implementation", to="review",
+                                 guard="review_requested", version=receipt.version),
+            spec=self.spec, from_stage="implementation", to_stage="review")
+        sources = pr.read_sources(context)
+        self.assertEqual(set(sources), set(pr.SOURCE_KEYS))
+        self.assertNotIn("observations", sources)      # source non installée
+        got = sources["receipts"][0]
+        self.assertTrue(got["accepted"])
+        self.assertEqual(got["guard"], "review_requested")
+        self.assertEqual(got["facts"], {"ticket": "ACME-7"})
+        self.assertEqual(got["sha256"], receipt.intent_sha256)
+        self.assertEqual(got["command_id"], receipt.command_id)
+        self.assertEqual([d["sha"] for d in sources["deliveries"]], ["a" * 40])
+        self.assertTrue(sources["deliveries"][0]["accepted"])
+        self.assertEqual(len(sources["decisions"]), 1)
+        # `requested` est posé par le trigger de 0013 : le lecteur rend le
+        # registre réel, pas seulement le jalon ajouté par le banc.
+        self.assertEqual([m["kind"] for m in sources["milestones"]],
+                         ["requested", "delivered"])
+        with self.refusal("verifier-invalid"):
+            pr.read_sources(object())
+
+    def test_read_sources_nomme_les_verificateurs_reserves(self):
+        lot = self.pinned(stage="implementation", state="build")
+        held = self.apply(self.command(lot, action="hold", hold="blocked",
+                                       frm="", to="", guard=""))
+        context = pr.VerificationContext(
+            db=self.db, work_item=self.row(lot),
+            command=self.command(lot, version=held.version), spec=self.spec,
+            from_stage="implementation", to_stage="implementation")
+        sources = pr.read_sources(context)
+        self.assertEqual([r["guard"] for r in sources["receipts"]],
+                         [pr.HOLD_VERIFIER])
+
+    # -- seam réel avec la tranche C (#1924) -------------------------------
+
+    @unittest.skipUnless(pv is not None, "tranche C (#1924) absente de main")
+    def test_seam_reel_avec_la_tranche_C(self):
+        """Les 15 appelables de C installés, l'API publique les fait parler.
+
+        Le vrai C lit le snapshot par `read_sources(context)` : avance gardée
+        `planning`, retenue `blocked` et reprise par le nom réservé `hold`,
+        `waiting_human` sur la collection `decisions`, et avance refusée depuis
+        une retenue."""
+        saved = pr.installed_verifiers()
+
+        def restore():
+            pr.INSTALLED_VERIFIERS.clear()
+            pr.INSTALLED_VERIFIERS.update(saved)
+
+        self.addCleanup(restore)
+        names = pv.install_verifiers(pr)
+        self.assertEqual(len(names), len(pv.GUARD_NAMES) + 1)
+        self.assertIn(pr.HOLD_VERIFIER, names)
+
+        lot = self.pinned(stage="draft", state="intake")
+        first = pr.apply_command(self.db, self.command(lot), spec=self.spec)
+        self.assertEqual((first.state, first.workflow_stage),
+                         ("build", "implementation"))
+
+        held = pr.apply_command(self.db, self.command(
+            lot, action="hold", hold="blocked", frm="", to="", guard="",
+            version=first.version), spec=self.spec)
+        self.assertEqual(held.state, "blocked")
+        with self.refusal("held"):          # une avance ne lève pas la retenue
+            pr.apply_command(self.db, self.command(
+                lot, frm="implementation", to="review", guard="review_requested",
+                version=held.version), spec=self.spec)
+        released = pr.apply_command(self.db, self.command(
+            lot, action="release", frm="", to="", guard="",
+            version=held.version), spec=self.spec)
+        self.assertEqual(released.state, "build")
+
+        request = self.request_open_for(lot)
+        waiting = pr.apply_command(self.db, self.command(
+            lot, action="hold", hold="waiting_human", frm="", to="", guard="",
+            version=released.version), spec=self.spec)
+        self.assertEqual(waiting.state, "waiting_human")
+        with self.refusal("decision-pending"):   # la réponse d'abord
+            pr.apply_command(self.db, self.command(
+                lot, action="release", frm="", to="", guard="",
+                version=waiting.version), spec=self.spec)
+        self.db.execute("UPDATE agent_mailbox SET delivered_at = now(),"
+                        " status = 'answered' WHERE id = %s", (request,))
+        after = pr.apply_command(self.db, self.command(
+            lot, action="release", frm="", to="", guard="",
+            version=waiting.version), spec=self.spec)
+        self.assertEqual(after.state, "build")
+
 
 @unittest.skipUnless(pw is not None, "tranche A (#1918) absente de main")
 class CompiledArtifactTest(PgTestCase):
@@ -837,7 +1219,7 @@ class CompiledArtifactTest(PgTestCase):
                                    runner_id="acme-runner-1"),
             workflow_ref=ACME_REF, workflow_version=ACME_VERSION, action="advance",
             from_stage="draft", to_stage="implementation", guard="planning")
-        receipt = pr.apply_command(
+        receipt = pr._apply(
             self.db, command, spec=compiled,
             verifiers={"planning": lambda context: pr.Verification(ok=True)})
         self.assertEqual(receipt.state, "build")

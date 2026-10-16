@@ -57,6 +57,12 @@ end $$;
 -- natif (`process-receipt/1`) : schéma, intention (empreinte SHA-256),
 -- commande, autorité et résultat de vérification. Les lignes d'historique
 -- (command_id NULL) ne sont pas concernées.
+--
+-- La condition exigée est enveloppée dans `IS TRUE` : un CHECK passe quand son
+-- expression vaut NULL, donc sans cela une clé absente (`->>` et
+-- `jsonb_typeof` rendent NULL) ou une valeur JSON `null` serait acceptée comme
+-- un reçu complet. `IS TRUE` refuse toute omission, à chaque niveau (clé de
+-- premier niveau, objet imbriqué, feuille), et n'accepte que la forme pleine.
 do $$
 begin
     if not exists (select 1 from pg_constraint
@@ -75,6 +81,6 @@ begin
                        and evidence->'command'->>'action' in
                            ('advance', 'hold', 'release', 'transfer')
                        and jsonb_typeof(evidence->'authority') = 'object'
-                       and jsonb_typeof(evidence->'verification') = 'object'));
+                       and jsonb_typeof(evidence->'verification') = 'object') is true);
     end if;
 end $$;

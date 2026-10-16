@@ -29,15 +29,22 @@ Ce que le registre garantit, dans UNE transaction :
    même intention retrouve le reçu accepté ; la même clé avec une charge
    canonique différente est un `intent-conflict`.
 6. **Aucun booléen client ne remplace une garde** : une avance exige un
-   vérificateur **installé côté serveur** pour la garde de l'arête ; sans
-   installation, `verifier-uninstalled`. Le client fournit des faits
-   structurés (`evidence`), jamais une décision.
+   vérificateur **installé côté serveur** pour la garde de l'arête, et
+   l'entrée comme la sortie de retenue exigent celui installé sous le nom
+   réservé `hold` (tranche C : `HOLD_VERIFIER`, l'appelable `verify_hold` de
+   `process_verifiers`) ; sans installation, `verifier-uninstalled`. Aucune
+   voie de contournement : une retenue ne s'efface pas par une avance. Le
+   client fournit des faits structurés (`evidence`), jamais une décision.
 7. **Rien à moitié** : l'écriture du lot, l'étape/version et le reçu sont dans
    la même transaction ; une erreur après le début ne laisse ni reçu ni
    transition (test au trigger, `rollback sans demi-événement`).
 8. **Les retenues survivent** : `blocked`/`waiting_human` gardent l'étape ;
-   `waiting_human` exige une demande de décision native en attente (L233, la
-   même requête que `work.move`) ; un cœur terminal ne se rouvre jamais.
+   une retenue ne se traverse pas — toute avance depuis un lot retenu est
+   refusée (`held`), seule une reprise explicite `release` en sort, vérifiée
+   côté serveur comme l'entrée ; `waiting_human` exige une demande de décision
+   native en attente (L233, la même requête que `work.move`) et sa reprise
+   attend que la décision soit répondue (`decision-pending`) ; un cœur terminal
+   ne se rouvre jamais, y compris par adoption de workflow.
    Les lots **sans workflow** ne passent pas par ici : `workflow-absent`,
    leur comportement (`work.move`) est inchangé.
 
@@ -88,9 +95,15 @@ Codes de refus stables (`RegistryRefusal.code`) : `command-invalid`,
 `spec-mismatch`, `lot-unknown`, `workflow-absent`, `ref-mismatch`,
 `revision-mismatch`, `version-conflict`, `intent-conflict`, `receipt-corrupt`,
 `stage-mismatch`, `stage-undeclared`, `edge-undeclared`, `terminal-reopened`,
-`hold-invalid`, `hold-redundant`, `hold-no-decision`, `not-held`,
+`held`, `hold-invalid`, `hold-redundant`, `hold-no-decision`, `decision-pending`,
+`not-held`,
 `repair-exhausted`, `revision-regression`, `verifier-uninstalled`,
 `verifier-invalid`, `verifier-error`, `verifier-refused`, `verifier-name`.
+
+Les vérificateurs C n'ont pas de SQL : `read_sources(context)` rend, dans la
+transaction et sous verrou, les collections réellement collectées
+(`milestones`, `receipts`, `decisions`, `deliveries`), jamais une collection
+absente (fail-closed).
 
 Le SQL du registre est ici, pas dans le stockage : c'est un composant serveur
 installé, pas une vue.
@@ -114,6 +127,11 @@ RECEIPT_SCHEMA = "process-receipt/1"
 INTENT_DOMAIN = b"ameesh-process-command/1\x00"
 #: Nom réservé du vérificateur de transfert de révision (pas une garde Process).
 TRANSFER_VERIFIER = "revision_transfer"
+#: Nom réservé du vérificateur d'entrée ET de sortie de retenue (pas une garde
+#: Process) : `hold` comme `release` passent par lui, sans voie de contournement.
+#: C'est le nom publié par la tranche C (`process_verifiers.HOLD_VERIFIER`) ;
+#: son appelable `verify_hold` dispatche sur l'`action` de la commande.
+HOLD_VERIFIER = "hold"
 
 ACTIONS = ("advance", "hold", "release", "transfer")
 HOLDS = ("blocked", "waiting_human")
@@ -483,11 +501,19 @@ def _registry(verifiers: Mapping[str, Verifier] | None) -> dict[str, Verifier]:
 
 
 def _lock_lot(tx: Any, work_item_id: int) -> Mapping[str, Any]:
-    """Verrouille le lot et rend sa ligne, ou refuse `lot-unknown`."""
+    """Verrouille le lot et rend sa ligne, ou refuse `lot-unknown`.
+
+    La ligne est le snapshot du lot pour le vérificateur (tranche C) : elle
+    porte ce que C lit (`title`, `closed_at`, `reviewer`, `type`, `loops`…).
+    `reviewer` vient de `to_jsonb`, comme les autres lectures #705 : une base
+    d'avant 0421 rend `''` au lieu de casser.
+    """
     rows = tx.query(
-        "SELECT id, state, assignee, type, app, workstream, loops,"
-        "       workflow_ref, workflow_stage, workflow_version"
-        "  FROM work_items WHERE id = %s FOR UPDATE",
+        "SELECT w.id, w.state, w.assignee, w.type, w.app, w.workstream, w.loops,"
+        "       w.title, w.closed_at,"
+        "       coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"
+        "       w.workflow_ref, w.workflow_stage, w.workflow_version"
+        "  FROM work_items w WHERE w.id = %s FOR UPDATE",
         (int(work_item_id),))
     if not rows:
         raise RegistryRefusal("lot-unknown", "lot %s introuvable" % work_item_id)
@@ -511,8 +537,10 @@ def _check_authority(tx: Any, authority: Authority) -> dict:
         raise RegistryRefusal("authority-unknown-actor",
                               "acteur %s absent du registre" % authority.actor)
     row = rows[0]
-    if row.get("status") == "stopped":
-        raise RegistryRefusal("authority-revoked", "acteur %s arrêté" % authority.actor)
+    if row.get("status") in ("stopped", "dead"):
+        raise RegistryRefusal("authority-revoked",
+                              "acteur %s hors service (%s)"
+                              % (authority.actor, row.get("status")))
     if authority.source == "runner":
         owner = row.get("lease_owner") or ""
         if owner != authority.runner_id:
@@ -663,6 +691,11 @@ def _plan_advance(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) 
         raise RegistryRefusal("terminal-reopened",
                               "lot %s en %s : un terminal ne se rouvre pas"
                               % (command.work_item_id, row["state"]))
+    if row["state"] in HOLDS:
+        raise RegistryRefusal(
+            "held",
+            "lot %s en %s : une reprise explicite (release) est requise"
+            % (command.work_item_id, row["state"]))
     if (command.to_stage, command.guard) not in _spec_edges(spec, command.from_stage):
         raise RegistryRefusal("edge-undeclared",
                               "arête %s → %s (%s) absente de l'artefact"
@@ -681,17 +714,35 @@ def _plan_advance(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) 
                  note="%s → %s (%s)" % (command.from_stage, command.to_stage, command.guard))
 
 
+def _lock_decisions(tx: Any, work_item_id: int) -> None:
+    """Verrouille les demandes de décision natives ouvertes du lot, AVANT le lot.
+
+    Ordre des verrous (revue N6) : la réponse du propriétaire
+    (`decisions.answer`) ferme la demande (`UPDATE agent_mailbox`) puis déplace
+    le lot (`work.move`) ; le registre prend donc `agent_mailbox` d'abord et
+    `work_items` ensuite, jamais l'inverse. Le verrou tient la demande ouverte
+    jusqu'au commit : une réponse ne se glisse pas entre le contrôle et
+    l'écriture de la retenue.
+    """
+    tx.query(
+        "SELECT 1 FROM agent_mailbox"
+        " WHERE delivered_at IS NULL AND kind = 'request'"
+        "   AND (payload -> 'decision') IS NOT NULL"
+        "   AND btrim(work_item_id) = %s FOR UPDATE",
+        (str(int(work_item_id)),))
+
+
 def _pending_decision(tx: Any, work_item_id: int) -> bool:
     """L233 : une demande de décision native ouverte tient le lot.
 
-    La ligne de la demande est verrouillée (`FOR UPDATE`) : la réponse et
-    l'entrée en `waiting_human` ne se croisent pas.
+    Lecture seule : les lignes sont déjà verrouillées par `_lock_decisions`,
+    pris au début de la transaction d'une retenue ou d'une reprise.
     """
     rows = tx.query(
         "SELECT 1 FROM agent_mailbox r"
         " WHERE r.delivered_at IS NULL AND r.kind = 'request'"
         "   AND (r.payload -> 'decision') IS NOT NULL"
-        "   AND btrim(r.work_item_id) = %s FOR UPDATE",
+        "   AND btrim(r.work_item_id) = %s",
         (str(int(work_item_id)),))
     return bool(rows)
 
@@ -715,11 +766,16 @@ def _plan_hold(tx: Any, row: Mapping[str, Any], command: Command) -> _Plan:
                  note="retenue %s (étape %s conservée)" % (command.hold, stage))
 
 
-def _plan_release(row: Mapping[str, Any], command: Command, spec: Any) -> _Plan:
+def _plan_release(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) -> _Plan:
     if row["state"] not in HOLDS:
         raise RegistryRefusal("not-held",
                               "lot %s en %s : aucune retenue à lever"
                               % (command.work_item_id, row["state"]))
+    if row["state"] == "waiting_human" and _pending_decision(tx, command.work_item_id):
+        raise RegistryRefusal(
+            "decision-pending",
+            "lot %s en waiting_human : la décision native est encore ouverte, "
+            "la reprise attend la réponse (L233)" % command.work_item_id)
     stage = row.get("workflow_stage")
     if not stage:
         raise RegistryRefusal("stage-mismatch", "lot %s sans étape courante" % command.work_item_id)
@@ -821,15 +877,23 @@ def _receipt(command: Command, plan: _Plan, event_id: int, version: int,
 # API : appliquer une commande, transférer une révision, lire l'état
 # --------------------------------------------------------------------------
 
-def apply_command(db: Db, command: Command, *, spec: Any,
-                  verifiers: Mapping[str, Verifier] | None = None) -> Receipt:
+def apply_command(db: Db, command: Command, *, spec: Any) -> Receipt:
     """Applique une commande native au lot, ou refuse (rien d'écrit).
 
     Tout — verrou du lot, autorité, révision, version, garde, écriture du lot
     et reçu — tient dans une transaction. Un rejeu de la même intention rend le
     reçu accepté (`replayed=True`) ; la même clé avec une autre intention est
     un `intent-conflict`.
+
+    Les vérificateurs viennent du registre **installé** (`install_verifier`) :
+    l'appelant ne fournit jamais le résultat d'une garde. `_apply` réserve
+    l'injection au banc de tests.
     """
+    return _apply(db, command, spec=spec, verifiers=INSTALLED_VERIFIERS)
+
+
+def _apply(db: Db, command: Command, *, spec: Any,
+           verifiers: Mapping[str, Verifier] | None = None) -> Receipt:
     _validate_command(command)
     if command.action == "transfer":
         raise RegistryRefusal("command-invalid",
@@ -839,6 +903,9 @@ def apply_command(db: Db, command: Command, *, spec: Any,
     registry = _registry(verifiers)
     intent = intent_sha256(command)
     with db.transaction() as tx:
+        if command.action in ("hold", "release"):
+            # N6 : `agent_mailbox` avant `work_items`, comme `decisions.answer`.
+            _lock_decisions(tx, command.work_item_id)
         row = _lock_lot(tx, command.work_item_id)
         authority = _check_authority(tx, command.authority)
         replayed = _replay(tx, command, intent)
@@ -852,10 +919,17 @@ def apply_command(db: Db, command: Command, *, spec: Any,
             plan = _plan_advance(tx, row, command, spec)
             verification = _verify(registry, command.guard, tx, row, command, spec,
                                    command.from_stage, command.to_stage)
+            verifier_name = command.guard
         elif command.action == "hold":
             plan = _plan_hold(tx, row, command)
+            verification = _verify(registry, HOLD_VERIFIER, tx, row, command, spec,
+                                   plan.stage, plan.stage)
+            verifier_name = HOLD_VERIFIER
         else:  # release (transfer est refusé plus haut)
-            plan = _plan_release(row, command, spec)
+            plan = _plan_release(tx, row, command, spec)
+            verification = _verify(registry, HOLD_VERIFIER, tx, row, command, spec,
+                                   plan.stage, plan.stage)
+            verifier_name = HOLD_VERIFIER
 
         tx.execute(
             "UPDATE work_items"
@@ -871,7 +945,7 @@ def apply_command(db: Db, command: Command, *, spec: Any,
             (plan.state, plan.stage, plan.loops, plan.state, plan.state,
              int(command.work_item_id)))
         evidence = _evidence(command, authority, verification, intent,
-                             _applied(command, plan), command.guard)
+                             _applied(command, plan), verifier_name)
         event_id = _insert_receipt(
             tx, work_item_id=command.work_item_id, state=plan.state, note=plan.note,
             actor=command.authority.actor, command_id=command.command_id,
@@ -882,16 +956,29 @@ def apply_command(db: Db, command: Command, *, spec: Any,
 def transfer_revision(db: Db, *, work_item_id: int, command_id: str,
                       expected_version: int, workflow_ref: str, workflow_version: int,
                       authority: Authority, spec: Any,
-                      evidence: Mapping[str, Any] | None = None,
-                      verifiers: Mapping[str, Verifier] | None = None) -> Receipt:
+                      evidence: Mapping[str, Any] | None = None) -> Receipt:
     """Pinn (ou change) la révision Process d'un lot — geste explicite seulement.
 
-    Première adoption : l'étape courante devient l'étape initiale de l'artefact
-    (la retenue éventuelle est conservée). Transfert : l'étape courante est
-    conservée, elle doit exister dans le nouvel artefact ; une régression de
-    version est refusée. Un vérificateur serveur `revision_transfer` doit être
-    installé : aucun transfert n'est possible par défaut.
+    Première adoption : l'étape initiale de l'artefact doit projeter le cœur
+    natif courant du lot (une retenue, elle, est conservée) ; un lot terminal
+    n'est jamais rouvert, même par adoption. Transfert : l'étape courante est
+    conservée, elle doit exister dans le nouvel artefact et projeter son cœur
+    courant hors retenue ; une régression de version est refusée. Un
+    vérificateur serveur `revision_transfer` doit être installé : aucun
+    transfert n'est possible par défaut, et l'appelant ne fournit jamais son
+    résultat (`_transfer` réserve l'injection au banc de tests).
     """
+    return _transfer(db, work_item_id=work_item_id, command_id=command_id,
+                     expected_version=expected_version, workflow_ref=workflow_ref,
+                     workflow_version=workflow_version, authority=authority,
+                     spec=spec, evidence=evidence, verifiers=INSTALLED_VERIFIERS)
+
+
+def _transfer(db: Db, *, work_item_id: int, command_id: str,
+              expected_version: int, workflow_ref: str, workflow_version: int,
+              authority: Authority, spec: Any,
+              evidence: Mapping[str, Any] | None = None,
+              verifiers: Mapping[str, Verifier] | None = None) -> Receipt:
     command = Command(
         work_item_id=int(work_item_id), command_id=command_id,
         expected_version=int(expected_version), authority=authority,
@@ -911,6 +998,11 @@ def transfer_revision(db: Db, *, work_item_id: int, command_id: str,
         _check_version(tx, command)
 
         if row.get("workflow_ref") is None:
+            if row["state"] in TERMINAL_CORES:
+                raise RegistryRefusal(
+                    "terminal-reopened",
+                    "lot %s en %s : un terminal ne se rouvre pas, même par adoption"
+                    % (command.work_item_id, row["state"]))
             stage = str(getattr(spec, "initial"))
             core = _spec_core(spec, stage)
             if core is None:
@@ -919,7 +1011,15 @@ def transfer_revision(db: Db, *, work_item_id: int, command_id: str,
             if core in TERMINAL_CORES:
                 raise RegistryRefusal("terminal-reopened",
                                       "étape initiale %s déjà terminale" % stage)
-            state = row["state"] if row["state"] in HOLDS else core
+            if row["state"] in HOLDS:
+                state = row["state"]
+            elif core == str(row["state"]):
+                state = core
+            else:
+                raise RegistryRefusal(
+                    "stage-mismatch",
+                    "adoption : l'étape initiale %s projette %s, lot en %s"
+                    % (stage, core, row["state"]))
         else:
             if int(row.get("workflow_version") or 0) > command.workflow_version:
                 raise RegistryRefusal(
@@ -927,9 +1027,15 @@ def transfer_revision(db: Db, *, work_item_id: int, command_id: str,
                     "révision %s → %s : un transfert ne revient pas en arrière"
                     % (row.get("workflow_version"), command.workflow_version))
             stage = str(row.get("workflow_stage") or getattr(spec, "initial"))
-            if _spec_core(spec, stage) is None:
+            core = _spec_core(spec, stage)
+            if core is None:
                 raise RegistryRefusal("stage-undeclared",
                                       "étape %s absente de l'artefact" % stage)
+            if row["state"] not in HOLDS and core != str(row["state"]):
+                raise RegistryRefusal(
+                    "stage-mismatch",
+                    "transfert : l'étape %s projette %s, lot en %s"
+                    % (stage, core, row["state"]))
             state = row["state"]
 
         verification = _verify(registry, TRANSFER_VERIFIER, tx, row, command, spec,
@@ -987,3 +1093,85 @@ def receipt_of(db: Db, work_item_id: int, command_id: str) -> dict | None:
     row = dict(rows[0])
     row["evidence"] = _as_json(row["evidence"])
     return row
+
+
+#: Collections réellement collectées pour la tranche C (pas d'`observations` :
+#: la source n'est pas installée, un vérificateur qui l'exige doit refuser).
+SOURCE_KEYS = ("milestones", "receipts", "decisions", "deliveries")
+
+
+def read_sources(context: VerificationContext) -> dict[str, Any]:
+    """Les collections réelles du lot, lues dans la transaction du vérificateur.
+
+    Tranche C : ses vérificateurs sont purs et sans SQL ; ce lecteur est le
+    leur, appelé depuis l'appelable installé. Le mapping ne déclare que ce qui
+    est réellement collecté — `SOURCE_KEYS` — jamais une collection absente
+    (`observations` n'est pas installée) : un vérificateur qui l'exige refuse
+    `source-unavailable` (fail-closed), jamais un accord par défaut.
+
+    * `milestones` : `{id, kind, sha, verdict, note}` ;
+    * `receipts` : reçus acceptés (`command_id` non nul) — `{accepted, guard,
+      event_id, command_id, workflow_stage, workflow_version, sha256,
+      evidence, facts}` ; `guard` est la garde Process, ou le nom réservé du
+      vérificateur (`hold`, `revision_transfer`) ;
+    * `decisions` : demandes de décision natives ouvertes, `{id, kind, payload,
+      work_item_id}` (L233) ;
+    * `deliveries` : jalons natifs `delivered`, `{id, sha, accepted}`.
+    """
+    if not isinstance(context, VerificationContext):
+        raise RegistryRefusal("verifier-invalid", "VerificationContext attendu")
+    db = context.db
+    item_id = int(context.command.work_item_id)
+    milestones = [
+        {"id": int(row["id"]), "kind": str(row["kind"]),
+         "sha": str(row["sha"] or ""), "verdict": row["verdict"],
+         "note": str(row["note"] or "")}
+        for row in db.query(
+            "SELECT id, kind, sha, verdict, note FROM work_item_milestones"
+            " WHERE work_item_id = %s ORDER BY id", (item_id,))]
+    receipts: list[dict[str, Any]] = []
+    for row in db.query(
+            "SELECT id, command_id::text AS command_id, workflow_stage,"
+            "       workflow_version, evidence"
+            "  FROM work_item_events"
+            " WHERE work_item_id = %s AND command_id IS NOT NULL ORDER BY id",
+            (item_id,)):
+        evidence = _as_json(row["evidence"])
+        if not isinstance(evidence, Mapping):
+            evidence = {}
+        command = evidence.get("command")
+        verification = evidence.get("verification")
+        guard = ""
+        if isinstance(command, Mapping):
+            guard = str(command.get("guard") or "")
+        if not guard and isinstance(verification, Mapping):
+            guard = str(verification.get("verifier") or "")
+        facts = evidence.get("facts")
+        receipts.append({
+            "accepted": True,
+            "guard": guard,
+            "event_id": int(row["id"]),
+            "command_id": str(row["command_id"]),
+            "workflow_stage": row["workflow_stage"],
+            "workflow_version": int(row["workflow_version"] or 0),
+            "sha256": _stored_intent(evidence),
+            "evidence": dict(evidence),
+            "facts": dict(facts) if isinstance(facts, Mapping) else {},
+        })
+    decisions = [
+        {"id": int(row["id"]), "kind": str(row["kind"]),
+         "payload": _as_json(row["payload"]),
+         "work_item_id": str(row["work_item_id"] or "")}
+        for row in db.query(
+            "SELECT id, kind, payload, work_item_id FROM agent_mailbox"
+            " WHERE delivered_at IS NULL AND kind = 'request'"
+            "   AND (payload -> 'decision') IS NOT NULL"
+            "   AND btrim(work_item_id) = %s ORDER BY id", (str(item_id),))]
+    deliveries = [
+        {"id": int(row["id"]), "sha": str(row["sha"] or ""), "accepted": True}
+        for row in db.query(
+            "SELECT id, sha FROM work_item_milestones"
+            " WHERE work_item_id = %s AND kind = 'delivered' ORDER BY id",
+            (item_id,))]
+    return {"milestones": milestones, "receipts": receipts,
+            "decisions": decisions, "deliveries": deliveries}
