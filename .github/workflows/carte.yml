@@ -44,16 +44,12 @@
 #     matrice verte (témoin K1/K2 de la R1).
 name: carte
 
+# #2116 — suspension temporaire des mesures automatiques (16/10/2026) :
+# quota d'artefacts et mesures répétées sans carte publiée. Le run 38931568303
+# a ses dix mesures vertes ; l'assemblage échoue sur doublons/hors-part (#1632).
+# Réactiver push/main et pull_request après correction de #1632 et un run
+# manuel complet : carte publiée liée à sa base exacte et coût mesuré.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - scripts/map.py
-      - scripts/map_measure.py
-      - scripts/test-parts.py
-      - tests/support.py
-      - .github/workflows/carte.yml
   workflow_dispatch:
 
 # #1314 — une carte de main n'est jamais annulée par la poussée suivante : la
