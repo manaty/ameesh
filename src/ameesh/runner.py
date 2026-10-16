@@ -598,6 +598,17 @@ class AgentWorker(threading.Thread):
         self._wd_seen = agent.get("cwd")
         self._wd_delay = 0.0
         self._wd_next = 0.0
+        #: #811 (B1) : un lot secondaire déclaré dont le dossier manque ne
+        #: bloque que LUI — échéance, délai croissant et dernier chemin connu
+        #: par lot (`_lot_wd_path` : le dossier revenu débloque aussitôt), et
+        #: `_lot_workdir_secondary` dit que l'échec courant ne relève pas du
+        #: blocage global « dossier absent » (L35), réservé au cwd primaire
+        self._lot_wd_until: dict = {}
+        self._lot_wd_delay: dict = {}
+        self._lot_wd_path: dict = {}
+        self._lot_workdir_secondary = False
+        self._lot_workdir_path: str | None = None
+        self._lot_workdir_error = ""
         #: panne de base (L72) : attente croissante entre deux essais, consigne
         #: consommée par un tour qui n'a pas pu partir (à remettre en attente
         #: au retour de la base), statut « base injoignable » posé, et session
@@ -1926,13 +1937,18 @@ class AgentWorker(threading.Thread):
         puis ses tours partagent la session courante ou une session sans lot :
         jamais de session dédiée rouverte ni de fermeture à chaque tour (#1898
         N1 ; c'est ici que vit l'ancien prédicat `lot_rotation_due`, #1898 N3).
-        Bail perdu ou base injoignable : le tour part dans la session courante,
-        le nouveau lot y est noté (pas de nouvel essai à chaque tour).
+        Bail perdu, base injoignable ou dossier absent : le tour ne part pas
+        dans la session du lot précédent et sa consigne reste à livrer (#811).
         """
         if not spec:
             return spec
         lot = spec.get("lot")
-        if self.proc is not None or self.session_policy() != "par-lot":
+        self._workdir_lot = lot or self.agent.get("session_work_item")
+        from . import projects as projects_mod
+        multi_switch = (lot and self.proc is None
+                        and len(projects_mod.agent_projects(self.agent)) > 1
+                        and str(lot) != str((self.agent or {}).get("session_work_item") or ""))
+        if self.proc is not None or (self.session_policy() != "par-lot" and not multi_switch):
             return spec
         courant = str((self.agent or {}).get("session_work_item") or "").strip()
         fini = False
@@ -1958,12 +1974,7 @@ class AgentWorker(threading.Thread):
             if courant == str(lot):
                 return spec
             if not self._switch_lot(courant, str(lot)):
-                try:
-                    if storage.of(self.db).operations.set_session_work_item(
-                            self.name, self.runner.runner_id, self.epoch, str(lot)):
-                        self.agent["session_work_item"] = str(lot)
-                except db_mod.DbError as exc:
-                    log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
+                return dict(spec, lot_switch_failed=True)
             return spec
         # aucun lot noté : une session qui a déjà tourné ne sera jamais
         # partagée avec un lot ; celle qui va s'ouvrir est celle du lot.
@@ -2156,10 +2167,19 @@ class AgentWorker(threading.Thread):
         # emprunte), pas celui de la fiche : une session n'est reprise que
         # sous le harnais qui l'a ouverte
         harnais = self.turn_harness()
+        cwd = self._resolve_workdir(lot=lot)
+        if not cwd:
+            if self._lot_workdir_secondary:
+                # #811 (B1) : ce lot attend son dossier ; l'agent garde ses
+                # tours primaires (pas de blocage global « dossier absent »).
+                self._lot_workdir_deferred(lot)
+            else:
+                self._workdir_missing(force_status=True)
+            return False
         try:
             out = storage.of(self.db).lot_sessions.switch(
                 self.name, self.runner.runner_id, self.epoch, to_lot=lot,
-                harness=harnais, account=nom, cwd=self.agent.get("cwd"),
+                harness=harnais, account=nom, cwd=cwd,
                 current=session)
         except db_mod.DbError as exc:
             log_async("[%s] session switch to lot %s failed (%s)" % (self.name, lot, exc))
@@ -2684,13 +2704,53 @@ class AgentWorker(threading.Thread):
     #: déplacé comprise) : 5 s, 10 s, 20 s… bornée à 5 min, par agent
     WORKDIR_BACKOFF_MIN = 5.0
     WORKDIR_BACKOFF_MAX = 300.0
+    #: #811 (B1) : dossier d'un lot secondaire absent — délai par lot (borné),
+    #: l'agent gardant ses autres tours
+    LOT_WORKDIR_BACKOFF_MIN = 30.0
+    LOT_WORKDIR_BACKOFF_MAX = 600.0
 
-    def _resolve_workdir(self, adopt: bool = True) -> str | None:
+    def _resolve_workdir(self, adopt: bool = True, *, lot=None) -> str | None:
         """Le dossier de travail utilisable, ou None.
 
-        Le `cwd` est celui de la ligne du registre relue par `pick()` (jamais
-        un cache de l'inscription) ; à défaut, adoption bornée d'un worktree
-        déplacé (0018), seulement si `adopt`."""
+        Le primaire garde le `cwd` du registre relu par `pick()` et l'adoption
+        bornée d'un worktree déplacé (0018). Un lot SECONDaire DÉCLARÉ (projet
+        de l'agent autre que le primaire) utilise le dossier de son projet au
+        Host, sans modifier le registre ; quand ce dossier manque, `None` ne
+        concerne que ce lot (`_lot_workdir_secondary`), jamais le blocage
+        global « dossier absent » (L35) réservé au cwd primaire. Un lot d'un
+        projet NON déclaré par l'agent, ou un lot inconnu, tourne dans le cwd
+        primaire comme avant L243-4 (#811 B1)."""
+        from . import canon as canon_mod, lot_workdir, projects as projects_mod
+        lot = lot or getattr(self, "_workdir_lot", None) or self.agent.get("session_work_item")
+        names = projects_mod.agent_projects(self.agent)
+        self._lot_workdir_secondary = False
+        self._lot_workdir_path = None
+        project = ""
+        if len(names) > 1:  # N3 : aucun accès base pour un agent mono-projet
+            try:
+                project = lot_workdir.project(self.db, lot)
+            except (lot_workdir.WorkdirError, canon_mod.CanonError):
+                project = ""  # lot inconnu : cwd primaire, comme avant L243-4
+        if project and project != names[0] and project in names[1:]:
+            self._lot_workdir_secondary = True
+            if getattr(self.runner, "mediated", False):
+                self._lot_workdir_error = "mediated executor has no per-project depot"
+                return None
+            try:
+                cwd = lot_workdir.destination(self.cfg, self.agent, project)
+            except (lot_workdir.WorkdirError, canon_mod.CanonError) as exc:
+                self._lot_workdir_error = "project %s: %s" % (project, exc)
+                return None
+            self._lot_workdir_path = cwd
+            self._lot_workdir_error = "project %s: %r" % (project, cwd)
+            return cwd if cwd and os.path.isdir(cwd) else None
+        self._lot_workdir_error = ""
+        return self._primary_workdir(adopt=adopt)
+
+    def _primary_workdir(self, adopt: bool = True) -> str | None:
+        """Le dossier primaire (cwd du registre, adoption bornée ; dépôt de
+        l'exécuteur médié) — jamais un projet secondaire : la garde L35 ne se
+        lève que sur le dossier qu'elle a vu manquer (#811 B1)."""
         if getattr(self.runner, "mediated", False):
             return self._mediated_workdir()  # L113 : dépôt de travail
         cwd = self.agent.get("cwd")
@@ -2784,7 +2844,8 @@ class AgentWorker(threading.Thread):
         cwd = self.agent.get("cwd")
         nouveau = not self._wd_blocked or cwd != self._wd_seen
         if nouveau or force_status:
-            message = "%s : %r" % (self.WORKDIR_ERROR, cwd)
+            message = "%s : %s" % (self.WORKDIR_ERROR,
+                                     getattr(self, "_lot_workdir_error", "") or repr(cwd))
             issue = registry.set_marked_block(
                 self.db, self.name, self.runner.runner_id, self.epoch,
                 self.WORKDIR_STATUS, message, self.WORKDIR_ERROR)
@@ -2844,6 +2905,56 @@ class AgentWorker(threading.Thread):
         log("[%s] working directory found again: %s — resuming" % (self.name, cwd))
         return True
 
+    def _lot_workdir_deferred(self, lot) -> None:
+        """#811 (B1) : diffère CE lot secondaire (dossier absent), échéance
+        croissante et dernier chemin connu — le dossier revenu le débloque au
+        sondage suivant, sans attendre l'échéance."""
+        lot = str(lot or "")
+        if not lot:
+            return
+        delay = self._lot_wd_delay.get(lot)
+        delay = (self.LOT_WORKDIR_BACKOFF_MIN if delay is None
+                 else min(self.LOT_WORKDIR_BACKOFF_MAX, delay * 2))
+        self._lot_wd_delay[lot] = delay
+        self._lot_wd_until[lot] = time.monotonic() + delay
+        if self._lot_workdir_path:
+            self._lot_wd_path[lot] = self._lot_workdir_path
+        log("[%s] lot #%s: %s — lot deferred for %ds, the agent keeps its other "
+            "turns" % (self.name, lot, self._lot_workdir_error or "no directory",
+                       int(delay)))
+
+    def _lot_deferred(self, lot) -> bool:
+        """#811 (B1) : ce lot secondaire attend-il encore son dossier ?
+
+        Le dernier chemin connu est revérifié à chaque appel : un dossier
+        recréé lève le différé tout de suite (pas d'attente de l'échéance)."""
+        lot = str(lot or "")
+        if not lot or lot not in self._lot_wd_until:
+            return False
+        path = self._lot_wd_path.get(lot)
+        if path and os.path.isdir(path):
+            self._lot_wd_until.pop(lot, None)
+            self._lot_wd_delay.pop(lot, None)
+            self._lot_wd_path.pop(lot, None)
+            return False
+        return self._lot_wd_until[lot] > time.monotonic()
+
+    def _lot_workdir_blocked(self, lot) -> bool:
+        """#811 (B1/B2) : ce lot ne peut pas ouvrir de tour faute de dossier.
+
+        L'état de différé (mémoire de ce worker) d'abord ; sinon la règle
+        partagée avec le hook (`lot_workdir.mail_hold`), pour ne pas livrer de
+        courrier dans la session d'un autre lot ni consommer un réveil pour un
+        lot dont le dossier manque. Une lecture en échec ne bloque rien."""
+        if self._lot_deferred(lot):
+            return True
+        try:
+            from . import lot_workdir
+            return lot_workdir.mail_hold(self.cfg, self.db, self.agent, lot)
+        except db_mod.DbError as exc:
+            log_async("[%s] lot workdir unreadable (%s)" % (self.name, exc))
+            return False
+
     def workdir_ready(self) -> bool:
         """Garde de `pick()` pendant un blocage « dossier absent » (L35).
 
@@ -2857,7 +2968,9 @@ class AgentWorker(threading.Thread):
             return True
         change = self.agent.get("cwd") != self._wd_seen
         du = change or time.monotonic() >= self._wd_next
-        cwd = self._resolve_workdir(adopt=du)
+        # #811 (B1) : la garde L35 surveille le dossier PRIMAIRE ; un lot
+        # secondaire différé ne la concerne pas (et ne la lève pas non plus).
+        cwd = self._primary_workdir(adopt=du)
         if cwd:
             return self._workdir_back(cwd)
         if du:
@@ -3617,6 +3730,13 @@ class AgentWorker(threading.Thread):
         if spec is not None:
             # #408 : le réveil sur un lot actionnable porte déjà son lot
             spec["lot"] = spec.get("lot") or self.turn_lot(spec)
+            if self._lot_workdir_blocked(spec.get("lot")):
+                # #811 (B1) : ne pas relancer en boucle le tour d'un lot
+                # secondaire sans dossier ; la consigne repart en attente.
+                if spec.get("kind") == "prompt":
+                    registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                            self.epoch)
+                return None
         return spec
 
     def _pick(self) -> dict | None:
@@ -3683,7 +3803,16 @@ class AgentWorker(threading.Thread):
         # plein tour).
         if not account_turn.continuity(self):
             return None  # #389 r2 : rotation requise mais annulée, rien consommé
-        urgents = mail.unread_urgent(self.db, self.name)
+        # #811 (B1/R3) : un urgent d'un lot retenu attend comme les autres, et
+        # le préfixe retenu ne le masque plus ; les messages primaires passent.
+        from . import lot_workdir
+        # Une construction partielle documentée (`__new__` sans `__init__`,
+        # doublures de test #1270) n'a pas de `cfg` : sans lui, la lecture du
+        # courrier reste simple — aucun canon à charger, rien à retenir.
+        cfg = getattr(self, "cfg", None)
+        urgents = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
+                                                  besoin=50, mode="urgent",
+                                                  deferred=self._lot_deferred)
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
             mid = int(refuse.get("id") or 0)
@@ -3697,21 +3826,40 @@ class AgentWorker(threading.Thread):
             self.nudged = False
             return self._courrier_spec("urgent", autorises)
         if self.suite:
-            # L105 : le tour précédent a été clos par un plafond ; le travail
-            # reprend avant toute nouvelle consigne (le courrier suit, par le hook).
-            raison, self.suite = self.suite, None
-            self.nudged = False
-            return {"kind": "suite", "prompt": adapters.SUITE_PROMPT % raison, "ids": []}
+            lot = self.turn_lot({"kind": "suite", "prompt": "", "ids": []})
+            if not self._lot_workdir_blocked(lot):
+                # L105 : le tour précédent a été clos par un plafond ; le travail
+                # reprend avant toute nouvelle consigne (le courrier suit, par le hook).
+                raison, self.suite = self.suite, None
+                self.nudged = False
+                return {"kind": "suite", "prompt": adapters.SUITE_PROMPT % raison, "ids": [],
+                        "lot": lot}
+            # #811 (B1) : la suite attend le dossier de son lot, sans perdre sa place.
         prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         if prompt:
-            self.nudged = False
-            self._reprise_attach = False
-            return {"kind": "prompt", "prompt": prompt, "ids": []}
-        messages = mail.unread(self.db, self.name)
+            lot = self.turn_lot({"kind": "prompt", "prompt": prompt, "ids": []})
+            if self._lot_workdir_blocked(lot):
+                # #811 (B1) : la consigne attend le dossier de SON lot ; elle
+                # reste en attente et les tours primaires continuent.
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            else:
+                self.nudged = False
+                self._reprise_attach = False
+                return {"kind": "prompt", "prompt": prompt, "ids": [], "lot": lot}
+        # #811 (B1/R3) : le courrier d'un lot retenu attend, les autres
+        # messages du tour passent — et la lecture franchit un préfixe retenu
+        # qui masquerait un message remisable plus récent.
+        messages = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
+                                                   besoin=mail.UNREAD_LIMIT,
+                                                   deferred=self._lot_deferred)
         if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
             # L125 : boîte pleine de courrier passif — les messages qui
             # réveillent, plus récents, ne doivent pas y rester invisibles
-            messages = mail.unread_active(self.db, self.name) + messages
+            reveil = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
+                                                     besoin=mail.UNREAD_LIMIT,
+                                                     mode="active",
+                                                     deferred=self._lot_deferred)
+            messages = reveil + messages
         if messages:
             spec = self._mail_spec(messages)
             if spec is not None:
@@ -3797,6 +3945,10 @@ class AgentWorker(threading.Thread):
             lots = st.actionable(self.name, today=_dt.date.today().isoformat())
             for row in lots:
                 if not self.lot_wake_allowed(row, now, base):
+                    continue
+                if self._lot_workdir_blocked(row["id"]):
+                    # #811 (B2) : pas de réveil consommé pour un lot dont le
+                    # dossier manque — un autre lot actionnable est élu.
                     continue
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
@@ -4716,6 +4868,32 @@ class AgentWorker(threading.Thread):
         return texte
 
     def _run_turn(self, spec: dict) -> bool:
+        if spec.get("lot_switch_failed"):
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        self._workdir_lot = spec.get("lot") or self.agent.get("session_work_item")
+        cwd = self._resolve_workdir()
+        if not cwd:
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            if self._lot_workdir_secondary:
+                # #811 (B1) : seul ce lot attend son dossier ; l'agent garde
+                # ses tours primaires (pas de blocage global « dossier absent »).
+                self._lot_workdir_deferred(self._workdir_lot)
+                return False
+            self._workdir_missing(force_status=True)
+            return False
+        # First assignment to another repository, or a changed Host root:
+        # a session can only resume in the directory that opened it.
+        session = self.current_session()
+        origin = self.agent.get("session_cwd")
+        from . import projects as projects_mod
+        if (session and len(projects_mod.agent_projects(self.agent)) > 1
+                and (self.agent.get("session_origin") != session or not origin
+                     or os.path.realpath(origin) != os.path.realpath(cwd))):
+            lot = self._workdir_lot
+            if not lot or not self._switch_lot(str(self.agent.get("session_work_item") or ""),
+                                               str(lot)):
+                return False
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
         harness = self.turn_harness()
@@ -4811,11 +4989,9 @@ class AgentWorker(threading.Thread):
                 self.agent["session_work_item"] = str(lot)
         self._note_delegate_turn(spec)
 
-        # Worktree renommé/déplacé (0018) : adoption bornée. Absent : la
-        # consigne repart en attente et `pick()` garde l'agent bloqué, avec une
-        # attente croissante et un journal au changement d'état (L35).
-        cwd = self._resolve_workdir()
-        if not cwd:
+        # Keep the directory used for the resume check above. Resolving a
+        # changed policy again here could resume a session in another cwd.
+        if not os.path.isdir(cwd):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             self._workdir_missing(force_status=True)
             return False
@@ -7625,7 +7801,10 @@ class Runner:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
         sa cible, avec ou sans PR, fait passer son lot livré
-        (`plan_git.sync_branches`). Sa propre connexion ; ne lève jamais."""
+        (`plan_git.sync_branches`). Le passage du feu (#1374, `fire.run_pass`)
+        suit : il arme l'auto-fusion des lots qui portent un feu du pilote et
+        réconcilie les PR fusionnées, avant l'atterrissage de la file
+        (`radar_once`). Sa propre connexion ; ne lève jamais."""
         from . import plan_git
         db = None
         try:
@@ -7639,6 +7818,7 @@ class Runner:
                     log_async("work item #%s delivered: %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            self.fire_once(db)
             if not self.dry_run:
                 self.measure_once(db)
                 self.lot_sessions_purge(db)
@@ -7657,6 +7837,23 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def fire_once(self, db) -> None:
+        """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
+        couverts par le gel courant et dont les portes sont vertes, invalide un
+        feu dont la tête a bougé, réconcilie une PR fusionnée. Ne lève jamais :
+        un feu raté est retenté au passage suivant."""
+        from . import fire
+        try:
+            report = fire.run_pass(self.cfg, db, dry_run=self.dry_run)
+            for entry in report:
+                if entry.get("result") in fire.LOUD:
+                    log_async("fire: lot #%s %s%s" % (
+                        entry["lot"], entry["result"],
+                        " — %s" % (entry.get("detail") or entry.get("error"))
+                        if entry.get("detail") or entry.get("error") else ""))
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            log_async("fire pass failed (%s: %s)" % (type(exc).__name__, exc))
 
     def measure_once(self, db) -> None:
         """L157c: measures the lots delivered since the last sweep (phases,

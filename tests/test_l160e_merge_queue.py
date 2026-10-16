@@ -100,6 +100,12 @@ class FakeQueue(FakeWork):
 
 
 class _Base(unittest.TestCase):
+    #: familles simulées : ces bancs sans base portent des noms courts (`a1`,
+    #: `rev1`) ; `actor_family` lit le registre, absent ici — l'indépendance
+    #: des avis reste donc vérifiée, mais sur ce dictionnaire.
+    FAMILIES = {"a1": "deepseek", "a2": "deepseek", "a3": "deepseek", "a4": "deepseek",
+                "rev1": "codex", "rev2": "claude", "rev3": "codex"}
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l160e-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -114,7 +120,10 @@ class _Base(unittest.TestCase):
                       mock.patch.object(work, "get",
                                         side_effect=lambda db, n: self.fake.lots.get(n)),
                       mock.patch.object(work, "milestones",
-                                        side_effect=lambda db, n, *a: self.marks.get(n, []))):
+                                        side_effect=lambda db, n, *a: self.marks.get(n, [])),
+                      mock.patch.object(merge_queue, "actor_family",
+                                        side_effect=lambda db, n: self.FAMILIES.get(
+                                            str(n or "").strip(), ""))):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -123,8 +132,12 @@ class _Base(unittest.TestCase):
 
     def ready(self, lot, *, verdict="ok", sha=None):
         sha = sha or self.tip(lot)
-        self.marks[lot] = [{"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha,
-                            "at_ts": 2.0},
+        # un doute de classe (pas de canon lisible dans ces bancs) garde
+        # l'exigence des domaines critiques : deux avis, familles distinctes.
+        self.marks[lot] = [{"id": 3, "kind": "verdict", "verdict": "ok", "sha": sha,
+                            "at_ts": 3.0, "actor": "rev2"},
+                           {"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha,
+                            "at_ts": 2.0, "actor": "rev1"},
                            {"id": 1, "kind": "frozen", "sha": sha, "at_ts": 1.0}]
 
     def green(self, lot, *, number=7, green=True, draft=False):
@@ -143,16 +156,19 @@ class EntryTest(_Base):
         with self.assertRaisesRegex(merge_queue.QueueError, "not frozen"):
             self.enter(1)
         self.ready(1, verdict="blocked")
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        # #1374 : un blocage non levé refuse la file avec sa cause
+        with self.assertRaisesRegex(merge_queue.QueueError, "blocked verdict"):
             self.enter(1)
         old = self.tip(1)
         self.ready(1)
         _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "a after the freeze")
         with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
             self.enter(1)
-        self.ready(1)  # frozen again, but the verdict is on the old commit
-        self.marks[1][0]["sha"] = old
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        self.ready(1)  # frozen again, but the verdicts are on the old commit
+        for mark in self.marks[1]:
+            if mark["kind"] == "verdict":
+                mark["sha"] = old
+        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
             self.enter(1)
         self.ready(1)
         with self.assertRaisesRegex(merge_queue.QueueError, "CI of PR #7 is not green"):
@@ -265,8 +281,10 @@ class EntryTest(_Base):
                 with self.assertRaisesRegex(merge_queue.QueueError, "not a commit id"):
                     self.enter(1)
         self.ready(1)
-        self.marks[1][0]["sha"] = "lot/1-a"  # a verdict on the branch, not on a commit
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        for mark in self.marks[1]:  # a verdict on the branch, not on a commit
+            if mark["kind"] == "verdict":
+                mark["sha"] = "lot/1-a"
+        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
             self.enter(1)
         # a branch named like a commit id is not that commit
         _git(self.repo, "branch", "deadbeef", tip)
@@ -973,8 +991,13 @@ class QueueWithoutRadarTest(PgTestCase):
         fresh = _git(origin, "rev-parse", "lot/1-a")
         self.assertNotEqual(stale, fresh)
         lot = work.add(self.db, title="a", branch="lot/1-a")["id"]
+        # #1374 : la porte des avis lit la famille de modele de l'auteur ; le
+        # banc simule l'auteur (`a1`) et deux relecteurs de familles distinctes
+        # (`rev1`, `rev2`), comme les bancs sans base plus haut.
+        self.db.execute("UPDATE work_items SET assignee = 'a1' WHERE id = %d" % lot)
         work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
-        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="reviewer")
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")
         status = {"number": 7, "green": True, "head": fresh, "draft": False}
         made: list = []
         real = tempfile.mkdtemp
@@ -988,6 +1011,10 @@ class QueueWithoutRadarTest(PgTestCase):
         with mock.patch.object(merge_queue, "radar_project", return_value=None), \
                 mock.patch.object(radar, "github_ci",
                                   return_value=lambda branch: dict(status)), \
+                mock.patch.object(merge_queue, "actor_family",
+                                  side_effect=lambda db, n: {
+                                      "a1": "deepseek", "rev1": "codex",
+                                      "rev2": "claude"}.get(str(n or "").strip(), "")), \
                 mock.patch.object(merge_queue.tempfile, "mkdtemp", side_effect=record):
             self.assertEqual(merge_queue.run(self.cfg, self.db, args), 0)
         # the fresh tip entered the queue, never the stale remote ref

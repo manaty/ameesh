@@ -886,6 +886,14 @@ def _widget_key(profile: Profile, items: list) -> str:
     return key
 
 
+def _read_at_of(gauges) -> float | None:
+    """L'horodatage du relevé (#1561) : le plus récent des seaux datés, None
+    si aucun ne porte de date. Sert à comparer deux sources (#1648)."""
+    stamps = [stamp for stamp in
+              (getattr(g, "read_at", None) for g in gauges or ()) if stamp]
+    return max(stamps) if stamps else None
+
+
 def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
               model=None, now: float | None = None) -> list:
     """Les jauges de forfait du compte.
@@ -898,8 +906,10 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
     #1580 (tranche 3) : le fichier du widget omarchy d'abord quand il est
     frais (il porte les seaux propres à un modèle, invisibles des journaux),
     ses drapeaux d'overage repris du journal ; sinon les journaux
-    `rate_limit_event.unifiedWindows`, comme avant. `model` filtre les seaux
-    de modèle (`model_scoped`).
+    `rate_limit_event.unifiedWindows`, comme avant. #1648 : entre deux relevés
+    datés, le plus récent gagne — un widget arrêté mais encore dans sa fenêtre
+    ne masque plus un journal plus frais. `model` filtre les seaux de modèle
+    (`model_scoped`).
 
     #1789/N3 : le widget ne se lit que pour un compte à dossier de
     configuration. Une clé API n'en a pas — `home()` retombe sur le dossier
@@ -909,17 +919,20 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
         from . import widget_usage
         primary = primary_of(profile.harness, items, environ)
         primary_name = primary.name if primary is not None else None
+        journal = book.claude_gauges(account=profile.name,
+                                     primary=primary_name)
         gauges = widget_usage.read(profile, now=now,
                                    key=_widget_key(profile, items))
+        widget_at, journal_at = _read_at_of(gauges), _read_at_of(journal)
+        if gauges is not None and widget_at is not None and journal_at is not None \
+                and widget_at < journal_at:
+            gauges = None      # #1648 : le journal est plus récent
         if gauges is not None:
-            journal = book.claude_gauges(account=profile.name,
-                                         primary=primary_name)
             overage = getattr(journal, "overage", None)
             if overage is not None:
                 gauges.overage = overage
         else:
-            gauges = book.claude_gauges(account=profile.name,
-                                        primary=primary_name)
+            gauges = journal
         return model_scoped(gauges, model)
     if profile.harness == "claude":
         primary = primary_of(profile.harness, items, environ)
@@ -1450,14 +1463,57 @@ def placeable(result: Evaluation, now: float) -> bool:
     return not result.gauges or not reading_outdated(result.gauges, now)
 
 
-def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
-    """La clé de classement d'un compte (0034 amendée, #1561, #1580).
 
-    * la fraîcheur du relevé (#1561) : sans relevé d'abord (L117, amendement
-      0034 du 2026-10-10 — un compte jamais utilisé compte pour 0 % et passe
-      en premier, pour ne pas laisser un forfait inutilisé), puis un relevé
-      courant, puis un relevé périmé, qui ne passe jamais avant un état
-      vérifié ;
+def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
+    """#1566 N1 — un relevé partiel porte-t-il encore une information utilisable ?
+
+    Un relevé partiel (une fenêtre datée remise à zéro, une autre encore
+    ouverte, #1561) reste **non vérifié** : #1561 le classait après tout état
+    vérifié. Le pilote en a borné le classement (GO du 15/10, lot #1566) : il
+    garde le rang d'un relevé **courant** (fraîcheur 1, jamais 0) quand
+
+    * son âge est connu, fini et non futur, et ne dépasse pas ce qui reste
+      d'**au moins une** fenêtre datée encore ouverte — même frontière que
+      `cost.reading_outdated` (#1672) ; et
+    * **chaque** fenêtre encore ouverte (non datée comprise : elle ne prouve
+      pas sa remise à zéro) reste sous son plafond effectif moins `RESERVE`
+      (`Evaluation.limits` : rythme, fenêtre courte, plafond fixe ou d'overage
+      — jamais `held_cap` seul, qui ignore les plafonds fixes).
+
+    Sans preuve (âge inconnu, aucune fenêtre datée ouverte, plafond absent), le
+    relevé reste périmé : fraîcheur 2. L'incident #1672 (relevé de quatre
+    jours, fenêtre 7 j à 9 h de sa remise à zéro) échoue la borne d'âge et
+    reste écarté du placement par `placeable`.
+    """
+    gauges = list(gauges)
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges)
+              if stamp]
+    if not stamps:
+        return False
+    age = now - min(stamps)
+    if not math.isfinite(age) or age < 0:
+        return False
+    running = [g for g in gauges if not g.resets_at or not g.reset_passed(now)]
+    if not any(g.resets_at and age <= g.resets_at - now for g in running):
+        return False
+    for gauge in running:
+        found = result.limits.get(gauge.key)
+        if found is None:
+            return False
+        if gauge.used_at(now) >= max(0.0, found[0] - RESERVE):
+            return False
+    return True
+
+
+def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
+    """La clé de classement d'un compte (0034 amendée, #1561, #1580, #1566).
+
+    * la fraîcheur du relevé (#1561, #1566 N1) : sans relevé d'abord (L117,
+      amendement 0034 du 2026-10-10 — un compte jamais utilisé compte pour
+      0 % et passe en premier, pour ne pas laisser un forfait inutilisé), puis
+      un relevé courant — ou un relevé partiel encore informatif
+      (`_informative_partial`, GO pilote du 15/10) —, puis un relevé périmé,
+      qui ne passe jamais avant un état vérifié ;
     * la perte par seconde d'ici la remise à zéro (`lost_rate`, la plus
       rapide d'abord, #1789/N1) ;
     * le retard sur le rythme (`lag`, le plus petit rapport d'abord) ;
@@ -1476,13 +1532,14 @@ def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
     found = expiry(gauges, now)
     # #1561 : absent (0, L117), courant (1), périmé (2) — le périmé après tout
     # état vérifié ; #1580/#1789 : le budget perdu avant le retard, lui-même
-    # avant l'ordre déclaré.
+    # avant l'ordre déclaré ; #1566 N1 : un partiel encore informatif garde le
+    # rang d'un courant.
     if not gauges:
         freshness = 0
-    elif stale_reading(gauges, now):
-        freshness = 2
-    else:
+    elif not stale_reading(gauges, now) or _informative_partial(gauges, result, now):
         freshness = 1
+    else:
+        freshness = 2
     return (freshness,
             -round(lost_rate(gauges, now), 9),
             round(lag(gauges, now, result.limits)[0], 6),
@@ -1495,14 +1552,15 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
     """Les comptes plaçables, du premier à consommer au dernier (0034 amendée).
 
-    Clé (#1561, #1580, #1789) : d'abord un relevé **courant** — un compte dont
-    le relevé est périmé (une fenêtre remise à zéro depuis la lecture, une autre
-    encore ouverte) ne passe jamais avant un compte dont l'état est vérifié,
-    quel que soit l'ordre de bascule ; puis le budget **qui s'évapore** — la
-    perte par seconde d'ici la remise à zéro (`lost_rate`, la plus rapide
-    d'abord, #1789/N1), le retard sur le rythme (`lag`, le plus petit rapport
-    d'abord), l'échéance de la capacité inutilisée (la plus proche d'abord ;
-    sans fenêtre en cours, après), la part perdue à cette remise à zéro
+    Clé (#1561, #1580, #1789, #1566 N1) : d'abord un relevé **courant** — un
+    compte dont le relevé est périmé (une fenêtre remise à zéro depuis la
+    lecture, une autre encore ouverte) ne passe jamais avant un compte dont
+    l'état est vérifié, quel que soit l'ordre de bascule, sauf s'il reste
+    informateur (plus bas) ; puis le budget **qui s'évapore** — la perte par
+    seconde d'ici la remise à zéro (`lost_rate`, la plus rapide d'abord,
+    #1789/N1), le retard sur le rythme (`lag`, le plus petit rapport d'abord),
+    l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
+    fenêtre en cours, après), la part perdue à cette remise à zéro
     (`lost_at_reset`, la plus grosse d'abord, #1580) ; puis l'ordre déclaré
     (`priority`, L226b « le compte par défaut en dernier », décision owner du
     2026-10-07).
@@ -1516,6 +1574,14 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
     continuité (`choose`, étape 2) garde son chemin : une session déjà sur le
     compte y reste et son tour rapporte la jauge ; un forçage manuel reste
     souverain.
+
+    #1566 N1 : un relevé partiel qui reste **informateur** — âge sous ce qui
+    reste d'une fenêtre datée ouverte, et chaque fenêtre ouverte sous son
+    plafond effectif moins `RESERVE` (`_informative_partial`, GO pilote du
+    15/10) — concourt avec les relevés courants : c'est la fin de l'inversion
+    de l'ordre de bascule quand seule une fenêtre courte s'est remise à zéro.
+    Sans preuve, il reste périmé (fraîcheur 2) ; un relevé écarté par
+    `placeable` ne revient pas par cette règle.
 
     Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
     un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
@@ -1551,11 +1617,23 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
         # prétendre à un 0 % mesuré (#1561).
         why = "no reading: unverified, tried first (L117)"
     elif stale_reading(gauges, now):
-        # #1561 : aucun relevé courant n'est disponible ; il est essayé faute
-        # de mieux (L71), pas choisi sur un rythme qui n'est plus mesuré.
-        # #1672 ne l'écarte que lorsqu'il est plus vieux que toute fenêtre
-        # encore ouverte (`placeable`) ; ici il reste dans le rang.
-        why = "%s, tried (no current reading)" % explain(evaluations[first.name], now)
+        # #1561 : un relevé périmé est essayé faute de mieux (L71), pas choisi
+        # sur un rythme qui n'est plus mesuré. #1672 ne l'écarte que lorsqu'il
+        # est plus vieux que toute fenêtre encore ouverte (`placeable`) ; ici
+        # il reste dans le rang. #1566 N1 : encore informatif (âge sous le
+        # reste d'une fenêtre ouverte, plafonds moins la réserve), il peut
+        # passer avant un relevé courant — la raison le dit « partiel », sans
+        # prétendre à une mesure courante.
+        still = _informative_partial(gauges, evaluations[first.name], now)
+        current_behind = any(
+            evaluations[p.name].gauges
+            and not stale_reading(evaluations[p.name].gauges, now)
+            for p in ranked[1:])
+        why = "%s, %s" % (
+            explain(evaluations[first.name], now),
+            "partial reading still informative (age within an open window, "
+            "below cap - reserve)" if still and current_behind
+            else "tried (no current reading)")
     else:
         why = None
         if len(ranked) > 1:

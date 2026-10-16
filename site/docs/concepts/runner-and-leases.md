@@ -244,6 +244,24 @@ ameesh run stop <name>        # no new lease; the current turn finishes
 
 `canon sync` never lifts a stop set by `ameesh run stop`.
 
+## Working on several projects
+
+An agent with several declared `projects` keeps its registry `cwd` for the
+primary project. A lot of another project uses that project's Host
+`work_roots` or `work_root`, expanding `{agent}`; the agent's `work_dirs`
+override applies to the primary project. Prepare that directory before
+automatic pick-up: the runner does not clone a repository or create an empty
+directory. A missing or ambiguous secondary directory leaves the lot
+unassigned; an explicitly assigned lot waits until its directory is ready —
+the agent is not blocked: its primary turns and mail keep flowing, and only
+that lot is retried later. A lot whose project the agent has **not** declared
+(or an unknown lot) keeps the primary `cwd`, as before per-project
+directories. Each lot's parked session keeps its opening directory, so
+returning to it resumes there. Changing the directory starts a new session.
+Multi-project agents keep separate lot sessions even with
+`session_policy=jamais`. The mediated executor's single agent depot cannot
+run a secondary project.
+
 ## Seeing it
 
 ```bash
