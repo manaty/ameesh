@@ -101,10 +101,26 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_rien_n_est_publie_si_la_fusion_echoue(self):
         # l'artefact `carte` et le cache ne s'écrivent qu'après une fusion
-        # réussie : aucune étape du job `carte` ne tourne sur échec.
+        # réussie : aucune étape de publication du job `carte` ne tourne sur
+        # échec. Un ménage tolérant (`continue-on-error`) peut, lui, tourner
+        # sur échec : il ne publie rien (quota d'artefacts).
         section = WORKFLOW.split("\n  carte:\n", 1)[1]
         etapes = section.split("    steps:\n", 1)[1]
-        self.assertNotIn("if: always()", etapes)
+        # la première étape suit `steps:` sans saut de ligne : on le remet
+        blocs = ("\n" + etapes).split("\n      - ")[1:]
+        publication = [b for b in blocs
+                       if "actions/upload-artifact" in b or "actions/cache/save" in b]
+        self.assertTrue(publication, "aucune étape de publication dans le job carte")
+        # toute condition qui fait tourner une étape après un échec, pas
+        # seulement la graphie `if: always()`
+        sur_echec = re.compile(r"^\s*if:.*(\b(always|failure)\(\)|!\s*cancelled\(\))", re.M)
+        for bloc in publication:
+            self.assertNotRegex(bloc, sur_echec,
+                                "une étape de publication ne tourne pas sur échec")
+        for bloc in blocs:
+            if sur_echec.search(bloc):
+                self.assertIn("continue-on-error: true", bloc,
+                              "seul un ménage tolérant tourne sur échec")
         self.assertIn("actions/cache/save@v4", etapes)
 
 
