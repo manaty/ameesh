@@ -3693,6 +3693,10 @@ class AgentWorker(threading.Thread):
 
     def run_turn(self, spec: dict) -> bool:
         """Exclude attach for the whole turn and life of its resident."""
+        self.fast_failure = False
+        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
         from .platform import session_lock
         if self._attach_pending():
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
@@ -3729,10 +3733,6 @@ class AgentWorker(threading.Thread):
         pas soldée ; elle expire ou change d'epoch, le message est remis plus
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
-        self.fast_failure = False
-        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            return False
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien
