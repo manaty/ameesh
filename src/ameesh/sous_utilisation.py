@@ -19,12 +19,14 @@ Quatre types d'alerte, levés par `ameesh alerts` et poussés par
   fenêtre si rien ne change (même définition que les « pertes à la remise à
   zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ;
 * `idle_capacity` : des agents réveillables (mode `execute`, exécuteur
-  vivant, au repos, sous leur budget, sans lot ni courrier) depuis plus du
-  seuil, alors que du travail attend (lots ouverts sans assigné, courrier en
+  vivant, au repos, sous leur budget, sans lot actionnable ni courrier)
+  alors que du travail attend (lots ouverts sans assigné, courrier en
   souffrance chez un agent occupé) ou que des agents payés au token
   travaillent pendant que des agents au forfait dorment (`forfait_au_repos`,
-  le cas aggravant). Le message propose l'action : répartir, ou réveiller
-  l'orchestrateur ;
+  le cas aggravant). #1677 : le repos se lit sur les lots actionnables
+  (`actionable_lots`), pas sur le temps depuis le dernier tour — le seuil ne
+  sert plus que de repli sans ce relevé. Le message propose l'action :
+  répartir, ou réveiller l'orchestrateur ;
 * `orchestrator_held` : un orchestrateur tenu par une session interactive
   (`ameesh attach`) depuis plus du seuil, avec du courrier non lu — il ne
   répartit plus (prolonge 0030) ;
@@ -78,7 +80,8 @@ PLAN_PACE_MIN_WINDOW_S = 86400.0
 PLAN_PACE_MIN_ELAPSED = 0.25
 #: âge maximal des relevés de jauge lus (une fenêtre de 7 jours + marge)
 PLAN_GAUGES_SINCE_S = 8 * 86400.0
-#: `idle_capacity` : au repos depuis 30 min
+#: `idle_capacity` : seuil (repli quand le relevé ne porte pas
+#: `actionable_lots` ; #1677)
 DEFAULT_IDLE_CAPACITY_S = 1800.0
 #: `orchestrator_held` : tenu par `attach` depuis 30 min
 DEFAULT_ORCHESTRATOR_HELD_S = 1800.0
@@ -824,14 +827,24 @@ def session_lot_busy(row: dict, *, waiting_free: bool = False) -> bool:
 
 
 def idle_agents(listing: list, now: float, idle_s: float, *,
-                waiting_free: bool = False) -> list:
-    """Les agents réveillables au repos sans lot ni courrier depuis au moins
-    `idle_s` : mode `execute`, exécuteur vivant (pas une session attachée),
-    au repos (ni en tour, ni en pause de budget, ni arrêtés). Partagé par
-    `idle_capacity`, `backlog_empty` et la prise automatique (L119) ;
-    `waiting_free` : voir `free_of_lots` (L165b) ; une consigne en attente
-    et un lot de session qui l'occupe (`session_lot_busy`) occupent l'agent,
-    comme pour la prise (`backlog._awaited`)."""
+                waiting_free: bool = False, actionable_idle: bool = False) -> list:
+    """Les agents réveillables au repos : mode `execute`, exécuteur vivant (pas
+    une session attachée), au repos (ni en tour, ni en pause de budget, ni
+    arrêtés). Partagé par `idle_capacity`, `backlog_empty` et la prise
+    automatique (L119) ; `waiting_free` : voir `free_of_lots` (L165b) ; une
+    consigne en attente et un lot de session qui l'occupe
+    (`session_lot_busy`) occupent l'agent, comme pour la prise
+    (`backlog._awaited`).
+
+    #1677 : `actionable_idle` lit le repos sur les lots **actionnables**
+    (`actionable_lots`, lu par `operations.listing` : rien qui l'occupe,
+    aucune correction attendue d'un verdict bloquant) au lieu du temps depuis
+    le dernier tour — un agent sans lot prend des tours de courrier toutes les
+    quelques minutes et ne serait donc jamais « au repos » (N9). La **prise**
+    de lots et les alertes de sous-utilisation s'en servent ; la remise
+    (`handoff.hand`, L233b) garde son contrat d'origine, « au repos depuis au
+    moins `idle_s` », qu'un relevé sans `actionable_lots` (bancs, appels
+    anciens) impose de toute façon."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -845,9 +858,12 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
         if waiting_free and (row.get("has_pending_prompt")
                              or session_lot_busy(row, waiting_free=True)):
             continue
-        since = idle_since(row)
-        if not since or now - since < idle_s:
+        if int(row.get("actionable_lots") or 0) > 0:
             continue
+        if not (actionable_idle and "actionable_lots" in row):
+            since = idle_since(row)
+            if not since or now - since < idle_s:
+                continue
         idle.append(row)
     return idle
 
@@ -943,7 +959,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     pressured = pressured or {}
     # L165b : un agent dont tous les lots attendent un autre est au repos
-    idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True)
+    idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True,
+                                       actionable_idle=True)
             if row["name"] not in held]
     on_hold = sorted((row["name"], row.get("host")) for row in idle
                      if row.get("host") in held_hosts)
@@ -977,8 +994,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if not (waiting_lots or backlog or aggravating):
         return []
     names = sorted(row["name"] for row in idle)
-    parts = ["%d wakeable agent(s) idle without a lot in progress for more than %s: %s"
-             % (len(names), _duration(idle_s), ", ".join(names))]
+    # #1677 (b) : le repos se lit sur les lots actionnables, plus sur le temps
+    # depuis le dernier tour (N9) — le texte ne promet plus une durée.
+    parts = ["%d wakeable agent(s) idle without an actionable lot: %s"
+             % (len(names), ", ".join(names))]
     if waiting_lots:
         parts.append("%d open lot(s) without an assignee (%s)" % (
             len(waiting_lots), ", ".join("#%d" % int(l["id"]) for l in waiting_lots[:8])
@@ -1277,7 +1296,7 @@ def backlog_empty(db, listing: list, now: float, *,
     invité à remplir la file (`ameesh work backlog add`)."""
     if idle_s <= 0:
         return []
-    idle = idle_agents(listing, now, idle_s)
+    idle = idle_agents(listing, now, idle_s, actionable_idle=True)
     if not idle:
         return []
     # #1696 (N2 de #1242) : une file dont tous les éléments sont bloqués n'est
@@ -1290,10 +1309,10 @@ def backlog_empty(db, listing: list, now: float, *,
     names = sorted(row["name"] for row in idle)
     return [_alert(
         "backlog_empty", None, None, len(names), idle_s,
-        "%d wakeable agent(s) idle without a lot for more than %s (%s) and the improvement "
+        "%d wakeable agent(s) idle without an actionable lot (%s) and the improvement "
         "backlog is empty. Action: add items with expected value "
         "(ameesh work backlog add), or assign a lot (ameesh work assign)"
-        % (len(names), _duration(idle_s), ", ".join(names)),
+        % (len(names), ", ".join(names)),
         agents=names, responsible=_common_responsible(idle))]
 
 

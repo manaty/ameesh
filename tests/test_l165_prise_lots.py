@@ -302,19 +302,23 @@ class PriseDeLotTest(_Lots):
         self.assertEqual(work.get(self.db, pour_deepseek["id"])["assignee"], "deepseek7")
 
     def test_seuil_de_repos_propre_aux_lots(self):
+        # #1677 (b) : le seuil de temps ne borne plus la prise des lots quand
+        # le relevé porte `actionable_lots` — un agent sans lot actionnable est
+        # au repos, quel que soit le temps depuis son dernier tour. Zéro reste
+        # l'interrupteur qui désactive la prise.
         self.agent("claude1", team="nexlink", since_s=20 * 60)
         lot = self.lot("lot")
-        self.assertEqual(self.take(lot_idle_s=30 * 60), [])
         self.assertEqual(self.take(lot_idle_s=0), [])
         self.assertEqual(self.take(lot_max_per_hour=0), [])
         # un lot tout juste créé est laissé à qui l'a créé
         self.db.execute("UPDATE work_items SET created_at = now() WHERE id = %s",
                         (lot["id"],))
-        self.assertEqual(self.take(), [])
+        self.assertEqual(self.take(lot_idle_s=30 * 60), [])
         self.db.execute("UPDATE work_items SET created_at = now() - interval '10 minutes'"
                         " WHERE id = %s", (lot["id"],))
-        # défaut : 15 min de repos suffisent, la file en demande 30
-        self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
+        # 20 min de repos, seuil de lot à 30 min : la prise part quand même
+        self.assertEqual([t["item"]["id"] for t in self.take(lot_idle_s=30 * 60)],
+                         [lot["id"]])
 
     def test_ordre_priorite_puis_dates_prevues(self):
         self.agent("a1", team="nexlink", since_s=3 * HEURE)
