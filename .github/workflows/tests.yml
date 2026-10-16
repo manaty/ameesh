@@ -653,7 +653,9 @@ jobs:
   # provisional green, for the two-week review (L161i); never required
   bilan:
     name: bilan des impactés
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    # #876 : « always() » seul recrée le job après l'annulation de l'exécution
+    # (il reste queued des heures, puis la conclut en rouge) ; !cancelled() le saute.
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
@@ -704,6 +706,11 @@ jobs:
   # ou exécution à la main — compte comme les autres)
   tests:
     name: tests
+    # #876 : seul check requis ; `always() && !cancelled()` le ferait passer
+    # skipped sur une exécution annulée, et GitHub compte un job sauté comme un
+    # succès — la PR redeviendrait fusionnable sans aucun test. Il garde donc
+    # `always()` (une exécution annulée le conclut en rouge) ; l'attente en file
+    # de cet agrégat après annulation est la saturation des runners (lot #828).
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
