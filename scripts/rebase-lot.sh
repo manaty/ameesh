@@ -10,8 +10,11 @@
 #
 # Ce lanceur passe core.commentChar=';' à *chaque* invocation de git rebase —
 # y compris --continue, là où l'éditeur s'ouvre réellement. Le rebasage
-# terminé, il contrôle que les sujets « #… » notés au départ existent encore ;
-# un sujet perdu est signalé et le lanceur sort en 4.
+# terminé, il contrôle les sujets « #… » notés au départ : un sujet disparu
+# dont le corps du commit devient un sujet est un sujet passé en corps (le
+# défaut), signalé, sortie 4 ; un sujet disparu sans cette trace est un
+# abandon volontaire (--empty=drop, drop dans -i, --skip) et n'est pas une
+# perte (#1516).
 #
 # Usage : scripts/rebase-lot.sh <arguments de git rebase>
 #   scripts/rebase-lot.sh origin/main
@@ -20,6 +23,9 @@
 set -euo pipefail
 
 etat=$(git rev-parse --git-path ameesh-rebase-lot.sujets)
+#: marque la première ligne de l'état : un sujet « #… » peut porter n'importe
+#: quel texte, elle évite de le confondre avec un sujet.
+ETAT_MARQUE='rebase-lot/etat-v2'
 en_cours() {
   [ -d "$(git rev-parse --git-path rebase-merge)" ] \
     || [ -d "$(git rev-parse --git-path rebase-apply)" ]
@@ -58,7 +64,7 @@ noter_sujets() {
         fi ;;
       --onto=*|--exec=*|--strategy=*|--strategy-option=*|--whitespace=*|--empty=*|--trailer=*|-C?*|-X?*|-s?*|-x?*|-S*) ;;
       --) positions+=("${args[@]:i+1}"); break ;;
-      -i|--interactive|-m|--merge|--apply|-q|--quiet|-v|--verbose|-n|--no-stat|--stat|-f|--force-rebase|--no-force-rebase|--no-ff|--ff|--verify|--no-verify|--signoff|--no-signoff|--committer-date-is-author-date|--no-committer-date-is-author-date|--reset-author-date|--no-reset-author-date|--ignore-whitespace|--no-ignore-whitespace|--autosquash|--no-autosquash|--update-refs|--no-update-refs|--gpg-sign|--gpg-sign=*|--no-gpg-sign|--autostash|--no-autostash|--rerere-autoupdate|--no-rerere-autoupdate|--reschedule-failed-exec|--no-reschedule-failed-exec) ;;
+      -i|--interactive|-m|--merge|--apply|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|-n|--no-stat|--stat|-k|--keep-empty|--no-keep-empty|--allow-empty-message|--no-allow-empty-message|-f|--force-rebase|--no-force-rebase|--no-ff|--ff|--verify|--no-verify|--signoff|--no-signoff|--committer-date-is-author-date|--no-committer-date-is-author-date|--reset-author-date|--no-reset-author-date|--ignore-whitespace|--no-ignore-whitespace|--autosquash|--no-autosquash|--update-refs|--no-update-refs|--gpg-sign|--gpg-sign=*|--no-gpg-sign|--autostash|--no-autostash|--rerere-autoupdate|--no-rerere-autoupdate|--reschedule-failed-exec|--no-reschedule-failed-exec) ;;
       -*) printf 'rebase-lot : option de plage non reconnue : %s\n' "$arg" >&2; return 2 ;;
       *) positions+=("$arg") ;;
     esac
@@ -90,9 +96,18 @@ noter_sujets() {
   fi
   # Les commits de fusion ne sont pas rejoués par un rebase ordinaire.
   ((merges)) || options_log+=(--no-merges)
-  local sujets
-  sujets=$(git log --format='%s' "${options_log[@]}" "${revisions[@]}" --) || return
-  printf '%s\n' "$sujets" | { grep '^#' || :; } >"$etat"
+  # Chaque sujet « #… » est noté avec la première ligne du corps de son
+  # commit : le défaut transforme le corps en sujet, cette marque le retrouve.
+  local liste h s corps
+  liste=$(git log --format='%H%x1f%s' "${options_log[@]}" "${revisions[@]}" --) || return
+  {
+    printf '%s\n' "$ETAT_MARQUE"
+    while IFS=$'\x1f' read -r h s; do
+      case "$s" in \#*) ;; *) continue ;; esac
+      corps=$(git show -s --format='%b' "$h" | sed -n '/[^[:space:]]/{p;q;}')
+      printf '%s\x1f%s\n' "$s" "$corps"
+    done <<<"$liste"
+  } >"$etat"
 }
 
 # Au démarrage seulement ; garder le même état après un conflit.
@@ -116,12 +131,36 @@ if ((abandon)); then
   exit 0
 fi
 
-# Rebasage terminé : chaque sujet de la plage notée doit exister, sans borne.
+# Rebasage terminé : un sujet « #… » de la plage notée qui a disparu est un
+# abandon volontaire (--empty=drop, drop dans -i, --skip) SAUF si le corps de
+# son commit réapparaît en sujet : le nettoyage a alors retiré la ligne « #… ».
 if [ -f "$etat" ] && ! en_cours; then
-  perdus=$(grep -F -x -v -f <(git log --format='%s' HEAD) "$etat" || :)
+  finaux=$(git log --format='%s' HEAD)
+  #: un sujet vidé (nettoyage + --allow-empty-message) est une perte aussi ;
+  #: on ne regarde que les commits produits par ce rebasage (ORIG_HEAD est la
+  #: tête d'avant, posée par git rebase).
+  origine=$(git rev-parse --verify -q ORIG_HEAD 2>/dev/null || :)
+  [ -n "$origine" ] || origine=HEAD
+  sujets_vides=$(git log --format='%s' "$origine"..HEAD 2>/dev/null | grep -c '^$' || :)
+  perdus= abandonnes=
+  while IFS= read -r ligne; do
+    [ "$ligne" != "$ETAT_MARQUE" ] || continue
+    sujet=${ligne%%$'\x1f'*}
+    corps=${ligne#*$'\x1f'}
+    printf '%s\n' "$finaux" | grep -Fqx -- "$sujet" && continue
+    if { [ -n "$corps" ] && printf '%s\n' "$finaux" | grep -Fqx -- "$corps"; } \
+      || [ "$sujets_vides" != 0 ]; then
+      perdus+="$sujet"$'\n'
+    else
+      abandonnes+="$sujet"$'\n'
+    fi
+  done <"$etat"
   rm -f "$etat"
+  if [ -n "$abandonnes" ]; then
+    printf 'rebase-lot : sujets « #… » absents — abandon volontaire (drop, skip ou commit vidé), pas une perte :\n%s' "$abandonnes" >&2
+  fi
   if [ -n "$perdus" ]; then
-    printf 'rebase-lot : sujets « #… » absents après le rebasage :\n%s\n' "$perdus" >&2
+    printf 'rebase-lot : sujets « #… » absents après le rebasage :\n%s' "$perdus" >&2
     printf "rebase-lot : contrôle « git log --format='%%s' » — un sujet a pu passer en corps.\n" >&2
     exit 4
   fi

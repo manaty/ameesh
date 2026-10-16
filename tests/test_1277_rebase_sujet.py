@@ -56,8 +56,8 @@ class RebaseSujetTest(unittest.TestCase):
         _git(self.depot, "commit", "-qam", "main avance")
         _git(self.depot, "checkout", "-q", "lot")
 
-    def _lancer(self, *commande: str) -> subprocess.CompletedProcess:
-        env = dict(GIT_ENV, GIT_EDITOR="true")
+    def _lancer(self, *commande: str, editeur: str = "true") -> subprocess.CompletedProcess:
+        env = dict(GIT_ENV, GIT_EDITOR=editeur)
         return subprocess.run(list(commande), cwd=self.depot, capture_output=True,
                               text=True, env=env)
 
@@ -88,12 +88,17 @@ class RebaseSujetTest(unittest.TestCase):
         self.assertEqual(self._sujet(), "#900 sujet du lot")
 
     def test_le_lanceur_signale_un_sujet_perdu(self) -> None:
-        """Le contrôle : un commit « #… » sauté est signalé (sortie 4)."""
+        """Le contrôle : un sujet retiré par l'éditeur est signalé (sortie 4).
+
+        #1516 : le témoin utilisait `--skip`, un abandon volontaire, que le
+        lanceur ne signale plus comme une perte ; l'éditeur qui mange la ligne
+        « #… » reproduit le défaut lui-même."""
         self._depot()
         self._conflit("bash", LANCEUR, "main")
-        proc = self._lancer("bash", LANCEUR, "--skip")
+        proc = self._lancer("bash", LANCEUR, "--continue", editeur="sed -i 1d")
         self.assertEqual(proc.returncode, 4, proc.stderr)
         self.assertIn("#900 sujet du lot", proc.stderr)
+        self.assertEqual(self._sujet(), "corps du lot")
 
 
 if __name__ == "__main__":
