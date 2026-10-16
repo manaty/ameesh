@@ -14,7 +14,8 @@ from datetime import datetime
 from unittest import mock
 
 from ameesh import (db as db_mod, radar, storage, train, train_ci, train_fire,
-                    train_git, train_policy, train_runner, train_transports, work)
+                    train_git, train_policy, train_runner, train_transports,
+                    train_transport_journal, work)
 
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
@@ -404,6 +405,133 @@ class TrainRunnerTest(PgTestCase):
         rows = passage.incident_facts(other).lands("o/r", plan["head"])
         self.assertEqual(rows[0]["files"], ["adapted-test", "content"])
         self.assertEqual(rows[0]["sha"], self.head)
+
+    def indexed_transport(self):
+        self.automatic_passage()
+        member = self.ops.queue(None)[0]
+        self.git(self.publisher, "checkout", "main")
+        self.git(self.publisher, "merge", "--no-ff", "--no-edit", self.head)
+        self.write("adapted-test", "existing qualified adaptation fixture\n")
+        self.git(self.publisher, "add", "adapted-test")
+        self.git(self.publisher, "commit", "--amend", "--no-edit")
+        head = self.git(self.publisher, "rev-parse", "HEAD")
+        ref = "refs/ameesh/resolutions/%d/journal-fixture" % member["work_item_id"]
+        self.git(self.publisher, "push", "-q", "origin", head + ":" + ref)
+        work.note(self.db, member["work_item_id"], "existing qualification fixture " + head,
+                  actor="fixture-pilot")
+        original = self.ops.events(member["work_item_id"], 1)[0]
+        qualification = dict(kind="adapted", references=[dict(kind="work-event", id=original["id"])])
+        self.import_transport = lambda db=self.db: train_transport_journal.import_ref(
+            db, self.project, self.publisher, ref, lot=member["work_item_id"],
+            source_head=self.head, qualification=qualification, actor="fixture-importer")
+        document = self.import_transport()
+        self.transport_connections = []
+
+        def resolve(db, *, facts, qualification, originals, history):
+            # Authority remains an explicit fixture. All supplied sources and
+            # their original authors are nevertheless read from real SQL.
+            self.transport_connections.append(db)
+            self.assertEqual(originals[0]["author"], "fixture-pilot")
+            self.assertEqual(originals[0]["record"], original)
+            self.assertEqual(facts, document["facts"])
+            active = not any(r["note"] == "withdraw fixture qualification" for r in history["events"])
+            return dict(facts=facts, qualification=qualification, active=active)
+        reader = train_transport_journal.Recorded(self.project, resolve=resolve)
+        return member, document, reader
+
+    def test_journal_import_real_sources_to_plan_then_fresh_connection_and_lost_clone(self):
+        member, document, reader = self.indexed_transport()
+        self.assertNotIn("admission", document)
+        self.assertNotIn("generation", document["facts"])
+        self.assertEqual(self.import_transport(), document)
+        indexed = self.ops.events_noted(train_transport_journal._prefix(member["work_item_id"]), 0)
+        self.assertEqual(len(indexed), 1)
+        passage = self.passage(transports=reader)
+        plan = passage.step(self.db, self.now)["plan"]
+        self.assertEqual(plan["transports"][0]["head"], document["facts"]["head"])
+        self.assertEqual(plan["transports"][0]["admission"], list(train.identity(member)))
+        shutil.rmtree(passage.repository_path())
+        other = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other.close)
+        resumed = self.passage(transports=train_transport_journal.Recorded(self.project, resolve=reader.resolve))
+        result = resumed.step(other, self.now + 1)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertIs(self.transport_connections[-1], other)
+        state = self.ops.train_read(self.key)
+        self.assertEqual(state["plan"], json.loads(json.dumps(plan)))
+        self.assertEqual(len(state["attempts"]), 1)
+        self.assertEqual(list(train.identity(self.ops.queue(None)[0])), list(train.identity(member)))
+
+    def test_journal_reader_rechecks_withdrawal_before_promotion_on_fresh_connection(self):
+        member, _, reader = self.indexed_transport()
+        passage = self.passage(transports=reader)
+        passage.step(self.db, self.now)
+        other = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other.close)
+        work.note(other, member["work_item_id"], "withdraw fixture qualification", actor="fixture-pilot")
+        result = passage.step(other, self.now + 1)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertIn("withdrawn", result["error"])
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+
+    def test_journal_reader_refuses_missing_originals_resolver_stale_context_and_ref(self):
+        member, document, reader = self.indexed_transport()
+        path = self.publisher
+        context = dict(source=member["source"], target="main", row=member, base=self.base, path=path)
+        with self.assertRaisesRegex(train.TrainError, "resolver unavailable"):
+            train_transport_journal.Recorded(self.project)(self.db, **context)
+        with self.assertRaisesRegex(train.TrainError, "current freeze and intermediate base"):
+            reader(self.db, **dict(context, base=self.head))
+        reader.resolve = lambda db, **kw: dict(facts=dict(kw["facts"], target="another"),
+                                              qualification=kw["qualification"], active=True)
+        with self.assertRaisesRegex(train.TrainError, "outside context"):
+            reader(self.db, **context)
+        original = document["qualification"]["references"][0]["id"]
+        with self.db.transaction() as tx:
+            tx.execute("DELETE FROM work_item_events WHERE id = %s", (original,))
+            with self.assertRaisesRegex(train.TrainError, "absent or outside lot"):
+                reader(tx, **context)
+        self.git(self.publisher, "push", "-q", "origin", self.head + ":" + document["facts"]["ref"], "--force")
+        with self.assertRaisesRegex(train.TrainError, "withdrawn or moved"):
+            reader(self.db, **context)
+
+    def test_journal_sources_keep_exact_milestone_mail_and_manifest_without_delivery_metadata(self):
+        lot = self.ops.queue(None)[0]["work_item_id"]
+        mark = self.ops.add_milestone(lot, "verdict", sha=self.head,
+                                      actor="fixture-pilot", verdict="ok", note="existing fixture")
+        mailbox = storage.of(self.db).mailbox
+        message = mailbox.send("fixture-pilot", "fixture-reader", "private qualification fixture",
+            host=None, kind="notify", payload={}, work_item_id=str(lot), signature=None,
+            signature_key=None, signed_payload=None, nonce=None, created_us=None, expires_us=None)
+        references = [dict(kind="milestone", id=mark["id"]), dict(kind="mail", id=message["id"]),
+                      dict(kind="manifest", commit=self.base, path=".github/workflows/tests.yml")]
+        before = train_transport_journal.originals(self.db, self.publisher, lot, references)
+        self.assertEqual([r["reference"] for r in before], references)
+        mailbox.mark_delivered([message["id"]])
+        self.assertEqual(train_transport_journal.originals(self.db, self.publisher, lot, references), before)
+        indexed = train_transport_journal._fingerprints(before)
+        self.assertNotIn("private qualification fixture", json.dumps(indexed))
+        self.assertEqual(indexed[1]["author"], "fixture-pilot")
+
+    def test_journal_snapshot_uses_current_generation_and_refuses_ambiguous_or_changed_originals(self):
+        member, document, reader = self.indexed_transport()
+        context = dict(source=member["source"], target="main", row=member, base=self.base, path=self.publisher)
+        next_member = dict(member, generation=member["generation"] + 1, frozen_id=member["frozen_id"] + 1)
+        receipt = reader(self.db, **dict(context, row=next_member))
+        self.assertEqual(receipt["admission"], list(train.identity(next_member)))
+        self.assertNotIn("admission", self.import_transport())
+        original = document["qualification"]["references"][0]["id"]
+        self.db.execute("UPDATE work_item_events SET actor = 'changed' WHERE id = %s", (original,))
+        with self.assertRaisesRegex(train.TrainError, "original transport qualification facts changed"):
+            reader(self.db, **context)
+        self.db.execute("UPDATE work_item_events SET actor = 'fixture-pilot' WHERE id = %s", (original,))
+        alternative = json.loads(json.dumps(document))
+        alternative["qualification"]["kind"] = "mechanical"
+        work.note(self.db, member["work_item_id"], train_transport_journal._prefix(member["work_item_id"])
+                  + json.dumps(alternative), actor="another-importer")
+        with self.assertRaisesRegex(train.TrainError, "ambiguous existing transport qualification"):
+            reader(self.db, **context)
 
     def test_automatic_claim_before_effect_crash_is_never_replayed(self):
         passage = self.automatic_passage()

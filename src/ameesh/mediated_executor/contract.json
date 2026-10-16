@@ -3541,6 +3541,15 @@
       "type": "string"
      },
      "required": true
+    },
+    {
+     "name": "once",
+     "kind": "keyword",
+     "schema": {
+      "type": "boolean"
+     },
+     "required": false,
+     "default": false
     }
    ],
    "result": {

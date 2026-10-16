@@ -1304,8 +1304,11 @@ class WorkItems(Domain):
         state was set without a journal line)."""
 
     @abc.abstractmethod
-    def note(self, item_id: int, state: str, text: str, actor: str) -> None:
-        """Journalise une note et rafraîchit `updated_at`."""
+    def note(self, item_id: int, state: str, text: str, actor: str, *, once: bool = False) -> None:
+        """Journalise une note et rafraîchit `updated_at`.
+
+        `once` sérialise sur le lot et n'insère pas un texte déjà présent.
+        """
 
     @abc.abstractmethod
     def lock_deep_analysis(self, item_id: int) -> None:
@@ -1376,7 +1379,7 @@ class WorkItems(Domain):
         """Délégations rendues au délégant depuis `since_ts`."""
 
     @abc.abstractmethod
-    def events(self, item_id: int, limit: int) -> list[dict]:
+    def events(self, item_id: int, limit: int | None) -> list[dict]:
         """Journal du lot, du plus récent au plus ancien."""
 
     @abc.abstractmethod

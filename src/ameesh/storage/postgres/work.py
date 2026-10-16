@@ -548,7 +548,19 @@ class WorkItems(interface.WorkItems):
             " ORDER BY d.resolved_at, d.id" % _DELEGATION_COLUMNS,
             (float(since_ts),))
 
-    def note(self, item_id, state, text, actor) -> None:
+    def note(self, item_id, state, text, actor, *, once=False) -> None:
+        if once:
+            with self.db.transaction() as tx:
+                rows = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                                (int(item_id),))
+                if not rows:
+                    raise DbError("lot %s not found" % item_id)
+                if tx.query("SELECT id FROM work_item_events"
+                            " WHERE work_item_id = %s AND note = %s LIMIT 1",
+                            (int(item_id), text)):
+                    return
+                WorkItems(tx).note(item_id, rows[0]["state"], text, actor)
+            return
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
@@ -590,7 +602,7 @@ class WorkItems(interface.WorkItems):
              WHERE work_item_id = %s
              ORDER BY id DESC LIMIT %s
             """,
-            (int(item_id), int(limit)),
+            (int(item_id), None if limit is None else int(limit)),
         )
 
     def events_noted(self, prefix, since_ts) -> list[dict]:

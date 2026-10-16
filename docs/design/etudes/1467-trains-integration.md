@@ -100,8 +100,13 @@ le lot et les têtes exactes, et le parcours léger sans avis préalable est
 et son delta exact. Son commit reste parent du paquet ; une reconstruction
 ne perd donc pas la résolution. Une remise incompatible reporte le membre et
 ses dépendants avec un motif, sans éjecter la file ni bloquer les autres lots.
-Le lecteur réel du manifeste/journal du composeur reste un fournisseur explicite
-à raccorder ; aucune qualification ni activation n'est déduite du port seul.
+`train_transport_journal` now imports published handoffs into the existing
+lot journal and resolves their original event/milestone/mail/manifest sources
+on every passage. Its reconstructible index has no generation or freeze ID;
+only the plan snapshot binds those. Source contents remain at their original
+location. The explicit qualification resolver must check author, exact scope
+and continued applicability; an absent resolver or ambiguous source defers
+the named member. The source reader supplies no implicit approval or activation.
 
 Les phases persistées précèdent les effets externes : `publishing`,
 `ci-intent`, `ci`, `ready`, `promoting`, puis `landed`. Une réponse de dispatch

@@ -107,13 +107,55 @@ ses lignes sont reprises à la coupure dans
 `reviews/integration-paquet-h-<timestamp>.md`. Les références de relecture ne
 figurent pas dans les commits ou les refs de transport.
 
-Le raccord restant doit donc relier ces faits aux qualifications déjà acquises
-dans le reçu durable du train. Le présent port ne lit pas encore ces sources
-réelles et ne déduit aucun avis de leurs seuls messages. Il ne demande ni
-reconstruction des preuves acquises ni nouvelle relecture d'une remise
-mécanique. Ce port préparatoire n'active pas le train.
+### Durable journal reader
+
+The pilot's lot event **30608, 16 October 2026 at 04:14 Paris** selects the
+existing lot journal as the reconstructible index. `train_transport_journal`
+implements this adapter without a new table or catalogue:
+
+```python
+train_transport_journal.import_ref(
+    db, project, private_repository, published_ref,
+    lot=lot_id, source_head=source_frozen_sha,
+    qualification={"kind": "mechanical", "references": original_references},
+    actor=importer,
+)
+reader = train_transport_journal.Recorded(project, resolve=qualified_resolver)
+passage = Passage(..., transports=reader)
+```
+
+Import fetches the published ref, reads its two parents, message, tree and
+exact delta, and resolves the original event/milestone/mail IDs or versioned
+manifest. The index retains source references, authors and identities; it
+does not duplicate private mail contents. `work.note(..., once=True)` serializes identical imports on the
+existing lot row; ordinary journal notes retain their existing behavior.
+The index contains no admission generation or freeze ID. Only the receipt
+selected into `plan.transports` binds the current generation and freeze.
+
+At every read the adapter resolves the original sources again, checks their
+original authors and unchanged facts, and checks the published ref. The
+explicit `resolve` port receives these sources and complete lot event and
+milestone histories on the current connection. It must qualify their actual
+authority, exact scope and continued applicability, returning the same facts
+and original references with `active=True`. A projection, ref name or free
+GO prose alone cannot supply this answer. There is no default interpreter or
+authority assigned to the importer. Existing mechanical qualifications are
+preserved without new votes or freezes.
+
+Missing/changed originals, missing resolvers, ambiguous index entries and
+stale contexts produce named member deferrals. During CI, withdrawal refuses
+promotion and preserves the existing plan and single CI attempt. This source
+adapter remains inactive until its qualification resolver is supplied.
 
 ## Validation du port
+
+The source adapter adds nine targeted checks, green with both PostgreSQL
+drivers, plus the 19 executor contract checks. They cover import to persisted
+plan, restart with a fresh connection and lost clone, withdrawal, ref movement,
+missing originals/resolver, changed authors, ambiguous sources, current
+generation snapshots, stable mail delivery metadata, concurrent note deduplication
+and preservation of ordinary notes and session fencing. Git and SQL are real;
+the semantic qualification resolver, CI and provenance remain explicit fixtures.
 
 Les vérifications ciblées couvrent 27 témoins moteur/Git existants, 7 lecteurs
 d'incidents et 15 témoins de transport/sélection. Les nouveaux parcours couvrent
