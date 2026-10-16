@@ -452,6 +452,27 @@ def _write_counters(state_dir, root, lock_path, quota_path, pending, clock,
             _restore_pending(pending, taken, pending_lock)
 
 
+def flush_reads(state_dir) -> int:
+    """Écrit une fois les compteurs en attente des caches vivants de ce
+    processus pour `state_dir` (#1813).
+
+    Le passage du Watcher dure toute la vie du runner : sans cet appel, une
+    suite de hits de cache restait invisible sur disque jusqu'à la requête
+    réelle suivante (`note`) ou à la fin du processus. Rend le nombre de
+    caches concernés ; jamais bloquant (une panne laisse `pending` intact)."""
+    state_dir = str(state_dir or "").strip()
+    if not state_dir:
+        return 0
+    root = os.path.join(state_dir, READS_DIR)
+    flushed = 0
+    for reads in list(_LIVE_READS):
+        if reads.root != root:
+            continue
+        reads.flush()
+        flushed += 1
+    return flushed
+
+
 class SharedReads:
     """Cache disque et quota GitHub partagés par les processus d'un hôte (#848).
 
@@ -477,7 +498,8 @@ class SharedReads:
     N1 : une construction ou une lecture ne crée aucun dossier — le cache
     naît à sa première écriture, et un `state_dir` vide est refusé plutôt
     que de fabriquer un chemin relatif. N3 : les compteurs s'agrègent en
-    mémoire et s'écrivent une fois par passage (`flush`, fin de processus),
+    mémoire et s'écrivent une fois par passage (`flush` : fin de passage du
+    Watcher, #1813, ou fin de processus),
     jamais un verrou par hit ; le retrait avant écriture est un échange sous
     verrou, donc un incrément concurrent n'est jamais perdu (#1927).
     N4 : la clé d'une entrée porte la base d'API
@@ -641,9 +663,10 @@ class SharedReads:
     def count(self, name: str, n: int = 1) -> None:
         """Un compteur partagé (hits, stale, refused…) ; jamais bloquant.
 
-        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (ou la fin
-        du processus) fait une seule écriture par passage, au lieu d'un verrou
-        de fichier et d'une réécriture de `quota.json` à chaque hit de cache.
+        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (fin de
+        passage du Watcher, #1813, ou fin du processus) fait une seule écriture
+        par passage, au lieu d'un verrou de fichier et d'une réécriture de
+        `quota.json` à chaque hit de cache.
         #1927 : le verrou en mémoire rend l'incrément sûr entre fils, et le
         retrait avant écriture (`_take_pending`) ne l'emporte jamais."""
         try:
