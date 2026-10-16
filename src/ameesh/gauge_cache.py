@@ -32,8 +32,17 @@ class GaugeCache:
             self._entries.pop(path, None)
             if len(readings) > self.max_accounts:
                 return
-            frozen = {account: (stamp, tuple(gauges), overage)
-                      for account, (stamp, gauges, overage) in readings.items()}
+            # #1661 : un relevé est (date, fenêtres, overage) — datation par
+            # l'événement (#1720), jamais le mtime ; le cache en garde une
+            # observation immuable, jamais l'objet mutable du producteur, sans
+            # perdre les drapeaux d'overage. La lecture tolère aussi la forme à
+            # deux champs (overage porté par `gauges`).
+            frozen = {}
+            for account, reading in readings.items():
+                stamp, gauges = reading[0], reading[1]
+                overage = (reading[2] if len(reading) > 2
+                           else getattr(gauges, "overage", None))
+                frozen[account] = (stamp, tuple(gauges), overage)
             self._entries[path] = (signature, frozen)
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)
