@@ -3962,6 +3962,7 @@
    "action_source": "autorité (0012)",
    "actions": "hors du sous-ensemble de l'exécuteur médié",
    "agents": "hors du sous-ensemble de l'exécuteur médié",
+   "alert_acknowledgements": "human alert acknowledgement (L87c): native operator only",
    "api_requests": "API idempotency (L87): ameesh serve only",
    "approvals": "autorité : jamais d'approbation depuis l'appareil (0012)",
    "authenticators": "autorité (0012)",
@@ -4040,6 +4041,12 @@
     "wake_check",
     "note_unleased",
     "operator_pause"
+   ],
+   "alert_acknowledgements": [
+    "acknowledge",
+    "clock",
+    "invalidate",
+    "live"
    ],
    "api_requests": [
     "complete",
