@@ -128,20 +128,37 @@ def run(root, operation, manifest, *, authority, adapter):
     with locked(root, manifest['host']) as directory:
         path = directory / (operation + '.json')
         active = directory / (manifest['host'] + '.active.json')
+        if path.name == 'readiness.json':
+            # Reserved controller/service name: an operation journal never
+            # replaces the independent service readiness document.
+            raise ControllerError('reserved operation id')
+        # The journal is read before the host is reserved, so a changed manifest
+        # can never leave an orphan reservation that would block every later
+        # operation of the host (the reservation itself stays authoritative when
+        # the host is still held by an interrupted run).
+        record = None
+        if path.exists() or path.is_symlink():
+            record = load(path)
+        changed = record is not None and (not isinstance(record, dict)
+                                          or record.get('manifest') != manifest
+                                          or record.get('digest') != digest)
         if active.exists() or active.is_symlink():
             owner = load(active)
             if owner != {'operation': operation, 'digest': digest}:
                 raise ControllerError('host has another unresolved release')
-        else:
+        elif changed:
+            # Refuse before reserving: this operation name already names another
+            # manifest, and no later run could resume that reservation.
+            raise ControllerError('operation manifest changed')
+        elif record is None or record['status'] not in ('accepted', 'rolled_back'):
             # Admission itself requires current authority, before reserving host.
+            # A finished operation is replayed without re-reserving it.
             if not checked(authority.validate, operation, digest, 'prepare'):
                 raise ControllerError('release authority denied')
             save(active, {'operation': operation, 'digest': digest})
-        if path.exists() or path.is_symlink():
-            record = load(path)
-            if record.get('manifest') != manifest or record.get('digest') != digest:
-                raise ControllerError('operation manifest changed')
-        else:
+        if changed:
+            raise ControllerError('operation manifest changed')
+        if record is None:
             record = {'manifest': manifest, 'digest': digest, 'mode': 'release',
                       'receipts': {}, 'intent': None, 'status': 'pending'}
             save(path, record)

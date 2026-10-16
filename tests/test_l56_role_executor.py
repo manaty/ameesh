@@ -483,6 +483,31 @@ class RoleExecutorTest(PgTestCase):
                 self.db.execute('DROP OWNED BY %s' % q(controller))
                 self.db.execute('DROP ROLE %s' % q(controller))
 
+    def test_release_role_write_grant_on_a_view_makes_the_audit_fail(self):
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_controller_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        view = 't_release_view_' + uuid.uuid4().hex[:8]
+        try:
+            result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
+            self.assertEqual(result.returncode,0,result.stderr)
+            # A view is a write path too: a grant on it must be audited like a
+            # table, not silently ignored.
+            self.db.execute('CREATE VIEW %s AS SELECT name FROM agent_registry' % q(view))
+            self.db.execute('GRANT UPDATE ON %s TO %s' % (q(view),q(controller)))
+            result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('unrelated write privilege',result.stderr)
+        finally:
+            self.db.execute('DROP VIEW IF EXISTS %s' % q(view))
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
+
     def test_host_cannot_change_schema(self):
         for sql in ("CREATE TABLE intruder (x int)",
                     "CREATE SCHEMA intruder",

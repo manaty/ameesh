@@ -189,6 +189,36 @@ class PrivateBackupTest(unittest.TestCase):
         archive.write_bytes(b"archive")
         return credentials, backup.digest(archive)
 
+    def test_shared_parent_or_tmpdir_is_refused_not_renarrowed(self):
+        # A pre-existing shared directory is not ours to narrow to 0700: dump,
+        # retrieve and upload refuse it, without touching its mode.
+        shared = self.root / "shared"
+        shared.mkdir(mode=0o777)
+        shared.chmod(0o1777)
+        credentials, sha = self.recovery_fixture()
+        settings = {"TMPDIR": str(shared), "SCW_ACCESS_KEY": "CANARY-ACCESS",
+                    "SCW_SECRET_KEY": "CANARY-SECRET", "SCW_BUCKET": "acme", "SCW_REGION": "fr-par"}
+        with mock.patch.dict(os.environ, settings), mock.patch.object(backup, "run") as child:
+            with self.assertRaisesRegex(backup.BackupError, "private owned"):
+                backup.dump(self.config, shared / "archive.dump")
+            with self.assertRaisesRegex(backup.BackupError, "private owned"):
+                backup.upload(self.output, "host-1")
+            with self.assertRaisesRegex(backup.BackupError, "private owned"):
+                backup.retrieve(credentials, "host-1", "remote.dump", sha, shared / "recovered.dump")
+        child.assert_not_called()
+        self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o1777)
+        # Our own directory, widened by an installer, is tightened instead of
+        # refused: the backup of the enrolled host must still run.
+        owned = self.root / "owned"
+        owned.mkdir(mode=0o755)
+        def child(args, *, env=None):
+            if args[0] == "pg_dump":
+                Path(args[-1]).write_bytes(b"archive")
+        with mock.patch.object(backup, "run", side_effect=child):
+            backup.dump(self.config, owned / "archive.dump")
+        self.assertEqual(stat.S_IMODE(owned.stat().st_mode), 0o700)
+        self.assertTrue((owned / "archive.dump").is_file())
+
     def test_retrieval_uses_separate_private_identity_and_pinned_origin(self):
         credentials, sha = self.recovery_fixture()
         seen = []
@@ -303,6 +333,31 @@ class PrivateBackupTest(unittest.TestCase):
                     backup.verify_restore(self.config, self.output, expected)
             self.assertEqual(admin.execute.call_count, 2)
             self.assertIn("DROP DATABASE", repr(admin.execute.call_args.args[0]))
+
+    def test_killed_verification_is_reaped_before_the_next_restore(self):
+        expected, admin, restored, connections = self.restore_fixture()
+        leftover = "ameesh_verify_" + "a" * 32
+        marker = self.output.parent / (".verify-" + "a" * 32 + ".json")
+        marker.write_text(json.dumps({"database": leftover}))
+        marker.chmod(0o600)
+        with mock.patch("psycopg.connect", side_effect=connections), mock.patch.object(backup, "run"):
+            proof = backup.verify_restore(self.config, self.output, expected)
+        self.assertTrue(proof["restore_verified"])
+        self.assertFalse(marker.exists())
+        first = repr(admin.execute.call_args_list[0].args[0])
+        self.assertIn("DROP DATABASE IF EXISTS", first)
+        self.assertIn(leftover, first)
+        # A marker naming anything but this module's disposable database is left
+        # alone: a tampered document can never aim a DROP at a live database.
+        forged = self.output.parent / (".verify-" + "b" * 32 + ".json")
+        forged.write_text(json.dumps({"database": "agent_mesh"}))
+        forged.chmod(0o600)
+        expected, admin, restored, connections = self.restore_fixture()
+        with mock.patch("psycopg.connect", side_effect=connections), mock.patch.object(backup, "run"):
+            self.assertTrue(backup.verify_restore(self.config, self.output, expected)["restore_verified"])
+        self.assertTrue(forged.exists())
+        self.assertIn("CREATE DATABASE", repr(admin.execute.call_args_list[0].args[0]))
+        self.assertNotIn("agent_mesh", repr([call.args[0] for call in admin.execute.call_args_list]))
 
     def test_restore_refuses_wrong_digest_without_opening_database(self):
         expected, _, _, _ = self.restore_fixture()
