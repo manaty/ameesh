@@ -840,7 +840,8 @@ class CostBook:
         return out
 
     # -- jauges de forfait --------------------------------------------------
-    def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
+    def claude_gauges(self, account: str | None = None,
+                      primary: str | None = None) -> "Gauges":
         """Read the latest Claude rate-limit gauges, shared across an account.
 
         With `account` (L30), use the marker preceding each turn, including
@@ -850,6 +851,11 @@ class CostBook:
         account claims them (L1078), never "the account itself". Leading
         readings before any established marker in a marked stream stay
         unknown, never primary.
+
+        #1661 : TOUS les chemins rendent un `Gauges` (liste + `overage`),
+        jamais une liste nue : un appelant qui lit `.overage` en direct ne
+        doit pas tomber sur le chemin vide. Le chemin par compte rend une
+        copie (le relevé est mis en cache et partagé entre CostBook).
         """
         if account is not None:
             return self._claude_gauges_of(account, primary)
@@ -872,9 +878,9 @@ class CostBook:
                     break
                 newest = (mtime, Gauges(gauges, _claude_overage(line)))
                 break
-        return newest[1] if newest else []
+        return newest[1] if newest else Gauges()
 
-    def _claude_gauges_of(self, account: str, primary: str | None) -> list:
+    def _claude_gauges_of(self, account: str, primary: str | None) -> "Gauges":
         """Read the newest gauges for one Claude account (L30).
 
         Compare turn-marker timestamps across agents. Only a stream without
@@ -882,6 +888,9 @@ class CostBook:
         L1078), dated by the event itself or left undated, never by the file
         modification time (#1720); with `primary` None, no account claims
         them.
+
+        #1661 : rend un `Gauges` (copie du relevé caché, `overage` compris),
+        jamais une liste nue — même quand aucun relevé n'existe.
         """
         best = None
         for agent in self.agents():
@@ -918,6 +927,8 @@ class CostBook:
         # the copy keeps the reading's overage flags (L226b, #1649).
         # No reading: an empty Gauges (overage None), the same type as a
         # reading, so a direct `.overage` read never meets a bare list (N1 impl-04).
+        # #1661 : le relevé caché est immuable et partagé entre CostBooks ; on
+        # en rend une copie fraîche, en gardant le type `Gauges` et son overage.
         return Gauges(best[1], best[2]) if best else Gauges()
 
     def codex_gauges(self, sessions: str | None = None) -> list:
@@ -2223,7 +2234,11 @@ def _claude_account_readings(events: list) -> dict:
             at = stamp if marked else _claude_event_date(event)
             gauges = _claude_windows(event, at)
             if gauges is not None:
-                readings[current] = (at, gauges, _claude_overage(event))
+                # #1720 : la date vient de l'événement, jamais du mtime ;
+                # #1661 : observation immuable (date, fenêtres, overage), le
+                # tuple évite de partager la liste mutable du producteur, et
+                # #1649 garde l'overage à côté des fenêtres.
+                readings[current] = (at, tuple(gauges), _claude_overage(event))
     return readings
 
 
