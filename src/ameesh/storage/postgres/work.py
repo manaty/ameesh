@@ -44,16 +44,23 @@ _COLUMNS_TEMPLATE = """
 
 
 def has_reviewer(db) -> bool:
-    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ? La
-    réponse est mise en cache sur la connexion : une lecture par base."""
-    flag = getattr(db, "_has_reviewer", None)
-    if flag is None:
-        flag = bool(db.query(
-            "SELECT 1 AS ok FROM information_schema.columns"
-            " WHERE table_schema = current_schema() AND table_name = 'work_items'"
-            "   AND column_name = 'reviewer'"))
+    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ?
+
+    Seule la réponse POSITIVE est mise en cache sur la connexion : une colonne
+    n'apparaît pas puis ne disparaît pas. La réponse négative ne l'est pas —
+    un démon (runner, serve) démarré avant 0421 voit la colonne dès qu'elle
+    est appliquée, sans redémarrage (#798, #813) ; sinon il gardait des
+    lectures sans relecteur et refusait les désignations jusqu'au
+    redémarrage."""
+    if getattr(db, "_has_reviewer", False):
+        return True
+    flag = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        "   AND column_name = 'reviewer'"))
+    if flag:
         try:
-            db._has_reviewer = flag
+            db._has_reviewer = True
         except Exception:  # objet sans attributs (proxy) : on relira
             pass
     return flag
@@ -504,8 +511,12 @@ class WorkItems(interface.WorkItems):
         reviewer_set = ""
         params: list = [assignee]
         if has_reviewer(self.db):
+            # #813 : NO KEY UPDATE suffit à sérialiser deux réassignations, et
+            # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
+            # insertions au journal et aux jalons du lot, que FOR UPDATE
+            # bloquait jusqu'au commit.
             seen = self.db.query(
-                "SELECT reviewer FROM work_items WHERE id = %s FOR UPDATE",
+                "SELECT reviewer FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                 (int(item_id),))
             previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
             reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
@@ -980,12 +991,16 @@ class WorkItems(interface.WorkItems):
                         # elle est libérée dans la transaction de la
                         # réservation, avec sa ligne de journal. Les lignes
                         # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
-                        # valeur déjà effacée.
+                        # valeur déjà effacée. `ORDER BY id` : ordre de
+                        # verrouillage canonique (#967) — deux transactions qui
+                        # reprennent les réservations héritées du même dépôt
+                        # verrouillent ainsi les mêmes lignes dans le même
+                        # ordre, jamais en sens inverse (interblocage).
                         for old in tx.query(
                                 "SELECT id, migration, state FROM work_items"
                                 " WHERE migration_repo = %s"
                                 "   AND state IN ('merged', 'promoted', 'closed')"
-                                " FOR UPDATE", (repo,)):
+                                " ORDER BY id FOR UPDATE", (repo,)):
                             tx.execute(
                                 "UPDATE work_items SET migration = NULL,"
                                 "       migration_repo = NULL, updated_at = now()"
@@ -1162,7 +1177,8 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "UPDATE merge_locks SET expires_at = clock_timestamp()"
                 " + %s * interval '1 second'"
-                " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
+                " WHERE target = %s AND owner = %s AND epoch = %s"
+                " AND expires_at > clock_timestamp() RETURNING epoch",
                 (float(ttl_s), key, owner, int(epoch)))
             return int(rows[0]["epoch"]) if rows else None
         rows = self.db.query(

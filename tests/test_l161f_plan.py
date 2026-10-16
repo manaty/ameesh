@@ -546,6 +546,26 @@ class MapTest(unittest.TestCase):
         self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
         self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
 
+    def test_new_file_imported_after_terminal_statement_keeps_the_doubt(self):
+        self.repo.write("tests/test_static.py",
+                        "raise RuntimeError\nimport ameesh.new_feature\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        card["modules"]["test_static"] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py",
+                      out["phase2_why"])
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
         # l'importe ; les tests que la carte a mesurés sur ce module (ici un
@@ -655,7 +675,7 @@ class MapTest(unittest.TestCase):
                     self.assertEqual(p["selection"]["mode"], "full")
                     self.assertIn("release/**", p["selection"]["why"])
                     self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                     self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                     self.assertEqual(
                         sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
@@ -683,7 +703,7 @@ class MapTest(unittest.TestCase):
         self.assertIn("release/**", release["selection"]["why"])
         self.assertNotEqual(release["parts"]["psycopg"], [])
         self.assertEqual(plan.outputs(release)["code"], "true")
-        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [9] * 9)
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -917,6 +937,34 @@ class ImportGraphTest(unittest.TestCase):
                 if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
                     self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                      {"src/ameesh/db.py"}, why)
+
+    def test_terminal_statement_prevents_later_import_proof(self):
+        known = {"src/ameesh/db.py"}
+        for terminal in ("raise RuntimeError", "import sys\nsys.exit(1)"):
+            with self.subTest(terminal=terminal):
+                source = terminal + "\nimport ameesh.db\n"
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                # Keep the possible edge for selection, even without proof.
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        # Class bodies execute during the containing module's import too.
+        source = "class C:\n    raise RuntimeError\nimport ameesh.db\n"
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                              guaranteed=True), set())
+
+    def test_terminal_statement_keeps_earlier_and_nonexecuted_proofs(self):
+        known = {"src/ameesh/db.py"}
+        for source in (
+            "import ameesh.db\nraise RuntimeError\n",
+            "import ameesh.db\nimport sys\nsys.exit(1)\n",
+            "def unused():\n    raise RuntimeError\nimport ameesh.db\n",
+            "def unused():\n    import sys\n    sys.exit(1)\nimport ameesh.db\n",
+            "if False:\n    raise RuntimeError\nimport ameesh.db\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
@@ -1414,10 +1462,10 @@ class PlanTest(unittest.TestCase):
         mods = parts.modules()
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         out = plan.outputs(p)
         self.assertEqual(json.loads(out["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(out["psql_parts"], "6")
+        self.assertEqual(out["psql_parts"], "9")
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
@@ -1440,7 +1488,9 @@ class PlanTest(unittest.TestCase):
         # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
-        self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
+        # #1692 : la suite complète passe de 6 à 9 parts ; le pilote d'une PR
+        # de lot reste à trois (n_pr), inchangé.
+        self.assertEqual(plan.PARTS["psql"][1], 9)
 
     def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
         # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
@@ -1516,8 +1566,8 @@ class PlanTest(unittest.TestCase):
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
         # #749 : une fusion a main passe la suite complete sous les deux pilotes
-        # (psql en 6 parts), pas seulement la CI de release.
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        # (psql en 9 parts depuis #1692), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -1699,7 +1749,7 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
                 self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
                 self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                 self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                 self.assertEqual(plan.outputs(p)["code"], "true")
 
@@ -1726,7 +1776,7 @@ class LotBranchTest(unittest.TestCase):
         p = plan.fallback_plan("pull_request", "boom", base_ref="main",
                                head_ref="release/1.10.0")
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), list(range(1, 10)))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
@@ -1773,8 +1823,10 @@ class LotBranchTest(unittest.TestCase):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
                                 for m in self.mods}}
         self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
+        # 235 modules × 2 s = 470 s -> deux parts ; la tranche fixe garde le
+        # test indépendant du nombre de modules du dépôt (314 au 15/10, et
+        # chaque lot qui ajoute un module de test le faisait basculer à 3)
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:235], card(2.0)), 2)
         self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):

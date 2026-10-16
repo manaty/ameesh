@@ -67,7 +67,12 @@
 # user and absolute paths, is recorded in /etc/ameesh/pilot-install.state
 # BEFORE it is created, and --purge removes only that):
 #   * user ameesh-guest (system, locked, no sudo, no docker), home
-#     $ROOT/home, $ROOT/{tmp,work}, all 0700;
+#     $ROOT/home, $ROOT/{tmp,work}, all 0700; a tree that is already there is
+#     kept as is — a reinstall never resets the mode or owner of an existing
+#     $ROOT or of its home/tmp/work, and --check reports them (L1586: a
+#     layout given by hand, or the 2710 of L159b, is not reopened; L159b2's
+#     install.sh gives $ROOT/home to the job user, whose passwd home it is,
+#     and --check accepts that owner — tmp and work stay the guest's alone);
 #   * /opt/ameesh/venv: ameesh[psycopg] from this checkout (root-owned);
 #   * /etc/systemd/system: ameesh-guest.slice, ameesh.slice.d/guest-weight.conf,
 #     ameesh-guest-runner@.service (its paths on --root, + a PATH drop-in),
@@ -775,6 +780,46 @@ if [ "$MODE" = check ]; then
       if printf '%s\n' $groups | grep -qx "$g"; then ko "$GUEST is in group $g"; fi
     done
   else ko "no user $GUEST"; fi
+  # L1586: the guest's volume, as step 1 left it. A reinstall never resets the
+  # mode or owner of a directory that is already there, so --check shows them
+  # (a 2710 root, or a home handed to the job user) instead of repairing in
+  # silence: home/tmp/work must be 0700; the root is reported as is — 0755 as
+  # installed here, 2710 with L159b's layout, where it is the guest's and the
+  # job group's — and only a world-writable one fails.
+  guid=$(guest_uid)
+  passwd_of_host() {
+    if [ -n "$HOSTDIR" ]; then cat "$HOSTDIR/etc/passwd" 2>/dev/null
+    elif command -v getent >/dev/null 2>&1; then getent passwd 2>/dev/null
+    else cat /etc/passwd; fi
+  }
+  # L159b2: deploy/guest/install.sh gives $ROOT/home to the job user, whose
+  # name (--job-user) is configurable and not known here; its passwd home is
+  # $ROOT/home, so that owner is accepted too. tmp and work stay the guest's.
+  owned_by_its_home() {  # UID PATH: a non-root account whose passwd home is PATH
+    passwd_of_host | awk -F: -v u="$1" -v h="$2" \
+      '$3 == u && u != 0 && $6 == h { found = 1 } END { exit !found }'
+  }
+  for d in "$ROOT" "$ROOT/home" "$ROOT/tmp" "$ROOT/work"; do
+    host_path=$(at "$d")
+    if [ ! -d "$host_path" ]; then ko "missing $d"; continue; fi
+    perm=$(stat -c '%a %U:%G' "$host_path")
+    mode=$(stat -c '%a' "$host_path")
+    owner=$(stat -c '%u' "$host_path")
+    if [ "$d" = "$ROOT" ]; then
+      case "${mode: -1}" in
+        [2367]) ko "$d is $perm, world-writable" ;;
+        *) ok "$d ($perm, kept as is by a reinstall)" ;;
+      esac
+    elif [ "$mode" != 700 ]; then
+      ko "$d is $perm, expected 700 and $GUEST's own"
+    elif [ "$owner" = "$guid" ]; then
+      ok "$d ($perm)"
+    elif [ "$d" = "$ROOT/home" ] && owned_by_its_home "$owner" "$d"; then
+      ok "$d ($perm, the job user's home, L159b2)"
+    else
+      ko "$d is $perm, not owned by $GUEST (uid ${guid:-none})"
+    fi
+  done
   for f in ameesh-guest.slice ameesh.slice.d/guest-weight.conf ameesh-guest-runner@.service \
            ameesh-guard.service; do
     if [ "$OFFLOAD_ONLY" = 1 ] && [ "$f" = ameesh-guest-runner@.service ]; then
@@ -1249,11 +1294,24 @@ for d in "$ROOT" "$ROOT/home" "$ROOT/tmp" "$ROOT/work"; do
     die "$d exists and is not a directory: move it away first"
   fi
 done
-absent "$ROOT" && remember "guest-dir $ROOT"
-run install -d -m 0755 "$ROOT"
+# L1586: only what is created here is created; a directory that is already
+# there keeps its mode and owner as they are (a reinstall must not reopen the
+# volume: a layout given by hand, or the 2710 of L159b, stays), and what is
+# kept is said here. --check reads and reports them too.
+if absent "$ROOT"; then
+  remember "guest-dir $ROOT"
+  run install -d -m 0755 "$ROOT"
+fi
 for d in home tmp work; do
-  absent "$ROOT/$d" && remember "guest-tree $ROOT/$d"
-  run install -d -m 0700 -o "$GUEST" -g "$GUEST" "$ROOT/$d"
+  if absent "$ROOT/$d"; then
+    remember "guest-tree $ROOT/$d"
+    # L159b's root is 2710: GNU install creates a child with the parent's
+    # setgid bit (2700), which --check refuses. A five-digit octal mode is
+    # applied explicitly, and leaves exactly 0700 (R1 #1586).
+    run install -d -m 00700 -o "$GUEST" -g "$GUEST" "$ROOT/$d"
+  else
+    echo "$ROOT/$d exists: kept as is ($(stat -c '%a %U:%G' "$(at "$ROOT/$d")"))"
+  fi
 done
 
 say "2. ameesh in $VENV (root-owned; the guest can run it, not change it)"

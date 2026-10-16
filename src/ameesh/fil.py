@@ -71,6 +71,7 @@ from typing import Iterable, Iterator, Protocol, Sequence
 
 from . import storage
 from .config import Config
+from .storage.interface import ThreadCensus
 
 DEFAULT_PROJECT = "default"
 #: nom de fichier du fil d'un projet (un lot assaini ne commence jamais par `_`)
@@ -1107,17 +1108,28 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
 
 def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_id: str,
           mailbox_ids: Sequence[int] = ()) -> None:
-    """Met à jour `thread_index` et note l'id externe dans `agent_mailbox.meta`
-    (une seule écriture : `storage.of(db).threads.index`).
+    """Met à jour `thread_index` et note l'id externe dans `agent_mailbox.meta`.
 
-    L361 : sous le verrou de la ligne du fil (`threads.lock`), que `expire`
-    prend aussi. Une entrée expirée entre son écriture et son indexation
-    n'est ni comptée ni citée ; une entrée déjà dans le fil quand la base l'a
-    recompté (`counted_until`, écrit dans la transaction du recomptage) n'est
-    pas comptée deux fois. Le fichier ne prouve pas ce recomptage : après
-    une expiration sans base, ou dont le recomptage n'a pas été validé
-    (échec, arrêt brutal après le renommage), la base est en retard sur le
-    fichier et recompte d'abord depuis lui (`_recount_if_behind`).
+    Avec une connexion Postgres, une seule écriture (`threads.index`) : L361,
+    sous le verrou de la ligne du fil (`threads.lock`), que `expire` prend
+    aussi. Une entrée expirée entre son écriture et son indexation n'est ni
+    comptée ni citée ; une entrée déjà dans le fil quand la base l'a recompté
+    (`counted_until`, écrit dans la transaction du recomptage) n'est pas
+    comptée deux fois. Le fichier ne prouve pas ce recomptage : après une
+    expiration sans base, ou dont le recomptage n'a pas été validé (échec,
+    arrêt brutal après le renommage), la base est en retard sur le fichier et
+    recompte d'abord depuis lui (`_recount_if_behind`).
+
+    Sur une connexion médiée, L361c : l'indexation est le census absolu du
+    fichier (`threads.recount`, portée H), la même opération serveur que
+    l'expiration — un `+1` local ne peut plus compter en double une entrée
+    déjà reprise par un recomptage, ni être écrasé par un recomptage plus
+    court. Un census de même fin logique qu'un recomptage plus court est
+    périmé (le recount ne reprend pas un census qui rallonge la ligne) :
+    la trace de la boîte reste écrite par `threads.index` (`count` faux),
+    portée B et auteur membre du fil, quand l'entrée porte des messages ;
+    elle ne touche ni le compte ni `last_*`, donc une entrée expirée
+    entre-temps n'est jamais ressuscitée par sa trace.
     """
     host = cfg.host if transport.name == "file" else ""
     key = dict(project=thread.project, lot=thread.lot or "", transport=transport.name,
@@ -1125,13 +1137,22 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
                                     if hasattr(transport, "location") else thread.key))
     if storage.is_remote(db):
         # exécuteur médié : un verrou ne tiendrait pas d'une requête à
-        # l'autre ; l'index d'avant L361, chaque entrée comptée. Une
-        # expiration y passe par `threads.recount` (L361b) : le recomptage du
-        # fichier fait foi et reprend l'index.
-        storage.of(db).threads.index(
-            **key, entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
-            excerpt=excerpt(entry.text), ts=float(entry.ts),
-            trace={"fil": {"transport": transport.name, "id": external_id, "host": host}})
+        # l'autre. L361c : le compte vient du census du fichier (à suivre ou
+        # à venir), par la même opération serveur que l'expiration
+        # (`threads.recount`, portée H), et non plus d'un `+1` local en
+        # course avec un recomptage. La trace de la boîte reste une écriture
+        # à part, sans comptage ni citation (`count` faux : ni `entries` ni
+        # `last_*`).
+        census = _census(transport, thread) if hasattr(transport, "census") else None
+        if census is None or mailbox_ids:
+            storage.of(db).threads.index(
+                **key, entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
+                excerpt=excerpt(entry.text), ts=float(entry.ts),
+                trace={"fil": {"transport": transport.name, "id": external_id, "host": host}},
+                count=census is None)
+        if census is not None:
+            kept, last, end = census
+            storage.of(db).threads.recount(**key, kept=kept, last=last, end=end)
         return
     with db.transaction() as tx:
         threads = storage.of(tx).threads
@@ -1157,11 +1178,19 @@ def _recount_if_behind(threads, key: dict, transport, thread: ThreadRef,
     """
     if bounds is None or (counted is not None and counted >= bounds[1]):
         return counted
+    kept, last, end = _census(transport, thread)
+    threads.expired(**{k: v for k, v in key.items() if k != "location"},
+                    kept=kept, last=last, end=end)
+    return end
+
+
+def _census(transport, thread: ThreadRef) -> tuple[int, dict | None, int]:
+    """Le census du fil, prêt pour l'index : entrées gardées, la plus récente
+    (ligne d'index), fin logique. Lu une seule fois, sous le verrou partagé du
+    fichier (`FileTransport.census`)."""
     entries, end = transport.census(thread)
     latest = max(reversed(entries), key=lambda e: e.ts) if entries else None
-    threads.expired(**{k: v for k, v in key.items() if k != "location"},
-                    kept=len(entries), last=_index_row(latest), end=end)
-    return end
+    return len(entries), _index_row(latest), end
 
 
 def _offset_of(entry_id: str) -> int | None:
@@ -1210,7 +1239,9 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
                 if storage.is_remote(db):
                     # L361b : le fichier d'abord (verrou local), puis UNE
                     # opération serveur (verrou de la ligne, recomptage,
-                    # expiration) : l'index ne peut pas rester en arrière.
+                    # expiration). Un recomptage perdu est rattrapé à
+                    # l'expiration suivante, depuis le fichier : l'index ne
+                    # reste pas en arrière.
                     report = run()
                     _recount_remote(db, transport, thread, key, location, report)
                 else:
@@ -1251,14 +1282,14 @@ def _recount_remote(db, transport, thread: ThreadRef, key: dict, location: str,
     bounds = transport.bounds(thread) if hasattr(transport, "bounds") else None
     if not report["dropped"] and bounds is None:
         return          # jamais expiré : l'index d'avant L361 suffit
-    entries, end = transport.census(thread)
-    last = max(reversed(entries), key=lambda e: e.ts) if entries else None
-    storage.of(db).threads.recount(**key, location=location, kept=len(entries),
-                                    last=_index_row(last), end=end)
+    kept, last, end = _census(transport, thread)
+    storage.of(db).threads.recount(**key, location=location, kept=kept, last=last, end=end)
 
 
-def _index_row(entry: Entry | None) -> dict | None:
-    """La plus récente entrée gardée, telle que l'index la cite."""
+def _index_row(entry: Entry | None) -> ThreadCensus | None:
+    """La plus récente entrée gardée, telle que l'index la cite (L361b, la
+    forme déclarée au contrat : `entry_id`, `author`, `excerpt`, `ts`,
+    `mailbox_id`)."""
     if entry is None:
         return None
     ids = [i for i in entry.meta.get("ids") or () if isinstance(i, int) and not isinstance(i, bool)]
@@ -1389,16 +1420,16 @@ def cmd_expire(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     db = None
     if not args.dry_run:
-        # L361b : un hôte médié expire par l'opération serveur (verrou,
-        # recomptage, expiration) ; c'est la connexion qui le dit. Sans elle,
-        # `expire` refuse et rien n'est touché.
+        # L361b: a mediated host expires through the server operation (lock,
+        # recount, expiry); the connection says whether it exists. Without it,
+        # `expire` refuses and nothing is touched.
         try:
             db = db_mod.connect(cfg)
         except db_mod.DbError as exc:
             message = " ".join(str(exc).split())[:200]
             if expiry_unavailable(cfg, None):
-                # L361b : sans index, un hôte médié n'expire pas ; le refus
-                # part d'ici, avant toute réécriture de fil
+                # L361b: without an index, a mediated host does not expire; the
+                # refusal starts here, before any thread rewrite
                 raise ExpiryUnavailable("%s (index unavailable: %s)" % (EXPIRY_UNAVAILABLE,
                                                                         message))
             print("thread index unavailable (%s): threads expire, the index is not updated"

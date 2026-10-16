@@ -240,9 +240,11 @@ def _critical_budget_pause(alert: dict) -> str:
 
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
-    des lots ouverts sans agent, l'écart est le sien (L165b, niveau 1)."""
+    des lots démarrables ouverts sans agent, l'écart est le sien (L165b,
+    niveau 1). #1608 : un lot qu'une attente planifiée retient n'est pas
+    démarrable, on ne lui demande pas de l'assigner."""
     text = "Idle capacity: %s." % (alert.get("detail") or "?")
-    if alert.get("lots"):
+    if alert.get("startable_lots", alert.get("lots")):
         text += (" Lots are waiting with idle agents: if this still holds at your next "
                  "pass, 30 min or more after this mail, fix it yourself (level 1, reversible): ameesh "
                  "work assign <lot> <agent> (an idle agent of the lot's team, highest "

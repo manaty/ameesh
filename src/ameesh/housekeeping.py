@@ -130,6 +130,9 @@ ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
 UNATTRIBUTED_REFRESH_S = 12 * 3600.0
 #: L162 : nombre de plus grosses entrées de /tmp dites quand le tmpfs se remplit
 TMP_TOP = 5
+#: #1547 (N3) : conteneurs hors tour détaillés dans le relevé de ménage — le
+#: journal garde le compte total (`others_total`), jamais une liste non bornée
+OTHERS_TOP = 20
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
@@ -1321,6 +1324,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
         blocked = unremovable > quota
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
+        handled: set = set()          # #1190: dry-run inodes already processed
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
             if blocked or counted <= quota:
@@ -1338,6 +1342,12 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     uncounted.add(path)
                 continue               # a `.git` appeared, or a mount point
             if now - mtime < min_age:
+                continue
+            inode = (st.st_dev, st.st_ino)
+            if dry_run and inode in handled:
+                # #1190: separate cache walks yield the inode again, but its
+                # names would already be gone. Mirror apply's `gone` case.
+                counted -= size
                 continue
             # #500: a candidate whose deletion is refused (path no longer in
             # the root, or unlink failed) is reclassified as unremovable and
@@ -1423,6 +1433,8 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     failed.append(path)
                     break
             files += 1
+            if dry_run:
+                handled.add(inode)
             if freed:
                 # #530: a name removed from an inode another hard link still
                 # holds frees no byte; only the last link credits the quota.
@@ -2886,17 +2898,34 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     s'ils portent `ameesh.lot`, une fois le lot fini ; les autres sont
     seulement signalés, avec la commande proposée.
 
+    #1411 : le relevé couvre aussi les conteneurs ARRÊTÉS (`ps -a`) — un
+    conteneur étiqueté sorti ou jamais démarré ne consomme plus de
+    processus, mais retient sa couche et ses volumes anonymes, et restait
+    invisible du ménage comme de la mesure. Une base de test d'un lot ENCORE
+    OUVERT reste gardée jusqu'à la fin du lot (L73) : une photographie de
+    l'état des tours ne prouve pas l'absence d'usage d'un hôte entier, et
+    rien ne l'exclut d'un démarrage de tour qui suivrait le constat (R1
+    #1411). On ne détruit donc pas sur cette photographie.
+
+    #1547 (N4) : ce repli ne réduit pas la pression (couches, swap) des bases
+    de lots encore ouverts — c'est le prix de la sûreté tant qu'un verrou
+    commun avec le démarrage d'un tour n'existe pas ; le relevé `ps -a` les
+    rend au moins visibles et comptées.
+
     Un conteneur étiqueté par un tour INCONNU de cette base, ou d'un autre
     hôte, n'est pas supprimé (signalé). Rend `{entries, plan, ameesh,
-    others}` ; `ameesh`/`others` à None si le moteur ne répond pas."""
-    out: dict = {"entries": [], "plan": [], "ameesh": None, "others": None}
+    others, others_total}` ; `ameesh`/`others` à None si le moteur ne répond
+    pas ; `others` est borné à `OTHERS_TOP` entrées (#1547 N3), le compte
+    total restant dans `others_total`."""
+    out: dict = {"entries": [], "plan": [], "ameesh": None, "others": None,
+                 "others_total": None}
     if runtime is None:
         return out
-    rows = runtime.list_all()
+    rows = runtime.list_all(stopped=True)
     if rows is None:
         return out
     binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
-    ours, others = [], []
+    ours, others, others_total = [], [], 0
     turns = storage.of(db).turn_resources
     for c in rows:
         labels = c.get("labels") or {}
@@ -2904,9 +2933,11 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
         ref = c.get("name") or c.get("id", "")[:12]
         if not turn:
             if only_turn is None:
-                others.append({"id": c.get("id", "")[:12], "name": c.get("name"),
-                               "image": c.get("image"), "status": c.get("status"),
-                               "command": "%s rm -f %s" % (binary, shlex.quote(ref))})
+                others_total += 1
+                if len(others) < OTHERS_TOP:
+                    others.append({"id": c.get("id", "")[:12], "name": c.get("name"),
+                                   "image": c.get("image"), "status": c.get("status"),
+                                   "command": "%s rm -f %s" % (binary, shlex.quote(ref))})
             continue
         if only_turn is not None and turn != only_turn:
             continue
@@ -2945,6 +2976,7 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
             ours.append(dict(base, action="kept", detail=entry["detail"]))
     out["ameesh"] = ours
     out["others"] = others if only_turn is None else None
+    out["others_total"] = others_total if only_turn is None else None
     return out
 
 
@@ -3219,7 +3251,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                        detail=known.get("detail"))
         top["command"] = "rm -rf -- %s" % shlex.quote(top["path"])
     report_measure["containers"] = {
-        "ameesh": conteneurs["ameesh"], "others": conteneurs["others"]}
+        "ameesh": conteneurs["ameesh"], "others": conteneurs["others"],
+        "others_total": conteneurs["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
     if not dry_run:
@@ -3316,6 +3349,9 @@ def print_report(report: dict) -> None:
         for c in autres:
             print("    %s  %s  (%s)  →  %s" % (c.get("name") or c.get("id"), c.get("image"),
                                               c.get("status") or "?", c["command"]))
+    reste = (conteneurs.get("others_total") or len(autres)) - len(autres)
+    if reste > 0:
+        print("    … %d more not listed (report bounded to %d)" % (reste, OTHERS_TOP))
     orphans = report.get("orphans") or []
     if orphans:
         print("  /tmp entries that appeared during a turn (never deleted by ameesh, except an "
