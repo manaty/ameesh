@@ -1505,11 +1505,19 @@ class WorkItems(interface.WorkItems):
             "  LEFT JOIN agent_registry r ON r.name = w.assignee"
             " ORDER BY w.id" % (item_columns(self.db), _CLOSED), (int(limit),))
 
-    def set_issue_ref(self, item_id, issue_ref, *, current) -> bool:
+    def set_issue_ref(self, item_id, issue_ref, *, current,
+                      migration_repo=interface.UNCHECKED) -> bool:
+        # #1654 : quand l'appelant a lu la réservation, le CAS la couvre aussi
+        # (`IS NOT DISTINCT FROM`, NULL compris) : une réservation prise entre
+        # sa lecture et cette écriture ne peut plus passer en silence.
+        guard, params = "", ()
+        if migration_repo is not interface.UNCHECKED:
+            guard = " AND migration_repo IS NOT DISTINCT FROM %s"
+            params = (migration_repo,)
         rows = self.db.query(
             "UPDATE work_items SET issue_ref = %s"
-            " WHERE id = %s AND coalesce(issue_ref, '') = coalesce(%s, '')"
-            " RETURNING id", (issue_ref, int(item_id), current))
+            " WHERE id = %s AND coalesce(issue_ref, '') = coalesce(%s, '')" + guard +
+            " RETURNING id", (issue_ref, int(item_id), current, *params))
         return bool(rows)
 
     # -- demandes d'humains sans lot (L130) --------------------------------------
