@@ -1189,8 +1189,10 @@ class NumeroAtterriTest(PgTestCase):
             return close_merged(db, item_id, **kwargs)
 
         with mock.patch.object(work, "close_merged", side_effect=sweep_then_close):
-            done = work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1",
-                               migration_landed=453)
+            # #1286 : `merged` exige une preuve Git réelle, lue dans le dépôt
+            # du lot ; le helper `_merged` la commit dans le clone nexlink, le
+            # balayage concurrent restant simulé par la doublure ci-dessus.
+            done = self._merged(lot, actor="dev1", migration_landed=453)
         self.assertEqual(done["result"], "landed")
         self.assertIn("landed migration 452 → 453 corrected (manaty/nexlink)",
                       done["detail"])
