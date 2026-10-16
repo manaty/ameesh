@@ -22,7 +22,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import adapters, exploitation, mail, menage, registry, storage
+from ameesh import adapters, exploitation, mail, menage, platform, registry, storage
 from ameesh import runner as runner_mod
 
 from .support import PgTestCase
@@ -313,6 +313,18 @@ class AbandonDbTest(_Systeme, PgTestCase):
         return menage.run_pass(self.cfgl, self.db, kw.pop("policy", self.pol), host="pc",
                                actor="t", now=time.time() + decalage, **kw)
 
+    def _sonde_teneurs_disponible(self) -> None:
+        """L63b : quand un processus du même utilisateur cache ses fichiers
+        ouverts (gpg-agent non dumpable, #1749), la sonde ne peut ni nommer un
+        détenteur ni prouver qu'il n'y en a plus : le ménage garde alors toute
+        entrée (« holders unreadable », fail-closed). Les décisions de
+        suppression ne sont pas observables sur un tel hôte — on le dit, sans
+        relâcher le garde-fou."""
+        try:
+            platform.holders(self.sys)
+        except platform.NotAvailable as exc:
+            self.skipTest("fichiers ouverts d'un tiers illisibles (L63b) : %s" % exc)
+
     def _en_tour(self, agent: str) -> None:
         """`agent` en tour sur l'hôte « pc » : statut running, bail vivant."""
         registry.upsert(self.db, agent, harness="claude", host="pc")
@@ -437,6 +449,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertEqual(recents, {heures, jours})
 
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
+        self._sonde_teneurs_disponible()
         abandon = os.path.join(self.sys, "preuve-images")
         self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwx", abandon],
                         capture_output=True)
@@ -478,6 +491,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertNotIn("tmp_orphan", types)
 
     def test_garde_fous(self):
+        self._sonde_teneurs_disponible()
         ouvert = os.path.join(self.sys, "ouvert")
         sale = os.path.join(self.sys, "clone-sale")
         homonyme = os.path.join(self.sys, "recree")
@@ -532,6 +546,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
                             for a in alertes))
 
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
+        self._sonde_teneurs_disponible()
         main = _repo(self.tmp)
         relecture = os.path.join(self.sys, "relecture")
         self._tour(lambda: _git("worktree", "add", "-q", "--detach", relecture, cwd=main),
