@@ -292,4 +292,3 @@ class HookRapideTest(PgTestCase):
         self.assertIsNotNone(marque, "un appel depuis un except ne doit pas "
                                      "empêcher le marqueur")
         self.assertFalse(marque["pending"])
-

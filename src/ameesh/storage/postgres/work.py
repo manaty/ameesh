@@ -1853,7 +1853,7 @@ class WorkItems(interface.WorkItems):
             "       EXISTS (SELECT 1 FROM commitments c"
             "                WHERE c.work_item_id = w.id AND c.kind = 'decision'"
             "                  AND c.status IN ('proposed', 'open')) AS decision_milestone"
-            "  FROM (SELECT %s,"
+            "  FROM (SELECT " + item_columns(self.db) + ","
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
             "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
@@ -1873,7 +1873,7 @@ class WorkItems(interface.WorkItems):
             "          w.planned_start NULLS LAST,"
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
-            " LIMIT %%s") % item_columns(self.db),
+            " LIMIT %s"),
             REQUEUED_PARAMS + REQUEUED_PARAMS + (int(limit),))
 
     def review_proposals(self, limit, *, proposal_prefix, window_s=21600.0) -> list[dict]:

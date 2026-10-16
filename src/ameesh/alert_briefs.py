@@ -115,6 +115,23 @@ def _verdict_due(alert: dict) -> str:
                 sous_utilisation._duration(alert.get("value") or 0), lot, lot))
 
 
+def _one_orchestrator(orchestras, by_name: dict, lot) -> list:
+    """Un seul orchestrateur pour un lot sans assigné (#1026).
+
+    Parmi ceux dont l'exécuteur est vivant (`sous_utilisation._awake_runner`),
+    un seul, choisi par le numéro du lot : stable d'une passe à l'autre
+    (relance comprise) et réparti. Aucun exécuteur vivant : tous — ils sont
+    arrêtés, le premier revenu agit, et la prise du lot est de toute façon
+    atomique (`ameesh work assign --claim`)."""
+    names = sorted(orchestras)
+    if not names:
+        return []
+    awake = [n for n in names if sous_utilisation._awake_runner(by_name.get(n) or {})]
+    if not awake:
+        return names
+    return [awake[int(lot or 0) % len(awake)]]
+
+
 def _stale_lot(alert: dict) -> str:
     lot = int(alert["lot"])
     who = alert.get("agent")
@@ -128,7 +145,9 @@ def _stale_lot(alert: dict) -> str:
         move = ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
                 "ameesh work assign %d <agent>" % (who, who, lot, lot))
     else:
-        move = "assign it: ameesh work assign %d <agent>" % lot
+        # #1026 : un lot sans assigné se prend (`--claim`) : deux orchestrateurs
+        # qui l'assignent en même temps ne peuvent plus se voler le lot.
+        move = "assign it: ameesh work assign %d <agent> --claim" % lot
     # L368: a dependency declared towards an open parent lot is a planned wait,
     # which already suppresses the alert and its 6 h reminder. The brief must
     # offer it, otherwise a stacked lot is triaged in vain every 6 h (#1642) ;
@@ -281,8 +300,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
     l'équipe de l'assigné (sinon celle du lot, #917) — ou du projet du lot
-    quand aucun relecteur n'est désigné (#705) ; `plan_underused`, ceux des
-    équipes des agents au repos ; `estimate_bias` (L157b), ceux de l'équipe de
+    quand aucun relecteur n'est désigné (#705) —, ou **un seul** quand le lot
+    n'a pas d'assigné (#1026 : sans équipe, le brief partait à tous et deux
+    orchestrateurs traitaient le même lot) ; `plan_underused`, ceux des équipes
+    des agents au repos ; `estimate_bias` (L157b), ceux de l'équipe de
     l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
@@ -350,8 +371,14 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                 # ameesh réveillerait les orchestrateurs nexlink, et
                 # inversement (une alerte reçue pousse à assigner, ce qui
                 # entretient la liste des orchestrateurs par historique).
-                # `lot_team` reste lu pour les alertes d'avant L243.
-                teams = {(alert.get("project") or alert.get("lot_team") or "").strip()} - {""}
+                # `lot_team` reste lu pour les alertes d'avant L243. Si aucun
+                # orchestrateur ne porte ce projet, repli sur tous (comme
+                # avant #917) : le choix unique de #1026 s'applique alors au
+                # vivier entier, sinon un lot orphelin ne serait briefé à
+                # personne.
+                lot_teams = {(alert.get("project") or alert.get("lot_team") or "").strip()} - {""}
+                if _of_teams(orchestras, by_name, lot_teams):
+                    teams = lot_teams
             if reviewer and str(reviewer) in by_name:
                 extra[str(reviewer)] = _verdict_due(alert)
         elif kind == "estimate_bias":
@@ -377,6 +404,19 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                                                 alert.get("project"), teams)}
         else:
             out = {o: text for o in _of_teams(orchestras, by_name, teams)}
+        if kind == "stale_lot" and not alert.get("agent"):
+            # #1026 : un lot sans assigné n'a pas d'équipe connue, donc `teams`
+            # est vide et `_of_teams` rend tous les orchestrateurs. Deux d'entre
+            # eux ont traité le même brief en 60 s (course #894/#895) : un seul
+            # destinataire.
+            # B1 bureau (15/10) : le vivier est d'abord restreint au PROJET du
+            # lot (#705 `_of_project` ; l'alerte porte `project`), sans quoi un
+            # lot ameesh peut n'être briefé qu'à un orchestrateur d'un autre
+            # projet, qui ne peut ni l'assigner ni le suivre — avant #1026 le
+            # brief partait à tous, donc l'orchestrateur du projet le recevait.
+            pool = _of_project(list(out), by_name, alert.get("project"), teams)
+            chosen = _one_orchestrator(pool, by_name, alert.get("lot"))
+            out = {name: out[name] for name in chosen}
         if kind in ("estimate_bias", "waiting_without_question") \
                 and alert.get("agent") in by_name:
             out.setdefault(alert["agent"], text)       # l'estimateur, l'assigné lui-même

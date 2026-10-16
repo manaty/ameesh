@@ -1081,7 +1081,8 @@ def is_pilot(cfg, db: Db, actor: str) -> bool:
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
            force: str | None = None,
-           wip_exception: str | None = None) -> dict:
+           wip_exception: str | None = None,
+           claim: bool = False) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -1098,7 +1099,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     (`is_pilot`), elle est écrite dans la note de la dernière attribution (même
     assigné : c'est le geste qui la réécrit), et le balayage (`ameesh work
     wip`) laisse alors le lot au-delà du plafond. Elle s'efface à l'attribution
-    suivante sans marqueur."""
+    suivante sans marqueur.
+
+    #1026 : `claim` n'attribue le lot que s'il est **sans assigné**. Un lot
+    déjà pris est refusé en nommant son porteur, et l'écriture est
+    conditionnelle à `assignee` encore vide : deux prises concurrentes, une
+    seule gagne, l'autre refuse sans changer la main."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1115,6 +1121,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
                         "orchestrator/design agent; the exception to the §4 limit is "
                         "explicit and reserved to the pilot" % (actor or "nobody"))
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
+    if claim and previous:
+        raise WorkError("lot %s already assigned to %s: claim refused, nothing changed"
+                        % (item_id, previous))
     if previous == check["assignee"] and not reason:
         if not branch:
             raise WorkError("lot %s already assigned to %s" % (item_id, previous))
@@ -1135,11 +1144,16 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         note += "; %s (pilot, %s): %s" % (WIP_EXCEPTION_MARK, actor or UNKNOWN_ACTOR, reason)
     queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                           % (check["assignee"], previous or "nobody"))
-    row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
+    row = storage.of(db).work.assign(item_id, check["assignee"],
+                                     current=None if claim else previous, note=note,
                                      actor=actor, queued_note=queued,
                                      forced_note=queued and _forced_note(check, note, force,
                                                                          actor))
     if row is None:
+        if claim:
+            holder = (get(db, item_id) or {}).get("assignee")
+            raise WorkError("lot %s taken in the meantime%s: claim refused, nothing changed"
+                            % (item_id, " by %s" % holder if holder else ""))
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
     behind = row.get("queued_behind")
     if branch:
