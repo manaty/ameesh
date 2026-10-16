@@ -251,9 +251,10 @@ def sandbox_argv(bwrap: str, argv, *, root: str, files: str, writable, env: dict
     """N3 de #1666 : la commande du sélecteur, enveloppée dans le bac à sable.
 
     Le binaire du sélecteur est résolu **avant** l'entrée (l'environnement du
-    bac à sable est vide) et son préfixe d'installation est monté en lecture
-    seule s'il n'est pas déjà dans le runtime (`node` hors `/usr`, `python`
-    d'un venv). L'arbre de la cible et les entrées sont montés en lecture
+    bac à sable est vide). Hors du runtime système, seuls son fichier et les
+    répertoires `lib`/`lib64` de son préfixe sont montés en lecture seule :
+    monter le préfixe entier exposerait le HOME pour un binaire de `~/bin`.
+    L'arbre de la cible et les entrées sont montés en lecture
     seule ; les seuls chemins inscriptibles sont les répertoires de travail et
     de sortie, propres à cette preuve. L'environnement du bac à sable est vidé
     puis reconstruit avec **toutes** les variables de `selector_env` — aucune
@@ -274,7 +275,8 @@ def sandbox_argv(bwrap: str, argv, *, root: str, files: str, writable, env: dict
                          "isolated" % argv[0])
     if not any(extra == path or extra.startswith(path.rstrip("/") + "/")
                for path in SANDBOX_RUNTIME):
-        bound.append(extra)
+        bound.append(real)
+        bound.extend(os.path.join(extra, name) for name in ("lib", "lib64"))
     cmd = sandbox_prefix(bwrap)
     cmd += _readonly_binds(bound + list(SANDBOX_LINKER))
     cmd += ["--ro-bind", root, root, "--ro-bind", files, files]

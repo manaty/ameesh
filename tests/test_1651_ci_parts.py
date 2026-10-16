@@ -835,6 +835,28 @@ class RealSandboxTest(_Contract):
 
     FAKE_SANDBOX = False
 
+    def test_a_relocated_runtime_does_not_expose_its_parent_directory(self):
+        runtime = os.path.join(self.tmp, "runtime")
+        os.makedirs(os.path.join(runtime, "bin"))
+        program = os.path.join(runtime, "bin", "sh")
+        shutil.copyfile(shutil.which("sh", path=os.defpath), program)
+        os.chmod(program, 0o755)
+        marker = os.path.join(runtime, "private-marker")
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("private fixture")
+        source = ('test ! -e "$1" || exit 99\n'
+                  'printf \'%s\' \'{"schema":"test-lot-plan/1",'
+                  '"due":["lot/backend-suite"]}\' > "$2"\n')
+        _write(self.repo, "scripts/ci/lot-plan.py", source)
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        plan = dataclasses.replace(PARTS_CONTRACT,
+                                   argv=(program, "{selector}", marker, "{out}"))
+        project = dataclasses.replace(self.project, ci_parts=plan)
+        proof = ci_parts.due(project, tip, self.base(), self.repo)
+        self.assertEqual(proof["due"], ("lot/backend-suite",))
+
     def test_the_real_sandbox_proves_the_plan_and_hides_host_and_network(self):
         _write(self.repo, "scripts/ci/lot-plan.py", REAL_SANDBOX_SELECTOR)
         self.publish_main()
