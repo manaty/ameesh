@@ -3957,7 +3957,7 @@
   }
  ],
  "refused": {
-  "interface_total": 412,
+  "interface_total": 413,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4070,6 +4070,7 @@
     "put"
    ],
    "canon": [
+    "claim_commit",
     "clear_pending_stop",
     "clear_responsible",
     "close_others",

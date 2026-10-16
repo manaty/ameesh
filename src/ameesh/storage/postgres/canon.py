@@ -65,7 +65,7 @@ class Canon(interface.Canon):
         )
 
     _STATE_COLUMNS = """
-        host, canon, canon_id, status, root, source, last_good_commit, diagnostic,
+        host, canon, canon_id, status, root, source, last_good_commit, process_commit, diagnostic,
         extract(epoch from last_good_at)::float8 AS last_good_ts,
         extract(epoch from checked_at)::float8   AS checked_ts,
         auth_status, auth_diagnostic,
@@ -83,6 +83,14 @@ class Canon(interface.Canon):
         return self.db.query(
             "SELECT %s FROM canon_state WHERE host = %%s ORDER BY canon" % self._STATE_COLUMNS,
             (host,))
+
+    def claim_commit(self, host, old, new, canon="") -> bool:
+        rows = self.db.query(
+            "UPDATE canon_state SET process_commit = %s "
+            "WHERE host = %s AND canon = %s"
+            " AND coalesce(process_commit, last_good_commit, '') = %s RETURNING host",
+            (new, host, canon or "", old))
+        return bool(rows)
 
     def key_for_root(self, host, root) -> str | None:
         rows = self.db.query(
