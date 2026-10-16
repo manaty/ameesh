@@ -20,6 +20,8 @@ Claude. Trois temoins de contrat ici :
 * l'historique (`persona_sessions`) dit le harnais de la session vivante, pas
   l'etiquette declaree, et garde la declaration quand l'origine est inconnue
   (#1251, N2 de la R2).
+* #1250 : `show` et `list` nomment le harnais de la session vivante quand il
+  differe du harnais declare (l'emprunt L242b reste visible a l'ecran).
 """
 from __future__ import annotations
 
@@ -154,6 +156,50 @@ class HistoriqueSuitLeHarnaisDeLaSessionTest(PgTestCase):
         self.assertIsNone(ligne["session_harness"])
         ps.record_start(self.db, "bascule", SID)
         self.assertEqual(ps.sessions(self.db, "bascule")[0]["harness"], "claude")
+
+
+class AffichageHarnaisSessionTest(PgTestCase):
+    """#1250 : `show` et `list` nomment le harnais de la session vivante quand
+    il differe du harnais declare (l'emprunt L242b etait invisible a l'ecran)."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "auteur", harness="claude", host=self.cfg.host,
+                        cwd=self.tmp, model="claude-opus-5-5")
+        self.db.execute(
+            "UPDATE agent_registry SET session_id = %s, session_origin = %s, "
+            "session_harness = 'codex' WHERE name = 'auteur'", (SID, SID))
+
+    def _sans_emprunt(self):
+        """La session vivante est du meme harnais que la declaration."""
+        self.db.execute("UPDATE agent_registry SET session_harness = 'claude' "
+                        "WHERE name = 'auteur'")
+
+    def test_show_nomme_le_harnais_de_la_session(self):
+        proc = self.mesh("show", "auteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("harness  : claude", proc.stdout)
+        self.assertIn("session harness: codex", proc.stdout)
+
+    def test_list_nomme_le_harnais_de_la_session(self):
+        proc = self.mesh("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("codex*", proc.stdout)
+        self.assertIn("session harness: the live session", proc.stdout)
+
+    def test_show_sans_emprunt_ne_repete_pas_la_declaration(self):
+        self._sans_emprunt()
+        proc = self.mesh("show", "auteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("session harness", proc.stdout)
+
+    def test_list_sans_emprunt_ne_marque_rien(self):
+        self._sans_emprunt()
+        proc = self.mesh("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("session harness", proc.stdout)
+        self.assertNotIn("codex", proc.stdout)
+        self.assertIn("claude", proc.stdout)
 
 
 if __name__ == "__main__":
