@@ -1345,9 +1345,16 @@ class Watcher:
             return []  # en attente d'un runner, ou relancée : au prochain relevé
         # Le détail GitHub porte le dernier attempt, même si la réouverture
         # a été refusée (tête plus récente sur la branche, #1612). Son verdict
-        # ne doit jamais conclure une autre tentative encore suivie en base.
-        if int(run.get("run_attempt") or 1) != int(row.get("run_attempt") or 1):
-            return []
+        # ne doit jamais conclure une autre tentative encore suivie en base :
+        # la ligne est conclue par l'état de son propre attempt, sans quoi
+        # elle resterait `running` sans fin et son verdict serait perdu.
+        attempt = int(row.get("run_attempt") or 1)
+        if int(run.get("run_attempt") or 1) != attempt:
+            run = self.api("repos/%s/actions/runs/%s/attempts/%s"
+                           % (repo, row["run_id"], attempt)) or {}
+            if (run.get("status") or "") != "completed" \
+                    or int(run.get("run_attempt") or 0) != attempt:
+                return []
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
         if not st.ci.conclude(repo, int(row["run_id"]), status):
             return []

@@ -291,6 +291,8 @@ class FauxApi:
         self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
         #: #846/#901 B1 : jobs d'une tentative — (run_id, attempt) -> jobs
         self.attempt_jobs: dict[tuple[int, int], list[dict]] = {}
+        #: #1612 : état d'une tentative — (run_id, attempt) -> exécution
+        self.attempts: dict[tuple[int, int], dict] = {}
         #: #845 : chemins appelés, pour compter les appels de la garde
         self.paths: list[str] = []
 
@@ -317,6 +319,11 @@ class FauxApi:
             return {"workflows": [item if isinstance(item, dict) else
                                   {"path": ".github/workflows/%s" % item, "state": "active"}
                                   for item in self.workflows]}
+        if "/actions/runs/" in path and "/attempts/" in path:
+            run_id = int(path.split("/actions/runs/")[1].split("/")[0])
+            attempt = int(path.rsplit("/", 1)[1])
+            return self.attempts.get((run_id, attempt), {"status": "in_progress",
+                                                         "run_attempt": attempt})
         if "/actions/runs/" in path:
             return self.done.get(int(path.rsplit("/", 1)[1]), {"status": "in_progress"})
         if "/check-runs" in path:
@@ -1490,7 +1497,8 @@ class WatcherTest(PgTestCase):
 
     def test_verdict_d_un_autre_attempt_ne_conclut_pas_la_ligne(self):
         """#1612 : le dernier état GitHub ne conclut jamais un autre attempt,
-        au rattrapage comme au relevé normal d'une ligne encore running."""
+        au rattrapage comme au relevé normal d'une ligne encore running ;
+        l'attempt suivi est conclu par son propre état (`attempts/<n>`)."""
         watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
         st = storage.of(self.db)
         for index, (catchup, tracked) in enumerate(((False, 1), (True, 1),
@@ -1514,7 +1522,19 @@ class WatcherTest(PgTestCase):
                 self.assertEqual(watcher.tick(self.db), [])
                 row = st.ci.run(DEPOT, run_id)
                 self.assertEqual((row["status"], row["run_attempt"]), ("running", tracked))
-                self.assertEqual(self.mails("dev-b"), [])
+                self.assertEqual(len(self.mails("dev-b")), index)
+                # l'attempt suivi se conclut par son propre état, pas par le
+                # dernier : la ligne ne reste pas `running` sans fin
+                self.api.attempts[(run_id, tracked)] = completed(
+                    ".github/workflows/tests.yml", "failure", attempt=tracked)
+                out = watcher.tick(self.db)
+                self.assertEqual([(o["action"], o["run_id"], o["status"]) for o in out],
+                                 [("verdict", run_id, "failure")])
+                row = st.ci.run(DEPOT, run_id)
+                self.assertEqual((row["status"], row["run_attempt"]), ("failure", tracked))
+                self.assertEqual(len(self.mails("dev-b")), index + 1)
+                self.assertIn("red", self.mails("dev-b")[-1]["body"])
+                self.assertEqual(watcher.tick(self.db), [])
 
     def test_echec_de_l_attempt_suivant_inscrit_avant_la_reouverture(self):
         """#1573 N2 : une liste en retard (#828) peut publier un échec de
