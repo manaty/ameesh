@@ -262,6 +262,22 @@ class AlertesVivaciteTest(_Base):
         for alerte in alertes.values():
             self.assertTrue({"lot", "title", "assignee", "reason", "responsible"} <= set(alerte))
 
+    def test_orphan_lot_promoted_avec_assigne_arrete(self):
+        # #753 : un lot promu (mesure post-déploiement à refaire) gardé par un
+        # agent arrêté doit rester visible, même si `open_lots_activity` l'exclut.
+        self.register("dort", "claude", cwd=self.tmp)
+        lot = work.add(self.db, title="promu", assignee="dort")
+        work.merged(self.db, lot["id"], sha="a" * 40, actor="dort")
+        work.move(self.db, lot["id"], "promoted", note="déployé", actor="dort")
+        self.assertEqual([a for a in self._types() if a["lot"] == lot["id"]], [])
+        registry.set_status(self.db, "dort", "stopped", status_text="arrêté",
+                            stop_reason="manuel")
+        alertes = [a for a in self._types() if a["lot"] == lot["id"]]
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual(alertes[0]["reason"], "arrete")
+        self.assertEqual(alertes[0]["lot_state"], "promoted")
+        self.assertEqual(alertes[0]["awaiting"], "post-deployment measurement")
+
     def test_orphan_lot_sans_tour_et_responsable(self):
         self.db.execute("UPDATE agent_registry SET responsible = 'human:proprio' "
                         "WHERE name = 'ouvrier'")

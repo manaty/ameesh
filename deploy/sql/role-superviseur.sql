@@ -344,6 +344,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
     ]),
+    -- L232b (0417) : la fermeture de release, lue par `ameesh_host_gate_state`
+    -- (`host` seulement ; périmètre d'opération et reçus exclus)
+    ('host_release_fences', ARRAY['host']),
     ('host_handoffs', ARRAY[
         'id', 'agent', 'source', 'target', 'state', 'fenced',
         'memory_bytes', 'disk_bytes', 'reserved_until', 'created_at', 'updated_at'
@@ -602,8 +605,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
         -- L122 (0053) : numéro de migration réservé par le lot, et son
-        -- dépôt (#443, 0390)
-        'migration', 'migration_repo',
+        -- dépôt (#443, 0390) ; #1567 : le numéro réellement atterri, quand la
+        -- renumérotation du paquet a changé celui de la réservation
+        'migration', 'migration_repo', 'migration_landed', 'migration_landed_repo',
         -- L157b (0054) : taille déclarée du changement
         'change_size',
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte

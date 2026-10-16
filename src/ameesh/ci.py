@@ -33,11 +33,21 @@ chaque passage un relevé (`Watcher.tick`) :
    exécution courte peut naître et finir entre deux passages sans jamais être
    vue « en cours » : un rattrapage borné des exécutions récemment terminées
    les découvre, rend leur verdict et réveille l'agent — une seule fois, et
-   jamais pour une tête déjà remplacée (#1110) ;
+   jamais pour une tête déjà remplacée (#1110). Tous les états non conclus
+   sont lus, `pending` compris (#1161) : une exécution qui attend un groupe de
+   concurrence derrière une exécution supplantée n'a sinon ni ligne, ni
+   verdict, ni réveil ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
-   reste, car l'agent a pu agir ;
+   reste, car l'agent a pu agir ; les exécutions non démarrées (`queued`,
+   `pending`) de la même PR, du même dépôt source et du même workflow
+   (périmètre prudent du veilleur), dont l'essai est prouvé antérieur à celui
+   de la tête courante sont annulées : jamais sur `main`, sur `release/…`, sur la tête
+   courante, ni sur un essai plus récent (un rerun garde son `id` et augmente
+   `run_attempt` ; sans date d'essai, rien n'est annulé) (#1161) ; une
+   exécution de PR restée `pending` plus de cinq minutes est signalée à
+   l'assigné ;
 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
    chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ;
 4. une exécution qui n'est plus en cours est conclue : verdict.
@@ -89,8 +99,19 @@ DISCOVERY_TTL = 3600.0
 DISCOVERY_RETRY = 300.0
 #: états GitHub d'une exécution pas encore conclue que le relevé lit : une
 #: exécution en attente d'un runner est vue dès la poussée, avant que
-#: l'exécution qu'elle remplace soit annulée
-LIVE_STATUSES = ("in_progress", "queued")
+#: l'exécution qu'elle remplace soit annulée. `pending` — l'exécution attend
+#: son groupe de concurrence (#1161) — est un état non conclu comme les
+#: autres : sans lui, un run bloqué derrière une exécution supplantée reste
+#: invisible, et n'a ni ligne, ni supersession, ni verdict, ni réveil. Les
+#: filtres `requested` et `waiting` sont acceptés par l'API (relevé du
+#: 14/10/2026 : aucun run dans ces états) ; ils sont lus comme les autres.
+LIVE_STATUSES = ("in_progress", "queued", "requested", "waiting", "pending")
+#: états GitHub d'une exécution qui n'a pas démarré : les seuls que le relevé
+#: annule quand une tête plus récente l'a supplantée (#1161)
+CANCELLABLE_STATUSES = ("queued", "pending")
+#: délai au-delà duquel une exécution de PR restée `pending` est signalée à
+#: l'assigné du lot (#1161)
+PENDING_ALERT = 300.0
 #: rattrapage borné des exécutions terminées entre deux passages (#1110) : on
 #: ne remonte pas plus loin que cette fenêtre, pour ne pas rendre de verdicts
 #: anciens après une longue interruption du veilleur
@@ -116,12 +137,12 @@ EXCERPT_LINES = 40
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
 #: #845 (arbitrage A du pilote, 14/10) : le relevé « runner busy sans job »
-#: coûte un appel par exécution non conclue (en plus des deux listes et de
+#: coûte un appel par exécution non conclue (en plus des listes par état et de
 #: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
 #: jamais à chaque passage. La fenêtre est écrite dans la base avant le premier
 #: appel HTTP (`ci_guard_scan`) : deux `notify --once` concurrents, ou deux
-#: hôtes, ne la mènent pas deux fois. À 600 s et 63 appels au plus par relevé,
-#: cette garde seule consomme au plus 378 appels/h et par dépôt (hors appels du
+#: hôtes, ne la mènent pas deux fois. À 600 s et 66 appels au plus par relevé,
+#: cette garde seule consomme au plus 396 appels/h et par dépôt (hors appels du
 #: suivi des échecs) ; la durée d'un relevé n'est pas bornée globalement, donc
 #: aucune détection en « <= 10 min » n'est promise.
 GUARD_SCAN_S = 600.0
@@ -136,15 +157,16 @@ GUARD_SCAN_MAX_RUNS = 60
 #: `carte.yml`, et 43 exécutions non conclues ont été mesurées le 13/10)
 GUARD_PER_PAGE = 100
 #: #845 (revue N/P2 2328 ; arbitrage A) : budget d'appels GitHub d'un relevé de
-#: la garde — les deux listes d'exécutions, un appel par exécution non conclue
-#: (chacune est relue : un run resté `queued` peut porter un job déjà
-#: `in_progress`, R1 cx3 B1), et la liste des runners. Le plafond couvre
-#: exactement `GUARD_SCAN_MAX_RUNS` exécutions : 2 + 60 + 1 = 63. Au-delà, le
-#: relevé est déclaré incomplet et RIEN n'est publié : un relevé partiel ne vaut
-#: pas un relevé complet, et les relevés précédents vieillissent jusqu'à ce que
-#: la fraîcheur (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre
-#: d'appels réellement consommés est journalisé dans `ci_guard_scan`.
-GUARD_SCAN_MAX_CALLS = 63
+#: la garde — une liste d'exécutions par état non conclu (`LIVE_STATUSES`,
+#: #1161 en lit cinq), un appel par exécution non conclue (chacune est relue :
+#: un run resté `queued` peut porter un job déjà `in_progress`, R1 cx3 B1), et
+#: la liste des runners. Le plafond couvre exactement `GUARD_SCAN_MAX_RUNS`
+#: exécutions : len(LIVE_STATUSES) + 60 + 1. Au-delà, le relevé est déclaré
+#: incomplet et RIEN n'est publié : un relevé partiel ne vaut pas un relevé
+#: complet, et les relevés précédents vieillissent jusqu'à ce que la fraîcheur
+#: (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre d'appels
+#: réellement consommés est journalisé dans `ci_guard_scan`.
+GUARD_SCAN_MAX_CALLS = len(LIVE_STATUSES) + GUARD_SCAN_MAX_RUNS + 1
 
 
 class _GuardBudget(RuntimeError):
@@ -164,16 +186,121 @@ def workflow_of(path: str | None) -> str:
     return str(path or "").rsplit("/", 1)[-1].strip()
 
 
-def updated_ts(run: dict) -> float | None:
-    """L'horodatage de dernière mise à jour d'une exécution (ISO 8601), ou
-    `None` s'il est absent ou illisible."""
-    text = str(run.get("updated_at") or run.get("created_at") or "").strip()
+def _iso_ts(text: str | None) -> float | None:
+    """Un horodatage ISO 8601 GitHub en secondes epoch, ou `None`."""
+    text = str(text or "").strip()
     if not text:
         return None
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def updated_ts(run: dict) -> float | None:
+    """L'horodatage de dernière mise à jour d'une exécution (ISO 8601), ou
+    `None` s'il est absent ou illisible."""
+    return _iso_ts(run.get("updated_at") or run.get("created_at") or "")
+
+
+def attempt_ts(run: dict) -> float | None:
+    """L'horodatage du dernier essai d'une exécution (ISO 8601), ou `None` :
+    l'âge d'une exécution qui attend, et la seule preuve d'antériorité entre
+    deux exécutions (#1161). `run_started_at` date l'essai courant — un rerun
+    garde son `run_id`, augmente `run_attempt` et repart à cette date ;
+    `created_at` ne date que le premier essai, donc pour un rerun sans
+    `run_started_at` la date est incertaine et rend `None`."""
+    if int(run.get("run_attempt") or 1) > 1:
+        return _iso_ts(run.get("run_started_at") or "")
+    return _iso_ts(run.get("run_started_at") or run.get("created_at") or "")
+
+
+def protected_branch(branch: str) -> bool:
+    """Une branche que le relevé ne supplante ni n'annule jamais : branche de
+    base (`main`) ou branche de release (`release/…`, canon §2) — #1161."""
+    branch = (branch or "").strip()
+    return branch in BASE_BRANCHES or branch.startswith("release/")
+
+
+def pull_request_run(run: dict) -> bool:
+    """Une exécution de PR : les seules que le relevé annule ou signale
+    (#1161) — une poussée sur la branche de base d'un autre dépôt (`develop`)
+    ou sur une étiquette n'est jamais une PR."""
+    return bool(run.get("pull_requests")) \
+        or (run.get("event") or "").startswith("pull_request")
+
+
+def pr_identity(run: dict) -> tuple[str, tuple[int, ...]] | None:
+    """(dépôt source, numéro(s) de PR) d'une exécution de PR, ou `None` sans
+    preuve. Le groupe de concurrence des workflows d'ameesh est
+    `format('pr-{0}', pull_request.number)` : deux PR de même nom de branche,
+    dans deux dépôts source distincts, ne se supplantent pas (#1161)."""
+    prs = [pr for pr in (run.get("pull_requests") or ()) if isinstance(pr, dict)]
+    numbers = tuple(sorted({int(pr["number"]) for pr in prs
+                            if pr.get("number") is not None}))
+    if not numbers:
+        return None
+    source = str((run.get("head_repository") or {}).get("full_name") or "").strip()
+    if not source:
+        for pr in prs:
+            source = str(((pr.get("head") or {}).get("repo") or {}).get("full_name")
+                         or "").strip()
+            if source:
+                break
+    if not source:
+        return None
+    return (source, numbers)
+
+
+def run_group(run: dict) -> tuple | None:
+    """Le périmètre prudent d'annulation : (dépôt source, PR, workflow).
+
+    Les groupes GitHub peuvent être partagés entre workflows d'un dépôt.
+    Exiger le même workflow est une garde volontaire du veilleur, qui ne
+    reconstitue pas l'expression `concurrency.group`. `None` sans preuve :
+    le relevé n'annule alors rien (#1161).
+    """
+    identity = pr_identity(run)
+    if identity is None:
+        return None
+    path = str(run.get("path") or "").strip()
+    return identity + (path or workflow_of(run.get("path")),)
+
+
+def proven_older(candidate: dict, successor: dict) -> bool:
+    """Le candidat est-il **prouvé** antérieur au successeur (#1161) ? L'ordre
+    des `id` ne le prouve pas : un rerun garde son `id` et augmente
+    `run_attempt`, si bien qu'une exécution d'`id` plus petit peut être le
+    dernier essai lancé. Seules deux dates d'essai strictement ordonnées le
+    prouvent ; une date incertaine conserve l'exécution."""
+    before, after = attempt_ts(candidate), attempt_ts(successor)
+    return before is not None and after is not None and before < after
+
+
+def proof_of(run: dict, successor: dict) -> dict:
+    """La preuve d'annulation d'une exécution, calculée sur la liste du relevé
+    (#1161, R1) : l'essai qualifié, sa tête, son groupe de concurrence et la
+    date d'essai du successeur. `cancel_run` la confronte à la relecture
+    fraîche avant tout POST."""
+    return {"run_attempt": int(run.get("run_attempt") or 1),
+            "head_sha": run.get("head_sha") or "",
+            "group": run_group(run),
+            "successor_ts": attempt_ts(successor)}
+
+
+def proof_holds(run: dict, proof: dict) -> bool:
+    """La relecture fraîche confirme-t-elle la preuve calculée sur la liste
+    (#1161, R1) ? Un essai qui a changé (`run_attempt`), une autre tête, un
+    autre groupe de concurrence ou une date d'essai qui n'est plus antérieure
+    au successeur rendent faux : l'exécution est conservée."""
+    if int(run.get("run_attempt") or 1) != int(proof.get("run_attempt") or 0):
+        return False
+    if (run.get("head_sha") or "") != (proof.get("head_sha") or ""):
+        return False
+    if run_group(run) != proof.get("group"):
+        return False
+    ts, successor_ts = attempt_ts(run), proof.get("successor_ts")
+    return ts is not None and successor_ts is not None and ts < successor_ts
 
 
 def events_of(check_runs, run_id: int) -> list[dict]:
@@ -352,6 +479,24 @@ def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
     return first
 
 
+def pending_text(run: dict, lot: dict | None, waited: float, cancelled: list[int]) -> str:
+    """Le message d'une exécution de PR restée `pending` : elle attend son
+    groupe de concurrence. `cancelled` : les exécutions supplantées non
+    démarrées que le relevé vient d'annuler pour le libérer (#1161)."""
+    head = _head(run, lot)
+    lines = ["%s: pending for %d min — the run is waiting for its concurrency "
+             "group." % (head, max(1, int(waited // 60)))]
+    if cancelled:
+        lines.append("Superseded run(s) of an earlier head were holding it: %s "
+                     "cancelled." % ", ".join(str(i) for i in cancelled))
+    else:
+        lines.append("No superseded run of this pull request can be cancelled: the "
+                     "group is held elsewhere; the run starts when it frees.")
+    lines += ["", "No need to wait for the CI in your turn (gh pr checks --watch): "
+                  "ameesh tells you."]
+    return "\n".join(lines)
+
+
 def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
           urgent: bool) -> int:
     """Envoie ; un texte refusé comme illisible (extrait binaire ou encodé)
@@ -526,10 +671,13 @@ class Watcher:
     partagé (#848) : une lecture identique n'est pas repayée à chaque
     passage, et un quota épuisé arrête le passage sans boucle."""
 
-    def __init__(self, cfg, *, api=None, log=None, clock=None, dry_run: bool = False,
-                 ttl=None):
+    def __init__(self, cfg, *, api=None, cancel=None, log=None, clock=None,
+                 dry_run: bool = False, ttl=None):
         self.cfg = cfg
         self.api = api
+        #: l'écriture d'annulation GitHub (`repos/<repo>/actions/runs/<id>/cancel`) ;
+        #: None : `gh api -X POST` en production, jamais en test sans le dire
+        self.cancel = cancel
         self.log = log or (lambda _text: None)
         self.clock = clock or time.time
         self.dry_run = bool(dry_run)
@@ -538,6 +686,11 @@ class Watcher:
         #: avertissements déjà journalisés par ce passage de service
         self._warned_workflows: set = set()
         self.ttl = None if ttl is None else float(ttl)
+        #: têtes de branche déjà en échec de lecture (une fois par service)
+        self._warned_branches: set = set()
+        #: exécutions `pending` déjà signalées (une fois par service : la
+        #: mémoire de `ci_runs` ne porte pas ce message, additif sans migration)
+        self._pending_alerted: set = set()
 
     def _cache_ttl(self) -> float:
         """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
@@ -618,6 +771,53 @@ class Watcher:
             return WORKFLOWS
         return found
 
+    def branch_head(self, repo: str, branch: str) -> str | None:
+        """La tête de `branch` selon GitHub, ou None (API muette, branche
+        disparue) : elle prouve quelle exécution de la branche n'est pas
+        supplantée, avant toute annulation (#1161)."""
+        try:
+            data = self.api("repos/%s/branches/%s" % (repo, branch)) or {}
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            if (repo, branch) not in self._warned_branches:
+                self._warned_branches.add((repo, branch))
+                self.log("CI %s: head of branch %s unreadable (%s)"
+                         % (repo, branch, " ".join(str(exc).split())[:200]))
+            return None
+        sha = str(((data.get("commit") or {}).get("sha")) or "").strip()
+        return sha or None
+
+    def cancel_run(self, repo: str, run_id: int, *, proof: dict | None = None) -> bool:
+        """Annule une exécution GitHub **non démarrée** (`queued`/`pending`)
+        dont l'essai est prouvé antérieur à celui de la tête courante du même
+        groupe de concurrence : elle retient la tête courante (#1161).
+        Idempotent : une exécution déjà conclue n'est pas annulée ; une erreur
+        de l'API est journalisée et rend False, sans toucher à la base ni
+        rendre de verdict.
+
+        `proof` est la preuve calculée sur la liste du relevé (essai, tête,
+        groupe, date du successeur) : la relecture fraîche doit la confirmer
+        avant le POST. Un essai plus récent (`run_attempt`), une autre tête, un
+        autre groupe ou une date d'essai qui n'est plus antérieure au
+        successeur conservent l'exécution — le POST ne vise jamais un essai que
+        la liste n'avait pas qualifié (#1161, R1)."""
+        try:
+            run = self.api("repos/%s/actions/runs/%s" % (repo, run_id)) or {}
+            if (run.get("status") or "") not in CANCELLABLE_STATUSES:
+                return False
+            if proof is not None and not proof_holds(run, proof):
+                return False
+            if self.cancel is None:
+                from . import plan_github
+                plan_github._json(plan_github.Gh(), [
+                    "api", "-X", "POST", "repos/%s/actions/runs/%s/cancel" % (repo, run_id)])
+            else:
+                self.cancel(repo, int(run_id))
+            return True
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            self.log("CI %s: cancel of run %s failed (%s)"
+                     % (repo, run_id, " ".join(str(exc).split())[:200]))
+            return False
+
     def tick(self, db) -> list[dict]:
         """Un relevé de chaque dépôt ; rend les envois et retraits."""
         from . import plan_github
@@ -657,6 +857,10 @@ class Watcher:
         out: list[dict] = []
         for run_id in sorted(live):
             out += self._follow(db, repo, live[run_id], lots)
+        # les exécutions de PR bloquées en `pending` : les exécutions non
+        # démarrées d'une tête supplantée retiennent le groupe de concurrence,
+        # elles sont annulées ; la tête courante qui attend est signalée (#1161)
+        out += self._unblock(db, repo, live, lots)
         # #747 : fin de l'attente d'un runner, distincte de la durée des tests
         st.ci.mark_started(repo, [i for i, r in live.items()
                                   if r.get("status") == "in_progress"])
@@ -742,8 +946,8 @@ class Watcher:
         Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
         la fenêtre de 600 s est écrite dans la base avant le premier appel
         (`ci_guard_scan`, atomique par dépôt), chaque exécution non conclue est
-        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 63 appels
-        (2 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
+        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 66 appels
+        (5 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
         relue : un run resté `queued` peut porter un job déjà `in_progress`
         quand un autre attend (mesure fondatrice #828), donc aucun instantané de
         jobs ne peut être réutilisé sur le seul statut `queued` (R1 finale cx3,
@@ -952,6 +1156,101 @@ class Watcher:
                             "by": run.get("head_sha"), "withdrawn": withdrawn})
         return out
 
+    def _unblock(self, db, repo: str, live: dict[int, dict], lots: list[dict]) -> list[dict]:
+        """Les exécutions de PR qui attendent leur groupe de concurrence
+        (#1161). Dans son périmètre prudent (même PR, même dépôt source,
+        même workflow), le relevé annule les exécutions non démarrées d'un
+        essai antérieur, jamais `main`, `release/…`, jamais la tête courante,
+        jamais un essai dont l'antériorité n'est pas prouvée (un rerun reste,
+        #901). La tête courante restée `pending` au-delà de PENDING_ALERT est
+        signalée à l'assigné du lot."""
+        groups: dict[tuple, list[dict]] = {}
+        for run in live.values():
+            branch = run.get("head_branch") or ""
+            if not branch or protected_branch(branch) or not pull_request_run(run):
+                continue
+            key = run_group(run)
+            if key is None:
+                continue  # PR, dépôt source ou workflow non prouvés : jamais annulé
+            groups.setdefault(key, []).append(run)
+        now = float(self.clock())
+        out: list[dict] = []
+        heads: dict[str, str | None] = {}
+        for key in sorted(groups):
+            runs = groups[key]
+            branch = runs[0].get("head_branch") or ""
+            if len({r.get("head_sha") or "" for r in runs}) < 2 \
+                    and not any((r.get("status") or "") == "pending" for r in runs):
+                continue  # une seule tête visible : rien à libérer ni à signaler
+            if branch not in heads:
+                heads[branch] = self.branch_head(repo, branch)
+            head = heads[branch]
+            if not head:
+                continue  # tête courante non prouvée : ni annulation, ni signal
+            successors = [r for r in runs if (r.get("head_sha") or "") == head]
+            if not successors:
+                continue  # aucun essai de la tête courante dans ce groupe
+            successor = max(successors,
+                            key=lambda r: (attempt_ts(r) or 0.0, int(r["id"])))
+            cancelled: list[int] = []
+            for run in sorted(runs, key=lambda r: int(r["id"])):
+                if (run.get("head_sha") or "") == head:
+                    continue
+                if (run.get("status") or "") not in CANCELLABLE_STATUSES:
+                    continue
+                if not proven_older(run, successor):
+                    continue  # antériorité non prouvée : l'exécution est conservée
+                run_id = int(run["id"])
+                # la preuve est calculée sur la liste ; `cancel_run` la
+                # revérifie sur la relecture fraîche avant le POST (#1161, R1)
+                if self.cancel_run(repo, run_id, proof=proof_of(run, successor)):
+                    cancelled.append(run_id)
+                    out.append({"action": "cancelled", "repo": repo, "run_id": run_id,
+                                "head_sha": run.get("head_sha"), "branch": branch,
+                                "for": int(successor["id"]), "by": head})
+            for run in sorted(runs, key=lambda r: int(r["id"])):
+                if (run.get("status") or "") != "pending" \
+                        or (run.get("head_sha") or "") != head:
+                    continue  # une tête supplantée qui attend : annulée ci-dessus
+                out += self._alert_pending(db, repo, run, lots, cancelled, now)
+        return out
+
+    def _alert_pending(self, db, repo: str, run: dict, lots: list[dict],
+                       cancelled: list[int], now: float) -> list[dict]:
+        """Signale à l'assigné une exécution de la tête courante restée
+        `pending` plus de PENDING_ALERT (groupe de concurrence, #1161) : une
+        fois par exécution et par vie du service — `ci_runs` ne porte pas ce
+        message, l'additif #1161 reste sans migration."""
+        from . import work
+        key = (repo, int(run["id"]))
+        if key in self._pending_alerted:
+            return []
+        started = attempt_ts(run)
+        if started is None or now - started < PENDING_ALERT:
+            return []
+        self._pending_alerted.add(key)
+        waited = now - started
+        item_id = lot_of_run(run, lots)
+        lot = work.get(db, int(item_id)) if item_id else None
+        to = recipient_of(lot)
+        if not to:
+            return [{"action": "pending", "repo": repo, "run_id": int(run["id"]),
+                     "to": None, "waited_s": int(waited), "cancelled": list(cancelled)}]
+        # la forme des lignes `ci_runs` : `branch`, `run_id`, `url` — les textes
+        # lisent l'exécution comme le reste du relevé
+        view = dict(run, run_id=int(run["id"]), branch=run.get("head_branch") or "",
+                    url=run.get("html_url") or run.get("url"),
+                    workflow=workflow_of(run.get("path")))
+        text = pending_text(view, lot, waited, cancelled)
+        payload = {"ci": {"repo": repo, "run_id": int(run["id"]),
+                          "head_sha": run.get("head_sha"), "branch": run.get("head_branch"),
+                          "kind": "pending", "workflow": workflow_of(run.get("path")),
+                          "waited_s": int(waited), "cancelled": list(cancelled)}}
+        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
+        return [{"action": "pending", "repo": repo, "run_id": int(run["id"]), "to": to,
+                 "waited_s": int(waited), "cancelled": list(cancelled),
+                 "message_id": message_id}]
+
     def _failures(self, db, repo: str, row: dict) -> list[dict]:
         """Les échecs nouveaux d'une exécution suivie, et leur message."""
         from . import work
@@ -1071,10 +1370,15 @@ def describe(record: dict) -> str:
     if record["action"] == "superseded":
         return "%s superseded by %s; %d unread message(s) withdrawn" % (
             where, _short(record.get("by") or ""), len(record.get("withdrawn") or ()))
+    if record["action"] == "cancelled":
+        return "%s: superseded run cancelled to free the concurrency group (for run %s)" % (
+            where, record.get("for"))
     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
         if record.get("to") else "(no recipient)"
     if record["action"] == "failures":
         return "%s: %d failure(s) %s" % (where, len(record.get("tests") or ()), to)
+    if record["action"] == "pending":
+        return "%s: pending %d min %s" % (where, int(record.get("waited_s") or 0) // 60, to)
     return "%s: verdict %s %s" % (where, record.get("status"), to)
 
 

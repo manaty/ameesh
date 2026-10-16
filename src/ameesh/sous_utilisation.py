@@ -188,9 +188,17 @@ def _common_responsible(rows) -> str | None:
 # --------------------------------------------------------------------------
 
 def _gauge(row: dict) -> cost_mod.Gauge:
-    return cost_mod.Gauge(row["harness"], row["key"], float(row.get("used") or 0.0),
+    """La jauge d'une ligne d'historique, portée par modèle restituée.
+
+    #1789/N6 : la clé d'un seau propre à un modèle porte sa portée
+    (`seven_day@fable`, #1580) — l'historique ne stocke pas le `scope` ; le
+    relire ici évite qu'un seau de modèle soit pris pour la fenêtre générale
+    du compte (alertes de sous-utilisation, `plan_underused`)."""
+    key = row["key"]
+    _, _, scope = key.partition("@")
+    return cost_mod.Gauge(row["harness"], key, float(row.get("used") or 0.0),
                           row.get("resets_at_ts"), float(row.get("window_s") or 0.0)
-                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]))
+                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]), scope=scope)
 
 
 def expiring(gauge, now: float) -> tuple | None:
@@ -279,9 +287,13 @@ def plan_underused(db, listing: list, now: float, *,
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
+        # #1789/N6 : un seau propre à un modèle (#1580 tranche 3) ne rend pas
+        # la capacité générale du compte inutilisable — seules les fenêtres
+        # générales se taisent entre elles ; un seau de modèle reste alerte.
+        blocking = [(g, seen) for g, seen in live if not getattr(g, "scope", "")]
         for gauge, seen in live:
             if any(other.exceeded(now, 0.0, multiplier, ceiling)
-                   for other, _ in live if other is not gauge):
+                   for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
@@ -503,21 +515,31 @@ def is_backlog_item(lot: dict) -> bool:
             and lot.get("state") == "intake")
 
 
-def waiting_project_lots(lots: list, *, db=None) -> list:
+def waiting_project_lots(lots: list, *, db=None, now: float | None = None) -> list:
     """Les lots du projet ouverts sans assigné (hors file d'amélioration) : du
     travail demandé qui attend qu'on le confie. Tant qu'il y en a, la prise
     automatique s'abstient (0037) et `idle_capacity` le signale. Quand la base
-    est fournie, seuls les lots sans dependance explicite ouverte attendent
-    un preneur ; les autres attendent leurs amonts."""
+    est fournie, seuls les lots **démarrables** attendent un preneur : un lot
+    qu'une attente planifiée retient (L368 : dépendance explicite ouverte,
+    engagement `depends_on` d'un lot ou d'un paquet ouvert, début prévu à
+    venir) attend son prérequis, pas un agent (#1625).
+
+    Une lecture des attentes en échec est conservatrice : le lot reste compté,
+    la porte reste fermée — jamais une amélioration prise sur un doute."""
     waiting = [lot for lot in lots
                if not (lot.get("assignee") or "").strip()
                and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
     if not waiting or db is None:
         return waiting
-    blocked = {int(edge["work_item_id"]) for edge in
-               storage.of(db).work_dependencies.for_items([lot["id"] for lot in waiting])
-               if edge["blocking"]}
-    return [lot for lot in waiting if int(lot["id"]) not in blocked]
+    from . import db as db_mod
+    from . import planned_waits
+    try:
+        waits = planned_waits.read(db, waiting, now=now)
+    except db_mod.Unavailable:
+        raise
+    except Exception:  # noqa: BLE001 - attentes illisibles : on ne devine pas
+        return waiting
+    return [lot for lot in waiting if int(lot["id"]) not in waits]
 
 
 def _budget_held(cfg, db, rows: list) -> dict:
@@ -928,8 +950,10 @@ def backlog_empty(db, listing: list, now: float, *,
     # pas prenable — même filtre `ready_only` que la prise automatique (L165).
     if storage.of(db).work.backlog(open_only=True, limit=1, ready_only=True):
         return []
-    # des lots du projet attendent un preneur : c'est `idle_capacity` qui parle
-    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db):
+    # des lots du projet démarrables attendent un preneur : c'est
+    # `idle_capacity` qui parle ; des lots tous retenus par une attente
+    # planifiée ne taisent pas une file vide (#1625)
+    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db, now=now):
         return []
     names = sorted(row["name"] for row in idle)
     return [_alert(

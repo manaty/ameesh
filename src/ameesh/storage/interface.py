@@ -56,7 +56,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
    pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
-   turn_costs      last_reading insert spent ledger correct
+   turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
                    pending_recipients_sorted unread_total dead_letters forward
@@ -97,8 +97,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
-                   open_lots_activity turns record_gauges gauge_history
-                   latest_gauges assigners record_balance balances
+                   open_lots_activity state_lots_activity turns record_gauges
+                   gauge_history latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
@@ -503,6 +503,20 @@ class TurnCosts(Domain):
         l'agent pour ce harnais — de cette session seulement si `session` est
         donnée : session, cum_usd, cum_input_tokens, cum_cached_input_tokens,
         cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
+
+    @abc.abstractmethod
+    def last_before(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la dernière ligne écrite de `agent` à `ts` (epoch) ou avant :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. Lecture seule,
+        pour relire le harnais qui tournait avant un instant donné (le gel d'un
+        lot)."""
+
+    @abc.abstractmethod
+    def first_after(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
+        écrit la ligne d'un tour à sa fin : le tour qui a posé un gel est le
+        premier écrit APRÈS l'instant du gel. Lecture seule."""
 
     @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
@@ -1311,6 +1325,17 @@ class WorkItems(Domain):
         """L122 : le lot (id, titre, état) qui a réservé ce numéro du dépôt."""
 
     @abc.abstractmethod
+    def record_landed_migration(self, item_id: int, number: int, repo: str, *,
+                                note: str, actor: str) -> dict | None:
+        """#1567 : enregistre (ou corrige) le numéro atterri d'un lot déjà
+        fusionné ou promu, journalisé dans la même transaction ; None si le lot
+        n'est pas dans un état terminal. La réservation n'est pas touchée."""
+
+    @abc.abstractmethod
+    def migration_landed_holder(self, number: int, repo: str) -> dict | None:
+        """#1567 : le lot (id, titre, état) qui nomme déjà ce numéro atterri."""
+
+    @abc.abstractmethod
     def record_resolution(self, item_id: int, other_id: int, *, commit: str, lot_tip: str,
                           other_tip: str, ref: str | None, files: list[str], note: str,
                           actor: str) -> dict | None:
@@ -1391,6 +1416,21 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def open_for(self, assignee: str) -> list[dict]:
         """L118 : les lots ouverts d'un assigné."""
+
+    @abc.abstractmethod
+    def release_agent(self, agent: str, *, reason: str, actor: str,
+                      measure_actor: str = "", measure_reason: str = "",
+                      dry_run: bool = False,
+                      stopped_with: tuple[str, ...] = ()) -> list[dict]:
+        """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+        d'équipe (assigné effacé, journal au lot avec la raison), et ses lots
+        promus dont la mesure reste à refaire allaient à ``measure_actor``
+        (l'auditeur, ``measure_reason`` au journal), en une transaction. Rend
+        les lots touchés. Idempotent : un lot dont l'assigné a changé
+        entre-temps n'est pas touché. ``dry_run`` : ce qui serait fait, rien
+        n'est écrit. ``stopped_with`` : si non vide, la transaction revérifie
+        que l'agent est encore ``stopped`` pour l'une de ces raisons avant de
+        rendre un lot (course fermée entre le relevé du registre et le geste)."""
 
     @abc.abstractmethod
     def open_by_ref(self, ref: str) -> list[dict]:
@@ -1591,11 +1631,14 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
-                     pr_ref: str | None, frozen_id: int | None = None) -> dict | None:
+                     pr_ref: str | None, frozen_id: int | None = None,
+                     landed: tuple[int, str] | None = None) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
         dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
-        `merged` (commit, auteur de la fusion) dans la même transaction."""
+        `merged` (commit, auteur de la fusion) dans la même transaction.
+        `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
+        écrit dans la même transaction."""
 
     @abc.abstractmethod
     def close(self, item_id: int, *, current: str, reason: str, superseded_by: int | None,
@@ -2546,6 +2589,12 @@ class Operations(Domain):
         epoch, échéance recontrôlée). Faux si le bail n'est plus le nôtre."""
 
     @abc.abstractmethod
+    def set_dormant(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
+        """L76 T2 : le texte de statut d'un résident endormi, en une écriture
+        conditionnelle — seulement si l'agent est `idle` et que le bail
+        (owner, epoch, échéance) est encore le nôtre. Faux sinon."""
+
+    @abc.abstractmethod
     def listing(self, *, today: str | None = None) -> list[dict]:
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
         `status_since_ts`, début du motif affiché (`status_reason_since_ts`), bail
@@ -2629,6 +2678,13 @@ class Operations(Domain):
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
         son relecteur désigné). Les plus anciennement actifs d'abord. `limit=None`
         lit toute la vérité avant le filtrage des attentes planifiées (L368)."""
+
+    @abc.abstractmethod
+    def state_lots_activity(self, state: str, limit: int | None) -> list[dict]:
+        """Lots d'un état donné (`promoted`, …), même forme que
+        `open_lots_activity` — qui exclut `merged`, `promoted` et `closed` :
+        un lot promu qu'un agent arrêté garde doit rester visible (#753, R1
+        auditeur). `limit=None` : toute la vérité."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:

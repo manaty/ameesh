@@ -237,11 +237,12 @@ class RoutageTest(unittest.TestCase):
 
 class FauxApi:
     """L'API GitHub vue par le relevé : workflows publiés par le dépôt
-    (découverte, #1110), exécutions en cours, état d'une exécution, check runs
-    d'une tête, et (#845) runners et jobs."""
+    (découverte, #1110), exécutions par état — `pending` compris (#1161) —,
+    tête d'une branche, état d'une exécution, check runs d'une tête,
+    l'écriture d'annulation, et (#845) runners et jobs."""
 
     def __init__(self):
-        self.live, self.queued, self.done, self.checks = [], [], {}, {}
+        self.live, self.queued, self.pending, self.done, self.checks = [], [], [], {}, {}
         #: exécutions terminées (rattrapage borné #1110)
         self.terminated = []
         #: fichiers de workflow que le dépôt publie (découverte #1110)
@@ -251,6 +252,29 @@ class FauxApi:
         self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
         #: #845 : chemins appelés, pour compter les appels de la garde
         self.paths: list[str] = []
+        #: tête de branche rendue par l'API (#1161)
+        self.branches = {}
+        #: annulations demandées (#1161), et l'erreur que l'écriture rend
+        self.cancels, self.cancel_error = [], None
+
+    def cancel(self, repo, run_id):
+        """L'écriture d'annulation (#1161) : l'exécution quitte les listes
+        vivantes et devient terminée annulée, comme chez GitHub."""
+        if self.cancel_error:
+            raise self.cancel_error
+        self.cancels.append((repo, int(run_id)))
+        for bucket in (self.live, self.queued, self.pending):
+            for run in list(bucket):
+                if int(run["id"]) == int(run_id):
+                    bucket.remove(run)
+        self.done[int(run_id)] = {"status": "completed", "conclusion": "cancelled"}
+
+    def _status_runs(self, path):
+        for status, bucket in (("queued", self.queued), ("pending", self.pending),
+                               ("in_progress", self.live)):
+            if "status=%s" % status in path:
+                return list(bucket)
+        return []  # requested, waiting : aucun run dans ces états
 
     def __call__(self, path):
         self.paths.append(path)
@@ -265,15 +289,24 @@ class FauxApi:
         if "/actions/runs?" in path:
             if "status=completed" in path:
                 return {"workflow_runs": list(self.terminated)}
-            runs = list(self.queued if "status=queued" in path else self.live)
+            runs = self._status_runs(path)
             return {"total_count": len(runs) + (1 if self.truncated else 0),
                     "workflow_runs": runs}
         if "/actions/workflows" in path:
             return {"workflows": [item if isinstance(item, dict) else
                                   {"path": ".github/workflows/%s" % item, "state": "active"}
                                   for item in self.workflows]}
+        if "/branches/" in path:
+            return {"commit": {"sha": self.branches.get(path.split("/branches/", 1)[1], "")}}
         if "/actions/runs/" in path:
-            return self.done.get(int(path.rsplit("/", 1)[1]), {"status": "in_progress"})
+            run_id = int(path.rsplit("/", 1)[1])
+            if run_id in self.done:
+                return self.done[run_id]
+            for bucket in (self.live, self.queued, self.pending):
+                for run in bucket:
+                    if int(run["id"]) == run_id:
+                        return run
+            return {"status": "in_progress"}
         if "/check-runs" in path:
             sha = path.split("/commits/")[1].split("/")[0]
             return {"check_runs": self.checks.get(sha, [])}
@@ -313,15 +346,25 @@ def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=N
 
 
 def run_view(run_id, sha, branch, *, base="main", message="", workflow="tests.yml",
-             attempt=1, updated_at=None):
-    view = {"id": run_id, "head_sha": sha, "head_branch": branch, "event": "pull_request"
-            if branch != "main" else "push", "path": ".github/workflows/%s" % workflow,
+             attempt=1, updated_at=None, status=None, created_at=None,
+             run_started_at=None, pr=1, source=DEPOT):
+    pull_request = branch != "main" and pr is not None
+    view = {"id": run_id, "head_sha": sha, "head_branch": branch,
+            "event": "pull_request" if pull_request else "push",
+            "path": ".github/workflows/%s" % workflow,
             "run_attempt": attempt,
+            "head_repository": {"full_name": source},
             "html_url": "https://github.com/%s/actions/runs/%d" % (DEPOT, run_id),
-            "pull_requests": [{"base": {"ref": base}}] if branch != "main" else [],
+            "pull_requests": [{"number": pr, "base": {"ref": base}}] if pull_request else [],
             "head_commit": {"message": message}}
     if updated_at:
         view["updated_at"] = updated_at
+    if created_at:
+        view["created_at"] = created_at
+    if run_started_at:
+        view["run_started_at"] = run_started_at
+    if status:
+        view["status"] = status
     return view
 
 
@@ -344,7 +387,7 @@ class WatcherTest(PgTestCase):
         self.cfg_ci = dataclasses.replace(
             self.cfg, github={"projects": {"ameesh": DEPOT}, "host": self.cfg.host})
         self.api = FauxApi()
-        self.watcher = ci.Watcher(self.cfg_ci, api=self.api)
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel)
         # une exécution verte de main déjà relevée : la référence du rouge hérité
         # (nommée `tests.yml` : la migration 0433 nomme les lignes antérieures)
         st = storage.of(self.db)
@@ -365,7 +408,7 @@ class WatcherTest(PgTestCase):
     def test_pas_l_hote_designe(self):
         cfg = dataclasses.replace(self.cfg, github={"projects": {"ameesh": DEPOT},
                                                     "host": "ailleurs"})
-        self.assertEqual(ci.Watcher(cfg, api=self.api).repos(), [])
+        self.assertEqual(ci.Watcher(cfg, api=self.api, cancel=self.api.cancel).repos(), [])
         self.assertEqual(self.watcher.repos(), [DEPOT])
 
     def test_run_vu_sans_branche_est_rattache_a_la_pose(self):
@@ -586,6 +629,310 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 422)["status"], "running")
 
+    def test_pending_lu_suivi_et_conclu(self):
+        # #1161 : une exécution bloquée en `pending` (groupe de concurrence non
+        # obtenu) est lue dès la poussée, garde une seule ligne quand elle
+        # repasse `queued`, puis reçoit son verdict et son réveil
+        sha = "e1" * 20
+        self.api.pending = [run_view(601, sha, "lot/1-un", status="pending")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        row = storage.of(self.db).ci.run(DEPOT, 601)
+        self.assertEqual((row["status"], row["work_item_id"]), ("running", self.lot["id"]))
+        compteur = "SELECT count(*) AS n FROM ci_runs WHERE run_id = 601"
+        self.assertEqual(self.db.query(compteur)[0]["n"], 1)
+        # relue `pending` : rien de neuf, pas de doublon
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.db.query(compteur)[0]["n"], 1)
+        # la même exécution passe `queued` : toujours une seule ligne
+        self.api.pending = []
+        self.api.queued = [run_view(601, sha, "lot/1-un", status="queued")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.db.query(compteur)[0]["n"], 1)
+        # conclusion : verdict et réveil, une fois
+        self.api.queued = []
+        self.api.done[601] = completed(".github/workflows/tests.yml", "success")
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out],
+                         [("verdict", "success")])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 601)["status"], "success")
+        self.assertEqual(len(self.mails("dev-a")), 1)
+
+    def test_pending_annule_les_executions_supplantees(self):
+        # #1161 : le groupe de concurrence est retenu par une exécution non
+        # démarrée d'un essai antérieur ; le relevé l'annule, jamais la tête
+        # courante, et l'écriture est idempotente
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        vieille, neuve = "f1" * 20, "f2" * 20
+        self.api.queued = [run_view(611, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.api.pending = [run_view(612, neuve, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T06:05:00Z")]
+        self.api.branches["lot/1-un"] = neuve
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["run_id"]) for o in out],
+                         [("superseded", 611), ("cancelled", 611)])
+        self.assertIn("cancelled to free", "\n".join(ci.describe(o) for o in out))
+        self.assertEqual(self.api.cancels, [(DEPOT, 611)])
+        st = storage.of(self.db)
+        self.assertEqual(st.ci.run(DEPOT, 611)["status"], "superseded")
+        self.assertEqual(st.ci.run(DEPOT, 612)["status"], "running")
+        # l'exécution annulée n'est plus vivante : rien à refaire, aucun doublon
+        self.assertEqual([o for o in watcher.tick(self.db)
+                          if o["action"] == "cancelled"], [])
+        self.assertEqual(self.api.cancels, [(DEPOT, 611)])
+
+    def test_annulation_reservee_au_meme_groupe(self):
+        # #1161 (R1 B1) : jamais `main`, jamais `release/…`, jamais la tête
+        # courante, jamais une poussée simple, une autre PR, un autre dépôt
+        # source ou un autre workflow — le groupe d'abord (même PR, même
+        # dépôt source, même fichier de workflow)
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        vieille, neuve = "1a" * 20, "1b" * 20
+        ancienne, recente = "2026-10-14T06:00:00Z", "2026-10-14T06:05:00Z"
+        # `main` et `release/…` : jamais touchées
+        self.api.queued = [run_view(621, "1c" * 20, "main", status="queued",
+                                    created_at=ancienne)]
+        self.api.pending = [run_view(622, "1d" * 20, "main", status="pending",
+                                     created_at=recente)]
+        self.api.branches["main"] = "1d" * 20
+        watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.api.queued = [run_view(623, "1e" * 20, "release/v1.10.0", status="queued",
+                                    created_at=ancienne)]
+        self.api.pending = [run_view(624, "1f" * 20, "release/v1.10.0", status="pending",
+                                     created_at=recente)]
+        self.api.branches["release/v1.10.0"] = "1f" * 20
+        watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        # la tête courante : deux essais de la même tête, aucun n'est annulé
+        self.api.queued = [run_view(631, neuve, "lot/1-un", status="queued",
+                                    created_at=ancienne)]
+        self.api.pending = [run_view(632, neuve, "lot/1-un", status="pending",
+                                     created_at=recente)]
+        self.api.branches["lot/1-un"] = neuve
+        watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        # une poussée simple (sans PR) : son groupe n'est pas celui de la PR
+        self.api.queued = [run_view(641, vieille, "lot/1-un", status="queued", pr=None,
+                                    created_at=ancienne)]
+        self.api.pending = [run_view(642, neuve, "lot/1-un", status="pending",
+                                     created_at=recente)]
+        watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        # même branche, une autre PR : deux groupes
+        self.api.queued = [run_view(643, vieille, "lot/1-un", status="queued", pr=2,
+                                    created_at=ancienne)]
+        self.api.pending = [run_view(644, neuve, "lot/1-un", status="pending", pr=1,
+                                     created_at=recente)]
+        watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        # même PR, un autre dépôt source : deux groupes
+        self.api.queued = [run_view(645, vieille, "lot/1-un", status="queued",
+                                    source="fork/ameesh", created_at=ancienne)]
+        self.api.pending = [run_view(646, neuve, "lot/1-un", status="pending",
+                                     source=DEPOT, created_at=recente)]
+        watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+
+    def test_annulation_ne_traverse_pas_les_workflows(self):
+        # #1161 (R1 B1) : le groupe s'évalue dans le fichier de workflow — un
+        # ancien `website-suite.yml` sans successeur de son workflow n'est pas
+        # annulé par la tête `tests.yml`, et l'est quand son workflow a son
+        # propre successeur sur la tête courante
+        cfg = dataclasses.replace(self.cfg, github={
+            "projects": {"ameesh": {"repo": DEPOT,
+                                    "workflows": ["tests.yml", "website-suite.yml"]}},
+            "host": self.cfg.host})
+        watcher = ci.Watcher(cfg, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        vieille, neuve = "1a" * 20, "1b" * 20
+        ancienne, recente = "2026-10-14T06:00:00Z", "2026-10-14T06:05:00Z"
+        self.api.queued = [run_view(647, vieille, "lot/1-un", status="queued",
+                                    workflow="website-suite.yml", created_at=ancienne)]
+        self.api.pending = [run_view(648, neuve, "lot/1-un", status="pending",
+                                     workflow="tests.yml", created_at=recente)]
+        self.api.branches["lot/1-un"] = neuve
+        watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.api.pending.append(run_view(649, neuve, "lot/1-un", status="pending",
+                                         workflow="website-suite.yml",
+                                         created_at=recente))
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [(DEPOT, 647)])
+        self.assertIn(("cancelled", 647), [(o["action"], o["run_id"]) for o in out])
+
+    def test_rerun_essai_2_date_et_non_id(self):
+        # #1161 (R1 B2) : un rerun garde son `id` et augmente `run_attempt` ;
+        # l'ordre des `id` ne prouve pas l'antériorité. L'essai 2 lancé après
+        # l'essai 1 de la nouvelle tête est conservé, l'essai antérieur est
+        # annulé, et une date d'essai incertaine conserve l'exécution
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        ancienne, courante = "2a" * 20, "2b" * 20
+        self.api.queued = [run_view(611, ancienne, "lot/1-un", status="queued",
+                                    attempt=2, run_started_at="2026-10-14T08:00:00Z")]
+        self.api.pending = [run_view(612, courante, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T07:00:00Z")]
+        self.api.branches["lot/1-un"] = courante
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # le même essai, antérieur à la nouvelle tête, est annulé
+        self.api.queued = [run_view(613, ancienne, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.pending = [run_view(614, courante, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T06:05:00Z")]
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [(DEPOT, 613)])
+        self.assertIn(("cancelled", 613), [(o["action"], o["run_id"]) for o in out])
+        # une date d'essai incertaine (aucune date) : conservée
+        self.api.queued = [run_view(615, ancienne, "lot/1-un", status="queued")]
+        self.api.pending = [run_view(616, courante, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T06:05:00Z")]
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [(DEPOT, 613)])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # un rerun sans date d'essai (seul `created_at` du premier essai) :
+        # date incertaine, conservé
+        self.api.queued = [run_view(617, ancienne, "lot/1-un", status="queued",
+                                    attempt=2, created_at="2026-10-14T05:00:00Z")]
+        self.api.pending = [run_view(618, courante, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T06:05:00Z")]
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [(DEPOT, 613)])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+
+    def test_preuve_reverifiee_sur_la_relecture_fraiche(self):
+        # #1161 (R1 delta) : la preuve d'antériorité est calculée sur la liste
+        # du relevé ; la relecture fraîche de l'exécution doit la confirmer
+        # avant le POST. Un rerun apparu entre les deux (essai 2 plus récent
+        # que le successeur), une date d'essai devenue plus récente, une autre
+        # tête ou un autre groupe conservent l'exécution : le POST ne vise
+        # jamais un essai que la liste n'avait pas qualifié.
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        vieille, courante = "3a" * 20, "3b" * 20
+        self.api.pending = [run_view(612, courante, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T07:00:00Z")]
+        self.api.branches["lot/1-un"] = courante
+        # liste : essai 1 à 06:00, antérieur ; relecture fraîche : essai 2 à
+        # 08:00, plus récent que le successeur -> conservée
+        self.api.queued = [run_view(611, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[611] = run_view(611, vieille, "lot/1-un", status="queued",
+                                      attempt=2,
+                                      run_started_at="2026-10-14T08:00:00Z")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # essai inchangé mais date d'essai fraîche plus récente que le
+        # successeur -> conservée
+        self.api.queued = [run_view(613, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[613] = run_view(613, vieille, "lot/1-un", status="queued",
+                                      run_started_at="2026-10-14T08:00:00Z")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # tête changée entre la liste et la relecture -> conservée
+        self.api.queued = [run_view(614, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[614] = run_view(614, "3c" * 20, "lot/1-un", status="queued",
+                                      created_at="2026-10-14T06:00:00Z")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # groupe changé (dépôt source) entre la liste et la relecture -> conservée
+        self.api.queued = [run_view(615, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[615] = run_view(615, vieille, "lot/1-un", status="queued",
+                                      created_at="2026-10-14T06:00:00Z",
+                                      source="quelqu-un/ameesh")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # relecture fraîche conforme à la liste (essai 1, 06:00, même tête,
+        # même groupe) -> annulée, comme avant
+        self.api.queued = [run_view(616, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done.pop(616, None)
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [(DEPOT, 616)])
+        self.assertIn(("cancelled", 616), [(o["action"], o["run_id"]) for o in out])
+
+    def test_erreur_d_annulation_sans_faux_verdict(self):
+        # #1161 : une erreur de l'API d'annulation est journalisée ; elle ne
+        # conclut rien, ne retire rien et laisse la nouvelle exécution suivie
+        journal = []
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             log=journal.append, clock=lambda: 1_000_000.0)
+        vieille, neuve = "3a" * 20, "3b" * 20
+        self.api.queued = [run_view(651, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        watcher.tick(self.db)
+        self.api.pending = [run_view(652, neuve, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T06:05:00Z")]
+        self.api.branches["lot/1-un"] = neuve
+        self.api.cancel_error = RuntimeError("boom")
+        out = watcher.tick(self.db)
+        self.assertEqual([o["action"] for o in out], ["superseded"])
+        self.assertTrue(any("cancel of run 651 failed" in line for line in journal))
+        st = storage.of(self.db)
+        self.assertEqual(st.ci.run(DEPOT, 651)["status"], "superseded")
+        self.assertEqual(st.ci.run(DEPOT, 652)["status"], "running")
+        self.assertEqual(self.mails("dev-a"), [])
+
+    def test_pending_signale_apres_cinq_minutes(self):
+        # #1161 : une exécution de la tête courante restée `pending` au-delà du
+        # délai est signalée à l'assigné du lot, une seule fois par service
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        sha = "4a" * 20
+        self.api.pending = [run_view(661, sha, "lot/1-un", status="pending",
+                                     created_at="1970-01-12T13:39:40+00:00")]
+        self.api.branches["lot/1-un"] = sha
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"], o["waited_s"], o["cancelled"]) for o in out],
+                         [("pending", "dev-a", 420, [])])
+        self.assertIn("pending 7 min", "\n".join(ci.describe(o) for o in out))
+        (m,) = self.mails("dev-a")
+        self.assertIn("pending for 7 min", m["body"])
+        self.assertIn("held elsewhere", m["body"])
+        self.assertFalse(mail.is_urgent(m))
+        self.assertEqual(self.payload_of(m)["ci"]["kind"], "pending")
+        # déjà signalée : le passage suivant ne double pas le message
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 1)
+        # une exécution `queued` de la même tête (attente de runner, banale)
+        # n'est jamais signalée : seul `pending` attend un groupe
+        self.api.pending = []
+        self.api.queued = [run_view(662, sha, "lot/1-un", status="queued",
+                                    created_at="1970-01-12T13:39:40+00:00")]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 1)
+
+    def test_pending_signale_et_debloque(self):
+        # #1161 : quand une exécution supplantée non démarrée retient le
+        # groupe, elle est annulée et le signalement le dit
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        vieille, neuve = "5a" * 20, "5b" * 20
+        self.api.queued = [run_view(671, vieille, "lot/1-un", status="queued",
+                                    created_at="1970-01-12T13:39:00+00:00")]
+        watcher.tick(self.db)
+        self.api.pending = [run_view(672, neuve, "lot/1-un", status="pending",
+                                     created_at="1970-01-12T13:39:40+00:00")]
+        self.api.branches["lot/1-un"] = neuve
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["run_id"]) for o in out],
+                         [("superseded", 671), ("cancelled", 671), ("pending", 672)])
+        (m,) = self.mails("dev-a")
+        self.assertIn("671 cancelled", m["body"])
+        self.assertEqual(self.payload_of(m)["ci"]["cancelled"], [671])
+
     def test_sans_base_relevee_passif(self):
         # relecture (4) : aucune exécution conclue de main relevée, l'échec
         # est peut-être hérité : message passif, jamais urgent
@@ -757,7 +1104,7 @@ class WatcherTest(PgTestCase):
                                                     "host": self.cfg.host})
         api = FauxApi()
         api.workflows = ["backend-suite.yml", "sql-invariant.yml"]
-        watcher = ci.Watcher(cfg, api=api)
+        watcher = ci.Watcher(cfg, api=api, cancel=api.cancel)
         sha = "9" * 40
         api.live = [run_view(901, sha, "lot/1-un", workflow="backend-suite.yml")]
         self.assertEqual(watcher.tick(self.db), [])
@@ -793,7 +1140,7 @@ class WatcherTest(PgTestCase):
             "host": self.cfg.host})
         api = FauxApi()
         api.workflows = ["backend-suite.yml", "website-suite.yml"]
-        watcher = ci.Watcher(cfg, api=api)
+        watcher = ci.Watcher(cfg, api=api, cancel=api.cancel)
         api.live = [run_view(920, "c" * 40, "lot/1-un", workflow="backend-suite.yml"),
                     run_view(921, "d" * 40, "lot/1-un", workflow="website-suite.yml")]
         watcher.tick(self.db)
@@ -811,7 +1158,7 @@ class WatcherTest(PgTestCase):
         api = FauxApi()
         api.workflows = ["tests.yml", {"path": ".github/workflows/eteint.yml",
                                        "state": "disabled_manually"}]
-        watcher = ci.Watcher(cfg, api=api, log=journal.append)
+        watcher = ci.Watcher(cfg, api=api, cancel=api.cancel, log=journal.append)
         api.live = [run_view(930, "e" * 40, "lot/1-un", workflow="eteint.yml")]
         watcher.tick(self.db)
         watcher.tick(self.db)
@@ -912,7 +1259,8 @@ class WatcherTest(PgTestCase):
         """#1110 P2-1 : une exécution née et finie entre deux passages n'a
         jamais été vue « en cours » ; le rattrapage la découvre terminée, rend
         son verdict et réveille l'agent — une seule fois."""
-        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
         sha = "a1" * 20
         self.api.terminated = [self.terminated(970, sha, "lot/1-un",
                                                conclusion="failure")]
@@ -933,7 +1281,8 @@ class WatcherTest(PgTestCase):
     def test_rattrapage_borne_et_sans_verdict_perime(self):
         """#1110 P2-1 : le rattrapage est borné (une exécution trop ancienne
         est ignorée) et une tête déjà remplacée ne rend pas de verdict."""
-        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
         vieille, neuve = "b1" * 20, "b2" * 20
         self.api.live = [run_view(980, neuve, "lot/1-un")]
         watcher.tick(self.db)
@@ -1046,7 +1395,8 @@ class WatcherTest(PgTestCase):
         """#1110 P3 : un workflow de la même tête, terminé dans le même
         passage, n'est pas annoncé « encore en cours » par le rattrapage."""
         self.api.workflows = ["backend-suite.yml", "website-suite.yml"]
-        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
         sha = "f1" * 20
         # passage 1 : le backend est vu en cours (ligne `running` en base)
         self.api.live = [run_view(1010, sha, "lot/1-un", workflow="backend-suite.yml")]
@@ -1274,7 +1624,7 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         self.assertTrue(any("incomplete (truncated)" in line for line in logs), logs)
         self.assertEqual(len(storage.of(self.db).ci.stuck_runners()), 1)
-        self.assertEqual(self.scan_state(), (False, "truncated", 2))
+        self.assertEqual(self.scan_state(), (False, "truncated", len(ci.LIVE_STATUSES)))
         self.api.truncated = False
         self.api.live = [run_view(900 + i, "%040d" % i, "main")
                          for i in range(ci.GUARD_SCAN_MAX_RUNS + 1)]
@@ -1345,7 +1695,7 @@ class WatcherTest(PgTestCase):
         self.api.jobs[901] = []
         premier.tick(self.db)
         self.assertEqual(vu, [True], "fenêtre absente avant le premier appel HTTP")
-        self.assertEqual(self.scan_state(), (True, None, 4))
+        self.assertEqual(self.scan_state(), (True, None, len(ci.LIVE_STATUSES) + 2))
         second = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
         self.api.paths.clear()
         second.tick(self.db)
@@ -1355,17 +1705,17 @@ class WatcherTest(PgTestCase):
         horloge.avance(ci.GUARD_SCAN_S)
         self.api.paths.clear()
         second.tick(self.db)
-        self.assertEqual(len(self.guard_calls()), 4)
+        self.assertEqual(len(self.guard_calls()), len(ci.LIVE_STATUSES) + 2)
         self.assertEqual(self.scan_state()[0], True)
 
     def test_garde_budget_ne_publie_pas_un_releve_partiel(self):
         """#845 (revue N/P2 2328 ; arbitrage A) : un relevé qui ne peut pas
         couvrir toutes les exécutions dans le budget d'appels s'arrête, ne
         publie RIEN (l'état précédent n'est ni défait ni rafraîchi : file ET
-        runners gardent leur `seen_at`) et date son incomplétude. Avec 63
-        appels pour 60 exécutions, le budget est un garde-fou de dernier
-        recours : le témoin abaisse le plafond dans une portée `mock` (11
-        exécutions, sous les 60 admises) pour l'exercer."""
+        runners gardent leur `seen_at`) et date son incomplétude. Avec
+        len(LIVE_STATUSES) + 60 + 1 appels pour 60 exécutions, le budget est un
+        garde-fou de dernier recours : le témoin abaisse le plafond dans une
+        portée `mock` (11 exécutions, sous les 60 admises) pour l'exercer."""
         horloge = FauxHorloge()
         logs = []
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
@@ -1381,8 +1731,8 @@ class WatcherTest(PgTestCase):
                          if a["type"] == "ci_queue_saturated"],
                         "la file en attente doit alerter avant le relevé partiel")
         # 11 exécutions `in_progress` sous un plafond de 12 appels : la
-        # onzième est refusée (2 listes + 10 jobs = 12 appels) ; un relevé
-        # partiel publié effacerait l'alerte à tort.
+        # limite est atteinte avant la fin (une liste par état vivant + les jobs
+        # jusqu'au plafond) ; publier ce relevé effacerait l'alerte à tort.
         self.api.live = [run_view(910 + i, "%040d" % i, "main") for i in range(11)]
         for i in range(11):
             self.api.live[i].update({"status": "in_progress", "created_at": iso(horloge.t)})
@@ -1409,10 +1759,10 @@ class WatcherTest(PgTestCase):
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=borne + 1)
                           if a["type"] == "ci_queue_saturated"], [])
 
-    def test_garde_60_executions_releve_complet_en_63_appels(self):
+    def test_garde_60_executions_releve_complet_au_budget(self):
         """#845 (arbitrage A) : le plafond de couverture (60 exécutions non
-        conclues) coûte exactement le budget (63 appels = 2 listes + 60 jobs +
-        1 runners) et publie un relevé complet."""
+        conclues) coûte exactement le budget (une liste par état vivant +
+        60 jobs + 1 runners) et publie un relevé complet."""
         horloge = FauxHorloge()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
         self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
@@ -1421,7 +1771,7 @@ class WatcherTest(PgTestCase):
         for i in range(ci.GUARD_SCAN_MAX_RUNS):
             self.api.jobs[910 + i] = []
         self.watcher.tick(self.db)
-        attendu = 2 + ci.GUARD_SCAN_MAX_RUNS + 1
+        attendu = len(ci.LIVE_STATUSES) + ci.GUARD_SCAN_MAX_RUNS + 1
         self.assertEqual(attendu, ci.GUARD_SCAN_MAX_CALLS,
                          "le budget ne couvre plus le plafond de couverture")
         self.assertEqual(len(self.guard_calls()), attendu, self.guard_calls())
@@ -1451,7 +1801,8 @@ class WatcherTest(PgTestCase):
         horloge.avance(ci.GUARD_SCAN_S)
         self.watcher.tick(self.db)
         self.assertTrue(any("incomplete (too_many_runs)" in line for line in logs), logs)
-        self.assertEqual(self.scan_state(), (False, "too_many_runs", 2))
+        self.assertEqual(self.scan_state(),
+                         (False, "too_many_runs", len(ci.LIVE_STATUSES)))
         (file_apres,) = storage.of(self.db).ci.queued_oldest()
         self.assertEqual(file_apres["seen_ts"], file_avant["seen_ts"],
                          "un relevé incomplet a publié la file")
@@ -1479,7 +1830,7 @@ class WatcherTest(PgTestCase):
         self.api.jobs[906] = [job_view("psql 1/1", status="queued", job_id=9061,
                                        created_at=iso(horloge.t - 1000))]
         self.watcher.tick(self.db)
-        self.assertEqual(len(self.guard_calls()), 4)
+        self.assertEqual(len(self.guard_calls()), len(ci.LIVE_STATUSES) + 2)
         # le job 9061 démarre alors que le run reste `queued` (9062 attend) :
         # l'instantané du premier relevé est périmé.
         horloge.avance(ci.GUARD_SCAN_S)
@@ -1493,12 +1844,13 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         st = storage.of(self.db)
         (row,) = st.ci.queued_oldest()
-        # un seul constat : le relevé doit relire (4 appels), la file ne doit
-        # garder que 9062, et le runner qui tient 9061 ne doit pas être « stuck ».
+        # un seul constat : le relevé doit relire (une liste par état vivant,
+        # puis un appel de jobs), la file ne doit garder que 9062, et le runner
+        # qui tient 9061 ne doit pas être « stuck ».
         self.assertEqual(
             (len(self.guard_calls()), int(row["queued"]), int(row["oldest_id"]),
              [r["name"] for r in st.ci.stuck_runners()]),
-            (4, 1, 9062, []), self.guard_calls())
+            (len(ci.LIVE_STATUSES) + 2, 1, 9062, []), self.guard_calls())
 
     def test_garde_fenetre_atomique_entre_connexions(self):
         """#845 (revue N/P2 2328) : la revendication de fenêtre est atomique —
@@ -1560,8 +1912,9 @@ class WatcherTest(PgTestCase):
         horloge.avance(ci.GUARD_SCAN_S)
         self.watcher.tick(self.db)
         self.assertTrue(any("guard failed" in line for line in logs), logs)
-        # 2 listes + 1 jobs + l'appel runners qui échoue (compté, puis levé)
-        self.assertEqual(self.scan_state(), (False, "failed", 4))
+        # une liste par état vivant + 1 jobs + l'appel runners qui échoue
+        # (compté, puis levé)
+        self.assertEqual(self.scan_state(), (False, "failed", len(ci.LIVE_STATUSES) + 2))
         (file_apres,) = storage.of(self.db).ci.queued_oldest()
         self.assertEqual(file_apres["seen_ts"], file_avant["seen_ts"],
                          "une erreur du relevé a publié la file")

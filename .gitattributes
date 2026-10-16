@@ -1,0 +1,7 @@
+# #1517 : listes centrales en ajout seul (L160a) : deux lots qui ajoutent
+# chacun une entrée au même endroit ne sont plus en conflit à la composition
+# d'un paquet ; git garde les lignes des deux côtés (pilote `union`, intégré à
+# git, sans configuration locale). La lecture (`scripts/test-parts.py`,
+# `read_list`) range et dédoublonne ce que l'union produit ; un nom inconnu
+# reste refusé.
+tests/parts/*.txt merge=union

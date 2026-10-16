@@ -62,6 +62,7 @@ from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
+from . import rebalance as rebalance_mod
 from . import fil, release, signing, storage, work
 from .config import Config
 from .db import Db
@@ -1556,10 +1557,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["branch"], item.get("branch_target") or "repository default target",
                     " (last commit seen ahead: %s)" % item["branch_head"][:12]
                     if item.get("branch_head") else ""))
-            if item.get("migration"):
-                print("migration: %s reserved in %s (L122)" % (
-                    work.migration_layout(item, cfg).label(item["migration"]),
-                    item.get("migration_repo")))
+            migration = work.migration_line(item, cfg)
+            if migration:
+                print("migration: %s" % migration)
             for mark in item["module_milestones"]:
                 print("module   : %s/%s · %s · by %s" % (
                     mark["module"], mark["kind"], mark["subject"], mark["actor"]))
@@ -1639,9 +1639,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
-                               actor=args.actor)
+                               actor=args.actor, migration_landed=args.migration_landed,
+                               cfg=cfg)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
+            elif done["result"] == "landed":
+                print("lot #%d already %s: %s" % (
+                    args.id, done["item"]["state"], done["detail"]))
             else:
                 print("lot #%d → merged (commit %s, declared by %s)" % (
                     args.id, args.sha.strip().lower()[:12], args.actor))
@@ -1856,12 +1860,14 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: interactive sessions (`ameesh attach`), also local; #408: lot_wake, on|off
 #: (rule 1, the runner's wake on an actionable lot), in the database; L76:
 #: resident (`on` | `off`) and resident_sleep, the resident process of the
-#: agent, local
+#: agent, local ; L81 : resident_reread_max (relu cumulé avant rotation)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode", "lot_wake", "resident", "resident_sleep")
+            "permission_mode", "lot_wake", "resident", "resident_sleep",
+            "resident_reread_max")
 #: L76: settings written in the local state of the agent's host only
-LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep")
+LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep",
+                  "resident_reread_max")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1953,7 +1959,7 @@ def cmd_set(cfg: Config, args) -> int:
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
-                      "resident=on|off resident_sleep=30m|0"
+                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -2015,6 +2021,14 @@ def cmd_set(cfg: Config, args) -> int:
                 except ValueError:
                     print("invalid resident_sleep: %r (e.g. 30m, 1h, 0 = never asleep)"
                           % valeur, file=sys.stderr)
+                    return 2
+            if cle == "resident_reread_max" and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                except ValueError:
+                    print("invalid resident_reread_max: %r (e.g. 50M, 10M, "
+                          "0 = never rotate on the cumulative re-read)" % valeur,
+                          file=sys.stderr)
                     return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
@@ -2564,6 +2578,10 @@ def build_parser() -> argparse.ArgumentParser:
                        "on the target): any open state → merged, merged milestone with the commit")
     pw_merged.add_argument("id", type=int)
     pw_merged.add_argument("--sha", required=True, help="the merge commit")
+    pw_merged.add_argument("--migration-landed", type=int, default=None, metavar="N",
+                           help="the migration number that actually landed (L122/#1567), when "
+                                "the landing renumbered the reservation; recorded with the "
+                                "merge, or corrected on an already merged lot")
     pw_merged.add_argument("--note", default="")
     pw_merged.add_argument("--actor", default="",
                            help="default: the session's bound identity (AGENT_MAIL_NAME)")
@@ -3001,6 +3019,9 @@ def cmd_accounts(cfg: Config, args) -> int:
         for row in rows:
             for cle in ("_gauges", "_limits", "_ceilings"):
                 row.pop(cle, None)
+        # #1580 point 2 : la marge des forfaits et les agents déplaçables
+        # (lecture seule : aucune bascule n'est faite ici)
+        prop = rebalance_mod.proposal(cfg, db, book)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
             if declares else []
         if getattr(args, "json", False):
@@ -3010,10 +3031,11 @@ def cmd_accounts(cfg: Config, args) -> int:
                 sante = []  # base sans la migration 0060
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
                               "accounts": rows, "switches": bascules,
-                              "credentials": sante},
+                              "credentials": sante, "proposal": prop.as_dict()},
                              ensure_ascii=False, indent=2, default=str))
             return 0
         print(accounts_mod.format_rows(rows))
+        print(prop.text())
         if bascules:
             print()
             print("latest switches:")

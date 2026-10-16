@@ -240,6 +240,20 @@ def holders(path: str | None, session_id: str) -> list[dict]:
     return platform.holders(path, session_id, exclude=platform.ancestry())
 
 
+def recently_modified(path: str | None) -> bool:
+    """A recently written external journal may still have a live writer.
+
+    Some harnesses close their journal between writes. Wait a quiet minute
+    before adoption or unleased resumption, even when no open fd was found.
+    """
+    if not path:
+        return False
+    try:
+        return time.time() - os.stat(path).st_mtime < 60
+    except FileNotFoundError:
+        return False
+
+
 def session_cwd(harness: str, path: str) -> str | None:
     """Le dossier de travail noté dans le journal de session (Codex :
     `session_meta.payload.cwd` ; Claude : champ `cwd`), ou None."""
@@ -849,6 +863,14 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                  % (session_id, ", ".join("pid %d" % t["pid"] for t in tenants)))
         warn(avert)
         constats.append(avert)
+    recent = recently_modified(path)
+    if recent and not force:
+        raise RepriseError("session %s was modified in the last 60 seconds: close the "
+                           "interactive session first and wait for a quiet minute" % session_id)
+    if recent:
+        avert = "--force: session %s adopted with activity in the last 60 seconds" % session_id
+        warn(avert)
+        constats.append(avert)
     # dossier de travail : --cwd, sinon celui du journal de session, sinon le registre
     noted = session_cwd(harness, path) if path else None
     if cwd:
@@ -924,10 +946,10 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                        "".join("\n- %s" % c for c in constats)),
                project=_project(cfg, after),
                meta={"audit": "adopt", "session": session_id, "account": compte or "",
-                     "harness": harness, "forced": bool(tenants),
+                     "harness": harness, "forced": bool(tenants or recent),
                      "previous_session": result.get("previous_session") or ""})
     return {"agent": name, "session": session_id, "harness": harness, "account": compte,
-            "path": path, "cwd": effectif, "forced": bool(tenants),
+            "path": path, "cwd": effectif, "forced": bool(tenants or recent),
             "wakeable": ok,
             "previous_session": result.get("previous_session"),
             "previous_mode": result.get("previous_mode"), "notes": constats}
@@ -994,7 +1016,10 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
                              simulate=True, session_account=origine,
                              critical=row["name"] in (getattr(cfg, "critical_agents", None)
-                                                      or ()))
+                                                      or ()),
+                             # #1580 (tranche 3) : le compte simulé pour cet
+                             # agent tient compte de son modèle
+                             model=row.get("model") or book.model_of(row["name"]))
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
@@ -1014,7 +1039,9 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
         sick = auth_failure.failing(db, cfg.host, harness)
     except db_mod.DbError:
         sick = {}
-    usable, raison = account_turn.summary_possible(old, book, items, sick=sick)
+    usable, raison = account_turn.summary_possible(
+        old, book, items, sick=sick,
+        model=row.get("model") or book.model_of(row["name"]))
     if usable:
         out.update(keep=True, deterministic=False,
                    why="session %s (account %s) is not portable to %s; the old "
@@ -1061,6 +1088,20 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
         warn("no runner holds %s's lease on %s: the instruction waits until a runner "
              "serves it again" % (name, row.get("host") or "?"))
     decision = plan(cfg, db, row, fresh=fresh)
+    if (not live and decision["keep"] and decision["session"]
+            and (row.get("host") or "") == cfg.host):
+        session = decision["session"]
+        _account, path, _searched = locate(cfg, row.get("harness") or "", session,
+                                          decision["previous"])
+        try:
+            tenants = holders(path or os.path.join(cfg.agent_dir(name), "session"), session)
+            recent = recently_modified(path)
+        except (platform.NotAvailable, OSError) as exc:
+            raise RepriseError("cannot check that session %s is closed: %s" % (session, exc)) from exc
+        if tenants or recent:
+            raise RepriseError("session %s is still open or was modified in the last 60 seconds: "
+                               "close the interactive session first and wait for a quiet minute"
+                               % session)
     for text in decision["warnings"]:
         warn(text)
     consigne = (brief or "").strip() or DEFAULT_RESUME

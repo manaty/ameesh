@@ -129,6 +129,17 @@ class PlanUnderusedTest(_Base):
         self.jauge("claude", "seven_day", 0.95, 2 * JOUR, 7 * JOUR, account="primaire")
         self.assertEqual(self.alertes(), [])
 
+    def test_seau_de_modele_au_seuil_ne_bloque_pas_la_fenetre_generale(self):
+        """#1789/N6 : un seau propre à un modèle (#1580, clé `seven_day@fable`)
+        au seuil ne rend pas la capacité **générale** du compte inutilisable —
+        l'alerte de fin de fenêtre de la fenêtre de 5 h reste due."""
+        self.jauge("claude", "five_hour", 0.10, 30 * 60, 5 * HEURE, account="primaire")
+        self.jauge("claude", "seven_day@fable", 0.95, 2 * JOUR, 7 * JOUR,
+                   account="primaire")
+        out = self.alertes()
+        self.assertEqual([(a["gauge"], a["reason"]) for a in out],
+                         [("five_hour", "fin_de_fenetre")])
+
     def test_releve_echu_et_releves_sans_compte(self):
         # fenêtre échue : la suivante ne court qu'au premier usage
         self.jauge("codex", "codex-300min", 0.0, -60, 5 * HEURE, account="secondaire")
@@ -197,6 +208,31 @@ class IdleCapacityTest(_Base):
     def alertes(self, **kw):
         return _types(exploitation.alerts(self.cfg, self.db, now=self.now, **_seuils(**kw)),
                       "idle_capacity", "orchestrator_held")
+
+    def test_lot_planifie_suit_l_horloge_de_l_alerte(self):
+        from ameesh import plan
+        self.agent("claude1")
+        lot = work.add(self.db, title="lot planifie")
+        jour = time.strftime("%Y-%m-%d", time.localtime(self.now + 3 * JOUR))
+        self.db.execute("UPDATE work_items SET planned_start = %s WHERE id = %s",
+                        (jour, lot["id"]))
+        debut = plan.day_start_ts(jour)
+        listing = self.listing()
+        # L'horloge du passage franchit la date, celle du poste reste avant :
+        # le lot est retenu par son début prévu (#1625), donc pas démarrable ;
+        # #1608 : l'alerte le dit et nomme l'attente au lieu de se taire.
+        with mock.patch("ameesh.planned_waits.time.time", return_value=debut - JOUR):
+            avant = sous_utilisation.idle_capacity(
+                self.db, listing, debut - JOUR, [], paid=("deepseek",))
+            self.assertEqual([a["lots"] for a in avant], [[lot["id"]]])
+            self.assertEqual(avant[0]["startable_lots"], [])
+            self.assertEqual(avant[0]["blocked_lots"],
+                             {str(lot["id"]): {"what": "scheduled", "start": jour}})
+            out = sous_utilisation.idle_capacity(
+                self.db, listing, debut, [], paid=("deepseek",))
+        self.assertEqual([a["lots"] for a in out], [[lot["id"]]])
+        self.assertEqual(out[0]["startable_lots"], [lot["id"]])
+        self.assertEqual(out[0]["blocked_lots"], {})
 
     def test_lots_sans_assigne(self):
         self.agent("claude1")

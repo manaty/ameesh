@@ -128,11 +128,37 @@ class Claude:
             elif message.get("type") == "control_response":
                 trace({"control_response": message.get("response")})
 
+    def call_usage(self) -> dict:
+        """Usage of a model call. `FAKE_CLAUDE_CONTEXT` sets the context the
+        harness reports (input + cache read + cache creation), for the L81
+        compaction thresholds; without it the historical 10+200+30."""
+        total = os.environ.get("FAKE_CLAUDE_CONTEXT")
+        if total:
+            return {"input_tokens": int(total), "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0, "output_tokens": 7}
+        return {"input_tokens": 10, "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 30, "output_tokens": 7}
+
+    def compact(self) -> None:
+        """L81 (étude §6.2): the boundary a native `/compact` produces —
+        `pre_tokens`/`post_tokens`, unless `FAKE_COMPACT_SKIP=1` (a harness
+        that reports none) or `FAKE_COMPACT_POST` forces the after."""
+        if os.environ.get("FAKE_COMPACT_SKIP") == "1":
+            return
+        pre = int(os.environ.get("FAKE_COMPACT_PRE")
+                  or os.environ.get("FAKE_CLAUDE_CONTEXT") or "240")
+        post = int(os.environ.get("FAKE_COMPACT_POST") or max(pre // 5, 1))
+        out({"type": "system", "subtype": "compact_boundary", "session_id": self.session,
+             "compact_metadata": {"trigger": "manual", "pre_tokens": pre,
+                                  "post_tokens": post}})
+
     def turn(self, first: dict) -> None:
         out({"type": "system", "subtype": "init", "session_id": self.session,
              "model": "fake-model"})
         texts = [self.replay(first)]
         trace({"user": texts[0]})
+        if texts[0].strip() == "/compact":
+            self.compact()
         if "ORPHAN" in texts[0]:
             orphan(keep_input="ORPHAN_IN" in texts[0])
         if "FLOOD" in texts[0]:
@@ -180,25 +206,28 @@ class Claude:
             out({"type": "user", "session_id": self.session, "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}})
         self.cost = round(self.cost + 0.01, 6)
-        usage = {"input_tokens": 10, "cache_read_input_tokens": 200,
-                 "cache_creation_input_tokens": 30, "output_tokens": 7}
+        usage = self.call_usage()
+        extra = {}
+        window = os.environ.get("FAKE_CLAUDE_WINDOW")
+        if window:
+            extra["modelUsage"] = {"fake-model": {"contextWindow": int(window)}}
         if interrupted:
             out({"type": "result", "subtype": "error_during_execution", "is_error": True,
                  "result": None, "session_id": self.session, "total_cost_usd": self.cost,
-                 "usage": usage})
+                 "usage": usage, **extra})
             return
         answer = "\n".join("ECHO:%s" % t for t in texts)
         out({"type": "assistant", "session_id": self.session, "message": {
             "id": "msg-final", "content": [{"type": "text", "text": answer}],
-            "usage": {"input_tokens": 10, "cache_read_input_tokens": 200,
-                      "cache_creation_input_tokens": 30, "output_tokens": 7}}})
+            "usage": usage}})
         if "ERROR" in texts[0]:
             out({"type": "result", "subtype": "error_during_execution", "is_error": True,
                  "errors": ["boom"], "session_id": self.session,
-                 "total_cost_usd": self.cost, "usage": usage})
+                 "total_cost_usd": self.cost, "usage": usage, **extra})
             return
         out({"type": "result", "subtype": "success", "is_error": False, "result": answer,
-             "session_id": self.session, "total_cost_usd": self.cost, "usage": usage})
+             "session_id": self.session, "total_cost_usd": self.cost, "usage": usage,
+             **extra})
 
 
 class Codex:
