@@ -1428,13 +1428,11 @@ def _overage_reason(harness: str, agent: str | None) -> str:
 
 
 def _held_for_overage(store, host: str, harness: str, now: float) -> set[str]:
-    """#1883 : les comptes retenus pour overage sur cet hôte, encore valides."""
-    held: set[str] = set()
-    for name, hold in store.holds(host, harness).items():
-        until = hold.get("until_ts")
-        if until is not None and float(until) > now:
-            held.add(name)
-    return held
+    """#1883 : les comptes retenus pour overage sur cet hôte, encore valides.
+
+    Lecture d'un seul jeu (`holds`), pour les chemins qui n'ont pas besoin de
+    la cohérence retenues/identités (`_etat_placement` la donne)."""
+    return _holds_valid(store.holds(host, harness), now)
 
 
 #: #1883 : vivacité d'une empreinte de dossier publiée pour l'hôte — une
@@ -1455,31 +1453,76 @@ def identity_of(profile: Profile) -> str | None:
     return hashlib.sha256(os.path.realpath(profile.home()).encode("utf-8")).hexdigest()
 
 
-def identity_conflicts(store, host: str, harness: str, items: list[Profile],
-                       now: float, *, publish: bool = True) -> set[str]:
-    """#1883 (arbitrage pilote, option a) : les comptes dont l'identité est
-    contredite par une autre configuration de l'hôte.
+def _publish_identities(store, host: str, harness: str, items: list[Profile]) -> None:
+    """#1883 (R3 auditeur, B2) : publie l'empreinte du dossier résolu de chaque
+    compte `config_dir` de ce processus.
 
-    Chaque processus publie l'empreinte du dossier résolu de ses comptes
-    `config_dir`, puis relit celles des autres : deux empreintes **vivantes**
-    (vues depuis `IDENTITY_WINDOW_S`) sous le même (hôte, harnais, nom) sont
-    deux dossiers différents derrière le même nom. Le compte est alors refusé
-    au placement — prendre la lecture de l'un pour une preuve saine de l'autre
-    est exactement l'incident de #1883 (le « secondaire » de deux profils de
-    pc-smichea, l'un à 47 %, l'autre à 34 %). `publish=False` (choix critique,
-    simulation : aucune écriture partagée) se contente de relire.
-    """
-    vues = store.identities(host, harness, now - IDENTITY_WINDOW_S)
+    Écriture NARROW (`account_identities` seulement), faite par TOUT processus
+    qui peut placer un tour, choix critique compris : sans elle, deux
+    configurations exclusivement critiques ne se voient jamais et le conflit
+    d'identité n'existe pour personne. La simulation (L39) ne publie jamais."""
+    for profile in items:
+        empreinte = identity_of(profile)
+        if empreinte is not None:
+            store.publish_identity(host, harness, profile.name, empreinte)
+
+
+def _conflicts_of(vues: dict, items: list[Profile]) -> set[str]:
+    """#1883 : les comptes dont une empreinte vivante contredit la leur."""
     conflits: set[str] = set()
     for profile in items:
         empreinte = identity_of(profile)
         if empreinte is None:
             continue
-        if publish:
-            store.publish_identity(host, harness, profile.name, empreinte)
         if any(vue["identity"] != empreinte for vue in vues.get(profile.name, [])):
             conflits.add(profile.name)
     return conflits
+
+
+def _holds_valid(holds: dict, now: float) -> set[str]:
+    """#1883 : les comptes dont la retenue court encore à `now`."""
+    return {name for name, hold in holds.items()
+            if hold.get("until_ts") is not None and float(hold["until_ts"]) > now}
+
+
+def _etat_placement(store, host: str, harness: str, items: list[Profile],
+                    now: float) -> tuple[set[str], set[str]]:
+    """#1883 (R3 auditeur, B1) : retenues valides et identités contredites,
+    lues ENSEMBLE en une transaction sous le verrou de placement.
+
+    Rend `(retenus, conflits)`. C'est le seul état sur lequel une décision de
+    placement est validée : une retenue publiée pendant la lecture des
+    identités ne peut plus être manquée (les deux jeux viennent de
+    `store.placement_state`, pas de deux lectures séparées)."""
+    etat = store.placement_state(host, harness, now - IDENTITY_WINDOW_S)
+    return _holds_valid(etat["holds"], now), _conflicts_of(etat["identities"], items)
+
+
+#: #1883 (R3 auditeur, B1) : nombre de reprises de la validation finale de
+#: `choose`. Chaque reprise rejoue `decide` sur un état relu sous le verrou de
+#: placement ; si l'état bouge encore à la borne, le tour est refusé — aucun
+#: compte peut-être retenu n'est rendu.
+VALIDATION_ESSAIS = 3
+
+
+def identity_conflicts(store, host: str, harness: str, items: list[Profile],
+                       now: float, *, publish: bool = True) -> set[str]:
+    """#1883 (arbitrage pilote, option a) : les comptes dont l'identité est
+    contredite par une autre configuration de l'hôte.
+
+    `publish=True` publie d'abord les empreintes de CE processus, puis relit
+    celles des autres (`placement_state`, sous le verrou de placement) : deux
+    empreintes **vivantes** (vues depuis `IDENTITY_WINDOW_S`) sous le même
+    (hôte, harnais, nom) sont deux dossiers différents derrière le même nom.
+    Le compte est alors refusé au placement — prendre la lecture de l'un pour
+    une preuve saine de l'autre est exactement l'incident de #1883 (le
+    « secondaire » de deux profils de pc-smichea, l'un à 47 %, l'autre à
+    34 %). `publish=False` (alertes, simulation : aucune écriture partagée) se
+    contente de relire."""
+    if publish:
+        _publish_identities(store, host, harness, items)
+    etat = store.placement_state(host, harness, now - IDENTITY_WINDOW_S)
+    return _conflicts_of(etat["identities"], items)
 
 
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
@@ -1492,13 +1535,17 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     l'agent (None : pas de session, ou session neuve) — elle le garde tant
     qu'il est sous son seuil (0034 §4).
 
-    Seule écriture : le dernier compte choisi (`account_active`,
-    comparer-et-changer, journalisé `bascule`) et l'historique des jauges.
-    Une erreur de base remonte : l'appelant suspend (fail-closed).
+    Écritures : le dernier compte choisi (`account_active`,
+    comparer-et-changer, journalisé `bascule`), l'historique des jauges, et
+    l'empreinte du dossier résolu des comptes `config_dir` (`account_identities`,
+    pour que les autres processus de l'hôte voient un même nom déclaré vers
+    deux dossiers ; jamais en simulation). Une erreur de base remonte :
+    l'appelant suspend (fail-closed).
 
     `simulate=True` (L39, `ameesh resume`) : le compte que choisirait le
     prochain tour, SANS AUCUNE écriture (ni bascule, ni historique des
-    jauges) ; `switched` dit la bascule qui aurait lieu.
+    jauges, ni empreinte d'identité) ; `switched` dit la bascule qui aurait
+    lieu.
 
     `paced=False` (garde de budget désactivée, L30) : quand aucun compte
     n'est sous son seuil, le rythme est levé — mais jamais les règles
@@ -1511,7 +1558,10 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     forçage (un forçage au seuil ne le retient pas s'il reste un compte) ;
     sans autre compte, le compte par défaut sert au-delà de son plafond
     implicite de 50 % (jamais en overage ; rythme et `overage_cap` tenus,
-    même avec `paced=False`), en dernier.
+    même avec `paced=False`), en dernier. #1883 (R3 auditeur, B2) : il publie
+    en revanche l'empreinte de son dossier (écriture narrow,
+    `account_identities`) — sans quoi deux configurations exclusivement
+    critiques ne se verraient jamais.
 
     `margin` (L242b (3), #389 r1) : un agent critique qui tourne sous un
     harnais emprunté ne revient au sien qu'avec la réserve des non-critiques
@@ -1550,19 +1600,24 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # L226b : un compte en échec d'authentification n'est jamais choisi
     sick = auth_failure.failing(db, host, harness)
     # L226b/#1883 (R1 auditeur, B1) : les retenues d'overage publiées par les
-    # AUTRES processus de l'hôte sont lues EN TÊTE et priment sur tout
-    # placement — forçage, continuité comme classement. Un compte facturé
-    # au-delà du plan ne reçoit aucun tour, même si la lecture locale d'ici le
-    # dit sain (deux configurations peuvent lire deux dossiers sous le même
-    # nom) : c'est le contrat « jamais de dépassement ».
-    retenus = _held_for_overage(store, host, harness, now)
+    # AUTRES processus de l'hôte priment sur tout placement — forçage,
+    # continuité comme classement. Un compte facturé au-delà du plan ne reçoit
+    # aucun tour, même si la lecture locale d'ici le dit sain (deux
+    # configurations peuvent lire deux dossiers sous le même nom) : c'est le
+    # contrat « jamais de dépassement ».
     # #1883 (arbitrage pilote, option a) : deux configurations de l'hôte qui
     # déclarent le même nom vers deux dossiers résolus rendent toute lecture
     # ambiguë — le compte est refusé au placement (et signalé à l'owner), pas
-    # pris pour une preuve saine. Publier son empreinte est une écriture
-    # partagée : un choix critique ou simulé se contente de relire.
-    conflits = identity_conflicts(store, host, harness, items, now,
-                                  publish=not readonly)
+    # pris pour une preuve saine.
+    # #1883 (R3 auditeur, B1/B2) : les empreintes de CE processus sont publiées
+    # (sauf en simulation, L39 ; y compris pour un choix critique, sans quoi
+    # deux configurations exclusivement critiques ne se voient jamais), PUIS
+    # les retenues et les identités sont lues ENSEMBLE, en une transaction sous
+    # le verrou de placement : aucune retenue publiée pendant la lecture des
+    # identités n'est manquée. Le point de validation final relit ce même état.
+    if not simulate:
+        _publish_identities(store, host, harness, items)
+    retenus, conflits = _etat_placement(store, host, harness, items, now)
 
     # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu d'écartés
     # (retenues d'overage, identités en conflit) ; `choose` la rejoue sur un
@@ -1769,27 +1824,38 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
 
     # #1883 (R2 auditeur, B1) : point unique de validation de TOUT retour qui
     # lance un tour (hors `auth_blocked`, que la garde de l'exécuteur ne lance
-    # pas). Les retenues d'overage ET les identités contredites sont relues à
-    # l'instant du placement, après la lecture des jauges comme après la
-    # bascule : un compte qu'un autre runner de l'hôte vient de fuir en
-    # dépassement, ou qu'une seconde configuration déclare vers un autre
-    # dossier, ne reçoit pas de tour — même si le forçage, la continuité ou le
-    # classement l'ont retenu sur un instantané périmé.
+    # pas). Les retenues d'overage ET les identités contredites sont relues
+    # ENSEMBLE (`_etat_placement`, une transaction sous le verrou de
+    # placement), après la lecture des jauges comme après la bascule : un
+    # compte qu'un autre runner de l'hôte vient de fuir en dépassement, ou
+    # qu'une seconde configuration déclare vers un autre dossier, ne reçoit pas
+    # de tour — même si le forçage, la continuité ou le classement l'ont retenu
+    # sur un instantané périmé.
+    # #1883 (R3 auditeur, B1) : la reprise est validée à son tour. La décision
+    # rejouée sur l'état frais peut choisir un compte dont une retenue est
+    # publiée pendant son classement ; chaque reprise repasse donc par la même
+    # relecture, et une borne franchie refuse le tour (`VALIDATION_ESSAIS`) —
+    # jamais un compte peut-être retenu rendu.
     choice = decide(retenus, conflits)
-    if choice.profile is not None and not choice.auth_blocked:
-        frais = _held_for_overage(store, host, harness, now)
-        conflits_frais = identity_conflicts(store, host, harness, items, now,
-                                            publish=False)
-        if choice.profile.name in frais or choice.profile.name in conflits_frais:
-            # une seule reprise : la décision est rejouée sur l'état frais —
-            # forçage levé pour un compte libre, continuité rompue, compte
-            # écarté du classement. Le compte actif partagé est relu : une
-            # bascule de la première décision a pu le déplacer.
-            row = store.active(host, harness) or row
-            active_name = row.get("account")
-            active = by_name(items, active_name) or active
-            choice = decide(frais, conflits_frais)
-    return choice
+    for _ in range(VALIDATION_ESSAIS):
+        if choice.profile is None or choice.auth_blocked:
+            return choice
+        frais, conflits_frais = _etat_placement(store, host, harness, items, now)
+        if (choice.profile.name not in frais
+                and choice.profile.name not in conflits_frais):
+            return choice
+        # reprise : la décision est rejouée sur l'état frais — forçage levé
+        # pour un compte libre, continuité rompue, compte écarté du classement.
+        # Le compte actif partagé est relu : une bascule de la décision
+        # précédente a pu le déplacer.
+        row = store.active(host, harness) or row
+        active_name = row.get("account")
+        active = by_name(items, active_name) or active
+        choice = decide(frais, conflits_frais)
+    return Choice(None, active, reason=(
+        "no %s account to place: the placement state changed on every re-read "
+        "(a hold or an identity conflict was published while deciding); "
+        "retrying next turn" % harness))
 
 
 def healthy(items: list[Profile], sick: dict) -> list[Profile]:

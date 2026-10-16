@@ -837,6 +837,20 @@ class Accounts(Domain):
         détectent un même nom déclaré vers deux dossiers différents."""
 
     @abc.abstractmethod
+    def placement_state(self, host: str, harness: str, since: float) -> dict:
+        """#1883 (R3 auditeur, B1) : retenues ET identités d'un couple (hôte,
+        harnais), lues en UNE transaction sous le verrou de placement.
+
+        Rend `{"holds": {account: {until_ts, reason}}, "identities":
+        {account: [{identity, last_ts}]}}`, les identités encore vivantes
+        depuis `since` (epoch). Toute publication de retenue
+        (`switch_guarded`, `hold`) prend le même verrou : aucune retenue ne
+        peut être publiée entre la lecture des retenues et celle des
+        identités — c'est l'état cohérent sur lequel `accounts.choose` valide
+        son choix (R3 auditeur, B1). `holds` et `identities` seuls restent des
+        lectures d'un jeu, sans cohérence entre eux."""
+
+    @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
         """Les dernières bascules de l'hôte (toutes ou d'un harnais), récentes d'abord."""
 

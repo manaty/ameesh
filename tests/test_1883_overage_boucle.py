@@ -290,8 +290,10 @@ class OveragePartageTest(_Base):
         store.hold(self.cfg.host, "codex", "secondaire", now + 600,
                    "codex plan: in overage")
         before = len(self._bascules())
-        with mock.patch.object(accounts, "_held_for_overage",
-                               side_effect=[set(), {"secondaire"}]):
+        with mock.patch.object(accounts, "_etat_placement",
+                               side_effect=[(set(), set()),
+                                            ({"secondaire"}, set()),
+                                            (set(), set())]):
             choix = accounts.choose(self.db, self.cfg.host, "codex", items,
                                     self._book(), now=now + 1.0, agent="runner-b")
         self.assertIsNone(choix.profile)          # aucun tour, aucune bascule
@@ -312,8 +314,10 @@ class OveragePartageTest(_Base):
         store.init_active(self.cfg.host, "codex", "secondaire")
         store.hold(self.cfg.host, "codex", "secondaire", now + 600,
                    "codex plan: in overage")
-        with mock.patch.object(accounts, "_held_for_overage",
-                               side_effect=[set(), {"secondaire"}]):
+        with mock.patch.object(accounts, "_etat_placement",
+                               side_effect=[(set(), set()),
+                                            ({"secondaire"}, set()),
+                                            (set(), set())]):
             choix = accounts.choose(self.db, self.cfg.host, "codex", items,
                                     self._book(), now=now + 1.0, agent="runner-b")
         self.assertEqual(choix.profile.name, "primaire", choix.why)
@@ -332,8 +336,10 @@ class OveragePartageTest(_Base):
         self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items,
                                        "secondaire", by="test"))
         store = storage.of(self.db).accounts
-        with mock.patch.object(accounts, "_held_for_overage",
-                               side_effect=[set(), {"secondaire"}]):
+        with mock.patch.object(accounts, "_etat_placement",
+                               side_effect=[(set(), set()),
+                                            ({"secondaire"}, set()),
+                                            (set(), set())]):
             choix = accounts.choose(self.db, self.cfg.host, "codex", items,
                                     self._book(), now=now + 1.0, agent="runner-b")
         self.assertEqual(choix.profile.name, "primaire", choix.why)
@@ -350,8 +356,10 @@ class OveragePartageTest(_Base):
         _journal(items[0].path, week=(34, now + 6 * DAY))
         _journal(items[1].path, week=(5, now + 6 * DAY))
         storage.of(self.db).accounts.init_active(self.cfg.host, "codex", "primaire")
-        with mock.patch.object(accounts, "_held_for_overage",
-                               side_effect=[set(), {"secondaire"}]):
+        with mock.patch.object(accounts, "_etat_placement",
+                               side_effect=[(set(), set()),
+                                            ({"secondaire"}, set()),
+                                            (set(), set())]):
             choix = accounts.choose(self.db, self.cfg.host, "codex", items,
                                     self._book(), now=now + 1.0, agent="runner-b",
                                     session_account="secondaire")
@@ -368,8 +376,10 @@ class OveragePartageTest(_Base):
         _journal(items[0].path, week=(34, now + 6 * DAY))
         _journal(items[1].path, week=(5, now + 6 * DAY))
         storage.of(self.db).accounts.init_active(self.cfg.host, "codex", "primaire")
-        with mock.patch.object(accounts, "_held_for_overage",
-                               side_effect=[set(), {"secondaire"}]):
+        with mock.patch.object(accounts, "_etat_placement",
+                               side_effect=[(set(), set()),
+                                            ({"secondaire"}, set()),
+                                            (set(), set())]):
             choix = accounts.choose(self.db, self.cfg.host, "codex", items,
                                     self._book(), now=now + 1.0, critical=True)
         self.assertTrue(choix.per_agent)
@@ -405,6 +415,73 @@ class OveragePartageTest(_Base):
         self.assertIn("secondaire", retenues)
         self.assertGreater(float(retenues["secondaire"]["until_ts"]), now)
         self.assertEqual(store.active(self.cfg.host, "codex")["account"], "primaire")
+
+    def test_la_validation_relit_retenues_et_identites_ensemble(self):
+        """B1 de la R3 auditeur : le point de validation lit retenues ET
+        identités en UNE fois (`_etat_placement` → `placement_state`, sous le
+        verrou de placement) — une retenue publiée pendant la décision écarte
+        le compte rendu, et la reprise est validée à son tour (trois
+        lectures)."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        store = storage.of(self.db).accounts
+        store.init_active(self.cfg.host, "codex", "primaire")
+        vrai = type(store).placement_state
+        appels = {"n": 0}
+
+        def etat(pilote, host, harness, since):
+            resultat = vrai(pilote, host, harness, since)
+            appels["n"] += 1
+            if appels["n"] == 2:
+                # un autre runner publie la retenue du secondaire pendant la
+                # validation de la première décision
+                resultat["holds"]["secondaire"] = {
+                    "until_ts": now + 600, "reason": "codex plan: in overage"}
+            return resultat
+
+        with mock.patch.object(type(store), "placement_state", etat):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now, agent="runner-b")
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+        self.assertEqual(choix.switched["to"], "primaire")
+        self.assertEqual(appels["n"], 3)   # la reprise a été validée à son tour
+
+    def test_la_reprise_est_validee_a_son_tour(self):
+        """B1 de la R3 auditeur, témoin 2 : la décision rejouée sur l'état
+        frais est validée comme la première — une retenue publiée pendant le
+        classement de la reprise ne passe pas. Les deux comptes retenus à la
+        borne, le tour est refusé : aucun compte peut-être retenu n'est
+        rendu."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        store = storage.of(self.db).accounts
+        store.init_active(self.cfg.host, "codex", "primaire")
+        vrai = type(store).placement_state
+        appels = {"n": 0}
+
+        def etat(pilote, host, harness, since):
+            resultat = vrai(pilote, host, harness, since)
+            appels["n"] += 1
+            if appels["n"] >= 2:
+                resultat["holds"]["secondaire"] = {
+                    "until_ts": now + 600, "reason": "codex plan: in overage"}
+            if appels["n"] >= 3:
+                resultat["holds"]["primaire"] = {
+                    "until_ts": now + 600, "reason": "codex plan: in overage"}
+            return resultat
+
+        with mock.patch.object(type(store), "placement_state", etat):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now, agent="runner-b")
+        self.assertIsNone(choix.profile)
+        self.assertIn("held for overage", choix.reason)
+        self.assertEqual(appels["n"], 3)
 
     def test_switch_guarded_refuse_une_cible_retenue(self):
         """Le verrou de la bascule : cible retenue ⇒ refus sans écriture ;
@@ -532,21 +609,49 @@ class IdentiteComptesTest(_Base):
         self.assertEqual(accounts.identity_conflicts(store, self.cfg.host, "codex",
                                                      items_b, now), set())
 
-    def test_simulation_et_choix_critique_ne_publient_pas(self):
-        """La publication d'empreinte est une écriture partagée : un choix
-        simulé ou critique (L242b) se contente de relire."""
+    def test_le_choix_critique_publie_son_identite(self):
+        """B2 de la R3 auditeur : un processus qui ne fait QUE des choix
+        critiques publie quand même l'empreinte de son dossier — sinon deux
+        configurations exclusivement critiques ne se voient jamais et le
+        conflit d'identité n'existe pour personne (table vide, aucun autre
+        chemin produit ne publie)."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items_a = self._declares(b)
+        now = float(int(time.time()))
+        _journal(items_a[0].path, week=(34, now + 6 * DAY))
+        _journal(items_a[1].path, week=(5, now + 6 * DAY))
+        choix_a = accounts.choose(self.db, self.cfg.host, "codex", items_a,
+                                  self._book(), now=now, critical=True)
+        self.assertTrue(choix_a.per_agent)
+        self.assertEqual(choix_a.profile.name, "secondaire", choix_a.why)
+        store = storage.of(self.db).accounts
+        vues = store.identities(self.cfg.host, "codex",
+                                now - accounts.IDENTITY_WINDOW_S)
+        self.assertIn("secondaire", vues)          # l'empreinte est publiée
+        # deuxième configuration critique : le MÊME nom vers un autre dossier —
+        # le conflit est vu par le choix, jamais pris pour une preuve saine
+        c = _dossier(os.path.join(self.tmp, "comptes", "codex-3"), creds="auth.json")
+        items_b = self._declares(c)
+        _journal(c, week=(5, now + 6 * DAY))
+        choix_b = accounts.choose(self.db, self.cfg.host, "codex", items_b,
+                                  self._book(), now=now, critical=True)
+        self.assertTrue(choix_b.per_agent)
+        self.assertEqual(choix_b.profile.name, "primaire", choix_b.why)
+
+    def test_la_simulation_ne_publie_pas(self):
+        """L39 : `ameesh resume` ne publie ni empreinte ni retenue — aucune
+        écriture partagée."""
         b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
         items = self._declares(b)
         now = float(int(time.time()))
         _journal(items[0].path, week=(34, now + 6 * DAY))
         _journal(items[1].path, week=(5, now + 6 * DAY))
         accounts.choose(self.db, self.cfg.host, "codex", items, self._book(),
-                        now=now, critical=True)
-        accounts.choose(self.db, self.cfg.host, "codex", items, self._book(),
                         now=now, simulate=True)
-        vues = storage.of(self.db).accounts.identities(
-            self.cfg.host, "codex", now - accounts.IDENTITY_WINDOW_S)
-        self.assertEqual(vues, {})
+        store = storage.of(self.db).accounts
+        self.assertEqual(store.identities(self.cfg.host, "codex",
+                                          now - accounts.IDENTITY_WINDOW_S), {})
+        self.assertEqual(store.holds(self.cfg.host, "codex"), {})
 
 
 class AlerteOverageTest(_Base):
