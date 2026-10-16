@@ -14,10 +14,20 @@ def _migration(sql: str) -> migrations.Migration:
 class NonAdditiveTest(unittest.TestCase):
     def test_migrations_du_depot_additives(self):
         # aucune fausse alerte sur ce qui est livré : vues recréées,
-        # contraintes remplacées, colonnes nullables ou avec défaut
+        # contraintes remplacées, colonnes nullables ou avec défaut. Une
+        # migration qui se déclare non additive (`-- ameesh: non additive`,
+        # mécanisme d'exception L151) est une exception assumée, pas une
+        # alerte : elle reste refusée par --additive-only (non_additive la
+        # nomme toujours), mais la garde du dépôt ne la compte plus comme un
+        # geste silencieux.
         self.assertEqual(
             {m.label: migrations.non_additive(m) for m in migrations.discover()
-             if migrations.non_additive(m)}, {})
+             if migrations.non_additive(m)
+             and not migrations.declared_non_additive(m)}, {})
+        for m in migrations.discover():
+            if migrations.declared_non_additive(m):
+                # la déclaration ne masque pas le contrôle : les raisons restent
+                self.assertTrue(migrations.non_additive(m))
 
     def test_ajouts_additifs(self):
         for sql in (

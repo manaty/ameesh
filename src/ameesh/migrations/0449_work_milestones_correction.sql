@@ -1,4 +1,8 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- ameesh: non additive — reprise de données : le DELETE ci-dessous retire des
+-- jalons `merged` périmés. Aucune forme additive ne peut retirer ces lignes ;
+-- le code d'avant #1693 lit le jalon sans le supposer présent, il ne casse donc
+-- pas (L151 : l'exception est déclarée, pas subie).
 -- 0449_work_milestones_correction — #1693 (N4) : une fusion annulée ne date pas.
 --
 -- Depuis #1693, la correction `merged → build` retire le jalon `merged` du lot

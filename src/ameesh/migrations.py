@@ -366,12 +366,20 @@ _DROP_RECREATED = re.compile(
 _MARKER = re.compile(r"--\s*ameesh\s*:\s*non[- ]additive", re.IGNORECASE)
 
 
+def declared_non_additive(migration: Migration) -> bool:
+    """La migration se déclare non additive (`-- ameesh: non additive`) : le
+    mécanisme d'exception de L151 (docs/BASCULE.md), pas une alerte. Elle reste
+    refusée par `--additive-only` — la déclaration ne l'exempte pas du
+    contrôle, elle nomme l'exception assumée."""
+    return bool(_MARKER.search(migration.sql))
+
+
 def non_additive(migration: Migration) -> list[str]:
     """Raisons pour lesquelles `migration` casserait le code d'avant ; vide si
     elle ne fait qu'ajouter (tables, colonnes nullables ou avec défaut, index,
     contraintes remplacées)."""
     reasons = []
-    if _MARKER.search(migration.sql):
+    if declared_non_additive(migration):
         reasons.append("marked non-additive")
     # commentaires retirés : une explication qui cite « drop » ne compte pas
     text = re.sub(r"--[^\n]*", " ", migration.sql)
