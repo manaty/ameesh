@@ -243,6 +243,50 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual([r["id"] for r in dependencies.released_by(self.db, self.b)], [self.a])
         self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
 
+    def test_an_unassigned_blocked_dependent_returns_to_intake(self):
+        """#1668 : sans destinataire, le lot que plus rien ne retient repasse
+        `intake` — `actionable()` ne lit que `intake`/`build`, sinon il reste
+        invisible au self-service jusqu'à l'alerte stale (jusqu'à 14 h)."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "intake")
+        notes = [e["note"] for e in work.events(self.db, self.a)]
+        self.assertIn("Dependency released: back to intake (no assignee, #1668)", notes)
+        self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
+
+    def test_an_assigned_blocked_dependent_keeps_its_state(self):
+        """#1668 : un lot assigné garde son état — le courrier de réveil porte
+        le geste à son agent, qui juge la suite (pas de réouverture forcée)."""
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "blocked")
+        [row] = self.inbox()
+        self.assertIn("lot #%d was closed" % self.b, row["body"])
+
+    def test_a_dependent_that_another_blocker_holds_stays_blocked(self):
+        """#1668 : la réouverture ne part qu'à la DERNIÈRE attente tombée."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        dependencies.add(self.db, self.a, self.c, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "blocked")
+        work.close(self.db, self.c, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "intake")
+
+    def test_an_unassigned_dependent_outside_blocked_is_untouched(self):
+        """#1668 : seule la retenue `blocked` se rouvre — une porte humaine
+        (`waiting_human`) ou un lot en cours ne sont pas des attentes de lot."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id = %s",
+                        (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "waiting_human")
+
     def test_the_wake_is_written_with_the_closure_in_one_transaction(self):
         """Le courrier part dans la transaction de fermeture : quand il est
         écrit, la transition est déjà visible (et elle n'est pas committée
