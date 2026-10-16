@@ -72,6 +72,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -363,12 +364,15 @@ _LIVE_READS: "weakref.WeakSet" = weakref.WeakSet()
 
 
 def _merge_counters(data: dict, pending: dict, clock) -> list[str]:
-    """Fusionne `pending` dans `data["counters"]` ; rend les noms fusionnés."""
+    """Fusionne `pending` dans `data["counters"]` ; rend les noms fusionnés.
+
+    #1813 : l'instantané (`list(pending.items())`) est pris avant d'itérer —
+    un `count()` d'un autre fil pendant la fusion n'écrit plus dedans."""
     counters = data.setdefault("counters", {})
     if not isinstance(counters, dict):
         counters = data["counters"] = {}
     merged = []
-    for name, n in pending.items():
+    for name, n in list(pending.items()):
         counters[name] = int(counters.get(name) or 0) + int(n)
         merged.append(name)
     if merged:
@@ -420,6 +424,27 @@ def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> N
             pending.pop(name, None)
 
 
+def flush_reads(state_dir) -> int:
+    """Écrit une fois les compteurs en attente des caches vivants de ce
+    processus pour `state_dir` (#1813).
+
+    Le passage du Watcher dure toute la vie du runner : sans cet appel, une
+    suite de hits de cache restait invisible sur disque jusqu'à la requête
+    réelle suivante (`note`) ou à la fin du processus. Rend le nombre de
+    caches concernés ; jamais bloquant (une panne laisse `pending` intact)."""
+    state_dir = str(state_dir or "").strip()
+    if not state_dir:
+        return 0
+    root = os.path.join(state_dir, READS_DIR)
+    flushed = 0
+    for reads in list(_LIVE_READS):
+        if reads.root != root:
+            continue
+        reads.flush()
+        flushed += 1
+    return flushed
+
+
 class SharedReads:
     """Cache disque et quota GitHub partagés par les processus d'un hôte (#848).
 
@@ -445,9 +470,10 @@ class SharedReads:
     N1 : une construction ou une lecture ne crée aucun dossier — le cache
     naît à sa première écriture, et un `state_dir` vide est refusé plutôt
     que de fabriquer un chemin relatif. N3 : les compteurs s'agrègent en
-    mémoire et s'écrivent une fois par passage (`flush`, fin de processus),
-    jamais un verrou par hit. N4 : la clé d'une entrée porte la base d'API
-    et une empreinte non réversible du jeton."""
+    mémoire et s'écrivent une fois par passage (`flush` : fin de passage du
+    Watcher, #1813, ou fin de processus), jamais un verrou par hit. N4 : la
+    clé d'une entrée porte la base d'API et une empreinte non réversible du
+    jeton."""
 
     def __init__(self, state_dir, *, clock=time.time, ttl: float = READS_TTL,
                  max_entries: int = READS_MAX, scope: str = ""):
@@ -465,6 +491,9 @@ class SharedReads:
         self._lock_path = os.path.join(self.root, ".lock")
         self._stores = 0
         self._pending: dict = {}
+        # #1813 : `count()` peut être appelé d'un autre fil (client partagé) ;
+        # le verrou protège l'incrément, les fusions prennent un instantané.
+        self._pending_lock = threading.Lock()
         _LIVE_READS.add(self)
         # N3 : les compteurs en attente partent une fois, à la fin du passage
         # (objet libéré ou processus terminé), sans ressusciter un état disparu.
@@ -593,7 +622,7 @@ class SharedReads:
         for reads in list(_LIVE_READS):
             if reads.root != self.root:
                 continue
-            for name, n in reads._pending.items():
+            for name, n in list(reads._pending.items()):
                 merged[name] = int(merged.get(name) or 0) + int(n)
         return merged
 
@@ -604,12 +633,14 @@ class SharedReads:
     def count(self, name: str, n: int = 1) -> None:
         """Un compteur partagé (hits, stale, refused…) ; jamais bloquant.
 
-        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (ou la fin
-        du processus) fait une seule écriture par passage, au lieu d'un verrou
-        et d'une réécriture de `quota.json` à chaque hit de cache."""
+        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (fin de
+        passage du Watcher, #1813, ou fin du processus) fait une seule écriture
+        par passage, au lieu d'un verrou et d'une réécriture de `quota.json` à
+        chaque hit de cache."""
         try:
             key = str(name)
-            self._pending[key] = self._pending.get(key, 0) + int(n)
+            with self._pending_lock:
+                self._pending[key] = self._pending.get(key, 0) + int(n)
         except (TypeError, ValueError):
             return
 
