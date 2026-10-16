@@ -547,6 +547,23 @@ class ProofCacheTest(_Contract):
             ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache), first)
         self.assertEqual(calls["extract"], 2)
 
+    def test_an_expired_entry_is_ignored_when_pruning_cannot_remove_it(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        calls = self.counting()
+        first = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        old = time.time() - ci_parts.PARTS_CACHE_TTL - 60
+        path = self.entry(first)
+        os.utime(path, (old, old))
+        with mock.patch.object(ci_parts.os, "remove", side_effect=PermissionError):
+            ci_parts._cache_prune(self.cache, time.time())
+        self.assertTrue(os.path.isfile(path))
+        # Le nettoyage est un effort : sa panne ne prolonge pas une preuve.
+        with mock.patch.object(ci_parts, "_cache_prune"):
+            again = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        self.assertEqual(again, first)
+        self.assertEqual(calls["extract"], 2)
+
     def test_without_a_cache_every_control_recomputes(self):
         branch = self.lot_touching("backend")
         tip = _git(self.repo, "rev-parse", branch)

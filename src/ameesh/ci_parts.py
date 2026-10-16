@@ -249,6 +249,8 @@ def _cache_read(cache: str, key: str, plan, base: str, frozen: str) -> dict | No
     recalculée, jamais servie."""
     try:
         with open(os.path.join(cache, key + ".json"), "r", encoding="utf-8") as handle:
+            if time.time() - os.fstat(handle.fileno()).st_mtime > PARTS_CACHE_TTL:
+                return None
             data = json.load(handle)
     except (OSError, ValueError):
         return None
