@@ -1549,10 +1549,20 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("pr_ref"):
                 print("PR       : %s" % item["pr_ref"])
             if item.get("branch"):
+                # #1899 : `branch_head` est le dernier commit vu par le balayage,
+                # pas la tête réelle de la branche (elle peut avoir bougé depuis).
+                # Le dire comme un cache, avec son instant, évite les triages
+                # faux (qa-01, 16/10 : rebase cru fait, verdict demandé sur une
+                # tête périmée) ; le calcul de `waiting` n'est pas touché.
+                avance = ""
+                if item.get("branch_head"):
+                    vu = "tête en avance vue au dernier balayage : %s" % item["branch_head"][:12]
+                    if item.get("branch_head_ts"):
+                        vu += " le %s" % _fmt_moment(item["branch_head_ts"])
+                    avance = " (%s — vérifier à la forge)" % vu
                 print("branch   : %s → %s%s" % (
                     item["branch"], item.get("branch_target") or "repository default target",
-                    " (last commit seen ahead: %s)" % item["branch_head"][:12]
-                    if item.get("branch_head") else ""))
+                    avance))
             if item.get("migration"):
                 print("migration: %s reserved in %s (L122)" % (
                     work.migration_layout(item, cfg).label(item["migration"]),
