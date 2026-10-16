@@ -261,8 +261,27 @@ QUOTA_HEADERS = {"limit": "X-RateLimit-Limit", "remaining": "X-RateLimit-Remaini
 #: ressource d'API par défaut quand la réponse ne dit pas `X-RateLimit-Resource` :
 #: le bucket REST `core`. Le bucket GraphQL ne se confond plus avec lui (R1 #848).
 DEFAULT_RESOURCE = "core"
-#: attente imposée après un 403/429 de quota sans `X-RateLimit-Reset` (secondes)
+#: attente imposée après un 403/429 de quota sans `X-RateLimit-Reset` (secondes),
+#: et après une limite secondaire sans `Retry-After` (#1405)
 RATE_LIMIT_WAIT = 60.0
+#: marque d'une limite secondaire dans le corps d'un 403/429 (sans casse)
+SECONDARY_LIMIT_MARK = "secondary rate limit"
+
+
+def resource_of(path: str) -> str:
+    """La ressource d'API qu'un chemin REST consomme (#1405, N2).
+
+    GitHub la dit dans `X-RateLimit-Resource`, mais seulement une fois la
+    requête partie : avant, le chemin seul doit dire quel bucket regarder,
+    sinon une recherche épuisée repart vers GitHub jusqu'au 403."""
+    head = str(path).lstrip("/").split("?", 1)[0].casefold()
+    if head == "graphql":
+        return "graphql"
+    if head == "search/code" or head.startswith("search/code/"):
+        return "code_search"
+    if head == "search" or head.startswith("search/"):
+        return "search"
+    return DEFAULT_RESOURCE
 
 
 class GithubRateLimited(GithubError):
@@ -281,11 +300,13 @@ class GithubRateLimited(GithubError):
 
 @dataclass
 class ReadEntry:
-    """Une lecture gardée : valeur JSON, ETag de revalidation, instant de lecture."""
+    """Une lecture gardée : valeur JSON, ETag de revalidation, instant de
+    lecture, ressource d'API dite par la réponse (#1405)."""
 
     value: object
     etag: str | None
     read_ts: float
+    resource: str | None = None
 
 
 def _int_or_none(value) -> int | None:
@@ -508,8 +529,13 @@ class SharedReads:
             return None
         if not isinstance(data, dict) or data.get("path") != path:
             return None
-        return ReadEntry(data.get("value"), data.get("etag"),
-                         float(data.get("read_ts") or 0.0))
+        try:
+            read_ts = float(data.get("read_ts") or 0.0)
+        except (TypeError, ValueError):
+            return None                # entrée illisible : repayée, jamais une panne
+        resource = data.get("resource")
+        return ReadEntry(data.get("value"), data.get("etag"), read_ts,
+                         str(resource) if resource else None)
 
     def fresh(self, entry: ReadEntry | None, *, now=None, ttl=None) -> bool:
         """Vrai si l'entrée est dans sa durée de vie (`ttl` par défaut)."""
@@ -520,13 +546,13 @@ class SharedReads:
         return ttl > 0 and now - entry.read_ts < ttl
 
     def store(self, path: str, value, *, etag: str | None = None,
-              read_ts=None) -> None:
+              read_ts=None, resource: str | None = None) -> None:
         now = float(self.clock() if read_ts is None else read_ts)
         self._ensure_dirs()
         try:
             _atomic_write(self._entry_path(path),
                           {"path": path, "value": value, "etag": etag or None,
-                           "read_ts": now})
+                           "read_ts": now, "resource": resource or None})
         except (OSError, ValueError, TypeError):
             return                 # le cache est une économie, jamais une panne
         self._stores += 1
@@ -537,7 +563,8 @@ class SharedReads:
         """Rafraîchit l'instant d'une entrée revalidée (304, sans quota)."""
         entry = self.cached(path)
         if entry is not None:
-            self.store(path, entry.value, etag=entry.etag, read_ts=read_ts)
+            self.store(path, entry.value, etag=entry.etag, read_ts=read_ts,
+                       resource=entry.resource)
 
     def prune(self) -> int:
         """Retire les entrées les plus anciennes au-delà de `max_entries`."""
@@ -621,19 +648,24 @@ class SharedReads:
         _write_counters(self.state_dir, self.root, self._lock_path,
                         self._quota_path, self._pending, self.clock)
 
-    def note(self, headers, *, status: int, now=None) -> float | None:
+    def note(self, headers, *, status: int, now=None, resource: str | None = None,
+             body: str | None = None) -> float | None:
         """Enregistre le quota lu dans les en-têtes, compte la requête.
 
         Le quota est rangé par ressource d'API (`X-RateLimit-Resource`, sinon
-        `core`) : le bucket REST core et le bucket GraphQL ne se confondent
-        plus (R1 #848 ; le pilote l'a demandé à 10:40Z). Rend l'instant
+        `resource`, celle du chemin, sinon `core`) : le bucket REST core et le
+        bucket GraphQL ne se confondent plus (R1 #848 ; le pilote l'a demandé
+        à 10:40Z). Une limite secondaire (403/429 dont `body` la cite) bloque
+        aussi, même quota restant : `Retry-After`, sinon le reset si le quota
+        est à zéro, sinon `RATE_LIMIT_WAIT` (#1405, N3). Rend l'instant
         (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""
         now = float(self.clock() if now is None else now)
         values = {key: _int_or_none(header_of(headers, header))
                   for key, header in QUOTA_HEADERS.items()}
         retry = _int_or_none(header_of(headers, "Retry-After"))
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
-            or DEFAULT_RESOURCE
+            or str(resource or "").strip().lower() or DEFAULT_RESOURCE
+        secondary = status in (403, 429) and SECONDARY_LIMIT_MARK in str(body or "").lower()
         self._ensure_dirs()
         try:
             with self._locked():
@@ -661,6 +693,8 @@ class SharedReads:
                     blocked = max(blocked, now + float(retry))
                 elif exhausted:
                     blocked = max(blocked, float(reset or (now + RATE_LIMIT_WAIT)))
+                elif secondary:
+                    blocked = max(blocked, now + RATE_LIMIT_WAIT)
                 quota["blocked_until"] = blocked if blocked > now else 0.0
                 quota["checked"] = now
                 _atomic_write(self._quota_path, data)
@@ -675,6 +709,22 @@ class SharedReads:
         now = float(self.clock() if now is None else now)
         until = float(self.quota(resource).get("blocked_until") or 0.0)
         return until if until > now else None
+
+
+def _resource_header(headers) -> str | None:
+    """La ressource d'API dite par une réponse (`X-RateLimit-Resource`), sinon None."""
+    return str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() or None
+
+
+def _error_body(exc) -> str:
+    """Le corps d'un refus HTTP (borné), pour y lire une limite secondaire."""
+    try:
+        data = exc.read(4096)
+    except Exception:  # noqa: BLE001 — un corps illisible ne dit rien
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return str(data or "")
 
 
 class Api:
@@ -716,12 +766,13 @@ class Api:
         now = float(self.clock())
         self.last_read = None
         entry = self.reads.cached(path) if self.reads is not None else None
+        resource = (entry.resource if entry is not None else None) or resource_of(path)
         if self.reads is not None and self.reads.fresh(entry, now=now, ttl=ttl):
             self.reads.count("hits")
             self.last_read = ReadMeta(entry.read_ts, False, "cache")
             return entry.value
         if self.reads is not None:
-            until = self.reads.blocked(now)
+            until = self.reads.blocked(now, resource)
             if until:
                 if entry is not None:
                     self.reads.count("stale")
@@ -741,10 +792,11 @@ class Api:
             if exc.code == 304 and entry is not None:
                 if self.reads is not None:
                     self.reads.touch(path, read_ts=now)
-                    self.reads.note(headers, status=304, now=now)
+                    self.reads.note(headers, status=304, now=now, resource=resource)
                 self.last_read = ReadMeta(now, False, "revalidated")
                 return entry.value
-            until = self.reads.note(headers, status=exc.code, now=now) \
+            until = self.reads.note(headers, status=exc.code, now=now, resource=resource,
+                                    body=_error_body(exc)) \
                 if self.reads is not None else None
             if until:
                 if entry is not None:
@@ -763,8 +815,9 @@ class Api:
             raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
         if self.reads is not None:
             etag = header_of(headers, "ETag")
-            self.reads.note(headers, status=200, now=now)
-            self.reads.store(path, value, etag=etag, read_ts=now)
+            self.reads.note(headers, status=200, now=now, resource=resource)
+            self.reads.store(path, value, etag=etag, read_ts=now,
+                             resource=_resource_header(headers))
         self.last_read = ReadMeta(now, False, "network")
         return value
 
@@ -794,11 +847,12 @@ class GhApi:
             self.last_read = ReadMeta(now, False, "network")
             return value
         entry = self.reads.cached(path)
+        resource = (entry.resource if entry is not None else None) or resource_of(path)
         if self.reads.fresh(entry, now=now, ttl=ttl):
             self.reads.count("hits")
             self.last_read = ReadMeta(entry.read_ts, False, "cache")
             return entry.value
-        until = self.reads.blocked(now)
+        until = self.reads.blocked(now, resource)
         if until:
             if entry is not None:
                 self.reads.count("stale")
@@ -810,10 +864,11 @@ class GhApi:
             self.gh, path, etag=entry.etag if entry is not None else None)
         if status == 304 and entry is not None:
             self.reads.touch(path, read_ts=now)
-            self.reads.note(headers, status=304, now=now)
+            self.reads.note(headers, status=304, now=now, resource=resource)
             self.last_read = ReadMeta(now, False, "revalidated")
             return entry.value
-        until = self.reads.note(headers, status=status, now=now)
+        until = self.reads.note(headers, status=status, now=now, resource=resource,
+                                body=body)
         if until and status in (403, 429):
             if entry is not None:
                 self.reads.count("stale")
@@ -827,7 +882,8 @@ class GhApi:
             value = json.loads(body) if body.strip() else None
         except ValueError as exc:
             raise GithubError("gh api %s: unreadable response" % path) from exc
-        self.reads.store(path, value, etag=header_of(headers, "ETag"), read_ts=now)
+        self.reads.store(path, value, etag=header_of(headers, "ETag"), read_ts=now,
+                         resource=_resource_header(headers))
         self.last_read = ReadMeta(now, False, "network")
         return value
 
