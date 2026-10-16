@@ -247,11 +247,13 @@ class PriseTest(_Base):
         # l'agent a maintenant un lot (et du courrier) : il ne prend plus rien
         self.assertEqual(self.take(), [])
 
-    def test_repos_trop_court_et_seuil_nul(self):
+    def test_seuil_nul_desactive_la_prise(self):
+        # #1677 (b) : le temps depuis le dernier tour ne borne plus la prise
+        # (l'agent sans lot actionnable est au repos) ; zéro la désactive.
         self.agent("claude1", since_s=60)
-        self.element("dette", 50)
-        self.assertEqual(self.take(), [])
+        dette = self.element("dette", 50)
         self.assertEqual(self.take(idle_s=0), [])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [dette["id"]])
 
     def test_debit_par_heure(self):
         for name in ("a1", "a2", "a3"):
