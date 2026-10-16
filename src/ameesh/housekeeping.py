@@ -3,7 +3,7 @@
 de base #1, cycle de vie des worktrees).
 
 ameesh fait le ménage de ce que SES agents créent, au lieu de le laisser à
-l'humain. Quatre familles, quatre règles :
+l'humain. Cinq familles, cinq règles :
 
 * **Dossier temporaire d'un agent** (jetable) : `TMPDIR`/`TMP`/`TEMP` d'un
   tour pointent vers `<tmp_root>/<agent>` (par défaut
@@ -48,6 +48,17 @@ l'humain. Quatre familles, quatre règles :
 * **Build output of idle worktrees** (L230, [`build_artifacts`]):
   `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
   with no process of the user inside; never in a main checkout.
+
+* **Volumes Docker sans conteneur** (L73/#2003, [`reap_volumes`]) : seuls
+  ceux que le mesh peut ATTRIBUER sont récoltés après
+  `docker_volume_idle` (24 h) — un volume nommé étiqueté `ameesh.bench` par
+  `scripts/pg-up.sh`, ou un volume anonyme (`com.docker.volume.anonymous`)
+  créé pendant un tour d'ameesh de cet hôte (`turn_resources`). Un volume
+  nommé sans étiquette, un volume anonyme d'un instant sans tour enregistré,
+  une date de création illisible d'un volume anonyme : listés dans `others`
+  (borné) avec la commande `docker volume rm`, JAMAIS supprimés (précédent
+  #411 : les volumes nommés existants sont conservés) ; `docker volume rm`
+  refuse de lui-même un volume encore monté.
 
 * **Entrées de `/tmp` apparues pendant un tour** (L162 : clone de relecture,
   `--cacheDirectory` explicite, image `docker save`) : elles sont signalées
@@ -133,6 +144,13 @@ TMP_TOP = 5
 #: #1547 (N3) : conteneurs hors tour détaillés dans le relevé de ménage — le
 #: journal garde le compte total (`others_total`), jamais une liste non bornée
 OTHERS_TOP = 20
+#: L73/#2003 : délai (secondes) sans conteneur avant qu'un volume Docker
+#: ATTRIBUÉ (volume de banc étiqueté, ou volume anonyme d'un tour fini) ne
+#: soit récolté. Les volumes non attribués ne sont jamais supprimés.
+DEFAULT_DOCKER_VOLUME_IDLE_S = 24 * 3600.0
+#: #2003 : volumes Docker non attribués détaillés dans le relevé — le journal
+#: garde le compte total, jamais une liste non bornée (comme `OTHERS_TOP`)
+VOLUMES_TOP = 20
 #: L162/L230 : début de la raison rendue quand l'OS ne dit pas qui tient une
 #: entrée ; l'hôte qui a déclaré des processus illisibles sans doute
 #: (`unreadable_ok`) repose alors la question avec son allow
@@ -198,7 +216,7 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
-               "docker_build_cache_alert")
+               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -217,6 +235,11 @@ class Policy:
     tmpfs_alert: float = DEFAULT_TMPFS_ALERT
     docker_orphan_volumes_alert: int = 100
     docker_build_cache_alert: int = 20 * 1024 ** 3
+    #: #2003 : récolter les volumes Docker ATTRIBUÉS (banc étiqueté, volume
+    #: anonyme d'un tour fini) ; `false` : aucun volume n'est jamais supprimé
+    docker_volumes: bool = True
+    #: #2003 : inactivité (secondes) sans conteneur avant cette récolte
+    docker_volume_idle: float = DEFAULT_DOCKER_VOLUME_IDLE_S
     redirect: bool = True
     xdg_cache: bool = False
     worktrees: bool = True
@@ -293,7 +316,7 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert`: fraction expected (0 < x <= 1, or \"60%\")")
         else:
             parsed["tmpfs_alert"] = part
-    for key in ("orphan_idle", "deps_idle", "artifact_idle"):
+    for key in ("orphan_idle", "deps_idle", "artifact_idle", "docker_volume_idle"):
         if raw.get(key) is None:
             continue
         seconds = parse_idle(raw[key])
@@ -313,7 +336,8 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`unreadable_ok` : %s" % problem)
         else:
             parsed["unreadable_ok"] = names
-    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps"):
+    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps",
+                "docker_volumes"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
@@ -362,8 +386,9 @@ def effective(canons, host: str) -> Policy:
                          "docker_orphan_volumes_alert", "docker_build_cache_alert") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
-            elif (key in ("orphan_idle", "deps_idle", "artifact_idle") and value > values[key]) or \
-                    (key in ("orphan_cleanup", "deps") and value is False
+            elif (key in ("orphan_idle", "deps_idle", "artifact_idle",
+                          "docker_volume_idle") and value > values[key]) or \
+                    (key in ("orphan_cleanup", "deps", "docker_volumes") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
     return Policy(origin=origin, **values)
@@ -3015,6 +3040,123 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     return out
 
 
+def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = False,
+                 now: float | None = None) -> dict:
+    """Volumes Docker de l'hôte (L73/#2003) : récolte les volumes SANS
+    conteneur (arrêtés compris, `volume ls --filter dangling=true`) que le
+    mesh peut ATTRIBUER, après `policy.docker_volume_idle` :
+
+    * un volume nommé étiqueté `ameesh.bench` (`scripts/pg-up.sh`) est un banc
+      de test du mesh ;
+    * un volume anonyme (`com.docker.volume.anonymous`) créé pendant un tour
+      d'ameesh de CET hôte (intervalle de `turn_resources`, `turn_at`) suit la
+      règle des conteneurs : récolté quand ce tour n'est plus `running`.
+
+    Les autres — volume nommé sans étiquette, volume anonyme créé hors de tout
+    tour enregistré de cet hôte, date de création illisible — ne sont JAMAIS
+    supprimés : listés dans `others` (borné à `VOLUMES_TOP`, compte total dans
+    `others_total`) avec la commande `docker volume rm` qu'un humain peut
+    décider (précédent #411 : les volumes nommés existants sont conservés).
+    Un volume de banc étiqueté dont la date est illisible est, lui, signalé
+    dans `ours` sans suppression : la garde d'âge ne peut pas être vérifiée.
+    `docker volume rm` refuse de lui-même un volume encore monté : la course
+    avec un `docker run` qui le reprend est fermée par Docker. Seul `docker`
+    est couvert (comme la mesure #411). `dry_run` : le plan seulement.
+
+    Rend `{entries, plan, ours, others, others_total}` ; `ours`/`others` à
+    None si le moteur ne répond pas, comme [`reap_containers`]."""
+    from . import containers as containers_mod
+    out: dict = {"entries": [], "plan": [], "ours": None, "others": None,
+                 "others_total": None}
+    if runtime is None or not getattr(policy, "docker_volumes", True):
+        return out
+    binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
+    if binary != "docker" or not hasattr(runtime, "volumes"):
+        return out
+    rows = runtime.volumes(dangling=True)
+    if rows is None:
+        return out
+    now = time.time() if now is None else float(now)
+    idle = max(0.0, float(policy.docker_volume_idle))
+    candidates = [row for row in rows
+                  if containers_mod.BENCH_LABEL in (row.get("labels") or {})
+                  or containers_mod.ANONYMOUS_LABEL in (row.get("labels") or {})]
+    created = runtime.volume_created([row["name"] for row in candidates]) \
+        if candidates and hasattr(runtime, "volume_created") else {}
+    if created is None:               # relevé illisible : aucune attribution
+        created = {}
+    turns = storage.of(db).turn_resources
+    ours, others, others_total = [], [], 0
+
+    def _other(row: dict, name: str, base: dict, reason: str) -> None:
+        nonlocal others_total
+        others_total += 1
+        if len(others) < VOLUMES_TOP:
+            others.append(dict(
+                base, driver=row.get("driver"), detail=reason,
+                command="%s volume rm %s" % (binary, shlex.quote(name))))
+
+    for row in rows:
+        name = row["name"]
+        labels = row.get("labels") or {}
+        base = {"kind": "volume", "path": name}
+        bench = labels.get(containers_mod.BENCH_LABEL)
+        anonymous = containers_mod.ANONYMOUS_LABEL in labels
+        if not bench and not anonymous:
+            _other(row, name, base,
+                   "no container references it; not attributable to the mesh")
+            continue
+        stamp = created.get(name)
+        if anonymous and not bench:
+            if stamp is None:
+                _other(row, name, base,
+                       "anonymous volume: creation time unreadable")
+                continue
+            turn = turns.turn_at(host, stamp)
+            if turn is None:
+                _other(row, name, base,
+                       "anonymous volume created outside any recorded turn of this host")
+                continue
+        elif stamp is None:
+            why = ("bench volume %s: creation time unreadable: flagged only" % bench)
+            ours.append(dict(base, action="signalé", detail=why))
+            out["plan"].append(dict(base, action="signalé", detail=why))
+            continue
+        age = now - stamp
+        if bench:
+            attribution = "bench volume %s" % bench
+        else:
+            agent = turn.get("agent")
+            base = dict(base, agent=agent)
+            if turn.get("status") == "running":
+                detail = "turn %s in progress" % str(turn.get("turn_id"))[:8]
+                ours.append(dict(base, action="attend", detail=detail))
+                continue
+            attribution = "anonymous volume of turn %s (%s)" % (
+                str(turn.get("turn_id"))[:8], agent or "?")
+        if age < idle:
+            detail = "%s; no container for %s (under %s)" % (
+                attribution, fmt_idle(age), fmt_idle(idle))
+            ours.append(dict(base, action="attend", detail=detail))
+            continue
+        why = "%s; no container for %s" % (attribution, fmt_idle(age))
+        out["plan"].append(dict(base, action="suppression", detail=why))
+        if dry_run:
+            ours.append(dict(base, action="suppression", detail=why))
+            continue
+        ok, error = runtime.remove_volume(name)
+        entry = dict(base, action="removed" if ok else "kept",
+                     detail=("%s: %s volume rm" % (why, binary)) if ok
+                     else "%s: deletion refused — %s" % (why, error),
+                     data={"driver": row.get("driver"), "labels": labels})
+        out["entries"].append(entry)
+        ours.append(entry)
+    out["ours"] = ours
+    out["others"] = others
+    out["others_total"] = others_total
+    return out
+
+
 def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
                 idle_after: float, now: float) -> str:
     """L219: why the pass keeps the temporary directory `path` of an agent
@@ -3056,6 +3198,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       poussé et qu'aucun agent ne l'utilise ;
     * L230: regenerable build dirs of idle worktrees (`build_artifacts`),
       when `artifact_scan` (the runner: at most every `SCAN_EVERY_S`);
+    * conteneurs des tours d'ameesh finis (L73, `reap_containers`) ;
+    * volumes Docker sans conteneur (L73/#2003, `reap_volumes`) : ceux que le
+      mesh peut attribuer sont récoltés après `docker_volume_idle`, les
+      autres signalés avec leur commande, jamais supprimés ;
     * entrées de /tmp signalées pendant un tour : jamais supprimées si non
       attribuées (#222) ; un signalement attribué d'avant #222, supprimé si
       abandonné (garde-fous de `_orphan_verdict`, L162) ; sinon dites avec la
@@ -3262,6 +3408,12 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
+    # 4b. #2003 : volumes Docker sans conteneur — attribués (banc étiqueté,
+    #     volume anonyme d'un tour fini de cet hôte) récoltés après
+    #     `docker_volume_idle` ; les autres signalés, jamais supprimés
+    volumes = reap_volumes(runtime, db, host, policy, dry_run=dry_run, now=now)
+    entries += volumes["entries"]
+    plan += volumes["plan"]
     # 5. /tmp entries signaled during a turn (L162): unattributed ones are
     #    never deleted (#222), an attributed one (before #222) is deleted once
     #    abandoned (`_orphan_verdict` guards), the others are told
@@ -3288,6 +3440,9 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     report_measure["containers"] = {
         "ameesh": conteneurs["ameesh"], "others": conteneurs["others"],
         "others_total": conteneurs["others_total"]}
+    report_measure["volumes"] = {
+        "ameesh": volumes["ours"], "others": volumes["others"],
+        "others_total": volumes["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
     if not dry_run:
@@ -3300,6 +3455,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     return {"host": host, "dry_run": dry_run, "entries": entries, "plan": plan,
             "skipped": skipped, "orphans": orphans, "measure": report_measure,
             "containers": report_measure["containers"],
+            "volumes": report_measure["volumes"],
             "policy": policy.as_dict()}
 
 
@@ -3367,9 +3523,11 @@ def print_report(report: dict) -> None:
     for note in report.get("skipped") or ():
         print("  skipped   %s" % note)
     conteneurs = report.get("containers") or {}
+    volumes = report.get("volumes") or {}
     docker = (report.get("measure") or {}).get("docker_storage")
     if docker:
-        print("  Docker storage (reported only, cleanup requires owner approval): "
+        print("  Docker storage (orphan count reported; only volumes ATTRIBUTED to this "
+              "mesh are reaped, after the idle delay): "
               "%s orphan volumes; %s private reclaimable build cache" % (
                   docker.get("orphan_volumes"), _fmt(docker.get("build_cache_reclaimable_bytes"))))
         for error in docker.get("errors") or ():
@@ -3378,6 +3536,15 @@ def print_report(report: dict) -> None:
         if c["action"] != "suppression":
             print("  container %-12s %s — %s" % (action_label(c["action"]), c["path"],
                                                  c.get("detail") or ""))
+    vus = {row.get("path") for row in rows}
+    for v in volumes.get("ameesh") or ():
+        # les états déjà listés dans `plan` (essai) ou `entries` (réalisation)
+        # ne sont pas répétés ici : la section dit ce qui reste (attente,
+        # signalement sans suppression)
+        if v["path"] in vus:
+            continue
+        print("  volume %-12s %s — %s" % (action_label(v["action"]), v["path"],
+                                          v.get("detail") or ""))
     autres = conteneurs.get("others") or []
     if autres:
         print("  containers not started by an ameesh turn (never deleted by ameesh):")
@@ -3387,6 +3554,16 @@ def print_report(report: dict) -> None:
     reste = (conteneurs.get("others_total") or len(autres)) - len(autres)
     if reste > 0:
         print("    … %d more not listed (report bounded to %d)" % (reste, OTHERS_TOP))
+    volumes_autres = volumes.get("others") or []
+    if volumes_autres:
+        print("  Docker volumes without a container, not attributable to this mesh "
+              "(never deleted by ameesh):")
+        for v in volumes_autres:
+            print("    %s  (%s)  →  %s" % (v.get("path"), v.get("detail") or "?",
+                                           v.get("command") or ""))
+        reste = (volumes.get("others_total") or len(volumes_autres)) - len(volumes_autres)
+        if reste > 0:
+            print("    … %d more not listed (report bounded to %d)" % (reste, VOLUMES_TOP))
     orphans = report.get("orphans") or []
     if orphans:
         print("  /tmp entries that appeared during a turn (never deleted by ameesh, except an "

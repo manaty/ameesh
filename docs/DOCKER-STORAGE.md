@@ -1,34 +1,63 @@
-# Docker storage: observation and owner cleanup (#411)
+# Docker storage: observation, attributed-volume retention (#2003) and owner cleanup (#411)
 
-Housekeeping samples Docker storage without deleting volumes, images or build
-cache, even during `ameesh menage --apply`. It counts `dangling=true` volumes
+Housekeeping samples Docker storage and counts `dangling=true` volumes
 (no container references, including stopped containers), and reads the
-**default Docker builder's** BuildKit metadata. Each CLI call has the runtime's
-deadline, capped at 10 seconds. It avoids `docker system df` and recursive
-volume-size scans, which were slow during the owner's concurrent prune.
-Podman and an absent Docker runtime are not measured by this feature.
+**default Docker builder's** BuildKit metadata. The observation itself deletes
+nothing. Each CLI call has the runtime's deadline, capped at 10 seconds. It
+avoids `docker system df` and recursive volume-size scans, which were slow
+during the owner's concurrent prune. Podman and an absent Docker runtime are
+not measured by this feature.
 
-`ameesh menage --json` exposes `measure.docker_storage`; the text report
-shows the orphan count and private reclaimable cache bytes. The periodic
-housekeeping pass persists the same summary. `ameesh alerts` reads these
-persisted samples, without launching Docker. No migration is required.
+Since #2003 the same pass also **reaps attributed Docker volumes**: a dangling
+volume is deleted only when the mesh can say where it came from, and only
+after `docker_volume_idle` (default 24 h):
 
-The default thresholds in the Host card's `policy.housekeeping` are:
+* a named volume labelled `ameesh.bench` — `scripts/pg-up.sh` labels the
+  database volume it creates; a shared bench keeps its volume while its
+  container exists, stopped containers included;
+* an anonymous volume (`com.docker.volume.anonymous`) whose creation time
+  falls inside a recorded turn of this host (`turn_resources`); it follows the
+  container rule and is reaped once that turn is no longer `running`.
+
+Everything else is **never deleted automatically**: a named volume without the
+label, an anonymous volume created outside any recorded turn, or an anonymous
+volume whose creation time is unreadable is listed in the bounded `others`
+section with its exact `docker volume rm` command so a human decides; a
+labelled bench volume whose creation time is unreadable is flagged without a
+command, since the age guard cannot be checked. This preserves the #411 rule
+(existing named volumes are kept) while stopping the silent accumulation of
+anonymous volumes leaked by test benches that remove their container without
+`-v`. `docker volume rm` itself refuses a volume still mounted, so a
+`docker run` racing the reap wins. Set
+`docker_volumes: false` in the Host card to disable reaping on one host.
+
+`ameesh menage --json` exposes `measure.docker_storage` and `measure.volumes`;
+the text report shows the orphan count, the volumes being reaped or kept, and
+the unattributed ones with their command. The periodic housekeeping pass
+persists the same summary. `ameesh alerts` reads these persisted samples,
+without launching Docker. No migration is required.
+
+The default thresholds and retention in the Host card's `policy.housekeeping`
+are:
 
 ```yaml
 docker_orphan_volumes_alert: 100
 docker_build_cache_alert: 20GiB
+docker_volumes: true          # reap attributed dangling volumes
+docker_volume_idle: 24h       # delay before an attributed volume is reaped
 ```
 
-The strictest threshold across the host's canons wins. Alerts
-`docker_orphan_volumes` and `docker_build_cache` are pushed to the responsible
-human by the standard notification routing. Errors and samples older than
-30 minutes produce `docker_storage_unavailable`: unknown is never reported
-as zero. A host needs a housekeeping sample before these alerts are available.
-The cache threshold counts private reclaimable records, excluding shared
-records and records in use. Reported total cache size is logical record
-accounting, not a promise of physical disk space recovered, especially with
-shared layers or btrfs. Other builders require a separate operator inventory.
+The strictest threshold across the host's canons wins; the longest
+`docker_volume_idle` wins, and one canon that sets `docker_volumes: false`
+disables reaping for that host. Alerts `docker_orphan_volumes` and
+`docker_build_cache` are pushed to the responsible human by the standard
+notification routing. Errors and samples older than 30 minutes produce
+`docker_storage_unavailable`: unknown is never reported as zero. A host needs a
+housekeeping sample before these alerts are available. The cache threshold
+counts private reclaimable records, excluding shared records and records in
+use. Reported total cache size is logical record accounting, not a promise of
+physical disk space recovered, especially with shared layers or btrfs. Other
+builders require a separate operator inventory.
 
 Sources: [Docker volume lifecycle](https://docs.docker.com/engine/storage/volumes/),
 [BuildKit cache accounting](https://docs.docker.com/reference/cli/docker/buildx/du/).
@@ -96,7 +125,10 @@ retains a cache budget and does not request `--all`, volume deletion or image
 pruning. It can recover less than the measured 45.28 GB because age and
 retention further restrict eligibility. Request an owner decision through
 `ameesh decide ask --lot 411 --needs-signature`; this document and the manifest
-are the reviewable scope. No cleanup is performed by the monitoring code.
+are the reviewable scope. The monitoring code performed no cleanup at the time
+of #411; #2003 (16 October 2026) later added the attributed-volume retention
+described at the top of this document, which never touches a named volume
+without the `ameesh.bench` label.
 
 Once the owner's volume prune has finished, refresh the read-only inventory
 before executing any separately approved action. If anonymous volumes remain,

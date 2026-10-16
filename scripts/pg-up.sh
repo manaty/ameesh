@@ -136,6 +136,15 @@ else
   if [ -n "$source_voulue" ]; then
     garde_sources -a "$source_voulue"
   fi
+  # #2003 : un volume nommé créé ici porte l'étiquette du banc — le ménage
+  # d'ameesh ne récolte que les volumes qu'il peut attribuer (banc étiqueté,
+  # ou volume anonyme d'un tour), après `docker_volume_idle` sans conteneur.
+  # Un volume existant garde ses étiquettes : Docker ne les modifie pas, et
+  # le ménage ne supprime jamais un volume nommé sans étiquette.
+  if [ "${VOLUME#/}" = "$VOLUME" ] && ! grep -qxF -- "$VOLUME" <<<"${volumes:-}"; then
+    docker volume create --label ameesh.bench=postgres "$VOLUME" >/dev/null \
+      || { echo "création du volume $VOLUME en échec" >&2; exit 1; }
+  fi
   echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT, volume $VOLUME)"
   # #1411 : le banc est partagé par tous les agents de l'hôte ; l'étiquette
   # d'un tour (posée par le shim docker depuis AMEESH_CONTAINER_LABELS) en
