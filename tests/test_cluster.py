@@ -100,6 +100,17 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #1467 (0442): plans and replayable admission/fire receipts stay closed
+    # to both supervisor roles. No new grants accompany this classification.
+    "integration_trains": {"target_key", "revision", "document", "updated_at"},
+    "integration_train_fires": {"id", "target_key", "plan_id", "document", "state",
+                                "changed_by", "owner", "epoch", "created_at", "updated_at"},
+    "integration_train_queue_receipts": {"id", "work_item_id", "generation", "frozen_id",
+                                         "kind", "created_at"},
+    # #1465 (0445), required by #1467: exact provenance receipts also keep
+    # their existing closed rights; this does not qualify their producers.
+    "provenance_receipts": {"subject", "sha", "actor", "session", "turn", "harness",
+                            "work_item_id", "at"},
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
     "agent_mesh_overview": {"roles", "aliases"},  # #423 : 0418 avant 0428 sur un schéma neuf

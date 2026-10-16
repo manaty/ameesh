@@ -19,7 +19,9 @@ class RecordedHistoryTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = self.tmp.name
-        self.git("init", "-q")
+        # PreparationTest creates main at base; never inherit the host's
+        # init.defaultBranch (main on the CI runners).
+        self.git("init", "-q", "-b", "fixture")
         self.git("config", "user.name", "fixture")
         self.git("config", "user.email", "fixture@example.invalid")
         self.base = self.commit("base")
