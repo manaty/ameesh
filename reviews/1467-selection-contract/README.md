@@ -225,6 +225,24 @@ inconnue conserve alors la génération tracée, sans événement ni numéro nou
 et sans CI individuelle. Un retrait commis ensuite sur la première connexion
 reste un report nommé sur la seconde ; aucune ligne n'est recréée.
 
+Le témoin consommateur
+`TrainRunnerTest.test_packet_enrollment_keeps_its_generation_through_cutoff_and_fresh_passage`
+relie explicitement `Enrollment` au vrai `Passage`. Une inscription packet
+après la coupure conserve son horodatage SQL : le passage reste inactif
+jusqu'au créneau suivant. Après perte du clone et ouverture d'une seconde
+connexion, la reprise avec histoire initiale inconnue retrouve le même reçu
+et la même génération. Le passage publie ensuite cette génération dans son
+manifeste, puis promeut le commit exact de la CI complète.
+
+Git et SQL sont réels ; candidat, provenance, calendrier, qualification
+initiale du schéma jetable, CI et autorité restent des fixtures explicites.
+Le témoin appelle lui-même l'inscription : `Passage` ne réalise pas encore
+cet inventaire ni cette inscription. Le futur raccord actif devra conserver
+l'horodatage réel et traiter les admissions après coupure au créneau suivant,
+sans vieillir artificiellement une génération pour l'inclure dans un paquet.
+Ce témoin ciblé passe avec psycopg (53,3 s) et psql (105,3 s), sous
+`ameesh heavy`, sans rejeu de suite ni CI distante.
+
 ## Port de transport qualifié
 
 Source de ce raccord : cadrage mesh-design **#69852 du 16 octobre à 03:12**,

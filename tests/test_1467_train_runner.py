@@ -14,7 +14,7 @@ from datetime import datetime
 from unittest import mock
 
 from ameesh import (db as db_mod, radar, storage, train, train_ci, train_fire,
-                    train_git, train_policy, train_runner, train_transports,
+                    train_candidates, train_git, train_policy, train_runner, train_transports,
                     train_transport_journal, work)
 
 from .support import PgTestCase
@@ -184,6 +184,75 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
         self.assertEqual(self.git(self.host, "rev-parse", "HEAD"), self.base)
         self.assertIsNone(passage.epoch)
+        self.assertEqual(self.notices, [])
+
+    def test_packet_enrollment_keeps_its_generation_through_cutoff_and_fresh_passage(self):
+        original = self.ops.queue(None)[0]
+        item_id = original["work_item_id"]
+        # Known disposable history: remove this fixture's individual entry
+        # without claiming a legacy-history qualification for any real lot.
+        self.db.execute("DELETE FROM merge_queue WHERE work_item_id = %s", (item_id,))
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (item_id,))
+        marks = self.ops.milestones(item_id, None)
+        freeze = next(mark for mark in marks if mark["id"] == original["frozen_id"])
+        candidate = dict(work_item_id=item_id, branch=original["branch"], target="main",
+                         causes=[], candidate=dict(sha=self.head, origin="frozen", declared=freeze))
+        passage = self.passage()
+        runtime = passage.runtime(self.db)
+        preparation = train_candidates.Preparation(self.db, self.project,
+            repository=runtime.repository, history=runtime.admissions.history,
+            policy=runtime.admissions.policy)
+        enrolled = train_candidates.Enrollment(preparation, runtime.admissions,
+            initial=lambda db, **context: True).enroll(candidate, self.base, actor="fixture")
+        entry = enrolled["entry"]
+        self.assertGreater(entry["generation"], original["generation"])
+        self.assertNotIn("targeted_ci", enrolled["proof"]["members"][0])
+        self.assertEqual(self.ops.milestones(item_id, None), marks)
+        self.assertEqual(self.api_calls, [])
+
+        # Anchor decision times to the returned SQL fact, never wall-clock
+        # progress. The allocation is one second after this fixture cutoff.
+        slot = entry["queued_ts"] - 1
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        self.assertEqual(passage.step(self.db, slot + 1), {"result": "idle"})
+        self.assertIsNone(self.ops.train_read(self.key))
+        self.assertEqual(self.api_calls, [])
+
+        shutil.rmtree(runtime.repository.clone.path)
+        other_db = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other_db.close)
+        restarted = self.passage()
+        fresh = restarted.runtime(other_db)
+        preparation = train_candidates.Preparation(other_db, self.project,
+            repository=fresh.repository, history=fresh.admissions.history,
+            policy=fresh.admissions.policy)
+        # Unknown initial history after restart permits the typed replay,
+        # with no new generation or journal entry.
+        replay = train_candidates.Enrollment(preparation, fresh.admissions).enroll(
+            candidate, self.base, actor="restarted-fixture")
+        self.assertEqual(replay, enrolled)
+        self.assertEqual(self.ops.milestones(item_id, None), marks)
+        result = restarted.step(other_db, slot + 3600)
+        self.assertEqual(result["result"], "ci", result)
+        plan = result["plan"]
+        self.assertEqual([train.identity(row) for row in plan["members"]], [train.identity(entry)])
+        self.assertEqual(plan["proof"], enrolled["proof"])
+        self.assertEqual(self.git(self.origin, "rev-parse", plan["branch"]), plan["head"])
+        self.assertEqual(restarted.step(other_db, slot + 3601)["result"], "awaiting-fire")
+        with mock.patch.object(work, "corrector", return_value="pilot"):
+            restarted.runtime(other_db).fires.give(plan, actor="pilot")
+        with mock.patch.object(train_fire.Fires, "_still_pilot", return_value=True):
+            result = restarted.step(other_db, slot + 3602)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
+        self.assertEqual(self.ops.queue(None)[0]["generation"], entry["generation"])
+        receipts = self.db.query(
+            "SELECT generation, kind FROM integration_train_queue_receipts WHERE work_item_id = %s",
+            (item_id,))
+        self.assertEqual(receipts, [dict(generation=entry["generation"], kind="packet")])
         self.assertEqual(self.notices, [])
 
     def test_scheduled_passage_uses_compiled_calendar_with_real_sql_and_reservation(self):
