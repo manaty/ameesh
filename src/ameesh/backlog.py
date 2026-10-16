@@ -68,9 +68,11 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
 * ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
   (il le confie sans doute dans la foulée) ;
-* un orchestrateur ne se sert pas lui-même ; ceux de l'équipe (sinon tous)
-  reçoivent un courrier `event` lié au lot et peuvent le réassigner (`ameesh
-  work assign`) ;
+* un orchestrateur ne se sert pas lui-même tant qu'un autre preneur est là ;
+  ses candidats passent en dernier et, s'il prend un lot faute d'autre
+  preneur, la note d'attribution garde la trace du repli (#1739) ; ceux de
+  l'équipe (sinon tous) reçoivent un courrier `event` lié au lot et peuvent
+  le réassigner (`ameesh work assign`) ;
 * au plus `lot_max_per_hour` prises par heure glissante, comptées à part de
   la file.
 * **L165b** (constat du 12/10 : 13 agents au repos, 10 lots sans agent, aucun
@@ -648,7 +650,16 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 orchestras = []
         # L165b : un agent dont tous les lots attendent un autre est libre
         pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
-        for row in pool:
+        # #1739 : plus aucun autre preneur ? un orchestrateur peut se servir,
+        # mais ses candidats passent en dernier : il ne prend que les lots que
+        # les autres ont laissés, et la note d'attribution garde la trace.
+        taker_count = len(pool)
+        if lots:
+            seen = {row["name"] for row in pool}
+            pool += [row for row in candidates(lot_idle_s, skip=(), waiting_free=True)
+                     if row["name"] not in seen]
+        for index, row in enumerate(pool):
+            fallback = index >= taker_count
             if len(taken) >= lot_room or not lots:
                 break
             if not within_budget(row):
@@ -670,25 +681,28 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     continue
                 if (item.get("lot_team") or "").strip() != primary:
                     continue
-                notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
-                                               orchestras)
+                # un orchestrateur qui se sert ne se prévient pas lui-même
+                notified = [name for name in _team_orchestrators(
+                    cfg, db, listing, item["lot_team"], orchestras) if name != row["name"]]
                 if dry_run:
                     taken.append({"item": item, "agent": row["name"], "message_id": None,
-                                  "kind": "lot", "notified": notified})
+                                  "kind": "lot", "notified": notified,
+                                  "fallback": fallback})
                     lots.remove(item)
                     break
                 try:
                     check = work.check_assignee(db, row["name"], cfg=cfg)
                 except work.WorkError:
                     break                   # agent non réveillable : au suivant
+                note = "%s par %s, au repos" % (LOT_TAKE_NOTE, check["assignee"])
+                if fallback:
+                    note += " (aucun autre preneur ; orchestrateur)"
                 try:
                     # #540 : sous le verrou de l'agent, pas de second lot
                     # non démarré (il en a reçu un depuis sa sélection).
                     # #1242 (L165) : la prise ne vise qu'un lot intake dont
                     # toutes les dépendances sont satisfaites.
-                    done = _assign_ready(st, item, check["assignee"],
-                                         "%s par %s, au repos" % (LOT_TAKE_NOTE,
-                                                                  check["assignee"]),
+                    done = _assign_ready(st, item, check["assignee"], note,
                                          work.takes_rule(check))
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
@@ -706,7 +720,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     mail.send(db, SENDER, name, lot_notice(done, check["assignee"], idle_for),
                               kind="event", work_item_id=str(done["id"]), payload=payload)
                 taken.append({"item": done, "agent": check["assignee"],
-                              "message_id": message_id, "kind": "lot", "notified": notified})
+                              "message_id": message_id, "kind": "lot",
+                              "notified": notified, "fallback": fallback})
                 break
     if not queue:
         return taken

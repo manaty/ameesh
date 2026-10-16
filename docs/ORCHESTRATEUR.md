@@ -62,7 +62,10 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   parente), sinon son application (`--app`). Un lot sans équipe connue
   attend l'orchestrateur.
 * Ordre : priorité, puis dates prévues (début, fin, livraison), puis
-  ancienneté. Un orchestrateur ne se sert pas lui-même.
+  ancienneté. Un orchestrateur ne se sert pas lui-même tant qu'un autre
+  preneur est là ; ses candidats passent en dernier et, s'il prend un lot
+  faute d'autre preneur, la note d'attribution porte la trace du repli
+  (#1739).
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
