@@ -33,7 +33,10 @@ class Authority:
 class Database:
     reachable=True
     def __init__(self,dsn='postgresql://controller@localhost/fixture-db'):
-        self.cfg=SimpleNamespace(dsn=dsn)
+        # The release connection names the database and schema the backup
+        # enrollment must match (K7): the factory binds no recovery set whose
+        # source is another database or an unavailable schema.
+        self.cfg=SimpleNamespace(dsn=dsn,schema='public')
     def ping(self):
         if not self.reachable: raise OSError('fixture database unavailable')
     def query(self,sql,params=()):

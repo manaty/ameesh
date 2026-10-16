@@ -13,6 +13,7 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location(
@@ -22,6 +23,9 @@ SPEC.loader.exec_module(recovery)
 
 
 class Database:
+    def __init__(self, schema='public', dsn='postgresql://release:CANARY-RELEASE@localhost/fixture-db'):
+        self.cfg = SimpleNamespace(schema=schema, dsn=dsn)
+
     def ping(self):
         return True
 
@@ -51,6 +55,7 @@ class RecoverySetTest(unittest.TestCase):
         for path in (self.root, self.retention, self.store):
             path.mkdir(mode=0o700)
         self.clock = lambda: 2_000_000.0
+        self.dumped_schemas = []
         self.capacity_path = base / 'restore-capacity.json'
         self.manifest = dict(host='fixture-host', commit='a' * 40, release='a' * 40 + '-' + 'b' * 64,
                              database='fixture-db', units=['ameesh-runner@one.service'],
@@ -99,9 +104,10 @@ class RecoverySetTest(unittest.TestCase):
         path.chmod(0o600)
         return document
 
-    def fake_dump(self, config, output, inventory):
+    def fake_dump(self, config, output, inventory, *, schema=None):
         settings = json.loads(Path(config).read_text())
         self.assertEqual(set(settings), {'dsn'})
+        self.dumped_schemas.append(schema)
         Path(output).write_bytes(b'archive-bytes')
         Path(output).chmod(0o600)
         document = self.write_inventory(output, inventory=inventory)
@@ -144,6 +150,43 @@ class RecoverySetTest(unittest.TestCase):
         self.assertFalse((Path(self.root) / 'release-fixture.set.json').exists())
         self.assertTrue(self.perform('accept'))
         self.assertTrue(self.backup())
+
+    # -- K7: the backup names the migrated database and schema --------------
+    def test_backup_source_and_schema_are_cross_checked_with_the_migrate(self):
+        # The inventory's schema follows the release schema, never a hardcoded
+        # 'public': the migrations write where the dump attests.
+        self.value = recovery.RecoverySet(Database(schema='mesh_fixture'), store=self.store,
+                                          root=self.root, retention=self.retention,
+                                          config=self.config, clock=self.clock)
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore):
+            self.assertTrue(self.perform('backup'))
+        self.assertEqual(self.dumped_schemas, ['mesh_fixture'])
+        # A set enrolled on another database than the migrated one is refused
+        # before any dump: it could not be this release's rollback evidence.
+        elsewhere = dict(self.config, dsn='postgresql://backup:CANARY-DSN@localhost/other-db')
+        with self.assertRaisesRegex(recovery.RecoveryError, 'release database'):
+            recovery.RecoverySet(Database(), store=self.store, root=self.root,
+                                 retention=self.retention, config=elsewhere, clock=self.clock)
+        # Without a release schema the inventory can never bind the migrated one.
+        with self.assertRaisesRegex(recovery.RecoveryError, 'release schema unavailable'):
+            recovery.RecoverySet(Database(schema=''), store=self.store, root=self.root,
+                                 retention=self.retention, config=self.config, clock=self.clock)
+
+    def test_backup_rejects_other_clusters_and_effective_database_overrides(self):
+        sources = (
+            'postgresql://backup@elsewhere/fixture-db',
+            'postgresql://backup@localhost:5433/fixture-db',
+            'postgresql://backup@localhost/fixture-db?dbname=other',
+            'host=localhost dbname=fixture-db dbname=other',
+            'host=localhost hostaddr=192.0.2.1 dbname=fixture-db',
+            'service=elsewhere dbname=fixture-db',
+        )
+        for dsn in sources:
+            with self.subTest(dsn=dsn), self.assertRaisesRegex(recovery.RecoveryError, 'release database'):
+                recovery.RecoverySet(Database(dsn='postgresql://release@localhost:5432/fixture-db'),
+                                     store=self.store, root=self.root,
+                                     retention=self.retention, config=dict(self.config, dsn=dsn))
 
     def test_lost_reply_reconciles_without_a_second_dump_or_restore(self):
         with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump) as dump, \
@@ -395,10 +438,10 @@ class RecoverySetTest(unittest.TestCase):
         autorite, premier = self.controller(stop='pin')
         appels = []
 
-        def dump_once(config, output, inventory):
+        def dump_once(config, output, inventory, *, schema=None):
             appels.append(1)
             source = self.fake_dump if len(appels) == 1 else self.fresh_dump
-            return source(config, output, inventory)
+            return source(config, output, inventory, schema=schema)
 
         with mock.patch.object(recovery.backup, 'snapshot_dump',
                                side_effect=dump_once) as dump, \
@@ -434,13 +477,13 @@ class RecoverySetTest(unittest.TestCase):
         recrée depuis la source vive jusqu'à `accepted`, empreintes fraîches."""
         appels = []
 
-        def dump(config, output, inventory):
+        def dump(config, output, inventory, *, schema=None):
             appels.append(1)
             if len(appels) == 1:
-                return self.fake_dump(config, output, inventory)
+                return self.fake_dump(config, output, inventory, schema=schema)
             if len(appels) == 2:
                 raise recovery.backup.BackupError('panne de dump')
-            return self.fresh_dump(config, output, inventory)
+            return self.fresh_dump(config, output, inventory, schema=schema)
 
         autorite, premier = self.controller(stop='pin')
         with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=dump), \
@@ -474,7 +517,7 @@ class RecoverySetTest(unittest.TestCase):
         self.assertEqual(record['files']['release-fixture.dump'],
                          hashlib.sha256(b'fresh-archive').hexdigest())
 
-    def fresh_dump(self, config, output, inventory):
+    def fresh_dump(self, config, output, inventory, *, schema=None):
         Path(output).write_bytes(b'fresh-archive')
         Path(output).chmod(0o600)
         document = self.write_inventory(output, inventory=inventory)
@@ -492,7 +535,7 @@ class RecoverySetTest(unittest.TestCase):
         for name in self.value._pending('release-fixture')['files']:
             os.utime(Path(self.retention) / name, (stale, stale))
 
-        def fresh_dump(config, output, inventory):
+        def fresh_dump(config, output, inventory, *, schema=None):
             Path(output).write_bytes(b'fresh-archive')
             Path(output).chmod(0o600)
             document = self.write_inventory(output, inventory=inventory)
@@ -515,7 +558,7 @@ class RecoverySetTest(unittest.TestCase):
         restore.assert_not_called()
         return restore
 
-    def compressible_dump(self, config, output, inventory):
+    def compressible_dump(self, config, output, inventory, *, schema=None):
         # A compressed-size check would admit this tiny archive; the pinned
         # uncompressed source size is what bounds the restored copy.
         Path(output).write_bytes(b'x')
