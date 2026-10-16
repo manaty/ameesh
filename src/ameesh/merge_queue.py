@@ -1084,6 +1084,10 @@ def run(cfg, db, args) -> int:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
             project = radar_project(cfg, repo)
+            # #1761 (main, 15/10) : sans projet radar déclaré, `working_clone`
+            # prête un clone jetable et la file s'ouvre depuis un poste agent ou
+            # pilote. #1467 refusait ce cas (branche partie avant #1761) :
+            # l'union garde le comportement fusionné de main.
             clone, scratch = working_clone(cfg, repo, project)
             try:
                 row = enter(db, args.id, repo=repo, actor=args.actor, project=project,

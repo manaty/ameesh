@@ -83,13 +83,36 @@ class CiResults(interface.CiResults):
             """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
 
     def conclude(self, repo, run_id, status) -> bool:
-        rows = self.db.query(
-            """
-            UPDATE ci_runs SET status = %s, concluded_at = now()
-             WHERE repo = %s AND run_id = %s AND status = 'running'
-            RETURNING run_id
-            """, (status, repo, int(run_id)))
-        return bool(rows)
+        from ... import merge_queue, train_events
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE ci_runs SET status = %s, concluded_at = now()
+                 WHERE repo = %s AND run_id = %s AND status = 'running'
+                RETURNING run_id, head_sha, branch
+                """, (status, repo, int(run_id)))
+            if rows and status in ("success", "failure", "cancelled"):
+                # The GitHub integration branch does not encode its target.
+                # Route only through the persisted exact source/head/branch;
+                # neither a lot recipient nor GitHub's default PR base is used.
+                subjects = tx.query(
+                    "SELECT target_key, document->'plan'->>'target' AS target"
+                    " FROM integration_trains"
+                    " WHERE document->'plan'->>'source' = %s"
+                    " AND document->'plan'->>'head' = %s"
+                    " AND document->'plan'->>'branch' = %s",
+                    (merge_queue.normalize_source("github.com/" + repo),
+                     rows[0]["head_sha"], rows[0]["branch"]))
+                for subject in subjects:
+                    project, _, target = subject["target_key"].partition(":")
+                    if target != subject["target"]:
+                        continue
+                    try:
+                        train_events.emit(tx, kind="ci-terminal", project=project, target=target)
+                    except ValueError:
+                        # A legacy/malformed namespace is not a train subject.
+                        pass
+            return bool(rows)
 
     def supersede(self, repo, branch, head_sha, run_id) -> list[dict]:
         # une exécution annulée avant que la suivante soit vue l'est aussi :
