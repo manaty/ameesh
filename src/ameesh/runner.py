@@ -34,6 +34,7 @@ import json
 import math
 import os
 import queue
+import select
 import shutil
 import signal
 import subprocess
@@ -173,6 +174,9 @@ RESIDENT_END_WAIT_S = 5.0
 #: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
 LIVE_REVIEW_EVERY_S = 300.0
 LIVE_REVIEW_IDLE_S = 600.0
+#: L498 : attente maximale du READY du trampoline de cgroup (secondes) —
+#: le placement précède l'exec du harnais, quelques millisecondes en pratique
+TURN_CGROUP_READY_S = 30.0
 #: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
 #: l'alerte `mail_undeliverable` est de 15 min)
 DEAD_LETTER_SWEEP_EVERY_S = 3600.0
@@ -3819,39 +3823,83 @@ class AgentWorker(threading.Thread):
             log_async("[%s] jeton de session indisponible (%s) : les commandes ameesh de la "
                       "session échoueront" % (self.name, db_mod.explain(exc)))
 
-    def _open_turn_resource(self, turn_id: str, pgid: int | None) -> None:
-        """Rattache le groupe du tour (L31, 0028) ; ne casse jamais le tour."""
-        self._turn_open = False
-        self._turn_open = self._attach_resource(turn_id, pgid)
+    @staticmethod
+    def _read_turn_cgroup_ready(fd: int, timeout: float = TURN_CGROUP_READY_S) -> str:
+        """L498 : lit le READY du trampoline sur le descripteur dédié, avec une
+        borne indépendante (le harnais, lui, garde son stdout intact). Rend ""
+        si le signal manque, si le fils est mort avant, ou à l'expiration."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        data = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            try:
+                readable, _, _ = select.select([fd], [], [], remaining)
+            except OSError:
+                return ""
+            if not readable:
+                return ""
+            try:
+                chunk = os.read(fd, 256)
+            except OSError:
+                return ""
+            if not chunk:
+                return ""
+            data += chunk
+            if b"\n" in data:
+                return data.split(b"\n", 1)[0].decode("ascii", "replace")
 
-    def _attach_resource(self, turn_id: str, pgid: int | None) -> bool:
+    def _open_turn_resource(self, turn_id: str, pgid: int | None,
+                            cgroup: str | None = None) -> None:
+        """Rattache le groupe (L31, 0028) et le cgroup (L498) du tour ; ne
+        casse jamais le tour."""
+        self._turn_open = False
+        self._turn_open = self._attach_resource(turn_id, pgid, cgroup=cgroup)
+
+    def _attach_resource(self, turn_id: str, pgid: int | None,
+                         cgroup: str | None = None) -> bool:
         """La ligne de ressource d'un tour, ou d'une vie de processus résident
-        (L76) ; False si elle n'a pas pu être ouverte."""
+        (L76) ; False si elle n'a pas pu être ouverte. Le cgroup délégué du
+        tour (L498) est enregistré après la ligne, s'il y en a un."""
         try:
             from . import containers as containers_mod
             storage.of(self.db).turn_resources.open_turn(
                 turn_id, self.name, self.runner.host, pgid=pgid,
                 label=containers_mod.turn_labels(turn_id, self.name))
-            return True
         except Exception as exc:  # ne casse jamais un tour
             log("[%s] could not attach the resources of turn %s (%s)"
                 % (self.name, turn_id[:8], exc))
             return False
+        if cgroup and not getattr(self.runner, "mediated", False):
+            try:
+                storage.of(self.db).turn_resources.attach_cgroup(turn_id, cgroup)
+            except Exception as exc:  # la propriété locale du cgroup reste entière
+                log("[%s] cgroup %s of turn %s not recorded (%s)"
+                    % (self.name, cgroup, turn_id[:8], exc))
+        return True
 
     def _close_turn_resource(self, turn_id: str, pgid: int | None, *,
-                             survives: bool = False) -> None:
+                             survives: bool = False,
+                             cgroup: str | None = None) -> None:
         """Ferme la ressource du tour ; `orphan` si elle survit (L31, 0028).
 
-        Un groupe encore vivant après l'arrêt escaladé, ou un conteneur qui
-        porte encore l'étiquette du tour, est signalé orphelin : **jamais
-        supprimé** ici."""
-        if not getattr(self, "_turn_open", False):
+        Un groupe encore vivant après l'arrêt escaladé, un cgroup qui ne se
+        vide pas, ou un conteneur qui porte encore l'étiquette du tour, est
+        signalé orphelin : **jamais supprimé** ici. Appelée seulement quand le
+        travail de fond n'est PAS confié au suivi (`background.start`) : le
+        cgroup du tour est alors tué et enlevé, sa latence et son pic mémoire
+        journalisés (L498, mesures)."""
+        recorded = getattr(self, "_turn_open", False)
+        if not recorded and not cgroup:
             return
         self._turn_open = False
-        self._release_resource(turn_id, pgid, survives=survives)
+        self._release_resource(turn_id, pgid, survives=survives, cgroup=cgroup,
+                               recorded=recorded)
 
     def _release_resource(self, turn_id: str, pgid: int | None, *,
-                          survives: bool = False) -> None:
+                          survives: bool = False, cgroup: str | None = None,
+                          recorded: bool = True) -> None:
         from .turn_processes import group_running
         conteneurs: list[str] = []
         runtime = self.runner.container_runtime()
@@ -3860,18 +3908,37 @@ class AgentWorker(threading.Thread):
                 conteneurs = runtime.running_for_turn(turn_id)
             except Exception:  # un moteur indisponible n'est pas un orphelin
                 conteneurs = []
-        orphelin = survives or bool(conteneurs) or group_running(pgid)
-        try:
-            storage.of(self.db).turn_resources.close_turn(
-                turn_id, orphan=orphelin, containers=conteneurs or None)
-        except Exception as exc:  # ne casse jamais la fin d'un tour
-            log("[%s] could not close the resources of turn %s (%s)"
-                % (self.name, turn_id[:8], exc))
-            return
+        emptied = None
+        if cgroup:
+            from .platform import turn_cgroup
+            peak = turn_cgroup.memory_peak(cgroup)
+            started = time.monotonic()
+            try:
+                emptied = turn_cgroup.kill(cgroup)
+            except Exception as exc:
+                log_async("[%s] turn %s cgroup %s not killed (%s)"
+                          % (self.name, turn_id[:8], cgroup, exc))
+                emptied = False
+            log("[%s] turn %s cgroup cleanup: %s in %d ms (memory peak %s)"
+                % (self.name, turn_id[:8],
+                   "emptied and removed" if emptied else "still populated",
+                   int((time.monotonic() - started) * 1000),
+                   "%d bytes" % peak if peak is not None else "unknown"))
+        orphelin = (survives or bool(conteneurs) or group_running(pgid)
+                    or emptied is False)
+        if recorded:
+            try:
+                storage.of(self.db).turn_resources.close_turn(
+                    turn_id, orphan=orphelin, containers=conteneurs or None)
+            except Exception as exc:  # ne casse jamais la fin d'un tour
+                log("[%s] could not close the resources of turn %s (%s)"
+                    % (self.name, turn_id[:8], exc))
+                return
         if orphelin:
             log("[%s] orphan resource of turn %s: %s"
                 % (self.name, turn_id[:8],
-                   ", ".join(conteneurs) if conteneurs else "surviving process group"))
+                   ", ".join(conteneurs) if conteneurs else
+                   (cgroup if emptied is False else "surviving process group")))
 
     # -- L76 : processus résident -----------------------------------------
     def _resident_refusal(self, adapter, audit_exempt: bool) -> str:
@@ -4489,7 +4556,14 @@ class AgentWorker(threading.Thread):
         #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
         #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
         stderr_debut = None
+        #: L498 : cgroup délégué du tour. None = repli PID/PGID (délégation
+        #: absente) ou tour exempté (le scope de l'auditeur est un frère de
+        #: l'unité, hors d'elle : décision de route). Le placement précède
+        #: l'exec du harnais ; un placement refusé refuse le lancement.
+        cgroup_path = None
+        ready_r = ready_w = None
         try:
+            from .platform import turn_cgroup
             with open(stderr_path, "ab") as stderr:
                 stderr_debut = stderr.tell()
                 if cle_resident is not None:
@@ -4500,17 +4574,44 @@ class AgentWorker(threading.Thread):
                         model=model, effort=effort, tier=tier, lot=lot_du_tour,
                         stderr_path=stderr_path)
                 if rp is None:
+                    # L498 : le cgroup délégué ne concerne que le lancement d'un
+                    # harnais par événement ; le processus résident (L76) sert
+                    # plusieurs tours et ne prend pas de cgroup par tour.
+                    if not audit_exempt:
+                        root = self.runner.turn_cgroup_root()
+                        if root is not None:
+                            # Publish creation and ownership together: reconciliation
+                            # must never see a directory before its live turn id.
+                            with self.runner._turn_cgroups_lock:
+                                cgroup_path = turn_cgroup.create(root, turn_id)
+                                if cgroup_path is None:
+                                    log("[%s] turn %s refused: cannot create a turn cgroup "
+                                        "under %s" % (self.name, turn_id[:8], root))
+                                    raise _LancementImpossible(
+                                        "turn cgroup refused: cannot create %s/turn-%s"
+                                        % (root, turn_id))
+                                self.runner._turn_cgroups_live.add(turn_id)
+                            ready_r, ready_w = os.pipe()
                     try:
                         # Le moissonneur de l'exécuteur ne touche jamais un harnais,
                         # même pas pendant son lancement (voir `background`).
                         with self.runner.launch_lock:
+                            if cgroup_path is not None:
+                                commande = turn_cgroup.command(
+                                    cgroup_path, ready_w,
+                                    self.runner.audit_command(
+                                        self.name, argv, self.agent, exempt=False,
+                                        seconds=audit_seconds))
+                            else:
+                                commande = self.runner.audit_command(
+                                    self.name, argv, self.agent, exempt=audit_exempt,
+                                    seconds=audit_seconds)
                             proc = subprocess.Popen(
-                                self.runner.audit_command(self.name, argv, self.agent,
-                                                          exempt=audit_exempt,
-                                                          seconds=audit_seconds),
+                                commande,
                                 cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
                                 text=True, bufsize=1, env=env,
                                 start_new_session=True,  # son groupe : on peut le tuer en entier
+                                pass_fds=(ready_w,) if ready_w is not None else (),
                             )
                             self.runner.harness_pids.add(proc.pid)
                     except RuntimeError as exc:
@@ -4518,6 +4619,12 @@ class AgentWorker(threading.Thread):
                     except OSError as exc:
                         raise _LancementImpossible("could not launch %s: %s"
                                                    % (argv[0], exc.strerror or exc)) from exc
+                    finally:
+                        # Le parent ne garde pas l'écriture : sinon la lecture du
+                        # READY attendrait son propre descripteur jusqu'à la borne.
+                        if ready_w is not None:
+                            os.close(ready_w)
+                            ready_w = None
             if rp is not None:
                 # publié le temps du tour : le veilleur, la perte du bail, la
                 # préemption et l'arrêt le tuent comme un harnais de tour
@@ -4535,10 +4642,22 @@ class AgentWorker(threading.Thread):
                     self.pgid = proc.pid  # start_new_session : le groupe porte son pid
                 # L31 (0028) : rattache le groupe (et l'étiquette des conteneurs) au
                 # tour, pour repérer ce qui survivrait à sa fin.
-                self._open_turn_resource(turn_id, proc.pid)
-            # Le trampoline valide le cgroup AVANT de lancer le harnais.
-            # L'attente de ce signal est bornée par le minuteur indépendant.
-            # Un scope refusé ne consomme aucun courrier.
+                self._open_turn_resource(turn_id, proc.pid, cgroup=cgroup_path)
+                # L498 : le trampoline a validé le placement AVANT d'exec le
+                # harnais ; sans READY, le lancement est refusé — aucun repli
+                # silencieux, aucun courrier consommé.
+                if ready_r is not None:
+                    ready = self._read_turn_cgroup_ready(ready_r)
+                    os.close(ready_r)
+                    ready_r = None
+                    if ready != turn_cgroup.READY:
+                        log("[%s] turn %s refused: turn cgroup placement not validated "
+                            "(missing READY, harness not run)" % (self.name, turn_id[:8]))
+                        raise _LancementImpossible(
+                            "turn cgroup not validated: placement refused or no READY")
+            # Le scope du tour exempté (auditeur) valide son plafond mémoire
+            # AVANT de lancer le harnais ; l'attente du READY est bornée par le
+            # minuteur indépendant. Un scope refusé ne consomme aucun courrier.
             if audit_exempt and (proc.stdout is None
                                  or proc.stdout.readline().strip() != audit_guard.READY):
                 raise _LancementImpossible("auditor scope not validated: memory cap "
@@ -4718,6 +4837,14 @@ class AgentWorker(threading.Thread):
             pgid = self.pgid
             if rp is not None:
                 self._resident_turn_end(rp)
+            # L498 : les descripteurs du READY ne survivent pas au tour (le
+            # descripteur d'écriture est déjà fermé après le Popen).
+            if ready_r is not None:
+                os.close(ready_r)
+                ready_r = None
+            if ready_w is not None:
+                os.close(ready_w)
+                ready_w = None
             # Fin NORMALE (harnais fini et moissonné, aucun arrêt d'urgence) :
             # ce qui tourne encore — processus du groupe, conteneurs du tour
             # sans lot — garde un délai de grâce (`background`). Sinon, ou
@@ -4729,7 +4856,8 @@ class AgentWorker(threading.Thread):
                         and not self.runner.once and self.turn_grace_seconds() > 0
                         and not self._urgent_end()):
                     fond = self.runner.background.survivors(
-                        turn_id, pgid, handles=background_handles)
+                        turn_id, pgid, handles=background_handles,
+                        cgroup=cgroup_path)
             except Exception as exc:  # dans le doute, le nettoyage d'avant
                 log_async("[%s] background work of turn %s not examined (%s)"
                           % (self.name, turn_id[:8], exc))
@@ -4751,7 +4879,7 @@ class AgentWorker(threading.Thread):
                 self.runner.background.start(
                     agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
                     containers=fond[1], grace_s=self.turn_grace_seconds(),
-                    handles=background_handles)
+                    handles=background_handles, cgroup=cgroup_path)
             elif rp is None:
                 if background_handles:
                     from .background import Entry
@@ -4764,7 +4892,13 @@ class AgentWorker(threading.Thread):
                                     unverified=handoff_failed or any(
                                         h.live() for h in background_handles.values()))
                     cleanup_survives |= self.runner.background._kill(cleanup)
-                self._close_turn_resource(turn_id, pgid, survives=cleanup_survives)
+                self._close_turn_resource(turn_id, pgid, survives=cleanup_survives,
+                                          cgroup=cgroup_path)
+            # Le cgroup du tour a été soit confié au suivi (`background.start`,
+            # qui l'a enregistré), soit tué et fermé ci-dessus : il n'est plus
+            # « ouvert » pour la réconciliation.
+            with self.runner._turn_cgroups_lock:
+                self.runner._turn_cgroups_live.discard(turn_id)
             self._background_handles = None
             self._menage_apres_tour(menage_tour, turn_id, spec)
             if conversation_recorder is not None:
@@ -5511,6 +5645,16 @@ class Runner:
         #: compris : `launch_lock`)
         from . import background as background_mod
         self.background = background_mod.Tracker(self, log=log_async)
+        #: L498 : racine cgroup déléguée de cette unité (None = repli
+        #: PID/PGID), sondée une fois — le réglage d'unité ne change pas
+        #: sans redémarrage de l'exécuteur
+        self._turn_cgroup_root: str | None = None
+        self._turn_cgroup_probed = False
+        #: L498 : tours de CE processus dont le cgroup est ouvert (posé au
+        #: lancement, retiré en fin de tour) — la réconciliation ne tue
+        #: jamais un cgroup encore vivant
+        self._turn_cgroups_live: set[str] = set()
+        self._turn_cgroups_lock = threading.Lock()
         #: #453 : une suite de tests lancée hors `ameesh heavy` a le plafond
         #: de durée d'une commande lourde
         from . import suite_cap
@@ -7513,6 +7657,85 @@ class Runner:
                 texte = "host not ready: %s" % exc
             log("harness %s (%s): %s" % (harness, ", ".join(sorted(noms)), texte))
 
+    def turn_cgroup_root(self) -> str | None:
+        """L498 : la racine cgroup déléguée de cette unité, ou None (repli
+        PID/PGID : hôte non Linux, délégation absente, racine non inscriptible,
+        `DelegateSubgroup=runner` manquant). Sondée une fois par exécuteur et
+        journalisée une fois — le code reste inerte là où la délégation n'est
+        pas posée."""
+        if not self._turn_cgroup_probed:
+            from .platform import turn_cgroup
+            root, reason = turn_cgroup.root_for_runner()
+            self._turn_cgroup_root = root
+            # Publish readiness only after the result, including to workers
+            # probing concurrently: a pending probe is not a PID/PGID fallback.
+            self._turn_cgroup_probed = True
+            if root is None:
+                log("per-turn cgroup unavailable (%s): keeping PID/PGID ownership"
+                    % reason)
+            else:
+                log("per-turn cgroup: delegated root %s" % root)
+        return self._turn_cgroup_root
+
+    def _live_turn_ids(self) -> set | None:
+        """Les tours de CE processus encore ouverts : cgroup posé au lancement
+        et pas encore clos, et travail de fond en grâce. None si le suivi du
+        fond est illisible : on ne tue alors rien à l'aveugle."""
+        with self._turn_cgroups_lock:
+            live = set(self._turn_cgroups_live)
+        try:
+            with self.background.lock:
+                live.update(entry.turn_id for entry in self.background.entries
+                            if entry.state == "running")
+        except Exception as exc:  # jamais de nettoyage sur un état inconnu
+            log_async("turn cgroups not reconciled: background state unreadable (%s)"
+                      % exc)
+            return None
+        return live
+
+    def reconcile_turn_cgroups(self, *, startup: bool = False) -> int:
+        """L498 : enlève les cgroups `turn-*` de la racine déléguée qui n'ont
+        plus de tour ouvert dans ce processus — au démarrage (`startup`, ce
+        qu'un exécuteur mort a laissé : orphelins préexistants) et au passage
+        périodique (nouveaux). Un cgroup dont le tour est en cours, ou dont le
+        travail de fond est suivi, est laissé. `cgroup.kill` puis
+        `populated 0` puis `rmdir` ; ce qui ne se vide pas est signalé avec
+        son chemin, jamais enlevé de force. Ne lève jamais."""
+        root = self.turn_cgroup_root()
+        if root is None:
+            return 0
+        from .platform import turn_cgroup
+        # Fail-closed : un état du fond illisible ne balaie rien, donc on le
+        # sonde AVANT d'énumérer. L'énumération précède la prise de référence
+        # qui décide : un tour créé pendant l'énumération est dans `live`, un
+        # tour créé après est absent des chemins. Création et publication
+        # partagent `_turn_cgroups_lock` avec la référence.
+        if self._live_turn_ids() is None:
+            return 0
+        paths = turn_cgroup.orphans(root)
+        live = self._live_turn_ids()
+        if live is None:
+            return 0
+        killed = 0
+        for path in paths:
+            turn_id = turn_cgroup.turn_id_of(path.rsplit("/", 1)[-1])
+            if not turn_id or turn_id in live:
+                continue
+            origine = "pre-existing" if startup else "new"
+            try:
+                emptied = turn_cgroup.kill(path)
+            except Exception as exc:
+                log_async("turn cgroup %s (%s) not reconciled (%s)"
+                          % (path, origine, exc))
+                continue
+            if emptied:
+                killed += 1
+                log("turn cgroup %s (%s orphan): killed and removed" % (path, origine))
+            else:
+                log_async("turn cgroup %s (%s orphan) could not be emptied; "
+                          "reported, nothing deleted" % (path, origine))
+        return killed
+
     def report_boot_orphans(self) -> list[dict]:
         """Après une coupure (L106) : les ressources de tour de CET hôte encore
         `running` (ou déjà `orphan`) ouvertes AVANT le démarrage de l'hôte n'ont
@@ -7811,6 +8034,7 @@ class Runner:
         self.log_harnesses()
         self.report_boot_orphans()
         self.settle_dead_turns()
+        self.reconcile_turn_cgroups(startup=True)  # L498 : cgroups d'un exécuteur mort
         reprise = Reprise(self.db_retry_max)
         code = 0
         try:
@@ -7834,6 +8058,7 @@ class Runner:
                     self.report_boot_orphans()      # #220 r2 : solde différé
                 if time.monotonic() >= self.live_review_at:
                     self.settle_dead_turns()        # #339
+                    self.reconcile_turn_cgroups()   # L498
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
