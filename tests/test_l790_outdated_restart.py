@@ -172,7 +172,10 @@ class SelectedTurnRefusedTest(unittest.TestCase):
             draining=threading.Event(), restart_for_stale=True, runner_id="runner-1")
         worker = types.SimpleNamespace(
             runner=runner, db=object(), name="perime", epoch=1, fast_failure=True)
+        # #1462 : run_turn lit d'abord la pause opérateur dans le registre —
+        # agent non pausé ici, la doublure de base ne porte pas de requêtes.
         with mock.patch.object(registry, "restore_prompt", return_value=True) as restore, \
+                mock.patch.object(registry, "get", return_value={}), \
                 mock.patch.object(registry, "set_status") as set_status:
             self.assertFalse(runner_mod.AgentWorker.run_turn(worker, {}))
         restore.assert_called_once_with(worker.db, "perime", "runner-1", 1)
