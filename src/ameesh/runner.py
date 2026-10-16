@@ -5803,6 +5803,7 @@ class Runner:
         #: au plus `drain_seconds` ; un second signal arrête tout de suite
         self.drain_seconds = max(0.0, float(getattr(cfg, "drain_seconds", 1800.0)))
         self.draining = threading.Event()
+        self._stop_signal_received = False
         self._drain_deadline = 0.0
         self._drain_since = 0.0
         self._drain_woken = False
@@ -6570,6 +6571,7 @@ class Runner:
         ordinaire (`systemctl restart`) ne tue donc plus le tour en cours.
         Second signal, borne nulle, ou passage unique : arrêt immédiat, comme
         avant (tour arrêté, consigne remise en attente)."""
+        self._stop_signal_received = True
         if self.once or self.drain_seconds <= 0 or self.draining.is_set():
             immediat = self.draining.is_set()
             self.stop.set()
@@ -7470,11 +7472,13 @@ class Runner:
     def stop_on_signal(self) -> bool:
         """L2009 : un signal d'arrêt a-t-il déjà été traité ?
 
-        `stop` ne dit rien ici : `shutdown` le pose dans tous les cas. Seuls le
-        drainage (premier SIGTERM d'un exécuteur classique, `draining`) et le
-        retrait médié (`sigterm_requested`) témoignent d'un signal reçu ; le
-        remplacement d'image (L790) s'interdit alors de se remplacer."""
-        return self.draining.is_set() or bool(self.sigterm_requested)
+        `stop` ne dit rien ici : `shutdown` le pose dans tous les cas. Le
+        marqueur de `request_stop` conserve aussi l'arrêt immédiat (drainage
+        nul ou passage unique), qui ne pose pas `draining`. Le retrait médié
+        pose `sigterm_requested`. Le remplacement d'image s'interdit alors
+        de se remplacer."""
+        return (bool(getattr(self, "_stop_signal_received", False))
+                or self.draining.is_set() or bool(self.sigterm_requested))
 
     def _sigterm_drained(self) -> bool:
         """Retrait engagé par SIGTERM et terminé (aucun bail détenu). Engage

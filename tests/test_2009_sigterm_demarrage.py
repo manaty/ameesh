@@ -193,6 +193,24 @@ class RunnerStopOnSignalTest(unittest.TestCase):
     def test_retrait_medie(self):
         self.assertTrue(self._runner(sigterm_requested=True).stop_on_signal())
 
+    def test_signal_sans_drainage_apres_shutdown_ne_se_remplace_pas(self):
+        for once, drain_seconds in ((False, 0), (True, 120)):
+            with self.subTest(once=once, drain_seconds=drain_seconds):
+                runner = self._runner(once=once, drain_seconds=drain_seconds,
+                                      stop=threading.Event(), wake_all=threading.Event())
+                # shutdown a déjà posé stop après le choix EXIT_RESTART.
+                runner.stop.set()
+                with mock.patch.object(runner_mod, "log_async"), \
+                        mock.patch.object(runner_mod, "_restart_with_installed_code") as restart:
+                    runner.request_stop(signal.SIGTERM)
+                    self.assertEqual(runner_mod._replace_image_or_stop(runner), 0)
+                restart.assert_not_called()
+
+    def test_shutdown_sans_signal_ne_bloque_pas_le_remplacement(self):
+        runner = self._runner(stop=threading.Event())
+        runner.stop.set()
+        self.assertFalse(runner.stop_on_signal())
+
 
 #: #2009 : injecté par `PYTHONPATH` dans le processus de l'exécuteur. La
 #: connexion de démarrage est ralentie UNE fois (marqueur), pour que le test y
