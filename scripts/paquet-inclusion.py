@@ -14,7 +14,7 @@ non plus, puisqu'un revert laisse la tête du lot ancêtre de la tête du paquet
 
 * la liste des lots **attendus** à la coupure (admissions et routages du
   pilote) : `--expected`, `--expected-file`, ou une section « admissions » du
-  manifeste (titre contenant « admission ») ;
+  manifeste (titre contenant « admission », liste ou tableau) ;
 * les lignes de **composition du manifeste** (table dont l'en-tête porte une
   colonne « lot » et une colonne « commit »), et les **retraits** consignés
   (lignes de la table de composition dont la note dit retrait/revert/report,
@@ -36,8 +36,10 @@ lot (contenu absent), et un contenu qui réapparaît pour un lot pourtant retir�
 donne un avertissement.
 
 Sortie : un rapport lisible, ou `--json` (schéma `ameesh-paquet-inclusion/1`).
-Code de retour : 0 si aucun défaut, 1 si une omission ou un contenu manquant
-n'est expliqué par aucune note de retrait/report, 2 si l'entrée est invalide.
+Codes de retour : 0 si aucun défaut ; 1 si une inclusion manquante, un contenu
+absent non expliqué ou un commit introuvable, ou bien, sous `--strict`, un
+contenu partiel ou vide non expliqué ; 2 si l'entrée est invalide (manifeste ou
+tête introuvable, ou aucune liste attendue sans `--no-expected`).
 Le script est en lecture seule : aucun réseau, aucune écriture dans le dépôt.
 """
 
@@ -65,6 +67,10 @@ NEGATIVE_RE = re.compile(
 )
 EXCLUSION_ROW_RE = re.compile(r"retrait|retir[ée]e?s?|revert|report", re.IGNORECASE)
 ADMISSION_HEADING_RE = re.compile(r"admission", re.IGNORECASE)
+NO_ADMISSION_HEADING_RE = re.compile(
+    r"(sans|aucun|aucune|pas de|pas d['’])\s*(section\s+)?(d['’]\s*)?admissions?",
+    re.IGNORECASE,
+)
 RETRAIT_HEADING_RE = re.compile(r"retrait|report|exclusion", re.IGNORECASE)
 
 
@@ -184,8 +190,18 @@ def parse_manifest(path: Path) -> Manifest:
     manifest = Manifest(path=path)
     composed_found = False
     seen_lines: set[int] = set()
+    admissions: list[int] = []
 
     for heading, block in iter_tables(lines):
+        if ADMISSION_HEADING_RE.search(heading) \
+                and not NO_ADMISSION_HEADING_RE.search(heading):
+            # Une section d'admissions écrite en tableau fournit la liste
+            # attendue ; elle n'est jamais lue comme une composition, même si
+            # ses colonnes s'appellent « lot » et « commit » (#1655 N2).
+            for line_no, line in block[2:]:
+                admissions.extend(int(found) for found in ID_RE.findall(line))
+                seen_lines.add(line_no)
+            continue
         header = [cell.lower() for cell in split_row(block[0][1])]
         is_retrait = any("retir" in cell or "revert" in cell for cell in header)
         is_compo = (
@@ -247,13 +263,15 @@ def parse_manifest(path: Path) -> Manifest:
 
     # Sections : admissions de la coupure (liste attendue) et retraits en prose.
     heading = ""
-    admissions: list[int] = []
     in_admissions = False
     for line_no, line in enumerate(lines, start=1):
         match = HEADING_RE.match(line)
         if match:
             heading = match.group(2)
-            in_admissions = bool(ADMISSION_HEADING_RE.search(heading))
+            in_admissions = bool(
+                ADMISSION_HEADING_RE.search(heading)
+                and not NO_ADMISSION_HEADING_RE.search(heading)
+            )
             continue
         if line_no in seen_lines or TABLE_ROW_RE.match(line):
             continue
@@ -316,15 +334,26 @@ def parse_name_status(data: bytes) -> list[tuple[str, str]]:
 
 
 def parse_added(patch: bytes) -> dict[str, list[str] | None]:
-    """{chemin: lignes ajoutées} (None = binaire) depuis un diff unifié -U0."""
+    """{chemin: lignes ajoutées} (None = binaire) depuis un diff unifié -U0.
+
+    Les en-têtes `---`/`+++` ne sont lus qu'**hors hunk** : une ligne ajoutée
+    qui commence par « ++ » produit une ligne de diff « +++ … » et ne doit pas
+    être prise pour un en-tête de fichier (#1655 N3).
+    """
     result: dict[str, list[str] | None] = {}
     path: str | None = None
+    in_hunk = False
     lines = patch.decode("utf-8", "surrogateescape").splitlines()
-    index = 0
-    while index < len(lines):
-        line = lines[index]
+    for line in lines:
         if line.startswith("diff --git "):
             path = None
+            in_hunk = False
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk:
+            if line.startswith("+"):
+                if path is not None:
+                    result.setdefault(path, []).append(line[1:])
         elif line.startswith("+++ "):
             candidate = line[4:].strip()
             if candidate != "/dev/null":
@@ -338,10 +367,6 @@ def parse_added(patch: bytes) -> dict[str, list[str] | None]:
         elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):
             if path is not None:
                 result[path] = None
-        elif line.startswith("+") and not line.startswith("+++"):
-            if path is not None:
-                result.setdefault(path, []).append(line[1:])
-        index += 1
     return result
 
 
@@ -423,6 +448,12 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
             )
             continue
         added = added_by_path.get(path)
+        if added is None and path not in added_by_path \
+                and blob_id(repo, parent, path) == blob_id(repo, commit, path):
+            # Aucun hunk pour ce chemin et blobs identiques : changement de mode
+            # seul (bit exécutable), sans delta de contenu — ce n'est pas un
+            # binaire (#1655 N1).
+            added = []
         if added is None:
             checks.append(
                 PathCheck(
@@ -531,6 +562,15 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     expected = collect_ids(args.expected, args.expected_file)
     if not expected and manifest.admissions:
         expected = list(manifest.admissions)
+    if not expected and not args.no_expected:
+        # Sans liste attendue, le contrôle « admissions × manifeste » ne peut
+        # pas conclure : une sortie 0 laisserait croire qu'il a eu lieu
+        # (#1655 N1). --no-expected l'assume explicitement.
+        raise InputError(
+            "aucun lot attendu : fournir --expected, --expected-file ou une "
+            "section « admissions » au manifeste, ou assumer le contrôle "
+            "partiel avec --no-expected"
+        )
     excused = {
         lot: "reporté (déclaré hors manifeste)"
         for lot in collect_ids(args.excused, args.excused_file)
@@ -688,7 +728,8 @@ def render(payload: dict) -> str:
     else:
         out.append(
             "Attendus : aucun — contrôle « admissions × manifeste » NON effectué "
-            "(fournir --expected, --expected-file ou une section « admissions »)"
+            "(--no-expected ; fournir --expected, --expected-file ou une section "
+            "« admissions »)"
         )
     out.append("")
 
@@ -819,7 +860,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="fichier de lots reportés/retirés hors manifeste")
     parser.add_argument("--json", action="store_true", help="sortie JSON")
     parser.add_argument("--strict", action="store_true",
-                        help="un contenu partiel compte comme un défaut bloquant")
+                        help="un contenu partiel ou vide compte comme un défaut "
+                             "bloquant")
+    parser.add_argument("--no-expected", dest="no_expected", action="store_true",
+                        help="assumer un contrôle sans liste attendue (admissions "
+                             "non vérifiées)")
     args = parser.parse_args(argv)
 
     for value in args.expected:
