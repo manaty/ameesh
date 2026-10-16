@@ -67,6 +67,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -81,6 +82,8 @@ PARTS_TIMEOUT = 300
 #: N4 de #1666 : délai de moisson après la mort du groupe — un petit-fils
 #: échappé de la session retiendrait les tubes plus longtemps sans effet utile
 PARTS_REAP_TIMEOUT = 10
+#: plafond du plan écrit par le sélecteur, lu par l'hôte (`_plan_file`)
+PLAN_MAX_BYTES = 1 << 20
 #: N2 de #1666 : durée de vie (s) d'une preuve mise en cache. La preuve est
 #: une fonction pure du couple (commit de base, tête gelée) et du contrat ;
 #: au-delà du délai elle est élaguée et recalculée, sans effet sur la porte.
@@ -323,12 +326,34 @@ def sandbox_ready(bwrap: str) -> str | None:
 
 def _plan_file(path: str, plan) -> tuple:
     """Le champ `due` du plan écrit à `path`, vérifié (schéma, liste de noms
-    non vides, sans doublon)."""
+    non vides, sans doublon).
+
+    `path` est dans un répertoire inscriptible du bac à sable : le sélecteur
+    (code de la cible) choisit ce qui s'y trouve, mais c'est l'hôte qui le lit.
+    Seul un fichier ordinaire est lu, sans suivre de lien (un lien vers un
+    fichier de l'hôte serait lu hors du bac à sable), sans bloquer (une FIFO
+    figerait l'admission) et dans la limite de `PLAN_MAX_BYTES`."""
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise PartsError("the selector wrote no readable plan at %s: %s" % (path, exc)) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PartsError("the selector's plan at %s is not a regular file" % path)
+        if info.st_size > PLAN_MAX_BYTES:
+            raise PartsError("the selector's plan at %s exceeds %d bytes" % (path, PLAN_MAX_BYTES))
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            raw = handle.read(PLAN_MAX_BYTES + 1)
+        if len(raw) > PLAN_MAX_BYTES:
+            raise PartsError("the selector's plan at %s exceeds %d bytes" % (path, PLAN_MAX_BYTES))
+        data = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError) as exc:
         raise PartsError("the selector wrote no readable plan at %s: %s" % (path, exc)) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not isinstance(data, dict):
         raise PartsError("the selector's plan is not a JSON object")
     schema = data.get("schema")

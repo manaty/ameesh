@@ -865,3 +865,46 @@ class RealSandboxTest(_Contract):
         proof = ci_parts.due(self.project, tip, self.base(), self.repo)
         self.assertEqual(proof["due"], ("lot/backend-suite",))
         self.assertEqual(proof["schema"], "test-lot-plan/1")
+
+
+class PlanFileTest(unittest.TestCase):
+    """Le plan est écrit par le sélecteur (code de la cible) dans un répertoire
+    inscriptible du bac à sable, puis lu par l'hôte : seul un fichier ordinaire
+    borné est lu, jamais un lien ni une FIFO."""
+
+    PLAN = mock.Mock(schema="test-lot-plan/1", due="due")
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="test-1666-plan-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.path = os.path.join(self.dir, "plan.json")
+
+    def write(self, path, data):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    def test_a_regular_plan_is_read(self):
+        self.write(self.path, {"schema": "test-lot-plan/1", "due": ["backend"]})
+        self.assertEqual(ci_parts._plan_file(self.path, self.PLAN),
+                         ("test-lot-plan/1", ("backend",)))
+
+    def test_a_link_to_a_host_file_is_not_followed(self):
+        host = os.path.join(self.dir, "host-file.json")
+        self.write(host, {"schema": "test-lot-plan/1", "due": []})
+        os.symlink(host, self.path)
+        with self.assertRaisesRegex(ci_parts.PartsError, "no readable plan"):
+            ci_parts._plan_file(self.path, self.PLAN)
+
+    def test_a_fifo_is_refused_without_blocking(self):
+        os.mkfifo(self.path)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ci_parts.PartsError, "not a regular file"):
+            ci_parts._plan_file(self.path, self.PLAN)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_an_oversized_plan_is_refused(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(" " * (ci_parts.PLAN_MAX_BYTES + 1))
+        with self.assertRaisesRegex(ci_parts.PartsError, "exceeds"):
+            ci_parts._plan_file(self.path, self.PLAN)
