@@ -4,12 +4,13 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import backlog, canon, cli, lot_workdir, mail, registry, storage, work
+from ameesh import backlog, canon, cli, lot_workdir, mail, rate_limit, registry, storage, work
 from ameesh.runner import AgentWorker
 
 from . import test_l165c_sessions_par_lot as sessions
@@ -375,3 +376,38 @@ class FitTest(unittest.TestCase):
         self.assertTrue(backlog.lot_fits({'app': 'nexlink', 'lot_team': 'ameesh'}, multi))
         self.assertFalse(backlog.lot_fits({'app': 'autre', 'lot_team': 'ameesh'}, multi))
         self.assertTrue(backlog.lot_fits({'lot_team': 'ameesh'}, multi))   # sans app
+
+
+class DoublurePartielleSansCfgTest(unittest.TestCase):
+    """#811 x #1270 (paquet 1700) : `_pick` ne doit pas exiger `cfg`.
+
+    La classe documente les constructions partielles (`__new__` sans
+    `__init__`, doublures de test) : sans `cfg`, la lecture du courrier reste
+    simple — aucun canon à charger, donc rien à retenir. Rouge avant le
+    correctif (AttributeError `cfg` sur la doublure de `TourDeRepriseTest`)."""
+
+    def _worker(self) -> AgentWorker:
+        w = AgentWorker.__new__(AgentWorker)
+        threading.Thread.__init__(w, name="rlx", daemon=True)  # jamais démarré
+        w.db, w.epoch = object(), 1
+        w.runner = SimpleNamespace(runner_id="r", idle_nudge=1200.0,
+                                   gate_holds=lambda: False, host_pressure=lambda: {})
+        w.rate_limit, w.rate_limit_streak = rate_limit.RATE_LIMITED, 1
+        w.rate_limit_since, w.rate_limit_retry_at = time.time() - 60, time.time() + 60
+        w.nudged, w.last_activity = True, time.monotonic()
+        w._session_en_attente, w.suite, w._reprise_attach = None, None, False
+        return w
+
+    def test_pick_sans_cfg_lit_le_courrier_simplement(self):
+        w = self._worker()
+        oui, non = mock.Mock(return_value=True), mock.Mock(return_value=False)
+        with mock.patch.multiple(w, _marque_base=non, maybe_relocate=non, budget_ok=oui,
+                                 _held_by_pressure=non, _host_pressure_release=mock.Mock(),
+                                 host_ready=oui, workdir_ready=oui, auth_ready=oui,
+                                 _lot_wake_spec=mock.Mock(return_value=None)), \
+                mock.patch("ameesh.runner.registry.get", return_value={"status": "blocked"}), \
+                mock.patch("ameesh.runner.registry.take_pending_prompt", return_value=None), \
+                mock.patch("ameesh.runner.mail.unread_urgent", return_value=[]), \
+                mock.patch("ameesh.runner.mail.unread", return_value=[]), \
+                mock.patch("ameesh.runner.account_turn.continuity", return_value=True):
+            self.assertIsNone(w._pick())

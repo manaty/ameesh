@@ -161,6 +161,8 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None) 
             "urgent": mail.unread_urgent}[mode]
     name = agent.get("name")
     besoin = max(1, int(besoin))
+    if cfg is None:                   # construction partielle : lecture simple
+        return lire(db, name, limit=besoin)
     if len(projects.agent_projects(agent)) < 2:
         return lire(db, name, limit=besoin)
     canons = None

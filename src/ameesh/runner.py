@@ -3743,7 +3743,11 @@ class AgentWorker(threading.Thread):
         # #811 (B1/R3) : un urgent d'un lot retenu attend comme les autres, et
         # le préfixe retenu ne le masque plus ; les messages primaires passent.
         from . import lot_workdir
-        urgents = lot_workdir.deliverable_unread(self.cfg, self.db, self.agent,
+        # Une construction partielle documentée (`__new__` sans `__init__`,
+        # doublures de test #1270) n'a pas de `cfg` : sans lui, la lecture du
+        # courrier reste simple — aucun canon à charger, rien à retenir.
+        cfg = getattr(self, "cfg", None)
+        urgents = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
                                                   besoin=50, mode="urgent",
                                                   deferred=self._lot_deferred)
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
@@ -3782,13 +3786,13 @@ class AgentWorker(threading.Thread):
         # #811 (B1/R3) : le courrier d'un lot retenu attend, les autres
         # messages du tour passent — et la lecture franchit un préfixe retenu
         # qui masquerait un message remisable plus récent.
-        messages = lot_workdir.deliverable_unread(self.cfg, self.db, self.agent,
+        messages = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
                                                    besoin=mail.UNREAD_LIMIT,
                                                    deferred=self._lot_deferred)
         if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
             # L125 : boîte pleine de courrier passif — les messages qui
             # réveillent, plus récents, ne doivent pas y rester invisibles
-            reveil = lot_workdir.deliverable_unread(self.cfg, self.db, self.agent,
+            reveil = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
                                                      besoin=mail.UNREAD_LIMIT,
                                                      mode="active",
                                                      deferred=self._lot_deferred)
