@@ -47,17 +47,33 @@ class FleetLineTest(unittest.TestCase):
 
 
 class FleetCommandTest(unittest.TestCase):
-    def run_fleet(self, readings, *, json_out=False):
+    def run_fleet(self, readings, *, json_out=False, send=None, code=0, err=None):
         store = mock.MagicMock()
         store.hosts.current.return_value = readings
         store.hosts.since.return_value = []
-        args = argparse.Namespace(host=None, json=json_out)
+        args = argparse.Namespace(host=None, json=json_out, send=send)
         out = io.StringIO()
         with mock.patch.object(storage, "of", return_value=store), \
                 mock.patch.object(mesh_cli.time, "time", return_value=10_000.0), \
-                contextlib.redirect_stdout(out):
-            self.assertEqual(mesh_cli._host_fleet(None, [], args), 0)
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err or io.StringIO()):
+            self.assertEqual(mesh_cli._host_fleet("db", [], args), code)
         return out.getvalue()
+
+    def test_send_mails_the_summary_as_printed(self):
+        with mock.patch.object(mesh_cli.mail, "send") as send:
+            text = self.run_fleet([reading("ci-1", 60 * GIB)], send=["bureau"])
+        send.assert_called_once_with("db", "ameesh", "bureau", text.rstrip("\n"),
+                                     kind="notify")
+
+    def test_send_failure_exits_non_zero_and_says_so(self):
+        err = io.StringIO()
+        with mock.patch.object(mesh_cli.mail, "send",
+                               side_effect=[RuntimeError("db down"), 7]) as send:
+            self.run_fleet([reading("ci-1", 60 * GIB)], send=["bureau", "owner"],
+                           code=1, err=err)
+        self.assertEqual(send.call_count, 2)
+        self.assertIn("not sent to bureau (RuntimeError: db down)", err.getvalue())
 
     def test_hosts_to_look_at_first(self):
         text = self.run_fleet([reading("ci-1", 60 * GIB),

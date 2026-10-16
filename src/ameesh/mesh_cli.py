@@ -705,10 +705,26 @@ def _host_fleet(db, canons, args) -> int:
         for line in lines:
             print(json.dumps(line, ensure_ascii=False, sort_keys=True))
         return 0
-    print("fleet: %d host(s), %d to look at" % (len(lines), sum(not l["ok"] for l in lines)))
-    for line in lines:
-        print("  " + _fleet_text(line))
-    return 0
+    text = "\n".join(["fleet: %d host(s), %d to look at"
+                      % (len(lines), sum(not l["ok"] for l in lines))]
+                     + ["  " + _fleet_text(line) for line in lines])
+    print(text)
+    # #2022: the daily summary, mailed as is to each recipient's thread (the
+    # bureau's, read by the owner); any failure exits non-zero so the timer
+    # unit shows failed instead of losing the summary
+    failed = 0
+    for name in getattr(args, "send", None) or ():
+        try:
+            mail.send(db, FLEET_SENDER, name, text, kind="notify")
+        except Exception as exc:
+            failed += 1
+            print("ameesh hosts --fleet: not sent to %s (%s: %s)"
+                  % (name, type(exc).__name__, exc), file=sys.stderr)
+    return 1 if failed else 0
+
+
+#: #2022: the sender of the mailed fleet summary
+FLEET_SENDER = "ameesh"
 
 
 def _fleet_text(line: dict) -> str:
@@ -2404,6 +2420,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_hosts.add_argument("--fleet", action="store_true",
                          help="fleet summary: one line per host, stale readings, disk, "
                               "zombies, the hosts to look at first (#2022)")
+    p_hosts.add_argument("--send", action="append", default=None, metavar="NAME",
+                         help="with --fleet: also mail the summary to NAME's thread "
+                              "(repeatable); exits 1 if a send fails (#2022)")
     p_hosts.add_argument("--hold", action="store_true",
                          help="hold HOST on purpose (#254): alerts and nudges about its "
                               "agents stay quiet until --until (required, 24 h at most)")
