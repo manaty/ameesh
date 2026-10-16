@@ -75,8 +75,9 @@ class RegistreLocalTest(unittest.TestCase):
             if os.access(parent, os.X_OK):
                 self.skipTest("compte privilégié : permissions non opposables")
             out = []
-            self.assertEqual(exploitation._gate_alerts(
-                self.cfg, [], 1000.0, unreadable=out), [])
+            alerts = exploitation._gate_alerts(self.cfg, [], 1000.0, unreadable=out)
+            # #2127 : la famille est nommée, et l'alerte dédiée dit la porte non lue
+            self.assertEqual([a["type"] for a in alerts], ["host_gate_unreadable"])
             self.assertEqual(out, [availability.GATE_FAMILY])
         finally:
             os.chmod(parent, 0o700)
@@ -84,11 +85,14 @@ class RegistreLocalTest(unittest.TestCase):
     def test_gate_alerts_avale_l_erreur_et_nomme_la_famille(self):
         out = []
         with mock.patch.object(availability, "local_alerts", side_effect=OSError("registre")):
-            self.assertEqual(exploitation._gate_alerts(self.cfg, [], 1000.0, unreadable=out), [])
+            alerts = exploitation._gate_alerts(self.cfg, [], 1000.0, unreadable=out)
+        self.assertEqual([a["type"] for a in alerts], ["host_gate_unreadable"])
         self.assertEqual(out, [availability.GATE_FAMILY])
-        # sans liste de sortie, la famille reste silencieuse comme avant
+        # sans liste de sortie, la famille ne peut pas être nommée ; l'alerte
+        # dédiée (#2127) dit quand même la porte non lue
         with mock.patch.object(availability, "local_alerts", side_effect=OSError("registre")):
-            self.assertEqual(exploitation._gate_alerts(self.cfg, [], 1000.0), [])
+            alerts = exploitation._gate_alerts(self.cfg, [], 1000.0)
+        self.assertEqual([a["type"] for a in alerts], ["host_gate_unreadable"])
 
 
 class AcquittementTest(PgTestCase):
