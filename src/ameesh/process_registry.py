@@ -47,6 +47,16 @@ Ce que le registre garantit, dans UNE transaction :
    ne se rouvre jamais, y compris par adoption de workflow.
    Les lots **sans workflow** ne passent pas par ici : `workflow-absent`,
    leur comportement (`work.move`) est inchangé.
+9. **Les cœurs libérés portent leurs effets de bord** : une avance vers
+   `merged`, `promoted` ou `closed` rend la réservation de migration (#956),
+   écrit sa ligne au journal, et réveille les dépendants (L385) — le premier
+   passage seulement — sous le verrou de graphe pris avant le lot, comme
+   `work.close`/`close_merged`. Le cœur `closed` exige la fermeture dans
+   l'évidence (`close_reason` parmi `abandoned`, `superseded` — avec
+   `superseded_by` —, `delivered` — avec la tête `sha`), pose
+   `close_reason`/`superseded_by` et les jalons `closed`/`delivered` : ce que
+   `work.close` refuse désormais à un lot pinné (N8) est fait ici, dans la
+   même transaction.
 
 Protocole `WorkflowSpec` (structurel, l'artefact de la tranche A le satisfait) :
 
@@ -56,6 +66,14 @@ Protocole `WorkflowSpec` (structurel, l'artefact de la tranche A le satisfait) :
     statuses() -> Sequence[str]
     core_of(status) -> str       cœur natif (`intake`…`closed`)
     transitions_from(status) -> Sequence[objet avec .target et .guard]
+
+Artifact trust boundary (N5): `spec` is supplied by the caller — the server
+component that compiled the pinned revision. The registry checks that the
+artifact `workflow_ref`/`workflow_version` match the command and the lot
+(`spec-mismatch`), never its content: the ref names the commit and tranche A
+publishes no digest, so the compiled artifact is trusted for that ref. The
+caller is the installed server component, never a client; if a later revision
+of the artifact publishes a digest, the seam must bind it to the command.
 
 Identité et époque : `Authority(actor, source, epoch, runner_id)` reprend
 l'identité liée de `identity.Binding` (`runner` avec runner_id + epoch de bail ;
@@ -96,7 +114,8 @@ Codes de refus stables (`RegistryRefusal.code`) : `command-invalid`,
 `revision-mismatch`, `version-conflict`, `intent-conflict`, `receipt-corrupt`,
 `stage-mismatch`, `stage-undeclared`, `edge-undeclared`, `terminal-reopened`,
 `held`, `hold-invalid`, `hold-redundant`, `hold-no-decision`, `decision-pending`,
-`not-held`,
+`hold-core-unproven`, `not-held`, `close-reason`, `superseded-unknown`,
+`delivered-sha`,
 `repair-exhausted`, `revision-regression`, `verifier-uninstalled`,
 `verifier-invalid`, `verifier-error`, `verifier-refused`, `verifier-name`.
 
@@ -139,6 +158,17 @@ HOLDS = ("blocked", "waiting_human")
 CORE_STATES = ("intake", "build", "qa", "merged", "promoted", "closed")
 #: Cœurs terminaux : jamais rouverts par une commande.
 TERMINAL_CORES = frozenset(("promoted", "closed"))
+#: Cœurs qui libèrent le lot pour ses dépendants et rendent sa réservation de
+#: migration (#956) : les mêmes que `work_dependencies._DONE`. L'avance qui y
+#: entre porte les effets de bord de la fermeture historique, que le stockage
+#: refuse désormais aux lots pinnés (#1922/N8) : `close_reason`/
+#: `superseded_by`, jalons `closed`/`delivered`, réservation rendue, réveil des
+#: dépendants (L385).
+RELEASED_CORES = frozenset(("merged", "promoted", "closed"))
+#: Fermetures admises pour un cœur `closed` (contrainte `close_reason` de la
+#: migration 0430) : l'évidence de la commande dit laquelle, comme les trois
+#: portes de `work.close` (abandon, remplacement, livraison hors cible).
+CLOSE_REASONS = ("abandoned", "superseded", "delivered")
 #: Sources d'identité admises (`identity.Binding.source`).
 SOURCES = ("runner", "explicit", "session")
 #: Reprises qa → build comptées par `work_items.loops` (même borne que work).
@@ -146,6 +176,9 @@ REPAIR_CORES = ("qa", "build")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+#: Tête relue d'une livraison hors cible (#988) : la même forme que
+#: `work._SHA_RE` (7 à 64 hexadécimaux), pas l'empreinte d'intention (64).
+_HEAD_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _VERIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
@@ -510,7 +543,7 @@ def _lock_lot(tx: Any, work_item_id: int) -> Mapping[str, Any]:
     """
     rows = tx.query(
         "SELECT w.id, w.state, w.assignee, w.type, w.app, w.workstream, w.loops,"
-        "       w.title, w.closed_at,"
+        "       w.title, w.closed_at, w.migration, w.migration_repo,"
         "       coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"
         "       w.workflow_ref, w.workflow_stage, w.workflow_version"
         "  FROM work_items w WHERE w.id = %s FOR UPDATE",
@@ -672,6 +705,59 @@ class _Plan:
     stage: str
     loops: int
     note: str
+    close_reason: str = ""
+    superseded_by: int | None = None
+    delivered_sha: str = ""
+
+
+def _close_facts(tx: Any, command: Command) -> tuple[str, int | None, str]:
+    """The closure carried by the command evidence, checked against legacy.
+
+    Entering the terminal core `closed` means the lot was abandoned,
+    superseded or delivered outside the target (the three doors of
+    `work.close`, constraint `close_reason` of 0430). The registry never
+    guesses: a missing or unknown reason is refused, `superseded_by` must name
+    an existing lot (not itself), and a delivery carries the reviewed head
+    (`sha`, 7 to 64 hex) that the `delivered` milestone persists.
+    """
+    evidence = command.evidence if isinstance(command.evidence, Mapping) else {}
+    reason = str(evidence.get("close_reason") or "").strip()
+    if reason not in CLOSE_REASONS:
+        raise RegistryRefusal(
+            "close-reason",
+            "an advance to closed requires close_reason in evidence (%s), got %r"
+            % (", ".join(CLOSE_REASONS), reason))
+    superseded_by: int | None = None
+    sha = ""
+    if reason == "superseded":
+        value = evidence.get("superseded_by")
+        if not _is_int(value) or int(value) <= 0:
+            raise RegistryRefusal(
+                "superseded-unknown",
+                "a superseded closure carries a positive superseded_by, got %r" % (value,))
+        if int(value) == int(command.work_item_id):
+            raise RegistryRefusal("superseded-unknown", "a lot cannot supersede itself")
+        if not tx.query("SELECT 1 FROM work_items WHERE id = %s", (int(value),)):
+            raise RegistryRefusal("superseded-unknown",
+                                  "superseding lot %s not found" % value)
+        superseded_by = int(value)
+    elif reason == "delivered":
+        sha = str(evidence.get("sha") or "").strip().lower()
+        if not _HEAD_RE.match(sha):
+            raise RegistryRefusal(
+                "delivered-sha",
+                "a delivered closure carries the reviewed head (sha, 7 to 64 hex), got %r"
+                % (evidence.get("sha"),))
+    return reason, superseded_by, sha
+
+
+def _close_label(reason: str, superseded_by: int | None, sha: str) -> str:
+    """The closure label of the journal and milestone note (legacy wording)."""
+    if reason == "superseded":
+        return "superseded by #%s" % superseded_by
+    if reason == "delivered":
+        return "delivered (head %s)" % sha[:12]
+    return "abandoned"
 
 
 def _plan_advance(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) -> _Plan:
@@ -710,19 +796,32 @@ def _plan_advance(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) 
             "repair-exhausted",
             "boucle qa → build épuisée (%s) : bloquer le lot ou demander une décision"
             % MAX_QA_LOOPS)
-    return _Plan(state=core_to, stage=command.to_stage, loops=loops,
-                 note="%s → %s (%s)" % (command.from_stage, command.to_stage, command.guard))
+    note = "%s → %s (%s)" % (command.from_stage, command.to_stage, command.guard)
+    close_reason, superseded_by, delivered_sha = "", None, ""
+    if core_to == "closed":
+        close_reason, superseded_by, delivered_sha = _close_facts(tx, command)
+        note = "%s — %s" % (note, _close_label(close_reason, superseded_by, delivered_sha))
+    return _Plan(state=core_to, stage=command.to_stage, loops=loops, note=note,
+                 close_reason=close_reason, superseded_by=superseded_by,
+                 delivered_sha=delivered_sha)
 
 
 def _lock_decisions(tx: Any, work_item_id: int) -> None:
-    """Verrouille les demandes de décision natives ouvertes du lot, AVANT le lot.
+    """Lock the open decision requests of the lot, AFTER the lot row (N12).
 
-    Ordre des verrous (revue N6) : la réponse du propriétaire
-    (`decisions.answer`) ferme la demande (`UPDATE agent_mailbox`) puis déplace
-    le lot (`work.move`) ; le registre prend donc `agent_mailbox` d'abord et
-    `work_items` ensuite, jamais l'inverse. Le verrou tient la demande ouverte
-    jusqu'au commit : une réponse ne se glisse pas entre le contrôle et
-    l'écriture de la retenue.
+    Lock order: the lot first, then the requests — the order of the single
+    L233 statement (`work.move(held=True)` locks the lot row, then the open
+    requests in its `EXISTS … FOR UPDATE`). The reverse order (requests then
+    lot) could deadlock with that statement on the same request; here the
+    command waits on the lot holding nothing. The lock keeps an open request
+    closed-proof until commit: an answer cannot slip between the check and the
+    hold write, and `_pending_decision`, read after both locks, sees every
+    request committed while the lot lock was awaited.
+
+    An INSERT committed after that read is not blocked by a row lock
+    (PostgreSQL has no gap lock): the ask path must take the lot lock before
+    inserting its request for a full serialization — noted for the C/D
+    consumer, see the design document.
     """
     tx.query(
         "SELECT 1 FROM agent_mailbox"
@@ -735,8 +834,8 @@ def _lock_decisions(tx: Any, work_item_id: int) -> None:
 def _pending_decision(tx: Any, work_item_id: int) -> bool:
     """L233 : une demande de décision native ouverte tient le lot.
 
-    Lecture seule : les lignes sont déjà verrouillées par `_lock_decisions`,
-    pris au début de la transaction d'une retenue ou d'une reprise.
+    Read after both locks (lot then requests, `_lock_decisions`): every
+    request committed while the lot lock was awaited is visible here.
     """
     rows = tx.query(
         "SELECT 1 FROM agent_mailbox r"
@@ -787,6 +886,50 @@ def _plan_release(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) 
         raise RegistryRefusal("terminal-reopened", "l'étape %s est terminale" % stage)
     return _Plan(state=core, stage=str(stage), loops=0,
                  note="reprise de %s vers %s" % (row["state"], stage))
+
+
+def _pre_hold_core(tx: Any, work_item_id: int) -> str | None:
+    """The last core recorded before the hold, read from the lot journal.
+
+    A hold keeps the step but not the core: the row only says `blocked` or
+    `waiting_human`, and the core before the hold is not a column anywhere.
+    The journal is the verifiable record — every transition writes the state
+    it produces, holds included — so the last line that is not a hold is the
+    core the lot will resume into. `None` when the journal proves nothing (a
+    lot created held, an out-of-band rewrite): fail-closed, the caller
+    refuses.
+    """
+    rows = tx.query(
+        "SELECT state FROM work_item_events"
+        " WHERE work_item_id = %s AND state NOT IN ('blocked', 'waiting_human')"
+        " ORDER BY id DESC LIMIT 1", (int(work_item_id),))
+    if not rows:
+        return None
+    state = str(rows[0]["state"])
+    return state if state in CORE_STATES else None
+
+
+def _check_held_core(tx: Any, command: Command, core: str) -> None:
+    """N10: the core before the hold must be proven, never assumed.
+
+    Adopting or transferring a held lot keeps the hold; the core it resumes
+    into is the one the new revision projects for the kept (or initial) step.
+    Since the row does not carry the pre-hold core, the journal is the only
+    witness: without one the registry refuses (`hold-core-unproven`) instead
+    of silently resuming elsewhere; with one, a divergence is a
+    `stage-mismatch`.
+    """
+    proof = _pre_hold_core(tx, int(command.work_item_id))
+    if proof is None:
+        raise RegistryRefusal(
+            "hold-core-unproven",
+            "lot %s is held and its journal proves no core before the hold: "
+            "refusing a step that could resume elsewhere" % command.work_item_id)
+    if proof != core:
+        raise RegistryRefusal(
+            "stage-mismatch",
+            "lot %s was %s before the hold, the adopted step projects %s"
+            % (command.work_item_id, proof, core))
 
 
 def _verify(verifiers: Mapping[str, Verifier], guard: str, tx: Any,
@@ -859,6 +1002,64 @@ def _insert_receipt(tx: Any, *, work_item_id: int, state: str, note: str, actor:
     return int(rows[0]["id"])
 
 
+def _release_migration(tx: Any, command: Command, row: Mapping[str, Any],
+                       state: str) -> None:
+    """#956: a lot entering a released core gives its migration number back.
+
+    The legacy `work.move`/`work.close` released the reservation in their own
+    transaction; a pinned lot never reaches those, so the registry carries the
+    same gesture — the storage `_release_migration`, including its journal
+    line, written before the receipt so that `Receipt.version` stays the last
+    id of the lot journal.
+    """
+    number = row.get("migration")
+    if number is None:
+        return
+    tx.execute(
+        "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
+        "       updated_at = now() WHERE id = %s", (int(command.work_item_id),))
+    tx.execute(
+        "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+        " VALUES (%s, %s, %s, %s)",
+        (int(command.work_item_id), state,
+         "migration %s released (state %s, #956)" % (number, state),
+         command.authority.actor))
+
+
+def _close_milestones(tx: Any, command: Command, plan: _Plan) -> None:
+    """The closure milestones the legacy `work.close` wrote: `closed` always,
+    `delivered` (with the reviewed head) for a delivery outside the target."""
+    tx.execute(
+        "INSERT INTO work_item_milestones (work_item_id, kind, actor, note)"
+        " VALUES (%s, 'closed', %s, %s) ON CONFLICT DO NOTHING",
+        (int(command.work_item_id), command.authority.actor, plan.note))
+    if plan.close_reason == "delivered":
+        tx.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, note)"
+            " VALUES (%s, 'delivered', %s, %s, %s) ON CONFLICT DO NOTHING",
+            (int(command.work_item_id), plan.delivered_sha,
+             command.authority.actor, plan.note))
+
+
+def _notify_released(tx: Any, command: Command, plan: _Plan, previous: str,
+                     threads: list) -> None:
+    """L385: the first entry into a released core wakes the dependants.
+
+    Under the dependency graph lock (taken before the lot, as the legacy
+    closures do), the mail is committed with the transition: no window where
+    the release is committed without its wake. A lot already released does not
+    wake twice (a `merged` then `closed`/`promoted` path); a closure carries
+    its reason to the message.
+    """
+    if previous in RELEASED_CORES:
+        return
+    from . import work_dependencies
+    work_dependencies.notify_released(
+        tx, int(command.work_item_id), blocker_state=plan.state,
+        blocker_reason=plan.close_reason if plan.state == "closed" else "",
+        after_commit=threads)
+
+
 def _receipt(command: Command, plan: _Plan, event_id: int, version: int,
              intent: str, replayed: bool = False) -> Receipt:
     return Receipt(
@@ -902,11 +1103,27 @@ def _apply(db: Db, command: Command, *, spec: Any,
     _check_spec(spec, command)
     registry = _registry(verifiers)
     intent = intent_sha256(command)
+    # N9 : l'avance qui entre dans un cœur libéré décide le réveil des
+    # dépendants sous le verrou de graphe, pris AVANT le lot — l'ordre des
+    # fermetures historiques (`work.close`/`close_merged`), qui le tiennent
+    # puis lisent `released_by`. Sans lui, deux libérations concurrentes
+    # perdraient ou doubleraient le réveil ; pris après le lot, il
+    # s'interbloquerait avec une fermeture legacy.
+    released = (command.action == "advance"
+                and _spec_core(spec, command.to_stage) in RELEASED_CORES)
+    threads: list = []
     with db.transaction() as tx:
-        if command.action in ("hold", "release"):
-            # N6 : `agent_mailbox` avant `work_items`, comme `decisions.answer`.
-            _lock_decisions(tx, command.work_item_id)
+        if released:
+            from . import work_dependencies
+            work_dependencies.lock(tx)
         row = _lock_lot(tx, command.work_item_id)
+        if command.action in ("hold", "release"):
+            # N12 : le lot d'abord, puis les demandes de décision ouvertes —
+            # l'ordre de l'instruction unique de L233 (`work.move(held=True)`
+            # verrouille le lot, puis les demandes dans son EXISTS ... FOR
+            # UPDATE). La lecture de `_pending_decision` vient après les deux
+            # verrous : une demande committée en attendant le lot est vue.
+            _lock_decisions(tx, command.work_item_id)
         authority = _check_authority(tx, command.authority)
         replayed = _replay(tx, command, intent)
         if replayed is not None:
@@ -936,21 +1153,34 @@ def _apply(db: Db, command: Command, *, spec: Any,
             "   SET state = %s,"
             "       workflow_stage = %s,"
             "       loops = loops + %s,"
+            "       close_reason = CASE WHEN %s = 'closed' THEN %s ELSE close_reason END,"
+            "       superseded_by = CASE WHEN %s = 'closed' THEN %s ELSE superseded_by END,"
             "       updated_at = now(),"
             "       closed_at = CASE WHEN %s IN ('promoted', 'closed')"
             "                         THEN now() ELSE closed_at END,"
             "       started_at = CASE WHEN %s IN ('build', 'qa')"
             "                         THEN coalesce(started_at, now()) ELSE started_at END"
             " WHERE id = %s",
-            (plan.state, plan.stage, plan.loops, plan.state, plan.state,
+            (plan.state, plan.stage, plan.loops, plan.state, plan.close_reason or None,
+             plan.state, plan.superseded_by, plan.state, plan.state,
              int(command.work_item_id)))
+        if plan.state in RELEASED_CORES:
+            _release_migration(tx, command, row, plan.state)
+        if plan.state == "closed":
+            _close_milestones(tx, command, plan)
         evidence = _evidence(command, authority, verification, intent,
                              _applied(command, plan), verifier_name)
         event_id = _insert_receipt(
             tx, work_item_id=command.work_item_id, state=plan.state, note=plan.note,
             actor=command.authority.actor, command_id=command.command_id,
             stage=plan.stage, version=command.workflow_version, evidence=evidence)
-        return _receipt(command, plan, event_id, event_id, intent)
+        if plan.state in RELEASED_CORES:
+            _notify_released(tx, command, plan, str(row["state"]), threads)
+        receipt = _receipt(command, plan, event_id, event_id, intent)
+    # le fil lisible après le commit seulement : un envoi annulé n'y laisse rien
+    for record in threads:
+        record(db.cfg, db)
+    return receipt
 
 
 def transfer_revision(db: Db, *, work_item_id: int, command_id: str,
@@ -1012,6 +1242,9 @@ def _transfer(db: Db, *, work_item_id: int, command_id: str,
                 raise RegistryRefusal("terminal-reopened",
                                       "étape initiale %s déjà terminale" % stage)
             if row["state"] in HOLDS:
+                # N10 : le cœur d'avant la retenue n'est pas sur la ligne ; le
+                # journal doit le prouver avant d'adopter une étape.
+                _check_held_core(tx, command, str(core))
                 state = row["state"]
             elif core == str(row["state"]):
                 state = core
@@ -1031,7 +1264,9 @@ def _transfer(db: Db, *, work_item_id: int, command_id: str,
             if core is None:
                 raise RegistryRefusal("stage-undeclared",
                                       "étape %s absente de l'artefact" % stage)
-            if row["state"] not in HOLDS and core != str(row["state"]):
+            if row["state"] in HOLDS:
+                _check_held_core(tx, command, str(core))
+            elif core != str(row["state"]):
                 raise RegistryRefusal(
                     "stage-mismatch",
                     "transfert : l'étape %s projette %s, lot en %s"

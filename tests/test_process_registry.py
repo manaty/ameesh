@@ -39,6 +39,7 @@ import glob
 import json
 import os
 import threading
+import time
 import unittest
 import uuid
 from dataclasses import dataclass
@@ -245,6 +246,33 @@ class RegistryTest(PgTestCase):
             "         '{\"decision\": {\"v\": 1, \"state\": \"pending\"}}'::jsonb, %s)"
             " RETURNING id", (str(lot_id),))
         return int(row[0]["id"])
+
+    def milestones(self, lot_id: int) -> list[dict]:
+        return self.db.query(
+            "SELECT kind, sha, actor, note FROM work_item_milestones"
+            " WHERE work_item_id = %s ORDER BY id", (lot_id,))
+
+    def closure_milestones(self, lot_id: int) -> list[dict]:
+        """Les jalons posés par une fermeture (le jalon `requested` naît avec le lot)."""
+        return [m for m in self.milestones(lot_id) if m["kind"] != "requested"]
+
+    def dependent(self, blocker: int, *, state: str = "blocked",
+                  assignee: str | None = "acme-dev2") -> int:
+        """An explicit prerequisite of `blocker`, with a registered agent."""
+        row = self.db.query(
+            "INSERT INTO work_items (title, state, assignee, app)"
+            " VALUES ('acme : dependent', %s, %s, 'acme') RETURNING id",
+            (state, assignee))
+        lot = int(row[0]["id"])
+        self.db.execute(
+            "INSERT INTO work_item_dependencies (work_item_id, blocker_id, created_by)"
+            " VALUES (%s, %s, %s)", (lot, int(blocker), ACME_ACTOR))
+        return lot
+
+    def mail_to(self, recipient: str) -> list[dict]:
+        return self.db.query(
+            "SELECT id, body, payload FROM agent_mailbox"
+            " WHERE recipient = %s AND kind = 'event' ORDER BY id", (recipient,))
 
     # -- avance nominale ---------------------------------------------------
 
@@ -692,6 +720,188 @@ class RegistryTest(PgTestCase):
         else:                            # la retenue a vu la demande ouverte
             self.assertEqual(state, "waiting_human")
 
+    # -- side effects of a released core (N9) ------------------------------
+
+    def test_advance_to_closed_carries_the_closure(self):
+        lot = self.pinned()
+        receipt = self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                          facts={"close_reason": "abandoned"}))
+        self.assertEqual(receipt.state, "closed")
+        row = self.row(lot)
+        self.assertEqual(row["close_reason"], "abandoned")
+        self.assertIsNone(row["superseded_by"])
+        self.assertIsNotNone(row["closed_at"])
+        closure = self.closure_milestones(lot)
+        self.assertEqual([m["kind"] for m in closure], ["closed"])
+        self.assertEqual(closure[0]["actor"], ACME_ACTOR)
+        self.assertIn("abandoned", closure[0]["note"])
+        # le reçu reste la dernière ligne du journal du lot
+        self.assertEqual(self.journal_version(lot), receipt.event_id)
+
+    def test_advance_to_closed_refuses_an_unproven_closure(self):
+        lot = self.pinned()
+        with self.refusal("close-reason"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work"))
+        with self.refusal("close-reason"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "finished"}))
+        with self.refusal("superseded-unknown"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "superseded",
+                                           "superseded_by": 0}))
+        with self.refusal("superseded-unknown"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "superseded",
+                                           "superseded_by": lot}))
+        with self.refusal("superseded-unknown"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "superseded",
+                                           "superseded_by": 999999}))
+        with self.refusal("delivered-sha"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "delivered"}))
+        with self.refusal("delivered-sha"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "delivered", "sha": "zz"}))
+        self.assertEqual(self.events(lot), [])
+        self.assertEqual(self.row(lot)["state"], "intake")
+        self.assertEqual(self.closure_milestones(lot), [])
+
+    def test_advance_to_closed_records_superseded_by_and_delivered(self):
+        superseding = self.pinned()
+        lot = self.pinned()
+        self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                facts={"close_reason": "superseded",
+                                       "superseded_by": superseding}))
+        row = self.row(lot)
+        self.assertEqual(row["close_reason"], "superseded")
+        self.assertEqual(row["superseded_by"], superseding)
+        self.assertEqual([m["kind"] for m in self.closure_milestones(lot)], ["closed"])
+
+        delivered = self.pinned()
+        head = "a1b2c3d4" * 5
+        self.apply(self.command(delivered, to="stopped", guard="stop_work",
+                                facts={"close_reason": "delivered",
+                                       "sha": head.upper()}))
+        kinds = {m["kind"]: m for m in self.closure_milestones(delivered)}
+        self.assertEqual(set(kinds), {"closed", "delivered"})
+        self.assertEqual(kinds["delivered"]["sha"], head)
+
+    def test_advance_to_a_released_core_gives_the_migration_back(self):
+        lot = self.pinned(stage="review", state="qa")
+        self.db.execute("UPDATE work_items SET migration = 452,"
+                        " migration_repo = 'manaty/ameesh' WHERE id = %s", (lot,))
+        receipt = self.apply(self.command(lot, frm="review", to="staging",
+                                          guard="qa_started", version=0))
+        self.assertEqual(receipt.state, "merged")
+        row = self.row(lot)
+        self.assertIsNone(row["migration"])
+        self.assertIsNone(row["migration_repo"])
+        released = [e for e in self.events(lot) if e["command_id"] is None]
+        self.assertEqual(len(released), 1)
+        self.assertIn("migration 452 released", released[0]["note"])
+        self.assertEqual(self.journal_version(lot), receipt.event_id)
+
+    def test_first_release_wakes_the_dependants(self):
+        blocker = self.pinned(stage="review", state="qa")
+        self.agent("acme-dev2")
+        dependent = self.dependent(blocker)
+        self.apply(self.command(blocker, frm="review", to="staging",
+                                guard="qa_started", version=0))
+        mails = self.mail_to("acme-dev2")
+        self.assertEqual(len(mails), 1)
+        self.assertEqual(mails[0]["payload"]["dependency"],
+                         {"dependent": dependent, "blocker": blocker,
+                          "blocker_state": "merged"})
+        self.assertIn("is merged", mails[0]["body"])
+        self.assertEqual(self.row(dependent)["state"], "blocked")
+
+    def test_advance_to_promoted_wakes_with_its_own_state(self):
+        # Un chemin qui va droit au cœur `promoted` (sans étape `merged`) :
+        # le réveil ne peut pas dire « merged », il nomme l'état atteint.
+        spec = _Spec(transitions=ACME_TRANSITIONS
+                     + (_Transition("review", "done", "work_completed"),))
+        blocker = self.pinned(stage="review", state="qa")
+        self.agent("acme-dev2")
+        dependent = self.dependent(blocker)
+        self.apply(self.command(blocker, frm="review", to="done",
+                                guard="work_completed", version=0), spec=spec)
+        mails = self.mail_to("acme-dev2")
+        self.assertEqual(len(mails), 1)
+        self.assertEqual(mails[0]["payload"]["dependency"]["blocker_state"], "promoted")
+        self.assertIn("is promoted", mails[0]["body"])
+        self.assertEqual(self.row(blocker)["state"], "promoted")
+        self.assertEqual(self.row(dependent)["state"], "blocked")
+
+    def test_a_lot_already_released_does_not_wake_twice(self):
+        blocker = self.pinned(stage="review", state="qa")
+        self.agent("acme-dev2")
+        self.dependent(blocker)
+        merged = self.apply(self.command(blocker, frm="review", to="staging",
+                                         guard="qa_started", version=0))
+        promoted = self.apply(self.command(blocker, frm="staging", to="done",
+                                           guard="work_completed",
+                                           version=merged.version))
+        self.assertEqual(promoted.state, "promoted")
+        self.assertEqual(len(self.mail_to("acme-dev2")), 1)
+
+    def test_unassigned_dependent_is_reopened_in_the_same_transaction(self):
+        blocker = self.pinned(stage="review", state="qa")
+        dependent = self.dependent(blocker, assignee=None)
+        self.apply(self.command(blocker, frm="review", to="staging",
+                                guard="qa_started", version=0))
+        self.assertEqual(self.row(dependent)["state"], "intake")
+        self.assertEqual(self.events(dependent)[-1]["state"], "intake")
+        self.assertEqual(self.mail_to("acme-dev2"), [])
+
+    def test_side_effects_roll_back_together(self):
+        lot = self.pinned()
+        self.db.execute("UPDATE work_items SET migration = 452,"
+                        " migration_repo = 'acme/repo' WHERE id = %s", (lot,))
+        self.db.script(
+            "CREATE FUNCTION t_1926_boom() RETURNS trigger LANGUAGE plpgsql AS $$"
+            " BEGIN RAISE EXCEPTION 'boom 1926'; END $$;"
+            " CREATE TRIGGER t_1926_boom BEFORE INSERT ON work_item_milestones"
+            "   FOR EACH ROW EXECUTE FUNCTION t_1926_boom();")
+        try:
+            with self.assertRaises(DbError):
+                self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                        facts={"close_reason": "abandoned"}))
+        finally:
+            self.db.script("DROP TRIGGER t_1926_boom ON work_item_milestones;"
+                           " DROP FUNCTION t_1926_boom();")
+        row = self.row(lot)
+        self.assertEqual(row["state"], "intake")
+        self.assertEqual(row["migration"], 452)
+        self.assertIsNone(row["close_reason"])
+        self.assertEqual(self.closure_milestones(lot), [])
+        self.assertEqual(self.events(lot), [])
+
+    def test_failed_wake_rolls_back_the_closure(self):
+        blocker = self.pinned(stage="review", state="qa")
+        self.agent("acme-dev2")
+        self.dependent(blocker)
+        self.db.execute("UPDATE work_items SET migration = 452,"
+                        " migration_repo = 'acme/repo' WHERE id = %s", (blocker,))
+        self.db.script(
+            "CREATE FUNCTION t_1926_nomail() RETURNS trigger LANGUAGE plpgsql AS $$"
+            " BEGIN RAISE EXCEPTION 'no mail 1926'; END $$;"
+            " CREATE TRIGGER t_1926_nomail BEFORE INSERT ON agent_mailbox"
+            "   FOR EACH ROW EXECUTE FUNCTION t_1926_nomail();")
+        try:
+            with self.assertRaises(DbError):
+                self.apply(self.command(blocker, frm="review", to="staging",
+                                        guard="qa_started", version=0))
+        finally:
+            self.db.script("DROP TRIGGER t_1926_nomail ON agent_mailbox;"
+                           " DROP FUNCTION t_1926_nomail();")
+        row = self.row(blocker)
+        self.assertEqual(row["state"], "qa")
+        self.assertEqual(row["migration"], 452)
+        self.assertEqual(self.closure_milestones(blocker), [])
+        self.assertEqual(self.events(blocker), [])
+        self.assertEqual(self.mail_to("acme-dev2"), [])
+
     # -- transfert de révision --------------------------------------------
 
     def transfer(self, lot_id: int, *, ref: str | None = None, version: int = ACME_VERSION,
@@ -746,8 +956,15 @@ class RegistryTest(PgTestCase):
                     self.transfer(lot)
                 self.assertEqual(self.events(lot), [])
                 self.assertEqual(self.row(lot)["state"], state)
-        held = self.lot(state="blocked")           # retenue conservée
-        receipt = self.transfer(held)
+        held = self.lot(state="blocked")           # retenue : cœur à prouver
+        with self.refusal("hold-core-unproven"):   # N10 : journal muet
+            self.transfer(held)
+        self.assertEqual(self.events(held), [])
+        proven = self.lot(state="blocked")
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " VALUES (%s, 'intake', 'acme avant la retenue', %s)", (proven, ACME_ACTOR))
+        receipt = self.transfer(proven)            # retenue conservée (N10)
         self.assertEqual(receipt.state, "blocked")
         self.assertEqual(receipt.workflow_stage, "draft")
 
@@ -807,6 +1024,60 @@ class RegistryTest(PgTestCase):
         self.assertTrue(again.replayed)
         self.assertEqual(again.event_id, first.event_id)
         self.assertEqual(len(self.events(lot)), 1)
+
+    # -- adoption/transfert d'un lot retenu (N10) --------------------------
+
+    def test_adoption_of_a_held_lot_needs_a_proven_core(self):
+        lot = self.lot(state="blocked")            # aucune ligne de journal
+        with self.refusal("hold-core-unproven"):
+            self.transfer(lot, spec=_Spec(initial="implementation"))
+        self.assertIsNone(self.row(lot)["workflow_ref"])
+        self.assertEqual(self.events(lot), [])
+
+    def test_adoption_of_a_held_lot_resumes_into_the_proven_core(self):
+        lot = self.lot(state="blocked")
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " VALUES (%s, 'build', 'acme avant la retenue', %s)", (lot, ACME_ACTOR))
+        receipt = self.transfer(lot, spec=_Spec(initial="implementation"))
+        self.assertEqual(receipt.state, "blocked")
+        self.assertEqual(receipt.workflow_stage, "implementation")
+        released = self.apply(self.command(lot, action="release", frm="", to="", guard="",
+                                           version=receipt.version))
+        self.assertEqual(released.state, "build")
+        self.assertEqual(released.workflow_stage, "implementation")
+
+    def test_adoption_of_a_held_lot_refuses_a_divergent_core(self):
+        lot = self.lot(state="blocked")
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " VALUES (%s, 'build', 'acme avant la retenue', %s)", (lot, ACME_ACTOR))
+        with self.refusal("stage-mismatch"):
+            self.transfer(lot, spec=_Spec(initial="draft"))       # cœur intake
+        self.assertIsNone(self.row(lot)["workflow_ref"])
+
+    def test_transfer_of_a_held_lot_proves_the_kept_core(self):
+        lot = self.lot(state="build")
+        first = self.transfer(lot, spec=_Spec(initial="implementation"))
+        self.apply(self.command(lot, action="hold", hold="blocked", frm="", to="",
+                                guard="", version=first.version))
+        same = _Spec(version=ACME_VERSION + 1)
+        accepted = pr._transfer(
+            self.db, work_item_id=lot, command_id=str(uuid.uuid4()),
+            expected_version=self.journal_version(lot),
+            workflow_ref=same.workflow_ref, workflow_version=same.workflow_version,
+            authority=self.authority(), spec=same, verifiers=self.verifiers)
+        self.assertEqual(accepted.state, "blocked")
+        self.assertEqual(accepted.workflow_version, same.workflow_version)
+        moved = _Spec(version=ACME_VERSION + 2, stages=tuple(
+            _Stage(stage.status, "qa" if stage.status == "implementation" else stage.core)
+            for stage in ACME_STAGES))
+        with self.refusal("stage-mismatch"):
+            pr._transfer(
+                self.db, work_item_id=lot, command_id=str(uuid.uuid4()),
+                expected_version=self.journal_version(lot),
+                workflow_ref=moved.workflow_ref, workflow_version=moved.workflow_version,
+                authority=self.authority(), spec=moved, verifiers=self.verifiers)
 
     # -- lots sans workflow, historique, annulation ------------------------
 
@@ -923,6 +1194,90 @@ class RegistryTest(PgTestCase):
         self.assertIsInstance(errors[0], pr.RegistryRefusal)
         self.assertEqual(errors[0].code, "version-conflict")
         self.assertEqual(len(self.events(lot)), 1)
+
+    def test_lot_lock_before_decision_requests(self):
+        """N12 : le lot d'abord, puis les demandes de décision — l'ordre de L233.
+
+        Un `ask` concurrent tient le lot et insère sa demande dans la MÊME
+        transaction ; la commande de reprise attend le lot, puis verrouille la
+        demande et la relit : elle refuse (`decision-pending`), sans
+        interbloquer. Le témoin sonde la demande pendant l'attente : sous
+        l'ordre inverse (demande puis lot), la commande tiendrait la demande en
+        attendant le lot, l'`ask` la demanderait à son tour et les deux se
+        bloqueraient — le probe le verrait et le test échouerait.
+        """
+        lot = self.pinned(stage="implementation", state="waiting_human")
+        request = self.request_open_for(lot)
+        b_ready = threading.Event()
+        a_started = threading.Event()
+        b_committed = threading.Event()
+        outcome: dict = {}
+
+        def ask():
+            db, probe = self.connect(), self.connect()
+            try:
+                with db.transaction() as tx:
+                    tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
+                               (lot,))
+                    tx.execute(
+                        "INSERT INTO agent_mailbox (sender, recipient, body, kind,"
+                        " payload, work_item_id) VALUES ('acme-orch', 'human:*', 'ask',"
+                        " 'request', '{\"decision\": {\"state\": \"pending\"}}'::jsonb, %s)",
+                        (str(lot),))
+                    b_ready.set()
+                    self.assertTrue(a_started.wait(15), "la commande n'a pas démarré")
+                    deadline = time.time() + 3
+                    held = False
+                    while time.time() < deadline:
+                        try:
+                            probe.query(
+                                "SELECT id FROM agent_mailbox WHERE id = %s"
+                                " FOR UPDATE NOWAIT", (request,))
+                        except DbError as exc:
+                            if "could not obtain lock" not in str(exc):
+                                raise
+                            held = True
+                            break
+                    outcome["held"] = held
+                    if held:
+                        # la commande tient la demande : on la demande aussi
+                        tx.query("SELECT id FROM agent_mailbox WHERE id = %s"
+                                 " FOR UPDATE", (request,))
+            finally:
+                probe.close()
+                db.close()
+                b_committed.set()
+
+        errors: list = []
+        results: list = []
+
+        def run_ask():
+            try:
+                ask()
+            except Exception as exc:            # noqa: BLE001 - remonté au test
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_ask)
+        thread.start()
+        self.assertTrue(b_ready.wait(15), "l'ask n'a pas verrouillé le lot")
+        a_started.set()
+        try:
+            results.append(pr._apply(
+                self.db, self.command(lot, action="release", frm="", to="", guard=""),
+                spec=self.spec, verifiers=self.verifiers))
+        except Exception as exc:                # noqa: BLE001 - remonté au test
+            errors.append(exc)
+        thread.join(30)
+        self.assertFalse(thread.is_alive(), "ask bloqué")
+        self.assertFalse(outcome.get("held"),
+                         "la commande a tenu la demande avant le lot : ordre inverse")
+        self.assertEqual([e for e in errors
+                          if not isinstance(e, pr.RegistryRefusal)], [])
+        self.assertEqual([e.code for e in errors
+                          if isinstance(e, pr.RegistryRefusal)], ["decision-pending"])
+        self.assertEqual(results, [])
+        self.assertTrue(b_committed.is_set())
+        self.assertEqual(self.row(lot)["state"], "waiting_human")
 
     # -- lecture et contraintes de migration -------------------------------
 
