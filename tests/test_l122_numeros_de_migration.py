@@ -1168,6 +1168,31 @@ class NumeroAtterriTest(PgTestCase):
         self.assertTrue(any("landed migration 452 recorded" in e["note"]
                             for e in work.events(self.db, lot["id"])))
 
+    def test_le_sweep_concurrent_avec_numero_deja_tenu_le_corrige(self):
+        # #1605 : la fusion concurrente a déjà enregistré 452 ; notre
+        # déclaration de 453 rencontre `already` et corrige le numéro tenu
+        lot = self._lot()
+        self._nx(lot)
+        close_merged = work.close_merged
+
+        def sweep_then_close(db, item_id, **kwargs):
+            close_merged(db, item_id, sha="a" * 40, actor="sweeper", source="sweeper",
+                         declared=True, landed=(452, "manaty/nexlink"))
+            return close_merged(db, item_id, **kwargs)
+
+        with mock.patch.object(work, "close_merged", side_effect=sweep_then_close):
+            done = work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1",
+                               migration_landed=453)
+        self.assertEqual(done["result"], "landed")
+        self.assertIn("landed migration 452 → 453 corrected (manaty/nexlink)",
+                      done["detail"])
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["state"], item["migration_landed"],
+                          item["migration_landed_repo"]),
+                         ("merged", 453, "manaty/nexlink"))
+        registry = storage.of(self.db).work
+        self.assertIsNone(registry.migration_landed_holder(452, "manaty/nexlink"))
+
     def test_deux_lots_ne_nomment_pas_le_meme_numero_atterri(self):
         first = self._lot(n=1)
         self._nx(first)

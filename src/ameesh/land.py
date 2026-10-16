@@ -506,7 +506,7 @@ class _Landing:
                     # avoir bougé depuis l'admission).
                     parts = merge_queue._parts_reader(
                         self.project, self.project.repo, self.row.get("target") or "",
-                        self.row["frozen_sha"], self.replayer)
+                        self.row["frozen_sha"], self.replayer, cfg=self.cfg)
                 merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts)
             except merge_queue.QueueError as exc:
                 return self.eject(str(exc), "Restore green CI on the frozen commit, then "

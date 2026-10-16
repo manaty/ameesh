@@ -114,7 +114,8 @@ def exit_text(rc: int) -> str:
 
 
 def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
-              run=subprocess.run, now=time.time, log=print) -> int:
+              run=subprocess.run, now=time.time, monotonic=time.monotonic,
+              log=print) -> int:
     require_supported_python()
     argv = command(recipe)
     if os.geteuid() == 0:
@@ -140,7 +141,9 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
         launched = False
         #: #1916 : premier instant de la porte périmée en cours, après un
         #: lancement. Remis à zéro dès que la porte redevient lisible (fraîche)
-        #: ou `stopped` : le garde est alors revenu.
+        #: ou `stopped` : le garde est alors revenu. #1971 : mesuré à l'horloge
+        #: monotone — un saut NTP ne doit ni allonger ni raccourcir la fenêtre ;
+        #: la porte, elle, garde l'heure murale de ses échéances.
         stale_since = None
         while not stop.is_set():
             # A dead guard ends supervision once we have run, including
@@ -151,14 +154,24 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
             # launch a stale gate only waits: at boot the guard may not have
             # renewed a heartbeat left expired by the reboot.
             # A late heartbeat must not reopen an already expired window.
-            if stale_since is not None and now() - stale_since >= STALE_RESUME_MAX_S:
+            if (stale_since is not None
+                    and monotonic() - stale_since >= STALE_RESUME_MAX_S):
+                log("VM supervisor: guard gate still stale after %ds, exiting"
+                    % STALE_RESUME_MAX_S)
                 return 0
             gate = gate_state(state_path, now())
             if gate != "stale":
+                if stale_since is not None:
+                    log("VM supervisor: guard gate fresh again (%s)" % gate)
                 stale_since = None
             elif launched:
                 if stale_since is None:
-                    stale_since = now()
+                    # #1972 : l'unité reste active sans conteneur pendant la
+                    # fenêtre ; l'exploitation le lit dans le journal
+                    log("VM supervisor: guard gate stale, executor stopped;"
+                        " resuming if the guard renews within %ds"
+                        % STALE_RESUME_MAX_S)
+                    stale_since = monotonic()
                 stop.wait(1)
                 continue
             if gate != "available":

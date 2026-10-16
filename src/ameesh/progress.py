@@ -184,6 +184,8 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
       Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
       renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
       ne compte pas ; sans SHA des deux côtés, comparaison des instants ;
+    * `verdict_required` : False quand le pilote a marqué « verdict non
+      requis » (`work.REVIEWER_NONE`, #1979) — la revue n'attend plus rien ;
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
@@ -273,6 +275,27 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
     reviewer = (last["actor"] if last else None) if verdict_current else designated
+    from .work_reviewers import designated as designated_reviewers
+    reviewers = designated_reviewers(item)
+    latest = {v["actor"]: v for v in verdicts}
+    current = {name: v for name, v in latest.items() if _verdict_applies(v, last_frozen)}
+    pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
+               if item.get("reviewers") is not None else [])
+    # Every designated reviewer owes their own verdict on the frozen head.
+    # A later GO from another reviewer cannot erase a blocking verdict.
+    blocked = [v for v in current.values() if v["kind"] == "blocked"]
+    if item.get("reviewers") is not None and reviewers and blocked:
+        last = max(blocked, key=lambda v: v["at_ts"])
+        verdict_current = True
+    elif reviewers and pending:
+        verdict_current = False
+    if item.get("reviewers") is not None and reviewers:
+        reviewer = last["actor"] if verdict_current and last else designated
+    # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
+    # mécanique, canon §11 bis/#87) en marquant la colonne du relecteur
+    # (`work.waive_review`) : l'attente passe alors à la fusion, sans faux
+    # « waiting: verdict » ni rappel à un relecteur.
+    verdict_required = designated != work_mod.REVIEWER_NONE
     return {
         "requested": requested,
         "frozen": freezes[0]["at_ts"] if freezes else None,
@@ -280,7 +303,10 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "verdict": last["at_ts"] if last else None,
         "verdict_kind": last["kind"] if last else None,
         "reviewer": reviewer,
+        "reviewers": reviewers,
+        "pending_reviewers": pending,
         "verdict_current": verdict_current,
+        "verdict_required": verdict_required,
         "merged": merged,
         "delivered": delivered,
         "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
@@ -316,7 +342,9 @@ def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
 
 def lot_state(work_state: str, jalons: dict) -> str:
     """État affiché d'un lot (décision 0024) : en revue, il n'est approuvé
-    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA)."""
+    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA) — ou,
+    #1979, par la marque « verdict non requis » du pilote (résolution de
+    composition mécanique, canon §11 bis/#87)."""
     if work_state in ("merged", "promoted"):
         return "merged"
     if work_state == "closed":
@@ -328,6 +356,13 @@ def lot_state(work_state: str, jalons: dict) -> str:
         if current is None:                 # jalons partiels : repli par les instants
             last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
             current = (jalons.get("verdict") or 0) >= last_frozen
+        # #1979 : dispensé de re-verdict, le lot n'est pas « en revue » : il
+        # est prêt à fusionner, comme après un verdict `ok` courant. Un verdict
+        # bloquant COURANT garde la main (une correction est due), comme dans
+        # `stagnation.waiting`.
+        if not (jalons.get("verdict_kind") == "blocked" and current) \
+                and jalons.get("verdict_required", True) is False:
+            return "approved"
         if jalons.get("verdict_kind") == "ok" and current:
             return "approved"
         return "review"
@@ -383,7 +418,12 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "state": lot_state(item.get("state") or "", jalons),
         "work_state": item.get("state") or "",
         "assignee": item.get("assignee") or None,
-        "reviewer": jalons["reviewer"],
+        # #1979 : une revue dispensée n'a pas de relecteur — l'état `approved`
+        # le dit ; le jeton de la colonne ne sort pas dans la vue.
+        "reviewer": (None if jalons["reviewer"] == work_mod.REVIEWER_NONE
+                     else jalons["reviewer"]),
+        "reviewers": jalons["reviewers"],
+        "pending_reviewers": jalons["pending_reviewers"],
         "milestones": {k: _round(jalons[k])
                        for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
@@ -839,6 +879,26 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
+    # #1822 : un lot léger sans verdict courant attend la fusion, pas un
+    # verdict ; la classe n'est lue — une fois par passage — que pour ces lots.
+    from . import lot_class
+    classes: dict = {}
+    for lot, item in zip(lots, items):
+        if (lot.get("waiting_for") or {}).get("what") != "verdict":
+            continue
+        cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes,
+                                         milestones=declared.get(int(item["id"]), []))
+        if cls != lot_class.LIGHT:
+            continue
+        rid = int(item["id"])
+        acts = by_item.get(rid, [])
+        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid))
+        lot["waiting_for"] = stagnation.with_availability(
+            stagnation.waiting(item, jalons, acts,
+                               responsible=(packages.get(item.get("package_id"))
+                                            or {}).get("responsible"),
+                               review_class=cls),
+            states, externals)
     package_items = st.package_items()
     plan = plan_mod.summarize(package_rows, package_items)
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)
@@ -1033,7 +1093,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
         extra = []
         if lot["assignee"]:
             extra.append("author %s" % lot["assignee"])
-        if lot["reviewer"]:
+        if lot.get("reviewers"):
+            extra.append("reviewers %s" % ", ".join(lot["reviewers"]))
+        elif lot["reviewer"]:
             extra.append("reviewer %s" % lot["reviewer"])
         if lot["blocked_verdicts"] or lot["blocks"]:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))

@@ -101,10 +101,12 @@
 # #856 — un runner arrêté (saturation #747) tue le publisher et l'étape
 # `close` : le check restait `in_progress` pour toujours. Le job `tests`
 # (indépendant des publishers) conclut les orphelins en relisant l'état
-# terminal réel du job et de l'exécution (`ci-flow.py sweep`, par le
-# `details_url` ou, à défaut, par le `check_suite`) : `cancelled`, jamais
-# `success` sans ligne `fin`, et aucun check actif n'est touché. D'où
-# `actions: read` et `checks: write` sur le job `tests`.
+# terminal réel du job et de l'exécution (`ci-flow.py sweep`, par
+# l'`external_id` du check #1393, sinon par le `details_url` ou, à défaut, par
+# le `check_suite`) : `cancelled`, jamais `success` sans ligne `fin`, et aucun
+# check actif n'est touché. D'où `actions: read` et `checks: write` sur le job
+# `tests`. #1393 : le balayage est borné (`timeout 120`, `--max-duration 100`)
+# sous le plafond de 5 min du job — il ne change jamais le verdict requis.
 name: tests
 
 on:
@@ -712,7 +714,9 @@ jobs:
   # never a required check.
   bilan:
     name: bilan des impactés
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    # #876 : « always() » seul recrée le job après l'annulation de l'exécution
+    # (il reste queued des heures, puis la conclut en rouge) ; !cancelled() le saute.
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
     # Union #1256 x #1468 : le pool prioritaire d'abord, puis l'hôte prêté
     # quand un prêt est armé, puis la flotte ordinaire. `bilan` est hors de la
@@ -775,6 +779,11 @@ jobs:
   # ou exécution à la main — compte comme les autres)
   tests:
     name: tests
+    # #876 : seul check requis ; `always() && !cancelled()` le ferait passer
+    # skipped sur une exécution annulée, et GitHub compte un job sauté comme un
+    # succès — la PR redeviendrait fusionnable sans aucun test. Il garde donc
+    # `always()` (une exécution annulée le conclut en rouge) ; l'attente en file
+    # de cet agrégat après annulation est la saturation des runners (lot #828).
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
@@ -821,15 +830,20 @@ jobs:
       # #856 : réconciliation indépendante du publisher — un runner arrêté
       # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
       # restait in_progress pour toujours. On relit l'état terminal réel du job
-      # et de l'exécution qui l'ont publié (par le `details_url`, sinon par le
-      # `check_suite` : GitHub laisse l'URL par défaut sur ces checks) ; jamais
-      # `success` sans ligne `fin`, aucun check dont l'exécution est encore
-      # active, ni d'une autre tête, n'est touché.
+      # et de l'exécution qui l'ont publié (par l'`external_id` du check #1393,
+      # sinon par le `details_url`, sinon par le `check_suite` : GitHub laisse
+      # l'URL par défaut sur ces checks) ; jamais `success` sans ligne `fin`,
+      # aucun check dont l'exécution est encore active, ni d'une autre tête,
+      # n'est touché.
       # `continue-on-error` : cette réconciliation ne change jamais le verdict
       # requis « tests » (comme la publication, elle n'est pas une cause d'échec).
       # `if: always()` : un bilan rouge (une part requise tombée) ne doit pas
       # sauter le checkout — sinon `sweep`, lancé en `always()`, n'a plus son
       # script et aucun check orphelin n'est conclu.
+      # #1393 : `timeout 120` et `--max-duration 100` bornent le balayage (les
+      # appels GitHub peuvent durer 20 s) sous le plafond de 5 min du job : un
+      # balayage lent ne peut pas faire expirer le job et rougir « tests » ; il
+      # s'arrête entre deux checks et les restants sont vus au passage suivant.
       - uses: actions/checkout@v4
         if: always()
         continue-on-error: true
@@ -838,4 +852,4 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci-flow.py sweep
+        run: timeout 120 python3 scripts/ci-flow.py sweep --max-duration 100

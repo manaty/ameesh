@@ -85,7 +85,7 @@ def _reading(row: dict) -> dict:
 
 #: colonnes d'une ressource de tour
 TURN_COLUMNS = (
-    "id, turn_id, agent, host, pgid, label, containers, "
+    "id, turn_id, agent, host, pgid, label, containers, cgroup, "
     "extract(epoch from started_at)::float8 AS started_ts, "
     "extract(epoch from ended_at)::float8 AS ended_ts, status"
 )
@@ -314,6 +314,12 @@ class TurnResources(interface.TurnResources):
             """,
             (turn_id, agent, host, None if pgid is None else int(pgid), label,
              _array(containers)),
+        )
+
+    def attach_cgroup(self, turn_id, cgroup) -> None:
+        self.db.query(
+            "UPDATE turn_resources SET cgroup = %s WHERE turn_id = %s RETURNING id",
+            (None if cgroup is None else str(cgroup), turn_id),
         )
 
     def close_turn(self, turn_id, *, orphan, containers=None) -> None:

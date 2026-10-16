@@ -124,8 +124,11 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
                 "merge packet/queue — no author action, do not nudge its assignee or "
                 "reassign it; the composer/pilot carries the merge")
     if who:
+        # #2016 : la commande porte le titulaire lu ici (`--if-holder`) : un
+        # second agent parti du même brief est refusé si le lot a changé de
+        # main entre-temps, au lieu de voler le lot au premier.
         return ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
-                "ameesh work assign %d <agent>" % (who, who, lot, lot))
+                "ameesh work assign %d <agent> --if-holder %s" % (who, who, lot, lot, who))
     # #1026 : un lot sans assigné se prend (`--claim`) : deux orchestrateurs
     # qui l'assignent en même temps ne peuvent plus se voler le lot.
     return "assign it: ameesh work assign %d <agent> --claim" % lot
@@ -247,13 +250,17 @@ def _slo_breach(alert: dict) -> str:
                sous_utilisation._duration(alert.get("value") or 0),
                sous_utilisation._duration(alert.get("threshold") or 0),
                ", assigned to %s" % who if who else ", unassigned"))
+    # #2016 : quand la commande est proposée, elle porte le titulaire lu
+    # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
+    # le lot a changé de main entre-temps, au lieu d'écraser le premier geste.
+    holder = " --if-holder %s" % who if who else ""
     if level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
-                "%d <agent>, then agent-mail send <agent> \"…\" --lot %d); do not wait "
-                "for the pilot if it is itself late" % (lot, lot))
+                "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
+                "for the pilot if it is itself late" % (lot, holder, lot))
     elif level >= 2:
-        move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>, then "
-                "agent-mail send <agent> \"…\" --lot %d)" % (lot, lot))
+        move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>%s, then "
+                "agent-mail send <agent> \"…\" --lot %d)" % (lot, holder, lot))
     else:
         move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
                 "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
@@ -357,8 +364,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
             text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
             teams = _projects(by_name, alert.get("agent"))
-            if reviewer and str(reviewer) in by_name:
-                extra[str(reviewer)] = _verdict_due(alert)
+            for name in str(reviewer or "").split(","):
+                name = name.strip()
+                if name in by_name:
+                    extra[name] = _verdict_due(alert)
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = _projects(by_name, alert.get("agent"))

@@ -92,7 +92,31 @@ The reviewer of a review can be **designated on entry to `qa`** (#705):
 a design agent designates, never the lot's assignee. The wait then names that
 reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
-designate one.
+designate one. Two corrections are gestures of the same authority (#1979):
+`ameesh work reviewer <id> --remove` removes all designations made by mistake
+(the lot goes back to waiting for a reviewer, and the alert asks for one
+again); `ameesh work reviewer <id> --no-verdict` marks "verdict not required"
+when no re-verdict is due (mechanical composition resolution, canon §11
+bis/#87, a verdict kept from a reviewed head) — the lot then waits only for
+its merge and no reminder reaches a reviewer. Designating a reviewer lifts
+the waiver; a current blocking verdict refuses it (a fix is due).
+
+The **review class** of the lot (canon §2, #1822) routes that wait too: a light
+lot's review happens after the merge, so a light lot with no current verdict
+waits for the merge, not for a verdict — even when a reviewer is designated.
+The class is read once per pass, and only for lots whose wait would otherwise
+be a verdict; when it cannot be read (no repository, no freeze, unreadable
+policy), the prudent verdict wait is kept instead of guessing a class.
+
+Several reviewers can be designated for the same lot (#2076): repeat
+`ameesh work reviewer <id> <agent>` to add a name. `work show` and the JSON
+`reviewers` list retain them all. The wait and alerts name each reviewer
+whose verdict on the frozen head is still due; one GO does not complete the
+other reviews. Withdraw a designation explicitly with
+`ameesh work reviewer <id> <agent> --remove` (the same authority is required).
+Assigning or delegating the lot to a reviewer removes that person's
+designation and preserves the others. Migration 0456 keeps the legacy
+`reviewer` field for older runners during an upgrade.
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
@@ -134,7 +158,15 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    diff of the freeze is one commit of the target (**squash**). `--verbatim` does not
    normalize any whitespace (`--stable` would confuse `"a b"` and `"ab"`): false
    negative rather than false positive; without it (git < 2.40), only ancestry
-   proves. Closing is conditioned in the database on the examined freeze: a new
+   proves. Each of these proofs is voided by an **effective revert** (#1825): a
+   later `Revert "…"` that cites the commit carrying the content, undoes exactly
+   its patch, and is reapplied by no later commit — the content is not delivered
+   and the lot stays open (`how: reverted`). Detection is best-effort, not a
+   guarantee: it scans only the most recent commits of the target (200) and
+   requires `git patch-id --verbatim` (git ≥ 2.40); a revert outside that window,
+   or an ancestry proof without `--verbatim`, still closes a reverted lot
+   wrongly. `sync-branches` and `sync-merges` carry the same guard. Closing is
+   conditioned in the database on the examined freeze: a new
    freeze declared in the meantime prevents it (`refrozen`);
 3. **the linked PR** (as a fallback, or alone):
 

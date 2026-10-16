@@ -3,7 +3,9 @@
 # agent-mesh-pg — le Postgres local du banc (Docker, postgres:17).
 #
 # Le port n'est publié que sur la boucle locale : la base n'est pas exposée au
-# réseau. Le volume nommé garde les données entre deux démarrages.
+# réseau. Le volume nommé garde les données entre deux démarrages ; un banc de
+# lot qui se déclare jetable (AMEESH_PG_DISPOSABLE=1) est, lui, récoltable par
+# le ménage d'ameesh après `docker_volume_idle` (24 h) sans conteneur.
 # Aucun mot de passe n'est codé ici : AMEESH_PG_PASSWORD le fixe à la création
 # du conteneur ; ensuite les clients le lisent dans PGPASSWORD ou ~/.pgpass.
 set -euo pipefail
@@ -24,6 +26,13 @@ if [ "$NAME" = ameesh-pg ]; then
 else
   VOLUME=${AMEESH_PG_VOLUME:-$NAME-data}
 fi
+# #2003 : le ménage d'ameesh ne récolte QUE les volumes dont le cycle de vie
+# jetable a été DÉCLARÉ. Cette déclaration est le fait de l'appelant :
+# `AMEESH_PG_DISPOSABLE=1` pose `ameesh.bench=disposable` sur le volume d'un
+# banc de lot (jamais sur le volume par défaut du banc partagé). Sans elle,
+# aucune étiquette : conservation par défaut. Le ménage ne récolte ensuite
+# qu'après `docker_volume_idle` d'absence continue (jamais l'âge de création).
+DISPOSABLE=${AMEESH_PG_DISPOSABLE:-${AGENT_MESH_PG_DISPOSABLE:-}}
 
 # deux postgres sur un même répertoire de données le corrompent : chaque
 # montage est comparé par le répertoire qu'il désigne sur l'hôte ; toute
@@ -135,6 +144,39 @@ else
   esac
   if [ -n "$source_voulue" ]; then
     garde_sources -a "$source_voulue"
+  fi
+  # #2003 : conservation par défaut, récolte sur déclaration explicite. Le
+  # volume par défaut du banc partagé (`ameesh-pg`/`agent-mesh-pg`) ne porte
+  # JAMAIS l'étiquette, même si l'appelant la demande : ses données survivent
+  # au conteneur (le contrat de ce script). Le volume d'un banc de lot ne
+  # reçoit `ameesh.bench=disposable` que si l'appelant a déclaré le banc
+  # jetable (`AMEESH_PG_DISPOSABLE=1`) ; toute autre création reste sans
+  # étiquette. Un volume existant garde ses étiquettes : Docker ne les modifie
+  # pas, et le ménage ne supprime jamais un volume non déclaré.
+  if [ "${VOLUME#/}" = "$VOLUME" ] && ! grep -qxF -- "$VOLUME" <<<"${volumes:-}"; then
+    ETIQUETTE=""
+    case "$DISPOSABLE" in
+      ""|0|false|no|non|off|FALSE|False|NO|No|NON|Non|OFF|Off) ;;
+      *)
+        case "$NAME" in
+          ameesh-pg|agent-mesh-pg)
+            if [ "$VOLUME" = "$NAME-data" ]; then
+              echo "banc partagé $NAME : AMEESH_PG_DISPOSABLE ignoré," \
+                   "le volume $VOLUME reste persistant" >&2
+            else
+              ETIQUETTE="ameesh.bench=disposable"
+            fi ;;
+          *)
+            ETIQUETTE="ameesh.bench=disposable" ;;
+        esac ;;
+    esac
+    if [ -n "$ETIQUETTE" ]; then
+      docker volume create --label "$ETIQUETTE" "$VOLUME" >/dev/null \
+        || { echo "création du volume $VOLUME en échec" >&2; exit 1; }
+    else
+      docker volume create "$VOLUME" >/dev/null \
+        || { echo "création du volume $VOLUME en échec" >&2; exit 1; }
+    fi
   fi
   echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT, volume $VOLUME)"
   # #1411 : le banc est partagé par tous les agents de l'hôte ; l'étiquette

@@ -89,6 +89,15 @@ class ReleaseFences:
             self._scope(tx, request)
             if authorize() is not True:
                 raise FenceError('release fence authority denied')
+            opened = tx.query("SELECT 1 FROM host_release_fence_receipts WHERE operation=%s "
+                              "AND step IN ('unfence','recovery_unfence') LIMIT 1",
+                              (request['operation'],))
+            if opened:
+                # One operation owns one closure, and that closure is terminal
+                # once opened: a later fence action (for example a recovery
+                # replay) must never re-close a host the same operation already
+                # released.
+                raise FenceError('release fence already opened for this operation')
             old = self._receipt(tx, request)
             if old is not None:
                 return old
