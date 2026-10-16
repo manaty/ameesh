@@ -13,19 +13,22 @@
 #     du registre lue sur la VM. Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
 #
 #   verifier     contrôles, rien n'est modifié
-#   installer    code REF dans /opt/ameesh/src (détaché), installé dans
-#                /opt/ameesh/venv (dépendance psycopg comprise) ; refuse tant
-#                que la base du mesh n'a pas toutes les migrations de REF
+#   installer    code REF dans /opt/ameesh/src (détaché), venv versionné
+#                préparé à l'écart (dépendance psycopg comprise) puis bascule
+#                atomique du venv (#1969) ; refuse tant que la base du mesh
+#                n'a pas toutes les migrations de REF
 #   redemarrer   ameesh-runner@<persona>, une par une, chacune hors tour ;
 #                refuse tant que les migrations du code installé manquent
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
-#   retour       réinstalle le commit d'avant et redémarre
+#   retour       bascule en arrière vers le venv précédent conservé, puis
+#                redémarre
 #
 #   En mode agents, installer et retour travaillent dans le layout du compte
 #   ameesh (~/.local/share/ameesh : clone src, instantanés src-<sha7> jamais
 #   écrasés, previous-sha, venv), avec les mêmes gardes de migrations ; le
 #   redémarrage reste hors tour sous bail. L'installation ne redémarre
-#   personne, le retour réinstalle l'ancien code puis redémarre et contrôle.
+#   personne, le retour bascule en arrière vers le venv précédent conservé
+#   puis redémarre et contrôle.
 #   Avant toute mutation, l'identité effective du compte runner (son
 #   EnvironmentFile) doit être celle de HOTE_AGENTS, et un journal de
 #   récupération retient le code quitté : une installation inachevée ferme la
@@ -77,6 +80,23 @@ mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
+# #1969 : le helper de bascule atomique est copié depuis le poste, pour que
+# l'installation et le retour emploient la même version quel que soit le
+# commit déployé (l'ancien code n'a pas forcément le fichier).
+BASCULE_VM=/tmp/ameesh-bascule-$$.py
+envoyer_bascule_vm() {
+  [ -r "$ICI/bascule.py" ] || { echo "bascule.py introuvable : $ICI/bascule.py" >&2; return 1; }
+  ssh_vm "cat > $BASCULE_VM" < "$ICI/bascule.py"
+}
+BASCULE_AGENTS=/home/ameesh/.local/state/ameesh/mise-a-jour/bascule-$$.py
+envoyer_bascule_agents() {
+  local b64
+  [ -r "$ICI/bascule.py" ] || { echo "bascule.py introuvable : $ICI/bascule.py" >&2; return 1; }
+  b64=$(base64 -w0 "$ICI/bascule.py") || return 1
+  utilisateur_agents bash -c "mkdir -p /home/ameesh/.local/state/ameesh/mise-a-jour
+    printf %s '$b64' | base64 -d > $BASCULE_AGENTS
+    chmod 600 $BASCULE_AGENTS"
+}
 # Versions de migration du commit $1 (clone du serveur) absentes de la base
 # du mesh, une par ligne ; rien si toutes sont passées.
 migrations_absentes() {
@@ -561,14 +581,16 @@ assurer_instantane_agents() {  # $1 : sha40 ; instantané exact, créé ou véri
     echo "instantané src-${sha:0:7} refusé ($etat) : le contenu ne correspond pas au commit ; le retirer à la main (aucun écrasement automatique)" >&2
     return 1; }
 }
-# Réinstallation depuis l'instantané $1 : paquet puis dépendances, même
-# chemin pour installer et retour.
+# Réinstallation depuis l'instantané $1 : venv versionné préparé à l'écart
+# puis bascule atomique (#1969), même chemin pour installer et retour.
 reinstaller_agents() {
+  local court=${1:0:7}
+  envoyer_bascule_agents || return 1
   utilisateur_agents bash -c "set -euo pipefail
     P=/home/ameesh/.local/share/ameesh; V=\$P/venv
-    \$V/bin/pip install -q --force-reinstall --no-deps \$P/src-${1:0:7}
-    \$V/bin/pip install -q \$P/src-${1:0:7}
-    \$V/bin/python -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
+    python3 $BASCULE_AGENTS preparer --venv \"\$V\" --src \"\$P/src-$court\" --version $court
+    python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court
+    \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
 }
 releve_agents() {  # identité et pièces du bon hôte, avant tout geste
   local installe clone previous
@@ -798,12 +820,13 @@ installer() {
   # nouveau code n'y entre qu'une fois la base migrée (10/10, L151)
   etape "migrations de ${sha:0:9} passées sur la base du mesh"
   exiger_migrations "$sha" installer
-  etape "extraction et installation dans $VENV"
+  etape "préparation isolée puis bascule dans $VENV (#1969)"
+  envoyer_bascule_vm
   ssh_vm "set -e
     git -C $SRC checkout -q --detach '$sha'
     test \"\$(git -C $SRC rev-parse HEAD)\" = '$sha'
-    $VENV/bin/pip install -q --force-reinstall --no-deps $SRC
-    $VENV/bin/pip install -q $SRC
+    python3 $BASCULE_VM preparer --venv $VENV --src $SRC --version ${sha:0:7}
+    python3 $BASCULE_VM activer --venv $VENV --version ${sha:0:7}
     $VENV/bin/python -c 'import psycopg, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \": modules L70 et L62 présents\")'"
   echo "installé. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
@@ -883,10 +906,11 @@ controler() {
 }
 
 retour() {
-  etape "retour au commit d'avant"
+  etape "retour au commit d'avant, par la bascule (sans pip)"
+  envoyer_bascule_vm
   ssh_vm "set -e; test -s $PRECEDENT
+    python3 $BASCULE_VM retour --venv $VENV
     git -C $SRC checkout -q --detach \"\$(cat $PRECEDENT)\"
-    $VENV/bin/pip install -q --force-reinstall --no-deps $SRC
     echo \"code : \$(git -C $SRC rev-parse --short HEAD)\""
   echo "base inchangée : les migrations passées avant l'installation sont additives, l'ancien code les ignore"
   redemarrer

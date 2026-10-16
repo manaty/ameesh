@@ -189,13 +189,42 @@ with log.open('a') as f:
 fail_at = int((state / 'pip-fail-at').read_text()) if (state / 'pip-fail-at').exists() else 0
 if fail_at and len(log.read_text().splitlines()) >= fail_at:
     sys.exit('pip failure (test)')
-# Un pip réussi publie direct_url.json sur la source installée : le venv pointe
-# alors l'instantané même si l'installation s'arrête au pip suivant.
-info = (Path(os.environ['FAKE_VM_HOME'])
-        / '.local/share/ameesh/venv/lib/python3.11/site-packages/ameesh-1.9.0.dist-info')
+# Un pip réussi publie direct_url.json sur la source installée : le venv qui le
+# porte pointe alors l'instantané même si l'installation s'arrête au pip suivant.
+# #1969 : le pip d'un venv versionné écrit dans CE venv (son propre chemin),
+# pas dans le venv vivant qui ne reçoit plus jamais de pip.
+info = (Path(sys.argv[0]).resolve().parents[1]
+        / 'lib/python3.11/site-packages/ameesh-1.9.0.dist-info')
 if info.is_dir():
     (info / 'direct_url.json').write_text(json.dumps(
         {'url': Path(sys.argv[-1]).resolve().as_uri()}))
+'''
+
+# #1969 : le helper de bascule crée un venv versionné (`python3 -m venv`). Sous
+# ce banc, `python3` est ce stub : il fabrique un venv factice dont le pip est
+# celui du harnais (journalisé), le python répond aux contrôles d'imports et le
+# script console porte le shebang attendu. Toute autre invocation va au vrai
+# python (c'est lui qui exécute le helper).
+PYTHON3 = r'''#!@@SHEBANG@@
+import os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if argv[:2] == ['-m', 'venv'] and len(argv) >= 3:
+    dest = Path(argv[2])
+    (dest / 'bin').mkdir(parents=True)
+    (dest / 'lib/python3.11/site-packages/ameesh-1.9.0.dist-info').mkdir(parents=True)
+    pip = dest / 'bin/pip'
+    pip.write_text(@@PIP@@)
+    pip.chmod(0o755)
+    python = dest / 'bin/python'
+    python.write_text('#!/bin/sh\nif [ "$1" = "-c" ]; then exit 0; fi\nexec '
+                      + @@PYREPR@@ + ' "$@"\n')
+    python.chmod(0o755)
+    ameesh = dest / 'bin/ameesh'
+    ameesh.write_text('#!%s\nimport sys\nsys.exit(0)\n' % python)
+    ameesh.chmod(0o755)
+    sys.exit(0)
+os.execv(@@PY@@, [@@PY@@] + argv)
 '''
 
 
@@ -233,7 +262,12 @@ class VmAgentsHarness(unittest.TestCase):
         # a missing fake command would fail the test rather than reach the host.
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        (self.bin / 'python3').symlink_to(sys.executable)
+        (self.bin / 'python3').write_text(
+            PYTHON3.replace('@@SHEBANG@@', sys.executable)
+                   .replace('@@PIP@@', repr(PIP))
+                   .replace('@@PYREPR@@', repr(sys.executable))
+                   .replace('@@PY@@', repr(sys.executable)))
+        (self.bin / 'python3').chmod(0o755)
         for name, text in [('ssh', SSH), ('scp', SCP), ('runuser', RUNUSER), ('id', ID),
                            ('systemctl', SYSTEMCTL), ('journalctl', JOURNALCTL),
                            ('sleep', SLEEP), ('systemd-run', SYSTEMD_RUN),
@@ -291,6 +325,10 @@ class VmAgentsHarness(unittest.TestCase):
         # (union composée) — le banc le copie à côté, comme bail.sh.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/paquet-git.sh',
                      self.origin / 'deploy/mise-a-jour/paquet-git.sh')
+        # #1969 : le helper de bascule est copié du poste vers la VM ; le banc
+        # l'installe dans son dépôt d'origine comme les autres pièces.
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/bascule.py',
+                     self.origin / 'deploy/mise-a-jour/bascule.py')
         shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
         (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
         (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')

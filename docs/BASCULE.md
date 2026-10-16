@@ -1291,6 +1291,30 @@ in place. If REF adds a dependency that `ameesh migrate` needs,
 `migrer` fails at import: first install that dependency in the venv
 (`pip install <paquet>`), then resume at `migrer`.
 
+## Atomic venv switch (#1969)
+
+`poste.sh installer` and `vm.sh installer` (server and agents) no longer run
+`pip` in the **live** venv: they prepare a **versioned** venv next to it
+(`venv-<sha7>`, with its own pip, dependencies and controls), then switch in a
+single rename. A concurrent command (`agent-mail send`, `ameesh work`, a
+runner's import) therefore sees either the whole old code or the whole new
+code — never the incomplete state of the 16/10 incident
+(`ModuleNotFoundError ameesh.platform.process`, missing `ameesh`/code 127).
+Controls run **before** the switch: imports (`psycopg`, `ameesh`),
+`ameesh --version`, and the console script's shebang pointing at the
+versioned venv's Python.
+
+The first switch converts the live `venv` directory into a symlink
+atomically (`renameat2(RENAME_EXCHANGE)`, Linux ≥ 3.15) and keeps the old
+directory as `venv-precedent`; later switches are a single `rename()` of the
+symlink. A preparation failure removes its partial directory and leaves the
+active version untouched; `retour` switches back to the previous venv, kept
+whole on disk, **without pip**, and is idempotent. `src-current` and
+`previous-sha` keep their meaning. The helper is
+`deploy/mise-a-jour/bascule.py` (`preparer`, `activer`, `retour`, `etat`),
+copied to the VM (server and agents) so that install and rollback use the same
+version whatever commit is deployed.
+
 ## Update to 1.10.0 (path B, mediated executor)
 
 1.10.0 brings path B, the mediated executor (L107 to L115,
