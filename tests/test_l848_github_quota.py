@@ -104,8 +104,8 @@ class FakeGitHub:
                 request.full_url, failure["code"], failure.get("message", "rate limited"),
                 quota_headers(remaining=failure.get("remaining", "0"),
                               limit=self.limit, reset=failure.get("reset", self.reset),
-                              retry=failure.get("retry")),
-                io.BytesIO(b'{"message": "API rate limit exceeded"}'))
+                              retry=failure.get("retry"), resource=failure.get("resource")),
+                io.BytesIO(failure.get("body", b'{"message": "API rate limit exceeded"}')))
         etag = self.etags.get(path)
         if etag and sent.get("if-none-match") == etag:
             raise urllib.error.HTTPError(
@@ -401,6 +401,104 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(reads.counters()["not_modified"], 1)
 
 
+class ResourceAndSecondaryLimitTest(unittest.TestCase):
+    """#1405 : le cache retient la ressource du chemin et la limite
+    secondaire, et repaie une entrée illisible (N2-N3 de la R2 bureau de
+    #848 ; la clé par client, N1, est celle de #1790 : `reads_scope`)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.clock = Clock()
+        self.gh = FakeGitHub(self.clock)
+        self.gh.body["repos/o/r"] = {"id": 1}
+        self.gh.body["search/issues?q=x"] = {"total_count": 0}
+
+    def api(self, token="secret-token", base=BASE):
+        reads = plan_github.SharedReads(self.dir.name, clock=self.clock, ttl=60)
+        return plan_github.Api(token=token, base=base, reads=reads, ttl=60,
+                               clock=self.clock, opener=self.gh)
+
+    def test_entree_illisible_repayee(self):
+        """Une date illisible dans une entrée ne fait pas échouer la lecture."""
+        api = self.api()
+        api.get("repos/o/r")
+        path = api.reads._entry_path("repos/o/r")
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["read_ts"] = "abc"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        self.assertIsNone(api.reads.cached("repos/o/r"))
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})
+        self.assertEqual(len(self.gh.calls), 2)
+
+    def test_ressource_du_chemin(self):
+        self.assertEqual(plan_github.resource_of("repos/o/r"), "core")
+        self.assertEqual(plan_github.resource_of("/search/issues?q=x"), "search")
+        self.assertEqual(plan_github.resource_of("search/code?q=x"), "code_search")
+        self.assertEqual(plan_github.resource_of("graphql"), "graphql")
+
+    def test_recherche_epuisee_bloquee_davance(self):
+        """N2 : une ressource non core épuisée ne repart pas vers GitHub."""
+        api = self.api()
+        self.gh.fail_next = {"code": 403, "remaining": "0", "resource": "search",
+                             "reset": self.clock.now + 60}
+        with self.assertRaises(plan_github.GithubRateLimited):
+            api.get("search/issues?q=x")
+        self.assertEqual(len(self.gh.calls), 1)
+        with self.assertRaises(plan_github.GithubRateLimited):
+            api.get("search/issues?q=x")
+        self.assertEqual(len(self.gh.calls), 1)          # aucune requête de plus
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})  # core intact
+        self.assertEqual(len(self.gh.calls), 2)
+        self.clock.advance(61)
+        self.assertEqual(api.get("search/issues?q=x"), {"total_count": 0})
+
+    def test_refus_sans_entete_range_sous_la_ressource_du_chemin(self):
+        """N2 : sans `X-RateLimit-Resource`, le refus va au bucket du chemin."""
+        api = self.api()
+        self.gh.fail_next = {"code": 429, "remaining": "0", "reset": self.clock.now + 60}
+        with self.assertRaises(plan_github.GithubRateLimited):
+            api.get("search/issues?q=x")
+        self.assertIsNotNone(api.reads.blocked(resource="search"))
+        self.assertIsNone(api.reads.blocked())
+
+    def test_limite_secondaire_retenue(self):
+        """N3 : 403 secondaire, quota restant, sans `Retry-After` : attente bornée."""
+        api = self.api()
+        api.get("repos/o/r")
+        self.clock.advance(61)
+        self.gh.fail_next = {"code": 403, "remaining": "4000",
+                             "body": b'{"message": "You have exceeded a secondary rate limit"}'}
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})   # cache servi
+        self.assertTrue(api.last_read.stale)
+        self.assertEqual(api.reads.blocked(),
+                         self.clock.now + plan_github.RATE_LIMIT_WAIT)
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})
+        self.assertEqual(len(self.gh.calls), 2)              # pas de nouvel essai
+        self.clock.advance(plan_github.RATE_LIMIT_WAIT + 1)
+        api.get("repos/o/r")
+        self.assertEqual(len(self.gh.calls), 3)
+
+    def test_refus_ordinaire_ne_bloque_pas(self):
+        """N3 : un 403 de droits (quota restant, sans mention secondaire) reste
+        une erreur, sans attente imposée."""
+        api = self.api()
+        self.gh.fail_next = {"code": 403, "remaining": "4000",
+                             "body": b'{"message": "Resource not accessible by integration"}'}
+        with self.assertRaises(plan_github.GithubError) as caught:
+            api.get("repos/o/r")
+        self.assertNotIsInstance(caught.exception, plan_github.GithubRateLimited)
+        self.assertIsNone(api.reads.blocked())
+
+    def test_secondaire_quota_a_zero_attend_le_reset(self):
+        reads = plan_github.SharedReads(self.dir.name, clock=self.clock)
+        until = reads.note(quota_headers(remaining="0", reset=self.clock.now + 900),
+                           status=403, body="secondary rate limit")
+        self.assertEqual(until, self.clock.now + 900)
+
+
 class TransportMetaTest(unittest.TestCase):
     """R1 #848 B2 : le transport dit ce qu'il a servi (date d'origine, péremption)."""
 
@@ -460,11 +558,11 @@ class ReaderStaleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             wall = Clock()
             reads = plan_github.SharedReads(directory, clock=wall, ttl=60)
+            api = plan_github.Api(token="t", base=BASE, reads=reads, ttl=60,
+                                  clock=wall, opener=self._no_network)
             reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=1.0)
             reads.note(quota_headers(remaining="0", reset=100000),
                        status=403, now=wall.now)
-            api = plan_github.Api(token="t", base=BASE, reads=reads, ttl=60,
-                                  clock=wall, opener=self._no_network)
             reader, value = self._reader(directory, wall, api)
             self.assertEqual(value, {"id": 1})           # rien n'est perdu
             self.assertTrue(reader.stale("repos/o/r"))   # mais c'est périmé
@@ -475,9 +573,9 @@ class ReaderStaleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             wall = Clock()
             reads = plan_github.SharedReads(directory, clock=wall, ttl=60)
-            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=990.0)
             api = plan_github.Api(token="t", base=BASE, reads=reads, ttl=60,
                                   clock=wall, opener=self._no_network)
+            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=990.0)
             reader, value = self._reader(directory, wall, api)
             self.assertEqual(value, {"id": 1})
             self.assertEqual(reader.stamp("repos/o/r"), 990.0)
