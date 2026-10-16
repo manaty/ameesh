@@ -671,6 +671,12 @@ def _host_measure_lines(latest: dict, offer: dict | None) -> list[str]:
         out.append("  shares     CPU application %s, guest %s of %s; guest memory %s" % (
             cpus(latest.get("app_cpu")), cpus(latest.get("guest_cpu")),
             latest.get("cpu_count") or "—", _fmt_bytes(latest.get("guest_mem_bytes"))))
+    # #2022: processes and zombies, of the host and of the publishing runner
+    if latest.get("procs_total") is not None:
+        out.append("  processes  %d, zombies %d; runner %s: %s, zombies %s" % (
+            latest["procs_total"], latest.get("procs_zombie") or 0,
+            latest.get("runner_id") or "—", latest.get("runner_procs", "—"),
+            latest.get("runner_zombies", "—")))
     # without an offer the host lends nothing: show what it could lend
     lent = res.offered(latest, offer if offer is not None else {})
     if lent is not None:

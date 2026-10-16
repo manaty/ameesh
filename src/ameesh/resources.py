@@ -104,10 +104,15 @@ DISK_TREND_HORIZON_S = 24 * 3600.0
 DISK_TREND_CRITICAL_S = 6 * 3600.0
 DISK_TREND_MIN_POINTS = 6
 DISK_TREND_MIN_SPAN_S = 3600.0
+#: #2022: zombies of a host at or over this count raise `host_zombies` — a
+#: warning, no pause (16/10, found by hand: 99 on ameesh-ci-3, 5 900 on the
+#: workstation, 11 000 on agents-1, #1749)
+ZOMBIE_KEYS = ("max_zombies",)
+DEFAULT_MAX_ZOMBIES = 200
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
 THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
                   "max_tmpfs_used", *POWER_KEYS, *PRESSURE_KEYS,
-                  *BTRFS_KEYS, *WARN_KEYS)
+                  *BTRFS_KEYS, *WARN_KEYS, *ZOMBIE_KEYS)
 #: L159c : plafonds mémoire des unités d'agent, dans `policy.resources` aussi.
 #: Ce ne sont pas des seuils de contre-pression : systemd les fait respecter
 #: (`MemoryMax`), `ameesh doctor` vérifie l'écart entre le canon et l'unité.
@@ -235,6 +240,17 @@ def finite_float(value) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def parse_count(value) -> int | None:
+    """#2022: a count (`max_zombies`): a positive integer, None otherwise."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip()) or None
+    return None
 
 
 def parse_percent(value) -> float | None:
@@ -765,6 +781,37 @@ def guest_memory(cgroups: list[str] | None = None) -> int | None:
     return None if any(v is None for v in values) else sum(values)
 
 
+#: #2022 (0455): the process counts of a reading
+PROCESS_FIELDS = ("procs_total", "procs_zombie", "runner_procs", "runner_zombies")
+
+
+def processes(root: int | None = None, table: list[dict] | None = None) -> dict:
+    """#2022: `procs_total` and `procs_zombie` of the host, `runner_procs` and
+    `runner_zombies` among the descendants of `root` (default: this
+    process, the runner); all None when the process table cannot be read —
+    an empty table would read as « nothing runs »."""
+    if table is None:
+        try:
+            table = platform.process_table()
+        except Exception:  # NotAvailable, or any read error: unmeasured
+            return dict.fromkeys(PROCESS_FIELDS)
+    root = os.getpid() if root is None else int(root)
+    kids: dict[int, list[dict]] = {}
+    for proc in table:
+        kids.setdefault(proc.get("ppid"), []).append(proc)
+    own, stack, seen = [], [root], {root}
+    while stack:
+        for child in kids.get(stack.pop(), ()):
+            if child["pid"] not in seen:
+                seen.add(child["pid"])
+                own.append(child)
+                stack.append(child["pid"])
+    return {"procs_total": len(table),
+            "procs_zombie": sum(1 for p in table if p.get("zombie")),
+            "runner_procs": len(own),
+            "runner_zombies": sum(1 for p in own if p.get("zombie"))}
+
+
 def lendable(reading: dict, basis: dict | None = None) -> dict:
     """Capacity the host could lend (study L159 §1.4), before the offer.
 
@@ -1040,6 +1087,9 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None,
     reading.update(lendable(reading, basis))
     reading["guard_restart"] = guard_restart(now=now)
     reading.update({key: (gate or {}).get(key) for key in GATE_KEYS})
+    # #2022: zombies and processes, of the host and of this runner
+    reading.update(processes())
+    reading["runner_id"] = getattr(cfg, "runner_id", None) or None
     storage.of(db).hosts.record(reading)
     return reading
 
@@ -1078,6 +1128,7 @@ def thresholds(policy=None) -> dict:
     cpu_pressure = parse_percent(raw.get("max_cpu_pressure"))
     unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
     headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
+    zombies = parse_count(raw.get("max_zombies"))
     warn_used = parse_fraction(raw.get("warn_disk_used"))
     warn_free = parse_bytes(raw.get("warn_disk_free"))
     cpus = cpu_count() or 1
@@ -1101,6 +1152,8 @@ def thresholds(policy=None) -> dict:
         # #2022: early disk warning (never a pause)
         "warn_disk_used": DEFAULT_WARN_DISK_USED if warn_used is None else warn_used,
         "warn_disk_free": DEFAULT_WARN_DISK_FREE if warn_free is None else warn_free,
+        # #2022: zombies of the host (a warning, never a pause)
+        "max_zombies": DEFAULT_MAX_ZOMBIES if zombies is None else zombies,
     }
 
 
@@ -1122,6 +1175,7 @@ def declared(policy) -> dict:
     out: dict = {}
     for key in THRESHOLD_KEYS:
         value = (finite_float(raw.get(key)) if key == "max_load"
+                 else parse_count(raw.get(key)) if key in ZOMBIE_KEYS
                  else parse_fraction(raw.get(key)) if key in FRACTION_KEYS
                  else parse_percent(raw.get(key)) if key in POWER_KEYS + PRESSURE_KEYS
                  else parse_bytes(raw.get(key)))
@@ -1416,6 +1470,8 @@ def fmt_value(key: str, value) -> str:
         return "—"
     if key == "max_load":
         return "%.2f" % float(value)
+    if key in ZOMBIE_KEYS:
+        return "%d" % int(value)
     if key in FRACTION_KEYS:
         return "%d %%" % round(float(value) * 100)
     if key in POWER_KEYS:
