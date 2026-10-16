@@ -204,7 +204,11 @@ def _hook_binary(command: str) -> str:
 
 
 #: variables d'environnement d'un chemin de hook : `$HOME` et `${HOME}`.
-_HOOK_VARIABLE = re.compile(r"\$(?:\{(?P<accolade>[A-Za-z0-9_]+)\}|(?P<nu>[A-Za-z0-9_]+))")
+#: Un nom commence par une lettre ou `_` ; `$1` est le positionnel seul,
+#: `$1abc` vaut `$1` puis `abc` comme au shell (#1981/N2).
+_HOOK_VARIABLE = re.compile(
+    r"\$(?:\{(?P<accolade>[A-Za-z_][A-Za-z0-9_]*|[0-9])\}"
+    r"|(?P<nu>[A-Za-z_][A-Za-z0-9_]*|[0-9]))")
 
 
 def _hook_path(binary: str, environ=None) -> str:
