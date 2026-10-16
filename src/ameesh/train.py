@@ -30,6 +30,13 @@ class TrainError(RuntimeError):
     """A missing proof or an uncertain effect: do not merge."""
 
 
+class MemberDeferred(TrainError):
+    """A named composition exclusion, never an accusation or queue ejection."""
+    def __init__(self, row, reason):
+        super().__init__(reason)
+        self.admission = identity(row)
+
+
 @dataclass(frozen=True)
 class Policy:
     enabled: bool = False
@@ -142,6 +149,7 @@ class Ports(Protocol):
     def dependencies(self, rows: list[dict]) -> list[dict]: ...
     def qualify(self, rows: list[dict], base: str, mode: str) -> dict: ...
     def compose(self, base: str, rows: list[dict], nonce: str) -> dict: ...
+    def validate_transports(self, plan: dict) -> list[dict]: ...
     def publish(self, plan: dict, epoch: int) -> None: ...
     def start_ci(self, plan: dict) -> None: ...
     def ci(self, plan: dict) -> dict: ...
@@ -187,6 +195,10 @@ class Engine:
                     nonce=nonce,
                     branch="integration/train-%s-%s" % (state["stamp"], token[:16]),
                     id=token, created_ts=now)
+        if "transports" in merged:
+            if not isinstance(merged["transports"], list) or not merged["transports"]:
+                raise TrainError("nonempty structured composition transports required")
+            plan["transports"] = copy.deepcopy(merged["transports"])
         state["plan"] = plan
         state["phase"] = "publishing"
         state["attempts"].append(dict(id=token, head=plan["head"], tree=plan["tree"],
@@ -206,6 +218,10 @@ class Engine:
         proof = self.ports.qualify(plan["members"], plan["base"], self.policy.ci_mode)
         if digest(proof) != digest(plan["proof"]):
             raise TrainError("admission evidence changed: recompose and qualify again")
+        if plan.get("transports"):
+            validate = getattr(self.ports, "validate_transports", None)
+            if not callable(validate) or digest(validate(plan)) != digest(plan["transports"]):
+                raise TrainError("qualified transport evidence changed before train effect")
 
     def _ci(self, state):
         ci = self.ports.ci(state["plan"])
@@ -264,7 +280,29 @@ class Engine:
             if self.policy.build_beta and (state.get("plan") or {}).get("diagnostic"):
                 raise TrainError("diagnostic CI is disabled during build/beta")
             if state["phase"] == "composing":
-                state = self._plan(state, state["members"], now)
+                # Bounded by the number of admissions: no CI is dispatched
+                # while incompatible contexts and their dependents are removed.
+                while state["members"]:
+                    try:
+                        state = self._plan(state, state["members"], now)
+                        break
+                    except MemberDeferred as exc:
+                        if exc.admission not in [identity(r) for r in state["members"]]:
+                            raise TrainError("composition deferred an unknown admission") from exc
+                        candidates = [r for r in state["members"] if identity(r) != exc.admission]
+                        available = ordered(candidates, self.ports.dependencies(candidates))
+                        kept = {identity(r) for r in available}
+                        deferred = [r for r in state["members"] if identity(r) not in kept]
+                        state["deferred"].extend(deferred)
+                        state.setdefault("selection", []).append(dict(
+                            admission=exc.admission, reason=str(exc),
+                            deferred=[identity(r) for r in deferred]))
+                        state["members"] = available
+                        state = self._save(state)
+                if state["phase"] == "composing":
+                    state["phase"] = "empty"
+                    state = self._save(state)
+                    return {"result": "empty", "selection": state.get("selection", [])}
             if state["phase"] == "publishing":
                 self._current(state)
                 self._held()

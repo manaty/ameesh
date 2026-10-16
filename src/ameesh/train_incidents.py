@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 
-from . import land, merge_queue, radar, resolutions, storage, train_diagnosis
+from . import land, merge_queue, radar, resolutions, storage, train_diagnosis, train_transports
 from .train import SCHEMA, TrainError, identity
 from .train_review import SHA
 
@@ -73,13 +73,19 @@ class PacketFacts:
         if self._git("rev-parse", "--verify", head + "^{tree}").strip() != plan["tree"]:
             raise TrainError("incident packet tree differs from persisted manifest")
         parents = self._git("rev-list", "--parents", "-n", "1", head).split()
-        expected = list(dict.fromkeys([plan["base"]] + [r["frozen_sha"] for r in members]))
+        receipts = train_transports.for_plan(plan)
+        for member in members:
+            receipt = receipts.get(member["work_item_id"])
+            if receipt is not None:
+                train_transports.verify(self.path, receipt, member)
+        expected = list(dict.fromkeys([plan["base"]] + [r["frozen_sha"] for r in members]
+                                     + [r["head"] for r in receipts.values()]))
         if parents != [head] + expected:
             raise TrainError("incident packet parents differ from persisted members")
         return state, plan
 
     def lands(self, repo, head):
-        """One candidate per member, using its own merge-base diff only.
+        """One candidate per member, using its source or qualified transport diff.
 
         Historical member branches and current lot assignments may have moved.
         Neither is read. #1681 resolves the candidate's assignee separately.
@@ -90,17 +96,25 @@ class PacketFacts:
         if found is None:
             return self.fallback(repo, head) if self.fallback is not None else []
         _, plan = found
+        receipts = train_transports.for_plan(plan)
         rows = []
         for member in plan["members"]:
             sha = member["frozen_sha"]
-            bases = self._git("merge-base", "--all", plan["base"], sha).split()
-            if len(bases) != 1:
-                raise TrainError("unique member divergence base required")
+            receipt = receipts.get(member["work_item_id"])
+            if receipt is None:
+                bases = self._git("merge-base", "--all", plan["base"], sha).split()
+                if len(bases) != 1:
+                    raise TrainError("unique member divergence base required")
+                base, diff_head = bases[0], sha
+            else:
+                base, diff_head = receipt["base"], receipt["head"]
             files = self._git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-                              "--name-only", "-z", bases[0], sha, "--").split("\0")
+                              "--name-only", "-z", base, diff_head, "--").split("\0")
             rows.append(dict(sha=sha, lot=member["work_item_id"], author="",
                              summary="packet member #%s" % member["work_item_id"],
                              files=[name for name in files if name]))
+            if receipt is not None:
+                rows[-1]["transport"] = receipt["head"]
         return rows
 
     def links_for(self, repo, head):

@@ -66,6 +66,10 @@ class Runtime:
     def compose(self, base, rows, nonce):
         return self.repository.compose(self.target_branch, base, rows, nonce)
 
+    def validate_transports(self, plan):
+        self._belongs(plan)
+        return self.repository.validate_transports(plan)
+
     def _held(self, epoch):
         if epoch is None or self.ledger.acquire(epoch) != epoch:
             raise TrainError("target reservation lost before train effect")
@@ -95,6 +99,8 @@ class Runtime:
         if digest(self.qualify(plan["members"], plan["base"], self.policy.ci_mode)) \
                 != digest(plan["proof"]):
             raise TrainError("admission evidence changed before train effect")
+        if plan.get("transports"):
+            self.validate_transports(plan)
 
     def publish(self, plan, epoch):
         self._current(plan)

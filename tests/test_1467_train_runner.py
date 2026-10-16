@@ -6,6 +6,7 @@ CI and the provenance provider are explicit fixtures, never live services.
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import types
@@ -13,7 +14,7 @@ from datetime import datetime
 from unittest import mock
 
 from ameesh import (db as db_mod, radar, storage, train, train_ci, train_fire,
-                    train_git, train_policy, train_runner, work)
+                    train_git, train_policy, train_runner, train_transports, work)
 
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
@@ -361,6 +362,48 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(state["fire"]["policy_commit"], self.base)
         self.assertFalse(state["fire"]["merge"]["named_fire"])
         self.assertIsNone(passage.epoch)
+
+    def test_qualified_transport_survives_sql_restart_and_missing_clone_without_refreeze(self):
+        self.automatic_passage()  # install the explicit fixture's automatic policy
+        member = self.ops.queue(None)[0]
+        source_identity = list(train.identity(member))
+        self.git(self.publisher, "checkout", "main")
+        self.git(self.publisher, "merge", "--no-ff", "--no-edit", self.head)
+        self.write("adapted-test", "qualified adaptation fixture\n")
+        self.git(self.publisher, "add", "adapted-test")
+        self.git(self.publisher, "commit", "--amend", "--no-edit")
+        head = self.git(self.publisher, "rev-parse", "HEAD")
+        receipt = dict(schema=train_transports.SCHEMA, source=member["source"], target="main",
+            admission=source_identity, base=self.base, head=head,
+            tree=self.git(self.publisher, "rev-parse", "HEAD^{tree}"),
+            delta=train_transports.delta(self.publisher, self.base, head),
+            ref="refs/ameesh/resolutions/%d/qualified-fixture" % member["work_item_id"],
+            qualification=dict(kind="adapted", references=[dict(kind="work-event", id=1)]))
+        self.git(self.publisher, "push", "-q", "origin", head + ":" + receipt["ref"])
+        connections = []
+        def reader(db, **context):
+            connections.append(db)
+            return json.loads(json.dumps(receipt))
+        passage = self.passage(transports=reader)
+        plan = passage.step(self.db, self.now)["plan"]
+        self.assertEqual(plan["transports"], [receipt])
+        self.assertEqual(list(train.identity(plan["members"][0])), source_identity)
+        self.assertNotIn("transports", plan["proof"])
+        shutil.rmtree(passage.repository_path())
+        other = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other.close)
+        result = passage.step(other, self.now + 1)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
+        self.assertIn(head, self.git(self.origin, "rev-list", "--parents", "-n", "1", plan["head"]).split()[1:])
+        self.assertIs(connections[-1], other)
+        state = self.ops.train_read(self.key)
+        self.assertEqual(len(state["attempts"]), 1)
+        self.assertEqual(state["plan"], json.loads(json.dumps(plan)))
+        self.assertEqual(list(train.identity(self.ops.queue(None)[0])), source_identity)
+        rows = passage.incident_facts(other).lands("o/r", plan["head"])
+        self.assertEqual(rows[0]["files"], ["adapted-test", "content"])
+        self.assertEqual(rows[0]["sha"], self.head)
 
     def test_automatic_claim_before_effect_crash_is_never_replayed(self):
         passage = self.automatic_passage()

@@ -22,7 +22,7 @@ from . import (merge_queue, radar, resolutions, train, train_admissions,
 class Passage:
     def __init__(self, cfg, project, *, owner, policy, policy_path,
                  policy_commit, workflows, provider, mechanics, notify, impact=None,
-                 reservation=None):
+                 reservation=None, transports=None):
         if not isinstance(owner, str) or not owner.strip():
             raise train.TrainError("explicit runner reservation owner required")
         if not isinstance(policy, train.Policy) or not callable(notify):
@@ -33,6 +33,7 @@ class Passage:
         self.mechanics = mechanics
         self.impact = impact
         self.reservation = reservation
+        self.transports = transports
         self.maintenance_at = None
         self.epoch = None
 
@@ -106,7 +107,9 @@ class Passage:
         # concurrently. They must never reset this passage's worktree.
         directory = self.repository_path()
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
-        repository = train_git.Repository(self.project, clone)
+        transports = (None if self.transports is None else
+                      lambda **context: self.transports(db, **context))
+        repository = train_git.Repository(self.project, clone, transports=transports)
         ledger = (self.reservation_ledger(db) if self.reservation is not None else
                   train_store.Ledger(db, self.project, target, self.owner))
         authority = fires(self.cfg, ledger) if rules.merge_named_fire else fires(ledger, rules)

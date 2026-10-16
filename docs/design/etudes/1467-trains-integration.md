@@ -87,16 +87,21 @@ distant. Publication et promotion comparent atomiquement la branche attendue
 et la référence du bail. La promotion écrit le commit testé lui-même. Une
 cible déplacée, une branche de train modifiée ou une génération ancienne
 refuse le geste. Les cibles protégées et les branches de release restent
-refusées. Le premier raccord n'utilise aucune résolution automatique : un
-conflit attend sa qualification de delta.
+refusées. Le raccord de transport consomme un reçu qualifié sur une base
+intermédiaire exacte ; une résolution de paire seule ne le remplace pas.
 
 Les cas de candidature #753/#1734 et de transport #1651 sont décrits dans
 [`reviews/1467-selection-contract`](../../../reviews/1467-selection-contract/README.md).
 Le lecteur de candidature #1756 distingue le gel effectif du gel déclaré ;
 il ne remplace pas une génération admise. Les refus Git nomment désormais
 le lot et les têtes exactes, et le parcours léger sans avis préalable est
-éprouvé jusqu'à la lecture historique. Le transport qualifié reste un port
-distinct à raccorder, avec les preuves conservées sur son contexte exact.
+éprouvé jusqu'à la lecture historique. Le transport qualifié est conservé dans
+`plan.transports`, séparé de l'admission source, avec ses références existantes
+et son delta exact. Son commit reste parent du paquet ; une reconstruction
+ne perd donc pas la résolution. Une remise incompatible reporte le membre et
+ses dépendants avec un motif, sans éjecter la file ni bloquer les autres lots.
+Le lecteur réel du manifeste/journal du composeur reste un fournisseur explicite
+à raccorder ; aucune qualification ni activation n'est déduite du port seul.
 
 Les phases persistées précèdent les effets externes : `publishing`,
 `ci-intent`, `ci`, `ready`, `promoting`, puis `landed`. Une réponse de dispatch
