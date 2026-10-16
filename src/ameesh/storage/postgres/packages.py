@@ -30,6 +30,16 @@ _COLUMNS = """
 SYNC_LOCK_SQL = ("SELECT pg_advisory_xact_lock(hashtextextended("
                  "current_schema() || ':canon-sync-packages', 0))")
 
+#: Borne de l'attente du verrou de sync (#1747) : généreuse — un premier sync
+#: d'hôte peut être long —, mais finie. Sous psycopg, `statement_timeout` levé
+#: pour la prise ne borne plus l'attente : un détenteur resté « idle in
+#: transaction » (par exemple `adopt_default`, qui tient le verrou du registre
+#: des authentificateurs et la ligne `canon_state ''`) figeait le sync sans
+#: fin. Sous psql, le délai CLIENT du pilote (`statement_timeout` de session
+#: + 5 s appliqué à chaque instruction, `db._PsqlTransaction._run`) reste la
+#: borne effective quand elle est plus courte.
+SYNC_LOCK_TIMEOUT_MS = 600_000
+
 
 class WorkPackages(interface.WorkPackages):
 
@@ -40,16 +50,28 @@ class WorkPackages(interface.WorkPackages):
         démarrage d'un hôte, le premier sync d'un canon peut être long (un
         déploiement change beaucoup de fiches) et les suivants échoueraient en
         57014, laissant la porte d'hôte fermée jusqu'au réessai. On lève donc
-        le délai le temps de la prise, puis on rétablit celui de la session
-        pour le reste de la transaction. `set_config(..., true)` (et non un
+        le délai le temps de la prise, puis on rétablit ceux de la session pour
+        le reste de la transaction. `set_config(..., true)` (et non un
         `SET LOCAL ... %s`) : une instruction utilitaire n'accepte pas de
         paramètre lié, les deux pilotes envoient le leur tel quel.
+
+        L'attente reste BORNÉE (#1747) : `lock_timeout` est posé le temps de la
+        prise (`SYNC_LOCK_TIMEOUT_MS`), puis rétabli avec `statement_timeout`.
+        Sans lui, sous psycopg, un détenteur qui ne rend pas le verrou figeait
+        le sync sans fin ; sous psql, le délai client du pilote
+        (`statement_timeout` de session + 5 s par instruction) borne déjà
+        l'attente, et la plus courte des deux bornes s'applique.
         """
         previous = self.db.query(
-            "SELECT current_setting('statement_timeout') AS timeout")[0]["timeout"]
-        self.db.execute("SELECT set_config('statement_timeout', '0', true)")
+            "SELECT current_setting('statement_timeout') AS statement,"
+            " current_setting('lock_timeout') AS lock")[0]
+        self.db.execute("SELECT set_config('statement_timeout', '0', true),"
+                        " set_config('lock_timeout', %s, true)",
+                        ("%dms" % SYNC_LOCK_TIMEOUT_MS,))
         self.db.execute(SYNC_LOCK_SQL)
-        self.db.execute("SELECT set_config('statement_timeout', %s, true)", (previous,))
+        self.db.execute("SELECT set_config('statement_timeout', %s, true),"
+                        " set_config('lock_timeout', %s, true)",
+                        (previous["statement"], previous["lock"]))
 
     def all(self, *, include_absent: bool = False) -> list[dict]:
         sql = "SELECT %s FROM work_packages" % _COLUMNS

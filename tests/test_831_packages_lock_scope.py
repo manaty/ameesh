@@ -13,8 +13,9 @@ d'hôte restait fermée jusqu'au réessai.
 
 Témoins, tous sur la course réelle : deux canons déclarant le même identifiant
 (un seul écrit, l'autre constate le conflit) ; `rebase_default` attend le sync
-en cours ; l'attente du verrou ne compte pas dans le délai de requête de la
-session.
+en cours ; l'attente du verrou ne compte pas dans `statement_timeout` mais
+reste bornée (#1747 : `lock_timeout` posé le temps de la prise, rétabli
+aussitôt).
 """
 from __future__ import annotations
 
@@ -22,9 +23,12 @@ import os
 import tempfile
 import threading
 import time
+from unittest import mock
 
-from ameesh import canon, canon_sync
+from ameesh import canon, canon_sync, db as db_mod
 from ameesh.storage import of as storage_of
+from ameesh.storage.postgres import packages
+from ameesh.storage.postgres.packages import SYNC_LOCK_SQL
 
 from .support import PgTestCase
 
@@ -193,3 +197,34 @@ class PackagesLockScopeTest(PgTestCase):
         self._join(thread, state, timeout=120)
         self.assertEqual(report.created, [], "le suiveur a réécrit des fiches")
         self.assertEqual(sorted(report.unchanged), ["p0", "p1"])
+
+    def test_lock_wait_is_bounded_by_lock_timeout(self):
+        """#1747 : l'attente est bornée, même quand `statement_timeout` est levé
+        pour la prise — un détenteur qui ne rend pas le verrou fait échouer le
+        sync (55P03), il ne le fige pas sans fin."""
+        holder = self.connect()
+        taker = self.connect()
+        try:
+            with holder.transaction() as tx:
+                tx.execute(SYNC_LOCK_SQL)  # le détenteur garde le verrou
+                with mock.patch.object(packages, "SYNC_LOCK_TIMEOUT_MS", 250):
+                    with self.assertRaises(db_mod.DbError) as caught:
+                        with taker.transaction() as attempt:
+                            storage_of(attempt).packages.lock_sync()
+                self.assertEqual(caught.exception.sqlstate, "55P03",
+                                 "l'attente doit échouer sur le délai de verrou")
+        finally:
+            holder.close()
+            taker.close()
+
+    def test_lock_sync_restores_timeouts_for_the_rest_of_the_transaction(self):
+        """#1747 : les deux délais sont rétablis juste après la prise — le
+        reste du sync garde le `statement_timeout` de la session et ne subit
+        pas la borne de prise."""
+        with self.db.transaction() as tx:
+            before = tx.query("SELECT current_setting('statement_timeout') AS statement,"
+                              " current_setting('lock_timeout') AS lock")[0]
+            storage_of(tx).packages.lock_sync()
+            after = tx.query("SELECT current_setting('statement_timeout') AS statement,"
+                             " current_setting('lock_timeout') AS lock")[0]
+        self.assertEqual(after, before)

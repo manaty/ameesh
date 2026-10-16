@@ -1850,8 +1850,11 @@ class WorkPackages(Domain):
         toute écriture de `canon` (`canon.rebase_default`). À appeler dans une
         transaction ouverte : il tient jusqu'au COMMIT, comme
         `authenticators.lock_registry`. L'attente du verrou ne compte pas dans
-        le délai de requête de la session (un premier sync long ne fait pas
-        échouer les suivants)."""
+        le `statement_timeout` de la session (un premier sync long ne fait pas
+        échouer les suivants), mais elle reste BORNÉE (#1747) : par le
+        `lock_timeout` que le pilote Postgres pose le temps de la prise, et,
+        sous psql, par le délai client de chaque instruction
+        (`statement_timeout` + 5 s) — la plus courte des deux s'applique."""
 
 
 # --------------------------------------------------------------------------
