@@ -12,7 +12,7 @@ import unittest
 from contextlib import nullcontext
 from unittest import mock
 
-from ameesh import exploitation, notify, resources, storage
+from ameesh import config, exploitation, notify, resources, storage
 from ameesh.storage.postgres import hosts as pg_hosts
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,13 +47,15 @@ class ProcessesTest(unittest.TestCase):
         store = mock.MagicMock()
         store.hosts.turns_in_progress.return_value = 0
         store.hosts.lend_basis.return_value = None
-        cfg = mock.Mock(host="pc", runner_id="runner-a@pc")
+        cfg = config.Config(host="pc")
         counts = {"procs_total": 9, "procs_zombie": 4, "runner_procs": 2, "runner_zombies": 1}
         with mock.patch.object(storage, "of", return_value=store), \
                 mock.patch.object(resources, "processes", return_value=counts), \
                 mock.patch.object(resources, "disk_paths", return_value=[]), \
                 mock.patch.object(resources, "tmp_paths", return_value=["/tmp"]):
             reading = resources.collect(cfg, None)
+            self.assertEqual(reading["runner_id"], cfg.runner)
+            reading = resources.collect(config.Config(host="pc", runner_id="runner-a@pc"), None)
         self.assertEqual(reading["runner_id"], "runner-a@pc")
         self.assertEqual(reading["procs_zombie"], 4)
         self.assertEqual(store.hosts.record.call_args[0][0]["runner_zombies"], 1)

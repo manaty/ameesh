@@ -1089,7 +1089,7 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None,
     reading.update({key: (gate or {}).get(key) for key in GATE_KEYS})
     # #2022: zombies and processes, of the host and of this runner
     reading.update(processes())
-    reading["runner_id"] = getattr(cfg, "runner_id", None) or None
+    reading["runner_id"] = getattr(cfg, "runner_id", None) or getattr(cfg, "runner", None) or None
     storage.of(db).hosts.record(reading)
     return reading
 
