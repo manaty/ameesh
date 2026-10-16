@@ -113,6 +113,49 @@ class PriseTest(_Base):
         self.element("autre amelioration", 50)
         self.assertEqual(self.take(), [])
 
+    def _planifie(self, lot, jours=3):
+        self.db.execute("UPDATE work_items SET planned_start = current_date + %s"
+                        " WHERE id = %s", (int(jours), lot["id"]))
+
+    def test_lot_planifie_plus_tard_laisse_prendre_l_amelioration(self):
+        # #1625 : seul un lot dont le début prévu est à venir attend — il
+        # attend sa date, pas un agent : l'amélioration prête est prise.
+        self.agent("claude1")
+        lot = work.add(self.db, title="projet planifie")
+        self._planifie(lot)
+        item = self.element("amelioration prete", 50)
+
+        self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+    def test_lot_pret_a_cote_d_un_lot_planifie_garde_la_priorite(self):
+        # #1625 : mixte — un lot démarrable suffit à fermer la porte (0037 §3).
+        self.agent("claude1")
+        plus_tard = work.add(self.db, title="projet planifie")
+        self._planifie(plus_tard)
+        pret = work.add(self.db, title="demande humaine prete")
+        item = self.element("amelioration", 50)
+
+        self.assertEqual([t for t in self.take() if t["kind"] == "backlog"], [])
+        self.assertIsNone(work.get(self.db, item["id"])["assignee"])
+        work.close(self.db, pret["id"], abandoned=True)
+        self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
+
+    def test_attentes_illisibles_ferment_la_porte(self):
+        # #1625 : une lecture des attentes en échec ne devine pas — le lot
+        # reste compté et aucune amélioration n'est prise.
+        self.agent("claude1")
+        lot = work.add(self.db, title="projet planifie")
+        self._planifie(lot)
+        self.element("amelioration", 50)
+        from ameesh import planned_waits
+        with patch.object(planned_waits, "read", side_effect=RuntimeError("illisible")):
+            self.assertEqual(self.take(), [])
+            self.assertEqual(
+                [l["id"] for l in sous_utilisation.waiting_project_lots(
+                    storage.of(self.db).operations.open_lots_activity(500), db=self.db)],
+                [lot["id"]])
+
     def test_capacite_idle_ne_propose_pas_un_lot_du_projet_bloque(self):
         self.agent("claude1")
         amont = work.add(self.db, title="amont", assignee="human:proprio")
@@ -360,6 +403,13 @@ class AlerteEtNotifyTest(_Base):
         lot = work.add(self.db, title="demande humaine")
         self.assertEqual(alertes(), [])
         work.close(self.db, lot["id"], abandoned=True)
+        # #1625 : un lot que sa date retient n'attend pas un agent — la file
+        # vide se signale quand même
+        plus_tard = work.add(self.db, title="demande planifiee")
+        self.db.execute("UPDATE work_items SET planned_start = current_date + 3"
+                        " WHERE id = %s", (plus_tard["id"],))
+        self.assertEqual(len(alertes()), 1)
+        work.close(self.db, plus_tard["id"], abandoned=True)
         # #1696 (N2) : un élément bloqué n'est pas prenable — l'alerte parle.
         amont = work.add(self.db, title="amont", assignee="human:proprio")
         bloque = self.element("dette bloquée", 50)

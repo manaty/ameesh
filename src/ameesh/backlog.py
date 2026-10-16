@@ -744,9 +744,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     if not queue:
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe
-    # avant toute amélioration
+    # avant toute amélioration ; un lot qu'une attente planifiée retient
+    # (dépendance, engagement, date) n'attend pas un agent (#1625)
     if taken or sous_utilisation.waiting_project_lots(
-            st.operations.open_lots_activity(500), db=db):
+            st.operations.open_lots_activity(500), db=db, now=now):
         return taken
     pool = candidates(idle_s)
     for row in pool:

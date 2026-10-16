@@ -313,6 +313,50 @@ class FauxCgroupTest(FausseMontureTest):
         self.assertIsNone(turn_cgroup.memory_peak("/absent", root_dir=self.base))
 
 
+class RefusDePlacementTest(FausseMontureTest):
+    """#1641 : un placement refusé n'attend pas la réconciliation.
+
+    Le trampoline est le seul à savoir, à cet instant, que le cgroup du tour
+    restera vide ; il l'enlève lui-même (le nettoyage de fin de tour de
+    l'exécuteur reste le filet). Le `rmdir` réel n'est pas modelisable sur une
+    fausse monture (les fichiers de contrôle y comptent), on injecte donc
+    `remove` — comme les témoins de `kill` le font déjà."""
+
+    def _refus(self, args: list) -> tuple[int, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = turn_cgroup.main(args, root_dir=self.base)
+        return code, err.getvalue()
+
+    def test_refus_d_entree_enleve_le_cgroup_vide(self):
+        self.fake("/u", {"cgroup.procs": ""})
+        turn = self.fake("/u/turn-a", {"cgroup.events": "populated 0\n"})
+        with mock.patch.object(turn_cgroup, "remove", return_value=True) as enleve:
+            code, err = self._refus(["--cgroup", turn, "--ready-fd", "1", "--", "true"])
+        self.assertEqual(code, turn_cgroup.REFUSED)
+        self.assertIn("could not enter cgroup", err)
+        enleve.assert_called_once_with(turn, root_dir=self.base)
+
+    def test_cgroup_non_popule_enleve_aussi(self):
+        self.fake("/u", {"cgroup.procs": ""})
+        turn = self.fake("/u/turn-a", {"cgroup.events": "populated 0\n"})
+        with mock.patch.object(turn_cgroup, "enter", return_value=True), \
+                mock.patch.object(turn_cgroup, "remove", return_value=True) as enleve:
+            code, err = self._refus(["--cgroup", turn, "--ready-fd", "1", "--", "true"])
+        self.assertEqual(code, turn_cgroup.REFUSED)
+        self.assertIn("is not populated after placement", err)
+        enleve.assert_called_once_with(turn, root_dir=self.base)
+
+    def test_refus_avant_placement_ne_touche_pas_au_cgroup(self):
+        self.fake("/u", {"cgroup.procs": ""})
+        with mock.patch.object(turn_cgroup, "remove", return_value=True) as enleve:
+            code, err = self._refus(["--cgroup", "/../../etc", "--ready-fd", "1",
+                                     "--", "true"])
+        self.assertEqual(code, turn_cgroup.REFUSED)
+        self.assertIn("outside", err)
+        enleve.assert_not_called()
+
+
 class TrampolineTest(unittest.TestCase):
     """A.9–A.11 : ligne de commande, refus hermétiques, `main` en processus."""
 
