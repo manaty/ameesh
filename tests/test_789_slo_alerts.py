@@ -130,6 +130,7 @@ class BriefsTest(_Base):
         out = self.briefs(self.slo()[0])
         self.assertEqual(sorted(out), ["dev1"])
         self.assertIn("SLO breach, level 1", out["dev1"])
+        self.assertIn("late by 30 min (target 1 h)", out["dev1"])
         self.assertIn("ameesh work note %d" % self.lot["id"], out["dev1"])
 
     def test_niveau_2_pilote_seul(self):
@@ -137,6 +138,7 @@ class BriefsTest(_Base):
         out = self.briefs(self.slo()[0])
         self.assertEqual(sorted(out), ["orch"])
         self.assertIn("pilot: reassign", out["orch"])
+        self.assertIn("late by 1 h 30 (target 1 h)", out["orch"])
 
     def test_niveau_3_bureau_et_auditeur(self):
         self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
@@ -145,6 +147,8 @@ class BriefsTest(_Base):
         out = self.briefs(self.slo()[0])
         self.assertEqual(sorted(out), ["auditeur", "bureau"])
         self.assertIn("bureau or auditor", out["bureau"])
+        for text in out.values():
+            self.assertIn("late by 35 min (target 15 min)", text)
         self.assertIn("the owner is notified", out["bureau"])
 
 
