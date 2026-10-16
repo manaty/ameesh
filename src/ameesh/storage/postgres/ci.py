@@ -141,13 +141,23 @@ class CiResults(interface.CiResults):
     def base_failures(self, repo, branch, *, workflow="") -> dict:
         # strictement la même suite : les lignes antérieures à la migration
         # 0433, toutes de `tests.yml`, y sont nommées (#1110, R1 P2-2)
+        # #1683 : la référence est la tête la plus récemment poussée, pas
+        # l'exécution conclue le plus récemment — une exécution lente d'une
+        # tête plus ancienne ne redevient pas la base. Pour chaque tête, sa
+        # première observation, annulations comprises (un réessai ne la
+        # rajeunit pas), mais le résultat de sa dernière exécution conclue.
         rows = self.db.query(
             """
-            WITH last AS (
-                SELECT run_id, head_sha FROM ci_runs
-                 WHERE repo = %s AND branch = %s AND status IN ('success', 'failure')
-                   AND workflow = %s
-                 ORDER BY concluded_at DESC, run_id DESC LIMIT 1
+            WITH runs AS (
+                SELECT run_id, head_sha, status, concluded_at,
+                       min(coalesce(created_at, first_seen_at))
+                           OVER (PARTITION BY head_sha) AS seen_at
+                  FROM ci_runs
+                 WHERE repo = %s AND branch = %s AND workflow = %s
+            ), last AS (
+                SELECT run_id, head_sha FROM runs
+                 WHERE status IN ('success', 'failure')
+                 ORDER BY seen_at DESC, concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f
