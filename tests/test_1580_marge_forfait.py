@@ -256,12 +256,22 @@ class GardesMargeTest(unittest.TestCase):
         cfg = SimpleNamespace(accounts={}, critical_agents=("config-critical",), host="test")
         fleet = {name: "deepseek" for name in
                  ("auditeur", "designer", "pilot", "config-critical", "explicit", "dev")}
+        # La criticité de rôle se lit dans la fiche du canon propriétaire :
+        # `conception` est un rôle critique. Un canon factice porteur de cette
+        # fiche satisfait les deux lecteurs — celui d'avant L242c (#414 :
+        # `role_orchestrators` puis `owned_card`, d'où `owns`/`agent`) comme
+        # celui d'après (`critical_by_role`, `critical_roles` par défaut).
+        card = SimpleNamespace(title="designer",
+                               fiche=SimpleNamespace(data={"roles": ["conception"]}))
+        canon = SimpleNamespace(name="A", readable=True, federation=None,
+                                agents=[card], load_findings=(),
+                                owns=lambda ref: ref == "A",
+                                agent=lambda name: card if name == "designer" else None)
         with (mock.patch.object(cost, "paid_harnesses_of", return_value=("deepseek",)),
-              mock.patch.object(auditor, "load_all", return_value=[]),
+              mock.patch.object(auditor, "load_all", return_value=[canon]),
               mock.patch.object(sous_utilisation, "declared_orchestrators", return_value={"pilot"}),
-              mock.patch.object(sous_utilisation, "role_orchestrators", return_value={"designer"}),
-              mock.patch.object(auditor, "owned_card", return_value=object()),
-              mock.patch.object(registry, "get", return_value={"name": "designer"})):
+              mock.patch.object(registry, "get",
+                                side_effect=lambda db, name: {"name": name, "canon": "A"})):
             prop = rebalance.proposal(cfg, object(), object(), now=1_000_000,
                                       fleet=fleet, critical=("explicit",))
         self.assertEqual((prop.candidates, prop.kept_for_review), (1, 0))
