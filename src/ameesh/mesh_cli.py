@@ -2766,6 +2766,19 @@ def build_parser() -> argparse.ArgumentParser:
     pa_check.add_argument("--json", action="store_true")
     pa_check.add_argument("--dry-run", action="store_true", help="probe only, write nothing")
     pa_check.set_defaults(func=cmd_accounts)
+    from . import login_cli as login_cli_mod
+    pa_login = acc_sub.add_parser(
+        "login", help="private OAuth login challenge for a declared account (L232d)")
+    pa_login.add_argument("harness", help="harness: " + ", ".join(login_cli_mod.adapter_names()))
+    pa_login.add_argument("account", nargs="?", default=None,
+                          help="declared account (default: the harness's primary account)")
+    pa_login.add_argument("--approver", required=True,
+                          help="human:<id> who will sign the challenge")
+    pa_login.add_argument("--scope", default="", help="short text shown in the signed summary")
+    pa_login.add_argument("--wait", type=float, default=login_cli_mod.TTL_WAIT_S,
+                          help="bounded wait for the receipt, in seconds (default 900)")
+    pa_login.add_argument("--json", action="store_true")
+    pa_login.set_defaults(func=login_cli_mod.cmd_accounts_login)
     p_acc.set_defaults(func=cmd_accounts)
 
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
