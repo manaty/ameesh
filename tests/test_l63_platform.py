@@ -369,7 +369,11 @@ class PlatformTest(unittest.TestCase):
             self.skipTest("root lit tout : pas de refus de lecture à simuler")
         moi = "%d %d %d %d" % ((os.getuid(),) * 4)
         with tempfile.TemporaryDirectory() as tmp:
-            cible = os.path.join(tmp, "tenu")
+            # macOS : `tempfile` rend /var/folders/… quand le chemin réel est
+            # /private/var/… ; `holders` compare le lien lu de /proc à son
+            # realpath, donc la cible doit être canonique dès le symlink, sinon
+            # le détenteur n'est pas retrouvé et le doute l'emporte (CI macOS).
+            cible = os.path.realpath(os.path.join(tmp, "tenu"))
             open(cible, "w").close()
             racine = self._faux_proc("gpg-agent", moi)
             # ce processus-ci tient `cible` : le /proc simulé porte son lien
