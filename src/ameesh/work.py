@@ -915,7 +915,8 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     seule gagne, l'autre refuse sans changer la main.
 
     #1787 : une re-prise par le porteur lui-même (`claim` sur son propre lot)
-    est un no-op réussi (`noop`), sans écriture ni ligne de journal."""
+    est un no-op réussi (`noop`) : l'attribution ne change pas et n'est pas
+    journalisée ; seule une `branch` fournie est enregistrée (`set_branch`)."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
