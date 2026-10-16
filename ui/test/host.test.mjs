@@ -51,8 +51,8 @@ test("host: the components' events reach open, openApproval and notify", () => {
   const { calls, host } = fakeHost();
   const off = ui.connectHost(host, { config, mesh: "org", apiBase: "https://mesh.example.org" });
   fire(config, "ameesh:open-lot", { lot: 1464, title: "#1464" });
-  fire(config, "ameesh:open-project", { id: "ameesh", name: "ameesh" });
-  fire(config, "ameesh:open-agent", { name: "mty-amh-impl-03" });
+  fire(config, "ameesh:open-project", { project: "ameesh" });
+  fire(config, "ameesh:open-agent", { agent: "mty-amh-impl-03", project: "ameesh" });
   fire(config, "ameesh:approval-requested", { url: "https://mesh.example.org/approve/abc" });
   fire(config, "ameesh:alert", { kind: "budget", title: "Budget", text: "cap reached" });
   fire(config, "ameesh:alert", "the mesh is stale");
@@ -79,6 +79,21 @@ test("host: unbinding stops the routing and clears the provider", () => {
   holder.remove();
 });
 
+test("host: two mesh bindings route each event only to its own config", () => {
+  const a = mountConfig(), b = mountConfig();
+  const { calls, host } = fakeHost();
+  const offA = ui.connectHost(host, { config: a.config, mesh: "a" });
+  const offB = ui.connectHost(host, { config: b.config, mesh: "b" });
+  fire(a.config, "ameesh:open-lot", { lot: 1 });
+  fire(b.config, "ameesh:alert", "only b");
+  fire(a.config, "ameesh:approval-requested", "https://a.example/a/1");
+  assert.deepEqual(calls.opened.map((t) => t.mesh), ["a"]);
+  assert.deepEqual(calls.alerts.map((t) => t.mesh), ["b"]);
+  assert.deepEqual(calls.approvals, ["https://a.example/a/1"]);
+  offA(); offB();
+  a.holder.remove(); b.holder.remove();
+});
+
 test("host: a <ameesh-config> is created when the page has none", () => {
   for (const el of document.querySelectorAll("ameesh-config")) el.remove();
   const holder = document.createElement("div");
@@ -89,5 +104,31 @@ test("host: a <ameesh-config> is created when the page has none", () => {
   assert.ok(config);
   assert.equal(config.apiBase, "https://m.example");
   off();
+  holder.remove();
+});
+
+test("host: an explicit API base selects the token of that mesh", async () => {
+  const { holder, config } = mountConfig();
+  config.apiBase = "https://b.example";
+  const { host } = fakeHost({ meshes: () => [
+    { id: "a", apiBase: "https://a.example" },
+    { id: "b", apiBase: "https://b.example" },
+  ] });
+  const off = ui.connectHost(host, { config });
+  await settle();
+  assert.equal(await config.tokenProvider(), "tok:b");
+  off(); holder.remove();
+});
+
+test("host: pending mesh discovery does not mutate an unbound config", async () => {
+  const { holder, config } = mountConfig();
+  config.apiBase = "";
+  let resolve;
+  const { host } = fakeHost({ meshes: () => new Promise((done) => { resolve = done; }) });
+  const off = ui.connectHost(host, { config });
+  off();
+  resolve([{ id: "a", apiBase: "https://a.example" }]);
+  await settle();
+  assert.equal(config.apiBase, "");
   holder.remove();
 });
