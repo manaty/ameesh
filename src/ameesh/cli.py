@@ -1468,6 +1468,20 @@ def _sweep_line(action, kind) -> str:
                action["count"], "would be" if action.get("dry_run") else "were", suffix))
 
 
+def _sweep_failed(result: dict) -> list[dict]:
+    """Les refus qui laissent vraiment du courrier en souffrance (#1615/N1).
+
+    Un refus n'est un échec que si le destinataire refusé n'a été ni renvoyé
+    (à un autre successeur) ni expiré : un premier successeur arrêté suivi
+    d'un successeur vivant rend donc 0, et le refus reste dit au rapport. Un
+    refus portant sur l'ancien relancé (`old_relaunched`) n'en est pas un non
+    plus : sa boîte est de nouveau lue, son courrier lui sera remis."""
+    settled = {action.get("old") for action in result["forwarded"]}
+    settled |= {action.get("recipient") for action in result["expired"]}
+    return [refused for refused in result["refused"]
+            if refused.get("old") not in settled and not refused.get("old_relaunched")]
+
+
 def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
     """L976 : re-livre au successeur, ou expire après la rétention, le courrier
     en souffrance (`undeliverable.sweep`) — le même passage que le ménage de
@@ -1499,17 +1513,20 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
         return 1
     if opts.get("--json"):
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        return 1 if result["refused"] else 0
+        return 1 if _sweep_failed(result) else 0
     actions = result["forwarded"] + result["expired"]
-    if not actions and not result["refused"]:
+    failed = _sweep_failed(result)
+    if not actions and not failed:
         print("no dead letter to sweep (retention %d day(s), 0 = never)"
               % result["days"])
         return 0
     if not actions:
         # #1396/N2 : que des refus de renvoi — le dire (le courrier n'est pas
         # remis) au lieu d'annoncer « no dead letter », et sortir non-zéro.
+        # #1615/N1 : seuls comptent les refus qu'un autre successeur n'a pas
+        # réparés — un courrier remis n'est pas un échec.
         print("no dead letter swept: %d re-delivery refusal(s) (retention %d day(s), "
-              "0 = never)" % (len(result["refused"]), result["days"]))
+              "0 = never)" % (len(failed), result["days"]))
     elif result["dry_run"]:
         print("dry run: retention %d day(s); %d recipient(s) to sweep:"
               % (result["days"], len(actions)))
@@ -1526,7 +1543,7 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
             fastmail.bump(cfg, action.get("new") or "")
         print("retention %d day(s); dead mail stays in the mailbox, marked expired"
               % result["days"])
-    return 1 if result["refused"] else 0
+    return 1 if failed else 0
 
 
 def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
