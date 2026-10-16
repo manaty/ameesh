@@ -4239,6 +4239,7 @@
     "adopt",
     "assigners",
     "gauge_history",
+    "gauge_latest",
     "latest_gauges",
     "listing",
     "open_lots_activity",
