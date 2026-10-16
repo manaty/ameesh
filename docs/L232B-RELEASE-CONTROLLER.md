@@ -151,6 +151,13 @@ before their own lock and can later fail on stale inventory: upgrade every
 migration worker before relying on reconciliation. This library integration does
 not enroll controller/SSH adapters, select a migration identity or provide a
 host claim fence. Transactional approved migration SQL remains a prerequisite.
+`migrate` under the enrolled release-controller role is not supported: the
+worker's `BOOTSTRAP` creates `schema_migrations` when it is absent, and that
+role deliberately holds no `CREATE`, so it is insufficient by design. Granting
+it `CREATE` would be a privilege change outside this work. Migrations run under
+the schema owner's migration identity, an administrator prerequisite this work
+does not select; a readable `has_database_privilege('CREATE')` pre-check that
+refuses before any effect would be a useful addition, not a requirement.
 
 Real disposable PostgreSQL tests cover competing workers before inventory,
 fresh-schema and DDL rollback, additive refusal after an obsolete CLI preflight,
@@ -534,7 +541,11 @@ previously accepted sets whose policy window has passed; a held set, or one
 whose remote members have no enrolled deletion adapter, stays protected and
 the expiry is retried at the next acceptance. An interrupted publication is
 recreated from the live source; an artifact left by an interrupted attempt is
-only reused while it is inside the bounded reuse window. A receipt that is
+only reused while it is inside the bounded reuse window — one hour
+(`REUSE_SECONDS` in `sauvegarde-release.py`): the receipt is bound to the
+operation and its manifest, not to the approval that asked for it, so under a
+single approval the drift stays below that bound and a set resumed days later
+is recreated, never pinned stale. A receipt that is
 missing, stale, from another manifest or no longer matching its files never
 holds `pin`: the set is recreated from the live source before registration —
 the step still runs
