@@ -361,7 +361,9 @@ def freeze_candidate(rows: list[dict]) -> dict:
 
     * gel et avis nommant le même commit (préfixe admis) : le gel déclaré ;
     * avis favorable postérieur à un gel qui nomme un autre commit : le SHA
-      de l'avis, le gel déclaré étant périmé (rebase) ;
+      de l'avis, le gel déclaré étant périmé (rebase) — sauf si ce commit est
+      nommé par un jalon antérieur au gel (ancienne tête) : l'avis est tardif
+      et écarté, note `late-verdict-on-older-commit` (#1767) ;
     * gel postérieur à l'avis sur un autre commit : refus
       `freeze-after-verdict`, un nouvel avis est dû sur la tête gelée (#1283) ;
     * sans gel déclaré : le SHA de l'avis favorable ;
@@ -386,11 +388,27 @@ def freeze_candidate(rows: list[dict]) -> dict:
             return None
         return max(items, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
 
-    last = newest(verdicts)
-    out = {"sha": "", "origin": "", "declared": _freeze_mark(freeze),
-           "verdict": _freeze_mark(last), "causes": [], "notes": []}
     f_sha = commit_id((freeze or {}).get("sha"))
     f_at = float((freeze or {}).get("at_ts") or 0)
+    # #1767 : un avis ok postérieur au gel sur un commit que la frise nommait
+    # déjà avant ce gel (ancienne tête) est tardif : il ne déclasse pas le gel.
+    # Un commit jamais nommé avant le gel reste lu comme un rebase relu.
+    before = [commit_id(r.get("sha")) for r in marks
+              if r.get("kind") in ("frozen", "verdict")
+              and float(r.get("at_ts") or 0) < f_at] if f_sha else []
+
+    def late(v) -> bool:
+        sha = commit_id(v.get("sha"))
+        return ((v.get("verdict") or "ok") == "ok" and bool(sha)
+                and float(v.get("at_ts") or 0) > f_at
+                and not same_commit(sha, f_sha)
+                and any(same_commit(sha, b) for b in before))
+
+    last = newest([v for v in verdicts if not late(v)])
+    out = {"sha": "", "origin": "", "declared": _freeze_mark(freeze),
+           "verdict": _freeze_mark(last), "causes": [], "notes": []}
+    if any(late(v) for v in verdicts):
+        out["notes"].append("late-verdict-on-older-commit")
     if freeze is not None and not f_sha:
         out["notes"].append("declared-freeze-unusable")
     v_sha = commit_id((last or {}).get("sha"))
