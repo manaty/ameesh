@@ -1232,6 +1232,81 @@ class ImportGraphTest(unittest.TestCase):
                 self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
                                                       guaranteed=True), known, why)
 
+    def test_assigned_module_aliases_and_getattr_exits_stop_proofs(self):
+        # #1878, N de la relecture Claude de #1860 : un module sys/os renommé
+        # par affectation (`s = sys` puis `s.exit()`) et une lecture statique
+        # `getattr(sys, 'exit')` sont des sorties comme les autres : les
+        # imports suivants restent des arêtes possibles, jamais des preuves.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "sys renommé": "import sys\n"
+                           "s = sys\n"
+                           "s.exit(1)\n"
+                           "import ameesh.db\n",
+            "os renommé": "import os\n"
+                          "o = os\n"
+                          "o._exit(1)\n"
+                          "import ameesh.db\n",
+            "module importé aliasé puis renommé": "import sys as s0\n"
+                                                  "s = s0\n"
+                                                  "s.exit(1)\n"
+                                                  "import ameesh.db\n",
+            "chaîne de renommages": "import sys\n"
+                                    "s = sys\n"
+                                    "t = s\n"
+                                    "t.exit(1)\n"
+                                    "import ameesh.db\n",
+            "paire de modules": "import sys, os\n"
+                                "s, o = sys, os\n"
+                                "o._exit(1)\n"
+                                "import ameesh.db\n",
+            "getattr sys.exit": "import sys\n"
+                                "getattr(sys, 'exit')(1)\n"
+                                "import ameesh.db\n",
+            "getattr os._exit": "import os\n"
+                                "getattr(os, '_exit')(1)\n"
+                                "import ameesh.db\n",
+            "getattr avec défaut": "import sys\n"
+                                   "getattr(sys, 'exit', None)(1)\n"
+                                   "import ameesh.db\n",
+            "getattr via module renommé": "import sys\n"
+                                          "s = sys\n"
+                                          "getattr(s, 'exit')(1)\n"
+                                          "import ameesh.db\n",
+            "getattr affecté puis appelé": "import sys\n"
+                                           "e = getattr(sys, 'exit')\n"
+                                           "e(1)\n"
+                                           "import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # une simple mention ne coupe rien : ni un module renommé non utilisé,
+        # ni un getattr d'un autre membre, d'un autre porteur ou dynamique
+        kept = {
+            "module renommé jamais appelé": "import sys\n"
+                                            "s = sys\n"
+                                            "import ameesh.db\n",
+            "getattr d'un autre membre": "import sys\n"
+                                         "getattr(sys, 'version')\n"
+                                         "import ameesh.db\n",
+            "getattr d'un porteur ordinaire": "class C:\n"
+                                              "    pass\n"
+                                              "getattr(C, 'exit')\n"
+                                              "import ameesh.db\n",
+            "getattr au nom dynamique": "import sys\n"
+                                        "name = 'exit'\n"
+                                        "getattr(sys, name)\n"
+                                        "import ameesh.db\n",
+        }
+        for why, source in kept.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known, why)
+
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
         # prouve pas que `ameesh/db.py` est chargé — le paquet peut lier le nom

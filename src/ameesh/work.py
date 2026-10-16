@@ -736,6 +736,15 @@ _ASSIGNEE_HINT = ("register the agent (agent-runner register <name> <harness> �
                   "an external session with a human owner, add --externe")
 
 
+#: #1979 : marque « verdict non requis » que le pilote pose dans la colonne du
+#: relecteur quand aucun re-verdict n'est dû (résolution de composition
+#: mécanique, canon §11 bis/#87, ou verdict conservé d'une tête relue) : sans
+#: elle, le registre affiche un faux « waiting: verdict » et les rappels
+#: partent à un relecteur qui n'a rien à relire. Le jeton commence par un
+#: caractère que `config.NAME_RE` refuse : il ne peut pas désigner un agent.
+REVIEWER_NONE = _pg.REVIEWER_NONE
+
+
 def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     """#705 : le relecteur désigné d'une revue est un nom joignable.
 
@@ -776,14 +785,9 @@ def check_reviewer_choice(db: Db, item: dict, reviewer: str, *, cfg=None) -> str
     return name
 
 
-def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
-                       actor: str | None = None, remove: bool = False) -> dict:
-    """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
-
-    Geste de pilote : mêmes autorités que la correction (`corrector`) — un
-    humain, un orchestrateur ou un agent de conception. Le relecteur doit être
-    joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
-    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
+def _review_item(cfg, db: Db, item_id: int, actor: str | None):
+    """#705/#1979 : l'autorité du geste de relecture, et le lot, qui doit être
+    en `qa` (comme pour `designate_reviewer`)."""
     who = corrector(cfg, db, actor, what="designation")
     item = get(db, item_id)
     if item is None:
@@ -794,21 +798,78 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
             "review (ameesh work move %s qa --reviewer <agent>), or with "
             "ameesh work reviewer %s <agent> once it is in qa"
             % (item_id, item["state"], item_id, item_id))
-    # Removal must work even if the reviewer has left the registry.
+    return who, item
+
+
+def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
+                    remove: bool = False) -> dict:
+    """Écrit la colonne du relecteur (nom, vide, ou `REVIEWER_NONE`) et sa
+    ligne de journal, ou dit pourquoi l'écriture n'a pas eu lieu."""
+    row = storage.of(db).work.designate_reviewer(item_id, value, actor=who,
+                                                event=event, remove=remove)
+    if row is None:
+        # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
+        # et elle, le lot a pu quitter qa ou recevoir `value` comme assigné.
+        latest = get(db, item_id)
+        if latest is not None and latest["state"] == "qa":
+            raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
+                            "reviews another agent's work" % (value, item_id))
+        raise WorkError("lot %s left qa in the meantime: retry" % item_id)
+    return row
+
+
+def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
+                       actor: str | None = None, remove: bool = False) -> dict:
+    """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
+
+    Geste de pilote : mêmes autorités que la correction (`corrector`) — un
+    humain, un orchestrateur ou un agent de conception. Le relecteur doit être
+    joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
+    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
+    who, item = _review_item(cfg, db, item_id, actor)
+    # A former reviewer can still be withdrawn after leaving the registry.
     name = (reviewer or "").strip() if remove else check_reviewer_choice(
         db, item, reviewer, cfg=cfg)
     if not name:
         raise WorkError("empty reviewer")
-    row = storage.of(db).work.designate_reviewer(item_id, name, actor=who, remove=remove)
-    if row is None:
-        # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
-        # et elle, le lot a pu quitter qa ou recevoir `name` comme assigné.
-        latest = get(db, item_id)
-        if latest is not None and latest["state"] == "qa":
-            raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
-                            "reviews another agent's work" % (name, item_id))
-        raise WorkError("lot %s left qa in the meantime: retry" % item_id)
-    return row
+    return _write_reviewer(db, item_id, name, who, "reviewer %s %s" % (
+        name, "removed" if remove else "designated"), remove=remove)
+
+
+def clear_reviewer(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
+    """#1979 : retire la désignation du relecteur d'un lot en `qa`.
+
+    Geste de pilote (mêmes autorités que `designate_reviewer`). Le lot
+    retombe dans l'attente réelle d'un relecteur — « verdict d'un relecteur
+    (non désigné) » — et l'alerte redemande d'en désigner un : c'est le geste
+    inverse de `waive_review`, pour une désignation posée à tort."""
+    who, _item = _review_item(cfg, db, item_id, actor)
+    return _write_reviewer(db, item_id, "", who, "reviewer designation removed")
+
+
+def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
+    """#1979 : marque « verdict non requis » sur un lot en `qa`.
+
+    Geste de pilote : il constate qu'aucun re-verdict n'est dû — résolution de
+    composition mécanique (canon §11 bis/#87), verdict conservé d'une tête
+    relue. Le registre cesse alors d'attendre un verdict (l'attente devient la
+    fusion) et les rappels ne partent plus à un relecteur. Désigner un
+    relecteur, retirer la marque (`clear_reviewer`), sortir de qa ou geler
+    une autre tête rend la revue à nouveau due."""
+    who, item = _review_item(cfg, db, item_id, actor)
+    # Un verdict bloquant COURANT demande une correction, pas une dispense :
+    # la marque dormirait et dispenserait la revue suivante à tort. Les
+    # transitions se lisent dans l'ordre chronologique (`lot_transitions`),
+    # pas le journal complet, qui rend le plus récent d'abord.
+    from . import progress  # import tardif : progress importe ce module
+    transitions = storage.of(db).progress.lot_transitions([int(item_id)])
+    jalons = progress._jalons_de_lot(item, transitions, [], milestones(db, item_id))
+    if jalons.get("verdict_kind") == "blocked" and jalons.get("verdict_current"):
+        raise WorkError(
+            "verdict not required refused: lot %s carries a current blocked "
+            "verdict — a fix is due, not a waiver (#1979)" % item_id)
+    return _write_reviewer(db, item_id, REVIEWER_NONE, who,
+                           "verdict not required: no re-verdict due (#1979)")
 
 
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:
@@ -902,7 +963,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
-           force: str | None = None, claim: bool = False) -> dict:
+           force: str | None = None, claim: bool = False,
+           if_holder: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -920,13 +982,26 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
 
     #1787 : une re-prise par le porteur lui-même (`claim` sur son propre lot)
     est un no-op réussi (`noop`) : l'attribution ne change pas et n'est pas
-    journalisée ; seule une `branch` fournie est enregistrée (`set_branch`)."""
+    journalisée ; seule une `branch` fournie est enregistrée (`set_branch`).
+
+    #2016 : `if_holder` nomme le titulaire lu par l'appelant (l'instantané
+    d'une alerte) ; si le lot a changé de main depuis, la réassignation est
+    refusée en nommant le porteur courant. Deux agents partis du même brief ne
+    se volent plus le lot : le second relit le lot au lieu d'écraser le
+    premier."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
         raise WorkError("lot %s already %s: nothing to reassign" % (item_id, item["state"]))
     previous = item.get("assignee")
+    if if_holder is not None:
+        expected = str(if_holder).strip() or None
+        if (previous or None) != expected:
+            raise WorkError(
+                "lot %s changed holder since the reading: now %s (expected %s); "
+                "re-read the lot and retry" % (item_id, previous or "nobody",
+                                               expected or "nobody"))
     _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
     if claim and previous:
@@ -1430,7 +1505,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         holder = storage.of(db).work.migration_landed_holder(*landed)
         raise WorkError(_landed_taken(landed[0], landed[1], holder, cfg)) from exc
     if landed is not None and done["result"] == "already":
-        # A merge sweep may have closed the lot after our initial read.
+        # un balayage a pu fusionner le lot après notre lecture : le numéro
+        # déclaré est enregistré (ou corrige celui déjà tenu) après coup
         return _record_landed(db, done["item"], landed, actor=actor, cfg=cfg)
     if done["result"] == "refused":
         item = done["item"]

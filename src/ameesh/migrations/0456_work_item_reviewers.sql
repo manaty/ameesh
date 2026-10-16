@@ -12,24 +12,37 @@ declare
 begin
     names := coalesce(new.reviewers, '{}');
     if tg_op = 'INSERT' then
-        names := array_append(names, new.reviewer);
+        if new.reviewer = '-none' then
+            names := array['-none'];
+        else
+            names := array_append(names, new.reviewer);
+        end if;
     elsif new.reviewers is not distinct from old.reviewers then
         -- Legacy writers only know reviewer. A designation adds a name;
         -- clearing it withdraws that name, preserving the other reviewers.
         if new.reviewer is distinct from old.reviewer then
-            if coalesce(new.reviewer, '') = '' then
+            if new.reviewer = '-none' then
+                -- #1979: a waiver replaces every designation, including when
+                -- it is written by a runner that knows only reviewer.
+                names := array['-none'];
+            elsif coalesce(new.reviewer, '') = '' then
                 names := array_remove(names, old.reviewer);
             else
-                names := array_append(names, new.reviewer);
+                names := array_append(array_remove(names, '-none'), new.reviewer);
             end if;
         end if;
     end if;
     foreach name in array names loop
-        if coalesce(name, '') <> '' and name is distinct from new.assignee
+        if coalesce(name, '') <> '' and name <> '-none'
+           and name is distinct from new.assignee
            and not name = any(canonical) then
             canonical := array_append(canonical, name);
         end if;
     end loop;
+    -- Keep the waiver only on its own; it is never a designated reviewer.
+    if cardinality(canonical) = 0 and '-none' = any(names) then
+        canonical := array['-none'];
+    end if;
     new.reviewers := canonical;
     new.reviewer := coalesce(canonical[cardinality(canonical)], '');
     return new;

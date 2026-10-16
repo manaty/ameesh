@@ -54,6 +54,19 @@ class ReviewWaitingTest(unittest.TestCase):
         self.assertIn("first", briefs)
         self.assertIn("second", briefs)
 
+    def test_waiver_is_not_a_reviewer_and_light_lots_can_merge(self):
+        from ameesh import lot_class
+        item, marks = self.marks()
+        self.assertEqual(stagnation.waiting(item, marks, review_class=lot_class.LIGHT)["what"],
+                         "merge")
+        item.update(reviewer=work.REVIEWER_NONE, reviewers=[work.REVIEWER_NONE])
+        marks = progress._work_item_milestones(item, [], [], [])
+        self.assertEqual(marks["reviewers"], [])
+        self.assertEqual(marks["pending_reviewers"], [])
+        self.assertFalse(marks["verdict_required"])
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+        self.assertIsNone(progress.build_lot(dict(item, id=42), [], [])["reviewer"])
+
 
 class MultipleReviewersTest(PgTestCase):
     def setUp(self):
@@ -101,6 +114,37 @@ class MultipleReviewersTest(PgTestCase):
                         (self.lot["id"],))
         self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
         self.assertIsNone(self.designate("first"))
+
+    def test_global_removal_and_waiver_replace_all_designations(self):
+        for flag in ("--remove", "--no-verdict"):
+            with self.subTest(flag=flag):
+                self.designate("first")
+                self.designate("second")
+                proc = self.mesh("work", "reviewer", str(self.lot["id"]), flag,
+                                 "--actor", "chief",
+                                 env=self.env(AMEESH_ALERT_ORCHESTRATORS="chief"))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                row = work.get(self.db, self.lot["id"])
+                self.assertEqual(row["reviewers"],
+                                 [work.REVIEWER_NONE] if flag == "--no-verdict" else [])
+                marks = progress._work_item_milestones(row, [], [], [])
+                self.assertEqual(marks["pending_reviewers"], [])
+                self.assertEqual(marks["verdict_required"], flag != "--no-verdict")
+                # A fresh designation clears the waiver, and accumulates again.
+                self.designate("first")
+                self.designate("second")
+                self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"],
+                                 ["first", "second"])
+
+    def test_legacy_waiver_is_replaced_by_a_new_designation(self):
+        self.designate("first")
+        self.designate("second")
+        self.db.execute("UPDATE work_items SET reviewer = %s WHERE id = %s",
+                        (work.REVIEWER_NONE, self.lot["id"]))
+        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], [work.REVIEWER_NONE])
+        self.db.execute("UPDATE work_items SET reviewer = 'first' WHERE id = %s",
+                        (self.lot["id"],))
+        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["first"])
 
     def test_delegation_and_return_preserve_other_reviewers(self):
         self.designate("first")

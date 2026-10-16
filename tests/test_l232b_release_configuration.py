@@ -74,6 +74,22 @@ class ReleaseConfigurationTest(unittest.TestCase):
         with self.assertRaisesRegex(config.ConfigurationError,'authority'): self.perform('configure')
         self.assertFalse(self.guard.exists())
 
+    def test_transient_authority_error_is_not_turned_into_a_definitive_failure(self):
+        self.perform('pin')
+        def unavailable(*args):
+            raise RuntimeError('authority database unavailable')
+        self.authority.validate=unavailable
+        try:
+            self.perform('configure')
+        except config.ConfigurationError as error:
+            self.fail('transient authority error became definitive: %r' % error)
+        except RuntimeError:
+            pass
+        else:
+            self.fail('transient authority error was swallowed')
+        self.assertEqual(self.unit.read_text(),'prior unit\n')
+        self.assertFalse(self.guard.exists())
+
     def test_target_bytes_bound_to_signed_release_and_enrolled_inventory(self):
         self.perform('pin'); self.release['configuration']['guard']['content']='different'
         with self.assertRaisesRegex(config.ConfigurationError,'identity'): self.perform('configure')

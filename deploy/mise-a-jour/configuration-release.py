@@ -103,10 +103,10 @@ class ConfigurationFiles:
         return wanted
 
     def approved(self,request):
-        try:
-            granted=self.authority.validate(request['operation'],request['manifest_digest'],request['step'])
-        except Exception:
-            granted=False
+        # An explicit refusal is definitive; an authority that cannot be read
+        # (database, proof, clock) stays uncertain so the durable intent is
+        # reconciled instead of failing configure for good.
+        granted=self.authority.validate(request['operation'],request['manifest_digest'],request['step'])
         if granted is not True or (request['step']=='rollback' and self.clock()>request['manifest']['rollback_until']):
             raise ConfigurationError('configuration authority unavailable')
 
