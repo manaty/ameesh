@@ -117,6 +117,62 @@ class FreezeCandidateTest(unittest.TestCase):
         self.assertEqual(out["origin"], "verdict")
         self.assertIn("declared-freeze-stale", out["notes"])
 
+    def test_avis_tardif_sur_l_ancienne_tete_ne_declasse_pas_le_gel(self):
+        # #1767 : gel A (ancienne tête), regel B, ok de cx1 sur B, puis ok
+        # tardif de dev1 sur A — A était nommé avant le gel courant
+        out = plan_git.freeze_candidate([
+            frozen(A, 5, id=1),
+            frozen(B, 10, id=2),
+            verdict(B, 11, id=3, actor="cx1"),
+            verdict(A, 12, id=4, actor="dev1")])
+        self.assertEqual(out["sha"], B)
+        self.assertEqual(out["origin"], "frozen")
+        self.assertEqual(out["causes"], [])
+        self.assertEqual(out["verdict"]["id"], 3)
+        self.assertIn("late-verdict-on-older-commit", out["notes"])
+        self.assertNotIn("declared-freeze-stale", out["notes"])
+
+    def test_ancienne_tete_nommee_par_un_avis_avant_le_gel(self):
+        # l'ancienne tête n'a jamais été gelée, mais un avis la nommait
+        out = plan_git.freeze_candidate([
+            verdict(A, 5, id=1, actor="dev1"),
+            frozen(B, 10, id=2),
+            verdict(B, 11, id=3, actor="cx1"),
+            verdict(A, 12, id=4, actor="dev1")])
+        self.assertEqual(out["sha"], B)
+        self.assertIn("late-verdict-on-older-commit", out["notes"])
+
+    def test_avis_tardif_seul_un_avis_reste_du_sur_le_gel(self):
+        # aucun avis sur B : l'ok tardif sur A ne rend pas A candidat, le
+        # dernier avis pertinent précède le gel — un nouvel avis est dû
+        out = plan_git.freeze_candidate([
+            frozen(A, 5, id=1),
+            verdict(A, 6, id=2),
+            frozen(B, 10, id=3),
+            verdict(A, 12, id=4, actor="dev1")])
+        self.assertEqual(out["sha"], "")
+        self.assertEqual(out["causes"], ["freeze-after-verdict"])
+
+    def test_commit_jamais_nomme_avant_le_gel_reste_un_rebase(self):
+        # sans trace antérieure, l'ancêtreté est inconnue : lecture inchangée
+        out = plan_git.freeze_candidate([
+            frozen(B, 10, id=1),
+            verdict(B, 11, id=2, actor="cx1"),
+            verdict(A, 12, id=3, actor="dev1")])
+        self.assertEqual(out["sha"], A)
+        self.assertEqual(out["origin"], "verdict")
+        self.assertIn("declared-freeze-stale", out["notes"])
+        self.assertNotIn("late-verdict-on-older-commit", out["notes"])
+
+    def test_blocage_tardif_sur_l_ancienne_tete_jamais_ecarte(self):
+        out = plan_git.freeze_candidate([
+            frozen(A, 5, id=1),
+            frozen(B, 10, id=2),
+            verdict(B, 11, id=3, actor="cx1"),
+            verdict(A, 12, id=4, actor="dev1", kind="blocked")])
+        self.assertEqual(out["sha"], "")
+        self.assertEqual(out["causes"], ["blocked-verdict"])
+
 
 if __name__ == "__main__":
     unittest.main()
