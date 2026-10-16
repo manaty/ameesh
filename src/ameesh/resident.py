@@ -129,7 +129,9 @@ class TurnResult:
     calls), plus `context_tokens` (context of its last call) and
     `context_window` when the harness gives them. `cost`: USD of the turn
     when it can be told apart from the session's cumulative cost
-    (`cost_total`)."""
+    (`cost_total`). `compact`: the native compaction the harness reported in
+    the turn (`{"pre": …, "post": …}`, tokens before and after; L81), None
+    when it reported none."""
 
     status: str
     final: str = ""
@@ -140,6 +142,7 @@ class TurnResult:
     cost: float | None = None
     cost_total: float | None = None
     duration_s: float = 0.0
+    compact: dict | None = None
 
 
 class Turn:
@@ -578,6 +581,8 @@ class ResidentDriver:
         self._window: int | None = None
         self._cost: float | None = None
         self._cost_total: float | None = None
+        #: L81: native compaction reported in this turn (compact_boundary)
+        self._compact: dict | None = None
 
     def _add_usage(self, input_tokens: int = 0, cache_read: int = 0, cache_creation: int = 0,
                    output_tokens: int = 0) -> None:
@@ -615,7 +620,8 @@ class ResidentDriver:
                 session=self.session_id, usage=usage,
                 inputs=tuple(i for i in current.inputs if i not in self._unconfirmed),
                 cost=self._cost, cost_total=self._cost_total,
-                duration_s=round(time.monotonic() - current.started, 3))
+                duration_s=round(time.monotonic() - current.started, 3),
+                compact=dict(self._compact) if self._compact else None)
             self._turn = None
             self._followups.clear()
             self._unconfirmed.clear()
@@ -979,6 +985,10 @@ class ClaudeStreamJson(ResidentDriver):
         parsed = self.adapter.parse(line)
         if parsed.get("session"):
             self.session_id = str(parsed["session"])
+        if ((kind == "system" and event.get("subtype") == "compact_boundary")
+                or kind == "compact_boundary"):
+            # L81 (étude §6.2) : la compaction native est un événement du tour
+            self._on_compact(event)
         principal = not event.get("parent_tool_use_id")
         if kind == "user" and event.get("isReplay"):
             with self._lock:
@@ -993,12 +1003,46 @@ class ClaudeStreamJson(ResidentDriver):
         if kind == "result" and principal:
             self._on_result(event)
 
+    def _on_compact(self, event: dict) -> None:
+        """L81 (étude §6.2) : la compaction native rapportée par le harnais —
+        ses jetons avant/après ; le contexte mesuré suit l'après, pour que la
+        décision d'entretien ne redemande pas une compaction sans fin."""
+        meta = event.get("compact_metadata")
+        if not isinstance(meta, dict):
+            meta = event
+
+        def token(*names) -> int | None:
+            for name in names:
+                value = meta.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return int(value)
+            return None
+
+        compact = {"pre": token("pre_tokens", "preTokens", "pre"),
+                   "post": token("post_tokens", "postTokens", "post")}
+        with self._lock:
+            self._compact = compact
+            if compact["post"] is not None:
+                self._context = compact["post"]
+
     def _on_result(self, event: dict) -> None:
         usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
         self._add_usage(_number(usage.get("input_tokens")),
                         _number(usage.get("cache_read_input_tokens")),
                         _number(usage.get("cache_creation_input_tokens")),
                         _number(usage.get("output_tokens")))
+        # L81 (étude §6.1) : la fenêtre du modèle, donnée par `modelUsage`
+        # (Claude Code) ; sans elle la décision de compaction ne peut se
+        # prendre sur la part du contexte.
+        model_usage = event.get("modelUsage")
+        if isinstance(model_usage, dict):
+            for entry in model_usage.values():
+                window = _number((entry or {}).get("contextWindow")) \
+                    if isinstance(entry, dict) else 0
+                if window:
+                    with self._lock:
+                        self._window = window
+                    break
         with self._lock:
             total = event.get("total_cost_usd")
             if isinstance(total, (int, float)) and not isinstance(total, bool):
