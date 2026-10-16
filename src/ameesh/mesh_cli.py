@@ -1643,6 +1643,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "",
                 " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
+            # #800 : la désignation est conservée ; l'avertissement de famille
+            # est indicatif (canon §2).
+            if item.get("reviewer_warning"):
+                print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
@@ -1652,6 +1656,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("lot #%d: reviewer %s (state %s, designated by %s)" % (
                 item["id"], item["reviewer"], item["state"],
                 args.actor or "the bound identity"))
+            if item.get("reviewer_warning"):
+                print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
@@ -2538,7 +2544,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.add_argument("--reviewer", default=None, metavar="AGENT",
                          help="#705: designate the reviewer of the review that starts, only "
                               "when moving to qa: waiting(), the progress view and the stale_lot "
-                              "alert name them before any verdict")
+                              "alert name them before any verdict; a reviewer of the author's "
+                              "declared harness warns (indicative, #800)")
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
