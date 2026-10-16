@@ -20,6 +20,14 @@ prouve si la capacité est revenue. Un échec réel ailleurs, ou une deuxième
 annulation, n'est jamais masqué — la garde ne relance pas, le check reste
 rouge et un humain tranche.
 
+#1002 : en mode `--run-id`, l'état de l'exécution est relu avant toute
+décision. `GET actions/runs/<id>/jobs` lit en effet la **dernière** tentative
+par défaut, et `rerun-failed-jobs` vise la tentative courante : un événement
+`workflow_run` rejoué à la main après une relance (événement tentative 1, état
+courant tentative 2) ferait lire la tentative 2 et demanderait une tentative 3.
+La garde refuse donc un événement périmé — la tentative de l'événement doit
+être celle qui est courante — et relit l'exécution juste avant le POST.
+
 La décision est une fonction pure (`decision`), testable sans réseau ; les
 appels passent par `urllib` avec le jeton du job (comme `scripts/ci-flow.py`),
 sans dépendre de `gh`.
@@ -105,8 +113,32 @@ def decision(jobs: list[dict], tentative: int,
     return True, "job(s) hébergé(s) annulé(s) faute de runner : %s" % noms
 
 
+def evenement_perime(tentative: int, etat: dict) -> str | None:
+    """Raison de refuser un événement `workflow_run` périmé, sinon ``None``.
+
+    Pure, testable sans réseau. L'événement doit décrire la tentative courante
+    d'une exécution terminée : `GET .../jobs` lit la dernière tentative par
+    défaut et `rerun-failed-jobs` vise la tentative courante, donc un
+    événement rejoué (tentative 1) après une relance (courante 2) demanderait
+    une tentative 3 (#1002). Une exécution qui n'est plus terminée — le temps
+    qu'un rejeu manuel démarre, par exemple — est refusée de même : rien ne
+    doit être relancé sur une tentative en cours.
+    """
+    courante = etat.get("run_attempt")
+    if courante != tentative:
+        return ("événement périmé : tentative %s de l'événement, tentative %s "
+                "courante de l'exécution %s"
+                % (tentative,
+                   courante if courante is not None else "inconnue",
+                   etat.get("id", "?")))
+    if etat.get("status") != "completed":
+        return ("exécution %s non terminée (statut %r) : la relance attend la "
+                "conclusion" % (etat.get("id", "?"), etat.get("status")))
+    return None
+
+
 class GitHub:
-    """Les deux appels utiles, avec le jeton du job (aucun `gh` requis)."""
+    """Les trois appels utiles, avec le jeton du job (aucun `gh` requis)."""
 
     def __init__(self, env=None):
         env = os.environ if env is None else env
@@ -138,6 +170,10 @@ class GitHub:
             if len(lot) < 100:
                 return out
             page += 1
+
+    def etat(self, run_id: str) -> dict:
+        """L'exécution courante : `run_attempt` et `status` (#1002)."""
+        return self.call("GET", "actions/runs/%s" % run_id)
 
     def relancer(self, run_id: str) -> None:
         """Rejoue les jobs en échec et leurs dépendants (l'agrégat `tests`
@@ -174,10 +210,25 @@ def main(argv=None) -> int:
     if args.apply and not args.run_id:
         print("--apply exige --run-id", file=sys.stderr)
         return 2
+    tentative = args.tentative
+    if args.run_id:
+        # #1002 : l'événement peut avoir été rejoué à la main ; c'est la
+        # tentative courante de l'exécution qui décide, pas celle de
+        # l'événement.
+        gh = GitHub()
+        try:
+            etat = gh.etat(args.run_id)
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+            print("lecture de l'exécution impossible : %s" % exc, file=sys.stderr)
+            return 2
+        perime = evenement_perime(tentative, etat)
+        if perime:
+            _annonce("décision : ne pas relancer — %s" % perime)
+            return 0
+        tentative = int(etat["run_attempt"])
     if args.jobs:
         jobs = jobs_du_fichier(args.jobs)
     elif args.run_id:
-        gh = GitHub()
         try:
             jobs = gh.jobs(args.run_id)
         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
@@ -186,13 +237,20 @@ def main(argv=None) -> int:
     else:
         print("--run-id ou --jobs requis", file=sys.stderr)
         return 2
-    relancer, raison = decision(jobs, args.tentative)
+    relancer, raison = decision(jobs, tentative)
     _annonce("décision : %s — %s"
              % ("relancer" if relancer else "ne pas relancer", raison))
     if not relancer or not args.apply:
         return 0
     gh = GitHub()
     try:
+        # relecture juste avant le POST : si une autre relance (ou un rejeu
+        # manuel) est passée entre-temps, on ne demande pas de tentative en
+        # plus
+        perime = evenement_perime(tentative, gh.etat(args.run_id))
+        if perime:
+            _annonce("décision : ne pas relancer — %s" % perime)
+            return 0
         gh.relancer(args.run_id)
     except (urllib.error.URLError, urllib.error.HTTPError) as exc:
         print("relance impossible : %s" % exc, file=sys.stderr)

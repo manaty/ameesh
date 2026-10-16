@@ -427,18 +427,29 @@ class SessionTest(unittest.TestCase):
         # range le message.
         self.responder.script["work.get"] = {"id": 812, "app": "canon"}
         self.responder.script["threads.index"] = None
+        # L361c : le compte du fil vient du census, porté par `threads.recount`
+        self.responder.script["threads.recount"] = 1791640000
         code, out, err = self.ameesh("mail", "send", "coord", "PR prête pour relecture.",
                                      "--lot", "812")
         self.assertEqual(code, 0, err)
         self.assertIn("coord", out)
         # contrat 1.1 : le fil est indexé depuis la session, auteur `agent:<nom>`
         self.assertEqual(self.server.ops(), ["leases.state", "agents.overview",
-                                             "mailbox.send", "work.get", "threads.index"])
+                                             "mailbox.send", "work.get", "threads.index",
+                                             "threads.recount"])
         index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
         self.assertEqual(index["body"]["kwargs"]["author"], "agent:inge-front")
         self.assertEqual(index["body"]["kwargs"]["project"], "canon")
         self.assertEqual(index["body"]["kwargs"]["lot"], "812")
+        self.assertIs(index["body"]["kwargs"]["count"], False)
         self.assertEqual(index["body"]["fence"]["epoch"], 42)
+        # L361c : le census du fil est porté par la même session, sous le même lot
+        recount = [r for r in self.session_requests()
+                   if r["body"]["op"] == "threads.recount"][0]
+        self.assertEqual(recount["body"]["kwargs"]["project"], "canon")
+        self.assertEqual(recount["body"]["kwargs"]["lot"], "812")
+        self.assertIsInstance(recount["body"]["kwargs"]["kept"], int)
+        self.assertIsInstance(recount["body"]["kwargs"]["end"], int)
         req = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.send"][-1]
         self.assertEqual(req["body"]["args"][:2], ["inge-front", "coord"])
         self.assertTrue(req["headers"].get(C.IDEMPOTENCY_HEADER))
@@ -455,6 +466,7 @@ class SessionTest(unittest.TestCase):
             "recipient_project": "canon"}
         self.responder.script["work.get"] = None
         self.responder.script["threads.index"] = None
+        self.responder.script["threads.recount"] = 1791640000
         code, out, err = self.ameesh("mail", "send", "coord", "Lot d'un autre projet.",
                                      "--lot", "900")
         self.assertEqual(code, 0, err)

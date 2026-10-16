@@ -22,7 +22,7 @@ PROJECT_SQL = (
     " FROM agent_registry r WHERE r.name = %s")
 
 MAIL_COLUMNS = """
-    id, sender, recipient, body, kind, payload, status, host,
+    id, sender, recipient, body, kind, payload, status, host, work_item_id,
     signature, signature_key, signed_payload, nonce,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from delivered_at)::float8 as delivered_ts,
@@ -145,6 +145,29 @@ class Mailbox(interface.Mailbox):
             ORDER BY id
             LIMIT %%s
             """ % MAIL_COLUMNS,
+            (recipient, int(limit)),
+        )
+
+    def unread_mid_turn(self, recipient, limit) -> list[dict]:
+        """L514/#885 : le filtre de `mail.mid_turn` DANS la requête — un
+        verdict, un arbitrage, un message humain ou urgent, sans borne sur les
+        autres non-lus (les 200 premiers ne sont pas un plafond de lecture)."""
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox m
+            WHERE recipient = %%s AND delivered_at IS NULL
+              AND (payload @> '{"urgent": true}'::jsonb
+                   OR payload @> '{"human": true}'::jsonb
+                   OR payload @> '{"verdict": true}'::jsonb
+                   OR payload @> '{"arbitration": true}'::jsonb)
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_registry v
+                  WHERE v.name = m.recipient AND (%s)
+              )
+            ORDER BY id
+            LIMIT %%s
+            """ % (MAIL_COLUMNS, self.ACTIVE_SQL),
             (recipient, int(limit)),
         )
 

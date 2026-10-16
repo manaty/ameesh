@@ -139,7 +139,8 @@ test("config token-form: a stream's refusal forgets the token too, not a newer o
   let release;
   const sent = [];
   window.fetch = globalThis.fetch = async (url, init) => {
-    if (new URL(url).pathname !== "/api/v1/events") return fetch(url, init);
+    // Keep the app’s automatic stream separate from the manually held stream.
+    if (new URL(url).pathname !== "/api/v1/events" || init.signal) return fetch(url, init);
     sent.push(new Headers(init.headers).get("Authorization"));
     await new Promise((r) => { release = r; });
     return new Response("", { status: 401, statusText: "Unauthorized" });

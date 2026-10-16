@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Mode a2: operator-installed, dedicated rootless Podman identity and volume.
+# Configure the guard's agent_units to this exact unit, state/ack paths to
+# the recipe, and run without --observe. See docs/VM-EXECUTEUR-MEDIE.md.
+# Rootless Podman needs XDG_RUNTIME_DIR: enable lingering for ameesh-guest
+# (loginctl enable-linger) so /run/user/<uid> exists, then set that path in a
+# drop-in (Environment=XDG_RUNTIME_DIR=/run/user/<uid>); %U is 0 in a system
+# unit and does not follow User=.
+[Unit]
+Description=ameesh — mediated executor on a lending VM
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ameesh-guest
+Group=ameesh-guest
+Slice=ameesh-guest.slice
+Delegate=yes
+WorkingDirectory=/srv/ameesh-guest
+Environment=HOME=/srv/ameesh-guest/home
+Environment=TMPDIR=/srv/ameesh-guest/tmp
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ameesh/venv/bin/python -m ameesh.mediated_executor.vm_supervisor /etc/ameesh/mediated-recipe.json
+# Only executor exit 1 is retried, inside the supervisor. Other exits need
+# operator intervention; the guard may restart units it stopped itself.
+Restart=no
+KillMode=mixed
+TimeoutStopSec=125
+OOMScoreAdjust=500
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

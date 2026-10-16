@@ -107,3 +107,21 @@ Two consequences:
 `--take-idle 0`, `--take-lot-idle 0` and `--dry-run` keep their meaning; a
 per-agent cap (`CostBook.over`) and a host under pressure, on low battery or
 not ready still stop the pickup.
+
+# Amendment of 2026-10-13 (2): a paused plan agent hands its ready lots back
+
+Same owner instruction, lot #757. The lots of a **non-critical Claude agent
+paused on budget** no longer all wait for a free DeepSeek taker:
+
+- a **non-started** lot (`intake`) returns to the team queue (assignee
+  cleared, one journal note): the automatic take above gives it to the first
+  free capable agent of the team, plan agents first, DeepSeek or Codex — a
+  plan agent at its ceiling no longer keeps a ready lot out of the queue;
+- a **started** lot (`build`) keeps the direct L233b handoff (branch, git
+  state and what remains to do travel with it), by a free DeepSeek **or
+  Codex** agent of the same project.
+
+Never handled, as before: a lot under review or frozen, a sensitive or
+reserved one, one waiting for a decision, one whose last assignment came from
+a human. The rolling hourly ceiling (`--handoff-max-per-hour`) counts returns
+and handoffs together; the cross-family review rule is unchanged.
