@@ -107,10 +107,10 @@ noter_sujets() {
   # portent que sur la branche effectivement rebasée (HEAD) : une autre branche
   # passée en argument garde le seul contrôle des sujets d'origine.
   local base= ref= lot=
-  if ((racine)); then
-    base=root
-  elif [ -n "$onto" ]; then
+  if [ -n "$onto" ]; then
     base=$(git rev-parse --verify --quiet "$onto^{commit}") || base=
+  elif ((racine)); then
+    base=root
   elif ((keep)); then
     base=$(git merge-base "$upstream" "$branche" || :)
   else

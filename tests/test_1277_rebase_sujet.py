@@ -178,6 +178,15 @@ class HistoriqueBrancheTest(unittest.TestCase):
         proc = self._lancer("bash", LANCEUR, "--onto", "main", base, "lot/1476-essai")
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_root_onto_exclut_la_destination(self) -> None:
+        """--root rejoue tous les commits du lot, sans contrôler ceux de --onto."""
+        _git(self.depot, "checkout", "--orphan", "lot/1476-essai")
+        _git(self.depot, "rm", "-rf", ".")
+        self._commit("lot.txt", "lot\n", "#1476 : racine du lot")
+        proc = self._lancer("bash", LANCEUR, "--root", "--onto", "main")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("rebase-lot :", proc.stderr)
+
     def test_base_et_branche_hors_lot_non_controlees(self) -> None:
         """Un marqueur committé sur la base, et une branche qui n'est pas
         `lot/<id>…` : la plage rejouée seule est contrôlée (aucun faux positif)."""
