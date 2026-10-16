@@ -206,6 +206,20 @@ sont tues tant que le relevé n'est pas rafraîchi (#1561). Chaque relevé porte
 son horodatage (`read_at` : marqueur de compte Claude, date du journal Codex),
 exposé par `accounts list --json` et l'instantané `progress`.
 
+Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
+peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/
+usage/claude*.json`, dossier réglable par l'hôte avec
+`AMEESH_USAGE_WIDGET_DIR`), quand il est **frais** : il porte les seaux
+**propres à un modèle** (le « Fable Weekly » d'un compte, que les journaux
+`rate_limit_event` ne voient pas). Un instantané n'est lu que si `updatedAt`
+(repli : date du fichier) n'est pas plus vieux que sa plus courte fenêtre —
+une fenêtre courte remise à zéro depuis le relevé invaliderait aussi la
+longue (#1561) ; sinon les journaux restent la source, et un hôte sans widget
+ne change rien. Un seau de modèle (`title`, ex. « Fable Weekly ») ne compte
+que pour une session **de ce modèle** ; un modèle inconnu l'ignore, et
+`accounts list` les montre tous (la ligne d'état peut donc être retenue par un
+seau de modèle).
+
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,
 premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire
