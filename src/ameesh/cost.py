@@ -893,8 +893,8 @@ class CostBook:
 
         Compare turn-marker timestamps across agents. Only a stream without
         any marker uses the `primary` account (the harness's default one,
-        L1078) and file modification time; with `primary` None, no account
-        claims them.
+        L1078), dated by the event itself or left undated, never by the file
+        modification time (#1720); with `primary` None, no account claims them.
 
         #1661 : rend un `Gauges` (copie du relevé caché, `overage` compris),
         jamais une liste nue — même quand aucun relevé n'existe.
@@ -917,7 +917,7 @@ class CostBook:
                     # make a racy snapshot old enough to be cached.
                     seen = time.time_ns()
                     events, stat, complete = _claude_account_tail(path)
-                    readings = _claude_account_readings(events, stat.st_mtime)
+                    readings = _claude_account_readings(events)
                     if complete and not _racy(stat, seen):
                         self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
                     else:
@@ -1991,7 +1991,8 @@ def _claude_windows(event: dict, read_at: float | None = None) -> list | None:
     """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles.
 
     `read_at` (#1561) : l'horodatage du relevé — le marqueur de compte qui
-    précède le tour, ou la date du flux pour un flux sans marqueur.
+    précède le tour, ou la date de l'événement pour un flux sans marqueur
+    (#1720, 0.0 = non daté).
     """
     info = event.get("rate_limit_info") or {}
     windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
@@ -2201,14 +2202,32 @@ def _racy(stat, now_ns: int) -> bool:
     return now_ns - stat.st_ctime_ns < RACY_CTIME_NS
 
 
-def _claude_account_readings(events: list, mtime: float) -> dict:
+def _claude_event_date(event: dict) -> float:
+    """La date que l'événement porte lui-même, 0.0 s'il n'en porte pas (#1720).
+
+    Un `rate_limit_event` Claude réel n'a ni `ts` ni `timestamp` : un flux sans
+    marqueur reste donc **non daté**, au lieu d'être daté de la mtime du journal
+    (dernière écriture de n'importe quel événement), qui le faisait passer pour
+    plus frais qu'un widget plus récent (#1648).
+    """
+    for key in ("ts", "timestamp"):
+        date = _epoch(event.get(key))
+        if date:
+            return date
+    return 0.0
+
+
+def _claude_account_readings(events: list) -> dict:
     """Attribute all accounts in one pass; None is a verified legacy stream.
 
     Each reading is (stamp, gauges, overage): the overage flags stay beside
-    the gauges, so the shared cache keeps them too (L226b, #1649).
+    the gauges, so the shared cache keeps them too (L226b, #1649). #1720 : un
+    flux sans marqueur ne se date que de l'événement lui-même
+    (`_claude_event_date`) ; sans date, le relevé est non daté et la priorité
+    #1580 au widget s'applique (#1648).
     """
     marked = any(_is_claude_marker(e) for e in events)
-    current, stamp = None, 0.0 if marked else mtime
+    current, stamp = None, 0.0
     readings = {}
     for event in events:
         if _is_claude_marker(event):
@@ -2218,12 +2237,14 @@ def _claude_account_readings(events: list, mtime: float) -> dict:
             except (TypeError, ValueError):
                 stamp = 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
-            gauges = _claude_windows(event, stamp)
+            at = stamp if marked else _claude_event_date(event)
+            gauges = _claude_windows(event, at)
             if gauges is not None:
                 # #1661 : observation immuable (date, fenêtres, overage) — le
                 # tuple évite de partager la liste mutable du producteur, et
-                # le cache garde l'overage à côté des fenêtres.
-                readings[current] = (stamp, tuple(gauges), _claude_overage(event))
+                # le cache garde l'overage à côté des fenêtres. #1720 : la date
+                # est celle de l'événement, jamais la mtime du journal.
+                readings[current] = (at, tuple(gauges), _claude_overage(event))
     return readings
 
 

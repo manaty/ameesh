@@ -140,6 +140,8 @@ def read(profile, *, now: float | None = None, directory=None,
 
     A snapshot whose shortest window has reset since `updatedAt` no longer
     says anything reliable (#1561): None, the caller falls back on the logs.
+    Its buckets carry their reading date (`read_at`, #1648), so the caller
+    can compare two dated sources.
     """
     now = time.time() if now is None else now
     path = snapshot_path(profile, directory=directory, environ=environ, key=key)
