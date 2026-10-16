@@ -218,8 +218,11 @@ class PlatformMemoryTest(unittest.TestCase):
             self.assertFalse(process.release_free_memory())
 
     def test_release_without_a_libc_is_false(self):
-        with mock.patch("ctypes.CDLL", side_effect=OSError("no libc")):
-            self.assertFalse(process.release_free_memory())
+        # TypeError : `CDLL(None)` sous Windows (pas de handle du processus)
+        for exc in (OSError("no libc"), TypeError("expected str, got NoneType")):
+            with self.subTest(exc=type(exc).__name__), \
+                    mock.patch("ctypes.CDLL", side_effect=exc):
+                self.assertFalse(process.release_free_memory())
 
 
 class BigTurnMemoryTest(PgTestCase):

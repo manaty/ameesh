@@ -89,7 +89,7 @@ def release_free_memory() -> bool:
     try:
         libc = ctypes.CDLL(None)
         trim = libc.malloc_trim
-    except (OSError, AttributeError):
+    except Exception:  # OSError, AttributeError ; TypeError sous Windows (CDLL(None))
         return False
     try:
         trim.argtypes = [ctypes.c_size_t]
