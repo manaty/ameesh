@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import dataclasses
+import io
 import os
 import tempfile
 import types
@@ -464,6 +466,18 @@ class TrainGitTest(_Land):
         repository = train_git.Repository(project, self.clone)
         with self.assertRaisesRegex(train.TrainError, "protected"):
             repository.target("main")
+
+    def test_incompatible_declared_radar_profile_is_refused(self):
+        args = types.SimpleNamespace(queue_command="add", repo=self.repo, id=1, actor="runner")
+        cfg = dataclasses.make_dataclass("Cfg", ["state_dir", "radar"])(
+            self.cfg.state_dir,
+            {"projects": {"other": {"repo": os.path.join(self.tmp, "other-repo")}}})
+        err = io.StringIO()
+        with mock.patch.object(merge_queue, "radar_project", return_value=None), \
+                mock.patch.object(merge_queue, "enter") as enter, contextlib.redirect_stderr(err):
+            self.assertEqual(merge_queue.run(cfg, None, args), 1)
+        enter.assert_not_called()
+        self.assertIn("radar.projects", err.getvalue())
 
     def test_missing_radar_profile_uses_a_throwaway_clone_never_the_radar_one(self):
         # #1761 (main, fusionne le 15/10 18:28, anterieur a la base de #1467 du
