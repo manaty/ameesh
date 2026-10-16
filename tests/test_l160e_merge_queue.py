@@ -21,7 +21,7 @@ from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
                     resolutions, storage, work)
 
 from .support import PgTestCase
-from .test_l160b_radar import LOTS, MIG, _git, make_repo
+from .test_l160b_radar import LOTS, MIG, _git, git_env, make_repo
 from .test_l160d_resolutions import FakeWork, _commit_on, _identity, _manual_resolution
 
 
@@ -240,7 +240,7 @@ class EntryTest(_Base):
         self.assertFalse(os.path.exists(os.path.join(agents, ".git", "FETCH_HEAD")))
         self.assertNotEqual(subprocess.run(["git", "-C", agents, "cat-file", "-e",
                                             self.tip(1) + "^{commit}"],
-                                           capture_output=True).returncode, 0)
+                                           capture_output=True, env=git_env()).returncode, 0)
         # without the clone, origin cannot be fetched: refused, never the cached tip
         self.fake.queue_rows.clear()
         with self.assertRaisesRegex(merge_queue.QueueError, "without the radar's clone"):
@@ -760,7 +760,8 @@ class PassTest(_Base):
         report = self.run_pass(repo=agents)
         for repo in (self.repo, agents, radar.clone_dir(self.cfg, "p")):
             self.assertNotEqual(subprocess.run(["git", "cat-file", "-e", frozen + "^{commit}"],
-                                               cwd=repo, capture_output=True).returncode, 0)
+                                               cwd=repo, capture_output=True,
+                                               env=git_env()).returncode, 0)
         self.assertNotIn(1, [b["work_item"] for b in report["branches"]])
         self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
         self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
