@@ -9,7 +9,9 @@ harnais de `tests/fakebin`.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import json
 import os
 import time
@@ -19,6 +21,7 @@ from unittest import mock
 
 from ameesh import (account_turn, accounts, fil, mail, platform, registry, reprise,
                     storage, work)
+from ameesh import main as mesh_main
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -54,12 +57,21 @@ def _rollout(home: str, sid: str, cwd: str, used_percent: float | None = None) -
                     "primary": {"used_percent": used_percent, "window_minutes": 300,
                                 "resets_at": time.time() + 3600},
                     "secondary": None}}}) + "\n")
+    # L82: this fixture is a closed, quiet session, ready for adoption.
+    quiet = time.time() - 120
+    os.utime(chemin, (quiet, quiet))
     return chemin
 
 
 class _Base(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
+        # Session holders are an explicit observation in these adoption tests;
+        # unrelated non-dumpable host processes must not decide their result.
+        # Platform discovery and fail-closed refusals have their own L63 tests.
+        holders = mock.patch.object(reprise, "holders", return_value=[])
+        holders.start()
+        self.addCleanup(holders.stop)
         for table in ("account_active", "account_holds", "account_switches", "turn_costs",
                       "spend_pending", "quota_gauge_readings"):
             self.db.execute("DELETE FROM %s" % table)
@@ -108,18 +120,6 @@ class _Base(PgTestCase):
 # --------------------------------------------------------------------------
 
 class AdoptTest(_Base):
-    def setUp(self) -> None:
-        super().setUp()
-        # #1965 : comme #1805, la table des processus de l'hôte est injectée
-        # (déterministe) ; sa lecture réelle a ses témoins
-        # (`tests/test_l63_platform.py`). Sans cela, un processus du même
-        # utilisateur non dumpable (gpg-agent) fait lever `platform.holders`
-        # (NotAvailable) et `adopt` refuse en fail-closed L63b — comportement
-        # voulu du produit, mais témoin dépendant du poste (canon §3).
-        patcher = mock.patch.object(platform, "holders", lambda *a, **k: [])
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def test_session_codex_trouvee_sous_son_compte(self):
         comptes = self._codex()
         chemin = _rollout(comptes["codex"][1]["path"], SID, self.travail)
@@ -180,13 +180,11 @@ class AdoptTest(_Base):
 
     def test_session_ouverte_refusee_puis_force(self):
         comptes = self._codex()
-        _rollout(comptes["codex"][0]["path"], SID, self.travail)
+        chemin = _rollout(comptes["codex"][0]["path"], SID, self.travail)
         self._externe("coord")
-        # table injectée : la session est tenue par un processus CONSTATÉ (la
-        # lecture réelle a ses témoins dans tests/test_l63_platform.py)
-        tenant = [{"pid": os.getpid(), "why": "open file",
-                   "cmd": "codex resume %s" % SID}]
-        with mock.patch.object(platform, "holders", lambda *a, **k: list(tenant)):
+        tenant = [{"pid": os.getpid(), "why": "open file", "cmd": "test harness"}]
+        with open(chemin, "a", encoding="utf-8"), \
+                mock.patch.object(reprise, "holders", return_value=tenant):
             with self.assertRaises(reprise.RepriseError) as ctx:
                 reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
                               harness="codex")
@@ -214,7 +212,7 @@ class AdoptTest(_Base):
             "4242 gpg-agent")
         for force in (False, True):
             with self.subTest(force=force), \
-                    mock.patch.object(platform, "holders", side_effect=muet):
+                    mock.patch.object(reprise, "holders", side_effect=muet):
                 with self.assertRaises(reprise.RepriseError) as ctx:
                     reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
                                   harness="codex", force=force)
@@ -244,6 +242,10 @@ class AdoptTest(_Base):
             fh.write(json.dumps({"type": "user", "cwd": self.travail}) + "\n")
         dsh = _dossier(os.path.join(self.tmp, "dsh-home"))
         os.makedirs(os.path.join(dsh, "sessions", "--tmp--", "session-" + SID))
+        quiet = time.time() - 120
+        for closed in (os.path.join(projet, SID + ".jsonl"),
+                       os.path.join(dsh, "sessions", "--tmp--", "session-" + SID)):
+            os.utime(closed, (quiet, quiet))
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": claude, "DSH_HOME": dsh}):
             out = reprise.adopt(self._cfg(), self.db, "cl", session_id=SID, harness="claude")
             self.assertEqual((out["account"], out["cwd"]), (None, self.travail))
@@ -262,25 +264,18 @@ class AdoptTest(_Base):
 
     def test_cli_adopt_json(self):
         comptes = self._codex()
-        chemin = _rollout(comptes["codex"][1]["path"], SID, self.travail)
+        _rollout(comptes["codex"][1]["path"], SID, self.travail)
         config = os.path.join(self.tmp, "config-hote.json")
         with open(config, "w", encoding="utf-8") as fh:
             json.dump({"accounts": comptes}, fh)
         self._externe("coord")
-        # #1965 : la CLI est un processus à part — la table injectée en setUp
-        # ne l'atteint pas. Sur un hôte où un processus du même utilisateur
-        # cache ses fichiers ouverts (gpg-agent), le refus L63b est le
-        # comportement voulu (témoins : AdoptFailClosedTest, test_l63) : ce
-        # témoin se déclare non concluant sur le succès de l'adoption, au lieu
-        # de dépendre de la table de processus du poste (canon §3).
-        try:
-            platform.process.holders(chemin, SID, exclude=platform.ancestry())
-        except platform.NotAvailable as exc:
-            self.skipTest("hôte à processus du même utilisateur illisible : %s" % exc)
-        proc = self.mesh("adopt", "coord", "--session", SID, "--harness", "codex", "--json",
-                         env=self.env(AMEESH_CONFIG=config))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        out = json.loads(proc.stdout)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.env(AMEESH_CONFIG=config)), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = mesh_main.main(["adopt", "coord", "--session", SID,
+                                   "--harness", "codex", "--json"])
+        self.assertEqual(code, 0, stderr.getvalue())
+        out = json.loads(stdout.getvalue())
         self.assertEqual((out["agent"], out["account"]), ("coord", "secondaire"))
         proc = self.mesh("show", "coord")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -517,9 +512,7 @@ class SessionAccountTest(_Base):
         cfg = dataclasses.replace(self._cfg(comptes), budget_usd_per_hour=10.0,
                                   budget_check_interval=0.0)
         self._externe("coord")
-        # #1965 : table des processus injectée (voir AdoptTest.setUp)
-        with mock.patch.object(platform, "holders", lambda *a, **k: []):
-            reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex")
+        reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex")
         runner, worker = self._worker("coord", cfg)
         try:
             self.assertIsNotNone(self._tour(worker))
