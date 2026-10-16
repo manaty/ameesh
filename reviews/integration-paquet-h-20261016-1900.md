@@ -84,6 +84,15 @@ de la r2 #1500), il est prudent pour la fenêtre et ne leur invente pas de cause
 - `contract.json` et compteurs médiés **inchangés** (identiques à la base r2 :
   64 opérations admises, 364 refusées, 428 à l'interface) ;
   `docs/EXECUTEUR-MEDIEE.md` non retouché ; `test_l107` rejoué vert.
+- **#2096 × test_l790** : la doublure de
+  `SelectedTurnRefusedTest.test_run_turn_remet_la_consigne_et_refuse` ne portait
+  pas `_release_turn_memory`, appelée par `run_turn` depuis #2096
+  (`runner.py:4062`) : `AttributeError` déterministe sur les têtes `4b8ca5fa`
+  et `2be7efec`, vert sur main `edf2bf3d`. Adaptation mécanique de doublure
+  (§11bis, décision pilote du 16/10 22:35) :
+  `_release_turn_memory=lambda *a, **k: None`, assertions du test inchangées,
+  code #2096/#2110 non modifié ; module `test_l790_outdated_restart`
+  **24 OK psql + 24 OK psycopg** sur cette tête.
 
 ## Contrôles de composition
 
@@ -100,7 +109,7 @@ de la r2 #1500), il est prudent pour la fenêtre et ne leur invente pas de cause
 - Modules voisins rejoués sur l'arbre réduit : l107, l122, l109, cluster,
   1286_declared_merge_proof — résultats consignés au fil du lot.
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur ce manifeste.
-- **Une seule CI complète** sur cette tête gelée (§12) ; aucune CI de lot ; le
-  feu du pilote sur l'ancienne tête `916b0c28` ne couvre pas cette tête — un
-  nouveau feu sur la tête exacte est demandé avant tout réarmement
-  d'auto-fusion.
+- **Une seule CI complète** sur cette tête (§12) ; aucune CI de lot ; le feu du
+  pilote `35956` sur `2be7efec` a été retiré par le pilote (auto-fusion
+  désarmée) — la tête réparée appelle un **nouveau feu sur sa tête exacte**
+  avant tout réarmement d'auto-fusion.
