@@ -14,7 +14,7 @@ plus d'un chemin qu'une bascule changerait sous lui :
   à l'écart : pip dans son coin, puis contrôles d'imports, de point d'entrée et
   de shebang AVANT toute mise en service ;
 * `<venv>` reste un répertoire stable qui ne porte que des LANCEURS
-  (`bin/python`, `bin/ameesh`) : ils lisent le lien `venv-courant` au
+  (`bin/python` et ses alias, `bin/ameesh`) : ils lisent le lien `venv-courant` au
   démarrage et exécutent le binaire du venv versionné. L'interpréteur voit
   donc un chemin CONCRET (`venv-<sha7>/lib/pythonX/site-packages`) : un
   processus déjà lancé garde ce chemin, et une bascule suivante ne peut plus
@@ -25,7 +25,7 @@ plus d'un chemin qu'une bascule changerait sous lui :
   `ModuleNotFoundError ameesh.platform.process`, `ameesh` absent/code 127) ;
 * la première conversion d'un venv RÉEL ne le déplace pas et ne touche pas son
   `lib/` : ce contenu est réutilisé (lien) comme version précédente
-  `venv-<sha7>`, seuls `bin/python` et `bin/ameesh` sont remplacés par les
+  `venv-<sha7>`, seuls les interpréteurs de `bin/` et `bin/ameesh` sont remplacés par les
   lanceurs — un processus en cours n'importe pas depuis `bin/`. Le retour se
   fait en rebasculant le lien, sans pip.
 
@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -135,8 +136,7 @@ def _read_report(venv):
 
 
 def _write_report(venv, name):
-    with open(_report_path(venv), "w") as handle:
-        handle.write(name + "\n")
+    _write(_report_path(venv), name + "\n", mode=0o644)
 
 
 # --------------------------------------------------------------------------
@@ -208,7 +208,12 @@ def _installer_lanceurs(venv):
         os.makedirs(bin_dir, exist_ok=True)
     except OSError as exc:
         _die("bin/ inscriptible requis dans %s : %s" % (venv, exc))
-    _write(os.path.join(bin_dir, "python"), _LAUNCHER.format(lien=CURRENT, binaire="python"))
+    # Les scripts console installés par pip pointent souvent sur python3,
+    # qui peut viser directement le binaire de base et contourner python.
+    interpreteurs = {"python"} | {nom for nom in os.listdir(bin_dir)
+                                  if re.fullmatch(r"python[0-9]+(?:\.[0-9]+)*", nom)}
+    for nom in sorted(interpreteurs):
+        _write(os.path.join(bin_dir, nom), _LAUNCHER.format(lien=CURRENT, binaire="python"))
     _write(os.path.join(bin_dir, "ameesh"), _LAUNCHER.format(lien=CURRENT, binaire="ameesh"))
     _write(os.path.join(bin_dir, "pip"), _PIP_REFUS)
     for nom in ("pip3", "pip3.14", "pip3.12"):
@@ -328,9 +333,9 @@ def activer(args):
     if _live_target(venv) == version:
         print("bascule: venv-%s déjà actif" % version)
         return 0
-    _pointer(venv, version)
     if precedent and precedent != version:
         _write_report(venv, precedent)
+    _pointer(venv, version)
     print("bascule: venv-%s actif%s" % (version, "" if not precedent else " (avant : %s)" % precedent))
     return 0
 

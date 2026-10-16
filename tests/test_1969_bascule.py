@@ -158,6 +158,33 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual((0, "v1"), lire(self.venv))
         self.assertEqual("tardif=v2", self.reveiller(neuf))
 
+    def test_alias_python3_et_scripts_console_suivent_la_version_vivante(self):
+        vrai_venv(self.base, "v1", "v1", "old_only")
+        os.rename(self.base / "venv-v1", self.venv)
+        # Même forme que le venv installé : python3 vise directement le binaire
+        # de base ; les points d'entrée pip ont ce python3 dans leur shebang.
+        alias = self.venv / "bin" / "python3"
+        alias.unlink()
+        alias.symlink_to(os.path.realpath(sys.executable))
+        for nom in ("agent-mail", "agent-runner"):
+            script = self.venv / "bin" / nom
+            script.write_text("#!%s\nimport pkg1969\nprint(pkg1969.VALUE)\n" % alias)
+            script.chmod(0o755)
+        vrai_venv(self.base, "v2", "v2", "new_only")
+        (self.base / "venv-v2" / bascule.MARKER).write_text('{}')
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        for valeur in ("v2", "v1"):
+            for nom in ("python", "python3", "agent-mail", "agent-runner"):
+                with self.subTest(version=valeur, commande=nom):
+                    commande = [str(self.venv / "bin" / nom)]
+                    if nom.startswith("python"):
+                        commande += ["-c", "import pkg1969; print(pkg1969.VALUE)"]
+                    resultat = subprocess.run(commande, capture_output=True, text=True)
+                    self.assertEqual(0, resultat.returncode, resultat.stderr)
+                    self.assertEqual(valeur, resultat.stdout.strip())
+            if valeur == "v2":
+                self.assertEqual(0, retour(self.venv))
+
     # -- B2 : le retour réutilise le venv réel, sans pip --------------------
 
     def test_retour_reutilise_le_venv_reel_sans_pip(self):
@@ -199,6 +226,19 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual(0, activer(self.venv, "v2", precedent="v2"))
         self.assertEqual((0, "v2"), lire(self.venv))
         self.assertEqual("v1", bascule.etat_de(str(self.venv))["precedente"])
+
+    def test_echec_enregistrement_precedent_ne_bascule_pas(self):
+        faux_venv(self.base, "v1")
+        os.rename(self.base / "venv-v1", self.venv)
+        faux_venv(self.base, "v2")
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        faux_venv(self.base, "v3")
+        with mock.patch.object(bascule, "_write_report", side_effect=OSError("disque plein")):
+            with self.assertRaises(OSError):
+                activer(self.venv, "v3")
+        self.assertEqual((0, "v2"), lire(self.venv))
+        self.assertEqual(0, retour(self.venv))
+        self.assertEqual((0, "v1"), lire(self.venv))
 
     def test_bascule_concurrente_voit_ancien_ou_nouveau_entier(self):
         faux_venv(self.base, "v1")

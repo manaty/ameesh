@@ -1316,7 +1316,7 @@ path and could mix old and new submodules).
 `activer` only replaces the `venv-courant` symlink (temp + `rename()`), so
 there is no window without a live version. The **first** conversion of a real
 venv does not move or rewrite it: its `lib/` is reused by link as the
-previous version `venv-<sha7>` (adopted without pip), only `bin/python` and
+previous version `venv-<sha7>` (adopted without pip), only the Python interpreters in `bin/` and
 `bin/ameesh` become launchers — a running process imports from `lib/`, not
 from `bin/`. `retour` points the symlink back to the recorded previous
 version, **without pip**, including that first conversion (review B2: the
