@@ -364,6 +364,9 @@ def _is_exit_func(node: ast.expr, exit_names: set[str],
     """Whether an expression designates a known import-time termination: a
     bound name, or `sys.exit`/`os._exit` (aliases of `sys`, `os` and of the
     imported names included)."""
+    if isinstance(node, ast.NamedExpr):
+        # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
+        return _is_exit_func(node.value, exit_names, sys_names, os_names)
     if isinstance(node, ast.Name):
         return node.id in exit_names
     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):

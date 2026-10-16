@@ -1139,6 +1139,12 @@ class ImportGraphTest(unittest.TestCase):
                               "f = e\n"
                               "f(1)\n"
                               "import ameesh.db\n",
+            "alias appelé dans son affectation": "import sys\n"
+                                                  "(e := sys.exit)(1)\n"
+                                                  "import ameesh.db\n",
+            "alias importé appelé dans son affectation": "from sys import exit as bye\n"
+                                                           "(e := bye)(1)\n"
+                                                           "import ameesh.db\n",
             "affectation multiple": "import sys\n"
                                     "e = f = sys.exit\n"
                                     "f(1)\n"
