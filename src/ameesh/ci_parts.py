@@ -41,16 +41,26 @@ tourne, le répertoire est supprimé. Toute incertitude — configuration
 illisible, sélecteur absent de l'arbre épinglé, erreur de git, commande qui
 échoue ou dépasse son délai, plan absent, illisible, d'un autre schéma ou
 mal formé — lève `PartsError` : un contrat inconnu n'est pas un vert.
+
+N2 de #1666 : la preuve rendue par `due` est mise en cache (facultatif,
+`cache_dir(cfg)`) par couple (commit de base, tête gelée) et par contrat ;
+l'arbre de la cible n'est extrait qu'une fois par couple, plus à chaque
+contrôle d'atterrissage, et une entrée relue est revalidée avant d'être
+servie. N4 de #1666 : le sélecteur tourne dans sa propre session et son
+groupe de processus entier est tué quand il dépasse `PARTS_TIMEOUT`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tarfile
 import tempfile
+import time
 
 from . import plan_git
 from .canon import GIT_TIMEOUT, GitError, _git, _git_env
@@ -58,10 +68,21 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 #: plafond d'exécution du sélecteur : un sélecteur bloqué ne retient pas la
 #: passe du radar des heures (canon §3, plafonds de la CI)
 PARTS_TIMEOUT = 300
+#: N4 de #1666 : délai de moisson après la mort du groupe — un petit-fils
+#: échappé de la session retiendrait les tubes plus longtemps sans effet utile
+PARTS_REAP_TIMEOUT = 10
+#: N2 de #1666 : durée de vie (s) d'une preuve mise en cache. La preuve est
+#: une fonction pure du couple (commit de base, tête gelée) et du contrat ;
+#: au-delà du délai elle est élaguée et recalculée, sans effet sur la porte.
+PARTS_CACHE_TTL = 24 * 3600
+#: version du format de cache : une entrée d'une autre version est ignorée
+PARTS_CACHE_VERSION = 1
 #: les espaces de noms substituables dans `argv` : `radar.parse_ci_parts` les
 #: refuse à la déclaration, `due` les substitue
 PLACEHOLDERS = ("selector", "root", "files", "out")
 PLACEHOLDER_RE = re.compile(r"\{([^{}]*)\}")
+#: un identifiant de commit (SHA-1 ou SHA-256), pour valider une entrée de cache
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 class PartsError(RuntimeError):
@@ -202,14 +223,125 @@ def _plan_file(path: str, plan) -> tuple:
     return schema, tuple(clean)
 
 
-def due(project, sha: str, base_sha: str, repo: str) -> dict:
+def cache_dir(cfg) -> str | None:
+    """Le répertoire du cache de preuves d'un hôte (`<état>/radar/ci-parts`),
+    ou None sans état : l'admission et les atterrissages du même hôte
+    partagent ainsi la même preuve (N2 de #1666)."""
+    state = getattr(cfg, "state_dir", None)
+    return os.path.join(state, "radar", "ci-parts") if state else None
+
+
+def _cache_key(plan, base: str, frozen: str) -> str:
+    """La clé d'une preuve : le couple (commit de base, tête gelée) et le
+    contrat qui la produit. Deux contrats différents ne partagent jamais une
+    entrée."""
+    payload = json.dumps({"version": PARTS_CACHE_VERSION, "base": base, "frozen": frozen,
+                          "selector": plan.selector, "argv": list(plan.argv),
+                          "schema": plan.schema, "due": plan.due},
+                         sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_read(cache: str, key: str, plan, base: str, frozen: str) -> dict | None:
+    """La preuve mise en cache, relue et **revalidée** comme un plan frais ;
+    toute entrée illisible, incomplète, d'un autre schéma, d'un autre format
+    ou d'un autre couple (base, tête gelée) est ignorée — la preuve est
+    recalculée, jamais servie."""
+    try:
+        with open(os.path.join(cache, key + ".json"), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != PARTS_CACHE_VERSION:
+        return None
+    schema = data.get("schema")
+    if not isinstance(schema, str) or not schema.strip():
+        return None
+    if plan.schema and schema != plan.schema:
+        return None
+    names = data.get("due")
+    if not isinstance(names, list) or not all(
+            isinstance(name, str) and name.strip() for name in names):
+        return None
+    clean = tuple(name.strip() for name in names)
+    if len(set(clean)) != len(clean):
+        return None
+    if data.get("base") != base or data.get("frozen") != frozen:
+        return None
+    if not isinstance(data.get("merge_base"), str) \
+            or not _COMMIT_RE.fullmatch(data["merge_base"]):
+        return None
+    return {"schema": schema, "due": clean, "selector": plan.selector,
+            "base": base, "merge_base": data["merge_base"], "frozen": frozen}
+
+
+def _cache_write(cache: str, key: str, proof: dict) -> None:
+    """Écrit la preuve en cache, atomiquement ; un échec d'écriture ne fait
+    jamais échouer la preuve — le cache est un coût, pas une garantie."""
+    path = os.path.join(cache, key + ".json")
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        os.makedirs(cache, exist_ok=True)
+        data = {"version": PARTS_CACHE_VERSION, "schema": proof["schema"],
+                "due": list(proof["due"]), "base": proof["base"],
+                "merge_base": proof["merge_base"], "frozen": proof["frozen"]}
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _cache_prune(cache: str, now: float) -> None:
+    """Élague les preuves plus vieilles que `PARTS_CACHE_TTL` : le cache ne
+    grossit pas sans borne (N2 de #1666)."""
+    try:
+        entries = list(os.scandir(cache))
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.endswith(".json"):
+            continue
+        try:
+            if now - entry.stat().st_mtime > PARTS_CACHE_TTL:
+                os.remove(entry.path)
+        except OSError:
+            continue
+
+
+def _kill_group(proc) -> None:
+    """N4 de #1666 : `subprocess.run(timeout=…)` ne tue que l'enfant direct ;
+    les petits-enfants du sélecteur (node, sh…) lui survivraient. Le sélecteur
+    tourne dans sa propre session (`start_new_session=True`) : on tue le
+    groupe entier, sans quoi un sélecteur bloqué laisse des processus
+    derrière lui."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None) -> dict:
     """Les parts que le change set de la tête gelée `sha` rend dues, calculées
     par le sélecteur versionné de `project` (`ci_parts`), lu au commit
     `base_sha` de `repo` et alimenté du diff `merge-base(base_sha, sha)..sha`.
 
     Rend `{schema, due, selector, base, merge_base, frozen}` ; lève
     `PartsError` dès que la preuve manque (sélecteur absent de l'arbre
-    épinglé, change set inconnu, commande en échec, plan mal formé)."""
+    épinglé, change set inconnu, commande en échec, plan mal formé).
+
+    N2 de #1666 : `cache` (un répertoire, `cache_dir(cfg)`) garde la preuve
+    par couple (base, tête gelée) et par contrat. L'arbre entier de la cible
+    (~71 Mo pour Nexlink) n'est plus extrait aux trois contrôles
+    d'atterrissage : une preuve en cache est relue et revalidée, jamais
+    recalculée pour un autre couple. Sans `cache`, le calcul reste intact."""
     plan = getattr(project, "ci_parts", None)
     if plan is None:
         raise PartsError("project %s declares no ci_parts contract" % project.name)
@@ -230,6 +362,16 @@ def due(project, sha: str, base_sha: str, repo: str) -> dict:
     if not base:
         raise PartsError("the versioned selection source %r is not a commit of %s: the due "
                          "parts cannot be proven" % (base_sha, repo))
+    #: N2 de #1666 : la preuve est une fonction pure du couple (base, tête
+    #: gelée) et du contrat ; l'extraction de l'arbre (~71 Mo pour Nexlink)
+    #: n'est refaite que sur un défaut de cache, jamais aux contrôles
+    #: répétés d'un même couple. Entrée revalidée : jamais servie telle quelle.
+    key = _cache_key(plan, base, frozen) if cache else None
+    if cache:
+        _cache_prune(cache, time.time())
+        hit = _cache_read(cache, key, plan, base, frozen)
+        if hit is not None:
+            return hit
     try:
         parent = merge_base(repo, base, frozen)
         changed = change_set(repo, parent, frozen)
@@ -255,20 +397,38 @@ def due(project, sha: str, base_sha: str, repo: str) -> dict:
             raise PartsError("the ci_parts command uses an unknown placeholder: %s" % exc) from exc
         env = selector_env(root, tmp)
         try:
-            proc = subprocess.run(argv, cwd=root, capture_output=True, timeout=PARTS_TIMEOUT,
-                                  check=False, env=env)
-        except subprocess.TimeoutExpired as exc:
-            raise PartsError("the selector %s timed out after %d s"
-                             % (plan.selector, PARTS_TIMEOUT)) from exc
+            proc = subprocess.Popen(argv, cwd=root, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, env=env,
+                                    start_new_session=True)
         except OSError as exc:
             raise PartsError("the selector %s cannot start (%s: %s)"
                              % (plan.selector, argv[0], exc)) from exc
+        try:
+            out, err = proc.communicate(timeout=PARTS_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            #: N4 de #1666 : le sélecteur et ses petits-enfants, pas seulement
+            #: l'enfant direct.
+            _kill_group(proc)
+            try:
+                proc.wait(timeout=PARTS_REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pass
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            raise PartsError("the selector %s timed out after %d s"
+                             % (plan.selector, PARTS_TIMEOUT))
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()[-300:]
+            tail = (err or out or b"").decode("utf-8", "replace").strip()[-300:]
             raise PartsError("the selector %s failed (exit %d): %s"
                              % (plan.selector, proc.returncode, tail))
         schema, names = _plan_file(result, plan)
-        return {"schema": schema, "due": names, "selector": plan.selector,
-                "base": base, "merge_base": parent, "frozen": frozen}
+        proof = {"schema": schema, "due": names, "selector": plan.selector,
+                 "base": base, "merge_base": parent, "frozen": frozen}
+        if cache:
+            _cache_write(cache, key, proof)
+        return proof
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

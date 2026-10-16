@@ -1117,15 +1117,21 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     (Actions, external app checks and commit statuses), the latest activity
     of each workflow database ID: `{runs,
     green, pending: [workflows], failed: [workflows], contexts: {label:
-    success|pending|failed}}`; green needs at least one check, all concluded
-    and passing. Raises `plan_github.GithubError` when it cannot be read
-    (never taken for « no CI »).
+    success|pending|failed}, statuses: {context: success|pending|failed}}`;
+    green needs at least one check, all concluded and passing. Raises
+    `plan_github.GithubError` when it cannot be read (never taken for
+    « no CI »).
 
     L1651 (#1650): `contexts` carries the same reading label by label, so the
     gate can prove that a part the change set makes due **exists** on the
     frozen commit; a `skipped` run or check is `success` for the rollup (it
     blocks nothing) but `failed` here — a due part that did not run is not a
-    green one."""
+    green one.
+
+    N1 de #1666 : `contexts` mêle les libellés des trois espaces (runs,
+    checks, statuts). Les parts dues d'un projet (`ci_parts`) sont des
+    **statuts de commit** : `statuses` les rend seuls, pour qu'un run ou un
+    check portant le nom d'une part ne puisse pas en tenir lieu."""
     from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
@@ -1236,20 +1242,35 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
             or statuses["total_count"] != len(statuses["statuses"])
             or statuses["total_count"] >= 100):
         raise plan_github.GithubError("commit statuses: malformed, truncated or wrong SHA response")
+    #: N1 de #1666 : les parts dues d'un projet (`ci_parts`) sont des statuts
+    #: de commit ; ce dictionnaire ne retient que cet espace-là, là où
+    #: `contexts` mêle aussi les libellés de runs et de checks.
+    status_contexts: dict = {}
+
+    def note_status(name: str, state: str) -> None:
+        """Même règle que `note` : le plus fort des états d'un même contexte
+        l'emporte — un contexte vert ne rachète pas le même contexte rouge."""
+        if CI_CONTEXT_RANK[state] > CI_CONTEXT_RANK.get(status_contexts.get(name), -1):
+            status_contexts[name] = state
+
     for status in statuses["statuses"]:
         if not isinstance(status, dict) or not status.get("context"):
             raise plan_github.GithubError("commit statuses: invalid context")
         if status.get("state") == "pending":
             pending.append(status["context"])
             note(status["context"], "pending")
+            note_status(status["context"], "pending")
         elif status.get("state") != "success":
             failed.append(status["context"])
             note(status["context"], "failed")
+            note_status(status["context"], "failed")
         else:
             note(status["context"], "success")
+            note_status(status["context"], "success")
     count = len(latest) + len(external) + len(statuses["statuses"])
     return {"runs": count, "green": bool(count) and not pending and not failed,
-            "pending": sorted(pending), "failed": sorted(failed), "contexts": contexts}
+            "pending": sorted(pending), "failed": sorted(failed),
+            "contexts": contexts, "statuses": status_contexts}
 
 
 #: L756 (#566): les déclencheurs d'une exécution de la suite **complète** —
