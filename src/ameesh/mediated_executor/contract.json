@@ -4080,6 +4080,7 @@
     "put"
    ],
    "canon": [
+    "claim_commit",
     "clear_pending_stop",
     "clear_responsible",
     "close_others",
@@ -4120,7 +4121,6 @@
     "failures",
     "finish_guard_scan",
     "for_lot",
-    "guard_runs",
     "head_replaced",
     "latest_concluded",
     "mark_started",
@@ -4130,7 +4130,6 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
-    "queued",
     "queued_oldest",
     "reopen_run",
     "run",
@@ -4301,6 +4300,8 @@
    ],
    "turn_costs": [
     "correct",
+    "first_after",
+    "last_before",
     "ledger",
     "paid_lines",
     "spent_between",

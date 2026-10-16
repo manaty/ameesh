@@ -258,6 +258,20 @@ def recently_modified(path: str | None) -> bool:
         return False
 
 
+def recently_modified(path: str | None) -> bool:
+    """A recently written external journal may still have a live writer.
+
+    Some harnesses close their journal between writes. Wait a quiet minute
+    before adoption or unleased resumption, even when no open fd was found.
+    """
+    if not path:
+        return False
+    try:
+        return time.time() - os.stat(path).st_mtime < 60
+    except FileNotFoundError:
+        return False
+
+
 def session_cwd(harness: str, path: str) -> str | None:
     """Le dossier de travail noté dans le journal de session (Codex :
     `session_meta.payload.cwd` ; Claude : champ `cwd`), ou None."""
@@ -1231,7 +1245,8 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
 
 def _local_session(cfg: Config, row: dict) -> str | None:
     """La session à reprendre, même règle que l'exécuteur (`current_session`) :
-    le registre, sinon le fichier local s'il est postérieur au dernier oubli."""
+    le registre, sinon le fichier local s'il est postérieur au dernier oubli,
+    à la marge de dérive des horloges près (`SESSION_RESET_SKEW_S`, #1898 N4)."""
     if row.get("session_id"):
         return row["session_id"]
     if (row.get("host") or "") != (cfg.host or ""):
@@ -1241,8 +1256,10 @@ def _local_session(cfg: Config, row: dict) -> str | None:
         with open(path, encoding="utf-8") as fh:
             session = fh.read().strip() or None
         reset = row.get("session_reset_ts")
-        if session and reset and os.stat(path).st_mtime <= float(reset):
-            return None
+        if session and reset:
+            from .runner import SESSION_RESET_SKEW_S
+            if os.stat(path).st_mtime <= float(reset) + SESSION_RESET_SKEW_S:
+                return None
         return session
     except OSError:
         return None

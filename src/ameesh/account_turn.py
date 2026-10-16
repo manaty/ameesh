@@ -708,7 +708,8 @@ def _fallback_available(cfg, db, name: str, own: str, limites, *, now: float,
 
 def _is_critical(cfg, db, name: str, row: dict) -> bool:
     """`auditor.is_critical` sans exécuteur (rôles du canon, orchestrateurs
-    déclarés) : rôles illisibles, l'agent est jugé ordinaire."""
+    déclarés). Rôles illisibles : repli critique (#424 r6, fail-closed), comme
+    `auditor.is_critical` et `Runner.is_critical`."""
     from . import auditor as auditor_mod
     from . import sous_utilisation
 
@@ -716,8 +717,8 @@ def _is_critical(cfg, db, name: str, row: dict) -> bool:
         canons = auditor_mod.load_all(cfg, strict=False) if cfg is not None else []
         declared = sous_utilisation.declared_orchestrators()
         return auditor_mod.is_critical(cfg, db, name, canons, declared=declared, agent=row)
-    except Exception:  # noqa: BLE001 - rôles illisibles : le choix ordinaire
-        return False
+    except Exception:  # noqa: BLE001 - rôles illisibles : repli critique (#424 r6)
+        return True
 
 
 def rotate_harness(worker, old_harness: str, new_harness: str, session: str) -> bool:
