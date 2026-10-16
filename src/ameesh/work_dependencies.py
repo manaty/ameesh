@@ -2,6 +2,7 @@
 """L385: explicit prerequisites, service validation and work CLI."""
 from __future__ import annotations
 
+import datetime
 import json
 
 from . import storage, work
@@ -43,6 +44,68 @@ def grouped(db, item_ids):
     for edge in storage.of(db).work_dependencies.for_items(item_ids):
         result.setdefault(int(edge["work_item_id"]), []).append(edge)
     return result
+
+
+# --------------------------------------------------------------------------
+# #1945 : atterrissage planifié sur un véhicule de paquet
+# --------------------------------------------------------------------------
+
+def land(db, item_id, vehicle_id, *, until_on, actor):
+    """Déclare (ou renouvelle) l'atterrissage planifié du lot sur un véhicule.
+
+    Le lot et le véhicule doivent être ouverts et distincts ; l'échéance est
+    une journée ISO, fin de journée incluse. Un simple geste, aucun texte
+    libre : la tête et l'étape sont relues à chaque passe chez le véhicule."""
+    _id(item_id)
+    _id(vehicle_id)
+    if not isinstance(actor, str) or not actor.strip():
+        raise work.WorkError("a landing declaration needs an identified actor")
+    try:
+        day = datetime.date.fromisoformat(str(until_on)[:10]).isoformat()
+    except (TypeError, ValueError, OverflowError):
+        raise work.WorkError("--until expects an ISO day (YYYY-MM-DD)")
+    result = storage.of(db).work_dependencies.set_landing(
+        item_id, vehicle_id, until_on=day, actor=actor)
+    errors = {"self_landing": "a lot cannot land on itself",
+              "unknown_lot": "landing endpoints must be existing lots",
+              "finished_lot": "the landing lot must still be open",
+              "finished_vehicle": "the vehicle must still be open"}
+    if result.get("error"):
+        raise work.WorkError(errors[result["error"]])
+    return result["landed"]
+
+
+def clear_landing(db, item_id, *, actor):
+    """Retire la déclaration d'atterrissage (rend le signal stale)."""
+    _id(item_id)
+    return storage.of(db).work_dependencies.clear_landing(item_id, actor=actor)
+
+
+def landings(db, item_ids):
+    """`{lot: ligne}` des atterrissages déclarés (lecture groupée)."""
+    return {int(row["work_item_id"]): row
+            for row in storage.of(db).work_dependencies.landings_for(item_ids)}
+
+
+def landing_head(db, vehicle_id):
+    """Dernier gel du véhicule (sha), ou None : la tête exacte, lue en base."""
+    rows = storage.of(db).progress.lot_milestones([int(vehicle_id)])
+    freezes = [r for r in rows if r.get("kind") == "frozen"
+               and (r.get("sha") or "").strip()]
+    freezes.sort(key=lambda r: r.get("at_ts") or 0)
+    return freezes[-1]["sha"].strip() if freezes else None
+
+
+def landing_label(landing, head=None):
+    """Libellé d'une attente d'atterrissage : véhicule, étape, tête, échéance."""
+    label = "landing on vehicle #%d" % int(landing["vehicle"])
+    step = landing.get("step")
+    if step or head:
+        details = [d for d in (step, "head %s" % head[:12] if head else None) if d]
+        label += " (%s)" % ", ".join(details)
+    if landing.get("until"):
+        label += " until %s" % landing["until"]
+    return label
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +233,8 @@ def wait_label(wait):
         return "planned start %s" % wait["start"]
     if wait["what"] == "hold":
         return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
+    if wait["what"] == "landing":
+        return landing_label(wait, wait.get("head"))
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 
@@ -206,4 +271,46 @@ def run(db, args):
                 "blocking" if edge["blocking"] else "satisfied"))
         if not edges:
             print("lot #%d: no explicit prerequisites" % args.id)
+    return 0
+
+
+def add_landing_parser(sub, func):
+    parser = sub.add_parser(
+        "landing", help="#1945: declare (or clear) the planned landing on a package vehicle")
+    parser.add_argument("id", type=int, help="landing lot (done, waiting for the vehicle)")
+    parser.add_argument("--vehicle", type=int, metavar="LOT",
+                        help="open lot that carries the composition (the vehicle)")
+    parser.add_argument("--until", metavar="YYYY-MM-DD",
+                        help="finite deadline: the alert returns after that day")
+    parser.add_argument("--clear", action="store_true", help="withdraw the declaration")
+    parser.add_argument("--actor", default="")
+    parser.add_argument("--json", action="store_true")
+    parser.set_defaults(func=func)
+
+
+def run_landing(db, args):
+    _id(args.id)
+    if work.get(db, args.id) is None:
+        raise work.WorkError("lot #%d not found" % args.id)
+    changed = None
+    if args.clear:
+        changed = clear_landing(db, args.id, actor=args.actor)
+    else:
+        if args.vehicle is None or not args.until:
+            raise work.WorkError("a landing declaration needs --vehicle and --until "
+                                 "(or --clear)")
+        changed = land(db, args.id, args.vehicle, until_on=args.until, actor=args.actor)
+    row = landings(db, [args.id]).get(args.id)
+    if args.json:
+        print(json.dumps({"id": args.id, "changed": changed, "landing": row},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if changed is not None:
+        print("lot #%d: landing %s" % (args.id, "updated" if changed else "unchanged"))
+    if row:
+        wait = {"what": "landing", "vehicle": int(row["vehicle_id"]),
+                "step": row.get("vehicle_state"), "until": row.get("until_on")}
+        print("#%d: %s" % (args.id, landing_label(wait, landing_head(db, int(row["vehicle_id"])))))
+    else:
+        print("lot #%d: no planned landing" % args.id)
     return 0

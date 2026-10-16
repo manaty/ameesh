@@ -30,6 +30,30 @@ class WorkDependencies(abc.ABC):
         """
 
     @abc.abstractmethod
+    def set_landing(self, item_id: int, vehicle_id: int, *, until_on: str, actor: str) -> dict:
+        """Declare (or renew) a planned landing: an open vehicle, a finite day.
+
+        Both lots must exist and be open, and the vehicle must differ from the
+        lot. Repeating the gesture replaces the previous declaration and
+        journals once. Returns `landed`, or `error` (`unknown_lot`,
+        `finished_lot`, `finished_vehicle`).
+        """
+
+    @abc.abstractmethod
+    def clear_landing(self, item_id: int, *, actor: str) -> bool:
+        """Withdraw the declaration and journal once; False when there is none."""
+
+    @abc.abstractmethod
+    def landings_for(self, item_ids: Sequence[int]) -> list[dict]:
+        """Declared landings of these lots, with the vehicle's current state.
+
+        One row per declared lot: `work_item_id`, `vehicle_id`, `until_on`
+        (ISO day), `created_by`, `created_ts`, `vehicle_state`, `open` (the
+        vehicle is not merged/promoted/closed). The head is not stored: the
+        caller reads the vehicle's last freeze.
+        """
+
+    @abc.abstractmethod
     def release_unassigned(self, item_ids: Sequence[int], *, actor: str) -> list[int]:
         """Return still-unassigned blocked candidates to intake and journal them.
 

@@ -78,6 +78,65 @@ class WorkDependencies(Contract):
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
 
+    @staticmethod
+    def _landing_journal(tx, item_id, note, actor):
+        tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
+                   " SELECT id, state, %s, %s, clock_timestamp() FROM work_items WHERE id = %s",
+                   (note, actor, item_id))
+        tx.execute("UPDATE work_items SET updated_at = clock_timestamp() WHERE id = %s", (item_id,))
+
+    def set_landing(self, item_id, vehicle_id, *, until_on, actor):
+        if item_id == vehicle_id:
+            return {"error": "self_landing"}
+        with self.db.transaction() as tx:
+            self.lock()                       # même verrou que le graphe de dépendances
+            rows = tx.query("SELECT id, state FROM work_items WHERE id IN (%s, %s)"
+                            " ORDER BY id FOR UPDATE", (item_id, vehicle_id))
+            states = {int(row["id"]): row["state"] for row in rows}
+            if item_id not in states or vehicle_id not in states:
+                return {"error": "unknown_lot"}
+            if states[item_id] in _DONE:
+                return {"error": "finished_lot"}
+            if states[vehicle_id] in _DONE:
+                return {"error": "finished_vehicle"}
+            tx.execute("""
+                INSERT INTO work_landings(work_item_id, vehicle_id, until_on, created_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (work_item_id) DO UPDATE
+                    SET vehicle_id = EXCLUDED.vehicle_id,
+                        until_on = EXCLUDED.until_on,
+                        created_by = EXCLUDED.created_by,
+                        created_at = clock_timestamp()
+                """, (item_id, vehicle_id, until_on, actor))
+            self._landing_journal(
+                tx, item_id, "Landing declared: vehicle #%d until %s" % (vehicle_id, until_on), actor)
+            return {"landed": True}
+
+    def clear_landing(self, item_id, *, actor):
+        with self.db.transaction() as tx:
+            self.lock()
+            removed = tx.query("DELETE FROM work_landings WHERE work_item_id = %s"
+                               " RETURNING vehicle_id", (item_id,))
+            if not removed:
+                return False
+            self._landing_journal(
+                tx, item_id, "Landing cleared: vehicle #%d" % int(removed[0]["vehicle_id"]), actor)
+            return True
+
+    def landings_for(self, item_ids):
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return []
+        return self.db.query("""
+            SELECT l.work_item_id, l.vehicle_id, l.until_on::text AS until_on,
+                   l.created_by,
+                   extract(epoch FROM l.created_at)::float8 AS created_ts,
+                   w.state AS vehicle_state,
+                   w.state NOT IN ('merged', 'promoted', 'closed') AS open
+            FROM work_landings l JOIN work_items w ON w.id = l.vehicle_id
+            WHERE l.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
+            " ORDER BY l.work_item_id", tuple(ids))
+
     def release_unassigned(self, item_ids, *, actor):
         """#1668 : un dépendant NON ASSIGNÉ dont la dernière attente vient de
         tomber repasse `blocked` → `intake` dans la transaction de fermeture.
