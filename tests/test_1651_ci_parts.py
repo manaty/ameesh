@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import signal
 import sys
 import unittest
 from unittest import mock
@@ -219,6 +220,17 @@ class ContractTest(_Contract):
         with self.assertRaisesRegex(ci_parts.PartsError, "failed \\(exit 1\\)"):
             ci_parts.due(self.project, tip, self.base(), self.repo)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX signal return codes")
+    def test_a_selector_terminated_by_signal_refuses(self):
+        """A runtime crash must remain a failure, never an empty valid plan."""
+        _write(self.repo, "scripts/ci/lot-plan.py",
+               selector("os.kill(os.getpid(), %d)" % signal.SIGTERM))
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        with self.assertRaisesRegex(ci_parts.PartsError, r"failed \(exit -%d\)" % signal.SIGTERM):
+            ci_parts.due(self.project, tip, self.base(), self.repo)
+
     def test_a_malformed_or_unknown_plan_refuses(self):
         branch = self.lot_touching("backend")
         tip = _git(self.repo, "rev-parse", branch)
@@ -255,10 +267,14 @@ class ContractTest(_Contract):
     def test_the_selector_runs_without_the_host_environment(self):
         """Le sélecteur vient du dépôt : il ne voit pas les jetons ni les DSN
         de l'hôte qui exécute la porte."""
-        with mock.patch.dict(os.environ, {"AMEESH_SENTINEL": "secret", "GH_TOKEN": "t"}):
+        with mock.patch.dict(os.environ, {"AMEESH_SENTINEL": "secret", "GH_TOKEN": "t",
+                                          "LD_LIBRARY_PATH": "/runtime/lib",
+                                          "LD_PRELOAD": "/private/injected.so"}):
             env = ci_parts.selector_env("/root", "/home")
         self.assertNotIn("AMEESH_SENTINEL", env)
         self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("LD_PRELOAD", env)
+        self.assertEqual(env["LD_LIBRARY_PATH"], "/runtime/lib")
         self.assertEqual(env["GITHUB_WORKSPACE"], "/root")
         self.assertEqual(env["HOME"], "/home")
         self.assertIn("PATH", env)
