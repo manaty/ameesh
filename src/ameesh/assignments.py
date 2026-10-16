@@ -63,7 +63,12 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
     ajoute les agents de conception). `history=False` (#740) : les lots confiés
     ne comptent pas, seule une déclaration compte."""
     from .agent_names import resolve as resolve_agent_name
-    name = resolve_agent_name(name, db=db, operation="assignments.is_orchestrator")
+    try:
+        name = resolve_agent_name(name, db=db, operation="assignments.is_orchestrator")
+    except Exception:
+        # Registre indisponible (base hors service, doublure de test #424) :
+        # on garde l'orthographe reçue, comme avant la résolution d'alias.
+        pass
     from . import sous_utilisation as su
 
     declared = {resolve_agent_name(su._bare(n), db=db, operation="authority.orchestrator")
