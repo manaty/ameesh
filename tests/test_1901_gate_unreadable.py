@@ -67,6 +67,20 @@ class RegistreLocalTest(unittest.TestCase):
         self.assertEqual([a["type"] for a in alerts], ["host_unavailable"])
         self.assertEqual(out, [])
 
+    def test_repertoire_inaccessible_n_est_pas_un_registre_absent(self):
+        self.ecrire("{ tronqué")
+        parent = os.path.dirname(self.path)
+        os.chmod(parent, 0)
+        try:
+            if os.access(parent, os.X_OK):
+                self.skipTest("compte privilégié : permissions non opposables")
+            out = []
+            self.assertEqual(exploitation._gate_alerts(
+                self.cfg, [], 1000.0, unreadable=out), [])
+            self.assertEqual(out, [availability.GATE_FAMILY])
+        finally:
+            os.chmod(parent, 0o700)
+
     def test_gate_alerts_avale_l_erreur_et_nomme_la_famille(self):
         out = []
         with mock.patch.object(availability, "local_alerts", side_effect=OSError("registre")):
@@ -154,11 +168,19 @@ class PasseIncompleteTest(PgTestCase):
     def entry(self, n):
         return list(n.state["active"].values())
 
+    def test_etat_anterieur_sans_hote_ne_resout_pas_la_porte_illisible(self):
+        self._porte_illisible(legacy=True)
+
     def test_porte_illisible_ne_resout_pas_et_ne_renotifie_pas(self):
+        self._porte_illisible()
+
+    def _porte_illisible(self, legacy=False):
         self.ecrire_registre(self.indisponible())
         n = self.notifier()
         n.run_pass(self.db)
         alerte = self.entry(n)[0]["alert"]
+        if legacy:
+            alerte.pop("observation_host", None)
         self.assertEqual(alerte["type"], "host_unavailable")
         self.assertEqual(len(self.sent), 1)
         key = alert_ack.key_of(alerte)

@@ -248,7 +248,9 @@ def local_alerts(cfg, listing: list[dict], now: float | None = None,
     pour autant — c'est une famille non observée, et `GATE_FAMILY` est ajouté
     à `unreadable` quand une liste est fournie."""
     path = default_path(cfg)
-    if not os.path.exists(path):
+    try:
+        os.stat(path)
+    except FileNotFoundError:
         return []
     registre = FileRegistry(path)
     rows = registre.rows()

@@ -1051,6 +1051,7 @@ class Notifier:
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
                  ) -> list:
         from . import alert_ack
+        from .mediated_executor import availability
         observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         now = float(self.clock())
         #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
@@ -1118,9 +1119,12 @@ class Notifier:
                 # preuve de résolution.
                 continue
             observer = entry["alert"].get("observation_host")
-            if unreadable and observer is not None and observer == getattr(self.cfg, "host", None):
+            if (availability.GATE_FAMILY in unreadable
+                    and entry["alert"].get("type") in availability.ALERT_TYPES
+                    and observer in (None, getattr(self.cfg, "host", None))):
                 # #1901 : la famille « porte d'hôte » n'a pas été lue par cette
                 # passe ; ni résolution ni acquittement invalidé sur une absence.
+                # L'état antérieur à #1901 ne gardait pas observation_host.
                 continue
             del active[key]
             if self._acknowledged(entry, acknowledgements):
