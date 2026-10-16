@@ -1529,9 +1529,7 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     pinned = _pinned_ref(item)
     if pinned:
         # #1922 : la fermeture d'un lot sous workflow passe par le registre.
-        raise WorkError(
-            "lot %s is pinned to workflow %s: closing goes through "
-            "process_registry" % (item_id, pinned))
+        raise _pinned_close_error(item_id, pinned)
     if superseded_by is not None:
         if int(superseded_by) == int(item_id):
             raise WorkError("a lot cannot supersede itself")
@@ -1562,6 +1560,11 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     for record in threads:
         record(db.cfg, db)
     if row is None:
+        # #1922/N14 : le refus peut venir d'une adoption concurrente, que le
+        # filtre SQL a interceptée (N8) ; nommer la retenue, pas l'état.
+        pinned = _adopted_ref(db, item_id)
+        if pinned:
+            raise _pinned_close_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
 
@@ -1587,6 +1590,31 @@ def _pinned_ref(item: dict) -> str:
     `workflow_ref` absent d'un élément.
     """
     return str(item.get("workflow_ref") or "")
+
+
+def _pinned_transition_error(item_id: int, pinned: str) -> WorkError:
+    """Le refus explicite d'un `move` historique sur un lot pinné (#1922)."""
+    return WorkError(
+        "lot %s is pinned to workflow %s: transitions go through "
+        "process_registry" % (item_id, pinned))
+
+
+def _pinned_close_error(item_id: int, pinned: str) -> WorkError:
+    """Le refus explicite d'une fermeture historique sur un lot pinné (#1922)."""
+    return WorkError(
+        "lot %s is pinned to workflow %s: closing goes through "
+        "process_registry" % (item_id, pinned))
+
+
+def _adopted_ref(db: Db, item_id: int) -> str:
+    """La révision Process qui a adopté le lot entre la lecture et l'écriture.
+
+    #1922/N14 : la garde applicative lit `workflow_ref` hors du verrou du lot ;
+    le filtre SQL refuse ensuite l'écriture (N8). Relire ici rend le refus
+    explicite du lot pinné, au lieu d'un « moved in the meantime » générique
+    qui ferait réessayer une écriture réservée au registre.
+    """
+    return _pinned_ref(get(db, item_id) or {})
 
 
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
@@ -1632,9 +1660,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         # #1922 : un lot pinné sur une révision Process ne bouge que par le
         # registre (process_registry), qui vérifie la garde côté serveur et
         # écrit le reçu dans la même transaction.
-        raise WorkError(
-            "lot %s is pinned to workflow %s: transitions go through "
-            "process_registry" % (item_id, pinned))
+        raise _pinned_transition_error(item_id, pinned)
     current = item["state"]
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
@@ -1656,6 +1682,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         row = storage.of(db).work.move(item_id, state, current=current, loops=0, note=text,
                                        actor=actor)
         if row is None:
+            # #1922/N14 : adoption concurrente (workflow_ref) ou état changé.
+            pinned = _adopted_ref(db, item_id)
+            if pinned:
+                raise _pinned_transition_error(item_id, pinned)
             raise WorkError("lot %s moved in the meantime: retry" % item_id)
         return row
     if state not in TRANSITIONS[current]:
@@ -1684,6 +1714,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile
             raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
+        # #1922/N14 : adoption concurrente (workflow_ref) ou état changé.
+        pinned = _adopted_ref(db, item_id)
+        if pinned:
+            raise _pinned_transition_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     if reviewer:
         # #705 : la désignation est un geste distinct (journalisé), fait dans la

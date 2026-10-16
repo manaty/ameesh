@@ -362,9 +362,14 @@ class Operations(interface.Operations):
         # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
         reviewer = ("w.reviewer" if has_reviewer(self.db)
                     else "''::text AS reviewer")
+        # #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
+        # `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
+        # migration. `released_by` en écarte les dépendants pinnés, dont la
+        # retenue ne tombe que par une commande `release` du registre.
         sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, __REVIEWER__,
+                   coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(

@@ -16,9 +16,10 @@
 # pilote (connexion persistante, notifications, nombre d'allers-retours).
 #
 # Liste additive (L160a) : un module par ligne, sa raison en commentaire sur la
-# même ligne, ordre alphabétique, sans doublon (scripts/test-parts.py refuse
-# une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
-# deux endroits différents du fichier, sans conflit.
+# même ligne, ordre alphabétique, sans doublon ; la lecture range et
+# dédoublonne ce qu'une fusion `union` produit (un nom inconnu reste refusé).
+# Deux lots qui ajoutent chacun un module touchent ainsi deux endroits
+# différents du fichier, sans conflit.
 
 test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
@@ -54,6 +55,9 @@ test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS 
 test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
 test_l165c_sessions_par_lot  # stockage : sessions mises de côté par (agent, lot), bascule fencée par le bail, lots actionnables, réveils (L165b, #408)
 test_l232a_handoffs  # storage: physical reservations, controller locks, claim fence, CAS journal and recovery (L232a)
+test_l232b_bootstrap  # owner-signed bootstrap scopes, original approval expiry and account digest binding (L232b)
+test_l232b_migration_worker  # database-wide migration election, atomic inventory and additive release guard (L232b)
+test_l232b_release_fence  # signed release closure, racing claim/turn writers, draining and durable receipt replay (L232b)
 test_l232e_drain_handoffs  # storage: lifecycle generation checks, drain/return handoffs and readiness (L232e)
 test_l232e_host_lifecycle  # storage: persistent withdrawal, stale-host detection and concurrent gate/claim guards (L232e)
 test_l232e_loss_recovery  # storage: scoped recovery proof, expired lease fencing and source loss thresholds (L232e)

@@ -22,6 +22,15 @@ from .vm_recipe import command
 
 
 NAME = "ameesh-vm-executor"
+#: #1916 : après un lancement, une porte périmée n'arrête plus la supervision
+#: sur-le-champ. Le conteneur est arrêté (arrêt observé) et le garde dispose
+#: de cette fenêtre pour renouveler son battement : une porte fraîche revenue
+#: dans le délai relance l'exécuteur sans opérateur, et aucun lancement n'a
+#: lieu tant que la porte reste périmée. Passé le délai, la supervision
+#: s'arrête comme avant (sortie 0) : une garde durablement absente doit
+#: rester visible, unité inactive. Le délai reprend l'ordre de grandeur du
+#: `restart_after_seconds` par défaut du garde (600 s).
+STALE_RESUME_MAX_S = 600.0
 #: #1781 N3 : `shutil.rmtree(dir_fd=)` n'existe qu'à partir de Python 3.11,
 #: alors que `pyproject.toml` déclare 3.9. Sur 3.9/3.10, l'effacement de
 #: révocation (code 6) lèverait une TypeError après le lancement et le volume
@@ -129,13 +138,29 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
         state_path = str(Path(recipe["state_dir"]) / "state.json")
         ack_path = str(Path(recipe["ack_dir"]) / "ack.json")
         launched = False
+        #: #1916 : premier instant de la porte périmée en cours, après un
+        #: lancement. Remis à zéro dès que la porte redevient lisible (fraîche)
+        #: ou `stopped` : le garde est alors revenu.
+        stale_since = None
         while not stop.is_set():
             # A dead guard ends supervision once we have run, including
-            # between two windows. Before the first launch a stale gate only
-            # waits: at boot the guard may not have renewed its heartbeat yet.
-            gate = gate_state(state_path, now())
-            if gate == "stale" and launched:
+            # between two windows — but only after a bounded window lets a
+            # guard that restarts renew its heartbeat (#1916): the container
+            # was already stopped and observed, and a fresh gate found in the
+            # window resumes supervision with no operator. Before the first
+            # launch a stale gate only waits: at boot the guard may not have
+            # renewed a heartbeat left expired by the reboot.
+            # A late heartbeat must not reopen an already expired window.
+            if stale_since is not None and now() - stale_since >= STALE_RESUME_MAX_S:
                 return 0
+            gate = gate_state(state_path, now())
+            if gate != "stale":
+                stale_since = None
+            elif launched:
+                if stale_since is None:
+                    stale_since = now()
+                stop.wait(1)
+                continue
             if gate != "available":
                 stop.wait(1)
                 continue
@@ -146,9 +171,10 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
             except FileNotFoundError:
                 pass
             process = None
-            # Why the container was stopped: "exit" (signal or stale gate,
-            # this supervisor ends) or "wait" (a fresh guard said `stopped`,
-            # or its window ended: wait for the next `available`).
+            # Why the container was stopped: "exit" (signal, this supervisor
+            # ends) or "wait" (a fresh guard said `stopped`, its window ended,
+            # or the gate went stale: wait for the next `available`, bounded
+            # by STALE_RESUME_MAX_S after a stale gate, #1916).
             stopping = None
             try:
                 process = launch(argv)
@@ -161,7 +187,7 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
                         remove_code(fds["enroll_dir"])
                     gate = gate_state(state_path, now())
                     if stop.is_set() or gate in ("stopped", "stale"):
-                        stopping = "wait" if gate == "stopped" and not stop.is_set() else "exit"
+                        stopping = "exit" if stop.is_set() else "wait"
                         result = run(["podman", "stop", "--ignore", "--time=100", NAME],
                                      timeout=110, check=False)
                         if result.returncode:
