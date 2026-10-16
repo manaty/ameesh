@@ -408,6 +408,25 @@ l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
 
+## Intégration par paquets §12 : contrôle d'inclusion avant le feu
+
+Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
+lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
+et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
+à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+
+```sh
+scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
+    --head origin/integration/paquet-23h-20261015 \
+    --expected-file "$TMPDIR/admissions-23h.txt"
+```
+
+Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
+composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
+ne suffit pas après un revert (#1638). Un contenu *partiel* est listé « à
+lire » (union, adaptation) ; `--strict` le rend bloquant. Détail, format de la
+liste attendue et validation sur le paquet 11h : `docs/PAQUET-INCLUSION.md`.
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot
