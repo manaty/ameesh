@@ -521,11 +521,13 @@ schema, so the set can only be the pre-migration image of the migrated database.
 psycopg) the recovery set refuses at construction with the named
 `LibpqParserUnavailable`, so admission stays fail-closed instead of accepting an
 unverified target. The enrolled `dsn` and the release connection's DSN are
-compared after libpq resolution: the effective `host`, `hostaddr`, `port` and
-`dbname` (each falling back to `PGHOST`, `PGHOSTADDR` and `PGPORT`) must be
-textually equal. The backup may therefore carry its own credentials, but not
-another spelling of the same server (`127.0.0.1` for `localhost`, an omitted
-host on one side, a different host case); `service`/`PGSERVICE` is refused.
+compared after libpq parsing: the effective `host`, `hostaddr`, `port` and
+`dbname` must be textually equal. Absent network fields fall back respectively
+to `PGHOST`, `PGHOSTADDR` and `PGPORT` (then empty host/hostaddr and port `5432`);
+`dbname` must be supplied in the DSN. The backup may therefore carry its own
+credentials, but not another spelling of the same server (`127.0.0.1` for
+`localhost`, a different host case). An omitted host can match an explicit host
+when `PGHOST` supplies that same value; `service`/`PGSERVICE` is refused.
 `backup` publishes the dump and its pinned row inventory in the private
 retention root, proves an isolated
 restore against that inventory, proves a configured remote copy can be
