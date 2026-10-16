@@ -1113,6 +1113,82 @@ class ImportGraphTest(unittest.TestCase):
                 self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                  {"src/ameesh/db.py"}, why)
 
+    def test_assigned_exit_aliases_and_star_imports_stop_proofs(self):
+        # #1860 : un alias de sortie par affectation (`e = sys.exit ; e()`) et
+        # `_exit()` après `from os import *` terminent aussi l'import : les
+        # imports suivants restent des arêtes possibles, jamais des preuves.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "sys.exit affecté": "import sys\n"
+                                "e = sys.exit\n"
+                                "e(1)\n"
+                                "import ameesh.db\n",
+            "os._exit affecté": "import os as o\n"
+                                "e = o._exit\n"
+                                "e(1)\n"
+                                "import ameesh.db\n",
+            "exit importé affecté": "from sys import exit as bye\n"
+                                    "e = bye\n"
+                                    "e(1)\n"
+                                    "import ameesh.db\n",
+            "quit builtin affecté": "q = quit\n"
+                                    "q()\n"
+                                    "import ameesh.db\n",
+            "chaîne d'alias": "import sys\n"
+                              "e = sys.exit\n"
+                              "f = e\n"
+                              "f(1)\n"
+                              "import ameesh.db\n",
+            "affectation multiple": "import sys\n"
+                                    "e = f = sys.exit\n"
+                                    "f(1)\n"
+                                    "import ameesh.db\n",
+            "cible multiple lisible": "import sys\n"
+                                      "e, f = sys.exit, print\n"
+                                      "e(1)\n"
+                                      "import ameesh.db\n",
+            "affectation gardée": "import sys\n"
+                                  "if callable(sys):\n"
+                                  "    e = sys.exit\n"
+                                  "e(1)\n"
+                                  "import ameesh.db\n",
+            "affectation différée": "import sys\n"
+                                    "def quit_now():\n"
+                                    "    global e\n"
+                                    "    e = sys.exit\n"
+                                    "quit_now()\n"
+                                    "e(1)\n"
+                                    "import ameesh.db\n",
+            "from os import *": "from os import *\n"
+                                "_exit(1)\n"
+                                "import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # une affectation qui ne porte pas de sortie ne coupe aucune preuve
+        kept = {
+            "appel ordinaire": "e = print\n"
+                               "e('x')\n"
+                               "import ameesh.db\n",
+            "lambda ordinaire": "e = lambda: 0\n"
+                                "e()\n"
+                                "import ameesh.db\n",
+            "cible multiple ordinaire": "e, f = 1, 2\n"
+                                        "e()\n"
+                                        "import ameesh.db\n",
+            "nom affecté jamais appelé": "import sys\n"
+                                         "e = sys.exit\n"
+                                         "import ameesh.db\n",
+        }
+        for why, source in kept.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known, why)
+
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
         # prouve pas que `ameesh/db.py` est chargé — le paquet peut lier le nom
