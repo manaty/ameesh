@@ -1250,11 +1250,25 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
-                  actor: str, source: str = "", frozen_id: int | None = None) -> dict | None:
+                  actor: str, source: str = "", frozen_id: int | None = None,
+                  packet: dict | None = None, packet_initial: bool = False,
+                  lease: tuple | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
-        lot is no longer open."""
+        lot is no longer open. `packet` (#1467) is the expected QA item
+        snapshot (app, branch, branch_target, type, resolved_target): create only, with a real
+        expected freeze. A replay returns its same queued generation; an
+        existing different entry, withdrawal, or changed snapshot refuses.
+        Packet allocation/withdrawal receipts survive in typed train storage,
+        separate from free-text work notes (including legacy receipt notes);
+        they never certify historical reviews or CI. These adapter write
+        paths do not isolate receipts from a trusted role's arbitrary SQL.
+        A first insertion also needs `packet_initial=True` from the caller's qualified history
+        provider: absence of a queue row cannot prove never-withdrawn for
+        historical lots. It cannot override a recorded withdrawal.
+        `lease` (#1467): optional `(target key, owner, epoch)`, locked after
+        the lot and checked live before allocation/replay, in this transaction."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
@@ -1278,7 +1292,10 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
-        """L160e (0058): takes the lot out of the queue, with a journal line."""
+        """L160e (0058): takes the lot out of the queue, with a journal line.
+        Locks the lot before its queue row and records a typed `removed`
+        receipt for the deleted row's freeze in the same transaction.
+        A free-text journal note cannot write this receipt."""
 
     @abc.abstractmethod
     def land_lock(self, key: str, owner: str, ttl_s: float, *,
@@ -1291,6 +1308,45 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
         """L160e2 (0058): frees the lease, if still held at that epoch."""
+
+    @abc.abstractmethod
+    def train_read(self, key: str) -> dict | None:
+        """#1467: durable train document and its revision, or None."""
+
+    @abc.abstractmethod
+    def train_save(self, key: str, document: dict, *, revision: int,
+                   owner: str, epoch: int) -> dict | None:
+        """#1467: compare-and-swap train state under the existing land lease.
+
+        revision=0 creates it. Every write locks and then rechecks the lease
+        against wall time, and compares the previous document revision.
+        A stale holder cannot overwrite a newer train. No remote API grant.
+        """
+
+    @abc.abstractmethod
+    def train_fire_read(self, key: str, plan_id: str) -> dict | None:
+        """#1467: latest persisted fire receipt, including withdrawn history."""
+
+    @abc.abstractmethod
+    def train_fire_give(self, key: str, document: dict) -> dict | None:
+        """#1467: append a fire for the current exact persisted plan.
+
+        Locks the target; refuses replacement of an active/claimed fire.
+        Caller authenticates the pilot on a declared role, never history.
+        """
+
+    @abc.abstractmethod
+    def train_fire_change(self, key: str, fire_id: int, state: str, *, actor: str,
+                          owner: str | None = None, epoch: int | None = None) -> dict | None:
+        """#1467: serialized revoke, promotion claim, or completion.
+
+        Claim requires the live train lease and persisted promotion intent.
+        It commits BEFORE any external effect; an uncertain claim never
+        becomes revocable or active again automatically. Completion requires
+        a live holder; a restarted holder first observes the exact remote
+        head in business code. A failed transition returns None.
+        No mediated operation or authority is granted by this interface.
+        """
 
     @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
@@ -1332,8 +1388,8 @@ class WorkItems(Domain):
         """Un lot, ou None."""
 
     @abc.abstractmethod
-    def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
-        """Lots, du plus récemment modifié au plus ancien."""
+    def items(self, *, state: str | None, assignee: str | None, limit: int | None) -> list[dict]:
+        """Lots, du plus récemment modifié au plus ancien ; None sans limite."""
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
@@ -1369,8 +1425,11 @@ class WorkItems(Domain):
         state was set without a journal line)."""
 
     @abc.abstractmethod
-    def note(self, item_id: int, state: str, text: str, actor: str) -> None:
-        """Journalise une note et rafraîchit `updated_at`."""
+    def note(self, item_id: int, state: str, text: str, actor: str, *, once: bool = False) -> None:
+        """Journalise une note et rafraîchit `updated_at`.
+
+        `once` sérialise sur le lot et n'insère pas un texte déjà présent.
+        """
 
     @abc.abstractmethod
     def lock_deep_analysis(self, item_id: int) -> None:
@@ -1455,7 +1514,7 @@ class WorkItems(Domain):
         """Délégations rendues au délégant depuis `since_ts`."""
 
     @abc.abstractmethod
-    def events(self, item_id: int, limit: int) -> list[dict]:
+    def events(self, item_id: int, limit: int | None) -> list[dict]:
         """Journal du lot, du plus récent au plus ancien."""
 
     @abc.abstractmethod
@@ -1464,8 +1523,9 @@ class WorkItems(Domain):
         `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
 
     @abc.abstractmethod
-    def milestones(self, item_id: int, limit: int) -> list[dict]:
-        """Les jalons d'un lot (0013), du plus récent au plus ancien."""
+    def milestones(self, item_id: int, limit: int | None) -> list[dict]:
+        """Les jalons d'un lot (0013), du plus récent au plus ancien.
+        `None` lit tout l'historique, notamment les anciens blocages du train."""
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
