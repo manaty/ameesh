@@ -49,7 +49,7 @@ from .canon import FETCH_TIMEOUT, GitError
 
 STATES = ("queued", "landing", "landed", "ejected")
 #: pair states where the conflict between two queued lots is not covered
-UNPREPARED = ("conflict", "stale", "error")
+UNPREPARED = ("conflict", "stale", "error", "unclassified")
 #: lot branches fetched into the radar's clone for `readiness`
 QUEUE_REF = "refs/ameesh/queue/"
 #: a milestone names its commit by its id: a ref or a revision expression

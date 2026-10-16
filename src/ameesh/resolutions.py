@@ -787,7 +787,8 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
     replays = getattr(cache, "replays", None) if cache is not None else None
     sizes = {} if sizes is None else sizes
     replays = {} if replays is None else replays
-    conflicted = [p for p in report.get("pairs") or () if p["state"] == "conflict"]
+    conflicted = [p for p in report.get("pairs") or ()
+                  if p["state"] in ("conflict", "target-conflict", "unclassified", "superseded")]
     found = [latest[frozenset(p["lots"])] for p in conflicted if frozenset(p["lots"]) in latest]
     missing: list[str] = []
     if found and replayer is not None:
@@ -800,7 +801,7 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
     for p in conflicted:
         one, two = (dict(branches.get(n) or {"work_item": n}, **{
             k: (lots.get(n) or {}).get(k) for k in ("priority", "state")}) for n in p["lots"])
-        if one.get("base") and two.get("base"):
+        if one.get("base") and two.get("base") and not p.get("attribution_pending"):
             p["resolver"] = choose_resolver(one, two, p["files"], repo=report.get("repo"),
                                             sizes=sizes)
         row = latest.get(frozenset(p["lots"]))
@@ -823,7 +824,8 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
         result = replays[key]
         resolution["replay"] = result["state"]
         resolution["remaining"] = result.get("remaining") or []
-        if result["state"] in ("prepared", "stale"):
+        if (p["state"] == "conflict" and result["state"] in ("prepared", "stale")
+                and (result["state"] == "prepared" or not p.get("attribution_pending"))):
             p["state"] = result["state"]
 
 
