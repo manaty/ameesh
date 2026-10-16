@@ -92,23 +92,40 @@ state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
 assert args[0] == '--user', args
 unit = args[-1]
+name = unit.split('@')[1].removesuffix('.service')
 with (state / 'systemctl.log').open('a') as f:
     f.write(' '.join(args) + '\n')
-if 'restart' in args:
-    name = unit.split('@')[1].removesuffix('.service')
-    (state / ('restart-' + name)).touch()
+def stopped():
+    return (state / ('stopped-' + name)).exists()
+def reload_epoch():
     # un runner redémarré reprend son bail à une époque supérieure
     epoch = state / ('lease-epoch-' + name)
     epoch.write_text(str(int(epoch.read_text()) + 2 if epoch.exists() else 9))
+if 'stop' in args:
+    # #1152 : l'arrêt prouvé précède tout nouveau démarrage.
+    (state / ('stopped-' + name)).touch()
+elif 'start' in args:
+    (state / ('stopped-' + name)).unlink(missing_ok=True)
+    (state / ('restart-' + name)).touch()
+    reload_epoch()
+elif 'restart' in args:
+    # Ancien chemin gardé visible pour les assertions qui l'interdisent.
+    (state / ('restart-' + name)).touch()
+    reload_epoch()
 elif 'show' in args:
-    if 'MainPID' in args:
-        print('123')
+    if 'ActiveState' in args:
+        print('inactive' if stopped() else 'active')
+    elif 'MainPID' in args:
+        print('0' if stopped() else '123')
     else:
         print('{ path=/bin/runner ; argv[]=/bin/runner run --runner-id '
-              'runner-' + unit.split('@')[1].removesuffix('.service') + '@host-agents ; }')
+              'runner-' + name + '@host-agents ; }')
 elif 'is-active' in args:
-    # le marqueur ne vise que l'unité du runner : les autres restent actives
-    if (state / 'unit-inactive').exists() and 'ameesh-runner' in unit:
+    # #1152 : l'état suit l'arrêt prouvé (`stop`) ; le marqueur
+    # `unit-inactive` (#1633) dit une unité déjà arrêtée avant tout geste,
+    # pour la seule unité du runner : les autres (`ameesh-notify`) restent
+    # actives.
+    if stopped() or ((state / 'unit-inactive').exists() and 'ameesh-runner' in unit):
         sys.exit(3)
     print('active')
 '''
@@ -403,8 +420,10 @@ class VmAgentsInstallTest(VmAgentsHarness):
             dict(name='old1', host='host-agents', mode='execute', status='stopped')]))
         p = self.run_vm('redemarrer')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('restart ameesh-runner-agent@old1.service',
-                      (self.state / 'systemctl.log').read_text())
+        log = (self.state / 'systemctl.log').read_text()
+        self.assertIn('--user stop ameesh-runner-agent@old1.service', log)
+        self.assertIn('--user start ameesh-runner-agent@old1.service', log)
+        self.assertNotIn('restart', log)
         self.assertIn('old1 : arrêté dans le registre', p.stdout)
         self.assertIn('nouveau code', p.stdout)
         self.assertNotIn('old1 : redémarré (était', p.stdout)
@@ -894,8 +913,11 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(snapshot), self.old)
         for call in self.pip_calls():
             self.assertIn('src-' + self.old[:7], call)
-        self.assertIn('restart ameesh-runner-agent@dev9.service',
+        self.assertIn('--user stop ameesh-runner-agent@dev9.service',
                       (self.state / 'systemctl.log').read_text())
+        self.assertIn('--user start ameesh-runner-agent@dev9.service',
+                      (self.state / 'systemctl.log').read_text())
+        self.assertNotIn('restart', (self.state / 'systemctl.log').read_text())
         self.assertIn('dev9 : redémarré', p.stdout)
         self.assertIn('contrôles verts', p.stdout)
         # second retour : idempotent, la cible est le code installé

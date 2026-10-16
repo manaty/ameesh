@@ -3,10 +3,10 @@
 Un hôte d’agents utilise les unités **utilisateur**
 `ameesh-runner-agent@<agent>.service`, sous le compte `ameesh`.
 Depuis le poste, `deploy/mise-a-jour/vm.sh agents redemarrer` les redémarre
-une par une, hors tour. `agents controler` (ou `agents verifier`) contrôle
-les unités et les baux, sans redémarrer personne. `agents installer [REF]`
-installe une révision gelée dans le layout du compte et `agents retour`
-réinstalle la précédente (#1252).
+une par une, arrêt prouvé avant chaque démarrage. `agents controler` (ou
+`agents verifier`) contrôle les unités et les baux, sans redémarrer personne.
+`agents installer [REF]` installe une révision gelée dans le layout du compte
+et `agents retour` réinstalle la précédente (#1252).
 
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
@@ -31,8 +31,11 @@ deploy/mise-a-jour/vm.sh agents redemarrer
 deploy/mise-a-jour/vm.sh agents controler
 ```
 
-Le redémarrage attend la fin des tours, pendant au plus `ATTENTE_MAX`
-secondes (7200 par défaut). Il relit le placement avant chaque redémarrage :
+Le redémarrage ferme l’admission de chaque unité par `stop` (SIGTERM) avant
+de la démarrer : le tour en cours draine, borné par `TimeoutStopSec` (35 min),
+et le démarrage n’a lieu qu’après preuve du point sûr (`ActiveState=inactive`
+et `MainPID=0`). Aucune fenêtre « idle » n’est attendue : une persona en tour
+ne bloque plus la mise à jour. Il relit le placement avant chaque redémarrage :
 un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
 pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
 est rechargée sur le nouveau code (#1633), sans quoi elle servirait la

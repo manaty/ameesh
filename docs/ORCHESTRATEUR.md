@@ -635,9 +635,10 @@ restée 4 h fusionnée sans être déployée :
    packages, review before CI and no CI per lot between cuts, sober proofs
    (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
    reviewed commit.
-4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
-   un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
-   d'exécuteur du poste le lance dans une unité systemd distincte :
+4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
+   exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
+   Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance
+   donc dans une unité systemd distincte :
    `systemd-run --user --unit=ameesh-redemarrer-$(date +%s) bash
    deploy/mise-a-jour/poste.sh redemarrer <REF>`. Un `setsid` ou un `nohup`
    ne suffit pas : le script reste dans le groupe de contrôle de l'unité de
