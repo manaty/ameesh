@@ -1499,13 +1499,18 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
         return 1
     if opts.get("--json"):
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        return 0
+        return 1 if result["refused"] else 0
     actions = result["forwarded"] + result["expired"]
-    if not actions:
+    if not actions and not result["refused"]:
         print("no dead letter to sweep (retention %d day(s), 0 = never)"
               % result["days"])
         return 0
-    if result["dry_run"]:
+    if not actions:
+        # #1396/N2 : que des refus de renvoi — le dire (le courrier n'est pas
+        # remis) au lieu d'annoncer « no dead letter », et sortir non-zéro.
+        print("no dead letter swept: %d re-delivery refusal(s) (retention %d day(s), "
+              "0 = never)" % (len(result["refused"]), result["days"]))
+    elif result["dry_run"]:
         print("dry run: retention %d day(s); %d recipient(s) to sweep:"
               % (result["days"], len(actions)))
     for action in result["forwarded"]:
@@ -1515,13 +1520,13 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
     for action in result["refused"]:
         print("  %s: re-delivery to %s refused — %s" % (
             action["old"], action["new"], action["reason"].splitlines()[0]), file=sys.stderr)
-    if not result["dry_run"]:
+    if not result["dry_run"] and actions:
         # #1604 : les successeurs locaux ont du courrier neuf.
         for action in result["forwarded"]:
             fastmail.bump(cfg, action.get("new") or "")
         print("retention %d day(s); dead mail stays in the mailbox, marked expired"
               % result["days"])
-    return 0
+    return 1 if result["refused"] else 0
 
 
 def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
