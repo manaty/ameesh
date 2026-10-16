@@ -72,8 +72,8 @@ refus de `work queue add` faute de CI individuelle. Cette commande passe par
 À l'inverse, `Admissions.qualify(..., mode="packet")` ne lit aucune CI
 individuelle, mais ne voit que les générations déjà inscrites dans cette file.
 
-Le raccord manquant est l'inscription explicite d'un candidat qualifié pour
-le train dans la file persistante. Il doit valider la branche publiée, les
+L'inscription explicite d'un candidat qualifié pour
+le train dans la file persistante doit valider la branche publiée, les
 avis historiques et la politique, puis recevoir sa génération du stockage
 réel. L'inventaire ne fabrique pas cette génération et ne contourne pas la
 porte individuelle. La CI complète du paquet, sur son arbre exact et avec un
@@ -108,9 +108,70 @@ manquantes, léger sans avis, blocage et release. Le probe fournisseur exact
 ajoute le parcours inventaire → préparation. Un cas Git/SQL réel prouve que
 la préparation laisse la file vide et les jalons inchangés, puis alloue
 explicitement une génération dans le stockage de test et la qualifie en mode
-`packet`, sans CI individuelle. Cet appel de fixture ne branche aucun écrivain
-dans le produit. L'inscription automatique et ses courses de réadmission restent
-à raccorder après qualification du geste par le pilote.
+`packet`, sans CI individuelle. Aucun profil ou écrivain du runner n'est activé.
+
+### Inscription explicite et reprise
+
+Source : **mesh-design, 16 octobre 2026 à 13:16**, réponse aux courriers
+80193/80993. Le pilote qualifie la préparation de l'inscription packet dans
+la file existante, distincte de `readiness` individuel, après les contrôles
+branche/gel natif/provenance/historique/politique. Il exige le `frozen_id`
+attendu, une reprise idempotente et une relecture des preuves et de la vraie
+génération avant effets ; aucune file réelle ni le paquet 26 ne sont concernés.
+
+```python
+result = train_candidates.Enrollment(
+    preparation, admissions, initial=qualified_initial_queue_history,
+).enroll(
+    candidate, current_base, actor=bound_actor,
+)
+```
+
+`Enrollment` réalise la préparation, appelle `queue_add(..., packet=snapshot)`
+puis refetch la branche et appelle `Admissions.qualify(..., "packet")`. Le
+stockage verrouille le lot, compare son état `qa`, son projet, sa branche,
+sa cible, son type et le dernier gel natif, puis insère sans remplacer une
+ligne existante. Une reprise ne rend que sa génération exacte encore `queued` ;
+elle n'alloue pas de nouveau numéro et n'ajoute pas d'événement. Une ligne
+d'une autre admission, en cours d'atterrissage ou éjectée reste intacte.
+
+La suppression physique de `queue_remove` nécessite une trace durable pour
+ne pas transformer un retrait en nouvelle candidature. Le stockage inscrit
+dans le journal existant des notes structurées `ameesh-queue-receipt/1`
+(`kind=packet|removed`, `frozen_id`, `generation`), dans la transaction de
+l'allocation ou du retrait. Le retrait prend le même verrou de lot avant la
+ligne de file. Ces traces servent uniquement à conserver la génération d'une
+reprise ou à refuser une réadmission ; elles ne certifient aucun avis ni CI.
+Aucune table, migration ou opération d'API n'est ajoutée. Un retrait individuel
+est également conservé, mais l'inscription individuelle explicite reste possible.
+
+Un ancien `queue_remove` pouvait avoir supprimé la ligne avant l'introduction
+de ces traces. L'absence de ligne et de reçu ne prouve donc pas une première
+inscription. Le lecteur explicite `initial(db, subject=...)` doit qualifier
+ce fait depuis ses sources originales ; seul `True` permet une insertion
+initiale via `packet_initial`. Aucun lecteur réel n'est choisi par défaut.
+La seule absence de ligne ou une prose libre ne suffit pas ; la qualification
+doit aussi couvrir la transition des anciens écrivains qui ne traçaient pas
+leurs retraits.
+Sans source qualifiée, `queue-history-unknown` reporte le membre. La reprise
+d'une allocation déjà tracée n'a pas besoin de ce bootstrap, et même un
+lecteur favorable ne peut effacer un retrait tracé. Les tests utilisent une
+qualification initiale simulée sur leur schéma jetable ; ils ne qualifient
+pas l'historique réel de #2005. Ce port historique a été demandé au pilote.
+
+`enroll_many` renvoie séparément les admissions et les reports nommés par lot,
+et poursuit les candidatures indépendantes. Un refus après allocation conserve
+sa ligne pour les contrôles du train ; il ne supprime ni ne réinscrit une
+génération concurrente.
+
+Les témoins SQL utilisent deux connexions pour le regel au même SHA, le
+retrait et l'allocation concurrente. Ils couvrent également rollback, refus
+d'un sujet changé, conservation des générations existantes et reprise après
+suppression. Les parcours Git/SQL vérifient la relecture après allocation :
+un retrait ou un avis bloquant nouvellement commis produit un refus, sans
+effet de publication. Le runtime conserve ses propres revalidations avant
+publication et promotion. Le raccord à un profil actif et les fournisseurs
+échéance canon / suites et événements Nexlink restent distincts.
 
 ## Port de transport qualifié
 

@@ -230,9 +230,9 @@ son origine et les refus restent nommés. Ce résultat ne porte aucune
 génération de file et n'est pas une admission. Le cas Nexlink #2005
 (courrier codex3 #80142 du 16/10, gel `5dfba839f556`, avis 8770/8772)
 illustre la frontière restante : `queue add` exige encore une CI individuelle
-avant l'inscription que le train consomme. L'inscription explicite, après
-qualification historique/politique/branche publiée et par le stockage réel,
-reste à raccorder ; la preuve complète du paquet reste due avant promotion.
+avant l'inscription que le train consomme. L'inscription explicite préparée
+ci-dessous reste distincte de cette commande ; la preuve complète du paquet
+reste due avant promotion.
 
 `train_candidates.Preparation` réalise cette qualification préalable en
 lecture seule. Il relit le sujet `qa`, refuse releases et candidatures dérivées
@@ -240,9 +240,26 @@ d'un avis, résout le SHA éventuellement abrégé contre les objets de la branc
 fraîchement lue et exige la base courante exacte. La politique versionnée et
 `Recorded.qualify_subject` vérifient ensuite le gel déclaré actuel, chaque
 auteur et les avis requis. Le résultat conserve un sujet sans génération ;
-ce n'est pas une admission. L'allocation reste un geste distinct du stockage
+ce n'est pas une admission. L'allocation est un geste distinct du stockage
 réel, suivi de la qualification de sa génération par `Admissions`. Ni ce
 résultat ni une ancienne préparation ne peuvent remplacer cette revalidation.
+
+Après qualification du pilote le 16 octobre à 13:16 (réponse80193/80993),
+`train_candidates.Enrollment` prépare le candidat, appelle le `queue_add`
+réel avec snapshot du lot et gel natif attendu, puis relit la branche, la
+génération et les preuves `Admissions` en mode `packet`. Le chemin SQL
+`packet` insère seulement une nouvelle admission, ou rend sa même génération
+encore en file après une reprise ; il n'écrase aucune admission existante.
+Les traces d'allocation/retrait du journal existant empêchent de réadmettre
+automatiquement le même gel après suppression de sa ligne de file. Le
+retrait et l'allocation prennent le même verrou de lot. L'ambiguïté d'un
+ancien retrait sans trace structurée exige un lecteur initial qualifié,
+injecté explicitement ; son absence produit `queue-history-unknown`, sans
+présumer jamais-inscrit d'une ligne absente. Les reprises déjà tracées
+restent possibles sans ce bootstrap et les retraits tracés restent refusés.
+Les reports sont nommés par lot et les candidats indépendants poursuivent.
+Aucun statut CI individuel n'est créé et la commande individuelle garde sa porte existante.
+Ce port explicite n'est pas raccordé à un profil actif.
 
 Le fournisseur de politique reste obligatoire : il reçoit le lot courant,
 l'admission, la base exacte et le dépôt d'historique. Il doit rendre un

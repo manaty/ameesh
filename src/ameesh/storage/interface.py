@@ -1159,11 +1159,20 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
-                  actor: str, source: str = "", frozen_id: int | None = None) -> dict | None:
+                  actor: str, source: str = "", frozen_id: int | None = None,
+                  packet: dict | None = None, packet_initial: bool = False) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
-        lot is no longer open."""
+        lot is no longer open. `packet` (#1467) is the expected QA item
+        snapshot (app, branch, branch_target, type, resolved_target): create only, with a real
+        expected freeze. A replay returns its same queued generation; an
+        existing different entry, withdrawal, or changed snapshot refuses.
+        Packet allocation/withdrawal receipts survive in the work journal;
+        they never certify historical reviews or CI. A first insertion also
+        needs `packet_initial=True` from the caller's qualified history
+        provider: absence of a queue row cannot prove never-withdrawn for
+        historical lots. It cannot override a recorded withdrawal."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,

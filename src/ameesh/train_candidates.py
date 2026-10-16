@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Read-only QA inventory through the explicit #1756 candidate reader.
+"""QA inventory, qualification and explicit packet enrollment through #1756.
 
 A candidate is neither a queue generation nor historical review/CI evidence.
 The published branch, exact provenance and policy still need qualification
-before enrollment; no enrollment or runtime hook is installed here.
+before enrollment; no provider or runner hook is installed here.
 """
 from __future__ import annotations
 
@@ -106,4 +106,53 @@ class Preparation:
         requirement.check(subject, base)
         historical = self.history.qualify_subject(subject, base, required=requirement.reviews)
         return dict(schema="ameesh-train-candidate-preparation/1", subject=subject,
+                    item=dict({key: item.get(key) for key in ("app", "branch", "branch_target", "type")},
+                              resolved_target=target),
                     policy=asdict(requirement), history=historical)
+
+
+class Enrollment:
+    """Explicit packet enrollment; no runner or live queue is installed."""
+
+    def __init__(self, preparation, admissions, *, initial=None):
+        if admissions.history is not preparation.history or admissions.project is not preparation.project \
+                or admissions.policy is not preparation.policy:
+            raise TrainError("enrollment and admission must share exact qualification providers")
+        self.preparation, self.admissions = preparation, admissions
+        if initial is not None and not callable(initial):
+            raise TrainError("explicit initial queue-history qualification reader required")
+        self.initial = initial
+
+    def enroll_many(self, candidates, base, *, actor):
+        ids = [row["work_item_id"] for row in candidates]
+        if len(ids) != len(set(ids)):
+            raise TrainError("ambiguous candidate enrollment batch")
+        admitted, deferred = [], []
+        for candidate in candidates:
+            try:
+                admitted.append(self.enroll(candidate, base, actor=actor))
+            except TrainError as exc:
+                deferred.append(dict(work_item_id=candidate["work_item_id"], reason=str(exc)))
+        return dict(admitted=admitted, deferred=deferred)
+
+    def enroll(self, candidate, base, *, actor):
+        prepared = self.preparation.prepare(candidate, base)
+        subject = prepared["subject"]
+        # Historical queue_remove deleted its row without a typed receipt.
+        # A qualified reader must resolve that legacy ambiguity; an absent
+        # reader/unknown answer only permits replay of a recorded allocation.
+        initial = (self.initial(self.preparation.history.db, subject=copy.deepcopy(subject))
+                   if self.initial is not None else None)
+        row = self.preparation.ops.queue_add(subject["work_item_id"], target=subject["target"],
+            frozen_sha=subject["frozen_sha"], frozen_id=subject["frozen_id"], source=subject["source"],
+            packet=prepared["item"], packet_initial=initial is True,
+            actor=actor, note="packet enrollment; complete packet CI remains due")
+        if row is None:
+            raise TrainError("packet enrollment #%s refused: subject, freeze or queue changed/withdrawn, "
+                             "or queue-history-unknown" %
+                             subject["work_item_id"])
+        self.preparation.repository.check_members(subject["target"], [row])
+        # This rereads the real generation and complete evidence after the
+        # allocation transaction. The runtime repeats it before any effect.
+        proof = self.admissions.qualify([row], base, "packet")
+        return dict(entry=row, proof=proof)

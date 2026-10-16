@@ -814,9 +814,9 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="", frozen_id=None) -> dict | None:
+                  source="", frozen_id=None, packet=None, packet_initial=False) -> dict | None:
         with self.db.transaction() as tx:
-            lot = tx.query("SELECT state FROM work_items WHERE id = %s"
+            lot = tx.query("SELECT state, app, branch, branch_target, type FROM work_items WHERE id = %s"
                            " AND state NOT IN ('merged', 'promoted', 'closed')"
                            " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
@@ -826,18 +826,62 @@ class WorkItems(interface.WorkItems):
             latest_id = latest[0]["id"] if latest else None
             if frozen_id is not None and frozen_id != latest_id:
                 return None
-            tx.execute(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
-                " VALUES (%s, %s, %s, %s, %s, %s)"
-                " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
+            if packet is not None:
+                fields = ("app", "branch", "branch_target", "type")
+                if frozen_id is None or lot[0]["state"] != "qa" \
+                        or set(packet) != set(fields) | {"resolved_target"} \
+                        or packet["resolved_target"] != target \
+                        or any(lot[0][key] != packet[key] for key in fields):
+                    return None
+                current = self._queue_row(tx, item_id)
+                markers = tx.query("SELECT note FROM work_item_events WHERE work_item_id = %s"
+                                   " AND note LIKE 'ameesh-queue-receipt/1 %%' ORDER BY id", (int(item_id),))
+                allocated = None
+                for marker in markers:
+                    try:
+                        receipt = json.loads(marker["note"].split(" ", 1)[1])
+                    except (ValueError, IndexError):
+                        return None  # ambiguous journal: never recreate an admission
+                    if not isinstance(receipt, dict) or set(receipt) != {"kind", "frozen_id", "generation"} \
+                            or receipt["kind"] not in ("packet", "removed") \
+                            or type(receipt["frozen_id"]) is not int \
+                            or type(receipt["generation"]) is not int:
+                        return None
+                    if receipt.get("frozen_id") != frozen_id:
+                        continue
+                    if receipt.get("kind") == "removed":
+                        return None
+                    if receipt.get("kind") == "packet":
+                        allocated = receipt.get("generation")
+                if current is not None:
+                    same = (current["generation"], current["target"], current["frozen_id"],
+                            current["frozen_sha"], current["source"], current["state"])
+                    return current if same == (allocated, target, frozen_id, frozen_sha, source, "queued") else None
+                if allocated is not None:
+                    return None  # the allocated entry was withdrawn; do not resurrect it
+                if packet_initial is not True:
+                    return None  # absence is ambiguous for legacy DELETE-only writers
+            conflict = (" DO NOTHING" if packet is not None else
+                " DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
                 "   source = excluded.source, frozen_id = excluded.frozen_id,"
                 "   generation = nextval('merge_queue_generation_seq'), landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
-                "   updated_at = now()",
+                "   updated_at = now()")
+            inserted = tx.query(
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (work_item_id)" + conflict + " RETURNING work_item_id",
                 (int(item_id), target, frozen_sha, actor or "", source or "", latest_id))
+            if not inserted:
+                return None
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
-            return self._queue_row(tx, item_id)
+            row = self._queue_row(tx, item_id)
+            if packet is not None:
+                WorkItems(tx)._event(int(item_id), lot[0]["state"],
+                    "ameesh-queue-receipt/1 " + json.dumps(dict(kind="packet", frozen_id=frozen_id,
+                        generation=row["generation"]), sort_keys=True), actor)
+            return row
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
                      note="", actor="", clear_rank=False, lease=None,
@@ -886,12 +930,20 @@ class WorkItems(interface.WorkItems):
 
     def queue_remove(self, item_id, *, note, actor) -> bool:
         with self.db.transaction() as tx:
+            # Same order as allocation/refreeze: a withdrawal cannot vanish
+            # between a packet's check for absence and its insertion.
+            lot = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query("DELETE FROM merge_queue WHERE work_item_id = %s"
-                            " RETURNING work_item_id", (int(item_id),))
+                            " RETURNING work_item_id, generation", (int(item_id),))
             if not rows:
                 return False
-            lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            latest = tx.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+                              " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+            if latest:
+                WorkItems(tx)._event(int(item_id), lot[0]["state"],
+                    "ameesh-queue-receipt/1 " + json.dumps(dict(kind="removed", frozen_id=latest[0]["id"],
+                        generation=rows[0]["generation"]), sort_keys=True), actor)
             return True
 
     def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:

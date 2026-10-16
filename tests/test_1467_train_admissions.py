@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 import subprocess
+import threading
 import types
 from unittest import mock
 
@@ -153,7 +154,7 @@ class TrainAdmissionsTest(PgTestCase):
         with self.assertRaisesRegex(train.TrainError, "latest exact freeze"):
             self.admissions.qualify([entry], base, "packet")
 
-    def test_qa_preparation_precedes_real_generation_and_keeps_packet_ci_pending(self):
+    def enrollment_fixture(self):
         base, first, head, old_entry = self.recorded_admission()
         item = old_entry["work_item_id"]
         self.db.execute("DELETE FROM merge_queue WHERE work_item_id = %s", (item,))
@@ -171,19 +172,94 @@ class TrainAdmissionsTest(PgTestCase):
                       if mark["id"] == old_entry["frozen_id"])
         candidate = dict(work_item_id=item, branch="lot/admission", target="main", causes=[],
                          candidate=dict(sha=head[:12], origin="frozen", declared=freeze))
+        return base, first, head, item, candidate, preparation, old_entry
+
+    def enrollment(self, preparation):
+        # The initial history of this disposable schema is a known fixture.
+        # No production legacy-history reader is selected by the product.
+        return train_candidates.Enrollment(preparation, self.admissions,
+                                          initial=lambda db, **context: True)
+
+    def test_qa_preparation_precedes_real_generation_and_keeps_packet_ci_pending(self):
+        base, first, head, item, candidate, preparation, old_entry = self.enrollment_fixture()
         marks_before = self.ops.milestones(item, None)
         subject = preparation.prepare(candidate, base)["subject"]
         self.assertEqual(self.ops.queue(None), [])
         self.assertNotIn("generation", subject)
-        # This explicit fixture call, outside Preparation, is the only
-        # allocation. No individual CI or production runtime is involved.
-        entry = self.ops.queue_add(item, target=subject["target"], frozen_sha=subject["frozen_sha"],
-            frozen_id=subject["frozen_id"], source=subject["source"], actor="fixture", note="fixture")
+        enrollment = self.enrollment(preparation)
+        result = enrollment.enroll(candidate, base, actor="fixture")
+        entry = result["entry"]
         self.assertGreater(entry["generation"], old_entry["generation"])
-        proof = self.admissions.qualify([entry], base, "packet")["members"][0]
+        proof = result["proof"]["members"][0]
         self.assertEqual(set(proof["history"]["reviews"]["coverage"]), {first, head})
         self.assertNotIn("targeted_ci", proof)
         self.assertEqual(self.ops.milestones(item, None), marks_before)
+        replay = enrollment.enroll(candidate, base, actor="restarted-fixture")
+        self.assertEqual(replay, result)
+
+    def test_enrollment_rechecks_fresh_generation_and_reviews_after_allocation(self):
+        base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
+        enrollment = self.enrollment(preparation)
+        other = self.connect()
+        self.addCleanup(other.close)
+        actual = preparation.ops.queue_add
+        def withdrawn(*args, **kwargs):
+            row = actual(*args, **kwargs)
+            storage.of(other).work.queue_remove(item, note="withdrawn before reread", actor="fixture")
+            return row
+        with mock.patch.object(preparation.ops, "queue_add", side_effect=withdrawn):
+            with self.assertRaisesRegex(train.TrainError, "admission withdrawn"):
+                enrollment.enroll(candidate, base, actor="fixture")
+        self.assertEqual(self.ops.queue(None), [])
+        with self.assertRaisesRegex(train.TrainError, "changed/withdrawn"):
+            enrollment.enroll(candidate, base, actor="fixture")
+
+    def test_enrollment_rechecks_a_blocking_vote_committed_after_allocation(self):
+        base, _, head, item, candidate, preparation, _ = self.enrollment_fixture()
+        other = self.connect()
+        self.addCleanup(other.close)
+        actual = preparation.ops.queue_add
+        def blocked(*args, **kwargs):
+            row = actual(*args, **kwargs)
+            storage.of(other).work.add_milestone(item, "verdict", sha=head, actor="blocked-reader",
+                                                 verdict="blocked", note="fresh blockage")
+            return row
+        with mock.patch.object(preparation.ops, "queue_add", side_effect=blocked):
+            with self.assertRaisesRegex(train.TrainError, "unresolved blocking"):
+                self.enrollment(preparation).enroll(
+                    candidate, base, actor="fixture")
+
+    def test_enrollment_refuses_refreeze_between_preparation_and_allocation(self):
+        base, _, head, item, candidate, preparation, _ = self.enrollment_fixture()
+        other = self.connect()
+        self.addCleanup(other.close)
+        actual = preparation.ops.queue_add
+        def refrozen(*args, **kwargs):
+            storage.of(other).work.add_milestone(item, "frozen", sha=head, actor="fixture",
+                                                 verdict=None, note="new freeze before write")
+            return actual(*args, **kwargs)
+        with mock.patch.object(preparation.ops, "queue_add", side_effect=refrozen):
+            with self.assertRaisesRegex(train.TrainError, "subject, freeze or queue changed/withdrawn"):
+                self.enrollment(preparation).enroll(
+                    candidate, base, actor="fixture")
+        self.assertEqual(self.ops.queue(None), [])
+
+    def test_enrollment_names_a_refused_candidate_and_continues_independent_candidates(self):
+        base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
+        result = self.enrollment(preparation).enroll_many(
+            [dict(candidate, work_item_id=999), candidate], base, actor="fixture")
+        self.assertEqual([r["entry"]["work_item_id"] for r in result["admitted"]], [item])
+        self.assertEqual([r["work_item_id"] for r in result["deferred"]], [999])
+        self.assertIn("QA branch", result["deferred"][0]["reason"])
+
+    def test_ambiguous_legacy_history_refuses_first_insert_but_known_replay_needs_no_bootstrap(self):
+        base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
+        unknown = train_candidates.Enrollment(preparation, self.admissions)
+        with self.assertRaisesRegex(train.TrainError, "queue-history-unknown"):
+            unknown.enroll(candidate, base, actor="fixture")
+        self.assertEqual(self.ops.queue(None), [])
+        admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        self.assertEqual(unknown.enroll(candidate, base, actor="restart"), admitted)
 
     def test_light_admission_with_no_verdict_uses_versioned_zero_review_policy(self):
         # #1734: a LIGHT lot must not disappear behind a positive-vote filter.
@@ -257,3 +333,121 @@ class TrainAdmissionsTest(PgTestCase):
         with self.assertRaisesRegex(train.TrainError, "exclusion refused"):
             self.admissions.quarantine([self.entry], "red", lease=lease)
         self.assertEqual(self.ops.queue(None)[0]["state"], "queued")
+
+
+class PacketAllocationTest(PgTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ops = storage.of(self.db).work
+        self.item = work.add(self.db, title="packet allocation", app="fixture", branch="lot/member",
+                             branch_target="main", actor="fixture")["id"]
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (self.item,))
+        item = self.ops.get(self.item)
+        self.snapshot = {key: item[key] for key in ("app", "branch", "branch_target", "type")}
+        self.snapshot["resolved_target"] = "main"
+        mark = self.ops.add_milestone(self.item, "frozen", sha=HEAD, actor="fixture", verdict=None, note="")
+        self.arguments = dict(target="main", frozen_sha=HEAD, frozen_id=mark["id"], source="fixture-origin",
+                              actor="fixture", note="packet fixture", packet=self.snapshot,
+                              packet_initial=True)
+
+    def allocate(self, ops=None, **changes):
+        return (ops or self.ops).queue_add(self.item, **dict(self.arguments, **changes))
+
+    def test_restart_reuses_exact_generation_without_new_event_or_sequence_allocation(self):
+        row = self.allocate()
+        before = work.events(self.db, self.item)
+        sequence = self.db.query("SELECT last_value FROM merge_queue_generation_seq")
+        other = self.connect()
+        self.addCleanup(other.close)
+        self.assertEqual(self.allocate(storage.of(other).work, actor="restart"), row)
+        self.assertEqual(work.events(self.db, self.item), before)
+        self.assertEqual(self.db.query("SELECT last_value FROM merge_queue_generation_seq"), sequence)
+        for change in (dict(source="another-origin"), dict(target="develop"), dict(frozen_sha=BASE)):
+            with self.subTest(change=change):
+                self.assertIsNone(self.allocate(**change))
+        self.assertEqual(self.ops.queue(None)[0], row)
+
+    def test_existing_generations_are_never_adopted_overwritten_or_resurrected(self):
+        existing = self.allocate(packet=None)
+        for state in ("queued", "landing", "ejected", "landed"):
+            self.ops.queue_update(self.item, state=state)
+            with self.subTest(state=state):
+                self.assertIsNone(self.allocate())
+                self.assertEqual(self.ops.queue(None)[0]["generation"], existing["generation"])
+                self.assertEqual(self.ops.queue(None)[0]["state"], state)
+
+    def test_changed_subject_or_absent_expected_freeze_cannot_allocate(self):
+        for field, value in (("state", "build"), ("app", "another"), ("branch", "lot/other"),
+                             ("branch_target", "develop")):
+            old = self.ops.get(self.item)[field]
+            self.db.execute("UPDATE work_items SET " + field + " = %s WHERE id = %s", (value, self.item))
+            with self.subTest(field=field):
+                self.assertIsNone(self.allocate())
+            self.db.execute("UPDATE work_items SET " + field + " = %s WHERE id = %s", (old, self.item))
+        self.assertIsNone(self.allocate(frozen_id=None))
+        self.assertIsNone(self.allocate(packet=dict(self.snapshot, type="release")))
+        self.assertIsNone(self.allocate(packet_initial=False))
+        self.assertIsNone(self.allocate(target="develop"))
+        self.assertEqual(self.ops.queue(None), [])
+
+    def concurrent_change(self, change):
+        other = self.connect()
+        result, started = {}, threading.Event()
+        def allocate():
+            started.set()
+            try:
+                result["row"] = self.allocate()
+            except BaseException as exc:
+                result["error"] = exc
+        writer = threading.Thread(target=allocate)
+        try:
+            with other.transaction() as tx:
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE", (self.item,))
+                change(storage.of(tx).work)
+                writer.start()
+                self.assertTrue(started.wait(timeout=10))
+            writer.join(timeout=30)
+            self.assertFalse(writer.is_alive())
+            if "error" in result:
+                raise result["error"]
+            self.assertIn("row", result)
+            return result["row"]
+        finally:
+            other.close()
+            if writer.ident is not None:
+                writer.join(timeout=30)
+
+    def test_concurrent_same_sha_refreeze_refuses_old_native_freeze(self):
+        result = self.concurrent_change(lambda ops: ops.add_milestone(
+            self.item, "frozen", sha=HEAD, actor="fixture", verdict=None, note="new native freeze"))
+        self.assertIsNone(result)
+        self.assertEqual(self.ops.queue(None), [])
+
+    def test_concurrent_initial_enrollments_share_one_generation(self):
+        row = self.concurrent_change(lambda ops: self.allocate(ops))
+        self.assertEqual(self.ops.queue(None), [row])
+        markers = self.ops.events_noted("ameesh-queue-receipt/1 ", 0)
+        self.assertEqual(len(markers), 1)
+
+    def test_concurrent_withdrawal_survives_deletion_and_repeated_fresh_attempts(self):
+        self.allocate()
+        result = self.concurrent_change(lambda ops: ops.queue_remove(self.item, note="withdrawn", actor="fixture"))
+        self.assertIsNone(result)
+        self.assertIsNone(self.allocate())
+        self.assertEqual(self.ops.queue(None), [])
+
+    def test_withdrawal_of_an_individual_entry_also_prevents_automatic_readmission(self):
+        self.allocate(packet=None)
+        self.ops.queue_remove(self.item, note="individual withdrawal", actor="fixture")
+        self.assertIsNone(self.allocate())
+        # The existing explicit individual gesture remains available.
+        self.assertIsNotNone(self.allocate(packet=None))
+
+    def test_rollback_discards_both_allocation_and_replay_receipt(self):
+        with self.assertRaisesRegex(RuntimeError, "rollback"):
+            with self.db.transaction() as tx:
+                self.assertIsNotNone(self.allocate(storage.of(tx).work))
+                raise RuntimeError("rollback")
+        self.assertEqual(self.ops.queue(None), [])
+        self.assertFalse(self.ops.events_noted("ameesh-queue-receipt/1 ", 0))
+        self.assertIsNotNone(self.allocate())
