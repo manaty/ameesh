@@ -487,6 +487,39 @@ class RoleExecutorTest(PgTestCase):
                 self.db.execute('DROP OWNED BY %s' % q(controller))
                 self.db.execute('DROP ROLE %s' % q(controller))
 
+    def test_sequence_privilege_makes_the_controller_audit_fail(self):
+        """A sequence is outside relkind r/p, but its own privileges are writes:
+        USAGE opens nextval/currval, UPDATE opens setval. The controller needs
+        none of them, so each one fails the audit instead of passing silently."""
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_controller_' + uuid.uuid4().hex[:8]
+        sequence = 't_release_sequence_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        command = ['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                   '-v','role='+controller,'-f',str(sql)]
+        self.db.execute('CREATE SEQUENCE %s.%s' % (q(self.schema),q(sequence)))
+        try:
+            result = subprocess.run(command, env=env,text=True,capture_output=True,timeout=60)
+            self.assertEqual(result.returncode,0,attendu(result.stderr))
+            for privilege in ('USAGE','SELECT','UPDATE'):
+                self.db.execute('GRANT %s ON SEQUENCE %s.%s TO %s'
+                                % (privilege,q(self.schema),q(sequence),q(controller)))
+                try:
+                    result = subprocess.run(command, env=env,text=True,capture_output=True,timeout=60)
+                    self.assertNotEqual(result.returncode,0,privilege)
+                    self.assertIn('unrelated sequence privilege',result.stderr,
+                                  attendu(result.stderr))
+                finally:
+                    self.db.execute('REVOKE %s ON SEQUENCE %s.%s FROM %s'
+                                    % (privilege,q(self.schema),q(sequence),q(controller)))
+        finally:
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
+            self.db.execute('DROP SEQUENCE IF EXISTS %s.%s' % (q(self.schema),q(sequence)))
+
     def test_release_role_write_grant_on_a_view_makes_the_audit_fail(self):
         from pathlib import Path
         q = db_mod.quote_ident
