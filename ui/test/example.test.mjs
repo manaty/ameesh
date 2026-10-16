@@ -126,11 +126,20 @@ test("example: the fixtures server answers like a mesh", async () => {
 
 test("example: every module parses, Electron reference included", () => {
   for (const name of ["app.mjs", "host.mjs", "mount.mjs", "fixtures.mjs",
-    "fixtures-server.mjs", "electron/main.mjs", "electron/preload.mjs",
+    "fixtures-server.mjs", "electron/main.mjs", "electron/preload.cjs",
     "electron/renderer.mjs"]) {
     execFileSync(process.execPath, ["--check", fileURLToPath(new URL(name, EXAMPLE))],
       { stdio: "pipe" });
   }
+});
+
+test("example: the sandboxed preload is self-contained CommonJS", async () => {
+  // a sandboxed preload cannot use ESM: no import/export, `require` only,
+  // and no relative require either — it runs before any bundler
+  const source = await readFile(new URL("electron/preload.cjs", EXAMPLE), "utf8");
+  assert.match(source, /require\("electron"\)/);
+  assert.doesNotMatch(source, /^\s*(?:import|export)\b/m);
+  assert.doesNotMatch(source, /require\(["']\./);
 });
 
 test("example: the guides the package README announces exist", async () => {

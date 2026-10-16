@@ -1,6 +1,6 @@
 # Reference Electron host (L92)
 
-`main.mjs`, `preload.mjs`, `renderer.html` and `renderer.mjs` are a **reference**
+`main.mjs`, `preload.cjs`, `renderer.html` and `renderer.mjs` are a **reference**
 for an application that embeds `@ameesh/ui` in Electron — Nexlink, or any
 desktop application. Electron is not a dependency of ameesh: these files are
 not run here, `npm test` only proves they parse. The full walkthrough is
@@ -11,7 +11,8 @@ What the reference shows:
 * **window**: `contextIsolation: true`, `sandbox: true`,
   `nodeIntegration: false`, and one `partition: "persist:ameesh-<mesh>"` per
   mesh (no cookie or storage crosses);
-* **preload**: exactly the host contract crosses `contextBridge` — no
+* **preload**: `preload.cjs`, self-contained CommonJS — a sandboxed preload
+  cannot use ESM; exactly the host contract crosses `contextBridge` — no
   `ipcRenderer`, no Node, no module;
 * **main process**: the token is sealed at rest by `safeStorage`, approvals
   open in the system browser (`shell.openExternal`) and only on a known

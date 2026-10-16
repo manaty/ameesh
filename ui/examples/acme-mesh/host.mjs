@@ -3,7 +3,7 @@
 // offers the components — a token per mesh, an approval opened in the
 // foreground, a system notification, the list of its meshes, navigation.
 // In Electron this same object crosses `contextBridge` from the preload
-// (electron/preload.mjs); here it lives in the page, which is what a web host
+// (electron/preload.cjs); here it lives in the page, which is what a web host
 // would do with its own session.
 import { DEMO_TOKEN, MESH_ID, ORGANISATION } from "./fixtures.mjs";
 
