@@ -1800,11 +1800,14 @@ class WorkItems(Domain):
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod
     def issue_feed(self, limit: int) -> list[dict]:
-        """Les lots que la projection en issues examine : ouverts, ou qui
-        portent une `issue_ref` (les `limit` plus récents), par id croissant.
-        Chaque ligne ajoute l'équipe de la fiche du plan (`package_team`) et
-        l'équipe, le chantier et l'hôte de l'assigné au registre
-        (`assignee_team`, `assignee_chantier`, `assignee_host`). Une
+        """Les lots que la projection en issues examine : ouverts, porteurs
+        d'une `issue_ref`, ou pinnés sur une révision Process (#2130/D : un
+        cœur `merged` reste projeté ouvert), les `limit` plus récents, par id
+        croissant. Chaque ligne ajoute l'équipe de la fiche du plan
+        (`package_team`), l'équipe, le chantier et l'hôte de l'assigné au
+        registre (`assignee_team`, `assignee_chantier`, `assignee_host`), et
+        la révision Process du lot (`workflow_ref`, `workflow_stage`,
+        `workflow_version` ; `''`, NULL, 0 sur une base pré-0452). Une
         instruction."""
 
     @abc.abstractmethod
