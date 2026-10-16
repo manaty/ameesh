@@ -290,6 +290,27 @@ class ClaudeStreamJsonTest(DriverCase):
         known.start()
         self.assertAlmostEqual(self.wait(known.send("hi")).cost, 0.01)
 
+    def test_argv_is_idempotent_for_a_new_session(self):
+        """#2008 : deux appels a argv() avant tout tour gardent la MEME
+        creation de session ; le second ne bascule pas sur --resume avec
+        l'id tout neuf (la CLI refuserait « No conversation found »)."""
+        driver = self.driver()
+        first = driver.argv()
+        second = driver.argv()
+        self.assertEqual(first, second)
+        session = first[first.index("--session-id") + 1]
+        self.assertTrue(session)
+        self.assertNotIn("--resume", first)
+        self.assertEqual(driver.session_id, session)
+
+    def test_argv_is_idempotent_for_a_resumed_session(self):
+        """Le gel du choix ne doit pas casser la reprise : une session fournie
+        reste --resume, y compris sur appels repetes."""
+        driver = self.driver(session="sess-old")
+        self.assertEqual(driver.argv(), driver.argv())
+        self.assertEqual(driver.argv()[driver.argv().index("--resume") + 1], "sess-old")
+        self.assertNotIn("--session-id", driver.argv())
+
     def test_busy_then_steer_joins_the_turn(self):
         driver = self.driver()
         driver.start()
