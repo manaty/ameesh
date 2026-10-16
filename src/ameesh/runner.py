@@ -1214,7 +1214,7 @@ class AgentWorker(threading.Thread):
         # L125 : un courrier passif (accusé, copie, diffusion) n'ouvre pas de tour
         if mail.unread_active(self.db, self.name, limit=1):
             return True
-        return self.retry_due() or self.idle_due()
+        return self.idle_due()
 
     def request_preempt(self) -> None:
         """Un message prioritaire préempte le tour en cours (0018, R19).
@@ -3623,9 +3623,6 @@ class AgentWorker(threading.Thread):
             # l'exécuteur reprend la MÊME session (registre), une fois.
             self._reprise_attach = False
             return {"kind": "idle", "prompt": adapters.ATTACH_RESUME_PROMPT, "ids": []}
-        if self.retry_due():
-            # #1270 : échéance d'une reprise cadencée sans consigne en attente
-            return {"kind": "idle", "prompt": adapters.RETRY_PROMPT, "ids": []}
         if all(mail.passive_reason(m) for m in messages):
             # #408 : un courrier qui réveillera l'agent passe avant (fenêtre L125)
             reveil = self._lot_wake_spec()
@@ -5473,20 +5470,17 @@ class AgentWorker(threading.Thread):
                 self.fast_failure = False
                 self._avec_reprise("child session discarded",
                                    self._ecarte_session_fille, session)
-            # #1270 : une panne passagère du fournisseur (429, 5xx, flux
-            # DeepSeek) n'est pas un échec rapide — elle attend puis reprend
-            # seule, à délais cadencés. Un quota épuisé suit la même cadence
-            # mais reste compté par L48 : cinq refus arrêtent l'agent, un
-            # plafond n'est pas repris sans fin ; la garde comptable (L226b)
-            # reste seule juge du budget. Un échec d'une autre cause
+            # #1270 : un 429 de débit (ou un quota fournisseur) n'est pas un
+            # échec rapide — il attend puis reprend seul, à délais cadencés ;
+            # le quota est distingué du débit passager et la garde comptable
+            # (L226b) reste seule juge du budget. Un échec d'une autre cause
             # efface l'épisode (hors refus de session fille, qui n'est pas une
             # panne fournisseur et n'efface ni n'étend l'épisode).
             genre = rate_limit_mod.classify(
                 error, self.last_final,
                 auth_failure.stderr_tail(stderr_path, start=stderr_debut))
             if genre:
-                if genre == rate_limit_mod.RATE_LIMITED:
-                    self.fast_failure = False
+                self.fast_failure = False
                 if genre == self.rate_limit:
                     self.rate_limit_streak += 1
                 else:
@@ -5651,18 +5645,6 @@ class AgentWorker(threading.Thread):
             return max(0.0, self.rate_limit_retry_at - time.time())
         return rate_limit_mod.delay(self.rate_limit_streak)
 
-    def retry_due(self) -> bool:
-        """#1270 : un tour de reprise est dû — l'échéance d'un épisode de
-        débit passager est passée. Seul un tour de consigne remet sa consigne
-        en attente ; un tour de courrier, d'événements ou de reprise en échec
-        ne laisse rien (le courrier est soldé au lancement), et l'agent
-        restait `blocked` jusqu'au courrier suivant ou à la relance
-        d'inactivité — cas réels du 14/10 (Codex, tour « événements ») et du
-        15/10 (DeepSeek, tour « messages »). Un quota épuisé n'est pas repris
-        ainsi : il n'est pas repris sans fin."""
-        return (self.rate_limit == rate_limit_mod.RATE_LIMITED
-                and self.retry_remaining() <= 0)
-
     def _attendre_reprise(self, duree: float) -> None:
         """Attend l'échéance de reprise sans se laisser court-circuiter.
 
@@ -5714,8 +5696,8 @@ class AgentWorker(threading.Thread):
         relancé toutes les 5 s sans fin.
 
         #1270 : pour un épisode de débit/quota, c'est le temps **restant**
-        jusqu'à l'échéance durable (`retry at`) — jamais un délai repoussé par
-        un réveil ; L48 n'arrête jamais un débit passager, un quota si."""
+        jusqu'à l'échéance durable (`retry at`) — jamais l'arrêt L48, jamais
+        un délai repoussé par un réveil."""
         if self.rate_limit:
             return self.retry_remaining()
         base = self.runner.failure_backoff
