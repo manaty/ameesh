@@ -164,7 +164,7 @@ sources = pr.read_sources(context)                # real collections, in the tx
     server component that compiled the revision. The registry checks
     `workflow_ref`/`workflow_version` against the command and the lot
     (`spec-mismatch`), never the artifact content: the ref names the commit
-    and tranche A publishes no digest. If a later artifact publishes one, the
+    and slice A publishes no digest. If a later artifact publishes one, the
     seam must bind it.
 
 ## Proofs
