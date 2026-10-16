@@ -1,0 +1,125 @@
+0001_init applied
+0002_overview applied
+0003_authority applied
+0004_work_items applied
+0005_key_roles applied
+0006_authority_fixes applied
+0007_nonces_backfill applied
+0008_canon applied
+0009_threads applied
+0010_actions applied
+0011_receipts applied
+0012_events applied
+0013_work_item_milestones applied
+0014_cost applied
+0015_model_catalog applied
+0022_placement applied
+0023_authenticator_syncs applied
+0024_canon_state_authenticators applied
+0025_spend_pending applied
+0026_work_packages applied
+0027_exploitation applied
+0028_accounts applied
+0029_ressources_placement applied
+0030_mode_et_arret applied
+0031_delegation_a_echeance applied
+0032_plusieurs_canons applied
+0033_session_account applied
+0034_liaisons_de_session applied
+0035_authentificateurs_par_canon applied
+0036_corrections_de_relecture applied
+0041_plafond_de_contexte applied
+0042_budget_en_base applied
+0043_grand_livre_corrige applied
+0044_feuille_de_route applied
+0045_menage applied
+0046_plafonds_du_tour applied
+0047_alimentation_hote applied
+0048_pid_started_at applied
+0049_improvement_backlog applied
+0050_work_item_branch applied
+0051_turn_grace applied
+0052_work_item_estimates applied
+0053_work_item_migration applied
+0054_estimate_reference applied
+0055_ci_test_results applied
+0056_work_item_measures applied
+0057_work_resolutions applied
+0058_merge_queue applied
+0059_turn_costs_price_fallback applied
+0060_credential_health applied
+0061_host_measure applied
+0062_mediated_executor applied
+0063_executor_identity applied
+0064_model_relay applied
+0065_harness_versions applied
+0066_persona_session_history applied
+0067_btrfs_allocation applied
+0068_credential_failures applied
+0069_host_gate applied
+0359_host_volumes applied
+0361_guard_restart applied
+0362_agent_watches applied
+0363_project_modules applied
+0364_key_holders applied
+0368_conversations applied
+0371_host_handoffs applied
+0372_work_item_branch_head_at applied
+0373_work_dependencies applied
+0380_host_lifecycle applied
+0384_agent_lot_sessions applied
+0388_agent_projects applied
+0390_work_item_migration_repo applied
+0392_host_holds applied
+0395_thread_index_counted applied
+0396_ameesh_events applied
+0398_host_hold_bounds applied
+0402_relay_credential_health applied
+0403_lease_wait_since applied
+0410_rename_chantier_workstream applied
+0412_merge_queue_identity applied
+0413_agent_mailbox_work_item_index applied
+0417_host_release_fences applied
+0421_work_item_reviewer applied
+0423_turn_work_item applied
+0424_ci_run_queue_time applied
+0426_ci_guard_state applied
+0427_qa_role_guard applied
+0428_overview_projects applied
+0429_ci_run_attempt applied
+0430_work_delivered applied
+0431_module_agent_search_path applied
+0433_ci_runs_workflow applied
+0439_turn_resources_cgroup applied
+0440_api_idempotency applied
+0441_operator_pause applied
+0443_account_daily_budget applied
+0444_alert_acknowledgements applied
+0446_status_reason_since applied
+0447_migration_landed_number applied
+0448_ameesh_events_journal applied
+0451_account_identities applied
+0452_process_workflow_registry applied
+0454_operator_pause_reason_trim applied
+103 migration(s) applied
+migrate_rc=0
+version | name
+452 | process_workflow_registry
+(1 row)
+column_name | data_type | is_nullable | column_default
+command_id | uuid | YES | 
+evidence | jsonb | YES | 
+workflow_stage | text | YES | 
+workflow_version | bigint | YES | 
+workflow_ref | text | YES | 
+workflow_stage | text | YES | 
+workflow_version | bigint | NO | 0
+(7 rows)
+indexname
+work_item_events_command_uidx
+(1 row)
+conname | pg_get_constraintdef
+work_item_events_pkey | PRIMARY KEY (id)
+work_item_events_receipt_complete | CHECK (((command_id IS NULL) OR (((workflow_stage IS NOT NULL) AND (workflow_version IS NOT NULL) AND (evidence IS NOT NULL) AND (jsonb_typeof(evidence) = 'object'::text) AND ((evidence ->> 'schema'::text) = 'process-receipt/1'::text) AND (jsonb_typeof((evidence -> 'intent'::text)) = 'object'::text) AND (((evidence -> 'intent'::text) ->> 'sha256'::text) ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((evidence -> 'command'::text)) = 'object'::text) AND (((evidence -> 'command'::text) ->> 'action'::text) = ANY (ARRAY['advance'::text, 'hold'::text, 'release'::text, 'transfer'::text])) AND (jsonb_typeof((evidence -> 'authority'::text)) = 'object'::text) AND (jsonb_typeof((evidence -> 'verification'::text)) = 'object'::text)) IS TRUE)))
+work_item_events_work_item_id_fkey | FOREIGN KEY (work_item_id) REFERENCES iso1915_20261016_152510.work_items(id) ON DELETE CASCADE
+(3 rows)

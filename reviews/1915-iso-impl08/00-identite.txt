@@ -1,0 +1,22 @@
+date_utc=2026-10-16T15:25:10Z
+host=ameesh-agents-2
+venv=/home/ameesh/work/mty-amh-impl-08/.qa-1915/venv
+source_worktree=/home/ameesh/work/mty-amh-impl-08/.wt1915iso
+source_head=dffe30eaa54809e8e3350aaea046ed7c06b58e9b
+dffe30eaa54809e8e3350aaea046ed7c06b58e9b
+source_subject=dffe30eaa54809e8e3350aaea046ed7c06b58e9b Merge pull request #1484 from manaty/integration/paquet-h-20261016-1445
+contient_1994=204082b7447317c03841f37ef96c06f43a12229b oui
+2232bf719afd9925ff1737129cfbb4614edfbc59ed253ee6abc719b504ae5683  /home/ameesh/work/mty-amh-impl-08/.qa-1915/dist/ameesh-1.11.3-py3-none-any.whl
+ameesh_version=1.11.3
+ameesh_module=/home/ameesh/work/mty-amh-impl-08/.qa-1915/venv/lib/python3.12/site-packages/ameesh/__init__.py
+process_workflow=/home/ameesh/work/mty-amh-impl-08/.qa-1915/venv/lib/python3.12/site-packages/ameesh/process_workflow.py
+process_registry=/home/ameesh/work/mty-amh-impl-08/.qa-1915/venv/lib/python3.12/site-packages/ameesh/process_registry.py
+process_verifiers=/home/ameesh/work/mty-amh-impl-08/.qa-1915/venv/lib/python3.12/site-packages/ameesh/process_verifiers.py
+gardes=14
+reserves=1
+types_installes=7
+1367:         "note": str(row["note"] or ""), "actor": str(row["actor"] or "")}
+marqueur_acteur=présent
+1410:        {"id": str(row["id"]), "sha": str(row["sha"] or ""), "accepted": True}
+marqueur_livraison_chaine=présent
+migration_0452_installee=présente
