@@ -350,6 +350,50 @@ class GaugesOfTest(unittest.TestCase):
                          ["five_hour", "seven_day", "seven_day@fable"])
         self.assertTrue(vus.overage.capable)     # taken from the log
 
+    def _instantané_fable(self, age: float) -> None:
+        self._ecrit({"schemaVersion": 1, "ready": True,
+                     "updatedAt": _iso(self.now - age),
+                     "limits": [
+                         {"label": "Session (5-hour)", "percent": 0.2,
+                          "resetsAt": _iso(self.now + 4 * HEURE)},
+                         {"label": "Weekly (7-day)", "percent": 0.3,
+                          "resetsAt": _iso(self.now + 6 * JOUR)},
+                         {"label": "Fable Weekly", "title": "Fable Weekly",
+                          "percent": 0.0, "resetsAt": _iso(self.now + 6 * JOUR)}]})
+
+    def _journal_daté(self, age: float) -> Gauges:
+        return Gauges([Gauge("claude", "five_hour", 0.8, self.now + HEURE,
+                             5 * HEURE, read_at=self.now - age)],
+                      Overage(True, False))
+
+    def test_le_journal_plus_frais_que_le_widget_gagne(self):
+        """#1648 : un widget de 4 h (encore dans sa fenêtre courte) ne masque
+        plus un journal daté d'il y a une minute. Le journal gagne — les seaux
+        de modèle reviendront au prochain relevé du widget."""
+        self._instantané_fable(4 * HEURE)
+        self.book = SimpleNamespace(claude_gauges=lambda **kw: self._journal_daté(60))
+        profil = _profil(self.compte, "primaire")
+        with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
+            vus = accounts.gauges_of(self.book, profil, [profil],
+                                     model="claude-fable-5", now=self.now)
+        self.assertEqual([g.key for g in vus], ["five_hour"])
+        self.assertAlmostEqual(vus[0].used, 0.8)
+        self.assertTrue(vus.overage.capable)        # l'overage du journal
+        self.assertEqual(accounts._read_at_of(vus), self.now - 60)
+
+    def test_le_widget_plus_frais_garde_ses_seaux_de_modele(self):
+        """Inverse : journal daté d'il y a 10 min, widget d'il y a 30 s — le
+        widget gagne, seau de modèle compris (comportement #1580 conservé)."""
+        self._instantané_fable(30)
+        self.book = SimpleNamespace(claude_gauges=lambda **kw: self._journal_daté(600))
+        profil = _profil(self.compte, "primaire")
+        with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
+            vus = accounts.gauges_of(self.book, profil, [profil],
+                                     model="claude-fable-5", now=self.now)
+        self.assertEqual([g.key for g in vus],
+                         ["five_hour", "seven_day", "seven_day@fable"])
+        self.assertTrue(vus.overage.capable)        # repris du journal
+
     def test_fallback_on_the_log_if_source_missing_or_stale(self):
         profil = _profil(self.compte, "primaire")
         with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):

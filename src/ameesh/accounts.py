@@ -886,6 +886,14 @@ def _widget_key(profile: Profile, items: list) -> str:
     return key
 
 
+def _read_at_of(gauges) -> float | None:
+    """L'horodatage du relevé (#1561) : le plus récent des seaux datés, None
+    si aucun ne porte de date. Sert à comparer deux sources (#1648)."""
+    stamps = [stamp for stamp in
+              (getattr(g, "read_at", None) for g in gauges or ()) if stamp]
+    return max(stamps) if stamps else None
+
+
 def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
               model=None, now: float | None = None) -> list:
     """Les jauges de forfait du compte.
@@ -898,8 +906,10 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
     #1580 (tranche 3) : le fichier du widget omarchy d'abord quand il est
     frais (il porte les seaux propres à un modèle, invisibles des journaux),
     ses drapeaux d'overage repris du journal ; sinon les journaux
-    `rate_limit_event.unifiedWindows`, comme avant. `model` filtre les seaux
-    de modèle (`model_scoped`).
+    `rate_limit_event.unifiedWindows`, comme avant. #1648 : entre deux relevés
+    datés, le plus récent gagne — un widget arrêté mais encore dans sa fenêtre
+    ne masque plus un journal plus frais. `model` filtre les seaux de modèle
+    (`model_scoped`).
 
     #1789/N3 : le widget ne se lit que pour un compte à dossier de
     configuration. Une clé API n'en a pas — `home()` retombe sur le dossier
@@ -909,17 +919,20 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
         from . import widget_usage
         primary = primary_of(profile.harness, items, environ)
         primary_name = primary.name if primary is not None else None
+        journal = book.claude_gauges(account=profile.name,
+                                     primary=primary_name)
         gauges = widget_usage.read(profile, now=now,
                                    key=_widget_key(profile, items))
+        widget_at, journal_at = _read_at_of(gauges), _read_at_of(journal)
+        if gauges is not None and widget_at is not None and journal_at is not None \
+                and widget_at < journal_at:
+            gauges = None      # #1648 : le journal est plus récent
         if gauges is not None:
-            journal = book.claude_gauges(account=profile.name,
-                                         primary=primary_name)
             overage = getattr(journal, "overage", None)
             if overage is not None:
                 gauges.overage = overage
         else:
-            gauges = book.claude_gauges(account=profile.name,
-                                        primary=primary_name)
+            gauges = journal
         return model_scoped(gauges, model)
     if profile.harness == "claude":
         primary = primary_of(profile.harness, items, environ)
