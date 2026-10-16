@@ -1116,6 +1116,18 @@ def expiry(gauges, now: float) -> tuple | None:
     return best
 
 
+def lost_at_reset(gauges, now: float) -> float:
+    """#1580 (propriétaire, 2026-10-15) : le budget qui sera **perdu à la
+    remise à zéro** si rien ne le consomme d'ici là — la capacité inutilisée
+    (`1 − utilisé`, 0034 §5/L74) de la fenêtre qui se remet à zéro le plus
+    tôt (`expiry`). 0.0 : rien n'expire (aucune fenêtre en cours : relevé
+    échu, non daté ou absent — une lecture périmée n'annonce aucune perte).
+
+    C'est le score du choix : consommer d'abord ce qui va être perdu."""
+    found = expiry(gauges, now)
+    return found[1] if found is not None else 0.0
+
+
 def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | None]:
     """Le retard du compte sur son rythme (L117, amendement 0034 du 2026-10-10) :
     `(rapport, jauge)` de sa fenêtre **la plus contraignante**, où le rapport
@@ -1176,64 +1188,72 @@ def explain(result: Evaluation, now: float) -> str:
     return "%s %.0f%% used (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
 
 
+def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
+    """La clé de classement d'un compte (0034 amendée, #1580).
+
+    * sans relevé d'abord (L117, amendement 0034 du 2026-10-10) : un compte
+      jamais utilisé compte pour 0 % et passe en premier, pour ne pas laisser
+      un forfait inutilisé ;
+    * le retard sur le rythme (`lag`, le plus petit rapport d'abord) ;
+    * l'échéance de la capacité inutilisée (la plus proche d'abord, 0034 §1) ;
+    * la part de fenêtre perdue à cette remise à zéro (`lost_at_reset`, la
+      plus grosse d'abord) ;
+    * l'ordre déclaré (`priority`, L226b « primaries last »).
+
+    Les critères de budget précèdent l'ordre déclaré : demande du propriétaire
+    du 2026-10-15 (#1580) — le choix automatique ne suit plus un ordre fixe de
+    priorités, il consomme d'abord ce qui sera perdu à la remise à zéro."""
+    result = evaluations[profile.name]
+    gauges = result.gauges
+    found = expiry(gauges, now)
+    return (0 if not gauges else 1,
+            round(lag(gauges, now, result.limits)[0], 6),
+            found[0] if found is not None else float("inf"),
+            -round(lost_at_reset(gauges, now), 6),
+            priority(profile))
+
+
 def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
     """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
 
-    Clé (#1561) : d'abord un relevé **courant** — un compte dont le relevé est
-    périmé (une fenêtre remise à zéro depuis la lecture, une autre encore
-    ouverte) ne passe jamais avant un compte dont l'état est vérifié, quel que
-    soit l'ordre de bascule ; puis L226b, l'ordre de bascule (`priority` : le
-    compte par défaut en dernier, décision owner du 2026-10-07) ; puis le
-    retard sur le rythme (`lag`, le plus petit rapport d'abord) ; puis
-    l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
-    fenêtre en cours, après) ; puis l'ordre déclaré.
-
-    Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
-    un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
-    laisser un forfait inutilisé ; c'est le seul cas où l'absence passe avant
-    un relevé courant. Un compte non vérifié (relevé périmé) reste utilisable :
-    sans compte vérifié il est essayé (L71, « essayé, pas écarté »), et son
-    premier tour rapporte sa jauge.
+    Clé : relevés courants avant les relevés périmés (#1561), puis `_rank_key` — les critères de budget d'abord (retard sur le rythme,
+    échéance de la capacité inutilisée, part perdue), l'ordre déclaré en
+    dernier (#1580, demande du propriétaire du 2026-10-15).
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
     (`Evaluation.hard`)."""
-    def key(pair):
-        index, profile = pair
-        result = evaluations[profile.name]
-        gauges = result.gauges
-        found = expiry(gauges, now)
-        # Absent : L117 (premier). Périmé : après tout relevé courant (#1561).
-        unverified = bool(gauges) and stale_reading(gauges, now)
-        return (1 if unverified else 0,
-                priority(profile), round(lag(gauges, now, result.limits)[0], 6),
-                found[0] if found is not None else float("inf"), index)
     usable = [(i, p) for i, p in enumerate(items)
               if (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
-    return [p for _i, p in sorted(usable, key=key)]
+    return [p for _i, p in sorted(
+        usable, key=lambda pair: (bool(evaluations[pair[1].name].gauges) and
+                           stale_reading(evaluations[pair[1].name].gauges, now),)
+        + _rank_key(pair[1], evaluations, now) + (pair[0],))]
 
 
 def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     """La raison du choix d'une nouvelle session (journal, `accounts list`) :
-    « no reading: unverified, tried first (L117) ; avant : primaire seven_day
-    35 % utilisé (rythme 55 %) »."""
+    « sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant :
+    primaire seven_day 35 % utilisé (rythme 55 %) ».
+
+    L'ordre déclaré ne s'annonce que s'il a réellement décidé, les critères de
+    budget étant à égalité (`_rank_key`, #1580)."""
     first = ranked[0]
+    why = None
     gauges = evaluations[first.name].gauges
     if not gauges:
-        # L117 (amendement 0034 du 2026-10-10) : un compte jamais utilisé
-        # compte pour 0 % et passe en premier — la raison le dit, sans
-        # prétendre à un 0 % mesuré (#1561).
         why = "no reading: unverified, tried first (L117)"
     elif stale_reading(gauges, now):
-        # #1561 : aucun relevé courant n'est disponible ; il est essayé faute
-        # de mieux (L71), pas choisi sur un rythme qui n'est plus mesuré.
         why = "%s, tried (no current reading)" % explain(evaluations[first.name], now)
-    elif len(ranked) > 1 and priority(first) < priority(ranked[1]):
-        # L226b: the failover order decided, not the pace
-        why = "%s, first in the failover order (priority %d)" % (
-            explain(evaluations[first.name], now), priority(first))
-    else:
+    elif len(ranked) > 1:
+        mine = _rank_key(first, evaluations, now)
+        other = _rank_key(ranked[1], evaluations, now)
+        if mine[:4] == other[:4] and mine[4] != other[4]:
+            # L226b: the failover order decided, the budget criteria tied
+            why = "%s, first in the failover order (priority %d)" % (
+                explain(evaluations[first.name], now), priority(first))
+    if why is None:
         why = "%s, furthest behind its pace" % explain(evaluations[first.name], now)
     if len(ranked) > 1:
         why += "; ahead of: %s" % ", ".join(
@@ -1504,8 +1524,18 @@ def report(cfg, db, book, *, now: float | None = None,
         active = store.active(cfg.host, harness) if store else None
         holds = store.holds(cfg.host, harness) if store else {}
         active_name = (active or {}).get("account") or items[0].name
+        evaluations = {}
         for profile in items:
-            result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+            try:
+                result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+            except Exception as exc:  # noqa: BLE001 — #1600 : jauge illisible
+                # #1600 : une lecture en erreur ne fait pas tomber l'affichage
+                # (`ameesh accounts list`) : le compte reste listé, sans marge
+                # promise, avec sa raison — même motif que `rebalance._offer`
+                # et `live_fleet`.
+                result = Evaluation(profile)
+                result.reason = "gauge readings unreadable: %s" % exc
+            evaluations[profile.name] = result
             hold = holds.get(profile.name) or {}
             rows.append({
                 "harness": harness,
@@ -1548,7 +1578,7 @@ def report(cfg, db, book, *, now: float | None = None,
                 "_limits": result.limits,
                 "_ceilings": result.ceilings,
             })
-        _forecast(rows[len(rows) - len(items):], items, now)
+        _forecast(rows[len(rows) - len(items):], items, now, evaluations)
     return rows
 
 
@@ -1564,7 +1594,8 @@ def _overage_row(profile: Profile, gauges, now: float) -> dict:
             "in_use": in_overage(gauges, now)}
 
 
-def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
+def _forecast(rows: list[dict], items: list[Profile], now: float,
+              evaluations: dict) -> None:
     """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
     remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
     échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
@@ -1574,14 +1605,8 @@ def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
     inutilisée qu'il décrit (30 % d'une fenêtre de 7 j encore ouverte) n'est
     qu'une borne inférieure, et l'annonce « 70 % perdus à la remise à zéro »
     était fausse. Le compte porte `stale` pour les affichages."""
-    evaluations = {}
+    # Preserve the evaluated caps supplied by report (#1580).
     for row, profile in zip(rows, items):
-        # #1176 : les plafonds effectifs et les plafonds retenus sont ceux du
-        # rapport — `why` explique le choix avec le même plafond que `choose`.
-        result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"],
-                            limits=row.get("_limits") or {},
-                            ceilings=row.get("_ceilings") or {})
-        evaluations[profile.name] = result
         stale = bool(row["_gauges"]) and stale_reading(row["_gauges"], now)
         row["stale"] = stale
         row["losses"] = [] if stale else [
