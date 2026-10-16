@@ -78,6 +78,15 @@ sources = pr.read_sources(context)                # collections réelles, dans l
   conservée ; `waiting_human` exige une demande de décision native ouverte,
   L233), `release` (reprise de la retenue, vérifiée comme l'entrée ; une
   décision encore ouverte la refuse, `decision-pending`).
+  An `advance` into a **released core** (`merged`, `promoted`, `closed`)
+  carries the side effects the storage now refuses to a pinned lot (#1922/N8):
+  the migration reservation is given back (#956) with its journal line, and
+  the dependants are woken — once — under the dependency graph lock (L385). A
+  `closed` core demands the closure in the evidence: `close_reason` among
+  `abandoned`, `superseded` (with `superseded_by`, an existing lot other than
+  itself) or `delivered` (with `sha`, the reviewed head, 7 to 64 hex), and
+  writes `close_reason`/`superseded_by` plus the `closed`/`delivered`
+  milestones (`close-reason`, `superseded-unknown`, `delivered-sha`).
 * `transfer_revision(..., spec=…)` : première adoption (l'étape devient
   l'initiale de l'artefact, une retenue est conservée ; l'étape initiale doit
   projeter le cœur courant, sinon `stage-mismatch`, et un lot terminal n'est
@@ -133,11 +142,31 @@ sources = pr.read_sources(context)                # collections réelles, dans l
    base d'avant 0452, et donc par le contrat médié) : les commandes tournent
    aussi sur une connexion d'exécuteur médié (session de VM), où un SELECT
    brut est refusé (B5).
-8. Ordre des verrous : `agent_mailbox` (demandes de décision ouvertes du lot)
-   **avant** `work_items`, comme la réponse du propriétaire
-   (`decisions.answer` ferme la demande, puis déplace le lot) : pas
-   d'interblocage, et une réponse ne se glisse pas entre le contrôle et
-   l'écriture de la retenue.
+8. **Lock order (N12)**: for `hold`/`release`, the lot row (`work_items`) is
+   locked first, then the open decision requests (`agent_mailbox`) — the order
+   of the single L233 statement (`work.move(held=True)` locks the lot, then
+   the requests in its `EXISTS … FOR UPDATE`); the reverse order could
+   deadlock with it on the same request, and `decisions.answer` closes the
+   request before moving the lot in two separate transactions. The lock keeps
+   the request closed-proof until commit and `_pending_decision` is read after
+   both locks, so a request committed while the lot lock was awaited is seen.
+   An INSERT committed after that read is not blocked by a row lock
+   (PostgreSQL has no gap lock): the `ask` path must take the lot lock before
+   inserting its request for a full serialization. An `advance` into a
+   released core takes the dependency graph lock **before** the lot, like
+   `work.close`/`close_merged`.
+9. **Core before the hold (N10)**: adopting or transferring a held lot is
+   accepted only when the journal proves the core before the hold (the last
+   line that is not a hold) and the adopted/kept step projects it; otherwise
+   `hold-core-unproven` (nothing proven) or `stage-mismatch` (divergence).
+   The resume rewrites that proven core: the check is made at adoption, the
+   control is at release.
+10. **Artifact trust boundary (N5)**: `spec` is supplied by the caller, the
+    server component that compiled the revision. The registry checks
+    `workflow_ref`/`workflow_version` against the command and the lot
+    (`spec-mismatch`), never the artifact content: the ref names the commit
+    and tranche A publishes no digest. If a later artifact publishes one, the
+    seam must bind it.
 
 ## Preuves
 
