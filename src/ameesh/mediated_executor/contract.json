@@ -78,6 +78,62 @@
    ]
   },
   {
+   "name": "agents.runner_seen",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "host",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "owner",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "names",
+     "kind": "positional",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "null"
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
+   },
+   "rules": [
+    "Hôte forcé, names limité aux agents admis, owner préfixé exec:<id>: ; sans test de disponibilité."
+   ]
+  },
+  {
    "name": "agents.get",
    "write": false,
    "transport": "op",
@@ -3957,7 +4013,7 @@
   }
  ],
  "refused": {
-  "interface_total": 420,
+  "interface_total": 421,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
