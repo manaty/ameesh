@@ -489,6 +489,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     from . import canon as canon_mod
     from . import resources as res
 
+    if getattr(args, "send", None) and (
+            not getattr(args, "fleet", False)
+            or any(getattr(args, flag, False)
+                   for flag in ("json", "publish", "report", "hold", "release"))):
+        print("ameesh hosts: --send requires --fleet in text mode, "
+              "without --publish, --report, --hold or --release", file=sys.stderr)
+        return 2
     if args.hold or args.release:
         return _host_hold(cfg, args)
     if getattr(args, "publish", False):

@@ -47,6 +47,18 @@ class FleetLineTest(unittest.TestCase):
 
 
 class FleetCommandTest(unittest.TestCase):
+    def test_send_rejects_modes_that_would_skip_delivery(self):
+        parser = mesh_cli.build_parser()
+        for flags in ([], ["--fleet", "--json"], ["--fleet", "--publish"],
+                      ["--fleet", "--report"], ["--fleet", "--hold"],
+                      ["--fleet", "--release"]):
+            with self.subTest(flags=flags), \
+                    mock.patch.object(mesh_cli, "_open") as opened, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                args = parser.parse_args(["hosts", "--send", "bureau"] + flags)
+                self.assertEqual(mesh_cli.cmd_hosts(config_mod.Config(), args), 2)
+                opened.assert_not_called()
+
     def run_fleet(self, readings, *, json_out=False, send=None, code=0, err=None):
         store = mock.MagicMock()
         store.hosts.current.return_value = readings
