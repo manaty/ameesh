@@ -3365,11 +3365,13 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def base_failures(self, repo: str, branch: str, *, workflow: str = "") -> dict:
-        """Dernière exécution conclue (verte ou rouge) de `branch` **pour ce
-        workflow** : `{run_id, head_sha, tests}` (tests en échec de son attempt
-        courant), ou {} sans exécution. Le workflow évite de comparer deux
-        suites étrangères ; les lignes antérieures à la migration 0433, toutes
-        de l'ancien filtre global `tests.yml`, y sont nommées."""
+        """Dernière exécution conclue (verte ou rouge) de la **tête la plus récemment
+        poussée** de `branch`, pour ce workflow (#1683 : la conclusion la plus
+        récente peut être celle d'une tête plus ancienne) : `{run_id, head_sha,
+        tests}` (tests en échec de son attempt courant), ou {} sans exécution.
+        Le workflow évite de comparer deux suites étrangères ; les lignes
+        antérieures à la migration 0433, toutes de l'ancien filtre global
+        `tests.yml`, y sont nommées."""
 
     @abc.abstractmethod
     def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
