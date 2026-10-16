@@ -698,6 +698,11 @@ class ClaudeStreamJson(ResidentDriver):
         #: uuids written in the logical turn and not yet read by the harness
         self._unread: set[str] = set()
         self._reader: threading.Thread | None = None
+        #: vrai quand `session_id` a ete alloue par `argv()` pour ce demarrage
+        #: (creation) : un second appel doit repeter la MEME creation, jamais
+        #: basculer sur `session_flag` (--resume) avec un id tout neuf, que la
+        #: CLI refuserait (« No conversation found with session ID », #2008)
+        self._session_allocated = False
 
     @property
     def proc(self) -> subprocess.Popen | None:
@@ -708,11 +713,14 @@ class ClaudeStreamJson(ResidentDriver):
         argv = [adapter.binary, *self.block["launcher"],
                 *adapter._options(self.model, self.effort, self.tier, None),
                 *self.block["command"]]
-        if self.session_id:
+        if self.session_id and not self._session_allocated:
             argv += [*self.descriptor.session_flag, self.session_id]
         elif self.block.get("new_session"):
-            # the session id is known before the first turn
-            self.session_id = new_id()
+            # the session id is known before the first turn; a repeated call
+            # keeps the same id and the same creation flag (idempotent, #2008)
+            if not self.session_id:
+                self.session_id = new_id()
+                self._session_allocated = True
             argv += [*self.block["new_session"], self.session_id]
         return argv
 
@@ -990,6 +998,9 @@ class ClaudeStreamJson(ResidentDriver):
         parsed = self.adapter.parse(line)
         if parsed.get("session"):
             self.session_id = str(parsed["session"])
+            # la conversation existe desormais : un argv() ulterieur doit la
+            # reprendre (--resume), plus la creer (#2008)
+            self._session_allocated = False
         if ((kind == "system" and event.get("subtype") == "compact_boundary")
                 or kind == "compact_boundary"):
             # L81 (étude §6.2) : la compaction native est un événement du tour
