@@ -189,7 +189,7 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_merging_the_blocker_wakes_the_assignee_once(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        done = work.merged(self.db, self.b, sha="a" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         [row] = self.inbox()
         self.assertEqual((row["kind"], self.mail_lot(row)), ("event", str(self.a)))
@@ -198,7 +198,7 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration de fusion ne réveille pas une seconde fois.
-        self.assertEqual(work.merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -325,7 +325,7 @@ class ReleasedWakeTest(PgTestCase):
             return real(db, sender, recipient, body, **kw)
 
         with mock.patch("ameesh.mail.send", side_effect=spy):
-            work.merged(self.db, self.b, sha="b" * 40, actor="git:main")
+            work.close_merged(self.db, self.b, sha="b" * 40, actor="git:main")
         self.assertEqual(seen, [("merged", "dev-a", "event", True)])
 
     def test_a_failed_wake_rolls_back_the_closure_and_a_retry_wakes_once(self):
@@ -339,17 +339,17 @@ class ReleasedWakeTest(PgTestCase):
         dependencies.add(self.db, self.a, self.b, actor="test")
         with mock.patch("ameesh.mail.send", side_effect=RuntimeError("mailbox down")):
             with self.assertRaises(RuntimeError):
-                work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+                work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(work.get(self.db, self.b)["state"], "intake")
         self.assertEqual(self.inbox(), [])
-        done = work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         self.assertEqual(work.get(self.db, self.b)["state"], "merged")
         [row] = self.inbox()
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration, une fois la fusion commise, ne double pas.
-        self.assertEqual(work.merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -386,7 +386,7 @@ class ReleasedWakeTest(PgTestCase):
                 db = D.connect(self.cfg)
                 try:
                     start.wait(timeout=5)
-                    results.append(work.merged(db, blocker, sha="e" * 40,
+                    results.append(work.close_merged(db, blocker, sha="e" * 40,
                                                actor="git:main")["result"])
                 except Exception as exc:  # noqa: BLE001 - remonté par le test
                     errors.append(exc)
@@ -441,7 +441,7 @@ class ReleasedWakeTest(PgTestCase):
         def closer():
             db = D.connect(self.cfg)
             try:
-                results.append(work.merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
+                results.append(work.close_merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
@@ -480,7 +480,18 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_the_cli_declaration_wakes_too(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        proc = self.mesh("work", "merged", str(self.b), "--sha", "d" * 40, "--actor", "test")
+        import os
+        from .test_merged_work_item_tracking import _git
+        repo = os.path.join(self.tmp, "declared-blocker")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "remote", "add", "origin", "git@github.com:manaty/ameesh.git")
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("manaty/ameesh#1", self.b))
+        _git(repo, "commit", "--allow-empty", "-qm", "ameesh-work: %d" % self.b)
+        sha = _git(repo, "rev-parse", "HEAD")
+        proc = self.mesh("work", "merged", str(self.b), "--sha", sha,
+                         "--repo", repo, "--actor", "test")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         [row] = self.inbox()
         self.assertEqual(self.mail_lot(row), str(self.a))

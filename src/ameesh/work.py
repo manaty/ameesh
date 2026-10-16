@@ -1364,8 +1364,54 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     raise WorkError("lot %s moved in the meantime: retry" % item_id)
 
 
+def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
+                           cfg=None) -> str:
+    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture."""
+    from . import plan_git
+    from .canon import GitError
+
+    label = "lot #%s (%s: %s)" % (item["id"], item.get("app") or "?", item["title"])
+    try:
+        checkout = _checkout(lot_repository(item, cfg), repo, cfg)
+        commit = plan_git._commit(checkout, sha)
+        if not commit:
+            raise WorkError("commit %s not found in the lot's repository" % sha)
+        target = item.get("branch_target") or plan_git.default_target(checkout)
+        head = plan_git._commit(checkout, target) if target else None
+        if not head:
+            raise WorkError("merge target %r not found (fetch or configure ameesh.target)"
+                            % target)
+        if plan_git._git(checkout, "merge-base", "--is-ancestor", commit, head).returncode != 0:
+            raise WorkError("commit %s has not entered target %s" % (commit[:12], target))
+        message = plan_git._out(checkout, "show", "-s", "--format=%B", commit)
+        if message is None:
+            raise WorkError("commit message unreadable")
+        title = message.splitlines()[0] if message else ""
+        lot = int(item["id"])
+        if any(int(m.group(1)) == lot for m in plan_git.PARTIAL_TRAILER_RE.finditer(message)):
+            raise WorkError("commit declares only a partial delivery of this lot")
+        how = plan_git.cited_lots(message, hash_refs=plan_git.lot_ref_hash(checkout)).get(lot)
+        if how == "lot-branch" and item.get("branch"):
+            cited = plan_git.LOT_BRANCH_MERGE_RE.match(title)
+            if cited.group("branch") != item["branch"]:
+                how = None
+        if not how and item.get("branch"):
+            # A recorded agent/feature branch may also be named in a real
+            # merge title; a mere mention in a review body proves nothing.
+            parents = plan_git._out(checkout, "show", "-s", "--format=%P", commit)
+            if (parents and len(parents.split()) >= 2
+                    and plan_git._mentions(title, item["branch"])):
+                how = "recorded branch"
+        if not how:
+            raise WorkError("commit does not designate this lot: use ameesh-work: %s "
+                            "in the commit message (a PR number alone is not a lot)" % lot)
+        return commit
+    except (WorkError, GitError, plan_git.MergeProbeError) as exc:
+        raise WorkError("%s: merge declaration refused: %s" % (label, exc)) from exc
+
+
 def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
-           migration_landed: int | None = None, cfg=None) -> dict:
+           repo: str | None = None, migration_landed: int | None = None, cfg=None) -> dict:
     """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
     (fusion locale sur la branche cible) se déclare en une fois.
 
@@ -1374,7 +1420,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     l'acteur ; le journal dit « fusion déclarée par <acteur> (commit …) ».
     Idempotent (`already`, rien n'est réécrit) ; un lot fermé (abandonné,
     remplacé) n'est jamais rouvert : WorkError. Rend le constat de
-    `close_merged`.
+    `close_merged`. Le commit doit être lisible dans le dépôt du lot, désigner
+    ce lot et être entré dans sa cible ; aucune lecture réseau ni force.
 
     `migration_landed` (#1567) : le numéro de migration réellement atterri,
     quand la renumérotation du paquet a changé celui de la réservation (452 au
@@ -1388,12 +1435,16 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    # Preserve idempotency and the closed-lot diagnostic without requiring
+    # that an old clone or object still be available.
+    if item["state"] not in (*MERGED_STATES, "closed"):
+        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
-        repo = _landed_repo(item, cfg)
-        _check_landed_free(db, item_id, number, repo, cfg)
-        landed = (number, repo)
+        landed_repo = _landed_repo(item, cfg)
+        _check_landed_free(db, item_id, number, landed_repo, cfg)
+        landed = (number, landed_repo)
     if landed is not None and item["state"] in MERGED_STATES:
         return _record_landed(db, item, landed, actor=actor, cfg=cfg)
     extra = (note or "").strip()
