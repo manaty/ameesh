@@ -136,14 +136,27 @@ elle n'alloue pas de nouveau numéro et n'ajoute pas d'événement. Une ligne
 d'une autre admission, en cours d'atterrissage ou éjectée reste intacte.
 
 La suppression physique de `queue_remove` nécessite une trace durable pour
-ne pas transformer un retrait en nouvelle candidature. Le stockage inscrit
-dans le journal existant des notes structurées `ameesh-queue-receipt/1`
-(`kind=packet|removed`, `frozen_id`, `generation`), dans la transaction de
-l'allocation ou du retrait. Le retrait prend le même verrou de lot avant la
-ligne de file. Ces traces servent uniquement à conserver la génération d'une
-reprise ou à refuser une réadmission ; elles ne certifient aucun avis ni CI.
-Aucune table, migration ou opération d'API n'est ajoutée. Un retrait individuel
-est également conservé, mais l'inscription individuelle explicite reste possible.
+ne pas transformer un retrait en nouvelle candidature. Les reçus
+(`kind=packet|removed`, `frozen_id`, `generation`) sont inscrits dans
+`integration_train_queue_receipts`, ajoutée à la migration 0442 encore en
+préparation, dans la transaction de l'allocation ou du retrait. Le retrait
+prend le même verrou de lot avant la ligne de file et conserve le `frozen_id`
+de la ligne supprimée, même si le lot a depuis été regelé. Ces traces servent
+uniquement à conserver la génération d'une reprise ou à refuser une réadmission ;
+elles ne certifient aucun avis ni CI. Aucune opération d'API n'est ajoutée.
+Un retrait individuel est également conservé, mais l'inscription individuelle
+explicite reste possible.
+
+Cette séparation corrige le signalement de **dev7, 16 octobre à 13:38** :
+une note libre `ameesh-queue-receipt/1` pouvait auparavant forger une reprise.
+Le lecteur ignore désormais toutes ces notes, y compris celles écrites par
+un ancien binaire ou un autre chemin du journal ; aucune n'est importée comme
+preuve typée. Le contrat SQL ne donne aucun pouvoir d'inscription à `work note`.
+Deux témoins SQL ont reproduit les défauts avant correction (fausse reprise,
+retrait F1 après regel F2). Après correction, les 34 tests d'admission et
+trois contrôles de compatibilité de la file passent avec psycopg et psql ;
+les 19 contrôles du contrat médié passent également. Un troisième témoin
+vérifie qu'une fausse note de retrait ne supplante pas une allocation typée.
 
 Un ancien `queue_remove` pouvait avoir supprimé la ligne avant l'introduction
 de ces traces. L'absence de ligne et de reçu ne prouve donc pas une première
@@ -157,7 +170,9 @@ Sans source qualifiée, `queue-history-unknown` reporte le membre. La reprise
 d'une allocation déjà tracée n'a pas besoin de ce bootstrap, et même un
 lecteur favorable ne peut effacer un retrait tracé. Les tests utilisent une
 qualification initiale simulée sur leur schéma jetable ; ils ne qualifient
-pas l'historique réel de #2005. Ce port historique a été demandé au pilote.
+pas l'historique réel de #2005. Dev7 confirme le 16 octobre à 13:38 qu'aucune
+source existante ne permet ce bootstrap. Sa proposition de déclencheur de retrait
+et de coupure pour les gels futurs reste distincte, sans lecteur ajouté ici.
 
 `enroll_many` renvoie séparément les admissions et les reports nommés par lot,
 et poursuit les candidatures indépendantes. Un refus après allocation conserve

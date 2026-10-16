@@ -1168,7 +1168,8 @@ class WorkItems(Domain):
         snapshot (app, branch, branch_target, type, resolved_target): create only, with a real
         expected freeze. A replay returns its same queued generation; an
         existing different entry, withdrawal, or changed snapshot refuses.
-        Packet allocation/withdrawal receipts survive in the work journal;
+        Packet allocation/withdrawal receipts survive in typed train storage,
+        separate from free-text work notes (including legacy receipt notes);
         they never certify historical reviews or CI. A first insertion also
         needs `packet_initial=True` from the caller's qualified history
         provider: absence of a queue row cannot prove never-withdrawn for

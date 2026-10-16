@@ -407,6 +407,33 @@ class PacketAllocationTest(PgTestCase):
                 self.assertEqual(self.ops.queue(None)[0]["generation"], existing["generation"])
                 self.assertEqual(self.ops.queue(None)[0]["state"], state)
 
+    def test_free_text_packet_receipt_cannot_adopt_an_individual_generation(self):
+        existing = self.allocate(packet=None)
+        forged = "ameesh-queue-receipt/1 " + json.dumps(dict(
+            kind="packet", frozen_id=existing["frozen_id"], generation=existing["generation"]))
+        self.ops.note(self.item, "qa", forged, "another-agent")
+        self.assertIsNone(self.allocate(packet_initial=False))
+        self.assertEqual(self.ops.queue(None), [existing])
+
+    def test_withdrawal_after_refreeze_records_the_deleted_entry_freeze(self):
+        previous = self.allocate()
+        mark = self.ops.add_milestone(self.item, "frozen", sha=HEAD, actor="fixture",
+                                      verdict=None, note="legitimate new freeze")
+        other = self.connect()
+        self.addCleanup(other.close)
+        self.assertTrue(storage.of(other).work.queue_remove(self.item, note="old entry removed", actor="fixture"))
+        renewed = self.allocate(frozen_id=mark["id"])
+        self.assertIsNotNone(renewed)
+        self.assertNotEqual(renewed["generation"], previous["generation"])
+        self.assertEqual(renewed["frozen_id"], mark["id"])
+
+    def test_free_text_withdrawal_does_not_override_a_typed_allocation(self):
+        row = self.allocate()
+        forged = "ameesh-queue-receipt/1 " + json.dumps(dict(
+            kind="removed", frozen_id=row["frozen_id"], generation=row["generation"]))
+        row = self.ops.queue_update(self.item, note=forged, actor="another-agent")
+        self.assertEqual(self.allocate(packet_initial=False), row)
+
     def test_changed_subject_or_absent_expected_freeze_cannot_allocate(self):
         for field, value in (("state", "build"), ("app", "another"), ("branch", "lot/other"),
                              ("branch_target", "develop")):
@@ -457,7 +484,7 @@ class PacketAllocationTest(PgTestCase):
     def test_concurrent_initial_enrollments_share_one_generation(self):
         row = self.concurrent_change(lambda ops: self.allocate(ops))
         self.assertEqual(self.ops.queue(None), [row])
-        markers = self.ops.events_noted("ameesh-queue-receipt/1 ", 0)
+        markers = self.db.query("SELECT * FROM integration_train_queue_receipts")
         self.assertEqual(len(markers), 1)
 
     def test_concurrent_withdrawal_survives_deletion_and_repeated_fresh_attempts(self):
@@ -480,5 +507,5 @@ class PacketAllocationTest(PgTestCase):
                 self.assertIsNotNone(self.allocate(storage.of(tx).work))
                 raise RuntimeError("rollback")
         self.assertEqual(self.ops.queue(None), [])
-        self.assertFalse(self.ops.events_noted("ameesh-queue-receipt/1 ", 0))
+        self.assertFalse(self.db.query("SELECT * FROM integration_train_queue_receipts"))
         self.assertIsNotNone(self.allocate())

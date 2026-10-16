@@ -25,3 +25,18 @@ create table if not exists integration_train_fires (
 );
 create index if not exists integration_train_fires_plan
     on integration_train_fires(target_key, plan_id, id desc);
+
+-- Queue identity evidence is written only by allocation/withdrawal operations.
+-- Free-text work_item_events are never admission receipts, including older
+-- notes with the same apparent format: do not import them into this table.
+create table if not exists integration_train_queue_receipts (
+    id bigserial primary key,
+    work_item_id bigint not null references work_items(id) on delete cascade,
+    generation bigint not null check (generation > 0),
+    frozen_id bigint,
+    kind text not null check (kind in ('packet', 'removed')),
+    created_at timestamptz not null default clock_timestamp(),
+    unique (work_item_id, generation, kind)
+);
+create index if not exists integration_train_queue_receipts_freeze
+    on integration_train_queue_receipts(work_item_id, frozen_id, id);

@@ -250,10 +250,13 @@ réel avec snapshot du lot et gel natif attendu, puis relit la branche, la
 génération et les preuves `Admissions` en mode `packet`. Le chemin SQL
 `packet` insère seulement une nouvelle admission, ou rend sa même génération
 encore en file après une reprise ; il n'écrase aucune admission existante.
-Les traces d'allocation/retrait du journal existant empêchent de réadmettre
-automatiquement le même gel après suppression de sa ligne de file. Le
-retrait et l'allocation prennent le même verrou de lot. L'ambiguïté d'un
-ancien retrait sans trace structurée exige un lecteur initial qualifié,
+Les reçus d'allocation/retrait typés de `integration_train_queue_receipts`
+(migration 0442 en préparation) empêchent de réadmettre automatiquement le
+même gel après suppression de sa ligne de file. Le
+retrait et l'allocation prennent le même verrou de lot ; le retrait conserve
+le gel de la ligne supprimée. Une note libre, même au format des anciens
+reçus, n'est jamais une preuve de file (signalement dev7 du 16/10 à 13:38).
+L'ambiguïté d'un ancien retrait sans trace structurée exige un lecteur initial qualifié,
 injecté explicitement ; son absence produit `queue-history-unknown`, sans
 présumer jamais-inscrit d'une ligne absente. Les reprises déjà tracées
 restent possibles sans ce bootstrap et les retraits tracés restent refusés.
