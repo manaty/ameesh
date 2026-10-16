@@ -6000,6 +6000,7 @@ class Runner:
         #: au plus `drain_seconds` ; un second signal arrête tout de suite
         self.drain_seconds = max(0.0, float(getattr(cfg, "drain_seconds", 1800.0)))
         self.draining = threading.Event()
+        self._stop_signal_received = False
         self._drain_deadline = 0.0
         self._drain_since = 0.0
         self._drain_woken = False
@@ -6827,6 +6828,7 @@ class Runner:
         ordinaire (`systemctl restart`) ne tue donc plus le tour en cours.
         Second signal, borne nulle, ou passage unique : arrêt immédiat, comme
         avant (tour arrêté, consigne remise en attente)."""
+        self._stop_signal_received = True
         if self.once or self.drain_seconds <= 0 or self.draining.is_set():
             immediat = self.draining.is_set()
             self.stop.set()
@@ -7723,6 +7725,17 @@ class Runner:
         sur SIGTERM, au lieu d'arrêter ses tours en 3 s."""
         return (bool(getattr(self, "mediated", False)) and not self.once
                 and getattr(self, "host_gate", None) is not None)
+
+    def stop_on_signal(self) -> bool:
+        """L2009 : un signal d'arrêt a-t-il déjà été traité ?
+
+        `stop` ne dit rien ici : `shutdown` le pose dans tous les cas. Le
+        marqueur de `request_stop` conserve aussi l'arrêt immédiat (drainage
+        nul ou passage unique), qui ne pose pas `draining`. Le retrait médié
+        pose `sigterm_requested`. Le remplacement d'image s'interdit alors
+        de se remplacer."""
+        return (bool(getattr(self, "_stop_signal_received", False))
+                or self.draining.is_set() or bool(self.sigterm_requested))
 
     def _sigterm_drained(self) -> bool:
         """Retrait engagé par SIGTERM et terminé (aucun bail détenu). Engage
@@ -9280,6 +9293,70 @@ def attach_main(argv: list[str] | None = None) -> int:
             _sortie_sure(code)
 
 
+#: signaux d'arrêt de l'exécuteur : SIGTERM de systemd, SIGINT du terminal
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+class StopRequested(Exception):
+    """L2009 : un signal d'arrêt a été reçu avant que l'exécuteur ne tourne.
+
+    L'attente de la base au démarrage pose un gestionnaire temporaire ; quand
+    la base finit par répondre, le signal ne doit pas être avalé (incident du
+    16/10 : l'unité restait `deactivating/stop-sigterm` et l'exécuteur
+    reprenait des tours). L'appelant sort proprement, sans tour ni bail.
+    `signum` dit lequel."""
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = int(signum)
+
+
+def _signal_label(signum: int) -> str:
+    """Nom lisible d'un signal (`SIGTERM`), pour le journal."""
+    try:
+        return signal.Signals(signum).name
+    except ValueError:  # pragma: no cover - signal inconnu du système
+        return str(signum)
+
+
+def _replace_image_or_stop(runner) -> int:
+    """L790/L2009 : remplacement d'image entre deux tours, ou sortie propre.
+
+    Un signal d'arrêt reçu pendant que l'exécuteur se remplace ne doit jamais
+    être perdu (incident #2009 : `systemctl restart` concurrent du redémarrage
+    L790, unité `deactivating/stop-sigterm` 26 min, tours repris). S'il a déjà
+    été traité, on ne se remplace pas : on sort en 0, ce que le service attend.
+    Sinon les dispositions d'arrêt repassent au DÉFAUT avant l'`exec` : un
+    signal reçu ensuite tue le processus — l'arrêt demandé est honoré — au lieu
+    d'être consommé par le gestionnaire de l'image sortante. Le contrôle qui
+    suit la remise au défaut rattrape un gestionnaire déjà déclenché dont
+    l'effet (drainage, retrait médié) n'était pas encore visible. Rend le code
+    de sortie quand l'`exec` échoue (le service relance)."""
+    if runner is not None and runner.stop_on_signal():
+        # Le journal est déjà fermé (`_sortie_sure`) : écriture directe, comme
+        # le message du remplacement ; quelques octets, jamais bloquante.
+        print("agent-runner: image replacement cancelled: stop already requested",
+              file=sys.stderr, flush=True)
+        return 0
+    anciens = {}
+    for sig in STOP_SIGNALS:
+        try:
+            anciens[sig] = signal.signal(sig, signal.SIG_DFL)
+        except ValueError:  # hors du fil principal (tests)
+            pass
+    try:
+        if runner is not None and runner.stop_on_signal():
+            print("agent-runner: image replacement cancelled: stop requested "
+                  "during the replacement", file=sys.stderr, flush=True)
+            return 0
+        _restart_with_installed_code()
+    finally:
+        # Atteint seulement si l'`exec` n'a pas remplacé l'image (échec) ou si
+        # un arrêt a été rattrapé : on rend les dispositions d'avant.
+        for sig, ancien in anciens.items():
+            signal.signal(sig, ancien)
+    return EXIT_RESTART
+
+
 def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
     """Connexion de l'exécuteur au démarrage.
 
@@ -9288,12 +9365,21 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
     pas encore là (2026-10-10 : un exécuteur du poste sorti en échec à 12:35:20,
     relancé à la main à 12:39) — n'est plus une sortie en échec : attente
     croissante (2 s… `db_retry_max`), jusqu'à la base ou un signal d'arrêt. En
-    `--once`, l'échec reste immédiat."""
+    `--once`, l'échec reste immédiat.
+
+    L2009 : un signal d'arrêt reçu pendant cette attente n'est jamais avalé,
+    même quand la base finit par répondre. Le gestionnaire temporaire ne sert
+    qu'à sortir de l'attente : il lève `StopRequested`, et l'appelant sort
+    proprement (code 0, aucun tour, aucun bail)."""
     reprise = Reprise(float(getattr(cfg, "db_retry_max", 60.0)))
     arret = threading.Event()
+    signaux: list[int] = []
     anciens = {}
+    db = None
     if wait:
         def handler(signum, _frame):
+            # gestionnaire de signal : des drapeaux seulement
+            signaux.append(signum)
             arret.set()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -9305,7 +9391,9 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
             try:
                 db = db_mod.connect(cfg)
             except db_mod.Unavailable as exc:
-                if not wait or arret.is_set():
+                if arret.is_set():
+                    return None
+                if not wait:
                     print("agent-runner: %s unreachable: %s"
                           % ("mesh server" if getattr(cfg, "backend", None) == "mediated"
                              else "database", exc), file=sys.stderr)
@@ -9315,8 +9403,6 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
                     "in %ds (failure %d)" % (db_mod.explain(exc), int(attente),
                                              reprise.echecs))
                 if arret.wait(attente):
-                    print("agent-runner: stop requested before the database answered",
-                          file=sys.stderr)
                     return None
                 continue
             bilan = reprise.retablie()
@@ -9327,6 +9413,17 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
     finally:
         for sig, ancien in anciens.items():
             signal.signal(sig, ancien)
+        if arret.is_set():
+            # L2009 : le signal a été consommé pendant l'attente — ne pas
+            # l'avaler. La base éventuellement ouverte est rendue ici, `main`
+            # ne la verra jamais.
+            closer = getattr(db, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # la sortie ne dépend pas de cette fermeture
+                    pass
+            raise StopRequested(signaux[0] if signaux else signal.SIGTERM)
 
 
 def _take_settings(args) -> dict | None:
@@ -9410,7 +9507,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print("agent-runner: %s" % exc, file=sys.stderr)
         return 2
-    db = _connect_at_start(cfg, wait=not parsed.once)
+    try:
+        db = _connect_at_start(cfg, wait=not parsed.once)
+    except StopRequested as exc:
+        # L2009 : un signal d'arrêt a été reçu pendant l'attente de la base —
+        # sortie propre (code 0, le service ne relance pas), sans tour ni bail.
+        print("agent-runner: %s received at startup: exiting without a turn"
+              % _signal_label(exc.signum), file=sys.stderr)
+        return 0
     if db is None:
         return 1
     #: 1 tant que `run` n'a pas rendu : une exception sort en échec, y compris
@@ -9490,8 +9594,11 @@ def main(argv: list[str] | None = None) -> int:
     # telle quelle (mêmes options, même identité) pour reprendre le code neuf,
     # sans attendre un humain. Si le remplacement direct échoue, le code 75
     # sort en échec et le service (`Restart=on-failure`) relance l'exécuteur.
+    # L2009 : un signal d'arrêt reçu entre-temps fait sortir proprement (0) au
+    # lieu de se remplacer — le remplacer avalerait le signal et l'unité
+    # resterait `deactivating` pendant que l'image neuve reprend des tours.
     if code == EXIT_RESTART:
-        _restart_with_installed_code()
+        code = _replace_image_or_stop(runner)
     return code
 
 
