@@ -28,8 +28,8 @@ Refus (codes stables, portés par `WorkflowRefusal.code`) :
 * lecture     `json-invalid`, `key-duplicate` ;
 * forme       `value-type`, `value-empty`, `key-unknown`, `key-missing`,
               `schema-unsupported`, `ref-invalid`, `version-invalid` ;
-* étapes      `stage-duplicate`, `core-unknown`, `initial-undeclared`,
-              `stage-unreachable` ;
+* étapes      `stage-duplicate`, `stage-padded`, `stage-case-duplicate`,
+              `core-unknown`, `initial-undeclared`, `stage-unreachable` ;
 * types       `type-duplicate`, `type-unsupported` ;
 * arêtes      `edge-duplicate`, `edge-ambiguous`, `edge-undeclared`,
               `guard-unknown`, `terminal-reopening` ;
@@ -258,6 +258,7 @@ def _stages(value: Any) -> tuple[Stage, ...]:
     items = _list(value, path)
     out: list[Stage] = []
     seen: set[str] = set()
+    folded: dict[str, str] = {}
     for index, raw in enumerate(items):
         item = "%s[%d]" % (path, index)
         obj = _mapping(raw, item)
@@ -267,10 +268,19 @@ def _stages(value: Any) -> tuple[Stage, ...]:
         if core not in CORE_STATES:
             raise WorkflowRefusal("core-unknown", item + ".core",
                                   "cœur hors de %s" % ", ".join(CORE_STATES))
+        if status != status.strip():
+            raise WorkflowRefusal("stage-padded", item + ".status",
+                                  "espaces en bord dans le statut")
+        key = status.casefold()
+        other = folded.get(key)
+        if other is not None and other != status:
+            raise WorkflowRefusal("stage-case-duplicate", item + ".status",
+                                  "statut identique à la casse près à %s" % other)
         if status in seen:
             raise WorkflowRefusal("stage-duplicate", item + ".status",
                                   "statut déclaré deux fois")
         seen.add(status)
+        folded[key] = status
         out.append(Stage(status=status, core=core))
     return tuple(out)
 

@@ -496,6 +496,10 @@ class RegistryTest(PgTestCase):
             self.apply(self.command(lot, to="review", guard="qa_started"))
         with self.refusal("edge-undeclared"):
             self.apply(self.command(lot, to="implementation", guard="qa_repair"))
+        # #2086 N2: the direct stop is declared under `stop_work`, not under
+        # `planning` — the pair exists, the (to, guard) edge does not.
+        with self.refusal("edge-undeclared"):
+            self.apply(self.command(lot, to="stopped", guard="planning"))
         self.assertEqual(self.events(lot), [])
 
     def test_different_current_stage(self):
