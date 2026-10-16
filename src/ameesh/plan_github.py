@@ -445,8 +445,11 @@ def _write_counters(state_dir, root, lock_path, quota_path, pending, clock,
             fcntl.flock(fd, fcntl.LOCK_UN)
         with contextlib.suppress(OSError):
             os.close(fd)
-    if not merged:
-        _restore_pending(pending, taken, pending_lock)
+        # Dans `finally` : une panne d'un autre type (TypeError d'un
+        # `quota.json` aux valeurs étrangères) se propage, mais rend aussi
+        # les compteurs retirés.
+        if not merged:
+            _restore_pending(pending, taken, pending_lock)
 
 
 class SharedReads:
@@ -708,11 +711,13 @@ class SharedReads:
                 written = True
                 return quota["blocked_until"] or None
         except (OSError, ValueError):
+            return None
+        finally:
             # #1927 : le retrait n'est confirmé qu'une fois l'écriture faite ;
-            # les compteurs retirés reviennent tant qu'elle n'a pas eu lieu.
+            # les compteurs retirés reviennent tant qu'elle n'a pas eu lieu,
+            # quelle que soit la panne.
             if not written:
                 _restore_pending(self._pending, taken, self._pending_lock)
-            return None
 
     def blocked(self, now=None, resource: str = DEFAULT_RESOURCE) -> float | None:
         """L'instant (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""

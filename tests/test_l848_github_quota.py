@@ -355,6 +355,24 @@ class SharedReadsTest(unittest.TestCase):
         reads.flush()
         self.assertEqual(self.reads().counters()["hits"], 2)
 
+    def test_panne_inattendue_rend_aussi_les_compteurs(self):
+        """#1927 : une panne hors OSError/ValueError (un `quota.json` aux
+        valeurs d'un autre type lève TypeError dans la fusion) se propage
+        comme avant, mais ne perd pas les compteurs déjà retirés."""
+        for path in ("flush", "note"):
+            with self.subTest(path=path):
+                reads = self.reads()
+                reads.count("hits", 2)
+                with mock.patch.object(plan_github, "_atomic_write",
+                                       side_effect=TypeError("valeur illisible")):
+                    with self.assertRaises(TypeError):
+                        if path == "flush":
+                            reads.flush()
+                        else:
+                            reads.note(quota_headers(remaining="4990"), status=200)
+                self.assertEqual(reads._pending.get("hits"), 2)
+                reads._pending.clear()
+
     def test_finaliseur_ne_perd_pas_un_increment_concurrent(self):
         """#1927 : le finaliseur écrit par le même chemin ; un incrément reçu
         d'une autre instance vivante pendant son écriture reste visible."""
