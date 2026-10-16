@@ -18,7 +18,7 @@ import time
 
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, mail, registry
+from . import fastmail, fil, identity, mail, registry
 from .config import Config
 
 
@@ -115,6 +115,10 @@ class FileBackend:
             os.replace(tmp, os.path.join(self.inbox_dir(target), filename))
             if not copie:
                 written.append((target, filename))
+        # #1689 (N1) : le chemin rapide du destinataire (repli fichier) voit le
+        # dépôt sans attendre le TTL, y compris pour un envoi en copie.
+        for target, _genre, _charge, _copie in envois:
+            fastmail.bump(self.cfg, target)
         # Le fil, après le dépôt : une erreur ici ne perd rien (fil.record ne
         # lève pas). `v0` permet à import-v0 de ne pas réécrire ces messages.
         def chantier(name: str) -> str:

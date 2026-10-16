@@ -62,6 +62,21 @@ class _Base(PgTestCase):
             "SELECT body FROM agent_mailbox WHERE recipient = %s AND delivered_at IS NULL "
             "ORDER BY id", (name,))]
 
+    def _touched(self, name: str) -> int:
+        """#885 : les non-lus qu'une réservation a touchés (posée puis rendue,
+        ou soldée) — le témoin du churn : `consigne` ou `deja_consigne`."""
+        return self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox"
+            " WHERE recipient = %s AND delivered_at IS NULL"
+            "   AND (meta ? 'consigne' OR meta ? 'deja_consigne')", (name,))[0]["n"]
+
+    def _backlog(self, name: str, n: int) -> None:
+        """#885 : `n` non-lus ordinaires d'un coup (sans passer par `mail.send`)."""
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " SELECT 'bulk', %s, 'Ordinary backlog ' || i, 'notify', '{}'::jsonb"
+            "   FROM generate_series(1, %s) i", (name, n))
+
 
 class MidTurnHookTest(_Base):
     def _mail(self, name: str) -> None:
@@ -92,6 +107,62 @@ class MidTurnHookTest(_Base):
                 self.assertEqual(stop["decision"], "block")
                 self.assertIn("Ordinary progress note.", stop["reason"])
                 self.assertEqual(self._pending(name), [])
+
+    def test_verdict_behind_two_hundred_unread_is_seen_mid_turn(self):
+        """#885 : le verdict est derrière plus de `UNREAD_LIMIT` non-lus ; il
+        est vu au point sûr, et le retard ordinaire n'est pas touché (aucune
+        réservation, aucune libération : pas de churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "deep-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 250)
+                mail.send(self.db, "codex-review", name, "Verdict beyond 200.",
+                          payload={"verdict": True})
+                context = json.loads(self._hook(worker, harness, "PostToolUse")
+                                     )["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("Verdict beyond 200.", context)
+                self.assertNotIn("Ordinary backlog", context)
+                self.assertEqual(len(self._pending(name)), 250)
+                self.assertEqual(self._touched(name), 0)
+
+    def test_ordinary_mail_does_not_churn_the_reservation(self):
+        """#885 : deux points sûrs sans rien d'urgent n'écrivent RIEN — l'ancien
+        chemin réservait jusqu'à 200 non-lus puis les relâchait (le churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "churn-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 3)
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._touched(name), 0)
+                self.assertEqual(len(self._pending(name)), 3)
+
+    def test_active_reservations_do_not_hide_the_next_eligible_message(self):
+        worker = self._leased("reserved-codex", "codex")
+        ids = [int(row["id"]) for row in self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, payload)"
+            " SELECT 'review', %s, 'Reserved verdict ' || i, '{\"verdict\":true}'::jsonb"
+            " FROM generate_series(1, 200) i RETURNING id", (worker.name,))]
+        mail.reserve(self.db, worker.name, worker.runner.runner_id, worker.epoch,
+                     "other-token", ids=ids, porteur="consigne", ttl_seconds=3600)
+        last = mail.send(self.db, "review", worker.name, "Verdict after reservations",
+                         payload={"verdict": True})
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=1)], [last])
+        out = self._hook(worker, "codex", "PostToolUse")
+        self.assertIn("Verdict after reservations", out)
+        self.assertNotIn("Reserved verdict", out)
+        self.assertEqual(len(self._pending(worker.name)), 200)
+        # A reservation from an old lease or an expired one is reclaimable.
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,epoch}', to_jsonb(%s::bigint)) WHERE id = %s",
+                        (worker.epoch - 1, ids[0]))
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,expire}', '0'::jsonb) WHERE id = %s", (ids[1],))
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=2)], ids[:2])
 
     def test_owner_mail_alone_interrupts_a_dsh_turn(self):
         for harness in ("deepseek", "codex"):
