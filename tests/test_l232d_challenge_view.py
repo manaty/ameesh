@@ -12,6 +12,7 @@ passkey logicielle (tests/webauthn_soft.py), horloge avançable.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import unittest
 from urllib.parse import urlsplit
 
 from ameesh import receipts
+from ameesh.approve.service import ApproveService
 
 from .test_approve import AGENT, ALICE, ApproveBase
 from .webauthn_soft import SoftWebAuthn
@@ -78,11 +80,21 @@ class LoginReceiptFormTest(unittest.TestCase):
 
 
 class LoginChallengeTest(ApproveBase):
+    #: l'API des défis est ouverte sur ce banc, avec son jeton DÉDIÉ : le
+    #: jeton de service de l'équipe n'y est jamais accepté (avis B1 dev4).
+    LOGIN_API = True
+
+    def login_api(self, method: str, path: str, body=None, **kwargs):
+        """Appel de l'API des défis : jeton de connexion, pas celui d'équipe."""
+        kwargs.setdefault("host", self.local)
+        kwargs.setdefault("auth", self.login_token)
+        return self.http(method, path, body, **kwargs)
+
     def create_login(self, **overrides):
         body = {"host": "ameesh-agents-1", "provider": "gh", "account": "smichea",
                 "approver": ALICE, "requested_by": AGENT, "url": URL, "code": CODE}
         body.update(overrides)
-        status, _headers, payload = self.api("POST", "/login-requests", body)
+        status, _headers, payload = self.login_api("POST", "/login-requests", body)
         self.assertEqual(status, 201, payload)
         data = json.loads(payload)
         self.assertRegex(data["login_id"], r"^lgn_[0-9a-z]{26}$")
@@ -102,7 +114,7 @@ class LoginChallengeTest(ApproveBase):
         return page, payload
 
     def fetch_login_receipt(self, login_id):
-        status, _headers, payload = self.api("GET", "/login-receipts/" + login_id)
+        status, _headers, payload = self.login_api("GET", "/login-receipts/" + login_id)
         return status, json.loads(payload)
 
     def verify(self, raw, *, login_id, exp, **kwargs):
@@ -278,7 +290,7 @@ class LoginChallengeTest(ApproveBase):
     def test_url_hors_domaine_refusee(self):
         for url in ("https://evil.example/login", "http://github.com/login/device",
                     "https://github.com.evil.example/x", "https://user:pw@github.com/x"):
-            status, _headers, payload = self.api("POST", "/login-requests", {
+            status, _headers, payload = self.login_api("POST", "/login-requests", {
                 "host": "ameesh-agents-1", "provider": "gh", "account": "smichea",
                 "approver": ALICE, "requested_by": AGENT, "url": url, "code": CODE})
             self.assertEqual(status, 400, payload)
@@ -286,17 +298,43 @@ class LoginChallengeTest(ApproveBase):
     def test_provider_et_code_controles(self):
         for overrides in ({"provider": "gemini"}, {"code": "has space"}, {"host": "a b"},
                           {"account": "a" * 200}, {"scope": "x\ny"}):
-            status, _headers, payload = self.api("POST", "/login-requests", {
+            status, _headers, payload = self.login_api("POST", "/login-requests", {
                 "host": "ameesh-agents-1", "provider": "gh", "account": "smichea",
                 "approver": ALICE, "requested_by": AGENT, "url": URL, "code": CODE,
                 **overrides})
             self.assertEqual(status, 400, payload)
 
-    def test_jeton_de_service_exige(self):
+    def test_jeton_de_connexion_exige(self):
+        # sans jeton : 401
         status, _headers, _payload = self.http("POST", "/login-requests", {
             "host": "h", "provider": "gh", "account": "a", "approver": ALICE,
             "requested_by": AGENT, "url": URL, "code": CODE}, host=self.local)
         self.assertEqual(status, 401)
+        # le jeton de SERVICE DE L'ÉQUIPE n'ouvre JAMAIS un défi (avis B1 dev4) :
+        # tous les agents le lisent, et l'humain signerait un code généré ailleurs
+        status, _headers, payload = self.api("POST", "/login-requests", {
+            "host": "h", "provider": "gh", "account": "a", "approver": ALICE,
+            "requested_by": AGENT, "url": URL, "code": CODE})
+        self.assertEqual(status, 401, payload)
+        self.assertEqual(json.loads(payload)["error"], "unauthorized")
+        # ni sur la lecture du reçu
+        self.assertEqual(self.api("GET", "/login-receipts/lgn_" + "a" * 26)[0], 401)
+        # le jeton de connexion ne vaut pas non plus pour l'API d'approbation
+        status, _headers, payload = self.http(
+            "POST", "/requests", {"action_id": "act_" + "a" * 26, "approver": ALICE,
+                                  "requested_by": AGENT},
+            host=self.local, auth=self.login_token)
+        self.assertEqual(status, 401, payload)
+
+    def test_page_dit_declare_non_verifie(self):
+        """B1(b) : la page ne présente plus l'hôte ni le demandeur comme un fait."""
+        _data, path = self.create_login()
+        status, _headers, text = self.page(path)
+        self.assertEqual(status, 200, text)
+        self.assertIn("declared by the caller, not verified", text)
+        self.assertIn("generated", text)
+        self.assertIn("only continue if you started this connection yourself", text)
+        self.assertNotIn("An agent requests a", text)
 
     def test_ttl_borne(self):
         # 15 min au plus
@@ -311,7 +349,7 @@ class LoginChallengeTest(ApproveBase):
         record = self.service.store.get_login(data["login_id"])
         self.assertLessEqual(record["request"]["exp"] - record["request"]["iat"], 120)
         # une échéance passée est refusée
-        status, _headers, _payload = self.api("POST", "/login-requests", {
+        status, _headers, _payload = self.login_api("POST", "/login-requests", {
             "host": "ameesh-agents-1", "provider": "gh", "account": "smichea",
             "approver": ALICE, "requested_by": AGENT, "url": URL, "code": CODE,
             "provider_exp": now - 1})
@@ -365,6 +403,40 @@ class LoginChallengeTest(ApproveBase):
         # le code privé est effacé dès le reçu signé
         self.assertIsNone(self.service.store.login_private(data["login_id"]))
         self.assertFalse(os.path.exists(private))
+
+
+class LoginApiClosedTest(ApproveBase):
+    """L'API des défis est FERMÉE par défaut (avis B1 dev4, option a) : aucun
+    jeton, ni celui de l'équipe ni celui du superviseur, n'y ouvre un défi
+    tant que le service ne l'a pas ouverte par écrit (`login_api: "open"`)."""
+
+    LOGIN_API = False
+
+    def test_fermee_par_defaut(self):
+        body = {"host": "ameesh-agents-1", "provider": "gh", "account": "smichea",
+                "approver": ALICE, "requested_by": AGENT, "url": URL, "code": CODE}
+        for auth in (None, self.service_token, self.login_token):
+            kwargs = {"host": self.local}
+            if auth is not None:
+                kwargs["auth"] = auth
+            status, _headers, payload = self.http("POST", "/login-requests", body, **kwargs)
+            self.assertEqual(status, 403, (auth, payload))
+            self.assertEqual(json.loads(payload)["error"], "login_api_closed", payload)
+        for auth in (None, self.service_token, self.login_token):
+            kwargs = {"host": self.local}
+            if auth is not None:
+                kwargs["auth"] = auth
+            self.assertEqual(
+                self.http("GET", "/login-receipts/lgn_" + "a" * 26, **kwargs)[0], 403)
+
+    def test_service_sans_jeton_de_connexion_reste_ferme(self):
+        """Même config ouverte, sans jeton dédié chargé : refus (fail closed)."""
+        opened = dataclasses.replace(self.acfg, login_api="open")
+        service = ApproveService(opened, None, None, service_token=self.service_token)
+        self.assertFalse(service.login_api_open)
+        self.assertFalse(service.check_login_token(self.login_token))
+        # et un jeton vide ne vaut rien non plus
+        self.assertFalse(service.check_login_token(""))
 
 
 def receipts_render_summary_digest(request: dict) -> str:

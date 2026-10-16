@@ -355,6 +355,12 @@ class Config:
     #: AMEESH_APPROVE_ORIGINS (contrôle : `ameesh approve-check`).
     approve_url: str = ""
     approve_token_file: str = ""
+    #: L232d (#366) : jeton DÉDIÉ de l'API des défis de connexion
+    #: (AMEESH_LOGIN_TOKEN_FILE, 0600), distinct du jeton de service de
+    #: l'équipe ; tenu par le superviseur/exécuteur du compte, hors de portée
+    #: des agents. Vide : aucune connexion publiée (l'API est de toute façon
+    #: fermée par défaut côté service).
+    login_token_file: str = ""
     #: TLS local du service (passthrough) appelé sur la boucle locale :
     #: `approve_url` = https://127.0.0.1:PORT, certificat vérifié pour CE nom
     #: d'hôte H (AMEESH_APPROVE_TLS_NAME) ; vide = nom de l'URL
@@ -693,10 +699,12 @@ def load(env: dict | None = None) -> Config:
                  default=cfg.require_responsible), None, "AMEESH_REQUIRE_RESPONSIBLE"),
     )
     token_file = pick("AMEESH_APPROVE_TOKEN_FILE", default=cfg.approve_token_file) or ""
+    login_token_file = pick("AMEESH_LOGIN_TOKEN_FILE", default=cfg.login_token_file) or ""
     cfg = replace(
         cfg,
         approve_url=str(pick("AMEESH_APPROVE_URL", default=cfg.approve_url) or "").strip(),
         approve_token_file=_expand(str(token_file)) if token_file else "",
+        login_token_file=_expand(str(login_token_file)) if login_token_file else "",
         approve_tls_name=str(pick("AMEESH_APPROVE_TLS_NAME", default=cfg.approve_tls_name)
                              or "").strip().lower(),
     )

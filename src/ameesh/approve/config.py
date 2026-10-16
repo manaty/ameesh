@@ -12,8 +12,15 @@ Lue dans cet ordre, la dernière source l'emporte :
    `TLS_CERT`, `TLS_KEY`) ;
 3. les options de la ligne de commande.
 
-`api_via_public` n'existe que dans le fichier JSON : ouvrir l'API de service
-sous l'hôte public est un choix écrit, jamais une option d'environnement.
+`api_via_public` et `login_api` n'existent que dans le fichier JSON : ouvrir
+l'API de service sous l'hôte public, ou ouvrir l'API des défis de connexion
+(L232d), est un choix écrit, jamais une option d'environnement. L'API des
+défis est FERMÉE par défaut ; ouverte, elle exige un jeton qui lui est propre
+(`login_token_file`, distinct du jeton de service de l'équipe, et refusé s'il
+désigne le même fichier) : le jeton de service de l'équipe, lisible par tous
+ses agents, ne peut donc pas déposer de défi de connexion. Le jeton de
+connexion se garde hors de portée des agents (superviseur/exécuteur du
+compte).
 
 Règles de sûreté vérifiées ici, au démarrage :
 
@@ -53,6 +60,7 @@ from .. import httpkit, receipts
 DEFAULT_CONFIG = "~/.config/ameesh-approve/config.json"
 DEFAULT_STATE = "~/.local/state/ameesh-approve"
 DEFAULT_TOKEN_FILE = "~/.config/ameesh-approve/service-token"
+DEFAULT_LOGIN_TOKEN_FILE = "~/.config/ameesh-approve/login-token"
 DEFAULT_PORT = 8765
 
 #: une demande d'approbation vit au plus 15 minutes (exp court, spec §8.1)
@@ -67,6 +75,11 @@ MAX_TOKEN_FILE = httpkit.MAX_TOKEN_FILE
 PROFILE_STRICT = "strict"
 PROFILE_COMPATIBLE = "compatible"
 PROFILES = (PROFILE_STRICT, PROFILE_COMPATIBLE)
+#: API des défis de connexion (L232d, #366) : fermée par défaut ; « open » est
+#: un choix écrit du fichier JSON, et exige le jeton dédié `login_token_file`
+LOGIN_API_CLOSED = "closed"
+LOGIN_API_OPEN = "open"
+LOGIN_APIS = (LOGIN_API_CLOSED, LOGIN_API_OPEN)
 #: toujours réservés, quelle que soit la configuration (décision 0026) : la
 #: zone des hôtes d'équipe et son apex d'approbation ne sont jamais un RP ID
 BUILTIN_RESERVED_ZONES = ("nexlink.ph",)
@@ -152,6 +165,17 @@ class ApproveConfig:
     #: que sous un Host local (127.0.0.1:port) : ameesh l'appelle sur la boucle
     #: locale, le mandataire public ne l'expose pas.
     api_via_public: bool = False
+    #: API des défis de connexion (L232d, #366) : « closed » (défaut) refuse
+    #: POST /login-requests et GET /login-receipts ; « open » (choix écrit du
+    #: JSON seulement) les sert au porteur du jeton DÉDIÉ `login_token_file`,
+    #: jamais au jeton de service de l'équipe — celui-ci est lisible par tous
+    #: ses agents, et un défi déposé par un agent quelconque ferait signer à
+    #: l'humain un code d'appareil généré ailleurs (avis sécurité dev4, B1).
+    login_api: str = LOGIN_API_CLOSED
+    #: jeton du superviseur de connexion, seul autorisé sur l'API des défis
+    #: quand elle est ouverte ; fichier privé 0600, hors de portée des agents,
+    #: distinct du jeton de service.
+    login_token_file: str = _expand(DEFAULT_LOGIN_TOKEN_FILE)
     #: utiliser le dernier élément de X-Forwarded-For comme IP du client (à
     #: n'activer que derrière un mandataire qui pose cet en-tête)
     trust_forwarded: bool = False
@@ -298,6 +322,18 @@ class ApproveConfig:
             raise ApproveConfigError("action_table: simple SQL identifier expected")
         if not isinstance(self.api_via_public, bool):
             raise ApproveConfigError("api_via_public: JSON boolean expected (true | false)")
+        if self.login_api not in LOGIN_APIS:
+            raise ApproveConfigError("unknown login_api: %r (%s)"
+                                     % (self.login_api, ", ".join(LOGIN_APIS)))
+        if self.login_api == LOGIN_API_OPEN and not self.login_token_file:
+            raise ApproveConfigError(
+                "login_api %r requires login_token_file: the dedicated token of the login "
+                "supervisor (0600, out of the agents' reach); the team service token is never "
+                "accepted on the login API" % LOGIN_API_OPEN)
+        if self.login_token_file and _expand(self.login_token_file) == _expand(self.token_file):
+            raise ApproveConfigError(
+                "login_token_file must be DISTINCT from token_file: the team service token, "
+                "readable by every agent of the team, cannot open a connection challenge")
         return replace(self, origins=origins, reserved_zones=_names(self.reserved_zones),
                        reserved_hosts=_names(self.reserved_hosts))
 
@@ -339,6 +375,7 @@ _ENV = {
     "AMEESH_APPROVE_BIND": "bind",
     "AMEESH_APPROVE_PORT": "port",
     "AMEESH_APPROVE_TOKEN_FILE": "token_file",
+    "AMEESH_APPROVE_LOGIN_TOKEN_FILE": "login_token_file",
     "AMEESH_APPROVE_STATE": "state_dir",
     "AMEESH_APPROVE_PROPOSALS": "proposals_dir",
     "AMEESH_APPROVE_LEVEL": "level",
@@ -348,7 +385,7 @@ _ENV = {
     "AMEESH_APPROVE_TLS_CERT": "tls_cert",
     "AMEESH_APPROVE_TLS_KEY": "tls_key",
 }
-_PATHS = ("token_file", "state_dir", "proposals_dir", "tls_cert", "tls_key")
+_PATHS = ("token_file", "login_token_file", "state_dir", "proposals_dir", "tls_cert", "tls_key")
 
 
 def _coerce(name: str, value):
@@ -429,6 +466,13 @@ def read_service_token(path: str) -> str:
     """Lit le jeton de service ; refuse un fichier lisible par d'autres."""
     return httpkit.read_token_file(path, what="service token",
                                    hint="ameesh-approve gen-token", error=ApproveConfigError)
+
+
+def read_login_token(path: str) -> str:
+    """Lit le jeton du superviseur de connexion (L232d) ; mêmes contrôles."""
+    return httpkit.read_token_file(path, what="login token",
+                                   hint="ameesh-approve gen-token --login",
+                                   error=ApproveConfigError)
 
 
 def write_service_token(path: str) -> str:

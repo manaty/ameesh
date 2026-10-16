@@ -68,6 +68,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     cfg = _config(args, bind=args.bind, port=args.port, token_file=args.token_file,
                   tls_cert=args.tls_cert, tls_key=args.tls_key)
     token = config_mod.read_service_token(cfg.token_file)
+    login_token = None
+    if cfg.login_api == config_mod.LOGIN_API_OPEN:
+        # L232d (avis B1) : l'API des défis n'est ouverte qu'au porteur du
+        # jeton dédié, lu ici une fois (mêmes contrôles de fichier privé).
+        login_token = config_mod.read_login_token(cfg.login_token_file)
     tls = None
     if cfg.tls:
         from .tls import TlsReloader
@@ -85,7 +90,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except ActionSourceError as exc:
             print("warning: %s; POST /requests will answer 503 while it is missing" % exc,
                   file=sys.stderr)
-        service = ApproveService(cfg, db, source, service_token=token, db_lock=lock)
+        service = ApproveService(cfg, db, source, service_token=token,
+                                 login_token=login_token, db_lock=lock)
         server = make_server(service, tls=tls)
         if tls is not None and hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, lambda _sig, _frame: tls.request_reload())
@@ -97,6 +103,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                  ", ".join(cfg.origins),
                  "ALSO under the public host (api_via_public)" if cfg.api_via_public
                  else "on loopback only", cfg.state_dir), file=sys.stderr)
+        print("login API (connection challenges): %s"
+              % ("open (dedicated login token)" if login_token is not None else "closed"),
+              file=sys.stderr)
         try:
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
@@ -131,6 +140,13 @@ def cmd_enroll_link(args: argparse.Namespace) -> int:
 
 
 def cmd_gen_token(args: argparse.Namespace) -> int:
+    if getattr(args, "login", False):
+        path = (args.token_file or os.environ.get("AMEESH_APPROVE_LOGIN_TOKEN_FILE")
+                or config_mod.DEFAULT_LOGIN_TOKEN_FILE)
+        written = config_mod.write_service_token(path)
+        print("login token created: %s (0600) — keep it out of the agents' reach; "
+              "the service accepts it only when login_api is \"open\"" % written)
+        return 0
     path = (args.token_file or os.environ.get("AMEESH_APPROVE_TOKEN_FILE")
             or config_mod.DEFAULT_TOKEN_FILE)
     written = config_mod.write_service_token(path)
@@ -165,6 +181,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_token = sub.add_parser("gen-token", help="create the service token")
     p_token.add_argument("--token-file", default=None,
                          help="default: AMEESH_APPROVE_TOKEN_FILE or %s" % config_mod.DEFAULT_TOKEN_FILE)
+    p_token.add_argument("--login", action="store_true",
+                        help="create the DEDICATED login token instead (L232d, login_api "
+                             "open): default AMEESH_APPROVE_LOGIN_TOKEN_FILE or %s"
+                             % config_mod.DEFAULT_LOGIN_TOKEN_FILE)
     p_token.set_defaults(func=cmd_gen_token)
     return parser
 

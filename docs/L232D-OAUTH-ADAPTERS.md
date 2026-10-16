@@ -38,6 +38,42 @@ the view again is allowed (viewing does not consume the challenge nonce);
 signing `done` or `cancel` does, and the stored URL/code are erased as soon as
 a signed receipt exists.
 
+## Who may open a challenge: closed by default (B1)
+
+`POST /login-requests` and `GET /login-receipts/<id>` form the **login API**.
+It is **closed by default**: the service answers `403 login_api_closed`
+whatever the token. Opening it is a *written* choice of the service JSON,
+never an environment variable:
+
+```json
+{"login_api": "open", "login_token_file": "/etc/ameesh-approve/login-token"}
+```
+
+- the login API accepts **only** the dedicated token in `login_token_file`
+  (0600, same file checks as the service token; created with
+  `ameesh-approve gen-token --login`). The team service token — readable by
+  every agent of the team — is never accepted there: otherwise any holder
+  could file a device code generated elsewhere, with `host` set to the
+  expected host, and the passkey page would present it as a fact (the
+  device-auth grant goes to the process that generated the code, which the
+  service cannot bind).
+- `login_token_file` must be a **different file** from `token_file`; the
+  service refuses the configuration otherwise.
+- the login token is held by the login **supervisor/executor** of the account,
+  out of the agents' reach (no agent process reads it, no agent-readable
+  file). Its custody is a pilot decision (see preconditions); a token readable
+  by the agents would degrade the confinement back to a declared-only claim.
+- the ameesh client reads `AMEESH_LOGIN_TOKEN_FILE` (`login_token_file`);
+  without it, `ameesh accounts login` refuses before publishing.
+
+The page states what the service actually knows: the host and the requester
+are shown as **"declared by the caller, not verified"**, and the private view
+warns that the code authorises the device that **generated** it — "only
+continue if you started this connection yourself". That residual risk
+(device-auth cannot be bound to a host by the service) must be accepted
+explicitly by the pilot for the pilot host; the confinement above limits the
+exposure to the custody of the login token.
+
 ## Pinned adapters
 
 | harness | command | pinned | authorization URL | refused options |
@@ -91,7 +127,10 @@ Targeted tests of the slice, no full suite:
   environment, one live request, expiry/cancel/refusal categories, process
   group termination, receipt binding and publisher.
 - `tests/test_l232d_challenge_view.py` — the private challenge kind in the real
-  service (mute link, assertion, private view, signed receipt, nonce replay).
+  service (mute link, assertion, private view, signed receipt, nonce replay),
+  the honest page wording, and the login-API confinement: closed by default
+  (`403 login_api_closed`), the team service token refused (`401`), the
+  dedicated login token the only one accepted.
 - `tests/test_l232d_accounts_login.py` — CLI helpers (identity, profile,
   private home, version pinning, refusals).
 - `tests/test_l232d_credential_health.py` — post-login health writing.
@@ -111,7 +150,11 @@ Targeted tests of the slice, no full suite:
   activated;
 - one lease/cap/guard per operation, a rollback path and a canary run;
 - the security review of this slice is acquired **before** any real login is
-  attempted.
+  attempted;
+- the pilot records its explicit acceptance of the residual risk (declared
+  host/requester; the device code authorises the device that generated it),
+  and names the custody of the login token: which account/process holds it,
+  outside the agents' reach.
 
 See also `docs/COMPTES.md` for account declaration and the sentinel's health
 rules.

@@ -46,6 +46,7 @@ from urllib.parse import urlsplit
 from .. import jcs, receipts
 from ..db import DbError
 from . import duplicate, enroll, render
+from . import config as config_mod
 from .config import ApproveConfig
 from .sources import ACTION_ID_RE, REQUESTABLE_STATES, ActionSource, ActionSourceError
 from .store import Store, new_login_id, new_request_id, new_token
@@ -107,7 +108,8 @@ def _b64u(data: bytes) -> str:
 
 class ApproveService:
     def __init__(self, cfg: ApproveConfig, db, source: ActionSource, *, service_token: str,
-                 store: Store | None = None, clock=time.time, db_lock=None):
+                 login_token: str | None = None, store: Store | None = None, clock=time.time,
+                 db_lock=None):
         self.cfg = cfg
         self.db = db
         self.source = source
@@ -115,16 +117,32 @@ class ApproveService:
         self.clock = clock
         self.db_lock = db_lock or threading.RLock()
         self._token_digest = hashlib.sha256(service_token.encode("utf-8")).digest()
+        self._login_token_digest = (hashlib.sha256(login_token.encode("utf-8")).digest()
+                                    if login_token else None)
         self.policy = receipts.Policy(rp_id=cfg.rp_id, origins=cfg.origins,
                                       allow_facades=frozenset({"webauthn"}), level=cfg.level)
 
     # ------------------------------------------------------------------
-    # jeton de service
+    # jetons
     # ------------------------------------------------------------------
     def check_service_token(self, presented: str | None) -> bool:
         """Comparaison à temps constant (sur les SHA-256 : longueur fixe)."""
         presented_digest = hashlib.sha256((presented or "").encode("utf-8")).digest()
         return hmac.compare_digest(presented_digest, self._token_digest) and bool(presented)
+
+    @property
+    def login_api_open(self) -> bool:
+        """L'API des défis n'est ouverte que sur choix écrit ET jeton dédié."""
+        return (self.cfg.login_api == config_mod.LOGIN_API_OPEN
+                and self._login_token_digest is not None)
+
+    def check_login_token(self, presented: str | None) -> bool:
+        """Jeton du superviseur de connexion (L232d) ; jamais le jeton d'équipe."""
+        if self._login_token_digest is None:
+            return False
+        presented_digest = hashlib.sha256((presented or "").encode("utf-8")).digest()
+        return (hmac.compare_digest(presented_digest, self._login_token_digest)
+                and bool(presented))
 
     # ------------------------------------------------------------------
     # GET /health : la politique publiée (lot L27), sans aucun secret
@@ -141,6 +159,7 @@ class ApproveService:
             "profile": self.cfg.profile,
             "level": self.cfg.level,
             "api_via_public": bool(self.cfg.api_via_public),
+            "login_api": self.cfg.login_api,
             "tls": bool(tls),
         }
 

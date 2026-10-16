@@ -8,10 +8,13 @@ Routes :
                               assume_duplicate?})
     GET  /receipts/<id>       jeton de service — le reçu (200), en attente (202),
                               échu sans reçu (410)
-    POST /login-requests      jeton de service — crée un DÉFI DE CONNEXION
-                              (L232d : hôte, fournisseur, compte, portée,
-                              échéance) ; rend le lien, jamais l'URL ni le code
-    GET  /login-receipts/<id> jeton de service — le reçu du défi (200 | 202 | 410)
+    POST /login-requests      jeton de CONNEXION (dédié, L232d) — crée un DÉFI
+                              DE CONNEXION (hôte, fournisseur, compte, portée,
+                              échéance) ; rend le lien, jamais l'URL ni le code.
+                              Fermé par défaut (`login_api: "open"` dans le
+                              JSON du service) ; le jeton de service de
+                              l'équipe n'y est JAMAIS accepté (avis B1 dev4)
+    GET  /login-receipts/<id> jeton de connexion — le reçu du défi (200|202|410)
     GET  /a/<jeton>           page d'approbation
     POST /a/<jeton>           assertion WebAuthn → reçu (approve | deny)
     GET  /login/<jeton>       page du défi : sans URL ni code (lien muet)
@@ -32,6 +35,12 @@ En plus :
 * en-tête Host contrôlé : pages humaines sous un hôte des origines
   autorisées ; API de service sous l'hôte local (127.0.0.1:port) seulement,
   sauf `api_via_public` (anti-rebinding DNS), écrit dans le JSON ;
+* API des défis de connexion (L232d) : fermée par défaut ; quand `login_api`
+  vaut « open » (choix écrit du JSON), seuls le jeton DÉDIÉ
+  (`login_token_file`, tenu par le superviseur de connexion, hors de portée
+  des agents) est accepté — jamais le jeton de service de l'équipe, partagé
+  par tous ses agents : l'humain signerait un code d'appareil généré
+  ailleurs, présenté comme venant de l'hôte déclaré (avis sécurité B1) ;
 * POST humains : `Origin` doit être une origine autorisée (et
   `Sec-Fetch-Site`, s'il est présent, same-origin) ; API : aucun `Origin`
   (un navigateur n'a rien à y faire) ;
@@ -359,10 +368,20 @@ class ApproveHandler(BaseHTTPRequestHandler):
             raise ApproveError(403, "origin", "service API: no browser allowed")
         authorization = self.headers.get("Authorization") or ""
         scheme, _, presented = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not self.server.service.check_service_token(
-                presented.strip()):
-            raise ApproveError(401, "unauthorized", "service token missing or invalid")
+        presented = presented.strip()
         service = self.server.service
+        if kind == "login-api":
+            # L232d (avis B1 dev4) : fermée par défaut, et jamais ouverte au
+            # jeton de service de l'équipe — tous ses agents le lisent, et un
+            # défi déposé par n'importe qui ferait signer à l'humain un code
+            # d'appareil généré ailleurs, sous l'hôte déclaré.
+            if not service.login_api_open:
+                raise ApproveError(403, "login_api_closed",
+                                   "login API closed: connection challenges are refused")
+            if scheme.lower() != "bearer" or not service.check_login_token(presented):
+                raise ApproveError(401, "unauthorized", "login token missing or invalid")
+        elif scheme.lower() != "bearer" or not service.check_service_token(presented):
+            raise ApproveError(401, "unauthorized", "service token missing or invalid")
         if kind == "login-api":
             if self.command == "POST":
                 return self._json(201, service.create_login_request(load_json_body(raw)))

@@ -101,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
     print("verifier : RP ID %s, origins %s"
           % (policy.rp_id or "(missing)", ", ".join(policy.origins) or "(missing)"))
     print("API      : %s via %s" % (base, _route(base, service)))
+    print("login API: %s (connection challenges, dedicated token)"
+          % (service.get("login_api") or "unknown"))
     if ecarts:
         print("Policy MISMATCH (%d):" % len(ecarts))
         for ecart in ecarts:

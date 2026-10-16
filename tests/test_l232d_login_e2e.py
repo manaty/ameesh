@@ -49,6 +49,8 @@ def wait_for(predicate, timeout: float = 5.0) -> bool:
 
 class LoginEndToEndTest(ApproveBase):
     HOST = "ameesh-agents-1"
+    #: l'API des défis est ouverte sur ce banc, avec son jeton DÉDIÉ (B1 dev4)
+    LOGIN_API = True
 
     def setUp(self) -> None:
         super().setUp()
@@ -63,6 +65,7 @@ class LoginEndToEndTest(ApproveBase):
             accounts={"codex": [{"name": "default", "path": self.home}]},
             approve_url="http://127.0.0.1:%d" % self.port,
             approve_token_file=self.token_file,
+            login_token_file=self.login_token_file,
             approve_tls_name="",
         )
         self.environ = {"PATH": self.dir + ":" + os.environ.get("PATH", ""),

@@ -628,7 +628,7 @@ class EquipesTest(PgTestCase):
         self.assertEqual(data, {
             "service": "ameesh-approve", "health": 1, "rp_id": H_A, "origins": [ORIGIN_A],
             "public_url": ORIGIN_A, "profile": "strict", "level": "standard",
-            "api_via_public": False, "tls": False})
+            "api_via_public": False, "login_api": "closed", "tls": False})
         text = payload.decode()
         for secret in (self.a.token, self.a.cfg.state_dir, self.a.token_file):
             self.assertNotIn(secret, text)

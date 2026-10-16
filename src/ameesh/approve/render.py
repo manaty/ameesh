@@ -378,13 +378,14 @@ def login_page(view: dict) -> str:
     fields = [
         _field("Provider", view["provider"],
                warn=non_ascii if has_non_ascii(view["provider"]) else ""),
-        _field("Host", view["host"],
+        _field("Host (declared by the caller, not verified)", view["host"],
                warn=non_ascii if has_non_ascii(view["host"]) else ""),
         _field("Account", view["account"] or "(default)",
                warn=non_ascii if has_non_ascii(view["account"]) else ""),
         _field("Scope", view["scope"] or "(not specified)",
                warn=non_ascii if has_non_ascii(view["scope"]) else ""),
-        _field("Requested by", request["requested_by"]),
+        _field("Requested by (declared by the caller, not verified)",
+               request["requested_by"]),
         _field("Approver", request["approver"]),
         _field("Challenge valid until", _moment(view["exp"])),
     ]
@@ -404,11 +405,15 @@ def login_page(view: dict) -> str:
     body = (
         "<main id=\"ameesh-login\" %s>\n"
         "<h1>Connection to <code>%s</code></h1>\n"
-        "<p class=\"lead\">An agent requests a <strong>%s</strong> connection on the host "
-        "<code>%s</code>, for the account <code>%s</code>. The official link and its "
-        "one-time code are shown only after you sign with your passkey.</p>\n"
+        "<p class=\"lead\">A connection to <strong>%s</strong> was requested on the host "
+        "<code>%s</code>, for the account <code>%s</code>. The host and the requester "
+        "below are <strong>declared by the caller, not verified</strong> by this "
+        "service. The official link and its one-time code are shown only after you sign "
+        "with your passkey.</p>\n"
+        "<p class=\"lead\">This code authorises the device that <strong>generated</strong> "
+        "it: only continue if you started this connection yourself, on that host. If you "
+        "did not, cancel it.</p>\n"
         "<dl class=\"fields\">\n%s\n</dl>\n"
-        "<p class=\"lead\">If you did not request this connection, cancel it.</p>\n"
         "<section class=\"private\" id=\"login-private\" hidden>\n"
         "<h2>Private challenge — do not share</h2>\n"
         "<p class=\"notice\">Shown once, after your assertion. Never photograph it, never "
