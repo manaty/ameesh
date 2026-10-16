@@ -681,12 +681,12 @@ class RegistryTest(PgTestCase):
              ("release", "", "blocked", "implementation", "implementation")])
 
     def test_answer_and_hold_do_not_deadlock(self):
-        """N6: `agent_mailbox` before `work_items`, like `decisions.answer`.
+        """N6/N12: the hold and decision closure serialize on the request.
 
-        The hold locks the open request BEFORE the lot; the answer closes the
-        request (`decisions.close`): the two serialize, neither blocks on the
-        other, and the outcome stays consistent (hold accepted if it saw the
-        request, otherwise `hold-no-decision`)."""
+        The hold locks the lot, then the open request. Closing the request
+        (`decisions.close`) commits before `decisions.answer` moves the lot:
+        the two serialize, and the outcome stays consistent (hold accepted
+        if it saw the request, otherwise `hold-no-decision`)."""
         lot = self.pinned(stage="implementation", state="build")
         request = self.request_open_for(lot)
 
