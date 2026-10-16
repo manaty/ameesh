@@ -1011,7 +1011,7 @@ class Intentions:
         # laisserait le masque décider de son mode.
         for directory in (self.root.parent, self.root):
             if not directory.exists():
-                directory.mkdir(mode=0o700)
+                directory.mkdir(mode=0o700, exist_ok=True)
         try:
             info = self.root.lstat()
         except OSError:
@@ -1029,6 +1029,27 @@ class Intentions:
         # nom dérivé des seuls identifiants publics du triplet, jamais de la valeur.
         name = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
         return self._ensure() / (name + '.json')
+
+    @contextlib.contextmanager
+    def locked(self, reference: str, host: str, account: str):
+        # Garder le même inode : supprimer le verrou permettrait deux détenteurs.
+        path = self._path(self._key(reference, host, account)).with_suffix('.lock')
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError:
+            raise Refused('intent_lock') from None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise Refused('intent_lock')
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused('delivery_busy') from None
+            yield
+        finally:
+            os.close(fd)
 
     def get(self, reference: str, host: str, account: str) -> dict | None:
         key = self._key(reference, host, account)
@@ -1114,6 +1135,10 @@ class Livraison:
                 operation: str = 'install') -> dict:
         if operation not in ('install', 'rotate'):
             raise Refused('operation')
+        with self.intentions.locked(reference, host, account):
+            return self._deliver(reference, host, account, operation=operation)
+
+    def _deliver(self, reference: str, host: str, account: str, *, operation: str) -> dict:
         destination = self.politique.destination(reference, host, account)
         pending = self.intentions.get(reference, host, account)
         if pending is not None and (pending['operation'] != operation

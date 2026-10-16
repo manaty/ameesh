@@ -97,6 +97,26 @@ class IntentionTest(Materiel):
         self.assertTrue(receipt['ok'])
         self.assertFalse(receipt['replayed'])
 
+    def test_livraisons_concurrentes_ne_perdent_pas_l_intention(self):
+        perte = Perte(self.installeur)
+        first = self.livraison(perte)
+        second = self.livraison(Transport(self.installeur))
+        exchange = perte.exchange
+
+        def interleave(payload, timeout):
+            with self.assertRaises(coffre.Refused) as caught:
+                second.deliver(REFERENCE, HOST, UTILISATEUR)
+            self.assertEqual(caught.exception.category, 'delivery_busy')
+            return exchange(payload, timeout)
+
+        with mock.patch.object(perte, 'exchange', side_effect=interleave):
+            with self.assertRaises(coffre.Uncertain):
+                first.deliver(REFERENCE, HOST, UTILISATEUR)
+        self.assertEqual(len(self.intentions()), 1)
+        self.assertTrue(second.deliver(REFERENCE, HOST, UTILISATEUR)['replayed'])
+        self.assertEqual(coffre.unframe(perte.payloads[0])[0]['version'],
+                         coffre.unframe(second.transport.payloads[0])[0]['version'])
+
     def test_autre_operation_refusee_tant_qu_une_intention_court(self):
         with self.assertRaises(coffre.Uncertain):
             self.livraison(Perte(self.installeur)).deliver(REFERENCE, HOST, UTILISATEUR)

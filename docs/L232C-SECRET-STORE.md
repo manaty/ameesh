@@ -178,6 +178,8 @@ intent is open is refused (`pending_delivery`); an altered intent is refused
 (`intent_record`). A rotation replay still asks the turn boundary. If the
 store value changed in between, the helper answers `replay_mismatch` instead of
 overwriting: an operator settles it. The journal records `retry` for a replay.
+One local file lock per triple covers intent lookup, exchange and settlement;
+a concurrent caller is refused before sending (`delivery_busy`).
 
 ## Secret channel (transport, dispatcher, delegation)
 
