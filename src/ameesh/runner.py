@@ -3521,7 +3521,12 @@ class AgentWorker(threading.Thread):
             return None
         self.agent = agent
         if agent.get("operator_paused"):
-            return None  # L87b: keep prompts and mail; budget/pressure cannot lift this hold.
+            # L87b : rien n'est consommé, aucun tour ne démarre. L232a n'est pas
+            # un tour : un drainage d'hôte garde le droit de réserver puis de
+            # clore le passage de ce worker, sinon le bail source reste tenu et
+            # l'hôte ne se vide pas tant que la pause tient (N1 de la R2 #1462).
+            self.maybe_relocate({})
+            return None
         if self._session_en_attente is not None:
             self._enregistre_session()
         if self._marque_base(agent):
