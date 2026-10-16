@@ -39,8 +39,10 @@ l'ouverture d'une PR de promotion seule ne complete jamais un lot.
 
 Holds : `blocked` retient l'etape et la revision ; `waiting_human` exige une
 decision native reellement en attente (`decisions_pending >= 1`), jamais un
-simple drapeau. Les reparations sont bornees par `MAX_REPAIRS` ; aucune
-reouverture terminale.
+simple drapeau. Les entrees et sorties de retenue (`action` `hold`/`release`)
+passent par l'appelable reserve `HOLD_VERIFIER`, jamais par une voie de
+contournement ; une avance depuis une retenue est refusee (`hold-advance`).
+Les reparations sont bornees par `MAX_REPAIRS` ; aucune reouverture terminale.
 
 Collections d'un snapshot (noms des sources lues par B) : `milestones`,
 `receipts`, `observations`, `decisions`, `deliveries`.
@@ -90,6 +92,16 @@ MAX_REPAIRS = 2
 #: Retenues natives : elles gardent l'etape et la revision.
 HOLDS = ("blocked", "waiting_human")
 
+#: Actions du registre B : une avance gardee, une retenue, sa reprise.
+ACTIONS = ("advance", "hold", "release")
+
+#: Nom reserve du verificateur des retenues/reprises : B l'appelle pour
+#: `action` `hold` et `release`, comme `revision_transfer` pour un transfert.
+HOLD_VERIFIER = "hold"
+
+#: Verificateurs reserves installes par C en plus des 14 gardes.
+RESERVED_VERIFIERS = (HOLD_VERIFIER,)
+
 #: Environnements de deploiement observes.
 ENVIRONMENTS = ("staging", "preprod")
 
@@ -116,11 +128,15 @@ REFUSAL_CODES = (
     "failure-missing",
     "freeze-missing",
     "guard-unsupported",
+    "hold-advance",
+    "hold-invalid",
     "hold-no-decision",
+    "hold-redundant",
     "hold-unsupported",
     "item-mismatch",
     "item-missing",
     "merge-missing",
+    "not-held",
     "observation-result-mismatch",
     "observation-unwitnessed",
     "repair-bound",
@@ -145,6 +161,8 @@ REFUSAL_CODES = (
 class Command:
     """Une commande de transition : intention + references, jamais un verdict.
 
+    `action` est l'une de `ACTIONS` : `advance` (arete gardee), `hold`
+    (retenue, `hold` nomme `blocked`/`waiting_human`) ou `release` (reprise).
     `references` porte les faits structures du client (B les appelle
     `evidence`) : des chaines (sha, observation, lot) ou des entiers ; tout le
     reste est refuse. `actor`/`source` ne sont pas rejuges ici : l'autorite est
@@ -153,11 +171,13 @@ class Command:
 
     work_item_id: int
     command_id: str
-    guard: str
-    from_stage: str
-    to_stage: str
+    guard: str = ""
+    from_stage: str = ""
+    to_stage: str = ""
     actor: str = ""
     source: str = ""
+    action: str = "advance"
+    hold: str = ""
     references: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -622,12 +642,23 @@ def _command_problem(command: Any) -> str:
         uuid.UUID(command.command_id)
     except (ValueError, AttributeError, TypeError):
         return "command_id n'est pas un UUID"
-    if not _text(command.guard):
-        return "garde requise"
-    if not _text(command.from_stage) or not _text(command.to_stage):
-        return "etapes from/to requises"
-    if command.from_stage == command.to_stage:
-        return "etape inchangee"
+    action = _text(command.action) or "advance"
+    if action not in ACTIONS:
+        return "action %r hors de %s" % (command.action, ", ".join(ACTIONS))
+    if action == "advance":
+        if not _text(command.guard):
+            return "garde requise"
+        if not _text(command.from_stage) or not _text(command.to_stage):
+            return "etapes from/to requises"
+        if command.from_stage == command.to_stage:
+            return "etape inchangee"
+        if _text(command.hold):
+            return "une avance ne porte pas de retenue"
+    elif action == "hold":
+        if _text(command.hold) not in HOLDS:
+            return "retenue %r hors de %s" % (command.hold, ", ".join(HOLDS))
+    elif _text(command.hold):
+        return "une reprise ne porte pas de retenue"
     refs = command.references or {}
     if not isinstance(refs, Mapping):
         return "references: objet attendu"
@@ -643,12 +674,46 @@ def _command_problem(command: Any) -> str:
     return ""
 
 
+def _accept_hold(snapshot: Snapshot, references: tuple = ()) -> Decision:
+    """Une retenue/reprise acceptee garde l'etape courante."""
+    return Decision(True, "accepted", "", snapshot.workflow_stage,
+                    tuple(references))
+
+
+def _verify_hold_action(command: Command, snapshot: Snapshot) -> Decision:
+    """Entree en retenue ou reprise : jamais une avance deguisee."""
+    if _closed(snapshot):
+        return _refuse("terminal-reopening",
+                       "lot terminal : aucune reouverture", snapshot)
+    state = _text(snapshot.item.get("state"))
+    if _text(command.action) == "release":
+        if state not in HOLDS:
+            return _refuse("not-held",
+                           "lot %s : aucune retenue a lever"
+                           % (state or "sans etat"), snapshot)
+        return _accept_hold(snapshot)
+    hold = _text(command.hold)
+    if state == hold:
+        return _refuse("hold-redundant",
+                       "lot deja en retenue %s" % hold, snapshot)
+    if hold == "waiting_human":
+        if "decisions" not in set(snapshot.sources):
+            return _refuse("source-unavailable",
+                           "collection decisions non collectee", snapshot)
+        if max(_as_int(snapshot.decisions_pending), 0) < 1:
+            return _refuse("hold-no-decision",
+                           "waiting_human sans decision native en attente",
+                           snapshot)
+    return _accept_hold(snapshot)
+
+
 def verify(command: Command, snapshot: Snapshot) -> Decision:
     """Le verdict de C pour une commande, sur des preuves reelles. Sans exception.
 
-    L'ordre est celui des portes : forme de la commande, garde du registre,
-    lot, revision Process, etape (coherence avec la ligne verrouillee), terminal,
-    type, sources, references, puis la garde elle-meme. La version du journal
+    L'ordre est celui des portes : forme de la commande, lot, revision Process,
+    puis selon l'action : une avance (etape coherence avec la ligne verrouillee,
+    terminal, retenue en cours, type, sources, references, garde) ou une
+    retenue/reprise (`hold`/`release`). La version du journal
     (`expected_version`) n'est pas lue ici : elle appartient a B.
     """
     if not isinstance(snapshot, Snapshot):
@@ -656,10 +721,6 @@ def verify(command: Command, snapshot: Snapshot) -> Decision:
     problem = _command_problem(command)
     if problem:
         return Decision(False, "command-invalid", problem)
-    spec = _SPECS_BY_NAME.get(command.guard)
-    if spec is None:
-        return Decision(False, "guard-unsupported",
-                        "garde %r hors du registre fini" % command.guard)
     if not snapshot.item:
         return _refuse("item-missing", "snapshot sans lot", snapshot)
     if _as_int(snapshot.item.get("id")) != command.work_item_id:
@@ -668,6 +729,8 @@ def verify(command: Command, snapshot: Snapshot) -> Decision:
     if not _text(snapshot.workflow_ref):
         return _refuse("workflow-absent",
                        "projet sans workflow : aucune transition C", snapshot)
+    if (_text(command.action) or "advance") != "advance":
+        return _verify_hold_action(command, snapshot)
     if command.from_stage != snapshot.workflow_stage:
         return _refuse("stage-stale",
                        "etape de depart %r, etape native %r"
@@ -675,6 +738,15 @@ def verify(command: Command, snapshot: Snapshot) -> Decision:
     if _closed(snapshot):
         return _refuse("terminal-reopening",
                        "lot terminal : aucune reouverture", snapshot)
+    if _text(snapshot.item.get("state")) in HOLDS:
+        return _refuse("hold-advance",
+                       "lot en retenue %s : une avance doit passer par une "
+                       "reprise (release)" % snapshot.item.get("state"),
+                       snapshot)
+    spec = _SPECS_BY_NAME.get(command.guard)
+    if spec is None:
+        return Decision(False, "guard-unsupported",
+                        "garde %r hors du registre fini" % command.guard)
     if _text(snapshot.item.get("type")) not in INSTALLED_TYPES:
         return _refuse("type-unsupported",
                        "type %r non installe" % snapshot.item.get("type"),
@@ -760,6 +832,8 @@ def context_command(context: Any) -> Command:
         or _text(getattr(raw, "to_stage", "")),
         actor=_text(getattr(authority, "actor", "")),
         source=_text(getattr(authority, "source", "")),
+        action=_text(getattr(raw, "action", "")) or "advance",
+        hold=_text(getattr(raw, "hold", "")),
         references=dict(references) if isinstance(references, Mapping) else {},
     )
 
@@ -810,8 +884,10 @@ _SERVER_VERIFIERS: dict[tuple, Callable] = {}
 def server_verifier(guard: str, verification_cls: Any = None) -> Callable:
     """L'appelable serveur d'une garde : `VerificationContext -> Verification`.
 
-    Meme objet rendu pour un meme couple (garde, classe de `Verification`) :
-    `install_verifier` de B est idempotent pour un objet identique.
+    Sert aussi pour le nom reserve `HOLD_VERIFIER` (`hold`/`release`) : la
+    decision se prend sur l'`action` portee par la commande. Meme objet rendu
+    pour un meme couple (nom, classe de `Verification`) : `install_verifier` de
+    B est idempotent pour un objet identique.
     """
     key = (guard, verification_cls)
     existing = _SERVER_VERIFIERS.get(key)
@@ -834,16 +910,19 @@ def server_verifier(guard: str, verification_cls: Any = None) -> Callable:
 
 
 def install_verifiers(registry: Any = None) -> tuple[str, ...]:
-    """Installe les 14 appelables serveur dans `process_registry` (B).
+    """Installe les appelables serveur dans `process_registry` (B) : les 14
+    gardes du registre fini, puis `RESERVED_VERIFIERS` (le nom reserve
+    `hold`, pour les actions `hold` et `release`).
 
     Sans `registry`, importe `ameesh.process_registry` ; avec, utilise l'objet
-    fourni (tests, autre hote). Rend les gardes installees, dans l'ordre du
-    registre fini. Aucun verificateur par defaut cote B : sans cet appel, une
-    avance reste `verifier-uninstalled`.
+    fourni (tests, autre hote). Rend les noms installes, dans cet ordre. Aucun
+    verificateur par defaut cote B : sans cet appel, une avance, une retenue ou
+    une reprise reste `verifier-uninstalled`.
     """
     if registry is None:
         from . import process_registry as registry
     verification_cls = getattr(registry, "Verification")
-    for guard in GUARD_NAMES:
-        registry.install_verifier(guard, server_verifier(guard, verification_cls))
-    return GUARD_NAMES
+    names = GUARD_NAMES + RESERVED_VERIFIERS
+    for name in names:
+        registry.install_verifier(name, server_verifier(name, verification_cls))
+    return names

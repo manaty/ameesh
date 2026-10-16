@@ -10,9 +10,9 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from ameesh.process_verifiers import (GUARD_NAMES, context_command,
-                                      context_snapshot, install_verifiers,
-                                      server_verifier)
+from ameesh.process_verifiers import (GUARD_NAMES, RESERVED_VERIFIERS,
+                                      context_command, context_snapshot,
+                                      install_verifiers, server_verifier)
 
 REV = "a" * 40
 COMMAND_ID = "11111111-1111-4111-8111-111111111111"
@@ -84,11 +84,34 @@ class SeamTest(unittest.TestCase):
     def test_install_verifiers_installe_les_14_et_reste_idempotent(self):
         registry = Registry()
         installed = install_verifiers(registry)
-        self.assertEqual(installed, GUARD_NAMES)
-        self.assertEqual(tuple(registry.installed), GUARD_NAMES)
+        self.assertEqual(installed, GUARD_NAMES + RESERVED_VERIFIERS)
+        self.assertEqual(tuple(registry.installed),
+                         GUARD_NAMES + RESERVED_VERIFIERS)
         first = dict(registry.installed)
         install_verifiers(registry)          # memes objets : aucun ecrasement
         self.assertEqual(registry.installed, first)
+
+    def test_appelable_reserve_des_retenues(self):
+        registry = Registry()
+        install_verifiers(registry)
+        hold = registry.installed["hold"]
+        accepted = hold(context(command=command(action="hold",
+                                                hold="blocked")))
+        self.assertIsInstance(accepted, Verification)
+        self.assertTrue(accepted.ok, accepted.reason)
+        self.assertEqual(accepted.facts["stage"], "work")
+        without_decision = hold(context(
+            sources={"decisions": ()},
+            command=command(action="hold", hold="waiting_human")))
+        self.assertFalse(without_decision.ok)
+        self.assertEqual(without_decision.facts["code"], "hold-no-decision")
+        released = hold(context(work_item=item(state="blocked"),
+                                command=command(action="release")))
+        self.assertTrue(released.ok, released.reason)
+        bypass = registry.installed["start_work"](context(
+            work_item=item(state="blocked"), command=command(guard="start_work")))
+        self.assertFalse(bypass.ok)
+        self.assertEqual(bypass.facts["code"], "hold-advance")
 
     def test_appelable_accepte_sur_preuves(self):
         registry = Registry()
@@ -134,6 +157,12 @@ class SeamTest(unittest.TestCase):
         self.assertEqual(mapped.source, "runner")
         self.assertEqual(mapped.from_stage, "work")
         self.assertEqual(mapped.to_stage, "next")
+        self.assertEqual(mapped.action, "advance")
+        self.assertEqual(mapped.hold, "")
+        held = context_command(context(command=command(action="hold",
+                                                       hold="blocked")))
+        self.assertEqual(held.action, "hold")
+        self.assertEqual(held.hold, "blocked")
 
     def test_context_snapshot_derive_revision_et_sources(self):
         snapshot = context_snapshot(context())

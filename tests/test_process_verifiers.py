@@ -101,6 +101,20 @@ def command_for(guard: str, **overrides) -> Command:
     return Command(**values)
 
 
+def hold_command(hold: str, **overrides) -> Command:
+    values = dict(work_item_id=7, command_id=COMMAND_ID, action="hold",
+                  hold=hold, references={})
+    values.update(overrides)
+    return Command(**values)
+
+
+def release_command(**overrides) -> Command:
+    values = dict(work_item_id=7, command_id=COMMAND_ID, action="release",
+                  references={})
+    values.update(overrides)
+    return Command(**values)
+
+
 class VerificateursTest(unittest.TestCase):
 
     def assertRefusal(self, code, decision):
@@ -446,6 +460,54 @@ class VerificateursTest(unittest.TestCase):
         self.assertRefusal("hold-unsupported",
                            verify_hold("paused", full_snapshot()))
         self.assertEqual(set(HOLDS), {"blocked", "waiting_human"})
+
+    def test_retenue_exige_une_decision_native(self):
+        decision = verify(hold_command("waiting_human"), full_snapshot())
+        self.assertTrue(decision.accepted, decision)
+        self.assertEqual(decision.stage, "work")
+        self.assertRefusal(
+            "hold-no-decision",
+            verify(hold_command("waiting_human"),
+                   full_snapshot(decisions_pending=0)))
+        self.assertRefusal(
+            "source-unavailable",
+            verify(hold_command("waiting_human"),
+                   full_snapshot(sources=("milestones",))))
+
+    def test_retenue_blocked_et_inconnue(self):
+        self.assertTrue(verify(hold_command("blocked"),
+                               full_snapshot()).accepted)
+        self.assertRefusal("command-invalid",
+                           verify(hold_command("paused"), full_snapshot()))
+
+    def test_retenue_redondante_refusee(self):
+        self.assertRefusal(
+            "hold-redundant",
+            verify(hold_command("blocked"),
+                   full_snapshot(item=item(state="blocked"))))
+
+    def test_reprise_seulement_depuis_une_retenue(self):
+        decision = verify(release_command(),
+                          full_snapshot(item=item(state="blocked")))
+        self.assertTrue(decision.accepted, decision)
+        self.assertEqual(decision.stage, "work")
+        self.assertRefusal(
+            "not-held",
+            verify(release_command(), full_snapshot(item=item(state="build"))))
+
+    def test_avance_depuis_une_retenue_refusee(self):
+        for state in HOLDS:
+            with self.subTest(state=state):
+                decision = verify(command_for("start_work"),
+                                  full_snapshot(item=item(state=state)))
+                self.assertRefusal("hold-advance", decision)
+
+    def test_terminal_jamais_rouvert_par_une_retenue(self):
+        closed = full_snapshot(item=item(closed_at="2026-10-16T00:00:00Z"))
+        self.assertRefusal("terminal-reopening",
+                           verify(hold_command("blocked"), closed))
+        self.assertRefusal("terminal-reopening",
+                           verify(release_command(), closed))
 
     def test_kinds_observations_stables(self):
         self.assertEqual(OBSERVATION_KINDS, ("deployed", "pass", "fail"))
