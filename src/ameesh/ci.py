@@ -30,7 +30,16 @@ chaque passage un relevé (`Watcher.tick`) :
    reste, car l'agent a pu agir ;
 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
    chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ;
-4. une exécution qui n'est plus en cours est conclue : verdict.
+4. une exécution qui n'est plus en cours est conclue : verdict ;
+5. une exécution relancée (`gh run rerun`, geste courant sous saturation)
+   garde son `run_id` et change d'`run_attempt` (#901) : si GitHub la dit de
+   nouveau en cours, sa ligne est rouverte et suivie jusqu'à son verdict ; un
+   échec de l'attempt précédent qui n'est pas re-vu à la relance n'est plus
+   imputé à l'exécution, et un échec qui revient compte comme nouveau. Chaque
+   ligne publiée par `scripts/ci-flow.py` porte son attempt : tant que la
+   relance n'a pas republié son check run, celui de l'attempt précédent reste
+   le dernier de la tête et n'est pas relu ; une ligne sans marque vaut
+   attempt 1 et n'est jamais imputée à une relance.
 
 Courrier, de `ameesh` à l'assigné du lot, rangé dans le fil du lot, selon
 L125 :
@@ -164,9 +173,27 @@ def updated_ts(run: dict) -> float | None:
         return None
 
 
-def events_of(check_runs, run_id: int) -> list[dict]:
+def event_attempt(ev: dict) -> int:
+    """L'attempt qui a publié une ligne d'échec (#901) ; 1 si la ligne n'a pas
+    de marque (publiée avant le marquage) ou si elle est illisible : elle n'est
+    jamais imputée à une relance."""
+    try:
+        return max(1, int(ev.get("attempt") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def events_of(check_runs, run_id: int, attempt: int | None = None) -> list[dict]:
     """Les événements `test` en échec, pour l'exécution `run_id`, portés par
-    la sortie des check runs « tests (flux) » d'une tête."""
+    la sortie des check runs « tests (flux) » d'une tête.
+
+    #901 : `ci-flow.py` marque chaque ligne publiée de son attempt GitHub.
+    Une relance garde le `run_id` : pendant qu'elle est en file, le dernier
+    check run publié est encore celui de l'attempt précédent. `attempt=None`
+    (le relevé) rend les lignes de tous les attempts, chacune avec sa
+    provenance (`event_attempt`) : le relevé les enregistre sous leur propre
+    attempt et n'impute à la relance que les lignes de l'attempt courant. Un
+    entier ne rend que les lignes de cet attempt."""
     out, seen = [], set()
     for check in check_runs or ():
         if not str(check.get("name") or "").startswith(CHECK_PREFIX):
@@ -186,28 +213,31 @@ def events_of(check_runs, run_id: int) -> list[dict]:
                 continue
             if ev.get("execution") is not None and str(ev["execution"]) != str(run_id):
                 continue
-            key = (str(ev.get("part") or ""), ev["test"])
+            if attempt is not None and event_attempt(ev) != int(attempt):
+                continue
+            # la clé porte l'attempt : un check de l'attempt précédent et celui
+            # de la relance peuvent coexister dans la réponse, aucun ne masque
+            # l'autre (#901)
+            key = (event_attempt(ev), str(ev.get("part") or ""), ev["test"])
             if key not in seen:
                 seen.add(key)
                 out.append(ev)
     return out
 
 
-def failed_jobs_of(check_runs, run_id: int) -> list[str]:
-    """#846 : les jobs de l'exécution `run_id` déjà en échec, d'après les check
-    runs natifs de GitHub — les seuls publiés même quand aucun événement de
-    test ne l'est (panne d'installation, délai dépassé). Un check run d'un
-    autre workflow, ou d'une autre exécution du même commit, est écarté par le
-    lien vers son job (`/actions/runs/<run_id>/job/<job_id>`)."""
+def failed_jobs_of(jobs) -> list[str]:
+    """#846 : les jobs déjà en échec d'une **tentative** d'exécution, d'après
+    la liste des jobs de cette tentative (`actions/runs/<id>/attempts/<n>/jobs`)
+    — les seuls publiés même quand aucun événement de test ne l'est (panne
+    d'installation, délai dépassé). La tentative est explicite (#901 B1) : les
+    check runs d'une tête ne portent que le `run_id`, celui d'une tentative
+    antérieure encore publié serait imputé à la relance."""
     out = set()
-    for check in check_runs or ():
-        name = str(check.get("name") or "").strip()
-        if not name or name.startswith(CHECK_PREFIX):
+    for job in jobs or ():
+        name = str(job.get("name") or "").strip()
+        if not name:
             continue
-        if (check.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
-            continue
-        link = str(check.get("details_url") or check.get("url") or "")
-        if "/actions/runs/%d/job/" % int(run_id) not in link:
+        if (job.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
             continue
         out.add(name)
     return sorted(out)
@@ -681,9 +711,12 @@ class Watcher:
     def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str]) -> list[dict]:
         """Les exécutions terminées entre deux passages (#1110) : une exécution
         courte n'est jamais vue « en cours », donc jamais conclue sans ce
-        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
-        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
-        la même branche est ignorée (pas de verdict périmé)."""
+        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue au
+        même attempt est laissée au relevé normal (pas de doublon) ; une tête
+        déjà remplacée sur la même branche est ignorée (pas de verdict périmé).
+        Une ligne connue dont l'attempt a augmenté est une **relance** finie
+        entre deux passages (#1573 N1) : rouverte comme au relevé, puis suivie
+        par la queue existante (échecs + verdict)."""
         st = storage.of(db)
         data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
         runs = list(data.get("workflow_runs") or ())
@@ -697,17 +730,32 @@ class Watcher:
             if workflow_of(run.get("path")) not in followed:
                 continue
             run_id = int(run["id"])
-            if st.ci.run(repo, run_id) is not None:
-                continue
             updated = updated_ts(run)
             if updated is None or not 0 <= now - updated <= CATCHUP_WINDOW:
                 continue
             head = run.get("head_sha") or ""
             branch = run.get("head_branch") or ""
-            if st.ci.head_replaced(repo, branch, head, run_id):
-                continue
-            out += self._follow(db, repo, run, lots)
-            row = st.ci.run(repo, run_id)
+            known = st.ci.run(repo, run_id)
+            if known is not None:
+                attempt = int(run.get("run_attempt") or 1)
+                if known["status"] == "superseded" \
+                        or attempt <= int(known.get("run_attempt") or 1):
+                    # même attempt : la liste en retard (#828) redit terminée
+                    # une exécution déjà conclue — la rouvrir renverrait son
+                    # verdict à chaque passe
+                    continue
+                # #1573 N1 : la relance est déjà finie ; `_follow` rouvre la
+                # ligne (et rattache le lot si la branche a été posée après),
+                # la queue ci-dessous rend ses échecs et son verdict
+                out += self._follow(db, repo, run, lots)
+                row = st.ci.run(repo, run_id)
+                if row is None or row.get("status") != "running":
+                    continue  # tête remplacée, ou ligne non rouverte
+            else:
+                if st.ci.head_replaced(repo, branch, head, run_id):
+                    continue
+                out += self._follow(db, repo, run, lots)
+                row = st.ci.run(repo, run_id)
             if row is None or (run.get("status") or "") != "completed":
                 continue
             out += self._failures(db, repo, row)
@@ -885,13 +933,20 @@ class Watcher:
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
         """Une exécution en cours : enregistrée si nouvelle ; une exécution
         connue sans lot rattaché l'est dès que la branche du lot est posée
-        (#1321), tant que sa tête est encore celle de la branche ; elle
-        remplace les exécutions d'une autre tête sur la même branche (hors
-        base)."""
+        (#1321), tant que sa tête est encore celle de la branche ; une
+        exécution connue que GitHub dit de nouveau en cours est une **relance**
+        (#901 : `run_id` inchangé, `run_attempt` suivant) : sa ligne est
+        rouverte et suivie, sauf si une tête plus récente de la branche l'a
+        remplacée ou si l'attempt n'a pas augmenté (liste en retard, #828).
+        Elle remplace les exécutions d'une autre tête sur la même
+        branche (hors base)."""
         st = storage.of(db)
         run_id = int(run["id"])
+        attempt = int(run.get("run_attempt") or 1)
         known = st.ci.run(repo, run_id)
         if known is not None:
+            if known["status"] == "superseded":
+                return []  # la tête de la branche a bougé : la relance est sans objet
             if known.get("work_item_id") is None:
                 # #1321 : la branche du lot peut être posée après la première
                 # vue du run ; sans ce rattachement, `_conclude` lit
@@ -919,12 +974,23 @@ class Watcher:
                 elif lot is not None:
                     self.log("CI %s run %s: obsolete head %s (branch head %s), not linked"
                              % (repo, run_id, _short(head), _short(known_head)))
-            return []
+            known_attempt = int(known.get("run_attempt") or 1)
+            if attempt <= known_attempt:
+                # même attempt : soit la ligne est déjà suivie, soit une liste
+                # d'exécutions en retard (#828) redit en cours une exécution
+                # conclue sans qu'elle ait été relancée — la rouvrir renverrait
+                # son verdict à chaque passe.
+                return []
+            reopened = st.ci.reopen_run(repo, run_id, run_attempt=attempt)
+            if reopened is None:
+                return []
+            return [{"action": "rerun", "repo": repo, "run_id": run_id, "attempt": attempt,
+                     "branch": reopened.get("branch"), "to": None}]
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
                        base=base_of(run), work_item_id=lot_of_run(run, lots),
                        url=run.get("html_url"), workflow=workflow_of(run.get("path")),
-                       created_at=run.get("created_at"))
+                       created_at=run.get("created_at"), run_attempt=attempt)
         branch = run.get("head_branch") or ""
         if not branch or branch in BASE_BRANCHES:
             return []
@@ -941,13 +1007,20 @@ class Watcher:
         return out
 
     def _failures(self, db, repo: str, row: dict) -> list[dict]:
-        """Les échecs nouveaux d'une exécution suivie, et leur message."""
+        """Les échecs nouveaux de l'attempt courant d'une exécution suivie, et
+        leur message.
+
+        Un événement de l'attempt courant enregistré pendant que la ligne était
+        encore à l'attempt précédent (liste en retard, #828) n'est pas
+        réinséré par `add_failure` quand la ligne est ensuite rouverte : il est
+        signalé ici tant qu'aucun message ne l'a porté (#1573 N2)."""
         from . import work
         st = storage.of(db)
+        run_id, attempt = int(row["run_id"]), int(row.get("run_attempt") or 1)
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
-        self._record_failed_jobs(st, repo, row, checks.get("check_runs"))
+        self._record_failed_jobs(st, repo, row)
         if not events:
             return []
         reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0],
@@ -960,26 +1033,43 @@ class Watcher:
         # qu'on le sache, il n'est pas imputé par un urgent
         unknown_base = not reference
         before = set(reference.get("tests") or ())
-        new = []
+        # les lignes déjà enregistrées pour l'attempt courant, avec leur
+        # message : `add_failure` ne les réinsère pas (même attempt), mais
+        # celles qu'aucun message n'a portées restent à signaler (#1573 N2)
+        recorded = {(f["part"], f["test"]): f
+                    for f in st.ci.failures(repo, int(run_id))}
+        new, fresh = [], set()
         for ev in events:
+            source = event_attempt(ev)
             failure = {"part": str(ev.get("part") or ""), "test": ev["test"],
                        "module": ev.get("module") or "", "status": ev.get("statut"),
                        "inherited": ev["test"] in before,
                        "excerpt": ev.get("extrait") or "", "replay": ev.get("rejouer") or "",
                        "duration_s": ev.get("duree_s"), "failed_at": ev.get("ts")}
-            if st.ci.add_failure(repo, int(row["run_id"]), **failure):
-                new.append(failure)
+            added = st.ci.add_failure(repo, run_id, run_attempt=source, **failure)
+            if source == attempt:
+                # une ligne de l'attempt précédent (check run pas encore
+                # republié par la relance) est enregistrée sous le sien, jamais
+                # imputée à l'attempt courant (#901)
+                seen = recorded.get((failure["part"], failure["test"]))
+                if added or (seen is not None and not seen.get("message_id")):
+                    new.append(failure)
+                if added:
+                    fresh.add((failure["part"], failure["test"]))
         own = [f for f in new if not f["inherited"]]
         if not own:
             return []
         lot = work.get(db, int(row["work_item_id"])) if row.get("work_item_id") else None
         to = recipient_of(lot)
         if not to:
+            # sans destinataire, aucun message ne portera jamais ces lignes :
+            # seules les nouvelles sont journalisées, pas toutes à chaque passe
+            own = [f for f in own if (f["part"], f["test"]) in fresh]
             return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
-                     "tests": [f["test"] for f in own], "to": None}]
+                     "tests": [f["test"] for f in own], "to": None}] if own else []
         # premier message de l'exécution (un passif sans base compte aussi)
         first = not row.get("urgent_message_id") and not any(
-            f.get("message_id") for f in st.ci.failures(repo, int(row["run_id"])))
+            f.get("message_id") for f in recorded.values())
         urgent = first and not unknown_base
         text = failure_text(row, lot, own, first=first, unknown_base=unknown_base)
         short = failure_text(row, lot, own, first=first, unknown_base=unknown_base,
@@ -994,22 +1084,30 @@ class Watcher:
         if urgent:
             st.ci.set_message(repo, int(row["run_id"]), "urgent", message_id)
             row["urgent_message_id"] = message_id
-        st.ci.set_failure_message(repo, int(row["run_id"]),
+        st.ci.set_failure_message(repo, run_id, attempt,
                                   [(f["part"], f["test"]) for f in own], message_id)
         return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
-    def _record_failed_jobs(self, st, repo: str, row: dict, check_runs) -> None:
+    def _record_failed_jobs(self, st, repo: str, row: dict) -> None:
         """#846 : sur une branche de base, un job déjà en échec est un main
         rouge, même sans événement de test publié (panne d'installation, délai
         dépassé). Relevé ici pour que `ci.main_red` alerte sans attendre la
         conclusion de l'exécution. Aucun courrier n'en part : `_failures` ne
-        signale que les événements de test (part `job` mise à part)."""
+        signale que les événements de test (part `job` mise à part).
+        #901 B1 : les jobs sont ceux de l'attempt suivi, pas ceux de la tête —
+        un échec de l'attempt précédent encore publié n'est jamais inscrit sous
+        la relance, un vrai échec de l'attempt courant l'est."""
         if row.get("branch") not in BASE_BRANCHES:
             return
-        for job in failed_jobs_of(check_runs, int(row["run_id"])):
-            st.ci.add_failure(repo, int(row["run_id"]), part=JOB_PART, test=job,
+        run_id = int(row["run_id"])
+        attempt = int(row.get("run_attempt") or 1)
+        jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
+                        % (repo, run_id, attempt)) or {}
+        for job in failed_jobs_of(jobs.get("jobs")):
+            st.ci.add_failure(repo, run_id, run_attempt=attempt,
+                              part=JOB_PART, test=job,
                               module="", status="echec", inherited=False,
                               excerpt="", replay="", duration_s=None, failed_at=None)
 
@@ -1059,6 +1157,8 @@ def describe(record: dict) -> str:
     if record["action"] == "superseded":
         return "%s superseded by %s; %d unread message(s) withdrawn" % (
             where, _short(record.get("by") or ""), len(record.get("withdrawn") or ()))
+    if record["action"] == "rerun":
+        return "%s re-run attempt %s: tracking reopened" % (where, record.get("attempt"))
     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
         if record.get("to") else "(no recipient)"
     if record["action"] == "failures":
@@ -1150,6 +1250,9 @@ def render_status(report: dict) -> list[str]:
                      "named by github.host)")
     for run in report["runs"]:
         state = _STATUS_FR.get(run["status"], run["status"])
+        attempt = int(run.get("run_attempt") or 1)
+        if attempt > 1:
+            state += " (attempt %d)" % attempt
         if run["status"] == "superseded" and run.get("superseded_by"):
             state += " by %s" % _short(run["superseded_by"])
         own = [f for f in run["failures"] if not f.get("inherited")]
