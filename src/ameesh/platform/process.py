@@ -573,13 +573,17 @@ def _inside(target: str, real: str | None, is_dir: bool) -> bool:
 
 
 def holders(path: str | None, needle: str | None = None, exclude=(), *,
-            mapped: bool = False) -> list[dict]:
+            mapped: bool = False, session: bool = False) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
     `needle` sur la ligne de commande (hors argv[0] et hors les PID de
-    `exclude`). #248 : avec `mapped`, aussi l'exécutable et les fichiers
-    projetés en mémoire (module natif `.node`, binaire electron). Chaque
-    détenteur : `{"pid", "why", "cmd"}`.
+    `exclude`). Avec `session`, `needle` est un identifiant de session : seule
+    une reprise en cours le nomme (l'argument d'un sélecteur de session,
+    `codex resume <id>`, `claude --resume <id>`, `dsh --session-id <id>`,
+    séparé ou lié par `=`) ; le même identifiant CITÉ dans un brief, un
+    message ou un chemin n'est pas un détenteur (#1283). #248 : avec `mapped`,
+    aussi l'exécutable et les fichiers projetés en mémoire (module natif
+    `.node`, binaire electron). Chaque détenteur : `{"pid", "why", "cmd"}`.
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
     si ce processus-ci ne peut même pas lire SES fichiers ouverts, si l'OS
@@ -593,9 +597,9 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     exclude = set(int(p) for p in exclude)
     ps = _psutil()
     if ps is not None:
-        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
+        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped, session)
     if _proc_ok():
-        return _holders_proc(real, is_dir, needle, exclude, mapped)
+        return _holders_proc(real, is_dir, needle, exclude, mapped, session)
     raise NotAvailable("file holders",
                        "neither psutil nor /proc to list open files")
 
@@ -746,15 +750,123 @@ def _settle(doubts: dict, again) -> None:
                            % ", ".join(list(doubts.values())[:5]))
 
 
-def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | None:
-    if not hit and needle and pid not in exclude and any(needle in a for a in argv[1:]):
-        hit = "session id on the command line"
+#: Sélecteurs de session d'une ligne de commande : une reprise en cours nomme
+#: la session juste après eux (`claude --resume <id>`, `dsh --session-id <id>`,
+#: ou leur valeur liée par `=`), ou après les options de la sous-commande
+#: (`codex exec resume --json <id>`, `codex resume --no-alt-screen <id>`). Un
+#: identifiant cité ailleurs dans un argv — brief JSON, message, prompt, valeur
+#: d'option — n'est pas un détenteur (#1283).
+SESSION_SELECTORS = ("resume", "--resume", "-r", "--session-id")
+
+#: Options de reprise SANS valeur, par binaire (`basename(argv[0])`) : le
+#: jeton suivant reste candidat au positional de session. Toute autre option
+#: est supposée prendre une valeur — la consommer évite de prendre son
+#: argument pour l'id (`codex resume -m gpt-5.1-codex <id>`) ; une valeur liée
+#: par `=` tient en un seul jeton. La grammaire dépend du binaire pour un même
+#: jeton : `-p` = `--print` chez Claude mais `--profile <nom>` chez Codex, `-c`
+#: = `--continue` chez Claude mais `--config <clé=valeur>` chez Codex — les
+#: confondre perd une vraie reprise ou prend un profil pour un id (#1283 R1 cx2,
+#: aide locale Codex : `-p`/`--profile` porte une valeur). Sources : descripteurs
+#: `harness_descriptors/*.json`, `dsh --help` local, revue cx2.
+_CODEX_FLAGS = frozenset({
+    "--json", "--no-alt-screen", "--all", "--ephemeral", "--worktree",
+    "--no-daemon", "--ignore-user-config", "--ignore-rules", "--strict-config",
+    "--include-non-interactive", "--search", "--oss", "--approve-for-me",
+    "--full-auto",
+    "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust", "-h", "--help", "-V", "--version",
+})
+_CLAUDE_FLAGS = frozenset({
+    "-p", "--print", "-c", "--continue", "--verbose", "--fork-session",
+    "--include-partial-messages", "--strict-mcp-config", "--ide",
+    "--replay-user-messages", "--dangerously-skip-permissions",
+    "-h", "--help", "-V", "--version",
+})
+_DSH_FLAGS = frozenset({
+    "--json", "--no-daemon", "--dump-config", "--dump-config-schema",
+    "--dump-default-config", "-h", "--help", "-V", "--version",
+})
+#: Repli d'un binaire inconnu (harnais porté par un script de banc) : les
+#: grammaires dont le `resume` est un sous-commande à positional. Les options
+#: courtes ambiguës (`-p`, `-c`) en sont absentes : supposées à valeur, comme
+#: chez Codex, puisque c'est la grammaire du `resume` nu.
+RESUME_FLAGS = {
+    "codex": _CODEX_FLAGS,
+    "claude": _CLAUDE_FLAGS,
+    "dsh": _DSH_FLAGS,
+    "": _CODEX_FLAGS | _DSH_FLAGS,
+}
+
+#: Options qui désignent « la session la plus récente » : aucun positional
+#: d'id ne suit, un jeton cité après elles est un prompt. `--all` n'en fait
+#: PAS partie : chez Codex il élargit la recherche (Show all sessions), il ne
+#: désigne pas la dernière — un id le suivant est bien le positional
+#: (#1283 R1 cx2, aide locale).
+RESUME_LATEST = frozenset({"--last"})
+
+
+def _resume_flags(argv: list[str]) -> frozenset[str]:
+    """La grammaire d'options du binaire lancé (repli : binaires connus)."""
+    nom = os.path.basename(argv[0]) if argv else ""
+    return RESUME_FLAGS.get(nom, RESUME_FLAGS[""])
+
+
+def _resume_positional(argv: list[str], index: int,
+                       flags: frozenset[str]) -> str | None:
+    """Le positional de session d'une reprise à partir de `index` : options
+    consommées (leur valeur avec), `--` respecté ; None si `--last` désigne la
+    plus récente, ou s'il n'y a plus de positional."""
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if arg in RESUME_LATEST:
+            return None
+        if arg.startswith("-"):
+            index += 1
+            if not arg.partition("=")[1] and arg not in flags \
+                    and index < len(argv) and not argv[index].startswith("-"):
+                index += 1
+            continue
+        return arg
+    return None
+
+
+def _session_argument(argv: list[str], needle: str) -> bool:
+    """`needle` est-il nommé par une reprise en cours, et non cité ?
+
+    Tous les sélecteurs de la ligne sont essayés : un mot `resume` du texte
+    (prompt, message) ne masque pas un `--resume <id>` plus loin."""
+    flags = _resume_flags(argv)
+    for index, arg in enumerate(argv[1:], start=1):
+        flag, sep, value = arg.partition("=")
+        if sep and flag in SESSION_SELECTORS:
+            if value == needle:
+                return True
+        elif arg == "resume":
+            if _resume_positional(argv, index + 1, flags) == needle:
+                return True
+        elif arg in ("--resume", "-r", "--session-id"):
+            if index + 1 < len(argv) and argv[index + 1] == needle:
+                return True
+    return False
+
+
+def _verdict(pid: int, hit: str, argv: list[str], needle, exclude,
+             session: bool = False) -> dict | None:
+    if not hit and needle and pid not in exclude:
+        if session:
+            if _session_argument(argv, needle):
+                hit = "session id on the command line"
+        elif any(needle in a for a in argv[1:]):
+            hit = "session id on the command line"
     if hit:
         return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160]}
     return None
 
 
-def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
+                    session=False) -> list[dict]:
     me = os.getpid()
     try:
         ps.Process(me).open_files()
@@ -807,7 +919,7 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
                     argv = []
         except ps.NoSuchProcess:
             continue
-        row = _verdict(pid, hit, argv, needle, exclude)
+        row = _verdict(pid, hit, argv, needle, exclude, session)
         if row:
             found.append(row)
         elif refused:
@@ -851,7 +963,7 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
     return ""
 
 
-def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
@@ -901,7 +1013,7 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
                 argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
         except OSError:
             argv = []
-        row = _verdict(int(pid), hit, argv, needle, exclude)
+        row = _verdict(int(pid), hit, argv, needle, exclude, session)
         if row:
             found.append(row)
         elif refused:
