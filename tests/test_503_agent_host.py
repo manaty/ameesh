@@ -105,6 +105,7 @@ elif 'show' in args:
 elif 'is-active' in args:
     if scenario == 'inactive': sys.exit(3)
     if scenario == 'inactive-dev9' and '@dev9.' in args[-1]: sys.exit(3)
+    if (state / ('inactive-' + unit.split('@')[1].removesuffix('.service'))).exists(): sys.exit(3)
     print('active')
 '''
 
@@ -113,8 +114,10 @@ import json, os, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
+# #1133 : the value given to -p must already be absolute — systemd-run does
+# not expand %h in a transient unit's properties (it answers "not absolute").
 assert args[:7] == ['--user', '--pipe', '--wait', '--quiet', '-p',
-                    'EnvironmentFile=%h/.config/ameesh/env', '--'], args
+                    'EnvironmentFile=' + str(state / 'runner.env'), '--'], args
 with (state / 'systemd-run.log').open('a') as f: f.write(' '.join(args) + '\n')
 # The manager supplies these values; this stub deliberately does not source
 # or reimplement EnvironmentFile. A separate test exercises the real parser.
@@ -191,16 +194,36 @@ class AgentHostTest(unittest.TestCase):
             AMEESH_DSN=expected, AMEESH_SCHEMA='test_runner_schema')))
         p = self.run_vm('controler')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('EnvironmentFile=%h/.config/ameesh/env',
-                      (self.state / 'systemd-run.log').read_text())
+        log = (self.state / 'systemd-run.log').read_text()
+        # #1133 : an absolute path, expanded before systemd-run sees it (the
+        # `%h` specifier is not expanded there and would fail the unit).
+        self.assertIn('EnvironmentFile=' + str(self.state / 'runner.env'), log)
+        self.assertNotIn('%h', log)
 
     def test_restart_uses_remote_registry_and_user_units(self):
         p = self.run_vm()
         self.assertEqual(p.returncode, 0, p.stderr)
         restarts = [l for l in self.units().splitlines() if 'restart' in l]
+        # #1633 : la persona arrêtée du registre est du lot — son unité active
+        # est rechargée sur le nouveau code (aucun bail exigé) ; l'observateur
+        # et l'agent d'un autre hôte restent ignorés.
         self.assertEqual(restarts, ['--user restart ameesh-runner-agent@dev8.service',
-                                    '--user restart ameesh-runner-agent@dev9.service'])
+                                    '--user restart ameesh-runner-agent@dev9.service',
+                                    '--user restart ameesh-runner-agent@stopped.service'])
         self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertIn('stopped : arrêté dans le registre', p.stdout)
+        self.assertNotIn('stopped : redémarré (était', p.stdout)
+        self.assertNotIn('no lease before the restart', p.stdout)
+
+    def test_restart_leaves_an_inactive_stopped_unit_alone(self):
+        # #1633 : unité déjà arrêtée — aucune relance : elle chargera le
+        # nouveau code à son démarrage.
+        (self.state / 'inactive-stopped').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('restart ameesh-runner-agent@stopped.service', self.units())
+        self.assertIn('stopped : arrêté dans le registre', p.stdout)
+        self.assertIn('déjà arrêtée', p.stdout)
 
     def test_restart_waits_for_agent_out_of_turn(self):
         p = self.run_vm(scenario='busy-once')

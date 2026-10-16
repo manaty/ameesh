@@ -14,8 +14,8 @@
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
   ameesh activity <persona> [--since 24h] [--json]   persona activity log (L59);
-  ameesh attach <agent> [--wait] [--ttl S]
-        an interactive session on the agent's lease, same session (C9);
+  ameesh attach <agent> [--wait] [--ttl S] [--max 2h]
+        bounded native access: sleep the resident, then return its lease (L82);
   ameesh list | show          observability (host, lease, unread, budget, key);
   ameesh key …                public keys (owner / agent);
   ameesh approve | approvals | verify   signed approvals;
@@ -53,7 +53,14 @@
         --serve: the page served locally, read-only, with a Refresh button (L304);
   ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
         the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
-        docs/api/openapi-v1.json);
+        docs/api/openapi-v1.json); GET /api/v1/events streams the event log (L85);
+  ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
+        the event log (lot transitions, turns, costs, threads, decisions, alerts) and
+        its retention (365 days by default, L85);
+  ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
+        | identity <agent> [--json]
+        the gh commands run by agents, journaled per turn (who cancelled,
+        merged, labelled), and the GitHub identity an agent resolves to (#1645);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -126,6 +133,10 @@
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
         mediated executor API (/api/exec/v1, L108): an executor on a
         device without database access (docs/EXECUTEUR-MEDIEE.md).
+  ameesh github read <chemin> [--ttl SECONDES]
+        a GitHub REST read for the agents' watch scripts, through the host's
+        shared reads cache (#848, #860): a conditional request costs no quota,
+        and exit code 3 says the quota is exhausted with nothing cached.
 
 The human approval service (spec §9) is a separate command,
 `ameesh-approve` (python -m ameesh.approve), run under its own
@@ -168,11 +179,14 @@ MESH_COMMANDS = (
     # dans mesh_cli, mais aucune liste de routage ne le servait : code 2 avant
     # même de regarder la base.
     "ci",
+    # L750/L756 (#561/#566) : le périmètre d'une release et sa porte
+    # (`ameesh release open|check|reason`).
+    "release",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
 #: adoption et reprise (L39, décision 0030)
-REPRISE_COMMANDS = ("adopt", "resume")
+REPRISE_COMMANDS = ("adopt", "resume", "pause")
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")
 #: actions sous porte et file des décisions (actions_cli)
@@ -243,6 +257,11 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "activity":
         from . import activity
         return activity.main(rest)
+    if command == "github" and rest[:1] in (["gestes"], ["identity"]):
+        # #1645 : journal des gestes gh des agents, identité GitHub par rôle ;
+        # `ameesh github read` (#860) et l'aide restent à github_cli
+        from . import github_identity
+        return github_identity.main(rest)
     if command == "progress":
         from . import progress
         return progress.main(rest)
@@ -263,6 +282,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L84: read API, local mode
         from . import serve
         return serve.main(rest)
+    if command == "events":
+        # L85: the event log of `GET /api/v1/events`
+        from . import events
+        return events.main(rest)
     if command == "host" and rest and rest[0] in ("drain", "undrain", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
@@ -276,6 +299,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "github":
+        # #860 : lectures GitHub des veilles par le cache partagé de l'hôte
+        from . import github_cli
+        return github_cli.main(rest)
     if command == "sessions":
         # L52 (0032 §2): current and past persona sessions.
         from . import persona_sessions

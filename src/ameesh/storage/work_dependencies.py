@@ -30,6 +30,17 @@ class WorkDependencies(abc.ABC):
         """
 
     @abc.abstractmethod
+    def release_unassigned(self, item_ids: Sequence[int], *, actor: str) -> list[int]:
+        """Return still-unassigned blocked candidates to intake and journal them.
+
+        The caller supplies candidates with no remaining planned wait, in
+        the closure transaction while holding the dependency-graph lock.
+        Recheck state and assignee when writing; return only changed ids.
+        A lot pinned to a Process workflow is never released here: its hold
+        is lifted only by a `release` command of the registry (#1922/B4).
+        """
+
+    @abc.abstractmethod
     def lock(self) -> None:
         """Take the schema-wide dependency-graph lock in the current transaction.
 

@@ -16,9 +16,10 @@
 # pilote (connexion persistante, notifications, nombre d'allers-retours).
 #
 # Liste additive (L160a) : un module par ligne, sa raison en commentaire sur la
-# même ligne, ordre alphabétique, sans doublon (scripts/test-parts.py refuse
-# une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
-# deux endroits différents du fichier, sans conflit.
+# même ligne, ordre alphabétique, sans doublon ; la lecture range et
+# dédoublonne ce qu'une fusion `union` produit (un nom inconnu reste refusé).
+# Deux lots qui ajoutent chacun un module touchent ainsi deux endroits
+# différents du fichier, sans conflit.
 
 test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
@@ -28,6 +29,7 @@ test_653_db_connections  # stockage : sessions périodiques libérées, transact
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
 test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes planifiées et livraison Notifier (#789 t2)
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)
+test_810_multi_project_consumers  # stockage : `projects` lu par la vue par projet et le filtre progress, prise au projet primaire (L243-3)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
@@ -52,6 +54,9 @@ test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS 
 test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
 test_l165c_sessions_par_lot  # stockage : sessions mises de côté par (agent, lot), bascule fencée par le bail, lots actionnables, réveils (L165b, #408)
 test_l232a_handoffs  # storage: physical reservations, controller locks, claim fence, CAS journal and recovery (L232a)
+test_l232b_bootstrap  # owner-signed bootstrap scopes, original approval expiry and account digest binding (L232b)
+test_l232b_migration_worker  # database-wide migration election, atomic inventory and additive release guard (L232b)
+test_l232b_release_fence  # signed release closure, racing claim/turn writers, draining and durable receipt replay (L232b)
 test_l232e_drain_handoffs  # storage: lifecycle generation checks, drain/return handoffs and readiness (L232e)
 test_l232e_host_lifecycle  # storage: persistent withdrawal, stale-host detection and concurrent gate/claim guards (L232e)
 test_l232e_loss_recovery  # storage: scoped recovery proof, expired lease fencing and source loss thresholds (L232e)
@@ -59,6 +64,7 @@ test_l317_project_modules  # storage: transactional module guards, structured ev
 test_l317b_module_audit  # storage: current evidence audit and notification on both drivers (L317b)
 test_l368_planned_waits  # storage: unbounded activity, item plans and commitment dependencies (L368)
 test_l385_work_dependencies  # storage: serialized dependency graph, rollback, audit and blocker states (L385)
+test_l514_wake_on_event  # stockage : réservation/remise du hook, verdict de CI vers l'assigné, réveil de l'exécuteur (L514)
 test_l52_persona_sessions  # storage: session history SQL, resume and lease-fenced rotation (L52)
 test_l53_restore_guard  # storage: restoration refuses active leases and blocks concurrent claims through extraction (L53)
 test_l54_memory_runner  # storage: memory isolation and designation/sync through a fake-harness turn (L54)
@@ -67,6 +73,8 @@ test_l59_activity  # storage: bounded timeline SQL, timestamps, voided costs and
 test_l61_allers_retours  # allers-retours comptés par le pilote lui-même (AMEESH_DB_TRACE)
 test_l72_panne_de_base  # panne de base, reconnexion, réveils (listener)
 test_l78_conversations  # storage: cursor locking, JSON pages, R12 outbox, retention and commit NOTIFY (L78)
+test_l82_attach  # leases: resident handoff, duplicate refusal and queued inputs across native attach (L82)
 test_migrations  # couche base : migrations sur un schéma neuf
+test_process_registry  # stockage/driver : reçus transactionnels, verrous FOR UPDATE/FOR SHARE, concurrence et annulation (#1922)
 test_registry_lease  # verrous et baux : comportement différent entre psql et psycopg
 test_undeliverable  # courrier en souffrance : renvoi en une transaction (psql persistant), lecture jointe à la vue par projet (une requête)

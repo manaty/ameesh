@@ -160,7 +160,26 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L39 (0033) : NOM du compte d'origine de la session (jamais un profil)
         'session_account',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- #810 (0428) : la vue est recréée avec `r.*` et expose donc les
+        -- colonnes de `agent_registry` apparues depuis 0033 ; accordées ici à
+        -- l'identique de la table (mêmes données, mêmes refus de contenu).
+        -- L60 (0041) : plafond de contexte (un nombre)
+        'context_max_tokens',
+        -- L105 (0046) : plafonds du tour (des nombres)
+        'turn_max_seconds', 'turn_mail_max',
+        -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
+        'turn_grace_seconds',
+        -- L232a (0371) : clôture de passage entre hôtes
+        'handoff_fenced',
+        -- L165b (0384) : réveil sur lot actionnable et session (mêmes réglages)
+        'lot_wake', 'session_harness', 'session_cwd', 'session_origin',
+        -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+        'projects',
+        -- 0403 : attente de bail depuis (un instant)
+        'lease_wait_since',
+        -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
+        'workstream'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
@@ -175,6 +194,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'placement_profile',
         -- L232a (0371) : clôture de passage entre hôtes
         'handoff_fenced',
+        -- #1521 (0446) : début du motif de statut, sans contenu
+        'status_reason_since',
         -- L26 (0027) : réglages et état de session, sans contenu
         'session_policy', 'effort', 'tier', 'session_work_item',
         'status_since', 'restart_requested_at', 'session_reset_at',
@@ -323,6 +344,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
     ]),
+    -- L232b (0417) : la fermeture de release, lue par `ameesh_host_gate_state`
+    -- (`host` seulement ; périmètre d'opération et reçus exclus)
+    ('host_release_fences', ARRAY['host']),
     ('host_handoffs', ARRAY[
         'id', 'agent', 'source', 'target', 'state', 'fenced',
         'memory_bytes', 'disk_bytes', 'reserved_until', 'created_at', 'updated_at'
@@ -350,7 +374,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159e6 (0361): the guard's last restart (unit names and reasons)
         'guard_restart',
         -- L159f (0069): host gate state, seq and the guard's short reason
-        'gate_state', 'gate_seq', 'gate_reason'
+        'gate_state', 'gate_seq', 'gate_reason',
+        -- #2022 (0455): process and zombie counts, the publishing runner
+        'procs_total', 'procs_zombie', 'runner_id', 'runner_procs', 'runner_zombies'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
@@ -477,6 +503,19 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'billing_account', 'agent', 'usd', 'period', 'state', 'spend_key',
         'created_at', 'closed_at', 'closed_by'
     ]),
+    -- L85 (0396): the event log, identifiers and states only, never free text
+    ('ameesh_events', ARRAY[
+        'id', 'type', 'object', 'project', 'data', 'tx', 'created_at'
+    ]),
+    -- the retention's watermark: the greatest position (tx, id) it deleted
+    ('ameesh_events_pruned', ARRAY[
+        'one', 'tx', 'id', 'at'
+    ]),
+    -- #928 (0448): the journal's random identity, in every position; it names
+    -- a log, it carries no content and no secret
+    ('ameesh_events_journal', ARRAY[
+        'one', 'journal'
+    ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when)
     ('agent_watches', ARRAY[
         'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'
@@ -568,8 +607,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
         -- L122 (0053) : numéro de migration réservé par le lot, et son
-        -- dépôt (#443, 0390)
-        'migration', 'migration_repo',
+        -- dépôt (#443, 0390) ; #1567 : le numéro réellement atterri, quand la
+        -- renumérotation du paquet a changé celui de la réservation
+        'migration', 'migration_repo', 'migration_landed', 'migration_landed_repo',
         -- L157b (0054) : taille déclarée du changement
         'change_size',
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte

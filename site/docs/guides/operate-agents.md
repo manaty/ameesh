@@ -88,6 +88,7 @@ Each agent row keeps the historical keys and adds:
 | `harness`, `model`, `effort`, `tier` | harness and settings, or `null` |
 | `session_policy`, `session_policy_set` | effective policy; the agent's own setting or `null` |
 | `state` | `working`, `idle`, `paused` or `stopped` (same rules as `ameesh progress`) |
+| `paused_on_budget` | `true` when the agent's turn is held by the budget/pace guard (status `blocked`, text `budget : …`, L242b); a `blocked` for another cause (host not ready, authentication) stays `false` (#1070) |
 | `state_since_ts`, `state_for_s` | since when |
 | `lot` | `{id, title, state, source}`: the session's lot (`"session"`) unless it is merged or closed, else the most recent open lot assigned (`"assigned"`), or `null` |
 | `title` | title of the current lot, else the status text |
@@ -99,7 +100,9 @@ Each agent row keeps the historical keys and adds:
 | `stop_reason` | `manuel`, `bail_expire`, `retire_du_canon` (`externe`, `erreur` reserved), or `null` while the agent runs (v1.4.0) |
 
 The text view of `ameesh list` counts the lots once at the bottom and shows,
-for each agent, a **LOTS** column with its open assigned lots.
+for each agent, a **LOTS** column with its open assigned lots. A budget-paused
+agent reads `paused/…` in the STATUS column (never the truncated
+`blocked/bud`); a `blocked` for another cause stays `blocked/…` (#1070).
 
 ## Cost per turn, plan gauges, provider balance
 
@@ -224,7 +227,7 @@ D-Bus).
 
 ```bash
 ameesh work add --title T --assignee AGENT [--externe] …
-ameesh work assign <id> <agent> [--externe] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--claim]
 ameesh work delegate <id> <agent> --within 30m [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
 ```
@@ -245,7 +248,12 @@ human. Details:
 - a canon that is momentarily invalid does not block an assignment (warning);
   claiming stays closed until the next valid sync;
 - `work assign` reassigns an open lot, logs "assigned to X (before: Y)" in the
-  lot's events, and clears any delegation in progress.
+  lot's events, and clears any delegation in progress;
+- `--claim` (#1026) assigns only a lot that has no assignee: an already taken
+  lot is refused (exit 1) naming its holder, and the write is conditional on
+  the assignee still being empty, so two concurrent claims on the same lot
+  produce one assignment and one readable refusal, never a silent hand
+  change. The `stale_lot` and `idle_capacity` briefs carry that command.
 
 **Delegation with a deadline**. `work delegate` hands a lot to a wakeable
 agent (same guard; a human is refused, use `work assign`) and drops an event
