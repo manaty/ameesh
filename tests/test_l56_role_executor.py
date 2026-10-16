@@ -399,7 +399,7 @@ class RoleExecutorTest(PgTestCase):
             # PG17 : MAINTAIN est un droit réel, l'audit le refuse.
             result = apply(sql)
             self.assertNotEqual(result.returncode,0)
-            self.assertIn('unrelated write privilege',result.stderr)
+            self.assertIn('unrelated write privilege',result.stderr,attendu(result.stderr))
             # Même audit avec la version forcée avant 17 : la liste ne porte
             # plus MAINTAIN, donc l'audit va au bout au lieu d'échouer sur un
             # nom de droit inconnu.
