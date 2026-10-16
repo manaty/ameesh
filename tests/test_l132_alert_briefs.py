@@ -44,6 +44,10 @@ class BriefsTest(unittest.TestCase):
         self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
         self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        # #2016 : la réassignation proposée porte le titulaire lu (instantané) ;
+        # un second agent parti du même brief sera refusé si le lot a changé de
+        # main entre-temps.
+        self.assertIn("ameesh work assign 42 <agent> --if-holder dev1", text)
 
     def test_stale_lot_offre_le_hold_de_dependance(self):
         """#1642 : le brief doit offrir la dépendance déclarée (planned_wait),

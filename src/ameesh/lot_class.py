@@ -156,12 +156,15 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
            repo: Optional[str] = None, base: Optional[str] = None,
-           head: Optional[str] = None) -> dict:
+           head: Optional[str] = None, milestones: Optional[list] = None,
+           canons=None) -> dict:
     """La classe du lot `lot` ; ne lève jamais (tout doute rend `sensitive`).
 
     `item` évite une lecture de la base ; `repo`, `base` et `head` sont ceux
     que l'appelant a déjà résolus (la file de fusion connaît la tête gelée et
-    le dépôt du clone). Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
+    le dépôt du clone). `milestones` et `canons` (liste ou lecteur différé)
+    réutilisent les lectures groupées de l'appelant. Rend aussi `files`,
+    `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
     d'une politique) pour la trace.
     """
@@ -183,7 +186,8 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out["why"] = "no repository known for the lot"
         return out
     if not head:
-        freeze = plan_git.latest_freeze(work.milestones(db, lot))
+        freeze = plan_git.latest_freeze(work.milestones(db, lot) if milestones is None
+                                        else milestones)
         if not freeze or not str(freeze.get("sha") or "").strip():
             out["why"] = "lot #%d is not frozen" % lot
             return out
@@ -220,7 +224,10 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out.update({"class": LIGHT, "why": "no file changed since %s" % base,
                     "doubt": False})
         return out
-    canons = work.configured_canons(cfg)
+    if canons is None:
+        canons = work.configured_canons(cfg)
+    elif callable(canons):
+        canons = canons()
     if not canons:
         out["why"] = "no readable canon: review policy unknown"
         return out

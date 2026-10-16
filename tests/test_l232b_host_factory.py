@@ -23,6 +23,9 @@ factory=importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(factory)
 SERVICE_SPEC=importlib.util.spec_from_file_location('release_service',
     Path(__file__).resolve().parents[1]/'deploy/mise-a-jour/service-release.py')
 service=importlib.util.module_from_spec(SERVICE_SPEC); SERVICE_SPEC.loader.exec_module(service)
+# Le pilote psql n'installe pas psycopg : le parseur libpq manque alors et le
+# compagnon de sauvegarde doit refuser nommément (fail-closed), pas être sauté.
+HAVE_PSYCOPG=importlib.util.find_spec('psycopg') is not None
 
 
 class Authority:
@@ -33,7 +36,10 @@ class Authority:
 class Database:
     reachable=True
     def __init__(self,dsn='postgresql://controller@localhost/fixture-db'):
-        self.cfg=SimpleNamespace(dsn=dsn)
+        # The release connection names the database and schema the backup
+        # enrollment must match (K7): the factory binds no recovery set whose
+        # source is another database or an unavailable schema.
+        self.cfg=SimpleNamespace(dsn=dsn,schema='public')
     def ping(self):
         if not self.reachable: raise OSError('fixture database unavailable')
     def query(self,sql,params=()):
@@ -248,6 +254,14 @@ class HostFactoryTest(unittest.TestCase):
         value=factory.HostFactory(self.db,self.enrollment,documents=factory.Documents(self.enrollment_root),
             store=self.store,configuration_journal=self.journal,backup_root=self.backup,
             retention_root=self.retention,system=self.system,capabilities={})
+        if not HAVE_PSYCOPG:
+            # Le pilote psql n'installe pas psycopg : le parseur libpq manque,
+            # la cible ne peut pas être recoupée. L'admission doit REFUSER
+            # nommément (fail-closed), jamais accepter une cible non vérifiée.
+            with self.assertRaisesRegex(factory.FactoryError,
+                                        'libpq parser unavailable'):
+                value.admit(self.enrollment)
+            return
         self.assertEqual(value.admit(self.enrollment),factory.REQUIRED)
         adapter=value.for_operation(dict(operation='release-fixture'),self.authority)
         self.assertTrue(callable(getattr(adapter.recovery_set,'perform',None)))

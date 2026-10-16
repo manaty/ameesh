@@ -317,7 +317,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     proof = None
     if needs_commit_ci:
         if parts is None and getattr(project, "ci_parts", None):
-            parts = _parts_reader(project, repo, target, tip, clone)
+            parts = _parts_reader(project, repo, target, tip, clone, cfg=cfg)
         _required_ci(project, tip, commit_ci, parts=parts)
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
@@ -372,7 +372,7 @@ def _class_worse(candidate: dict, best: dict) -> bool:
     return bool(best.get("doubt")) and not candidate.get("doubt")
 
 
-def _parts_reader(project, repo: str, target: str, sha: str, clone):
+def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
     """L1651 (#1650): le lecteur des parts dues d'une tête gelée.
 
     Le contrat est celui du projet (`ci_parts`), versionné à `ci_parts.rev`
@@ -401,7 +401,9 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone):
                              "the due parts of the frozen head %s cannot be proven"
                              % (rev, project.name, sha[:12]))
         try:
-            proof = ci_parts.due(project, sha, base, holder)
+            #: N2 de #1666 : le cache de l'hôte (par couple base/tête gelée)
+            #: évite de réextraire l'arbre de la cible à chaque contrôle.
+            proof = ci_parts.due(project, sha, base, holder, cache=ci_parts.cache_dir(cfg))
         except ci_parts.PartsError as exc:
             raise QueueError("the parts the change set makes due on the frozen head %s cannot "
                              "be proven: %s" % (sha[:12], exc)) from exc
@@ -419,10 +421,14 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
 
     L1651 (#1650): `parts` (a callable returning the due contexts, or a
     sequence; None: none) closes the completeness hole. Each due part must
-    exist in `commit_ci`'s `contexts` for that exact commit and be terminal
-    success: a part never dispatched leaves no status, and a `skipped` or
-    `cancelled` attempt is not a green one. No status of another commit — the
-    reader is pinned to `sha` — can stand for a part of this one."""
+    exist in `commit_ci`'s `statuses` — the commit **status** space of that
+    exact commit — and be terminal success: a part never dispatched leaves no
+    status, and a `skipped` or `cancelled` attempt is not a green one. N1 de
+    #1666 : lire `contexts` (qui mêle runs, checks et statuts) laissait un run
+    ou un check portant le nom d'une part tenir lieu de part ; la preuve se
+    fait désormais dans l'espace des statuts seulement. No status of another
+    commit — the reader is pinned to `sha` — can stand for a part of this
+    one."""
     from . import plan_github, radar
     try:
         runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
@@ -443,10 +449,13 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     if parts is None:
         return
     due = list(parts() if callable(parts) else parts)
-    contexts = runs.get("contexts") or {}
-    missing = [part for part in due if contexts.get(part) != "success"]
+    #: N1 de #1666 : l'espace des **statuts de commit** seulement. Un lecteur
+    #: qui ne rend pas `statuses` (dict sans la clé, cache d'un autre format)
+    #: ne prouve aucune part : jamais de repli sur `contexts`.
+    statuses = runs.get("statuses") or {}
+    missing = [part for part in due if statuses.get(part) != "success"]
     if missing:
-        detail = ", ".join("%s (%s)" % (part, contexts.get(part) or "no status")
+        detail = ", ".join("%s (%s)" % (part, statuses.get(part) or "no status")
                            for part in missing)
         raise QueueError("the CI on the frozen commit %s does not prove the parts the change "
                          "set makes due (%d of %d missing or not successful: %s)"

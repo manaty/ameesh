@@ -360,11 +360,27 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _getattr_member(node: ast.Call) -> tuple[str, str] | None:
+    """`getattr(<name>, '<constant>', ...)` lu statiquement : le couple
+    (porteur, membre), ou `None` (forme dynamique, argument manquant). Le
+    défaut éventuel est sans effet ici : `sys.exit`/`os._exit` existent
+    toujours, donc l'appel termine quel que soit le défaut."""
+    if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
+        return None
+    if len(node.args) < 2:
+        return None
+    owner, attr = node.args[0], node.args[1]
+    if (isinstance(owner, ast.Name) and isinstance(attr, ast.Constant)
+            and isinstance(attr.value, str)):
+        return owner.id, attr.value
+    return None
+
+
 def _is_exit_func(node: ast.expr, exit_names: set[str],
                   sys_names: set[str], os_names: set[str]) -> bool:
     """Whether an expression designates a known import-time termination: a
-    bound name, or `sys.exit`/`os._exit` (aliases of `sys`, `os` and of the
-    imported names included)."""
+    bound name, `sys.exit`/`os._exit`, or their static `getattr` read (#1878)
+    (aliases of `sys`, `os` and of the imported names included)."""
     if isinstance(node, ast.NamedExpr):
         # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
         return _is_exit_func(node.value, exit_names, sys_names, os_names)
@@ -375,6 +391,14 @@ def _is_exit_func(node: ast.expr, exit_names: set[str],
             return node.value.id in sys_names
         if node.attr == "_exit":
             return node.value.id in os_names
+        return False
+    if isinstance(node, ast.Call):
+        read = _getattr_member(node)
+        if read is None:
+            return False
+        owner, attr = read
+        return ((attr == "exit" and owner in sys_names)
+                or (attr == "_exit" and owner in os_names))
     return False
 
 
@@ -501,11 +525,13 @@ class _RuntimeImports(ast.NodeVisitor):
 
     def _learn_exit_names(self, target: ast.expr, value: ast.expr | None) -> None:
         """Un nom affecté d'une sortie connue en devient une (#1860) :
-        `e = sys.exit` puis `e()`. L'ensemble ne rétrécit jamais — une
-        réaffectation peut être conditionnelle (#1474) : une preuve perdue
-        n'est jamais une fausse preuve. Une cible multiple lisible est suivie
-        élément par élément ; toute autre forme est gardée entière dès que la
-        valeur mentionne une sortie (conservateur)."""
+        `e = sys.exit` puis `e()`. Un nom affecté d'un module `sys`/`os`
+        devient un de ses alias (#1878) : `s = sys` puis `s.exit()`. Les
+        ensembles ne rétrécissent jamais — une réaffectation peut être
+        conditionnelle (#1474) : une preuve perdue n'est jamais une fausse
+        preuve. Une cible multiple lisible est suivie élément par élément ;
+        toute autre forme est gardée entière dès que la valeur mentionne une
+        sortie ou un de ces modules (conservateur)."""
         if value is None:
             return
         if (isinstance(target, (ast.Tuple, ast.List))
@@ -515,9 +541,17 @@ class _RuntimeImports(ast.NodeVisitor):
                 self._learn_exit_names(sub_target, sub_value)
             return
         names = self._target_names(target)
-        if names and any(_is_exit_func(node, self._exit_names, self._sys_names,
-                                       self._os_names)
-                         for node in ast.walk(value)):
+        if not names:
+            return
+        mentioned = [node.id for node in ast.walk(value)
+                     if isinstance(node, ast.Name)]
+        if any(name in self._sys_names for name in mentioned):
+            self._sys_names.update(names)
+        if any(name in self._os_names for name in mentioned):
+            self._os_names.update(names)
+        if any(_is_exit_func(node, self._exit_names, self._sys_names,
+                             self._os_names)
+               for node in ast.walk(value)):
             self._exit_names.update(names)
 
     def visit_Assign(self, node: ast.Assign) -> None:

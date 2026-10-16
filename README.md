@@ -97,6 +97,9 @@ scripts are untouched. The switch is described step by step, with rollback, in
 ```bash
 scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.1:55432
 # several agents on one host: AMEESH_PG_NAME=<agent>-pgtest AMEESH_PG_PORT=…
+# AMEESH_PG_DISPOSABLE=1 declares a lot bench disposable: housekeeping may reap
+# its <name>-data volume after 24 h without a container (conservation by
+# default; the shared ameesh-pg volume is never declared disposable)
 # (its volume is then <name>-data; a volume already mounted is refused)
 export PYTHONPATH=src
 # Aucun secret n'est codé dans le dépôt : le mot de passe du banc vient de
