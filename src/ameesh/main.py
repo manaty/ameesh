@@ -57,6 +57,10 @@
   ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
         the event log (lot transitions, turns, costs, threads, decisions, alerts) and
         its retention (365 days by default, L85);
+  ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
+        | identity <agent> [--json]
+        the gh commands run by agents, journaled per turn (who cancelled,
+        merged, labelled), and the GitHub identity an agent resolves to (#1645);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -253,6 +257,11 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "activity":
         from . import activity
         return activity.main(rest)
+    if command == "github" and rest[:1] in (["gestes"], ["identity"]):
+        # #1645 : journal des gestes gh des agents, identité GitHub par rôle ;
+        # `ameesh github read` (#860) et l'aide restent à github_cli
+        from . import github_identity
+        return github_identity.main(rest)
     if command == "progress":
         from . import progress
         return progress.main(rest)
