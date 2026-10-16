@@ -26,7 +26,12 @@ son acteur est l'auteur du lot produit, et les tours comptés de cet acteur
 réellement tourné. Entre le gel et la fusion, une session peut être remplacée
 ou changer de harnais (rotation, `adopt`, L242b) : le registre courant ne
 prouve rien du passé, et quand aucun tour n'est tracé la famille reste
-inconnue (`codex ou claude`) — elle n'est jamais devinée du registre.
+inconnue (`codex ou claude`) — elle n'est jamais devinée du registre. #1777 :
+le tour du gel est celui dont la ligne `turn_costs` suit le gel (elle est
+écrite à la fin du tour), dans la fenêtre d'un tour ; au-delà c'est une
+session suivante. Un gel reposé par un tiers ne fait pas de lui l'auteur : le
+premier gel reste la livraison, et si son acteur n'a aucun tour tracé on relit
+les tours de l'assigné.
 """
 from __future__ import annotations
 
@@ -44,6 +49,12 @@ HOUR = "23:59"
 #: 2026-10-13) : codex si l'auteur est Claude ou DeepSeek, sinon Claude.
 OPPOSITE = {"claude": "codex", "deepseek": "codex", "codex": "claude"}
 UNKNOWN_FAMILY = "codex ou claude"
+#: #1777 N1 : au-delà de cette fenêtre après le gel, la première ligne
+#: `turn_costs` de l'auteur n'est plus le tour qui a gelé mais une session
+#: suivante. `cost.record` écrit la ligne du tour à sa FIN, donc le tour du gel
+#: apparaît APRÈS l'instant du gel ; 30 min = `turn_max_seconds` par défaut
+#: (config.Config), la durée maximale d'un tour qui peut encore porter ce gel.
+FREEZE_TURN_WINDOW_S = 1800.0
 #: la règle du canon §2, recopiée dans le corps du lot (consigne injectée au
 #: relecteur, avec la route du défaut non bloquant — owner du 15/10/2026)
 BLOCKING = ("un défaut **bloquant** (B, P1) trouvé après la fusion ouvre aussitôt un lot de "
@@ -73,24 +84,6 @@ def deadline(now: Optional[datetime] = None) -> str:
 def reviewer_family(harness: Optional[str]) -> str:
     """La famille de relecture opposée au harnais de l'auteur."""
     return OPPOSITE.get((harness or "").strip().lower(), UNKNOWN_FAMILY)
-
-
-def _author(db, name: str) -> dict:
-    """Le harnais de l'auteur du lot, si le registre le connaît.
-
-    #1037 : c'est celui de sa session VIVANTE (`registry.live_harness`), pas
-    seulement son harnais déclaré — L242b fait tourner un agent sous un
-    harnais emprunté, et la relecture doit venir d'une autre famille que
-    celle qui a réellement produit le travail."""
-    name = (name or "").strip()
-    if not name:
-        return {"name": "", "harness": ""}
-    try:
-        from . import registry
-        row = registry.get(db, name) or {}
-    except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
-        return {"name": name, "harness": ""}
-    return {"name": name, "harness": registry.live_harness(row)}
 
 
 def _open(ops, ref: str) -> Optional[dict]:
@@ -127,58 +120,102 @@ def _marked(ops, lot: int, ref: str) -> bool:
 UNTRACED = "non tracé au gel"
 
 
-def _freeze(db, lot: int) -> Optional[dict]:
-    """Le dernier gel du lot (jalon `frozen` le plus récent), ou None.
-
-    Même règle que `plan_git.latest_freeze` : c'est le gel le plus récent qui
-    fait autorité. Une lecture impossible rend None (famille inconnue), jamais
-    une exception : la fusion est un fait, l'attribution reste descriptive."""
+def _freezes(db, lot: int) -> list:
+    """Tous les gels du lot (jalons `frozen`), du plus ancien au plus récent."""
     try:
         rows = work.milestones(db, int(lot)) or []
-        freezes = [r for r in rows if r.get("kind") == "frozen"]
-        if not freezes:
-            return None
-        return max(freezes, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
     except Exception:  # noqa: BLE001 - jalons illisibles : pas de trace
+        return []
+    return sorted((r for r in rows if r.get("kind") == "frozen"),
+                  key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
+
+
+def _freeze(db, lot: int) -> Optional[dict]:
+    """Le gel qui fait autorité pour l'auteur du lot, ou None.
+
+    Même règle que `plan_git.latest_freeze` — le gel le plus récent — **sauf**
+    quand un autre acteur en a reposé un après la livraison (pilote, bureau :
+    nouvelle tête, composition) : ce geste ne refait pas l'auteur, le premier
+    gel reste le sien (#1777 N2). Une lecture impossible rend None (famille
+    inconnue), jamais une exception : la fusion est un fait, l'attribution
+    reste descriptive."""
+    freezes = _freezes(db, lot)
+    if not freezes:
         return None
+    first, last = freezes[0], freezes[-1]
+    if len(freezes) > 1:
+        first_actor = str(first.get("actor") or "").strip()
+        last_actor = str(last.get("actor") or "").strip()
+        if first_actor and last_actor and first_actor != last_actor:
+            return first
+    return last
 
 
-def _turns_harness(db, agent: str, at_ts: float) -> str:
-    """Le harnais du dernier tour écrit de `agent` jusqu'à `at_ts` (epoch).
+def _harness_of(row: Optional[dict]) -> str:
+    return str((row or {}).get("harness") or "")
+
+
+def _turns_harness(db, agent: str, at_ts: float, *, contains: bool = True) -> str:
+    """Le harnais des tours de `agent` autour de `at_ts` (epoch).
 
     `turn_costs` (0014) est la seule trace du harnais qui a réellement tourné :
     une ligne par tour fini, écrite avec le harnais du flux. Le registre, lui,
     ne dit que l'état courant. Les lignes écartées (0043) sont gardées : le
-    tour a eu lieu, seule sa comptabilisation a été corrigée."""
-    rows = db.query(
-        "SELECT harness FROM turn_costs"
-        " WHERE agent = %s AND recorded_at <= to_timestamp(%s)"
-        " ORDER BY recorded_at DESC, id DESC LIMIT 1",
-        (agent, float(at_ts)))
-    return str((rows[0].get("harness") if rows else "") or "")
+    tour a eu lieu, seule sa comptabilisation a été corrigée.
+
+    #1777 N1 : `cost.record` écrit la ligne du tour à sa FIN, donc le tour qui
+    a posé le gel est le premier écrit APRÈS l'instant du gel — tant qu'il
+    reste dans `FREEZE_TURN_WINDOW_S`, faute de quoi c'est une session
+    suivante et l'on retombe sur le dernier tour antérieur. `contains=False`
+    (gel posé par un tiers : l'agent n'a pas forcément tourné) lit d'abord le
+    dernier tour antérieur, et ne prend le suivant qu'à défaut."""
+    ledger = storage.of(db).turn_costs
+    after = ledger.first_after(agent, float(at_ts))
+    before = ledger.last_before(agent, float(at_ts))
+    within_window = after is not None and (
+        0 <= float(after.get("recorded_ts") or 0) - float(at_ts) <= FREEZE_TURN_WINDOW_S)
+    if contains and within_window:
+        # le tour qui a posé le gel : la première ligne écrite après lui, si
+        # elle reste dans la fenêtre d'un tour, même sans tour antérieur.
+        return _harness_of(after)
+    if before is not None:
+        return _harness_of(before)
+    return _harness_of(after) if within_window else ""
 
 
 def _author_at_freeze(db, lot: int, item: dict) -> dict:
     """L'auteur du lot produit, et le harnais sous lequel il tournait au gel.
 
     #1053 : le gel est le geste de livraison — son acteur est l'auteur du lot
-    produit, et le registre de ses tours est relu **jusqu'à l'instant du gel**
+    produit, et le registre de ses tours est relu autour de l'instant du gel
     (`_turns_harness`). L'assigné courant ne le remplace pas : la relecture
     réassigne le lot après le gel. Sans gel, sans acteur ou sans tour tracé, la
     famille reste inconnue : le registre courant n'est jamais consulté pour la
-    deviner, il ne prouve rien d'historique (L242b, rotation, `adopt`)."""
+    deviner, il ne prouve rien d'historique (L242b, rotation, `adopt`).
+
+    #1777 N2 : un gel reposé par un tiers (pilote, bureau, `--actor`) ne fait
+    pas de ce tiers l'auteur : `_freeze` garde le premier gel quand l'acteur a
+    changé, et si l'acteur retenu n'a aucun tour tracé on relit les tours de
+    l'assigné, qui porte la production."""
     assignee = str(item.get("assignee") or "").strip()
     out = {"name": assignee, "harness": ""}
     try:
         freeze = _freeze(db, lot)
         if freeze is None:
             return out
-        name = str(freeze.get("actor") or "").strip() or assignee
+        actor = str(freeze.get("actor") or "").strip()
+        name = actor or assignee
         out["name"] = name
         at_ts = freeze.get("at_ts")
         if not name or at_ts is None:
             return out
-        out["harness"] = _turns_harness(db, name, at_ts)
+        harness = _turns_harness(db, name, at_ts, contains=(not actor or actor == name))
+        if not harness and actor and actor != assignee:
+            # N2 : le gel par un tiers sans tour tracé ne prouve pas la famille ;
+            # l'assigné est le producteur, et n'a pas posé ce gel.
+            out["name"] = assignee
+            harness = _turns_harness(db, assignee, at_ts, contains=False)
+        out["harness"] = harness
     except Exception:  # noqa: BLE001 - toute trace illisible : famille inconnue
         pass
     return out
