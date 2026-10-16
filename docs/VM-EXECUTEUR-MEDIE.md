@@ -89,6 +89,14 @@ d'effacer le volume et de le laisser en place.
 
 Le code d'enrôlement est effacé au premier acquittement **du lancement
 courant** après enrôlement, au plus tard à sa fin, y compris sur erreur.
+Seule exception : le `SIGKILL` du garde au niveau 4 tue le superviseur sans
+lui laisser ce nettoyage (#1402). Le code reste alors dans `enroll_dir` (lisible
+par l'invité et le propriétaire seulement), mais seulement si l'unité est tuée
+avant que le superviseur observe le premier acquittement : le code est
+retiré à cette observation, à la prochaine lecture (chaque seconde).
+Le lancement suivant l'utilise et l'efface comme d'habitude. Le
+propriétaire qui ne veut pas d'un code en attente le retire lui-même
+(`rm <enroll_dir>/code`) avant de relancer l'unité.
 Avant chaque lancement, l'ancien `ack.json` est retiré. Le répertoire
 d'acquittement est exclusif à ce conteneur ; le propriétaire arrête tout
 ancien lanceur avant activation. Un verrou dans `enroll_dir` refuse deux
@@ -106,12 +114,25 @@ fin facultative d'une fenêtre de prêt, pas une preuve de vie du garde.
 La recette impose `AMEESH_HOST_GATE_LENDING=1` : la porte fichier de l'image
 vérifie elle aussi ce battement et se replie sur `stopped`, même si le
 superviseur est gelé ou disparaît. Une fin de fenêtre passée bloque aussi.
-Si elle devient `stopped` pendant l'exécution, ou si le superviseur reçoit
-SIGTERM/SIGINT, `podman stop --time=100` transmet SIGTERM puis borne l'arrêt.
-Le drainage normal est appliqué par le runner de l'image. La sortie 0 ne
-relance pas le conteneur ; une nouvelle fenêtre après cet arrêt requiert
-un redémarrage par l'opérateur ou par le garde lorsqu'il a lui-même arrêté
-l'unité. [Référence Podman stop](https://docs.podman.io/en/latest/markdown/podman-stop.1.html).
+Si elle devient `stopped` ou périmée pendant l'exécution, ou si le
+superviseur reçoit SIGTERM/SIGINT, `podman stop --time=100` transmet SIGTERM
+puis borne l'arrêt. Le drainage normal est appliqué par le runner de l'image.
+La suite dépend de la cause (#1402) :
+
+- `stopped` d'un garde vivant (battement frais), ou fin de fenêtre
+  (`until_ts` passé) : le superviseur **ne sort pas**. Il attend la prochaine
+  porte `available` et relance alors lui-même le conteneur. L'unité reste
+  active : un arrêt du garde (niveau 4) la trouve, la note dans
+  `guard.stopped` et la redémarre après `restart_after_seconds`. Une sortie du
+  superviseur avant le `stop_guest` du garde la lui aurait cachée.
+- porte périmée (garde absent ou arrêté) ou signal : le superviseur sort 0,
+  et seul l'opérateur le redémarre. Avant son premier lancement, une porte
+  périmée le fait seulement attendre : au démarrage de la VM, le garde n'a
+  pas encore forcément renouvelé un battement expiré par le redémarrage.
+
+Le journal donne le code brut de l'exécuteur et, pour une fin par signal, le
+nom du signal (`-9 (SIGKILL)`). Une telle fin reste traitée comme une erreur
+(sortie 2). [Référence Podman stop](https://docs.podman.io/en/latest/markdown/podman-stop.1.html).
 
 Le propriétaire dépose la recette sans secret dans
 `/etc/ameesh/mediated-recipe.json` et prépare `HOME` et `TMPDIR` de l'unité
@@ -157,7 +178,8 @@ automatique systemd ne contourne cette règle.
 
 Les vérifications hors ligne couvrent les codes de sortie, les délais bornés,
 les acquittements anciens/courants, le retrait du code, le verrou, l'arrêt
-sur signal/porte périmée et le nettoyage sans suivi de liens. Le propriétaire
+sur signal/porte périmée, l'attente puis la relance après un `stopped` frais
+ou une fin de fenêtre, et le nettoyage sans suivi de liens. Le propriétaire
 effectue ensuite sur la VM pilote : enrôlement,
 tour relayé, drainage et acquittement, reprise, retrait sous charge,
 arrêt du garde (porte périmée), SIGTERM et révocation. L'existence d'une

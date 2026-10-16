@@ -29,6 +29,11 @@ NAME = "ameesh-vm-executor"
 RMTREE_DIR_FD_MIN = (3, 11)
 
 
+class UnsupportedPython(ValueError):
+    """#1402 : le seul refus dont `main` affiche le message — il ne nomme
+    que des versions, jamais un chemin de la recette."""
+
+
 def require_supported_python(version_info=None) -> None:
     """Refuse un interpréteur où l'effacement de révocation ne peut pas courir.
 
@@ -36,7 +41,7 @@ def require_supported_python(version_info=None) -> None:
     net, pas une erreur au moment d'effacer le volume."""
     info = sys.version_info if version_info is None else version_info
     if tuple(info[:2]) < RMTREE_DIR_FD_MIN:
-        raise ValueError(
+        raise UnsupportedPython(
             "the mediated supervisor requires Python >= %d.%d "
             "(shutil.rmtree(dir_fd=) for the revocation wipe); found %d.%d"
             % (RMTREE_DIR_FD_MIN + tuple(info[:2])))
@@ -76,13 +81,27 @@ def wipe(fd: int) -> None:
 
 
 def gate_state(path: str, now: float) -> str:
+    """The guard's state, `stopped` once its lending window is over, and
+    `stale` for a gate that is absent, malformed or without a fresh
+    heartbeat: the guard is then no longer there to stop or restart us."""
     try:
         state = parse_state(read_guest_json(path), now=now, lending=True)
         if state.until_ts is not None and state.until_ts <= now:
             return "stopped"
         return state.state
     except (TypeError, ValueError, OverflowError):
-        return "stopped"
+        return "stale"
+
+
+def exit_text(rc: int) -> str:
+    """#1402 N3 : the raw return code, and the signal's name when one ended
+    the process (`Popen` reports it negative)."""
+    if rc >= 0:
+        return str(rc)
+    try:
+        return "%d (%s)" % (rc, signal.Signals(-rc).name)
+    except ValueError:
+        return "%d (signal %d)" % (rc, -rc)
 
 
 def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
@@ -109,9 +128,15 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
         delay = 30
         state_path = str(Path(recipe["state_dir"]) / "state.json")
         ack_path = str(Path(recipe["ack_dir"]) / "ack.json")
+        launched = False
         while not stop.is_set():
-            # Never start during withdrawal or with a missing/stale guard.
-            if gate_state(state_path, now()) != "available":
+            # A dead guard ends supervision once we have run, including
+            # between two windows. Before the first launch a stale gate only
+            # waits: at boot the guard may not have renewed its heartbeat yet.
+            gate = gate_state(state_path, now())
+            if gate == "stale" and launched:
+                return 0
+            if gate != "available":
                 stop.wait(1)
                 continue
             # The first ack must be produced by this launch. The guest has
@@ -121,17 +146,22 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
             except FileNotFoundError:
                 pass
             process = None
-            stopping = False
+            # Why the container was stopped: "exit" (signal or stale gate,
+            # this supervisor ends) or "wait" (a fresh guard said `stopped`,
+            # or its window ended: wait for the next `available`).
+            stopping = None
             try:
                 process = launch(argv)
+                launched = True
                 while process.poll() is None:
                     ack = read_guest_json(ack_path)
                     if ack and ack.get("schema") == "ameesh-host-ack/1":
                         # The image writes its ack only after enrollment and
                         # volume identity checks, when the runner is started.
                         remove_code(fds["enroll_dir"])
-                    if stop.is_set() or gate_state(state_path, now()) == "stopped":
-                        stopping = True
+                    gate = gate_state(state_path, now())
+                    if stop.is_set() or gate in ("stopped", "stale"):
+                        stopping = "wait" if gate == "stopped" and not stop.is_set() else "exit"
                         result = run(["podman", "stop", "--ignore", "--time=100", NAME],
                                      timeout=110, check=False)
                         if result.returncode:
@@ -148,12 +178,19 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
                     if process is not None and process.poll() is None:
                         run(["podman", "kill", NAME], timeout=10, check=False)
                         process.wait(timeout=10)
-            log("VM executor exited: %s" % rc)
+            log("VM executor exited: %s" % exit_text(rc))
             if rc == 6:
                 wipe(fds["volume"])
                 return 6
-            if stopping:
+            if stopping == "exit":
                 return 0
+            if stopping == "wait":
+                # #1402 N1 : never exit on a fresh `stopped`. The unit stays
+                # running, so a guard stop (level 4) finds it, records it in
+                # `guard.stopped` and starts it again; a window that simply
+                # ended relaunches here at the next `available`.
+                delay = 30
+                continue
             if rc != 1:
                 # Podman errors (125..127), unexpected exits and signals are
                 # never treated as a retryable executor failure.
@@ -175,7 +212,11 @@ def main() -> int:
         with open(args.recipe, encoding="utf-8") as fh:
             recipe = json.load(fh)
         return supervise(recipe, stop)
+    except UnsupportedPython as exc:
+        print("VM supervisor failed: %s" % exc, flush=True)
+        return 2
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        # The type only: a message may name a path of the recipe.
         print("VM supervisor failed: %s" % type(exc).__name__, flush=True)
         return 2
 
