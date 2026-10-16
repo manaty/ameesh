@@ -199,7 +199,7 @@
       sign("view", data.challengeView).then(function (payload) {
         document.getElementById("login-url").textContent = payload.url || "";
         document.getElementById("login-code").textContent = payload.code || "";
-        available(payload.challengeDone);
+        available(payload.challenge_done);
         privateSection.hidden = false;
         openButton.hidden = true;
         doneButton.hidden = false;

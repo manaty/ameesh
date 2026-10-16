@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import unittest
 from urllib.parse import urlsplit
@@ -145,6 +146,14 @@ class LoginChallengeTest(ApproveBase):
         self.assertEqual(payload["url"], URL)
         self.assertEqual(payload["code"], CODE)
         self.assertIn("challenge_done", payload)
+        # le JavaScript de la page lit la réponse de `view` sous ces noms : un
+        # nom absent (`challengeDone`) laissait « I finished » inerte (R dev4)
+        js = os.path.join(os.path.dirname(receipts.__file__), "approve", "static",
+                          "approve.js")
+        with open(js, encoding="utf-8") as fh:
+            read = set(re.findall(r"\bpayload\.([A-Za-z_]+)", fh.read()))
+        self.assertTrue(read)
+        self.assertLessEqual(read, set(payload), "approve.js reads keys the view lacks")
         # rouvrir la vue ne consomme pas le nonce : une seconde assertion marche
         status, again = self.submit(path, self.sign(self.alice, page, decision="view"))
         self.assertEqual(status, 200, again)
