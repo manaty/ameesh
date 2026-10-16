@@ -29,12 +29,15 @@ prouve rien du passé, et quand aucun tour n'est tracé la famille reste
 inconnue (`codex ou claude`) — elle n'est jamais devinée du registre. #1777 :
 le tour du gel est celui dont la ligne `turn_costs` suit le gel (elle est
 écrite à la fin du tour), dans la fenêtre d'un tour ; au-delà c'est une
-session suivante. Un gel reposé par un tiers ne fait pas de lui l'auteur : le
-premier gel reste la livraison, et si son acteur n'a aucun tour tracé on relit
-les tours de l'assigné.
+session suivante. #1859 : un gel reposé par un tiers qui n'a jamais tenu le lot
+ne fait pas de lui l'auteur — le gel retenu est le plus récent dont l'acteur a
+tenu le lot (assigné courant, ou nommé au journal), le tiers écarté est nommé
+au corps du lot de relecture, et si aucun acteur retenu n'a de tour tracé on
+relit les tours de l'assigné.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -130,25 +133,27 @@ def _freezes(db, lot: int) -> list:
                   key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
 
 
-def _freeze(db, lot: int) -> Optional[dict]:
-    """Le gel qui fait autorité pour l'auteur du lot, ou None.
+#: #1859 : les notes du journal qui nomment un détenteur du lot
+_HELD = re.compile(r"(?:^|; )(?:assigned to|delegated to) ([^\s,;()]+)|\(before: ([^\s,;()]+)")
 
-    Même règle que `plan_git.latest_freeze` — le gel le plus récent — **sauf**
-    quand un autre acteur en a reposé un après la livraison (pilote, bureau :
-    nouvelle tête, composition) : ce geste ne refait pas l'auteur, le premier
-    gel reste le sien (#1777 N2). Une lecture impossible rend None (famille
-    inconnue), jamais une exception : la fusion est un fait, l'attribution
-    reste descriptive."""
-    freezes = _freezes(db, lot)
-    if not freezes:
-        return None
-    first, last = freezes[0], freezes[-1]
-    if len(freezes) > 1:
-        first_actor = str(first.get("actor") or "").strip()
-        last_actor = str(last.get("actor") or "").strip()
-        if first_actor and last_actor and first_actor != last_actor:
-            return first
-    return last
+
+def _holders(db, lot: int, item: dict) -> set:
+    """Les agents qui ont tenu le lot : l'assigné courant et ceux que le
+    journal nomme (`assigned to X`, `delegated to X`, `(before: X)`).
+
+    #1859 : un pilote ou le bureau qui repose le gel n'a jamais tenu le lot ;
+    son gel ne fait pas de lui l'auteur. Un ancien détenteur qui repose le gel,
+    lui, en reste l'auteur."""
+    names = {str(item.get("assignee") or "").strip()}
+    try:
+        for e in storage.of(db).work.events(int(lot), 500) or []:
+            for m in _HELD.finditer(str(e.get("note") or "")):
+                names.add(m.group(1) or m.group(2))
+    except Exception:  # noqa: BLE001 - journal illisible : l'assigné seul
+        pass
+    names.discard("")
+    names.discard("nobody")
+    return names
 
 
 def _harness_of(row: Optional[dict]) -> str:
@@ -193,29 +198,53 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     famille reste inconnue : le registre courant n'est jamais consulté pour la
     deviner, il ne prouve rien d'historique (L242b, rotation, `adopt`).
 
-    #1777 N2 : un gel reposé par un tiers (pilote, bureau, `--actor`) ne fait
-    pas de ce tiers l'auteur : `_freeze` garde le premier gel quand l'acteur a
-    changé, et si l'acteur retenu n'a aucun tour tracé on relit les tours de
-    l'assigné, qui porte la production."""
+    #1777 N2 / #1859 : un gel reposé par un tiers qui n'a jamais tenu le lot
+    (pilote, bureau, `--actor`) ne fait pas de lui l'auteur : les gels sont
+    relus du plus récent au plus ancien, et l'on garde le premier dont l'acteur
+    a tenu le lot (`_holders`). Le tiers écarté est nommé au corps (`refroze`).
+    Si aucun acteur retenu n'a de tour tracé, on relit les tours de l'assigné,
+    qui porte la production."""
     assignee = str(item.get("assignee") or "").strip()
     out = {"name": assignee, "harness": ""}
     try:
-        freeze = _freeze(db, lot)
+        freezes = _freezes(db, lot)
+        if not freezes:
+            return out
+        holders = _holders(db, lot, item)
+        third, freeze = "", None
+        for row in reversed(freezes):
+            actor = str(row.get("actor") or "").strip()
+            name = actor or assignee
+            if name and name not in holders:
+                third = third or name
+                continue
+            freeze = row
+            break
         if freeze is None:
-            return out
-        actor = str(freeze.get("actor") or "").strip()
-        name = actor or assignee
-        out["name"] = name
-        at_ts = freeze.get("at_ts")
-        if not name or at_ts is None:
-            return out
-        harness = _turns_harness(db, name, at_ts, contains=(not actor or actor == name))
-        if not harness and actor and actor != assignee:
-            # N2 : le gel par un tiers sans tour tracé ne prouve pas la famille ;
-            # l'assigné est le producteur, et n'a pas posé ce gel.
+            # aucun gel d'un détenteur : l'assigné est le producteur, et n'a
+            # pas posé ce gel (#1777 N2)
+            freeze = freezes[-1]
+            at_ts = freeze.get("at_ts")
             out["name"] = assignee
-            harness = _turns_harness(db, assignee, at_ts, contains=False)
-        out["harness"] = harness
+            if assignee and at_ts is not None:
+                out["harness"] = _turns_harness(db, assignee, at_ts, contains=False)
+        else:
+            actor = str(freeze.get("actor") or "").strip()
+            name = actor or assignee
+            out["name"] = name
+            at_ts = freeze.get("at_ts")
+            if name and at_ts is not None:
+                harness = _turns_harness(db, name, at_ts,
+                                         contains=(not actor or actor == name))
+                if not harness and actor and actor != assignee:
+                    # N2 : le gel par un tiers sans tour tracé ne prouve pas la
+                    # famille ; l'assigné est le producteur, et n'a pas posé ce
+                    # gel.
+                    out["name"] = assignee
+                    harness = _turns_harness(db, assignee, at_ts, contains=False)
+                out["harness"] = harness
+        if third:
+            out["refroze"] = third
     except Exception:  # noqa: BLE001 - toute trace illisible : famille inconnue
         pass
     return out
@@ -233,6 +262,9 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     author = author or {}
     who = author.get("name") or "inconnu"
     harness = author.get("harness") or UNTRACED
+    if author.get("refroze"):
+        # #1859 : un tiers a reposé le gel ; il n'est pas l'auteur
+        harness += "; gel reposé par %s, qui n'a pas tenu le lot" % author["refroze"]
     where = "PR #%s" % pr if pr else (merged_sha[:12] if merged_sha else "?")
     why = " ".join(str((klass or {}).get("why") or "").split())
     lines = [
