@@ -21,10 +21,20 @@ from .support import EMPTY_CONFIG, SRC, PgTestCase, child_env
 MIG = "src/ameesh/migrations"
 
 
+def git_env():
+    """Environnement des git du banc (#1943) : hermétique à la configuration de
+    l'agent (`~/.gitconfig`, `/etc/gitconfig` : rerere, autocrlf, hooks…), qui
+    ne doit pas changer le verdict d'un test (canon §3 : même verdict sur tous
+    les postes). Même isolation que les autres bancs du dépôt (`test_canon`,
+    `test_1277`, `scripts/l160g-mergiraf.py`)."""
+    return dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
+                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+
 def _git(repo, *args):
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, env=env)
+    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                          env=git_env())
     if proc.returncode != 0:
         raise AssertionError("git %s : %s" % (" ".join(args), proc.stderr))
     return proc.stdout.strip()
@@ -105,6 +115,28 @@ class ScanTest(unittest.TestCase):
         self.assertIsNone(dups["0002"]["in_target"])
         self.assertEqual(dups["0001"]["in_target"], MIG + "/0001_init.sql")
         self.assertEqual(radar.summary(report)["conflict"], 1)
+
+    def test_union_attribute_read_from_the_merge_target(self):
+        # #1517 : deux ajouts adjacents à une liste `merge=union` ne sont pas
+        # un conflit, même quand la copie locale a extrait un commit sans
+        # `.gitattributes` : les attributs sont lus dans l'arbre de la cible.
+        repo = os.path.join(self.tmp, "union")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "liste.txt", "a\nc\ne\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "sans attributs")
+        _write(repo, ".gitattributes", "liste.txt merge=union\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "attributs")
+        for name, entry in (("lot/1-a", "b"), ("lot/2-b", "bb")):
+            _git(repo, "checkout", "-q", "-b", name, "main")
+            _write(repo, "liste.txt", "a\n%s\nc\ne\n" % entry)
+            _git(repo, "commit", "-qam", name)
+        _git(repo, "checkout", "-q", "--detach", "main~1")
+        report = radar.scan(repo, LOTS[:2], default_target="main")
+        self.assertEqual({tuple(p["lots"]): p["state"] for p in report["pairs"]},
+                         {(1, 2): "overlap"})
 
     def test_conflict_with_target_and_origin_branch(self):
         _write(self.repo, "shared.py", "Uno\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n")
@@ -279,6 +311,31 @@ class RunPassTest(PgTestCase):
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM agent_mailbox")[0]["n"], 0)
         # sans `radar.projects` : rien
         self.assertEqual(radar.run_pass(self.cfg, self.db), [])
+
+
+class BancGitHermetiqueTest(unittest.TestCase):
+    """#1943 : le banc git des tests ne dépend pas de la config globale de
+    l'agent — `test_l160e` voyait un `.git/rr-cache` créé par le
+    `rerere.enabled=true` de son poste et rougissait (canon §3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l160b-hermetique-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = make_repo(self.tmp)
+
+    def test_une_config_globale_hostile_n_atteint_pas_le_banc(self):
+        hostile = os.path.join(self.tmp, "gitconfig")
+        with open(hostile, "w", encoding="utf-8") as fh:
+            fh.write("[rerere]\n\tenabled = true\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": hostile,
+                                          "GIT_CONFIG_NOSYSTEM": ""}):
+            # le conflit non résolu est le geste qui, sous rerere global,
+            # laissait le rr-cache que l'assertion « dépôt intact » voyait
+            _git(self.repo, "checkout", "-q", "-b", "conflit", "lot/2-b")
+            with self.assertRaises(AssertionError):
+                _git(self.repo, "merge", "-q", "--no-ff", "--no-commit", "lot/1-a")
+            self.assertFalse(os.path.exists(
+                os.path.join(self.repo, ".git", "rr-cache")))
 
 
 if __name__ == "__main__":

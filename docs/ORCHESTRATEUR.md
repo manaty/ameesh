@@ -28,6 +28,7 @@ lot**.
 | Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 2h` |
 | Demande d'un humain (L130) | `ameesh work add --title "RÉF : titre" --source "… « phrase exacte »" --priority N --estimate 2h`, puis le message `--lot <id>` |
 | Lot existant, sans agent | `ameesh mail send <agent> "…" --lot <id\|RÉF>` |
+| Prendre un lot sans agent (brief `stale_lot`/`idle_capacity`) | `ameesh work assign <id> <agent> --claim` : refusé si un autre l'a pris entre-temps, jamais de changement de main silencieux (#1026) |
 | Reprendre un lot à un autre agent | `ameesh work assign <id> <agent>`, puis le message `--lot <id>` |
 | Message sur un lot (relance, question) | `ameesh mail send <agent> "…" --lot <id>` |
 
@@ -499,9 +500,12 @@ courrier les rappelle) :
   « go », « d'accord » restent des réponses, qui réveillent.
 * **`--urgent` seulement quand l'attente bloque** : le destinataire doit agir
   avant de continuer (build cassé sur la branche commune, fusion à arrêter,
-  question sans laquelle il tourne à vide). D'un expéditeur habilité
-  (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même un tour en cours :
-  à réserver aux vraies urgences.
+  question sans laquelle il tourne à vide). De l'owner (`human:*`) ou d'un
+  expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même
+  un tour en cours : à réserver aux vraies urgences. Depuis #795, la première
+  alerte d'échec d'un lot est elle-même un urgent vérifié en base qui
+  interrompt le tour de l'agent du lot ; le verdict (vert ou rouge), lui,
+  réveille sans couper (#514).
 * **Diffusions** : `agent-mail send all "…"` dépose une annonce lue au
   prochain tour de chacun, sans réveiller personne ; `--urgent` réveille toute
   l'équipe, rarement.

@@ -870,20 +870,34 @@ def tour_path(cfg: Config, name: str) -> str:
     return os.path.join(cfg.state_dir, "hooks", name + ".tour.json")
 
 
-def tour_lit(cfg: Config, name: str, turn: str) -> dict:
-    """Compteur du tour `turn` ; un autre tour (ou rien de lisible) : zéro."""
+def tour_lu(cfg: Config, name: str) -> dict:
+    """Dernier état du courrier de tour, quel que soit le tour nommé.
+
+    Entre deux tours, le tour courant n'est plus nommé et l'état garde la
+    dernière remise : c'est là que L81 lit l'instant du dernier message
+    humain remis par le hook (le message n'est alors plus non-lu)."""
     try:
         with open(tour_path(cfg, name), encoding="utf-8") as fh:
             etat = json.load(fh)
-        if isinstance(etat, dict) and etat.get("turn") == turn:
+        return etat if isinstance(etat, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def tour_lit(cfg: Config, name: str, turn: str) -> dict:
+    """Compteur du tour `turn` ; un autre tour (ou rien de lisible) : zéro."""
+    etat = tour_lu(cfg, name)
+    try:
+        if etat.get("turn") == turn:
             return {"turn": turn, "remis": int(etat.get("remis") or 0),
                     "attente": int(etat.get("attente") or 0),
+                    "humain": float(etat.get("humain") or 0.0),
                     "signale": bool(etat.get("signale")),
                     # borne atteinte pendant un travail du tour (dit une fois)
                     "differe": bool(etat.get("differe")),
                     "travail": [str(t) for t in etat.get("travail") or []],
                     "travail_ts": float(etat.get("travail_ts") or 0.0)}
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         pass
     return {"turn": turn, "remis": 0, "attente": 0, "signale": False, "differe": False,
             "travail": [], "travail_ts": 0.0}
@@ -899,6 +913,22 @@ def _tour_ecrit(cfg: Config, name: str, etat: dict) -> None:
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+def _humain(cfg: Config, row: dict) -> bool:
+    """L125/L81 : message d'un humain — marqué à l'envoi, ou expéditeur
+    déclaré humain sur cet hôte (`AMEESH_HUMANS`)."""
+    return mail.is_human(row) or (row.get("sender") or "") in cfg.human_names
+
+
+def _tour_remis(cfg: Config, name: str, etat: dict, msgs: list[dict]) -> None:
+    """Compteur du tour, et (L81 §6.3) l'instant du dernier message humain
+    remis : le message n'est plus non-lu quand l'exécuteur décide de
+    l'entretien résident, c'est cet instant qui tient la fenêtre de calme."""
+    etat["remis"] = int(etat.get("remis") or 0) + len(msgs)
+    if any(_humain(cfg, m) for m in msgs):
+        etat["humain"] = time.time()
+    _tour_ecrit(cfg, name, etat)
 
 
 def _attente(bk, name: str, hors: list[dict]) -> int:
@@ -1132,8 +1162,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         from . import resident_runner
         tour = resident_runner.current_turn()
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
-        etat = tour_lit(cfg, name, tour) if borne else None
-        if etat is not None and etat["remis"] >= borne:
+        etat = tour_lit(cfg, name, tour) if (tour and binding.bound_to_lease) else None
+        if etat is not None and borne and etat["remis"] >= borne:
             if event == "Stop":
                 return 0
             attente = _attente(bk, name, [])
@@ -1156,14 +1186,17 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             return 0
         remise = _Remise(bk, name, binding)
         try:
-            limite = borne - etat["remis"] if etat is not None else None
+            # #289 : la garde `and borne` date la remise a zero (une borne
+            # nulle n'a rien reserve) ; la structure L514 de la chaine est
+            # gardee (limite, garder/prendre selon le filtre mi-tour).
+            limite = borne - etat["remis"] if etat is not None and borne else None
             if event == "PostToolUse" and mid_turn_filtered(tool, binding):
                 # L514/#885: in a dsh or codex turn, only what must not wait
                 msgs = remise.prendre_mi_tour(limite)
             else:
                 msgs = remise.prendre(limite)
             avis = ""
-            if etat is not None and msgs and etat["remis"] + len(msgs) >= borne:
+            if etat is not None and borne and msgs and etat["remis"] + len(msgs) >= borne:
                 attente = _attente(bk, name, msgs)
                 etat["attente"] = attente
                 if attente:
@@ -1192,8 +1225,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                     return 0
                 remise.solder()
                 if etat is not None:
-                    etat["remis"] += len(msgs)
-                    _tour_ecrit(cfg, name, etat)
+                    _tour_remis(cfg, name, etat, msgs)
                 bk.stop_counter(name, bump=True)
                 return 0
             if not msgs:
@@ -1207,8 +1239,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 return 0
             remise.solder()
             if etat is not None:
-                etat["remis"] += len(msgs)
-                _tour_ecrit(cfg, name, etat)
+                _tour_remis(cfg, name, etat, msgs)
         finally:
             remise.abandonner()
             # #1604 : marqueur posé seulement après un passage complet sans
@@ -1468,13 +1499,18 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
         return 1
     if opts.get("--json"):
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        return 0
+        return 1 if result["refused"] else 0
     actions = result["forwarded"] + result["expired"]
-    if not actions:
+    if not actions and not result["refused"]:
         print("no dead letter to sweep (retention %d day(s), 0 = never)"
               % result["days"])
         return 0
-    if result["dry_run"]:
+    if not actions:
+        # #1396/N2 : que des refus de renvoi — le dire (le courrier n'est pas
+        # remis) au lieu d'annoncer « no dead letter », et sortir non-zéro.
+        print("no dead letter swept: %d re-delivery refusal(s) (retention %d day(s), "
+              "0 = never)" % (len(result["refused"]), result["days"]))
+    elif result["dry_run"]:
         print("dry run: retention %d day(s); %d recipient(s) to sweep:"
               % (result["days"], len(actions)))
     for action in result["forwarded"]:
@@ -1484,13 +1520,13 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
     for action in result["refused"]:
         print("  %s: re-delivery to %s refused — %s" % (
             action["old"], action["new"], action["reason"].splitlines()[0]), file=sys.stderr)
-    if not result["dry_run"]:
+    if not result["dry_run"] and actions:
         # #1604 : les successeurs locaux ont du courrier neuf.
         for action in result["forwarded"]:
             fastmail.bump(cfg, action.get("new") or "")
         print("retention %d day(s); dead mail stays in the mailbox, marked expired"
               % result["days"])
-    return 0
+    return 1 if result["refused"] else 0
 
 
 def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
@@ -1564,7 +1600,10 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False)
             if refused:
                 print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
-        done = migrations.migrate(db, log=lambda line: print(line))
+        done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only)
+    except migrations.NonAdditiveMigration as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
     except db_mod.DbError as exc:
         print("migration failed: %s" % exc, file=sys.stderr)
         return 1

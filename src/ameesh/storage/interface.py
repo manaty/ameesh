@@ -773,6 +773,33 @@ class Accounts(Domain):
         un autre worker a déjà basculé : rien n'est écrit."""
 
     @abc.abstractmethod
+    def switch_guarded(self, host: str, harness: str, *, expected: str | None, to: str,
+                       kind: str, reason: str, agent: str | None, now: float,
+                       hold_reason: str | None = None,
+                       hold_until: float | None = None) -> bool:
+        """#1883 : bascule validée contre les retenues, en UNE transaction.
+
+        Même contrat que `switch` (compare-and-changer `expected`, un forçage
+        manuel n'est pas défait par l'automate), PLUS, sous le **même verrou**
+        de la ligne `account_active` :
+
+        * une retenue **valide** de `to` (`until_ts > now`) refuse la bascule :
+          rien n'est écrit, l'appelant relit l'actif — c'est ce qui ferme la
+          course « classement sur un instantané, retenue publiée entre-temps »
+          (R1 auditeur, B2) ;
+        * quand `hold_reason` est donné, pose (ou rafraîchit) la retenue du
+          compte **quitté** dans la même transaction — le compte qu'on quitte
+          en dépassement devient indisponible pour les autres workers au même
+          instant où la bascule est visible ;
+        * les retenues **échues** de `to` sont nettoyées dans la même
+          transaction (R2 auditeur, B2) : un nettoyage APRÈS le commit
+          effacerait une retenue publiée entre-temps par la bascule d'un autre
+          runner, qui attend le même verrou.
+
+        Faux sans rien écrire : compte vu changé, forçage manuel en place,
+        aucun changement, ou retenue valide sur `to`."""
+
+    @abc.abstractmethod
     def set_auto(self, host: str, harness: str, *, reason: str,
                  expected: str | None = None) -> bool:
         """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
@@ -793,6 +820,35 @@ class Accounts(Domain):
     @abc.abstractmethod
     def release(self, host: str, harness: str, account: str) -> None:
         """Retire la retenue d'un compte (il redevient éligible)."""
+
+    @abc.abstractmethod
+    def identities(self, host: str, harness: str, since: float) -> dict[str, list[dict]]:
+        """#1883 : les empreintes de dossier publiées pour ce couple (hôte,
+        harnais), encore vivantes depuis `since` (epoch) :
+        {account: [{identity, last_ts}]}. Deux empreintes sous le même nom
+        sont deux dossiers résolus : le compte est refusé au placement. Jamais
+        un chemin, seulement une empreinte (secret d'hôte)."""
+
+    @abc.abstractmethod
+    def publish_identity(self, host: str, harness: str, account: str,
+                         identity: str) -> None:
+        """#1883 : publie (ou rafraîchit) l'empreinte du dossier résolu
+        `identity` du compte, pour que les autres processus de l'hôte
+        détectent un même nom déclaré vers deux dossiers différents."""
+
+    @abc.abstractmethod
+    def placement_state(self, host: str, harness: str, since: float) -> dict:
+        """#1883 (R3 auditeur, B1) : retenues ET identités d'un couple (hôte,
+        harnais), lues en UNE transaction sous le verrou de placement.
+
+        Rend `{"holds": {account: {until_ts, reason}}, "identities":
+        {account: [{identity, last_ts}]}}`, les identités encore vivantes
+        depuis `since` (epoch). Toute publication de retenue
+        (`switch_guarded`, `hold`) prend le même verrou : aucune retenue ne
+        peut être publiée entre la lecture des retenues et celle des
+        identités — c'est l'état cohérent sur lequel `accounts.choose` valide
+        son choix (R3 auditeur, B1). `holds` et `identities` seuls restent des
+        lectures d'un jeu, sans cohérence entre eux."""
 
     @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
@@ -1427,7 +1483,12 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
-        """Un lot, ou None."""
+        """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
+        révision Process pinnée, '' quand il n'y en a pas — y compris sur une
+        base d'avant la migration 0452). Les commandes historiques
+        (`work.move`/`close`/`close_merged`) lisent la garde par cette
+        interface, jamais par un SELECT brut : celui-ci est refusé sur une
+        connexion d'exécuteur médié."""
 
     @abc.abstractmethod
     def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
@@ -2574,6 +2635,12 @@ class Operations(Domain):
         epoch, échéance recontrôlée). Faux si le bail n'est plus le nôtre."""
 
     @abc.abstractmethod
+    def set_dormant(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
+        """L76 T2 : le texte de statut d'un résident endormi, en une écriture
+        conditionnelle — seulement si l'agent est `idle` et que le bail
+        (owner, epoch, échéance) est encore le nôtre. Faux sinon."""
+
+    @abc.abstractmethod
     def listing(self, *, today: str | None = None) -> list[dict]:
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
         `status_since_ts`, début du motif affiché (`status_reason_since_ts`), bail
@@ -2655,8 +2722,10 @@ class Operations(Domain):
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee, `package_id`, type et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
-        son relecteur désigné). Les plus anciennement actifs d'abord. `limit=None`
-        lit toute la vérité avant le filtrage des attentes planifiées (L368)."""
+        son relecteur désigné), `workflow_ref` (#1922/N13 : la révision Process
+        qui pinne le lot, '' sur une base d'avant la 0452). Les plus
+        anciennement actifs d'abord. `limit=None` lit toute la vérité avant le
+        filtrage des attentes planifiées (L368)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:

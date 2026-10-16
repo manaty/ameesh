@@ -93,6 +93,12 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 # L226b/#1883 : un compte de forfait facturé au-delà du plan —
+                 # l'owner le sait tout de suite, la règle est « jamais de dépassement »
+                 "account_overage",
+                 # #1883 : deux configurations de l'hôte déclarent le même nom de
+                 # compte vers deux dossiers — lecture ambiguë, compte refusé
+                 "account_identity",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
@@ -169,6 +175,8 @@ TYPE_LABELS = {
     # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
     # humains si le type est dans `notify.types`
     "slo_breach": "internal deadline (SLO) overdue",
+    # #1107 (n2 P3 de #1035) : un lot que les passes d'alerte ne savent pas lire
+    "lot_unreadable": "work item unreadable by the alert passes",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",

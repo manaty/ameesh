@@ -246,7 +246,10 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # regroupé par projet (tri stable : dans un projet, l'ordre de
         # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
         rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
-        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
+        # #1782 : la colonne HARNESS fait 10, pas 9 — la valeur étoilée d'un
+        # harnais vivant de 9 lettres (`(live or '?')[:9] + '*'`) en fait 10 ;
+        # à 9, la ligne entière se décalait d'un caractère.
+        print("%-20s %-12s %-10s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
             "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS", "BUDGET",
             "KEY", "SEEN"))
         session_differs = False
@@ -272,7 +275,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             starred = bool(live) and live != declared
             if starred:
                 session_differs = True
-            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+            print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
                 (row.get("host") or "")[:10],
@@ -1255,12 +1258,16 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
 
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
               limit: int | None = None, threshold: float | None = None,
-              freeze: bool = False) -> list:
+              freeze: bool = False, repo: str | None = None,
+              target: str | None = None) -> list:
     """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84).
 
     `freeze` ajoute à chaque ligne le gel effectif dérivé (#1756), en un seul
     balayage de jalons : le composeur du paquet horaire lit ce champ au lieu
-    de JOINdre lui-même le dernier jalon `frozen`."""
+    de JOINdre lui-même le dernier jalon `frozen`. `repo` (dépôt git local) et
+    `target` (défaut : la cible du lot, sinon `origin/main`) permettent en plus
+    de porter un avis sur un gel republié quand le delta du lot est
+    mécaniquement constant (#1905) ; sans `repo`, le champ est inchangé."""
     from . import plan, plan_git, stagnation
     if threshold is None:
         threshold = stagnation.DEFAULT_THRESHOLD_S
@@ -1283,14 +1290,17 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
                     [row["id"] for row in rows]):
                 marks.setdefault(int(mark["work_item_id"]), []).append(mark)
             for row in rows:
-                row["freeze"] = plan_git.freeze_candidate(marks.get(int(row["id"]), []))
+                row["freeze"] = plan_git.freeze_candidate(
+                    marks.get(int(row["id"]), []), repo=repo,
+                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET)
         return rows
 
     # L61 : lectures regroupées — deux allers-retours en tout
     return db_mod.batched(db, lire)
 
 
-def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
+def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
+                target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
     from . import canon as canon_mod, plan
 
@@ -1301,7 +1311,9 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
         item["events"] = work.events(db, lot_id)
         item["milestones"] = work.milestones(db, lot_id)
         from . import plan_git
-        item["freeze"] = plan_git.freeze_candidate(item["milestones"])
+        item["freeze"] = plan_git.freeze_candidate(
+            item["milestones"], repo=repo,
+            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET)
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
@@ -1443,7 +1455,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
-                              branch_target=args.target, force=args.force)
+                              branch_target=args.target, force=args.force,
+                              claim=args.claim)
             if out.get("queue_warning"):
                 print("lot #%d not assigned to %s (before: %s)" % (
                     out["item"]["id"], args.agent, out["previous"] or "nobody"))
@@ -1496,7 +1509,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
                              threshold=stagnation.stale_after(args.stale_after),
-                             freeze=getattr(args, "freeze", False))
+                             freeze=getattr(args, "freeze", False),
+                             repo=getattr(args, "git_dir", None),
+                             target=getattr(args, "freeze_target", None))
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -1527,7 +1542,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "show":
             from . import estimates, lot_measures, resolutions
-            item = work_detail(cfg, db, args.id)
+            item = work_detail(cfg, db, args.id,
+                               repo=getattr(args, "git_dir", None),
+                               target=getattr(args, "freeze_target", None))
             if item is None:
                 print(USAGE_HINT % ("lot %s not found" % args.id), file=sys.stderr)
                 return 1
@@ -1889,12 +1906,14 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: interactive sessions (`ameesh attach`), also local; #408: lot_wake, on|off
 #: (rule 1, the runner's wake on an actionable lot), in the database; L76:
 #: resident (`on` | `off`) and resident_sleep, the resident process of the
-#: agent, local
+#: agent, local ; L81 : resident_reread_max (relu cumulé avant rotation)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode", "lot_wake", "resident", "resident_sleep")
+            "permission_mode", "lot_wake", "resident", "resident_sleep",
+            "resident_reread_max")
 #: L76: settings written in the local state of the agent's host only
-LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep")
+LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep",
+                  "resident_reread_max")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1986,7 +2005,7 @@ def cmd_set(cfg: Config, args) -> int:
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
-                      "resident=on|off resident_sleep=30m|0"
+                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -2048,6 +2067,14 @@ def cmd_set(cfg: Config, args) -> int:
                 except ValueError:
                     print("invalid resident_sleep: %r (e.g. 30m, 1h, 0 = never asleep)"
                           % valeur, file=sys.stderr)
+                    return 2
+            if cle == "resident_reread_max" and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                except ValueError:
+                    print("invalid resident_reread_max: %r (e.g. 50M, 10M, "
+                          "0 = never rotate on the cumulative re-read)" % valeur,
+                          file=sys.stderr)
                     return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
@@ -2497,10 +2524,22 @@ def build_parser() -> argparse.ArgumentParser:
                               "covers the head (origin, provenance, explicit causes)")
     pw_list.add_argument("--stale-after", default=None,
                          help="work item is stale with no activity for (default 6h, L29)")
+    pw_list.add_argument("--git-dir", default=None, metavar="D",
+                         help="#1905: local repository used to carry a verdict across a "
+                              "mechanically constant rebase (with --freeze)")
+    pw_list.add_argument("--freeze-target", default=None, metavar="REF",
+                         help="#1905: shared target of the rebase (default: the lot's "
+                              "target, else origin/main)")
     pw_list.set_defaults(func=cmd_work)
     pw_show = work_sub.add_parser("show")
     pw_show.add_argument("id", type=int)
     pw_show.add_argument("--json", action="store_true")
+    pw_show.add_argument("--git-dir", default=None, metavar="D",
+                         help="#1905: local repository used to carry a verdict across a "
+                              "mechanically constant rebase")
+    pw_show.add_argument("--freeze-target", default=None, metavar="REF",
+                         help="#1905: shared target of the rebase (default: the lot's "
+                              "target, else origin/main)")
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
@@ -2576,6 +2615,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_assign.add_argument("--externe", action="store_true",
                            help="force assignment to an external agent that has a "
                                 "human responsible")
+    pw_assign.add_argument("--claim", action="store_true",
+                           help="assign only if the work item has no assignee (atomic "
+                                "claim); refused, naming its holder, if it is already taken")
     pw_assign.add_argument("--branch", default=None,
                            help="work item branch (L118); allowed on a work item already assigned "
                                 "to this agent")

@@ -3957,7 +3957,6 @@
   }
  ],
  "refused": {
-  "interface_total": 415,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4003,10 +4002,14 @@
    "accounts": [
     "hold",
     "holds",
+    "identities",
     "init_active",
+    "placement_state",
+    "publish_identity",
     "release",
     "set_auto",
     "switch",
+    "switch_guarded",
     "switches"
    ],
    "action_source": [
@@ -4236,6 +4239,7 @@
     "record_balance",
     "request_restart",
     "resume",
+    "set_dormant",
     "set_settings",
     "turns"
    ],

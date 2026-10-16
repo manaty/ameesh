@@ -898,7 +898,7 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
-           force: str | None = None) -> dict:
+           force: str | None = None, claim: bool = False) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -907,7 +907,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
     la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
     du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
-    pas son propre travail."""
+    pas son propre travail.
+
+    #1026 : `claim` n'attribue le lot que s'il est **sans assigné**. Un lot
+    déjà pris est refusé en nommant son porteur, et l'écriture est
+    conditionnelle à `assignee` encore vide : deux prises concurrentes, une
+    seule gagne, l'autre refuse sans changer la main."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -916,6 +921,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     previous = item.get("assignee")
     _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
+    if claim and previous:
+        raise WorkError("lot %s already assigned to %s: claim refused, nothing changed"
+                        % (item_id, previous))
     if previous == check["assignee"]:
         if branch:
             row = set_branch(db, item_id, branch, branch_target, actor=actor)
@@ -930,11 +938,16 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         if item.get("delegated_by") and item.get("due_ts") else "")
     queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                           % (check["assignee"], previous or "nobody"))
-    row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
+    row = storage.of(db).work.assign(item_id, check["assignee"],
+                                     current=None if claim else previous, note=note,
                                      actor=actor, queued_note=queued,
                                      forced_note=queued and _forced_note(check, note, force,
                                                                          actor))
     if row is None:
+        if claim:
+            holder = (get(db, item_id) or {}).get("assignee")
+            raise WorkError("lot %s taken in the meantime%s: claim refused, nothing changed"
+                            % (item_id, " by %s" % holder if holder else ""))
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
     behind = row.get("queued_behind")
     if branch:
@@ -1298,6 +1311,14 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
         if item is None:
             raise WorkError("lot %s not found" % item_id)
         state = item["state"]
+        pinned = _pinned_ref(item)
+        if pinned:
+            # #1922 : sous workflow, l'état `merged` est écrit par le registre
+            # (garde serveur `merged_and_staging_deployed`), jamais par le
+            # constat de fusion seul.
+            return {"id": int(item_id), "result": "refused", "item": item,
+                    "detail": "lot pinned to workflow %s: transitions go through "
+                              "process_registry" % pinned}
         if state in MERGED_STATES:
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": "already %s" % state}
@@ -1505,6 +1526,10 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pinned = _pinned_ref(item)
+    if pinned:
+        # #1922 : la fermeture d'un lot sous workflow passe par le registre.
+        raise _pinned_close_error(item_id, pinned)
     if superseded_by is not None:
         if int(superseded_by) == int(item_id):
             raise WorkError("a lot cannot supersede itself")
@@ -1535,6 +1560,11 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     for record in threads:
         record(db.cfg, db)
     if row is None:
+        # #1922/N14 : le refus peut venir d'une adoption concurrente, que le
+        # filtre SQL a interceptée (N8) ; nommer la retenue, pas l'état.
+        pinned = _adopted_ref(db, item_id)
+        if pinned:
+            raise _pinned_close_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
 
@@ -1548,6 +1578,43 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
     if state and state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
+
+
+def _pinned_ref(item: dict) -> str:
+    """La révision Process qui pinne le lot (colonne 0452), '' sinon.
+
+    Lue dans l'élément rendu par `work.get`, donc portée par l'interface de
+    stockage — et par le contrat médié pour une session de VM. Aucun SELECT
+    brut ici : il est refusé sur une connexion d'exécuteur médié (B5, #1922).
+    Une base d'avant 0452 rend '' (aucun lot n'y est pinné), comme
+    `workflow_ref` absent d'un élément.
+    """
+    return str(item.get("workflow_ref") or "")
+
+
+def _pinned_transition_error(item_id: int, pinned: str) -> WorkError:
+    """Le refus explicite d'un `move` historique sur un lot pinné (#1922)."""
+    return WorkError(
+        "lot %s is pinned to workflow %s: transitions go through "
+        "process_registry" % (item_id, pinned))
+
+
+def _pinned_close_error(item_id: int, pinned: str) -> WorkError:
+    """Le refus explicite d'une fermeture historique sur un lot pinné (#1922)."""
+    return WorkError(
+        "lot %s is pinned to workflow %s: closing goes through "
+        "process_registry" % (item_id, pinned))
+
+
+def _adopted_ref(db: Db, item_id: int) -> str:
+    """La révision Process qui a adopté le lot entre la lecture et l'écriture.
+
+    #1922/N14 : la garde applicative lit `workflow_ref` hors du verrou du lot ;
+    le filtre SQL refuse ensuite l'écriture (N8). Relire ici rend le refus
+    explicite du lot pinné, au lieu d'un « moved in the meantime » générique
+    qui ferait réessayer une écriture réservée au registre.
+    """
+    return _pinned_ref(get(db, item_id) or {})
 
 
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
@@ -1588,6 +1655,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pinned = _pinned_ref(item)
+    if pinned:
+        # #1922 : un lot pinné sur une révision Process ne bouge que par le
+        # registre (process_registry), qui vérifie la garde côté serveur et
+        # écrit le reçu dans la même transaction.
+        raise _pinned_transition_error(item_id, pinned)
     current = item["state"]
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
@@ -1609,6 +1682,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         row = storage.of(db).work.move(item_id, state, current=current, loops=0, note=text,
                                        actor=actor)
         if row is None:
+            # #1922/N14 : adoption concurrente (workflow_ref) ou état changé.
+            pinned = _adopted_ref(db, item_id)
+            if pinned:
+                raise _pinned_transition_error(item_id, pinned)
             raise WorkError("lot %s moved in the meantime: retry" % item_id)
         return row
     if state not in TRANSITIONS[current]:
@@ -1637,6 +1714,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile
             raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
+        # #1922/N14 : adoption concurrente (workflow_ref) ou état changé.
+        pinned = _adopted_ref(db, item_id)
+        if pinned:
+            raise _pinned_transition_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     if reviewer:
         # #705 : la désignation est un geste distinct (journalisé), fait dans la

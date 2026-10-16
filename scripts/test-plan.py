@@ -61,8 +61,9 @@ version number never takes the lane: L157 is a pull-request rule.
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
-missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
+missing, unreadable, older than 48 h, not an ancestor of HEAD, or built on
+unreadable measure artefacts (`measure.artefacts_incomplets`, #1690/#1716):
+the order falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
 default) and the plan is marked unsure. A file the map cannot judge (Python
 outside `src/ameesh`, a non-documentation file no test reads, a syntax
 error) uses the textual heuristic for that file and marks the plan unsure;
@@ -688,6 +689,19 @@ def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
         return f"map older than {MAX_AGE_H} h ({age:.0f} h)", age
     if not card.get("commit") or not is_ancestor(card["commit"], head, repo):
         return f"map commit {str(card.get('commit'))[:12]} is not an ancestor of {head}", age
+    # #1716 : #1690 écarte un artefact de mesure illisible et le nomme dans
+    # `artefacts_incomplets`, mais la carte reste amputée des tests que cet
+    # artefact portait : un bloc peut ressortir couvert par le seul artefact
+    # lisible, et la sélection se réduire à l'insu du plan. La carte entière
+    # est suspecte — on ne sait pas quels blocs l'artefact perdu couvrait —
+    # donc ordre complet, comme pour toute carte inutilisable.
+    incomplets = (card.get("measure") or card.get("mesure") or {}).get(
+        "artefacts_incomplets") or []
+    if incomplets:
+        fichiers = ", ".join(str(i.get("fichier", "?")) for i in incomplets[:3]
+                             if isinstance(i, dict))
+        return (f"map with {len(incomplets)} unreadable measure artefact(s)"
+                + (f" ({fichiers})" if fichiers else "")), age
     return "", age
 
 
@@ -700,7 +714,7 @@ def is_foundation(path: str) -> bool:
 
 
 def read_list(path: pathlib.Path, known: list[str], required: bool = False) -> list[str]:
-    """`parts.read_list`, whose SystemExit (stale or unsorted entry) becomes a
+    """`parts.read_list`, whose SystemExit (stale entry) becomes a
     ValueError: `main` catches it and falls back to the full suite."""
     if not path.exists() and not required:
         return []

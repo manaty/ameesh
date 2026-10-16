@@ -13,9 +13,11 @@ import json
 import os
 import time
 import unittest
+from unittest import mock
 
 from ameesh import (alert_briefs, exploitation, notify, registry, storage, work,
                     work_dependencies)
+from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
 
@@ -147,6 +149,7 @@ class BriefsTest(_Base):
         out = self.briefs(self.slo()[0])
         self.assertEqual(sorted(out), ["dev1"])
         self.assertIn("SLO breach, level 1", out["dev1"])
+        self.assertIn("late by 30 min (target 1 h)", out["dev1"])
         self.assertIn("ameesh work note %d" % self.lot["id"], out["dev1"])
 
     def test_niveau_2_pilote_seul(self):
@@ -154,6 +157,7 @@ class BriefsTest(_Base):
         out = self.briefs(self.slo()[0])
         self.assertEqual(sorted(out), ["orch"])
         self.assertIn("pilot: reassign", out["orch"])
+        self.assertIn("late by 1 h 30 (target 1 h)", out["orch"])
 
     def test_niveau_3_bureau_et_auditeur(self):
         self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
@@ -162,6 +166,8 @@ class BriefsTest(_Base):
         out = self.briefs(self.slo()[0])
         self.assertEqual(sorted(out), ["auditeur", "bureau"])
         self.assertIn("bureau or auditor", out["bureau"])
+        for text in out.values():
+            self.assertIn("late by 35 min (target 15 min)", text)
         self.assertIn("the owner is notified", out["bureau"])
 
 
@@ -254,6 +260,66 @@ class NotifyLivreTest(_Base):
         self.assertEqual((bas["reason"], haut["reason"]),
                          ("intake_started/level-1", "intake_started/level-2"))
         self.assertNotEqual(notify.key_of(bas), notify.key_of(haut))
+
+
+class LotIllisibleTest(_Base):
+    """#1107 (n2 P3 de #1035) : un lot illisible n'éteint plus les alertes.
+
+    Un instant qui n'en est pas un fait lever `float()` dans le lecteur partagé
+    (`stagnation.describe`) ; sans garde, ce seul lot faisait tomber **toute**
+    la passe d'alertes. Le lot fautif est signalé (`lot_unreadable`), sans
+    horodatage inventé ; les lots sains gardent leurs alertes. La ligne
+    malformée est injectée à la lecture (`open_lots_activity`) : le calcul des
+    jalons, de l'attente et du SLO reste le vrai."""
+
+    def _illisible(self, malsain, **champs):
+        vrai = Operations.open_lots_activity
+
+        def lire(this, limit):
+            return [dict(row, **champs) if int(row["id"]) == int(malsain["id"]) else row
+                    for row in vrai(this, limit)]
+        return mock.patch.object(Operations, "open_lots_activity", lire)
+
+    def _lots(self):
+        self.age(1.5 * HEURE)                           # lot sain, en retard
+        # #540 : dev1 a déjà un lot non démarré, un second irait à la file
+        # d'équipe (sans assigné) ; le lot illisible a donc son propre agent,
+        # pour vérifier que le signal va bien à l'assigné.
+        registry.upsert(self.db, "dev3", harness="claude", host=self.cfg.host)
+        malsain = work.add(self.db, title="lot illisible", assignee="dev3")
+        self.age(1.5 * HEURE, lot=malsain)
+        return malsain
+
+    def _alertes(self, malsain, **champs):
+        with self._illisible(malsain, **champs):
+            # 7 h plus tard : les deux lots sont aussi stagnants (seuil 6 h)
+            return exploitation.alerts(self.cfg, self.db, now=self.now + 7 * HEURE,
+                                       **_seuils(orchestrators_declared=["orch"]))
+
+    def _verifie(self, alerts, malsain, valeur, slo):
+        par_type = lambda t: [a["lot"] for a in alerts if a["type"] == t]
+        self.assertEqual(par_type("slo_breach"), slo)
+        self.assertEqual(par_type("stale_lot"), [self.lot["id"]])
+        signaux = [a for a in alerts if a["type"] == "lot_unreadable"]
+        self.assertEqual([a["lot"] for a in signaux], [malsain["id"]])  # un seul signal
+        self.assertEqual(signaux[0]["agent"], "dev3")
+        self.assertIsNone(signaux[0]["since"])           # aucun instant inventé
+        self.assertIn("ValueError", signaux[0]["detail"])
+        self.assertIn(valeur, signaux[0]["detail"])
+        # un type d'alerte non enregistré ferait tomber le tri d'`alerts()`
+        self.assertIn("lot_unreadable", exploitation.ALERT_TYPES)
+        self.assertIn("lot_unreadable", notify.TYPE_LABELS)
+
+    def test_created_ts_malforme(self):
+        malsain = self._lots()
+        alerts = self._alertes(malsain, created_ts="pas-un-instant")
+        self._verifie(alerts, malsain, "pas-un-instant", [self.lot["id"]])
+
+    def test_last_activity_ts_malforme(self):
+        malsain = self._lots()
+        alerts = self._alertes(malsain, last_activity_ts="jamais")
+        # le SLO ne lit pas `last_activity_ts` : le lot garde son échéance
+        self._verifie(alerts, malsain, "jamais", [self.lot["id"], malsain["id"]])
 
 
 if __name__ == "__main__":

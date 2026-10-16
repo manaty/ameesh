@@ -58,6 +58,13 @@ class Operations(interface.Operations):
             " WHERE name = %s RETURNING name", tuple(params + [name]))
         return bool(rows)
 
+    def set_dormant(self, name, owner, epoch, status_text) -> bool:
+        return bool(self.db.query(
+            "UPDATE agent_registry SET status_text = %s, updated_at = now()"
+            " WHERE name = %s AND status = 'idle' AND lease_owner = %s"
+            "   AND lease_epoch = %s AND lease_expires_at > clock_timestamp()"
+            " RETURNING name", (status_text, name, owner, int(epoch))))
+
     def set_session_work_item(self, name, owner, epoch, work_item) -> bool:
         rows = self.db.query(
             """
@@ -340,9 +347,14 @@ class Operations(interface.Operations):
         # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
         reviewer = ("w.reviewer" if has_reviewer(self.db)
                     else "''::text AS reviewer")
+        # #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
+        # `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
+        # migration. `released_by` en écarte les dépendants pinnés, dont la
+        # retenue ne tombe que par une commande `release` du registre.
         sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, __REVIEWER__,
+                   coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
