@@ -154,7 +154,10 @@ refusés sur un lot pinné (y compris la couche de stockage appelée avec
 l'instantané d'avant l'adoption : le filtre `workflow_ref` est dans le SQL),
 `read_sources` fail-closed, annulation par trigger,
 historique intact, contraintes de la migration (`IS TRUE`, y compris la
-réapplication du fichier qui réinstalle la définition durcie). Un cas de **seam
+réapplication du fichier qui réinstalle la définition durcie), et **support
+avant 0452** : colonnes du registre absentes, `work.get` rend `workflow_ref`
+vide et `work.move`/`work.close` restent les commandes historiques (aucune
+sonde de colonne). Un cas de **seam
 réel avec la tranche C** (`process_verifiers.install_verifiers` sur le registre
 public : avance gardée `planning`, retenue, reprise, `waiting_human` par
 `read_sources`) tourne dès que C est présent, sinon il est sauté — C n'est pas

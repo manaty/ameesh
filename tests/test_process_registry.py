@@ -23,7 +23,10 @@ sélectionne psycopg ou psql par `AMEESH_DRIVER`) :
   écriture) ;
 * contraintes de la migration additive 0452 : reçu complet exigé `IS TRUE`
   (toute clé absente ou `null` imbriqué est refusé), unicité partielle
-  (lot, clé).
+  (lot, clé) ;
+* lecture de la garde par l'interface de stockage (`work.get`), y compris
+  sur une base d'avant 0452 (colonnes du registre absentes) : aucune sonde
+  de colonne, aucun SELECT brut (B5).
 
 Les organisations et agents sont fictifs (`acme`). Aucune activation :
 `INSTALLED_VERIFIERS` est vide par défaut, les tests injectent leurs
@@ -1123,6 +1126,51 @@ class RegistryTest(PgTestCase):
             lot, current="qa", sha="a" * 40, actor="test", note="n", pr_ref=None))
         self.assertEqual(self.row(lot)["state"], "qa")
         self.assertEqual(self.events(lot), [])
+
+    def _restore_workflow_columns(self) -> None:
+        """Réapplique les colonnes et gardes de la 0452 (migration additive)."""
+        self.db.execute("ALTER TABLE work_items"
+                        " ADD COLUMN IF NOT EXISTS workflow_ref text")
+        self.db.execute("ALTER TABLE work_items"
+                        " ADD COLUMN IF NOT EXISTS workflow_stage text")
+        self.db.execute("ALTER TABLE work_items"
+                        " ADD COLUMN IF NOT EXISTS workflow_version bigint"
+                        " NOT NULL DEFAULT 0")
+        self.db.execute(
+            "ALTER TABLE work_items DROP CONSTRAINT IF EXISTS"
+            " work_items_workflow_version_nonnegative")
+        self.db.execute(
+            "ALTER TABLE work_items ADD CONSTRAINT"
+            " work_items_workflow_version_nonnegative"
+            " CHECK (workflow_version >= 0)")
+        self.db.execute(
+            "ALTER TABLE work_items DROP CONSTRAINT IF EXISTS"
+            " work_items_workflow_stage_needs_ref")
+        self.db.execute(
+            "ALTER TABLE work_items ADD CONSTRAINT"
+            " work_items_workflow_stage_needs_ref"
+            " CHECK (workflow_stage is null or workflow_ref is not null)")
+
+    def test_avant_la_0452_les_commandes_historiques_ne_cassent_pas(self):
+        """B5 (paquet 0650), support avant 0452 : sans les colonnes du
+        registre, `work.get` rend `workflow_ref` vide (aucun lot n'y est
+        pinné) et les commandes historiques restent celles d'avant le
+        registre — la lecture ne dépend d'aucune sonde de colonne."""
+        bouge = self.lot(state="build")
+        ferme = self.lot(state="build")
+        self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_ref CASCADE")
+        self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_stage")
+        self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_version")
+        self.addCleanup(self._restore_workflow_columns)
+
+        self.assertEqual(work.get(self.db, bouge)["workflow_ref"], "")
+        self.assertEqual(work.get(self.db, ferme)["workflow_ref"], "")
+        row = work.move(self.db, bouge, "qa", actor=ACME_ACTOR)
+        self.assertEqual(row["state"], "qa")
+        closed = work.close(self.db, ferme, abandoned=True, actor=ACME_ACTOR)
+        self.assertEqual(closed["state"], "closed")
+        self.assertEqual(self.row(bouge)["state"], "qa")
+        self.assertEqual(self.row(ferme)["state"], "closed")
 
     def test_read_sources_ne_declare_que_le_reel(self):
         lot = self.pinned(stage="implementation", state="build")
