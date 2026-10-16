@@ -1853,12 +1853,14 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: interactive sessions (`ameesh attach`), also local; #408: lot_wake, on|off
 #: (rule 1, the runner's wake on an actionable lot), in the database; L76:
 #: resident (`on` | `off`) and resident_sleep, the resident process of the
-#: agent, local
+#: agent, local ; L81 : resident_reread_max (relu cumulé avant rotation)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode", "lot_wake", "resident", "resident_sleep")
+            "permission_mode", "lot_wake", "resident", "resident_sleep",
+            "resident_reread_max")
 #: L76: settings written in the local state of the agent's host only
-LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep")
+LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep",
+                  "resident_reread_max")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1950,7 +1952,7 @@ def cmd_set(cfg: Config, args) -> int:
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
-                      "resident=on|off resident_sleep=30m|0"
+                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -2012,6 +2014,14 @@ def cmd_set(cfg: Config, args) -> int:
                 except ValueError:
                     print("invalid resident_sleep: %r (e.g. 30m, 1h, 0 = never asleep)"
                           % valeur, file=sys.stderr)
+                    return 2
+            if cle == "resident_reread_max" and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                except ValueError:
+                    print("invalid resident_reread_max: %r (e.g. 50M, 10M, "
+                          "0 = never rotate on the cumulative re-read)" % valeur,
+                          file=sys.stderr)
                     return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
