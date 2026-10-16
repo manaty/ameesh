@@ -107,6 +107,16 @@ class RecoveryError(ValueError):
     pass
 
 
+class LibpqParserUnavailable(RecoveryError):
+    """Le parseur de DSN libpq (`psycopg.conninfo`) est absent.
+
+    Refus nommé et fail-closed : sans lui la cible effective de la sauvegarde
+    ne peut pas être recoupée avec la base de la release. Aucune cible non
+    vérifiée n'est acceptée, et le pilote `psql` (qui n'installe pas psycopg)
+    n'est pas une raison d'accepter : il refuse nommément.
+    """
+
+
 def configuration(document):
     """Exact administrator enrollment; credential values are never inlined."""
     if not isinstance(document, dict) or set(document) != CONFIG_FIELDS:
@@ -198,10 +208,16 @@ def database_target(dsn):
 
     Use libpq's precedence for query parameters and repeated keywords. Service
     references are refused because their external routing is not pinned here.
+    Without the libpq parser the target cannot be verified: a named refusal
+    (`LibpqParserUnavailable`), never an accepted value.
     """
-    from psycopg.conninfo import conninfo_to_dict
     if not isinstance(dsn, str) or not dsn or '\x00' in dsn:
         return None
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+    except ImportError:
+        raise LibpqParserUnavailable(
+            'libpq parser unavailable: psycopg is required to verify the target') from None
     try:
         parameters = conninfo_to_dict(dsn)
     except Exception:
