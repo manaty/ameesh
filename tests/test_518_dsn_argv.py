@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 
+from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import dsn as dsn_mod
 
@@ -180,6 +181,38 @@ class SplitPasswordTest(unittest.TestCase):
                 continue
             with self.subTest(refused=dsn), self.assertRaises(pg_errors.ProgrammingError):
                 conninfo_to_dict(dsn)
+
+
+class MaskDsnTest(unittest.TestCase):
+    """L537 : `mask_dsn` rend le DSN de `split_password`, jamais un mot de passe.
+
+    Le marqueur dit qu'il y en avait un ; un DSN refusé s'affiche
+    `<invalid DSN>`, jamais cité."""
+
+    def test_table(self):
+        for dsn, password, rest in CASES:
+            with self.subTest(dsn=dsn):
+                without = dsn if rest is None else rest
+                shown = config_mod.mask_dsn(dsn)
+                if not password:
+                    self.assertEqual(shown, without)
+                    continue
+                self.assertNotIn(password, shown)
+                self.assertIn(config_mod.MASKED_PASSWORD, shown)
+                self.assertTrue(shown.startswith(without), shown)
+
+    def test_refused_shows_invalid_without_quoting(self):
+        for dsn in DELIBERATE + REFUSED:
+            with self.subTest(dsn=dsn):
+                shown = config_mod.mask_dsn(dsn)
+                self.assertEqual(shown, "<invalid DSN>")
+                self.assertNotIn("Pw", shown)
+
+    def test_a_password_alone_is_the_marker(self):
+        self.assertEqual(config_mod.mask_dsn("password='two words'"),
+                         config_mod.MASKED_PASSWORD)
+        self.assertEqual(config_mod.mask_dsn("postgresql://u@h.invalid/db"),
+                         "postgresql://u@h.invalid/db")
 
 
 class CommandLineTest(unittest.TestCase):

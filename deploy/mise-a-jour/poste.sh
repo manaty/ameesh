@@ -336,7 +336,10 @@ proprietaire_de() {  # unit → the lease owner its runner takes: --runner-id, e
 
 # Redémarre les unités $2… (base $1 : mesh | ancienne) une par une, chacune
 # au premier instant où sa persona n'est pas en tour. Une persona longue en
-# tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout.
+# tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout. Une
+# persona arrêtée dans le registre (`stopped`, arrêt du propriétaire) n'est
+# pas réactivée (#1131) ; son unité encore active est seulement rechargée sur
+# le nouveau code (#1633), sans bail ni tour.
 redemarrer_liste() {
   local base=$1; shift
   local restantes=("$@") suivantes debut=$SECONDS u p st avant ligne heure tenu attendu
@@ -346,6 +349,25 @@ redemarrer_liste() {
       p=$(persona_de "$u")
       [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
       st=$(statut "$base" "$p")
+      # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
+      # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
+      # actives malgré le registre `stopped`).
+      # #1633 : la laisser tourner sur l'ancien code faisait repartir une
+      # reprise ultérieure sur cette version. Si son unité est encore active,
+      # on la redémarre pour charger le nouveau code — sans exiger de bail :
+      # la persona reste arrêtée, aucun tour. Une unité déjà arrêtée n'est pas
+      # relancée (elle chargera le nouveau code à son démarrage).
+      if [ "$st" = stopped ]; then
+        if systemctl --user is-active --quiet "$u"; then
+          systemctl --user restart "$u" \
+            && systemctl --user is-active --quiet "$u" \
+            || { echo "$u : unité d'une persona arrêtée, ne redémarre pas — journalctl --user -u $u -n 50" >&2; exit 1; }
+          echo "$p : arrêté dans le registre — unité $u redémarrée pour charger le nouveau code, aucun tour"
+        else
+          echo "$p : arrêté dans le registre — unité $u déjà arrêtée, rien à recharger"
+        fi
+        continue
+      fi
       if [ "$st" = running ]; then suivantes+=("$u"); continue; fi
       # #502: only a runner that held its lease must take it again (bail.sh)
       ligne=$(lire_bail "$base" "$p") && heure=$(heure_base "$base") \

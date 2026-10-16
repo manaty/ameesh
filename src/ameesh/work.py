@@ -378,9 +378,9 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
     analysis = deep_analysis.on_lot_created(db, item, actor=actor, cfg=cfg)
     if analysis is not None:
         item["deep_analysis"] = analysis
-    # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne crée pas de
-    # lot, elle va au backlog. L'avertissement est rendu par la création
-    # elle-même (tous les points d'entrée l'obtiennent) ; rien n'est refusé.
+    # canon §2 (15/10/2026): a review follow-up (N, P2, P3) does not create a
+    # lot, it goes to the backlog. The warning is produced by the creation
+    # itself (every entry point gets it); nothing is refused.
     from . import backlog
     hint = backlog.followup_hint(title=item.get("title") or title, source=source,
                                  issue_ref=issue_ref or "", app=app or "")
@@ -463,7 +463,8 @@ def lot_repository(item: dict, cfg=None) -> str:
 
 def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
-                      actor: str = "", cfg=None) -> dict:
+                      actor: str = "", cfg=None,
+                      skip_branches: tuple[str, ...] = ()) -> dict:
     """L122, #443 : réserve au lot le numéro de sa migration, avant d'écrire
     le fichier, dans le dépôt du lot (`lot_repository`) : le dossier et la
     numérotation sont les siens, jamais ceux d'ameesh pour un autre dépôt.
@@ -476,7 +477,12 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     réservations simultanées). Un lot qui a déjà sa réservation la garde
     (idempotent). `release` la libère, y compris sur un lot déjà terminal
     (#956 : un lot fusionné gardait sa réservation et bloquait le numéro).
-    Rend le lot, avec `migration_file`."""
+    `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
+    en plus de celle du lot — la branche d'intégration d'un paquet en
+    composition, dont les fichiers renumérotés ne doivent pas compter contre
+    la réservation. Rend le lot, avec `migration_file`. Une correction
+    concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
+    `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
 
     item = get(db, item_id)
@@ -491,6 +497,7 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         layout = migration_layout(item, cfg)
         row = storage.of(db).work.reserve_migration(
             item_id, item.get("migration_repo"), None, 0, actor=actor, release=True,
+            issue_ref=item.get("issue_ref"),
             note="migration %s released (%s)" % (layout.label(current), layout.repo))
         if row is None:
             raise WorkError("lot %s is no longer open: no reservation" % item_id)
@@ -506,7 +513,12 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                         "configuration: radar.projects.<project> with github %s and "
                         "migrations <dir>)" % (slug, slug))
     checkout = _checkout(slug, repo, cfg)
-    present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"))
+    trunks = sorted(set(skip_branches) & migrations.trunk_branches(checkout))
+    if trunks:
+        # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
+        raise WorkError("--skip-branch %s: a trunk branch is always scanned" % trunks[0])
+    present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
+                                      also_skip=tuple(skip_branches))
     if number is None:
         floor = max(present or [0]) + 1
         note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
@@ -521,7 +533,8 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
             layout.label(current) if current is not None else "none")
     try:
         row = storage.of(db).work.reserve_migration(item_id, slug, number, floor, note=note,
-                                                    actor=actor)
+                                                    actor=actor,
+                                                    issue_ref=item.get("issue_ref"))
     except storage.ReservationContention as exc:
         # #478 : budget de réessais épuisé sous la rafale — message lisible,
         # jamais la DbError brute de l'index unique
@@ -536,6 +549,13 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
             layout.label(number), slug, holder["id"] if holder else "?",
             holder["title"] if holder else "concurrent reservation")) from exc
     if row is None:
+        # #1830 : le CAS a échoué ; si le lot est encore ouvert et que sa
+        # référence d'issue a bougé pendant le scan du dépôt, le dire — sinon
+        # c'est la fermeture du lot qui a refusé.
+        again = get(db, item_id)
+        if (again is not None and again["state"] not in ("merged", "promoted", "closed")
+                and (again.get("issue_ref") or "") != (item.get("issue_ref") or "")):
+            raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
         raise WorkError("lot %s is no longer open: no reservation" % item_id)
     return _with_file(row, cfg)
 
@@ -570,6 +590,53 @@ def _checkout(slug: str, path: str | None, cfg=None) -> str:
                         "pass --repo <clone of %s>" % (top, origin or "no GitHub origin",
                                                        slug, slug))
     return top
+
+
+def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg=None) -> dict:
+    """#1603 : corrige la référence d'issue d'un lot, ou l'efface (`ref=None`).
+
+    Réservé aux correcteurs (humain, orchestrateur ou agent de conception),
+    comme `work set-app` : c'est `issue_ref` qui décide du dépôt où
+    `work migration` réserve (`lot_repository`), un lot créé sur l'issue d'un
+    autre dépôt ne peut donc pas réserver chez lui sans cette correction.
+    Refusée tant que le lot garde une réservation de migration dans un autre
+    dépôt que celui de la nouvelle référence (la libérer d'abord).
+    L'écriture passe par le compare-and-set du storage (aucune correction
+    concurrente n'est écrasée) puis laisse une ligne de journal."""
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    clean = (ref or "").strip() or None
+    if clean is not None and not _ISSUE_REPO_RE.match(clean):
+        raise WorkError("issue reference %r: expected owner/repo#N (or --none)" % clean)
+    actor = corrector(cfg, db, actor)
+    current = (item.get("issue_ref") or "").strip() or None
+    if current == clean:
+        return item
+    if item.get("migration") is not None:
+        # la réservation reste dans le dépôt où elle a été prise : la garder
+        # sous une issue d'un autre dépôt la rendrait fausse en silence
+        # (`work migration` est idempotent sur une réservation existante)
+        try:
+            target = lot_repository(dict(item, issue_ref=clean), cfg)
+        except WorkError:
+            target = None
+        if target != item.get("migration_repo"):
+            raise WorkError("lot %s holds migration %s in %s: release it first "
+                            "(`ameesh work migration %s --release`), then correct the "
+                            "issue reference and reserve again" % (
+                                item_id, migration_layout(item, cfg).label(item["migration"]),
+                                item.get("migration_repo"), item_id))
+    if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref"),
+                                             migration_repo=item.get("migration_repo")):
+        # #1654 : le CAS couvre aussi la réservation lue ; si l'issue n'a pas
+        # bougé, c'est une réservation arrivée entre la lecture et l'écriture.
+        again = get(db, item_id)
+        if again is not None and ((again.get("issue_ref") or "").strip() or None) == current:
+            raise WorkError("lot %s: migration reservation changed meanwhile, retry" % item_id)
+        raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
+    note(db, item_id, "issue_ref %s → %s" % (current or "—", clean or "—"), actor=actor)
+    return get(db, item_id) or item
 
 
 def open_lots(db: Db, assignee: str) -> list[dict]:
@@ -1506,6 +1573,8 @@ def milestone(
     actor: str = "",
     verdict: str | None = None,
     note: str = "",
+    on_frozen=None,
+    after_commit: list | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -1514,6 +1583,16 @@ def milestone(
     `closed` et `delivered` sont écrits automatiquement (transitions et
     fermeture, 0013 et #988), les déclarer à la main serait un mensonge sur la
     frise.
+
+    `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
+    transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
+    laisse `after_commit` recevoir les écritures de fil différées
+    (`mail.send(..., after_commit=…)`) ; c'est **l'appelant** qui vide la liste
+    après le COMMIT qu'il tient (celui du `with` interne sur une connexion
+    racine, celui de sa propre transaction si l'appel est imbriqué : un `with`
+    imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
+    le raccord de la désignation des relecteurs se branche à l'activation du
+    lot #1617, pas ici.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))
@@ -1527,10 +1606,13 @@ def milestone(
                             % (verdict, ", ".join(VERDICTS)))
     elif verdict is not None:
         raise WorkError("a verdict only makes sense for the `verdict` milestone")
+    if on_frozen is not None and kind != "frozen":
+        raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     if get(db, item_id) is None:
         raise WorkError("lot %s not found" % item_id)
     return storage.of(db).work.add_milestone(
-        item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip())
+        item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
+        on_frozen=on_frozen, after_commit=after_commit)
 
 
 def delays(db: Db, limit: int = 200, *, ids: Sequence[int] | None = None) -> list[dict]:

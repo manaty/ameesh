@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from ameesh import backlog, db as db_mod, notify, storage, work
+from ameesh.storage.postgres.work import WorkItems
 
 from .support import hold_for_owner
 from .test_l119_backlog import HEURE, _Base, _seuils
@@ -133,6 +134,89 @@ class PriseDeLotTest(_Lots):
         self.assertEqual(errors, [])
         self.assertEqual([t["item"]["id"] for t in result], [pret["id"]])
         self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+
+    def test_interblocage_de_prise_laisse_le_lot_libre_et_passe_au_suivant(self):
+        # #1496 : le serveur annule la prise victime d'un interblocage ; le
+        # passage continue comme après une prise perdue entre-temps.
+        self.agent("claude1", team="nexlink")
+        premier = self.lot("premier", priority=1)
+        second = self.lot("second", priority=2)
+        assign = WorkItems.assign
+        calls = []
+
+        def deadlock_once(store, item_id, *args, **kwargs):
+            calls.append(int(item_id))
+            if int(item_id) == premier["id"]:
+                raise db_mod.DbError("deadlock detected", sqlstate=db_mod.DEADLOCK_DETECTED)
+            return assign(store, item_id, *args, **kwargs)
+
+        with patch.object(WorkItems, "assign", deadlock_once):
+            out = self.take()
+        self.assertEqual(calls, [premier["id"], second["id"]])
+        self.assertEqual([t["item"]["id"] for t in out], [second["id"]])
+        self.assertIsNone(work.get(self.db, premier["id"])["assignee"])
+        self.assertFalse(any(m["work_item_id"] == str(premier["id"])
+                             for m in self.courriers()))
+        # le lot reste éligible : le passage suivant le prend
+        self.agent("claude2", team="nexlink")
+        self.assertEqual([t["item"]["id"] for t in self.take()], [premier["id"]])
+
+    def test_interblocage_de_prise_d_amelioration_passe_au_suivant(self):
+        self.agent("claude1")
+        premier = self.element("premier", 80)
+        second = self.element("second", 40)
+        assign = WorkItems.assign
+
+        def deadlock_once(store, item_id, *args, **kwargs):
+            if int(item_id) == premier["id"]:
+                raise db_mod.DbError("deadlock detected", sqlstate=db_mod.DEADLOCK_DETECTED)
+            return assign(store, item_id, *args, **kwargs)
+
+        with patch.object(WorkItems, "assign", deadlock_once):
+            out = self.take()
+        self.assertEqual([(t["kind"], t["item"]["id"]) for t in out],
+                         [("backlog", second["id"])])
+        self.assertIsNone(work.get(self.db, premier["id"])["assignee"])
+
+    def test_autre_erreur_de_prise_remonte(self):
+        self.agent("claude1", team="nexlink")
+        self.lot("lot")
+
+        def unique_violation(*args, **kwargs):
+            raise db_mod.DbError("duplicate key", sqlstate=db_mod.UNIQUE_VIOLATION)
+
+        with patch.object(WorkItems, "assign", unique_violation):
+            with self.assertRaises(db_mod.DbError):
+                self.take()
+
+    def test_interblocage_reel_classe_par_le_pilote(self):
+        # Le code 40P01 vient bien du pilote en service (psycopg ou psql),
+        # pas seulement du témoin simulé ci-dessus.
+        lots = [self.lot("verrou%d" % i)["id"] for i in range(2)]
+        barrier = threading.Barrier(2, timeout=15)
+        errors = []
+
+        def cross(first, second):
+            connection = db_mod.connect(self.cfg)
+            try:
+                with connection.transaction() as tx:
+                    tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE", (first,))
+                    barrier.wait()
+                    tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE", (second,))
+            except db_mod.DbError as exc:
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        workers = [threading.Thread(target=cross, args=pair, daemon=True)
+                   for pair in (lots, lots[::-1])]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(30)
+        self.assertFalse(any(w.is_alive() for w in workers), "interblocage non résolu")
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(db_mod.is_deadlock(errors[0]), errors[0].sqlstate)
 
     def test_auditeur_ne_prend_que_les_bugs_hors_instructions_protegees(self):
         self.agent("auditeur", team="ameesh")

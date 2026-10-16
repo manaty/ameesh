@@ -76,12 +76,20 @@ class Log:
         self.store = storage.of(db).conversations
 
     def append(self, kind, text="", *, author=None, session=None, turn=None,
-               event_id=None, meta=None, thread_text=None, truncated=False):
+               event_id=None, meta=None, thread_text=None, truncated=False,
+               thread=True):
+        """One entry; `thread=False` when the caller already wrote the readable
+        R12 copy of this message (L83: `mail.send` for a chat message): the
+        entry then carries no second outbox, and `thread_text` is refused."""
         if kind not in KINDS:
             raise ValueError("unknown conversation kind: %s" % kind)
         if thread_text is not None and kind not in ("human_message", "turn_end"):
             raise ValueError("only human messages and final answers go to the R12 outbox")
-        if kind == "human_message" and thread_text is None:
+        if not thread:
+            if thread_text is not None:
+                raise ValueError("thread=False: the readable copy is already written; "
+                                 "thread_text is not accepted")
+        elif kind == "human_message" and thread_text is None:
             thread_text = text
         short, cut = bounded(text)
         full, thread_cut = bounded(thread_text, THREAD_LIMIT)

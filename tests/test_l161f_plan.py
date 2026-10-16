@@ -546,6 +546,26 @@ class MapTest(unittest.TestCase):
         self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
         self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
 
+    def test_new_file_imported_after_terminal_statement_keeps_the_doubt(self):
+        self.repo.write("tests/test_static.py",
+                        "raise RuntimeError\nimport ameesh.new_feature\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        card["modules"]["test_static"] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py",
+                      out["phase2_why"])
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
         # l'importe ; les tests que la carte a mesurés sur ce module (ici un
@@ -655,7 +675,7 @@ class MapTest(unittest.TestCase):
                     self.assertEqual(p["selection"]["mode"], "full")
                     self.assertIn("release/**", p["selection"]["why"])
                     self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                     self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                     self.assertEqual(
                         sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
@@ -683,7 +703,7 @@ class MapTest(unittest.TestCase):
         self.assertIn("release/**", release["selection"]["why"])
         self.assertNotEqual(release["parts"]["psycopg"], [])
         self.assertEqual(plan.outputs(release)["code"], "true")
-        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [9] * 9)
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -755,6 +775,25 @@ class MapTest(unittest.TestCase):
         stranger = dict(card, commit="0" * 40)
         self.assertIn("not an ancestor", plan.map_problem(stranger, NOW, "HEAD",
                                                           self.repo.path)[0])
+
+    def test_map_problem_partial_measure(self):
+        """#1257 R1 B3 : une carte dont la fusion a écarté des couvertures est
+        partielle ; elle ne juge plus la sélection, même fraîche et ancêtre."""
+        card = self.repo.card()  # carte ancienne : la clé n'existe pas
+        self.assertEqual(plan.ignored_coverages(card), [])
+        self.assertEqual(plan.map_problem(card, NOW, "HEAD", self.repo.path)[0], "")
+        vide = dict(card, measure={"couverture_ignoree": []})  # carte neuve sans perte
+        self.assertEqual(plan.map_problem(vide, NOW, "HEAD", self.repo.path)[0], "")
+        partielle = dict(card, measure={"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]})
+        probleme, age = plan.map_problem(partielle, NOW, "HEAD", self.repo.path)
+        self.assertIn("partial measure", probleme)
+        self.assertIsNone(age)  # le refus ne dépend ni de la date ni du dépôt
+        # la forme ancienne (clé française) est lue aussi
+        ancienne = dict(card, mesure={"couverture_ignoree": [{"part": "m"}]})
+        self.assertIn("partial measure",
+                      plan.map_problem(ancienne, NOW, "HEAD", self.repo.path)[0])
 
     def test_always_and_recent_failures(self):
         changes = [("M", "src/ameesh/work.py"), ("A", "src/ameesh/migrations/0099_x.sql")]
@@ -898,6 +937,181 @@ class ImportGraphTest(unittest.TestCase):
                 if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
                     self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                      {"src/ameesh/db.py"}, why)
+
+    def test_terminal_statement_prevents_later_import_proof(self):
+        known = {"src/ameesh/db.py"}
+        for terminal in ("raise RuntimeError", "import sys\nsys.exit(1)"):
+            with self.subTest(terminal=terminal):
+                source = terminal + "\nimport ameesh.db\n"
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                # Keep the possible edge for selection, even without proof.
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        # Class bodies execute during the containing module's import too.
+        source = "class C:\n    raise RuntimeError\nimport ameesh.db\n"
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                              guaranteed=True), set())
+
+    def test_terminal_statement_keeps_earlier_and_nonexecuted_proofs(self):
+        known = {"src/ameesh/db.py"}
+        for source in (
+            "import ameesh.db\nraise RuntimeError\n",
+            "import ameesh.db\nimport sys\nsys.exit(1)\n",
+            "def unused():\n    raise RuntimeError\nimport ameesh.db\n",
+            "def unused():\n    import sys\n    sys.exit(1)\nimport ameesh.db\n",
+            "if False:\n    raise RuntimeError\nimport ameesh.db\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+    def test_guaranteed_edges_stop_at_a_module_level_termination(self):
+        # #1627 : une terminaison atteignable à l'import (`raise` gardé, garde
+        # d'exception, exit, assert faux) laisse les imports suivants possibles,
+        # jamais garantis — sinon le plan certifie un chargement qui peut ne pas
+        # avoir eu lieu. Sens conservateur : une preuve en moins, jamais une
+        # fausse preuve.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "raise gardé": "import os\n"
+                           "if not os.environ.get('PG'):\n"
+                           "    raise RuntimeError\n"
+                           "import ameesh.db\n",
+            "raise dans un except": "try:\n"
+                                    "    import psycopg\n"
+                                    "except ImportError:\n"
+                                    "    raise SystemExit\n"
+                                    "import ameesh.db\n",
+            "exit": "exit()\nimport ameesh.db\n",
+            "quit": "quit()\nimport ameesh.db\n",
+            "os._exit": "import os\nos._exit(1)\nimport ameesh.db\n",
+            "os._exit aliasé": "from os import _exit as bye\nbye(1)\nimport ameesh.db\n",
+            "sys.exit": "import sys\nsys.exit(1)\nimport ameesh.db\n",
+            "sys.exit aliasé": "import sys as s\ns.exit(1)\nimport ameesh.db\n",
+            "exit importé": "from sys import exit as bye\nbye(1)\nimport ameesh.db\n",
+            "assert faux": "assert False\nimport ameesh.db\n",
+            "raise avant, import dans le même corps de classe":
+                "class C:\n    raise RuntimeError\n    import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # un garde mort ne termine rien : `if TYPE_CHECKING:` ne s'exécute pas
+        dead = ("from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    raise RuntimeError\n"
+                "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(dead, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        # le corps d'une fonction ne tourne pas à l'import : son raise ne coupe
+        # pas la preuve du corps du module
+        deferred = ("def broken():\n    raise RuntimeError\n"
+                    "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(deferred, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        nested = ("def factory():\n"
+                  "    class C:\n        raise RuntimeError\n"
+                  "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(nested, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+
+    def test_exit_expressions_stop_proofs_before_class_body_and_after_assert(self):
+        # #1474 : les bases et décorateurs s'évaluent avant le corps de classe ;
+        # une sortie dans un assert s'exécute aussi, même sans assert faux.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import sys\nclass C(sys.exit(1)):\n    import ameesh.db\n",
+            "@exit()\nclass C:\n    import ameesh.db\n",
+            "import os as o\nclass C(metaclass=o._exit(1)):\n    import ameesh.db\n",
+            "from sys import exit as bye\nassert bye(1)\nimport ameesh.db\n",
+            "import os\nassert os._exit(1)\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+
+    def test_exit_expressions_stop_proofs_in_function_definitions(self):
+        # #1474 : décorateurs, valeurs par défaut et annotations d'une fonction
+        # ou d'un lambda s'évaluent à la définition ; seul le corps est différé.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "@exit()\ndef f():\n    pass\nimport ameesh.db\n",
+            "@exit()\nasync def f():\n    pass\nimport ameesh.db\n",
+            "import sys\ndef f(x=sys.exit(1)):\n    pass\nimport ameesh.db\n",
+            "import os as o\ndef f(*, x=o._exit(1)):\n    pass\nimport ameesh.db\n",
+            "def f(x: quit()):\n    pass\nimport ameesh.db\n",
+            "g = lambda a=quit(): 0\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        for source in ("def f():\n    exit()\nimport ameesh.db\n",
+                       "f = lambda: exit()\nimport ameesh.db\n",
+                       "@staticmethod\ndef f(x=1):\n    import os\nimport ameesh.db\n"):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_exit_expressions_keep_prior_dead_and_deferred_proofs(self):
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import ameesh.db\nclass C(exit()):\n    pass\n",
+            "if False:\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def factory():\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def unused():\n    assert quit()\nimport ameesh.db\n",
+            "class C:\n    import ameesh.db\n    quit()\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_reassigned_exit_symbols_stay_conservative(self):
+        # #1474 : un symbole de terminaison réaffecté (`sys = ...`, puis un
+        # `bye = ...` sur un nom importé de sys/os) n'est pas suivi — la
+        # réaffectation peut être conditionnelle, donc la preuve reste coupée :
+        # une preuve perdue, jamais une preuve fausse. L'arête de sélection
+        # possible est conservée.
+        known = {"src/ameesh/db.py"}
+        reassigned = {
+            "sys rebindé": "import sys\n"
+                           "sys = None\n"
+                           "sys.exit(1)\n"
+                           "import ameesh.db\n",
+            "sys rebindé sans sortie": "import sys\n"
+                                       "class Fake:\n"
+                                       "    @staticmethod\n"
+                                       "    def exit(code):\n"
+                                       "        return None\n"
+                                       "sys = Fake\n"
+                                       "sys.exit(0)\n"
+                                       "import ameesh.db\n",
+            "exit importé puis rebindé": "from sys import exit as bye\n"
+                                         "bye = print\n"
+                                         "bye('x')\n"
+                                         "import ameesh.db\n",
+            "exit builtin rebindé": "exit = print\n"
+                                    "exit('x')\n"
+                                    "import ameesh.db\n",
+            "os._exit aliasé puis rebindé": "from os import _exit as bye\n"
+                                            "bye = print\n"
+                                            "bye('x')\n"
+                                            "import ameesh.db\n",
+        }
+        for why, source in reassigned.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
@@ -1103,6 +1317,21 @@ class DocsLaneTest(unittest.TestCase):
         self.assertFullSuite(self._plan(["docs/guide.md"]), "map not usable")
         self.assertFullSuite(self._plan_without_map(["docs/guide.md"]), "no map")
 
+    def test_partial_measure_card_runs_the_full_suite(self):
+        """#1257 R1 B3 : une couverture écartée à la fusion rend la carte
+        partielle ; le jugement de sélection est refusé et le repli suite
+        complète s'applique, même carte fraîche et ancêtre."""
+        self.card["measure"] = {"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]}
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
+        self.repo.write("docs/guide.md", "# Guide, again\n")
+        self.repo.commit()
+        p = self._plan(["docs/guide.md"])
+        self.assertFullSuite(p, "partial measure")
+        self.assertFalse(p["map"]["used"])
+        self.assertFalse(p["sure"])
+
     def _plan_without_map(self, files):
         self.card = None
         return self._plan(files)
@@ -1132,6 +1361,75 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
 
 
+def _coverage_disponible() -> bool:
+    try:
+        import coverage  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class PartialMeasureTest(unittest.TestCase):
+    """#1257 R1 B3 : de la collecte (`scripts/map.py`) à la décision de
+    sélection (`scripts/test-plan.py`)."""
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_partial_card(self):
+        """Une part dont un fichier de couverture est illisible donne une carte
+        partielle ; le plan refuse alors de juger la sélection (repli suite
+        complète) au lieu de croire la mesure complète."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage.tronquee").write_bytes(b"pas du sqlite")
+        # carte fraîche et ancêtre de HEAD : seule la perte la rend inutilisable
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(len(card["mesure"]["couverture_ignoree"]), 1)
+        mesure = dict(card["mesure"], couverture_ignoree=[])
+        saine = dict(card, measure=mesure, mesure=mesure)  # témoin du témoin
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_zero_byte_coverage(self):
+        """R1 B3 #1257 : un fichier de couverture de 0 octet est une perte
+        conservatrice ; la carte est partielle et le plan refuse de juger la
+        sélection (repli suite complète). Le contrôle sain (même part sans le
+        fichier vide) reste utilisable."""
+        from coverage import CoverageData
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage.vide"
+        vide.write_bytes(b"")
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l1.T.test_a")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.write()
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        ignorees = card["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertIn("vide (0 octet)", ignorees[0]["raison"])
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
+        # témoin du témoin : sans le fichier vide, la même mesure est utilisable
+        vide.unlink()
+        saine = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(saine["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
 class InheritedFoundationTest(unittest.TestCase):
     """#1314 : le socle CI que la cible a déjà changé depuis la carte ne force
     plus la suite complète d'une branche de lot ; le changement du socle par
@@ -1311,10 +1609,10 @@ class PlanTest(unittest.TestCase):
         mods = parts.modules()
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         out = plan.outputs(p)
         self.assertEqual(json.loads(out["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(out["psql_parts"], "6")
+        self.assertEqual(out["psql_parts"], "9")
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
@@ -1337,7 +1635,9 @@ class PlanTest(unittest.TestCase):
         # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
-        self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
+        # #1692 : la suite complète passe de 6 à 9 parts ; le pilote d'une PR
+        # de lot reste à trois (n_pr), inchangé.
+        self.assertEqual(plan.PARTS["psql"][1], 9)
 
     def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
         # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
@@ -1413,8 +1713,8 @@ class PlanTest(unittest.TestCase):
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
         # #749 : une fusion a main passe la suite complete sous les deux pilotes
-        # (psql en 6 parts), pas seulement la CI de release.
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        # (psql en 9 parts depuis #1692), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -1596,7 +1896,7 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
                 self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
                 self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                 self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                 self.assertEqual(plan.outputs(p)["code"], "true")
 
@@ -1623,7 +1923,7 @@ class LotBranchTest(unittest.TestCase):
         p = plan.fallback_plan("pull_request", "boom", base_ref="main",
                                head_ref="release/1.10.0")
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), list(range(1, 10)))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
@@ -1670,8 +1970,10 @@ class LotBranchTest(unittest.TestCase):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
                                 for m in self.mods}}
         self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
+        # 235 modules × 2 s = 470 s -> deux parts ; la tranche fixe garde le
+        # test indépendant du nombre de modules du dépôt (314 au 15/10, et
+        # chaque lot qui ajoute un module de test le faisait basculer à 3)
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:235], card(2.0)), 2)
         self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):
@@ -1952,8 +2254,17 @@ def _run_bodies(text: str) -> list[str]:
 
 
 _BRANCH_REF = re.compile(r"github\.(base|head)_ref")
+# #1559: the value YAML reads is the same expression whatever the spacing
+# inside `${{ }}` and whether the scalar is quoted (`"${{ … }}"`,
+# `'${{ … }}'`), and a tab or extra spaces after the colon still open the
+# mapping value. Everything else stays an escape (fail closed).
+_BRANCH_REF_EXPR = r"\$\{\{\s*github\.(?:base|head)_ref\s*\}\}"
 _BRANCH_REF_ENV = re.compile(
-    r"^[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}\s*(?:#.*)?$")
+    "^[A-Z][A-Z0-9_]*:[ \t]+(?:"
+    + _BRANCH_REF_EXPR
+    + '|"' + _BRANCH_REF_EXPR + '"'
+    + "|'" + _BRANCH_REF_EXPR + "'"
+    + r")[ \t]*(?:#.*)?$")
 _ANY_KEY = re.compile(
     r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"{\[][^#]*?)\s*:(?:\s+|$)(?P<rest>.*)$""")
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_.-]+:(?:\s+&[A-Za-z0-9_.-]+)?\s*(?:#.*)?$")
@@ -2026,12 +2337,16 @@ def _under_env(lines: list[str], k: int, structural: set[int]) -> bool:
         if j not in structural or not line.strip() or line.lstrip().startswith("#"):
             continue
         dash, key = _dash_column(line), _key_column(line)
+        # #1559: an anchor or a tag before the key (`- &s env:`) does not
+        # change the mapping; only node properties are seen through, a scalar
+        # on the way still fails the witness.
+        _, content = _node_properties(line[key:])
         if key < col:
-            if not _BARE_KEY.match(line[key:]) or (
-                    first and line[key:].split(":", 1)[0] != "env"):
+            if not _BARE_KEY.match(content) or (
+                    first and content.split(":", 1)[0] != "env"):
                 return False
         elif dash is not None and dash < col:
-            if first or not _ITEM.match(line[key:]):
+            if first or not _ITEM.match(content):
                 return False
         else:
             continue
@@ -2061,9 +2376,43 @@ def _branch_ref_escapes(text: str) -> list[str]:
     return escapes
 
 
-_RUNNER_SELECTION = re.compile(r"^runs-on:[ \t]*\$\{\{.*\}\}[ \t]*(?:#.*)?$")
+_RUNNER_SELECTION = re.compile(
+    r"^runs-on:[ \t]*(?:"
+    r"\$\{\{.*\}\}"                       # valeur nue
+    r"|\"\$\{\{.*\}\}\""                  # valeur a guillemets doubles
+    r"|'\$\{\{.*\}\}'"                    # valeur a guillemets simples
+    r")[ \t]*(?:#.*)?$")
 _BRANCH_REF_COMPARED = re.compile(
-    r"startsWith\(github\.(?:base|head)_ref,\s*'[^',()]*'\)")
+    r"startsWith\(\s*github\.(?:base|head)_ref\s*,\s*'(?:[^',()]|'')*'\)")
+
+
+def _job_level(lines: list[str], k: int, structural: set[int]) -> bool:
+    """Is line `k` a direct key of a job mapping, under `jobs:`?
+
+    #1563: the `runs-on:` exemption is job-level only. A `runs-on:` nested in
+    a step mapping, a strategy or any other level is not the label GitHub
+    reads for a job; it stays text and the witness keeps refusing an
+    interpolation there (fail closed).
+    """
+    col, ancestors = _key_column(lines[k]), []
+    for j in range(k - 1, -1, -1):
+        line = lines[j]
+        if j not in structural or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash, key = _dash_column(line), _key_column(line)
+        if dash is not None and dash < col:
+            return False                     # un item de sequence sur le chemin
+        if key < col:
+            if not _BARE_KEY.match(line[key:]):
+                return False
+            ancestors.append(j)
+            col = key
+            if len(ancestors) == 2:
+                break
+    if len(ancestors) != 2:
+        return False
+    _job, jobs = ancestors
+    return _key_column(lines[jobs]) == 0 and lines[jobs].startswith("jobs:")
 
 
 def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
@@ -2079,6 +2428,15 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     The compared literal is a single argument: dev4's N, a quoted literal that
     spans arguments of a `format()` (`'…startsWith(github.head_ref, ', …`)
     must not absolve the interpolated reference that follows.
+
+    #1563: the `runs-on:` exemption is bound to the job level (`_job_level`)
+    and reads the YAML spellings GitHub reads for the value: bare or quoted
+    (`"${{ … }}"`, `'${{ … }}'`), spaces after `startsWith(` and around the
+    literal, and `''` for an apostrophe inside a compared literal. Two forms
+    stay documented fail-closed limits: a `${{` opened on one line and closed
+    on another (`_left_open` refuses the unclosed flow), and a single-quoted
+    value whose compared literal uses the `''` escape, which the witness does
+    not decode.
     """
     line = lines[k]
     col = _key_column(line)
@@ -2087,6 +2445,8 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     if _BRANCH_REF_ENV.match(line[col:]) and _under_env(lines, k, structural):
         return True
     if _RUNNER_SELECTION.match(line[col:]) is None:
+        return False
+    if not _job_level(lines, k, structural):
         return False
     return not _BRANCH_REF.search(_BRANCH_REF_COMPARED.sub("", line[col:]))
 
@@ -2179,10 +2539,40 @@ class RunBodiesTest(unittest.TestCase):
                              '          HEAD_REF: ${{ github.head_ref }}\n',
             "env first in the item": '      - env:\n'
                                      '          BASE_REF: ${{ github.base_ref }}\n',
+            # #1559: YAML reads the same env value under these legitimate
+            # spellings; only the semantics must count, not the exact form.
+            "quoted value": '      - name: s\n        env:\n'
+                            '          HEAD_REF: "${{ github.head_ref }}"\n'
+                            '        run: echo "$HEAD_REF"\n',
+            "single quoted value": '      - name: s\n        env:\n'
+                                   "          BASE_REF: '${{ github.base_ref }}'\n"
+                                   '        run: echo "$BASE_REF"\n',
+            "no inner spaces": '      - name: s\n        env:\n'
+                               '          HEAD_REF: ${{github.head_ref}}\n'
+                               '        run: echo "$HEAD_REF"\n',
+            "two spaces after colon": '      - name: s\n        env:\n'
+                                      '          BASE_REF:  ${{ github.base_ref }}\n'
+                                      '        run: echo "$BASE_REF"\n',
+            "anchor before the env key": '      - &s env:\n'
+                                         '          BASE_REF: ${{ github.base_ref }}\n'
+                                         '        run: echo "$BASE_REF"\n',
         }
         for name, step in allowed.items():
             with self.subTest(name=name):
                 self.assertEqual([], _branch_ref_escapes(steps + step))
+        # #1559: the same values, read by YAML in a `run:` body instead of an
+        # `env:` value, stay escapes: the witness follows the semantics.
+        for name, body in {
+            "quoted": 'BASE_REF: "${{ github.base_ref }}"\n',
+            "single quoted": "BASE_REF: '${{ github.base_ref }}'\n",
+            "no inner spaces": 'HEAD_REF: ${{github.head_ref}}\n',
+            "two spaces after colon": 'BASE_REF:  ${{ github.base_ref }}\n',
+        }.items():
+            with self.subTest(run=name):
+                self.assertNotEqual([], _branch_ref_escapes(
+                    steps + '      - run: |\n          ' + body))
+        self.assertNotEqual([], _branch_ref_escapes(
+            steps + '      - &s run: |\n          BASE_REF: ${{ github.base_ref }}\n'))
         self.assertEqual([], _branch_ref_escapes(
             "env:\n  BASE_REF: ${{ github.base_ref }}\n"
             "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
@@ -2203,6 +2593,40 @@ class RunBodiesTest(unittest.TestCase):
                      "\n      run: echo ok\"\n"):
             with self.subTest(bare=bare):
                 self.assertNotEqual([], _branch_ref_escapes("jobs:\n  a:\n" + bare))
+
+    def test_runner_selection_is_job_level_and_reads_yaml_spellings(self):
+        # #1563: l'exemption suit les formes YAML que GitHub lit pour un vrai
+        # `runs-on:` de job, et rien d'autre.
+        compared = "startsWith(github.head_ref, 'refs/heads/integration/')"
+        for name, line in {
+            "nue": "    runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared,
+            "guillemets doubles": (
+                "    runs-on: \"${{ %s && 'pool' || 'ci' }}\"\n" % compared),
+            "espace apres startsWith(": (
+                "    runs-on: ${{ startsWith( github.head_ref, "
+                "'refs/heads/integration/') && 'pool' || 'ci' }}\n"),
+            "apostrophe doublee": (
+                "    runs-on: ${{ startsWith(github.head_ref, "
+                "'refs/heads/it''s/') && 'pool' || 'ci' }}\n"),
+        }.items():
+            with self.subTest(forme=name):
+                self.assertEqual([], _branch_ref_escapes("jobs:\n  a:\n" + line))
+        # La meme ligne nichee dans un mapping d'etape ou une matrice n'est pas
+        # le `runs-on:` d'un job : elle reste une evasion (echec ferme).
+        for name, text in {
+            "mapping d'etape": ("jobs:\n  a:\n    steps:\n      - name: s\n"
+                                "        runs-on: ${{ %s && 'pool' || 'ci' }}\n"
+                                % compared),
+            "matrice": ("jobs:\n  a:\n    strategy:\n      matrix:\n"
+                        "        runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared),
+        }.items():
+            with self.subTest(hors_job=name):
+                self.assertNotEqual([], _branch_ref_escapes(text))
+        # Une expression `${{` ouverte sur une ligne et fermee sur une autre
+        # reste refusee : limite d'echec ferme documentee sur _branch_ref_allowed.
+        self.assertNotEqual([], _branch_ref_escapes(
+            "jobs:\n  a:\n    runs-on: ${{\n"
+            "      startsWith(github.head_ref, 'refs/heads/integration/') }}\n"))
 
     def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
         # YAML ignores indentation inside quotes, even after an anchor/tag.
@@ -2396,6 +2820,22 @@ class WorkflowTest(unittest.TestCase):
             self.assertNotIn("github.base_ref", body)
             self.assertNotIn("github.head_ref", body)
         self.assertEqual([], _branch_ref_escapes(self.text))
+
+    def test_fs_class_lane_follows_the_plan_release_output(self):
+        # #748 / #1247 R2 : le job « autre système de fichiers » ne rejoue la
+        # suite que pour une release (source ou cible `release/**`) ou à la
+        # main ; son `if:` lit l'output `release` du plan — posé par un step
+        # qui reçoit les branches par `env:` — et n'interpole aucun nom de
+        # branche dans une condition.
+        self.assertIn("release: ${{ steps.release.outputs.release }}", self.text)
+        fs_class = self.text[self.text.index("\n  fs-class:\n"):
+                             self.text.index("\n  platform-macos:\n")]
+        self.assertIn("needs.plan.outputs.release == 'true'", fs_class)
+        condition = fs_class.split("    if:", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("github.head_ref", condition)
+        self.assertNotIn("github.base_ref", condition)
+        self.assertIn('case "$BASE_REF" in release/*) release=true ;; esac', self.text)
+        self.assertIn('case "$HEAD_REF" in release/*) release=true ;; esac', self.text)
 
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur

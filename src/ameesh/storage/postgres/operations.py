@@ -83,7 +83,8 @@ class Operations(interface.Operations):
         today = today or _dt.date.today().isoformat()
         return self.db.query(
             """
-            SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
+            SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   r.effort, r.tier,
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
@@ -98,6 +99,8 @@ class Operations(interface.Operations):
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
                    extract(epoch from r.lease_expires_at)::float8 AS lease_expires_ts,
                    extract(epoch from r.status_since)::float8     AS status_since_ts,
+                   -- #1521 : le début du motif affiché (status_text), pas du statut
+                   extract(epoch from r.status_reason_since)::float8 AS status_reason_since_ts,
                    extract(epoch from r.last_turn_at)::float8     AS last_turn_ts,
                    extract(epoch from r.updated_at)::float8       AS updated_ts,
                    extract(epoch from r.restart_requested_at)::float8 AS restart_requested_ts,

@@ -202,7 +202,8 @@ class RetentionTest(unittest.TestCase):
                           "Path(sys.argv[sys.argv.index('--output') + 1]).write_bytes(b'new dump')\n")
         script = PATH.parents[1] / "serveur/sauvegarder-base.sh"
         return (script.read_text()
-                .replace("d=/home/ameesh/sauvegardes", "d=" + shlex.quote(str(self.root)))
+                .replace("d=${AMEESH_SAUVEGARDES_DIR:-/home/ameesh/sauvegardes}",
+                         "d=" + shlex.quote(str(self.root)))
                 .replace("python=/opt/ameesh/venv/bin/python", "python=" + shlex.quote(sys.executable))
                 .replace("helper=/usr/local/sbin/ameesh-sauvegarder-prive.py", "helper=" + shlex.quote(str(helper)))
                 .replace("/etc/ameesh/sauvegarde.env", str(self.root / "absent-storage.env"))

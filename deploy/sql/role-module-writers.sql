@@ -3,7 +3,8 @@
 -- These NOLOGIN groups belong to separate protected service logins, NEVER
 -- to executor logins. Credentials and canon/code are isolated at the OS level.
 -- Revoke PUBLIC TEMP on the database separately before applying this script.
--- The audit rejects effective TEMP, including grants inherited from PUBLIC.
+-- The audit rejects TEMP on the groups and their transitive members, including
+-- PUBLIC grants and other parent-role grants (also reachable by SET ROLE).
 \set ON_ERROR_STOP on
 BEGIN;
 SELECT current_schema() AS schema \gset
@@ -50,6 +51,31 @@ BEGIN
         END IF;
         IF has_database_privilege(r.oid, current_database(), 'TEMP') THEN
             RAISE EXCEPTION 'module writer groups must not create temporary objects (including PUBLIC grants)';
+        END IF;
+        -- The groups are NOLOGIN: the session belongs to a member login (or to
+        -- a role it inherits), so TEMP granted to a member defeats the barrier
+        -- just as well. has_database_privilege on the group alone cannot see
+        -- it (#919 N1). Walk the explicit memberships in pg_auth_members
+        -- instead of pg_has_role: a superuser, like the migration owner
+        -- running this audit, is implicitly a member of every role. This
+        -- barrier protects the module guards (ameesh_module_requirements,
+        -- ameesh_module_milestone_guard), which are ordinary functions and
+        -- resolve their tables through the caller's search_path, where pg_temp
+        -- comes first.
+        IF EXISTS (
+            WITH RECURSIVE members(oid) AS (
+                SELECT m.member FROM pg_auth_members m WHERE m.roleid = r.oid
+                UNION
+                SELECT m.member FROM pg_auth_members m JOIN members x ON m.roleid = x.oid
+            )
+            -- Check every parent conservatively, even when NOINHERIT means
+            -- its TEMP becomes usable only after SET ROLE. A login can create
+            -- a shadow table there and keep it when switching to the writer.
+            SELECT 1 FROM members JOIN pg_roles mr ON mr.oid = members.oid
+              JOIN pg_roles capability ON pg_has_role(mr.oid, capability.oid, 'MEMBER')
+             WHERE has_database_privilege(capability.oid, current_database(), 'TEMP')
+        ) THEN
+            RAISE EXCEPTION 'module writer group % has a member with TEMP (direct or inherited)', r.rolname;
         END IF;
         IF EXISTS (SELECT 1 FROM pg_roles p WHERE p.oid <> r.oid AND pg_has_role(r.oid, p.oid, 'MEMBER')) THEN
             RAISE EXCEPTION 'module writer groups must not inherit another role';

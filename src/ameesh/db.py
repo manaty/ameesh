@@ -88,6 +88,8 @@ _CONNECT_HINTS = (
 
 #: code SQLSTATE de PostgreSQL pour une violation d'unicité
 UNIQUE_VIOLATION = "23505"
+#: code SQLSTATE de PostgreSQL pour un interblocage détecté (#1496)
+DEADLOCK_DETECTED = "40P01"
 #: une ligne de sévérité psql en verbosité `verbose` : « ERROR:  23505: … ».
 #: Le libellé de sévérité est traduit par le client (`ERREUR` en français) :
 #: on ne le reconnaît pas à son nom, mais à la forme « <mot>: <code>: » — le
@@ -159,6 +161,13 @@ def is_unique_violation(exc: BaseException, constraint: str | None = None) -> bo
     if constraint is None:
         return True
     return exc.constraint == constraint
+
+
+def is_deadlock(exc: BaseException) -> bool:
+    """`exc` est-elle l'interblocage détecté par le serveur (#1496) ? La
+    transaction victime est annulée en entier ; seul le code SQLSTATE
+    tranche, jamais le texte (traduit selon `lc_messages`)."""
+    return isinstance(exc, DbError) and exc.sqlstate == DEADLOCK_DETECTED
 
 
 class Unavailable(DbError):
@@ -1208,6 +1217,13 @@ class PsycopgDriver:
                 conn.execute("LISTEN %s" % quote_ident(channel))
         except AttributeError as exc:  # psycopg trop ancien
             raise Unavailable("psycopg without LISTEN support: %s" % exc) from exc
+        except DbError:
+            raise
+        except Exception as exc:
+            # R2 auditeur P2-3 : une base qui refuse LISTEN (veille chaude,
+            # coupure entre connexion et LISTEN) doit rendre l'écouteur
+            # indisponible, pas tuer le fil du hub.
+            raise _map_error(exc) from exc
         return _PsycopgListener(conn, list(channels))
 
     def close(self) -> None:

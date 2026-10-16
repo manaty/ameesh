@@ -7,6 +7,7 @@ workstation venv, so no VM, unit, database or real mail is touched.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / 'deploy/mise-a-jour'
@@ -746,6 +748,97 @@ class SanteCourrierTest(unittest.TestCase):
     def test_choose_explicit_target_must_exist(self):
         with self.assertRaises(SystemExit):
             self.mod.choose([{'name': 'a'}], 'inconnu', 1000.0)
+
+    def test_choisir_croise_auto_prend_un_autre_hote_menee(self):
+        now = 1000.0
+        rows = [{'name': 'b', 'host': 'ameesh-agents-1', 'lease_owner': None,
+                 'lease_expires_ts': None},
+                {'name': 'c', 'host': 'ameesh-agents-2', 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5},
+                {'name': 'a', 'host': 'manaty-mesh-1', 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5}]
+        self.assertEqual(
+            self.mod.choisir_croise(rows, 'manaty-mesh-1', 'auto', now)[0]['name'], 'c')
+
+    def test_choisir_croise_cible_nommee_doit_exister_ailleurs(self):
+        rows = [{'name': 'a', 'host': 'ameesh-agents-1', 'lease_owner': 'r',
+                 'lease_expires_ts': 1005.0},
+                {'name': 'locale', 'host': 'manaty-mesh-1', 'lease_owner': 'r',
+                 'lease_expires_ts': 1005.0}]
+        self.assertEqual(
+            self.mod.choisir_croise(rows, 'manaty-mesh-1', 'a', 1000.0)[0]['name'], 'a')
+        for cible in ('inconnu', 'locale'):
+            with self.subTest(cible=cible):
+                with self.assertRaises(SystemExit):
+                    self.mod.choisir_croise(rows, 'manaty-mesh-1', cible, 1000.0)
+
+    def test_choisir_croise_sans_persona_menee(self):
+        rows = [{'name': 'b', 'host': 'ameesh-agents-1', 'lease_owner': None,
+                 'lease_expires_ts': None}]
+        cible, pourquoi = self.mod.choisir_croise(rows, 'manaty-mesh-1', 'auto', 1000.0)
+        self.assertIsNone(cible)
+        self.assertIn('autre hote', pourquoi)
+
+    def test_personas_sans_hote_liste_tous_les_executants(self):
+        rows = [{'name': 'a', 'host': 'h1', 'mode': 'execute', 'status': 'idle'},
+                {'name': 'b', 'host': 'h2', 'mode': 'execute', 'status': 'running'},
+                {'name': 'c', 'host': 'h2', 'mode': 'execute', 'status': 'stopped'},
+                {'name': 'd', 'host': 'h2', 'mode': 'externe', 'status': 'idle'}]
+        with mock.patch.object(self.mod.registry, 'overview', return_value=rows):
+            self.assertEqual([r['name'] for r in self.mod.personas(object(), None)],
+                             ['a', 'b'])
+            self.assertEqual([r['name'] for r in self.mod.personas(object(), 'h2')],
+                             ['b'])
+
+    def test_main_serveur_sonde_un_autre_hote(self):
+        """Le serveur sans executant sonde une persona menee d'un autre hote ;
+        la charge remise porte l'hote mesure et l'hote destinataire."""
+        sha = '0123456789abcdef0123456789abcdef01234567'
+        maintenant = 1000.0
+        autres = [{'name': 'vm-agent', 'host': 'ameesh-agents-1', 'mode': 'execute',
+                   'status': 'running', 'lease_owner': 'r',
+                   'lease_expires_ts': maintenant + 60}]
+        envois = {}
+
+        def faux_send(db, sender, recipient, body, **kw):
+            envois.update(recipient=recipient, payload=kw.get('payload'),
+                          jeton=body.split('--ack ')[1].split()[0])
+            return 7
+
+        def faux_get(db, message_id):
+            return {'id': message_id, 'delivered_ts': maintenant}
+
+        def faux_history(db, nom, **kw):
+            return [{'sender': nom, 'body': envois['jeton'],
+                     'delivered_ts': maintenant}]
+
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=autres), \
+             mock.patch.object(self.mod.registry, 'get',
+                               return_value={'last_turn_ts': maintenant + 1,
+                                             'status': 'idle'}), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send', side_effect=faux_send), \
+             mock.patch.object(self.mod.mail, 'get', side_effect=faux_get), \
+             mock.patch.object(self.mod.mail, 'history', side_effect=faux_history), \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             mock.patch.object(self.mod.time, 'monotonic', return_value=maintenant), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'manaty-mesh-1', '--serveur',
+                                  '--sha', sha, '--attente', '1', '--json'])
+        self.assertEqual(code, 0, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ok')
+        self.assertEqual(rapport['personas'], 0)
+        self.assertEqual(rapport['sonde']['destinataire'], 'vm-agent')
+        self.assertEqual(rapport['sonde']['hote_destinataire'], 'ameesh-agents-1')
+        self.assertEqual(envois['recipient'], 'vm-agent')
+        self.assertEqual(envois['payload']['staging'],
+                         {'hote': 'manaty-mesh-1', 'sha': sha,
+                          'destinataire_hote': 'ameesh-agents-1'})
 
 
 if __name__ == '__main__':

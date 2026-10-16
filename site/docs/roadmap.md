@@ -296,23 +296,3 @@ release is published yet. The main lines:
 Migrations 0058 to 0069 and 0359, 0361–0364, 0368, 0371–0373, 0380, 0384,
 0388, 0390, 0392, 0395, 0398, 0402, 0410, 0412, 0413, all additive; apply them
 with `ameesh migrate` before installing the new code.
-
-## Planned
-
-In no particular order, and without dates:
-
-- **provisioning** of the hosted modes of ameesh-approve (relay, dedicated
-  page) and the gateway on the hosting side — the code (passthrough gateway,
-  local TLS, read-only role per team) is on main; the hosting-side deployment
-  remains;
-- **evaluation** of models on reference tasks, and recommendations;
-- **harness descriptors** in a standard manifest format, a generic adapter, a
-  harness catalogue and conformance bench;
-- **signal intake** and a bounded **self-repair loop** (reproduce first, guarded
-  diffs, bounded QA, escalation to humans);
-- more **transports** for threads (team chat, e-mail) behind the same
-  interface;
-- the gate exposed as an **MCP proxy**;
-- a **SQLite** driver for a personal, single-machine profile;
-- **one Unix user per agent** and provenance signatures on agents' messages;
-- an **installer driven by the user's own harness**.
