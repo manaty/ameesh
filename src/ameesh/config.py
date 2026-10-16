@@ -163,6 +163,15 @@ def _canon_entry(raw, where: str) -> CanonEntry:
 
 @dataclass(frozen=True)
 class Config:
+    #: #1466 : le fichier réellement lu et la base dont il hérite (un « profil »
+    #: rangé sous le dossier de la configuration de l'hôte). Renseignés par
+    #: `load`, jamais lus du fichier : ils décrivent la lecture, pas un réglage.
+    config_path: str = ""
+    config_base: str = ""
+    #: #1466 : clés de premier niveau que le profil déclare et qui diffèrent de
+    #: la configuration de l'hôte : c'est l'écart qu'un profil périmé creuse
+    #: (des comptes ou un plafond d'hier). Vide pour un héritage fidèle.
+    config_shadowed: tuple[str, ...] = ()
     dsn: str = DEFAULT_DSN
     schema: str = "public"
     driver: str = "auto"  # auto | psycopg | psql
@@ -301,6 +310,8 @@ class Config:
     #: withdrawal deadline when a `draining` state gives none (seconds); 0 =
     #: the offer's `drain_seconds` on a lending host, 90 otherwise
     host_gate_drain: float = 0.0
+    #: L159i: require the Linux guard heartbeat in a mediated VM's file gate.
+    host_gate_lending: bool = False
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -401,6 +412,11 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: identité des humains par OIDC (L86, 0033 §4) : la clé `identity` de
+    #: l'hôte (`binding` : `subject` par défaut ou `email` ; `providers` :
+    #: issuer, client_id, domains), lue par `ameesh.oidc`. Jamais de secret
+    #: ici : un client OIDC public suffit pour vérifier un jeton.
+    identity: dict = field(default_factory=dict)
     #: L109 : exécuteur médié (`backend: mediated`) — URL du serveur du mesh
     #: (`/api/exec/v1`) et fichier 0600 du jeton d'accès de l'exécuteur (la
     #: source réelle du jeton est l'identité de l'exécuteur, L110). Dans la
@@ -470,6 +486,83 @@ class Config:
     def human_names(self) -> frozenset:
         return frozenset(n.strip() for n in (self.humans or "").split(",") if n.strip())
 
+    @property
+    def config_source(self) -> str:
+        """Où vient la configuration effective, en une ligne (#1466).
+
+        Un profil est un fichier rangé sous le dossier des profils d'exécuteur
+        (`~/.config/ameesh/runner-profiles/`) : il hérite des clés de
+        `config.json` qu'il ne déclare pas. Cet écart — un exécuteur qui lit un
+        profil et non la configuration de l'hôte — doit rester visible."""
+        if not self.config_path:
+            return "defaults (no config file)"
+        if not self.config_base:
+            return self.config_path
+        texte = "%s (profile; host config %s)" % (self.config_path, self.config_base)
+        if self.config_shadowed:
+            texte += "; overrides: %s" % ", ".join(self.config_shadowed)
+        return texte
+
+
+#: dossier des profils d'exécuteur : ses fichiers héritent de `config.json`
+#: (#1466). Les autres fichiers rangés à côté de `config.json` — par exemple
+#: `config-ancienne-base.json`, la configuration d'une AUTRE base — restent
+#: autonomes : ils n'empruntent ni comptes, ni `github`, ni `critical_agents`
+#: à l'hôte (revue Claude #1466 : un héritage trop large rejouerait des
+#: synchronisations GitHub). `"inherit": true` reste possible pour forcer.
+def _config_dir_default() -> str:
+    return os.path.join(os.path.dirname(_expand(DEFAULT_CONFIG)), "runner-profiles")
+
+
+def _read_json_object(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError) as exc:  # config cassée : on le dit, on continue
+        raise SystemExit("unreadable config %s: %s" % (path, exc))
+    if not isinstance(raw, dict):
+        raise SystemExit("unreadable config %s: JSON object expected" % path)
+    return raw
+
+
+def _inherit_base(cfg_path: str, raw: dict) -> str:
+    """La base héritée d'un fichier de configuration (#1466), ou ''.
+
+    Un **profil** — un fichier de configuration rangé sous le dossier des
+    profils d'exécuteur (`~/.config/ameesh/runner-profiles/`) — est une
+    superposition : les clés qu'il ne déclare pas (comptes, plafonds, canon…)
+    viennent du `config.json` de l'hôte. C'est ce qui évite qu'un profil périmé
+    fasse tourner des exécuteurs sur des comptes ou des plafonds d'hier.
+
+    `"inherit"` force la règle : `false` rend le fichier autonome (aucun
+    héritage), `true` hérite même hors du dossier des profils, une chaîne nomme
+    une autre base. Hors du dossier des profils, un fichier reste autonome :
+    le banc de tests, les configurations nommées dans un dossier temporaire et
+    celles d'une autre base rangées à côté de `config.json` ne lisent jamais la
+    configuration du poste."""
+    inherit = raw.get("inherit", None)
+    if inherit is False:
+        return ""
+    if inherit is True:
+        base = _expand(DEFAULT_CONFIG)
+    elif inherit is None:
+        base = _expand(DEFAULT_CONFIG)
+        dossier = _config_dir_default()
+        # hors du dossier des profils : autonome (banc de tests, configuration
+        # d'une autre base rangée à côté de `config.json`)
+        if not cfg_path.startswith(dossier + os.sep):
+            return ""
+    elif isinstance(inherit, str) and inherit.strip():
+        base = _expand(inherit.strip())
+    else:
+        raise SystemExit("invalid `inherit` %r (expected false, true or a path)"
+                         % (inherit,))
+    if os.path.abspath(base) == os.path.abspath(cfg_path):
+        return ""       # un fichier ne s'hérite jamais lui-même
+    if not os.path.exists(base):
+        raise SystemExit("inherited config not found: %s (base of %s)" % (base, cfg_path))
+    return base
+
 
 def load(env: dict | None = None) -> Config:
     env = dict(os.environ if env is None else env)
@@ -495,17 +588,30 @@ def load(env: dict | None = None) -> Config:
         if not os.path.exists(cfg_path) and os.path.exists(legacy_cfg):
             cfg_path = legacy_cfg
     raw: dict = {}
+    base_path = ""
+    shadowed: tuple[str, ...] = ()
     if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, encoding="utf-8") as fh:
-                raw = json.load(fh)
-        except (OSError, ValueError) as exc:  # config cassée : on le dit, on continue
-            raise SystemExit("unreadable config %s: %s" % (cfg_path, exc))
-        if not isinstance(raw, dict):
-            raise SystemExit("unreadable config %s: JSON object expected" % cfg_path)
+        raw = _read_json_object(cfg_path)
+        # #1466 : un profil (fichier rangé sous le dossier de la configuration
+        # de l'hôte) hérite de `config.json` ; ses propres clés l'emportent.
+        # L'héritage est une superposition de clés de premier niveau : une clé
+        # déclarée par le profil (par exemple `accounts`) remplace entièrement
+        # celle de la base, elle ne fusionne pas avec elle. Les clés ainsi
+        # remplacées et différentes de la base sont retenues : c'est l'écart
+        # qu'un profil périmé creuse, et il doit rester lisible.
+        base_path = _inherit_base(cfg_path, raw)
+        if base_path:
+            base_raw = _read_json_object(base_path)
+            shadowed = tuple(sorted(
+                key for key in raw
+                if key in base_raw and raw[key] != base_raw[key]))
+            raw = {**base_raw, **raw}
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
         known.discard("budget_explicit")  # calculé, jamais lu tel quel
+        known.discard("config_path")    # #1466 : décrit la lecture, pas un réglage
+        known.discard("config_base")
+        known.discard("config_shadowed")
         if isinstance(raw.get("humans"), list):
             raw = dict(raw, humans=",".join(str(n) for n in raw["humans"]))
         cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
@@ -710,6 +816,8 @@ def load(env: dict | None = None) -> Config:
                                     default=cfg.host_gate_fallback) or "").strip().lower(),
         host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
                                     False, "AMEESH_HOST_MEDIATED")),
+        host_gate_lending=bool(_as_bool(pick("AMEESH_HOST_GATE_LENDING", default=cfg.host_gate_lending),
+                                       False, "AMEESH_HOST_GATE_LENDING")),
         host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
                                         int(cfg.host_gate_drain))),
     )
@@ -745,6 +853,11 @@ def load(env: dict | None = None) -> Config:
     if cfg.backend == "mediated" and not cfg.exec_url:
         raise SystemExit("mediated backend: missing server URL (exec_url or "
                          "AMEESH_EXEC_URL)")
+    # #1466 : la provenance de la lecture voyage avec la configuration, pour
+    # que l'exécuteur (journal, `ameesh doctor`) et l'agent (CLI) voient le
+    # profil réellement lu et sa base.
+    cfg = replace(cfg, config_path=cfg_path, config_base=base_path,
+                  config_shadowed=shadowed)
     return cfg
 
 

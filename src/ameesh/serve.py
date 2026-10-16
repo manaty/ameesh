@@ -260,6 +260,18 @@ def _chat(ctx: Context, db, params, query) -> dict:
         raise ApiError(400, "bad_query", str(exc)) from exc
 
 
+def _agent_peek(ctx: Context, db, params, query) -> dict:
+    from . import agent_peek
+    try:
+        limit = _one(query, "limit")
+        return agent_peek.snapshot(db, params["agent"], human=ctx.human,
+                                   limit=int(limit) if limit is not None else 10)
+    except PermissionError as exc:
+        raise ApiError(403, "forbidden", "agent peek requires its responsible human") from exc
+    except ValueError as exc:
+        raise ApiError(400, "bad_query", "limit must be between 1 and 50") from exc
+
+
 def _lots(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli, stagnation
     limit = _checked(_one(query, "limit"), _LOT_RE, "limit")
@@ -286,10 +298,11 @@ def _decisions(ctx: Context, db, params, query) -> dict:
 
 
 def _alerts(ctx: Context, db, params, query) -> dict:
-    from . import exploitation
+    from . import alert_ack, exploitation
     thresholds = exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
-    return {"schema": "ameesh-alerts/1", "alerts": db_mod.batched(
-        db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))}
+    current = db_mod.batched(db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))
+    return {"schema": "ameesh-alerts/1", "alerts": alert_ack.annotate(
+        ctx.cfg, db, current, human=serve_actions.principal(ctx))}
 
 
 def _hosts(ctx: Context, db, params, query) -> dict:
@@ -365,6 +378,10 @@ ROUTES = (
                   "entries after this sequence number (default 0)"),
                  ("limit", {"type": "integer", "minimum": 1, "maximum": MAX_CHAT},
                   "entries at most (default %d)" % CHAT_PAGE))),
+    Route(API + "/agents/{agent}/peek", "ameesh-agent-peek/1",
+          "Responsible human's agent summary (`ameesh agent peek`)", _agent_peek,
+          query=(("limit", {"type": "integer", "minimum": 1, "maximum": 50},
+                  "latest public messages and tool summaries (default 10)"),)),
     Route(API + "/lots", "ameesh-lots/1", "Lots (`ameesh work list --json`)", _lots,
           query=(("state", {"type": "string"}, "state of the lots"),
                  ("assignee", {"type": "string"}, "assignee of the lots"), _LIMIT)),
@@ -459,6 +476,10 @@ _HOST = _obj("ameesh-host/1", ["host", "limits", "pressure", "history"],
 #: the response schemas: the keys every response carries (the objects they
 #: hold are the CLI's, documented in docs/EXPLOITATION.md and docs/PROGRESS.md)
 SCHEMAS = {
+    "ameesh-agent-peek/1": _obj("ameesh-agent-peek/1",
+        ["agent", "host", "lot", "captured_ts", "stale", "workspace", "events"],
+        agent=_STR, host=_STR, lot=_OBJ, captured_ts={"type": ["number", "null"]},
+        stale={"type": "boolean"}, workspace=_OBJ, events=_LIST),
     "ameesh-me/1": _obj("ameesh-me/1", ["human", "organisation", "mode", "roles",
                                         "deputyships", "language"],
                         human=_STR, organisation=_STR_NULL, mode={"enum": ["local"]},
@@ -493,7 +514,9 @@ SCHEMAS = {
     "ameesh-decisions/1": _obj("ameesh-decisions/1", ["requests", "prose", "approvals"],
                                requests=_LIST, prose=_LIST, approvals=_LIST),
     "ameesh-alerts/1": _obj("ameesh-alerts/1", ["alerts"], alerts={
-        "type": "array", "items": _obj("ameesh-alert/1", ["type"], type=_STR)}),
+        "type": "array", "items": _obj("ameesh-alert/1", ["type", "key", "acknowledged"],
+            type=_STR, key={"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            acknowledged={"type": "boolean"}, acknowledgement={"type": ["object", "null"]})}),
     "ameesh-hosts/1": _obj("ameesh-hosts/1", ["hosts"], hosts={
         "type": "array", "items": _HOST}),
     "ameesh-host/1": _HOST,
@@ -551,6 +574,8 @@ def openapi() -> dict:
                      "400": _response("bad request", "ameesh-error/1"),
                      "401": _response("token missing or refused", "ameesh-error/1"),
                      "503": _response("database unavailable", "ameesh-error/1")}
+        if route.schema == "ameesh-agent-peek/1":
+            responses["403"] = _response("responsible human required", "ameesh-error/1")
         if "{" in route.path:
             responses["404"] = _response("not found", "ameesh-error/1")
         if route.stream:

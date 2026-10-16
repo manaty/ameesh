@@ -34,10 +34,10 @@ Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
 lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
 Correctif du 2026-10-13 (#1066) : la remise implicite du lot tenu par
 l'expéditeur lui-même est refusée comme celle du lot d'un autre agent.
-Ajout #964 : `--assign` est le geste explicite qui autorise l'attribution
-d'un lot LIBRE (ou tenu par un humain) par un expéditeur que l'historique
-ne détecte pas comme orchestrateur ; il ne prend jamais le lot d'un agent,
-même le sien (la remise passe par `ameesh work assign`).
+Added #964: `--assign` is the explicit gesture that lets a sender the history
+does not detect as an orchestrator hand over a FREE lot (or one held by a
+human); it never takes a lot held by an agent, not even its own (handing over
+goes through `ameesh work assign`).
 """
 from __future__ import annotations
 
@@ -137,6 +137,30 @@ def _assignment_deferred(item: dict, recipient: str, why: str) -> str:
                recipient, int(item["id"]), recipient))
 
 
+def _branch_owner(db, branch: str, exclude: int | None = None):
+    """#1646 : le lot qui porte DÉJÀ cette branche, sinon None.
+
+    Une branche citée par un courrier peut être celle du parent d'un lot
+    empilé : la poser sur ce lot le ferait clore à la fusion du parent, sans
+    son propre contenu. Un lot terminal compte aussi : sa branche a déjà
+    atterri, la reposer fermerait le nouveau lot aussitôt."""
+    sql = "SELECT id, state, title FROM work_items WHERE branch = %s"
+    params: tuple = (branch,)
+    if exclude is not None:
+        sql += " AND id != %s"
+        params += (int(exclude),)
+    rows = db.query(sql + " ORDER BY id LIMIT 1", params)
+    return rows[0] if rows else None
+
+
+def _cited_branch_warning(owner: dict, branch: str, lot_id: int, recipient: str) -> str:
+    return ("branch %s already belongs to lot #%d (%s): not set on lot #%d — a branch "
+            "closes its own lot; to ride it anyway, set it explicitly: ameesh work "
+            "assign %d %s --branch %s"
+            % (branch, int(owner["id"]), owner.get("state") or "?",
+               int(lot_id), int(lot_id), recipient, branch))
+
+
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
@@ -147,8 +171,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
     `work_item_id` est l'étiquette du fil (le numéro du lot s'il est connu,
     sinon `lot` tel quel). `branch` (déduite du message par l'appelant) est
-    posée sur le lot qui n'en a pas. Lève AssignmentError quand le LOT ne peut
-    pas être rattaché (rien n'est alors déposé).
+    posée sur le lot qui n'en a pas, sauf si elle est déjà celle d'un autre
+    lot (#1646 : un avertissement dit alors quoi faire). Lève AssignmentError
+    quand le LOT ne peut pas être rattaché (rien n'est alors déposé).
 
     #858 : un refus de la garde d'attribution qui ne tient qu'au DESTINATAIRE
     (profil divergé en attendant le prochain canon sync, responsable manquant,
@@ -157,12 +182,12 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     message perdu emportait le réveil ; un réveil différé se rattrape à la
     prochaine réclamation.
 
-    `assign` (#964) : le geste explicite `--assign` du courrier. Sans lui, un
-    `--lot` n'assigne que venant d'un expéditeur que la détection
-    d'orchestrateur reconnaît (dont l'historique de distribution, L94) ; il
-    reste sinon une étiquette de fil. Avec lui, tout expéditeur peut confier
-    un lot LIBRE (ou tenu par un humain), jamais un lot tenu par un agent —
-    même le sien (#1066) : la remise passe par `ameesh work assign`.
+    `assign` (#964): the message's explicit `--assign` gesture. Without it, a
+    `--lot` only assigns when it comes from a sender the orchestrator
+    detection recognises (including the distribution history, L94); otherwise
+    it stays a plain thread label. With it, any sender can hand over a FREE
+    lot (or one held by a human), never a lot held by an agent — not even its
+    own (#1066): handing over goes through `ameesh work assign`.
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
@@ -187,13 +212,15 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         has_open = bool(work_mod.open_lots(db, recipient))
         if lot is None and has_open:
             return out
-        # #964 : `--assign` est le geste explicite qui dispense de la
-        # détection d'orchestrateur. Sans lui, l'historique de distribution
-        # (L94) garde le droit de confier un lot LIBRE — c'est ainsi que le
-        # bureau distribue (canon §4, #859) ; un lot tenu par un agent, lui,
-        # n'est jamais remis par l'étiquette, même à un orchestrateur
-        # déclaré (#1066, plus bas).
-        orchestrator = is_orchestrator(cfg, db, sender)
+        # #964: `--assign` is the explicit gesture that does without the
+        # orchestrator detection. Without it, the distribution history (L94)
+        # keeps the right to hand over a FREE lot — that is how the bureau
+        # distributes (canon §4, #859); a lot held by an agent is never handed
+        # over by the label, even to a declared orchestrator (#1066, below).
+        # #1701 N2: with `--assign` the gesture decides alone, so the
+        # detection (a canon read) is not consulted. `out["orchestrator"]`
+        # has no consumer; it reports the detection only when it ran.
+        orchestrator = is_orchestrator(cfg, db, sender) if not assign else False
         if not assign and not orchestrator:
             # une étiquette qui désigne un lot ouvert est rendue par son
             # numéro, pour tout expéditeur : le fil, l'activité du lot et le
@@ -227,6 +254,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             # #506: read before the lot exists (it makes its project known)
             introduced = (work_projects.introduction(cfg, db, project, sender)
                           if new_project and app is not None else "")
+            # #1646 : une branche citée déjà portée par un autre lot n'est pas
+            # posée (la fusion de l'autre clorait ce lot sans son contenu).
+            owner = _branch_owner(db, branch) if branch else None
             # #858 : un destinataire momentanément non réveillable ne fait pas
             # perdre le message : le lot est créé SANS assigné, l'attribution
             # est différée et l'expéditeur est averti (même règle que --lot).
@@ -234,7 +264,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             item = work_mod.add(db, title=title,
                                 assignee=None if refusal else recipient, actor=sender,
                                 source="mail", app=project, cfg=cfg,
-                                branch=None if refusal else branch,
+                                branch=None if (refusal or owner) else branch,
                                 estimate=minutes, note=introduced, force=force,
                                 parent_lot=parent_lot)
             if not refusal and item.get("queue_warning"):
@@ -242,6 +272,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             out.update(created=True, assigned=not refusal, branch=item.get("branch"))
             if refusal:
                 out["warnings"].append(_assignment_deferred(item, recipient, refusal))
+            if owner is not None:
+                out["warnings"].append(_cited_branch_warning(
+                    owner, branch, int(item["id"]), recipient))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
             # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne
@@ -252,6 +285,13 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         elif lot is not None:
             item = resolve_lot(db, lot)
             if item is None:
+                if assign:
+                    # #1701 N1: the explicit gesture names the lot to assign;
+                    # a reference matching no open lot is refused before any
+                    # deposit instead of degrading to a plain thread label.
+                    raise AssignmentError(
+                        "--assign: --lot %s matches no open lot (nothing is deposited; "
+                        "to create the lot: --new-lot \"title\", or ameesh work add)" % lot)
                 out["warnings"].append(
                     "--lot %s matches no open lot: kept as a plain thread label "
                     "(to create the lot: --new-lot \"title\", or ameesh work add)" % lot)
@@ -306,9 +346,14 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                                 out["warnings"].append(done["check"]["warning"])
                 if branch and not item.get("branch") \
                         and (item.get("assignee") or "") == recipient:
-                    item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
-                                               source="cited by the mail")
-                    out["branch"] = item.get("branch")
+                    owner = _branch_owner(db, branch, exclude=int(item["id"]))
+                    if owner is not None:
+                        out["warnings"].append(_cited_branch_warning(
+                            owner, branch, int(item["id"]), recipient))
+                    else:
+                        item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
+                                                   source="cited by the mail")
+                        out["branch"] = item.get("branch")
     except work_mod.WorkError as exc:
         raise AssignmentError(str(exc)) from exc
     if item is not None:

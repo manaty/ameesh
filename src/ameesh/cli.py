@@ -245,10 +245,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
-    # #964 : `--assign` = le geste explicite qui autorise un `--lot` à
-    # assigner un lot LIBRE (ou tenu par un humain) au destinataire, même
-    # hors détection d'orchestrateur (historique L94 compris) ; jamais un
-    # lot tenu par un agent (#1066).
+    # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
+    # FREE lot (or one held by a human) to the recipient, even outside the
+    # orchestrator detection (L94 history included); never a lot held by an
+    # agent (#1066).
     assign = "--assign" in args
     args = [arg for arg in args if arg != "--assign"]
     # #506: --app may name a project nobody declares yet, on purpose
@@ -727,8 +727,8 @@ class _Remise:
     l'annuler si rien n'a été montré. Repli fichier : lecture et marquage v0.
     """
 
-    def __init__(self, bk, name: str, binding) -> None:
-        self.bk, self.name = bk, name
+    def __init__(self, cfg, bk, name: str, binding) -> None:
+        self.cfg, self.bk, self.name = cfg, bk, name
         self.pg = getattr(bk, "kind", None) == "pg"
         self.owner = binding.runner_id if binding.bound_to_lease else None
         self.epoch = binding.epoch if self.owner else None
@@ -742,22 +742,51 @@ class _Remise:
         self.solde = False
 
     def prendre(self, limite: int | None = None) -> list[dict]:
-        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour)."""
+        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour).
+
+        #811 B1/R3 : un message dont l'unique lot est un secondaire déclaré
+        sans dossier n'est pas réservé — l'exécuteur retient ce courrier, mais
+        son état de différé vit en mémoire et le hook ne le voit pas : sans
+        cette garde partagée il le remettrait dans la session d'un autre lot et
+        le marquerait livré. La lecture franchit en outre le préfixe retenu,
+        qui pouvait masquer un message remisable plus récent."""
         if not self.pg:
             tous = self.bk.unread(self.name)
             self.msgs = tous if limite is None else tous[:max(0, limite)]
             self.reste = len(tous) - len(self.msgs)
             return self.msgs
-        taille = 200 if limite is None else max(1, limite)
-        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=taille)
-        self.ouverte = bool(rows)
-        self.msgs = [mail.normalize(row) for row in rows]
+        borne = 200 if limite is None else max(1, limite)
+        besoin, lus = borne, 0
+        self.msgs = []
+        while len(self.msgs) < borne:
+            ids = self._deliverable(besoin)
+            if len(ids) <= lus:       # boîte épuisée ou backend à page bornée
+                break
+            lus = len(ids)
+            # Les réservations actives (y compris celles de notre jeton) sont
+            # écartées avant la LIMIT SQL. Compléter depuis une page plus large
+            # si elles occupaient le préfixe lu, même en mono-projet (#811 R3).
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                                limit=borne - len(self.msgs))
+            self.msgs.extend(mail.normalize(row) for row in rows)
+            self.ouverte = bool(self.msgs)
+            besoin = max(mail.UNREAD_LIMIT, besoin * 2, lus * 2)
         # une réservation pleine peut cacher des non-lus : on le dit (au pire
         # pour rien, le prochain hook reviendra par le chemin complet).
-        self.reste = 1 if len(rows) >= taille else 0
+        self.reste = 1 if len(self.msgs) >= borne else 0
         return self.msgs
+        return self.msgs
+
+    def _deliverable(self, borne: int) -> list[int]:
+        """#811 B1/R3 : les ids à réserver, les lots retenus laissés en place.
+
+        Même règle que l'exécuteur (`lot_workdir.deliverable_unread`), dérivée
+        du registre et du Host pour être visible du hook."""
+        from . import lot_workdir, registry
+        agent = registry.get(self.bk.db, self.name) or {"name": self.name}
+        rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent, besoin=borne)
+        return [int(row["id"]) for row in rows if row.get("id") is not None]
 
     def garder(self, retenir, limite: int | None = None) -> list[dict]:
         """L514: keeps the reserved messages `retenir` accepts, at most
@@ -851,20 +880,34 @@ def tour_path(cfg: Config, name: str) -> str:
     return os.path.join(cfg.state_dir, "hooks", name + ".tour.json")
 
 
-def tour_lit(cfg: Config, name: str, turn: str) -> dict:
-    """Compteur du tour `turn` ; un autre tour (ou rien de lisible) : zéro."""
+def tour_lu(cfg: Config, name: str) -> dict:
+    """Dernier état du courrier de tour, quel que soit le tour nommé.
+
+    Entre deux tours, le tour courant n'est plus nommé et l'état garde la
+    dernière remise : c'est là que L81 lit l'instant du dernier message
+    humain remis par le hook (le message n'est alors plus non-lu)."""
     try:
         with open(tour_path(cfg, name), encoding="utf-8") as fh:
             etat = json.load(fh)
-        if isinstance(etat, dict) and etat.get("turn") == turn:
+        return etat if isinstance(etat, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def tour_lit(cfg: Config, name: str, turn: str) -> dict:
+    """Compteur du tour `turn` ; un autre tour (ou rien de lisible) : zéro."""
+    etat = tour_lu(cfg, name)
+    try:
+        if etat.get("turn") == turn:
             return {"turn": turn, "remis": int(etat.get("remis") or 0),
                     "attente": int(etat.get("attente") or 0),
+                    "humain": float(etat.get("humain") or 0.0),
                     "signale": bool(etat.get("signale")),
                     # borne atteinte pendant un travail du tour (dit une fois)
                     "differe": bool(etat.get("differe")),
                     "travail": [str(t) for t in etat.get("travail") or []],
                     "travail_ts": float(etat.get("travail_ts") or 0.0)}
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         pass
     return {"turn": turn, "remis": 0, "attente": 0, "signale": False, "differe": False,
             "travail": [], "travail_ts": 0.0}
@@ -880,6 +923,22 @@ def _tour_ecrit(cfg: Config, name: str, etat: dict) -> None:
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+def _humain(cfg: Config, row: dict) -> bool:
+    """L125/L81 : message d'un humain — marqué à l'envoi, ou expéditeur
+    déclaré humain sur cet hôte (`AMEESH_HUMANS`)."""
+    return mail.is_human(row) or (row.get("sender") or "") in cfg.human_names
+
+
+def _tour_remis(cfg: Config, name: str, etat: dict, msgs: list[dict]) -> None:
+    """Compteur du tour, et (L81 §6.3) l'instant du dernier message humain
+    remis : le message n'est plus non-lu quand l'exécuteur décide de
+    l'entretien résident, c'est cet instant qui tient la fenêtre de calme."""
+    etat["remis"] = int(etat.get("remis") or 0) + len(msgs)
+    if any(_humain(cfg, m) for m in msgs):
+        etat["humain"] = time.time()
+    _tour_ecrit(cfg, name, etat)
 
 
 def _attente(bk, name: str, hors: list[dict]) -> int:
@@ -1107,8 +1166,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         from . import resident_runner
         tour = resident_runner.current_turn()
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
-        etat = tour_lit(cfg, name, tour) if borne else None
-        if etat is not None and etat["remis"] >= borne:
+        etat = tour_lit(cfg, name, tour) if (tour and binding.bound_to_lease) else None
+        if etat is not None and borne and etat["remis"] >= borne:
             if event == "Stop":
                 return 0
             attente = _attente(bk, name, [])
@@ -1129,16 +1188,18 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # pour que le chemin rapide ne conclue pas « rien à faire ».
             _marque_boite(cfg, name, attente)
             return 0
-        remise = _Remise(bk, name, binding)
+        remise = _Remise(cfg, bk, name, binding)
         try:
-            limite = borne - etat["remis"] if etat is not None else None
+            # #289/L81 : une borne nulle (remise datée sans plafond) rend
+            # `limite=None` — la borne L514 du paquet garde ses deux chemins.
+            limite = borne - etat["remis"] if etat is not None and borne else None
             if event == "PostToolUse" and mid_turn_filtered(tool, binding):
                 # L514: in a dsh or codex turn, only what must not wait
                 msgs = remise.garder(mail.mid_turn, limite) if remise.prendre() else []
             else:
                 msgs = remise.prendre(limite)
             avis = ""
-            if etat is not None and msgs and etat["remis"] + len(msgs) >= borne:
+            if etat is not None and borne and msgs and etat["remis"] + len(msgs) >= borne:
                 attente = _attente(bk, name, msgs)
                 etat["attente"] = attente
                 if attente:
@@ -1167,8 +1228,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                     return 0
                 remise.solder()
                 if etat is not None:
-                    etat["remis"] += len(msgs)
-                    _tour_ecrit(cfg, name, etat)
+                    _tour_remis(cfg, name, etat, msgs)
                 bk.stop_counter(name, bump=True)
                 return 0
             if not msgs:
@@ -1182,8 +1242,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 return 0
             remise.solder()
             if etat is not None:
-                etat["remis"] += len(msgs)
-                _tour_ecrit(cfg, name, etat)
+                _tour_remis(cfg, name, etat, msgs)
         finally:
             remise.abandonner()
             # #1604 : marqueur posé seulement après un passage complet sans
@@ -1539,7 +1598,10 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False)
             if refused:
                 print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
-        done = migrations.migrate(db, log=lambda line: print(line))
+        done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only)
+    except migrations.NonAdditiveMigration as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
     except db_mod.DbError as exc:
         print("migration failed: %s" % exc, file=sys.stderr)
         return 1
@@ -1650,6 +1712,12 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schema     : %s" % cfg.schema)
     print("host       : %s" % cfg.host)
+    # #1466 : quel fichier cet hôte lit réellement, et ce qu'un profil écrase
+    print("config     : %s" % cfg.config_source)
+    if "accounts" in (cfg.config_shadowed or ()):
+        print("warning    : the configuration read here overrides the host `accounts` "
+              "(%s); other runners of the host may use different accounts — a stale "
+              "profile diverges silently" % cfg.config_path)
     from . import persona_memory
     from . import canon as canon_mod
     memory_note = ""
@@ -1720,6 +1788,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
         # L159c : plafond mémoire et slice des unités d'agent
         for line in hostcheck.memory_cap_lines(cfg, db):
+            print(line)
+        # L498 : cgroup délégué par tour (unité déléguée, racine libre et
+        # inscriptible) — lecture seule, sans changer le verdict
+        for line in hostcheck.turn_cgroup_lines(cfg, db):
             print(line)
     except db_mod.DbError:
         pass

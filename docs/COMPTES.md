@@ -15,11 +15,14 @@ compte est choisi ainsi :
 3. Sinon (ouverture de session, rotation, ou compte de la session au seuil) :
    parmi les comptes **utilisables** (profil valide, sous le seuil de la garde
    `min(90 %, part écoulée + 10 points)` dans **toutes** leurs fenêtres,
-   décision 0019), celui qui a **le plus de retard sur son rythme** : le plus
-   petit rapport `utilisé / rythme` (le rythme est le plafond de la garde à cet
-   instant de la fenêtre, colonne « rythme » de `ameesh accounts list`), pris
-   sur sa fenêtre la plus contraignante (5 h ou 7 jours). Un compte sans
-   fenêtre ouverte ou sans relevé compte pour 0 % utilisé : il passe **en
+   décision 0019), celui dont le **budget s'évapore le plus vite** : la part
+   inutilisée (`1 − utilisé`) de la fenêtre qui se remet à zéro le plus tôt,
+   rapportée au temps qui reste (`lost_rate`, #1789/N1) — consommer d'abord ce
+   qui sera perdu. À égalité, celui qui a **le plus de retard sur son rythme** :
+   le plus petit rapport `utilisé / rythme` (le rythme est le plafond de la
+   garde à cet instant de la fenêtre, colonne « rythme » de `ameesh accounts
+   list`), pris sur sa fenêtre la plus contraignante (5 h ou 7 jours). Un compte
+   sans fenêtre ouverte ou sans relevé compte pour 0 % utilisé : il passe **en
    premier**. Un **relevé partiel** (#1561 : une fenêtre datée remise à zéro
    alors qu'une autre court encore, ou un relevé non daté plus vieux que sa
    plus courte fenêtre) n'est plus un instantané courant : le compte est **non
@@ -32,11 +35,12 @@ compte est choisi ainsi :
    placement et, sans compte plaçable, le choix pause ; la remise à zéro qui
    motive la pause le rouvre (L71, 0 %). La continuité (règle 2) garde son
    chemin : une session déjà sur le compte y reste, et c'est son tour qui
-   rapporte la jauge ; un forçage manuel (règle 1) reste souverain. À égalité,
-   celui dont la capacité inutilisée expire le plus tôt, puis l'ordre déclaré
-   (amendement du 2026-10-10 à 0034, lot L117 : un compte jamais utilisé ne
-   doit pas rester inutilisé ; avant, le primaire, toujours en fenêtre ouverte,
-   gagnait toujours).
+   rapporte la jauge ; un forçage manuel (règle 1) reste souverain. À égalité de
+   perte et de retard, celui dont la capacité inutilisée expire le plus tôt,
+   puis la plus grosse part perdue, puis l'ordre déclaré (amendement du
+   2026-10-10 à 0034, lot L117 : un compte jamais utilisé ne doit pas rester
+   inutilisé ; avant, le primaire, toujours en fenêtre ouverte, gagnait
+   toujours).
 4. Tous les comptes au seuil, ou écartés faute d'un relevé assez récent pour
    placer : pause — la raison dit lequel des deux cas s'applique.
 
@@ -127,10 +131,10 @@ dans le canon :
 }
 ```
 
-* L'ordre départage les égalités de retard et d'échéance (par exemple deux
-  comptes jamais utilisés, ou les clés d'API sans jauge), et le premier sert
-  de compte actif par défaut (`account_active`) tant qu'aucun choix n'est
-  écrit.
+* L'ordre départage les égalités de budget — perte par seconde, retard,
+  échéance, part perdue (par exemple deux comptes jamais utilisés, ou les clés
+  d'API sans jauge) —, et le premier sert de compte actif par défaut
+  (`account_active`) tant qu'aucun choix n'est écrit.
 * `config_dir` sans `path` : le **dossier par défaut du harnais** (`~/.claude`,
   `~/.codex`, `~/.dsh`), jamais celui que l'environnement de l'exécuteur
   désigne (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` hérités) : un compte déclaré
@@ -158,8 +162,23 @@ dans le canon :
   seulement celles du compte choisi. Le profil est revalidé à chaque
   lancement, garde de budget active ou non : un profil invalide refuse le
   tour (consigne remise en attente, diagnostic dans `ameesh show`).
-* La bascule demande `ameesh migrate` (migration 0028) et un redémarrage de
-  l'exécuteur pour relire la configuration.
+* La bascule demande `ameesh migrate` (migration 0028). La configuration de
+  l'hôte est relue à chaud (#1466) : un compte ajouté, retiré ou corrigé dans
+  `config.json` prend effet au tour suivant, sans redémarrage de l'exécuteur.
+  Seuls les comptes, les plafonds, les rôles critiques et les binaires de
+  harnais suivent la relecture : la base, le schéma, le dossier d'état et les
+  cadences sont ceux du démarrage.
+* Profils (#1466) : un exécuteur peut être lancé sur un fichier nommé
+  (`AMEESH_CONFIG`) rangé sous `~/.config/ameesh/runner-profiles/`. Ce
+  **profil** est une superposition : les clés qu'il ne déclare pas — les
+  comptes, notamment — viennent de `config.json`. Une clé déclarée par le
+  profil l'emporte (une isolation voulue se déclare), et l'écart est affiché
+  par `ameesh doctor`, `ameesh accounts list` et le journal de l'exécuteur ;
+  un profil qui écrase `accounts` est signalé en clair. `"inherit": false`
+  rend un profil autonome ; `"inherit": true` force l'héritage ; une chaîne
+  nomme une autre base. Un fichier hors du dossier des profils reste autonome :
+  le banc de tests, et la configuration d'une autre base rangée à côté de
+  `config.json`, ne lisent jamais la configuration du poste.
 
 ## 3. Suivre et forcer
 
@@ -205,6 +224,33 @@ contraire marqué `↳ reading not current: window reset since the reading
 sont tues tant que le relevé n'est pas rafraîchi (#1561). Chaque relevé porte
 son horodatage (`read_at` : marqueur de compte Claude, date du journal Codex),
 exposé par `accounts list --json` et l'instantané `progress`.
+
+Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
+peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/
+usage/claude*.json`, dossier réglable par l'hôte avec
+`AMEESH_USAGE_WIDGET_DIR`), quand il est **frais** : il porte les seaux
+**propres à un modèle** (le « Fable Weekly » d'un compte, que les journaux
+`rate_limit_event` ne voient pas). Un instantané n'est lu que si `updatedAt`
+(repli : date du fichier) n'est pas plus vieux que sa plus courte fenêtre —
+une fenêtre courte remise à zéro depuis le relevé invaliderait aussi la
+longue (#1561) ; sinon les journaux restent la source, et un hôte sans widget
+ne change rien. Un seau de modèle (`title`, ex. « Fable Weekly ») ne compte
+que pour une session **de ce modèle** ; un modèle inconnu l'ignore, et
+`accounts list` les montre tous (la ligne d'état peut donc être retenue par un
+seau de modèle).
+
+Un relevé ne date pas de son écriture : un `rate_limit_event` ne porte aucun
+instant, et le dater au `mtime` du journal faisait passer la dernière mesure
+d'un agent arrêté pour une mesure fraîche (incident du 13/10 : seven_day 67 %
+a écrasé 87 % et l'admission est passée sous le plafond). Chaque relevé Claude
+porte donc sa **provenance** : l'instant de production — le ts du marqueur du
+tour qui l'a publié, absent pour un flux sans marqueur — et le journal
+d'origine. Un relevé dont une fenêtre était déjà close quand le tour a
+commencé est un **rejeu** du harnais : il reste lisible (la fenêtre échue vaut
+0 %, L71) mais n'est pas daté et ne remplace jamais une mesure datée. Les
+lecteurs départagent par instant de production, jamais par l'heure
+d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
+exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
 
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,

@@ -44,6 +44,17 @@ class BriefsTest(unittest.TestCase):
         self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
         self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        self.assertIn('ameesh work note 42 "hold: <reason>"', text)
+
+    def test_stale_lot_offre_le_hold_sans_date(self):
+        """#1664 : une porte hors mesh (fenêtre opérateur, décision humaine sans
+        demande ouverte) n'est portée par aucun lot ; le pilote la consigne en
+        `hold:`, que la stagnation lit comme un planned_wait — le brief doit
+        offrir ce geste, sinon la relance de 6 h reste inextinguible."""
+        text = alert_briefs.briefs(STALE, self.listing)["orch"]
+        self.assertIn("parked on a gate no open lot carries", text)
+        self.assertIn('ameesh work note 42 "hold: <reason>"', text)
+        self.assertIn('an "unhold: <reason>" note or a state change', text)
 
     def test_stale_lot_offre_le_hold_de_dependance(self):
         """#1642 : le brief doit offrir la dépendance déclarée (planned_wait),
@@ -80,6 +91,19 @@ class BriefsTest(unittest.TestCase):
         briefs = alert_briefs.briefs(alert, self.listing)
         self.assertEqual(sorted(briefs), ["orch", "orch-b"])     # équipe inconnue : tous
         self.assertIn("ameesh work assign 42 <agent>", briefs["orch"])
+
+    def test_stale_lot_sans_assigne_suit_l_equipe_du_lot(self):
+        # #917 : sans assigné, le brief va aux orchestrateurs de l'équipe du lot,
+        # pas à ceux de toutes les équipes. L713 : l'auditeur ne reçoit plus les
+        # stale_lot par courrier, même sans assigné (il les lit à sa passe).
+        alert = dict(STALE, agent=None, lot_team="b")
+        briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
+        self.assertEqual(sorted(briefs), ["orch-b"])
+        alert = dict(STALE, lot_team="b")               # assigné sans équipe : le lot tranche
+        self.assertEqual(sorted(alert_briefs.briefs(alert, _listing(("orch", "a"),
+                                                                    ("orch-b", "b"),
+                                                                    ("dev1", "")))),
+                         ["orch-b"])
 
     def test_plan_underused(self):
         briefs = alert_briefs.briefs(PLAN, self.listing, auditor_names=["auditeur"])

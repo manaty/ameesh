@@ -307,6 +307,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L78 (0368): conversation cursors and state, without message content.
     ('conversation_heads', ARRAY['agent', 'seq']),
+    ('agent_peek', ARRAY['agent', 'host', 'lease_epoch', 'captured_at']),
     ('conversation_log', ARRAY[
         'agent', 'seq', 'session', 'turn', 'kind', 'author', 'truncated',
         'event_id', 'created_at', 'project', 'lot', 'thread_entry'
@@ -326,7 +327,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('quota_gauge_readings', ARRAY[
         'id', 'harness', 'gauge_key', 'used', 'resets_at', 'window_s', 'observed_at',
-        'account'
+        'account', 'produced_at', 'source'
     ]),
     ('provider_balances', ARRAY[
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
@@ -344,6 +345,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
     ]),
+    -- L232b (0417) : la fermeture de release, lue par `ameesh_host_gate_state`
+    -- (`host` seulement ; périmètre d'opération et reçus exclus)
+    ('host_release_fences', ARRAY['host']),
     ('host_handoffs', ARRAY[
         'id', 'agent', 'source', 'target', 'state', 'fenced',
         'memory_bytes', 'disk_bytes', 'reserved_until', 'created_at', 'updated_at'
@@ -375,6 +379,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
+        -- L498 (0439) : le cgroup délégué du tour (chemin d'état, pas un secret)
+        'cgroup',
         'started_at', 'ended_at', 'status'
     ]),
     -- ménage (L73, 0045) : journal (chemins, tailles, commandes proposées)
@@ -525,7 +531,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
     -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
-    -- est un CONTENU)
+    -- est un CONTENU). `run_attempt` (#901, 0429) : quel essai de l'exécution
+    -- relancée (`gh run rerun`) porte la ligne.
     ('ci_runs', ARRAY[
         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
         'status', 'superseded_by', 'url', 'workflow', 'first_seen_at', 'concluded_at',
@@ -533,11 +540,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #747 (0424) : de l'ÉTAT, l'attente et l'exécution séparées ;
         -- created_at = création GitHub du run, started_at = premier relevé
         -- `in_progress` (l'extrait de sortie reste un contenu, ailleurs)
-        'created_at', 'started_at'
+        'created_at', 'started_at', 'run_attempt'
     ]),
     ('ci_test_failures', ARRAY[
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
-        'duration_s', 'failed_at', 'message_id', 'recorded_at'
+        'duration_s', 'failed_at', 'message_id', 'recorded_at', 'run_attempt'
     ]),
     -- #845 (0426) : garde de la CI par l'API — état des runners et de la file
     -- (même nature que ci_runs : identifiants, noms, horodatages, comptages,
@@ -602,8 +609,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
         -- L122 (0053) : numéro de migration réservé par le lot, et son
-        -- dépôt (#443, 0390)
-        'migration', 'migration_repo',
+        -- dépôt (#443, 0390) ; #1567 : le numéro réellement atterri, quand la
+        -- renumérotation du paquet a changé celui de la réservation
+        'migration', 'migration_repo', 'migration_landed', 'migration_landed_repo',
         -- L157b (0054) : taille déclarée du changement
         'change_size',
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte

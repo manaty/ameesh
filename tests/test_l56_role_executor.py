@@ -9,6 +9,7 @@ import subprocess
 import uuid
 import urllib.parse
 import unittest
+from unittest import mock
 
 from ameesh import migrations
 
@@ -183,7 +184,9 @@ class RoleExecutorTest(PgTestCase):
         finally:
             self.db.execute("REVOKE UPDATE ON project_modules FROM %s" % db_mod.quote_ident(self.role))
         # The trusted policies are unchanged and direct storage still refuses closure.
-        with self.assertRaises(work.WorkError):
+        # Reach the module-policy gate after an independently valid Git proof.
+        with mock.patch.object(work, "_declared_merge_commit", return_value="abcdef1234"), \
+                self.assertRaises(work.WorkError):
             work.merged(self.db, lot, sha="abcdef1234")
 
     def test_event_log_grant_reaches_an_isolated_writer(self):
@@ -356,10 +359,52 @@ class RoleExecutorTest(PgTestCase):
             self.assertEqual(proof["payload"]["output"], "observed execution")
             self.assertFalse(self.db.query("SELECT has_table_privilege(%s, 'project_modules', 'UPDATE') AS allowed",
                                            (writer,))[0]["allowed"])
-            self.assertEqual(work.merged(self.db, lot, sha="abcdef1234")["result"], "merged")
+            with mock.patch.object(work, "_declared_merge_commit", return_value="abcdef1234"):
+                self.assertEqual(work.merged(self.db, lot, sha="abcdef1234")["result"], "merged")
         finally:
             self.db.execute("DROP OWNED BY %s" % q(writer))
             self.db.execute("DROP ROLE %s" % q(writer))
+
+    def test_controller_audit_checks_maintain_only_from_postgresql_17(self):
+        """MAINTAIN n'existe qu'à partir de PG17 : l'audit ne l'interroge pas avant."""
+        import tempfile
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_maintain_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        text = sql.read_text()
+        self.assertIn("current_setting('server_version_num')",text)
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        def apply(path):
+            return subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(path)], env=env, text=True,
+                capture_output=True, timeout=60)
+        try:
+            # Avant PG17 (ou sur le banc 17) l'audit passe : le nom MAINTAIN
+            # n'est alors jamais demandé à has_table_privilege.
+            result = apply(sql)
+            self.assertEqual(result.returncode,0,result.stderr)
+            version = int(self.db.query("SELECT current_setting('server_version_num') AS v")[0]['v'])
+            if version < 170000:
+                return
+            self.db.execute('GRANT MAINTAIN ON host_release_fences TO %s' % q(controller))
+            # PG17 : MAINTAIN est un droit réel, l'audit le refuse.
+            result = apply(sql)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('unrelated write privilege',result.stderr)
+            # Même audit avec la version forcée avant 17 : la liste ne porte
+            # plus MAINTAIN, donc l'audit va au bout au lieu d'échouer sur un
+            # nom de droit inconnu.
+            with tempfile.TemporaryDirectory() as directory:
+                older = Path(directory)/'role-release-controller.sql'
+                older.write_text(text.replace("current_setting('server_version_num')::int",
+                                              '160000'))
+                result = apply(older)
+                self.assertEqual(result.returncode,0,result.stderr)
+        finally:
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
 
     def test_inherited_policy_writes_make_executor_audit_fail(self):
         q = db_mod.quote_ident
@@ -376,6 +421,100 @@ class RoleExecutorTest(PgTestCase):
             self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
             self.db.execute("DROP OWNED BY %s" % q(parent))
             self.db.execute("DROP ROLE %s" % q(parent))
+
+    def test_executor_reads_claim_fences_without_release_controller_writes(self):
+        for relation in ('host_release_operations','host_release_fences','host_release_fence_receipts'):
+            for privilege in ('INSERT','UPDATE','DELETE'):
+                with self.subTest(relation=relation, privilege=privilege):
+                    self.assertFalse(self.db.query(
+                        'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                        (self.login, relation, privilege))[0]['allowed'])
+        self.assertEqual(self.as_host("SELECT ameesh_host_claims_open('synthetic-host')").returncode, 0)
+
+    def test_inherited_release_fence_writes_make_executor_audit_fail(self):
+        q = db_mod.quote_ident
+        parent = 't_release_parent_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % q(parent))
+        try:
+            self.db.execute('GRANT DELETE ON host_release_fences TO %s' % q(parent))
+            self.db.execute('GRANT %s TO %s' % (q(parent),q(self.role)))
+            result = self.run_script(self.role)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('forbidden DELETE on host_release_fences', result.stderr,
+                          attendu(result.stderr))
+        finally:
+            self.db.execute('REVOKE %s FROM %s' % (q(parent),q(self.role)))
+            self.db.execute('DROP OWNED BY %s' % q(parent))
+            self.db.execute('DROP ROLE %s' % q(parent))
+
+    def test_release_fence_migration_revokes_creation_time_executor_defaults(self):
+        import shutil
+        from pathlib import Path
+        import tempfile
+        q = db_mod.quote_ident
+        schema = 't_release_upgrade_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE SCHEMA %s' % q(schema))
+        cfg = dataclasses.replace(self.cfg, schema=schema)
+        db = db_mod.connect(cfg)
+        try:
+            db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT,INSERT,UPDATE,DELETE,'
+                       'TRUNCATE,REFERENCES,TRIGGER ON TABLES TO %s'
+                       % (q(schema),q(self.role)))
+            with tempfile.TemporaryDirectory() as directory:
+                shutil.copy(Path(REPO,'src/ameesh/migrations/0417_host_release_fences.sql'), directory)
+                migrations.migrate(db, directory)
+            for relation in ('host_release_operations','host_release_fences','host_release_fence_receipts'):
+                for privilege in ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'):
+                    self.assertFalse(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                        (self.role,schema+'.'+relation,privilege))[0]['allowed'])
+                self.assertTrue(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                    (self.role,schema+'.'+relation,'SELECT'))[0]['allowed'])
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA %s CASCADE' % q(schema))
+
+    def test_independent_release_role_writes_only_fences_and_locks_registry(self):
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_controller_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        try:
+            for _ in range(2):
+                result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                    '-v','role='+controller,'-f',str(sql)], env=env, text=True,capture_output=True,timeout=60)
+                self.assertEqual(result.returncode,0,result.stderr)
+            registry.upsert(self.db,'release-worker',harness='other',host='synthetic-host')
+            with self.db.transaction() as tx:
+                tx.execute('SET LOCAL ROLE %s' % q(controller))
+                tx.query('SELECT name FROM agent_registry WHERE name=%s FOR UPDATE',('release-worker',))
+                tx.execute('INSERT INTO host_release_operations(operation,host,manifest_digest) VALUES (%s,%s,%s)',
+                           ('controller-fixture','synthetic-host','a'*64))
+                tx.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)',
+                           ('synthetic-host','controller-fixture','synthetic-probe'))
+                for relation in ('agent_mailbox','mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending'):
+                    tx.query('SELECT * FROM '+q(relation)+' LIMIT 0')
+                tx.query('SELECT * FROM mesh_approvals_status LIMIT 0')
+                # SignedDecisionAuthority re-reads the owner key at every step.
+                tx.query('SELECT name, holder, public_key, public_key_fingerprint, key_role,'
+                         ' key_updated_at, key_revoked_at FROM mesh_keys LIMIT 0')
+            with self.assertRaises(db_mod.DbError):
+                with self.db.transaction() as tx:
+                    tx.execute('SET LOCAL ROLE %s' % q(controller))
+                    tx.execute("UPDATE agent_registry SET status='running' WHERE name='release-worker'")
+            self.db.execute('DELETE FROM host_release_fences WHERE operation=%s',('controller-fixture',))
+            self.db.execute('DELETE FROM host_release_operations WHERE operation=%s',('controller-fixture',))
+            # A column-only grant must be detected, even without table UPDATE.
+            self.db.execute('GRANT UPDATE(public_key) ON agent_registry TO %s' % q(controller))
+            result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('unrelated column write privilege',result.stderr,
+                          attendu(result.stderr))
+        finally:
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
 
     def test_host_cannot_change_schema(self):
         for sql in ("CREATE TABLE intruder (x int)",

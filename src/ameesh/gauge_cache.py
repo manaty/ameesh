@@ -11,6 +11,10 @@ class GaugeCache:
     number of journals and account observations per journal; removed agent
     directories therefore cannot cause unlimited retention. No transcript
     text, credentials, registry entries or budget decisions are retained.
+
+    Une observation est `(estampille, production, gauges)` (#1132) : la copie
+    garde le TYPE de la liste (son `overage` pour `Gauges`) sans recopier ses
+    éléments, qui sont gelés.
     """
 
     def __init__(self, max_entries=128, max_accounts=64):
@@ -32,8 +36,19 @@ class GaugeCache:
             self._entries.pop(path, None)
             if len(readings) > self.max_accounts:
                 return
-            frozen = {account: (stamp, tuple(gauges), overage)
-                      for account, (stamp, gauges, overage) in readings.items()}
+            # #1661 : un relevé est (date, fenêtres, overage) — datation par
+            # l'événement (#1720), jamais le mtime ; le cache en garde une
+            # observation immuable, jamais l'objet mutable du producteur, sans
+            # perdre les drapeaux d'overage. La lecture tolère aussi la forme à
+            # deux champs (overage porté par `gauges`). #1132 : `date` est
+            # l'instant de PRODUCTION (None pour un flux non daté), et chaque
+            # fenêtre garde sa provenance (`produced_at`, `source`).
+            frozen = {}
+            for account, reading in readings.items():
+                stamp, gauges = reading[0], reading[1]
+                overage = (reading[2] if len(reading) > 2
+                           else getattr(gauges, "overage", None))
+                frozen[account] = (stamp, tuple(gauges), overage)
             self._entries[path] = (signature, frozen)
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)

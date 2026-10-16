@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from . import storage, work
 
@@ -133,10 +134,20 @@ def notify_released(db, blocker_id, *, blocker_state, blocker_reason="",
     Ne rattrape AUCUNE erreur : avaler l'échec ici committerait la fermeture
     sans son réveil, précisément le défaut que ce chemin doit exclure. Le fil
     lisible est écrit après le commit (`after_commit`, appelé par l'appelant).
+
+    #1668 : un dépendant NON ASSIGNÉ n'a pas de destinataire ; s'il est encore
+    `blocked` alors que plus rien ne le retient, il repasse `intake` dans la
+    même transaction — il redevient démarrable au self-service sans geste
+    d'agent, au lieu d'attendre une alerte stale (jusqu'à 14 h).
+
     Rend une ligne par courrier déposé (`lot`, `to`, `message_id`)."""
     from . import mail
     out: list[dict] = []
     rows = released_by(db, blocker_id)
+    unassigned = [int(r["id"]) for r in rows if not (r.get("assignee") or "").strip()]
+    if unassigned:
+        storage.of(db).work_dependencies.release_unassigned(
+            unassigned, actor=work.SYSTEM_SENDER)
     for row in rows:
         to = (row.get("assignee") or "").strip()
         if not to or to.startswith(work.HUMAN_PREFIX):
@@ -159,7 +170,17 @@ def wait_label(wait):
     if wait["what"] == "scheduled":
         return "planned start %s" % wait["start"]
     if wait["what"] == "hold":
-        return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
+        if wait.get("gate"):
+            return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
+        # #1664 : le hold déclaré, avec son auteur et sa date (le pilote juge
+        # sur pièce s'il tient toujours).
+        label = "hold"
+        if wait.get("by"):
+            label += " by %s" % wait["by"]
+        if wait.get("since"):
+            label += " since %s" % time.strftime("%Y-%m-%d %H:%M",
+                                                 time.localtime(float(wait["since"])))
+        return label
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 

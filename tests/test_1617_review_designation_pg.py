@@ -109,7 +109,7 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual([m["recipient"] for m in sent], ["r1", "r2"])
         for row in sent:
             self.assertIn(SHA_A, row["body"])
-            self.assertIn("jalon frozen #%d" % int(freeze["id"]), row["body"])
+            self.assertIn("frozen milestone #%d" % int(freeze["id"]), row["body"])
         marks = self.marks()
         self.assertEqual(len(marks), 1)
         self.assertEqual(pg.designation_of(marks[0])["freeze"],
@@ -130,6 +130,44 @@ class Test1617ReviewDesignationPg(PgTestCase):
                 missing=0, why="", messages=[{"to": "r1", "body": "à relire"}])
         self.assertEqual(self.mailbox(), [])
         self.assertEqual(self.marks(), [])
+
+    def test_a_write_on_an_open_transaction_without_after_commit_is_refused(self):
+        # #1775 N2 : un `with` imbriqué ne commite pas (psql comme psycopg) ;
+        # écrire puis vider le fil ici publierait des traces avant le commit
+        # de l'appelant. La lecture reste permise, l'écriture est refusée.
+        self.freeze()
+        with self.db.transaction() as tx:
+            last = pg.PgPort(tx).latest_freeze(self.lot)
+            with self.assertRaises(rd.DesignationError):
+                pg.PgPort(tx).commit(
+                    self.lot, freeze=last, required=1, state=rd.DESIGNATED,
+                    reviewers=[{"name": "r1", "family": "claude"}], missing=0, why="",
+                    messages=[{"to": "r1", "body": "à relire"}])
+            self.assertEqual(self.mailbox(tx), [])
+        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(self.marks(), [])
+
+    def test_the_journal_read_is_bounded_by_the_freeze(self):
+        # #1775 N3 : un marque ne peut pas précéder son gel. Un marque antidaté
+        # (impossible en pratique, injecté ici) n'est pas relu : la lecture du
+        # journal part du `at_ts` du jalon, pas de l'époque.
+        freeze = self.freeze()
+        fid = int(freeze["id"])
+        stale = pg._mark_note(self.lot, fid, state=rd.DESIGNATED, required=1,
+                              reviewers=[{"name": "r1", "family": "claude"}],
+                              missing=0, why="", authors=[], policy_ref="", sha=SHA_A)
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor, created_at)"
+            " VALUES (%s, %s, %s, %s, now() - interval '1 hour')",
+            (self.lot, "build", stale, "someone"))
+        self.assertIsNone(pg.PgPort(self.db).recorded(self.lot, fid))
+        # la désignation réelle reste écrite et relue, sans second courrier
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        found = pg.PgPort(self.db).recorded(self.lot, fid)
+        self.assertEqual(found["freeze"], {"id": fid, "sha": SHA_A})
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
+        self.assertEqual(len(self.marks()), 2)  # le marque antidaté + le vrai
 
     def test_a_late_writer_returns_the_recorded_designation_without_mailing(self):
         self.freeze()
@@ -188,8 +226,8 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual(out["missing"], 2)
         sent = self.mailbox()
         self.assertEqual([m["recipient"] for m in sent], ["pilot"])
-        self.assertIn("Aucune admission implicite", sent[0]["body"])
-        self.assertIn("jalon frozen #%d" % int(freeze["id"]), sent[0]["body"])
+        self.assertIn("No implicit admission", sent[0]["body"])
+        self.assertIn("frozen milestone #%d" % int(freeze["id"]), sent[0]["body"])
         # rejoué sans capacité nouvelle : une seule notification
         again = self.run_apply(pg.PgPort(self.db),
                                candidates=[rd.Candidate("r1", "deepseek")])
@@ -382,6 +420,76 @@ class Test1617FrozenHook(PgTestCase):
         for record in threads:
             record(self.db.cfg, self.db)
         self.assertEqual(drained, [self.schema])
+
+    # -- #1634 : une notification impossible n'annule pas le gel ---------
+    def waiting_freeze(self, notify):
+        """Gel par le hook sans relecteur désignable, notifiant `notify`."""
+        def hook(tx, milestone, threads):
+            seen["out"] = rd.apply(
+                dict(self.item, state="build"), policy=RULES,
+                paths=["src/ameesh/db.py"], port=pg.PgPort(tx, after_commit=threads),
+                freeze_sha=milestone["sha"],
+                authors=[{"name": "author", "family": "deepseek"}], candidates=[],
+                risk="sensitive", base="c" * 40, policy_ref="canon@deadbeef",
+                notify=notify)
+
+        seen: dict = {}
+        threads: list = []
+        row = work.milestone(self.db, self.lot, "frozen", sha=SHA_A, actor="me",
+                             on_frozen=hook, after_commit=threads)
+        for record in threads:
+            record(self.db.cfg, self.db)
+        return row, seen["out"]
+
+    def notes(self):
+        return [row["note"] for row in self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s ORDER BY id",
+            (self.lot,))]
+
+    def assert_freeze_kept_without_mail(self, row, out, recipient):
+        self.assertEqual([int(m["id"]) for m in self.milestones()], [int(row["id"])])
+        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(out["state"], rd.WAITING)
+        mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["state"], rd.WAITING)
+        self.assertEqual(mark["freeze"], {"id": int(row["id"]), "sha": SHA_A})
+        self.assertIn("notification undeliverable at freeze", mark["why"])
+        lisible = [n for n in self.notes() if n.startswith("désignation au gel")]
+        self.assertEqual(len(lisible), 1)
+        self.assertIn(recipient, lisible[0])
+        self.assertIn("Gel conservé", lisible[0])
+
+    def test_an_empty_notify_keeps_the_freeze(self):
+        row, out = self.waiting_freeze("")
+        self.assert_freeze_kept_without_mail(row, out, "— (no recipient)")
+
+    def test_an_unknown_notify_keeps_the_freeze(self):
+        row, out = self.waiting_freeze("ghost")
+        self.assert_freeze_kept_without_mail(row, out, "ghost (not in the registry)")
+
+    def test_a_normal_notify_is_mailed_at_freeze(self):
+        row, out = self.waiting_freeze("pilot")
+        self.assertEqual(len(self.milestones()), 1)
+        self.assertEqual(out["state"], rd.WAITING)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        self.assertNotIn("undeliverable", pg.designation_of(self.marks()[0])["why"])
+        self.assertFalse([n for n in self.notes() if n.startswith("désignation au gel")])
+
+    def test_an_unknown_reviewer_keeps_the_freeze_and_waits(self):
+        def hook(tx, milestone, threads):
+            seen["out"] = pg.PgPort(tx, after_commit=threads).commit(
+                self.lot, freeze={"id": int(milestone["id"]), "sha": SHA_A},
+                required=1, state=rd.DESIGNATED,
+                reviewers=[{"name": "ghost", "family": "claude"}], missing=0, why="",
+                messages=[{"to": "ghost", "body": "à relire"}])
+
+        seen: dict = {}
+        row = work.milestone(self.db, self.lot, "frozen", sha=SHA_A, actor="me",
+                             on_frozen=hook, after_commit=[])
+        self.assert_freeze_kept_without_mail(row, seen["out"],
+                                             "ghost (not in the registry)")
+        self.assertEqual(seen["out"]["reviewers"], [])
+        self.assertEqual(seen["out"]["missing"], 1)
 
     def test_a_raising_callback_rolls_the_freeze_back(self):
         def hook(tx, milestone, threads):

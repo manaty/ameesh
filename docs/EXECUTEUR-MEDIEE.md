@@ -16,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 64 opérations et la liste des 347 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 65 opérations et la liste des 363 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -59,12 +59,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 64 opérations, dont 25 lectures et 39 écritures. 54 passent par
+Comptes : 65 opérations, dont 25 lectures et 40 écritures. 55 passent par
 `op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Six
 lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
 sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (411
+signature et les mêmes types. Il vérifie aussi que l'interface entière (428
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -81,7 +81,9 @@ l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
 `roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
 `spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
 (sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.
-`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même. Un
+`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même, et
+`operations.gauge_latest` (#1132 : provenance des relevés, instant de
+production et source) avec lui. Un
 exécuteur médié ne fait ni ménage local ni passage périodique de ménage : son
 dossier de travail est effacé en fin de bail.
 
@@ -210,6 +212,22 @@ fait la correspondance.
   tout.
 
 Un réveil ne fait jamais foi : l'exécuteur relit toujours la base.
+
+## Contrat 1.2 : aperçu d’activité
+
+L'ajout compatible #1349 admet uniquement `operations.publish_peek(name,
+owner, epoch, payload)` depuis la route `op`, portée B, sous un bail vivant
+de l'agent admis. Le serveur force owner et epoch depuis l'enveloppe,
+masque et borne le contenu avant écriture. Une clé d'idempotence est requise.
+Les champs acceptés sont la branche et le diff stat suivis, des extraits
+publics et des noms/états d'outils ; pensées, arguments, sorties et champs
+inconnus sont exclus. Le jeu doré et son générateur couvrent cette opération.
+
+`operations.read_peek` reste refusée à tout exécuteur et toute session. La
+lecture passe par l'API humaine `/api/v1/agents/{agent}/peek`, avec contrôle du
+responsable déclaré. Déployer la migration additive 0436 et le serveur avant
+les nouveaux exécuteurs ; un ancien serveur refuse la nouvelle opération et
+l'aperçu est alors absent ou périmé, sans bloquer le harnais.
 
 ## Contrat 1.1
 
@@ -489,7 +507,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 64 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 65 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

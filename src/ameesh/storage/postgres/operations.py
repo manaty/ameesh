@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import json
+
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
@@ -44,6 +46,43 @@ def _marks(values) -> str:
 
 class Operations(interface.Operations):
 
+    def publish_peek(self, name, owner, epoch, payload) -> bool:
+        from ...agent_peek import sanitise
+        # Lock first, then check real time in a fresh statement: expired
+        # runners cannot publish after waiting behind a lease replacement.
+        with self.db.transaction() as tx:
+            tx.query("SELECT name FROM agent_registry WHERE name = %s FOR UPDATE", (name,))
+            rows = tx.query("""
+                INSERT INTO agent_peek (agent, host, lease_epoch, payload)
+                SELECT name, host, lease_epoch, %s::jsonb FROM agent_registry
+                WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+                  AND lease_expires_at > clock_timestamp()
+                ON CONFLICT (agent) DO UPDATE SET host = EXCLUDED.host,
+                  lease_epoch = EXCLUDED.lease_epoch, captured_at = clock_timestamp(),
+                  payload = EXCLUDED.payload RETURNING agent
+                """, (json.dumps(sanitise(payload), ensure_ascii=False), name, owner, int(epoch)))
+        return bool(rows)
+
+    def read_peek(self, name, human):
+        # An unavailable snapshot is explicit; metadata still describes the
+        # authorised agent. Old host/lease observations are never reused.
+        rows = self.db.query("""
+            SELECT r.host, r.status, r.status_text,
+                   w.id AS lot_id, w.title AS lot_title, w.state AS lot_state,
+                   extract(epoch FROM p.captured_at)::float8 AS captured_ts, p.payload
+            FROM agent_registry r
+            LEFT JOIN agent_peek p ON p.agent = r.name AND p.host = r.host
+                                     AND p.lease_epoch = r.lease_epoch
+            LEFT JOIN LATERAL (
+                SELECT id, title, state FROM work_items
+                WHERE assignee = r.name AND state NOT IN ('merged','promoted','closed')
+                ORDER BY (id::text = r.session_work_item) DESC NULLS LAST,
+                         (state = 'build') DESC, updated_at DESC, id DESC LIMIT 1
+            ) w ON true
+            WHERE r.name = %s AND r.responsible = %s
+            """, (name, human))
+        return rows[0] if rows else None
+
     # -- réglages ------------------------------------------------------------
     def set_settings(self, name, values) -> bool:
         cols = [key for key in values if key in self.SETTINGS]
@@ -57,6 +96,13 @@ class Operations(interface.Operations):
             "UPDATE agent_registry SET " + sets + ", updated_at = now()"
             " WHERE name = %s RETURNING name", tuple(params + [name]))
         return bool(rows)
+
+    def set_dormant(self, name, owner, epoch, status_text) -> bool:
+        return bool(self.db.query(
+            "UPDATE agent_registry SET status_text = %s, updated_at = now()"
+            " WHERE name = %s AND status = 'idle' AND lease_owner = %s"
+            "   AND lease_epoch = %s AND lease_expires_at > clock_timestamp()"
+            " RETURNING name", (status_text, name, owner, int(epoch))))
 
     def set_session_work_item(self, name, owner, epoch, work_item) -> bool:
         rows = self.db.query(
@@ -334,19 +380,22 @@ class Operations(interface.Operations):
             "  FROM work_items WHERE assignee = %s AND state NOT IN " + _CLOSED +
             " ORDER BY updated_at DESC, id DESC", (name,))
 
-    def open_lots_activity(self, limit) -> list[dict]:
-        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
-        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
-        reviewer = ("w.reviewer" if has_reviewer(self.db)
-                    else "''::text AS reviewer")
-        sql = ("""
+    #: corps commun de `open_lots_activity` / `state_lots_activity` : la
+    #: dernière activité d'un lot (ligne, transitions, jalons, actions,
+    #: messages). `%%s` du LIMIT est échappé : `_lots_activity` injecte le
+    #: WHERE, qui peut lui-même porter un `%s`.
+    _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, __REVIEWER__,
+                   coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
+                            nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
                        w.updated_at, ev.at, ms.at, ac.at, mb.at))::float8 AS last_activity_ts
               FROM work_items w
+              LEFT JOIN work_packages k ON k.id = w.package_id
+              LEFT JOIN work_packages kp ON kp.id = w.package_parent
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM work_item_events e
                                   WHERE e.work_item_id = w.id) ev ON true
               LEFT JOIN LATERAL (SELECT max(at) AS at FROM work_item_milestones m
@@ -355,12 +404,28 @@ class Operations(interface.Operations):
                                   WHERE a.work_item = w.id) ac ON true
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM agent_mailbox b
                                   WHERE b.work_item_id = w.id::text) mb ON true
-             WHERE w.state NOT IN """ + _CLOSED + """
+             WHERE %s
              ORDER BY last_activity_ts ASC, w.id
-             LIMIT %s
-            """).replace("__REVIEWER__", reviewer)
+             LIMIT %%s
+            """
+
+    def _lots_activity(self, where, params) -> list[dict]:
+        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
+        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
+        reviewer = ("w.reviewer" if has_reviewer(self.db)
+                    else "''::text AS reviewer")
         return self.db.query(
-            sql, (int(limit) if limit is not None else None,))
+            self._LOTS_ACTIVITY.replace("__REVIEWER__", reviewer) % where, params)
+
+    def open_lots_activity(self, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state NOT IN " + _CLOSED,
+            (int(limit) if limit is not None else None,))
+
+    def state_lots_activity(self, state, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state = %s",
+            (state, int(limit) if limit is not None else None))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
@@ -382,27 +447,61 @@ class Operations(interface.Operations):
     def record_gauges(self, readings) -> int:
         inserted = 0
         for g in readings:
-            # L30 (0028) : une jauge de COMPTE porte son nom ; NULL = sans comptes
+            # L30 (0028) : une jauge de COMPTE porte son nom ; NULL = sans comptes.
+            # #1132 (0434) : `produced_at` (instant de production, NULL quand le
+            # flux ne le date pas) et `source` (journal d'origine) : la provenance.
+            # La dédup ne regarde plus la SEULE dernière insertion, ni n'importe
+            # quelle ligne identique (delta auditeur, tête a66546be) : une
+            # production STRICTEMENT plus fraîche de la même valeur neutralise une
+            # relecture plus ancienne, mais à production ÉGALE (NULL inclus) c'est
+            # la DERNIÈRE valeur de ce rang qui décide, dans l'ordre de
+            # `gauge_latest` (production, puis insertion). Une oscillation
+            # 87 -> 67 -> 87 sous le même marqueur reste donc lisible, une
+            # production plus récente à valeur égale est conservée, et un relevé
+            # périmé réinséré ne devient jamais « le dernier ».
             account = g.get("account")
+            produced = g.get("produced_at")
             rows = self.db.query(
                 """
+                WITH candidat AS (
+                    SELECT %s::text AS harness, %s::text AS gauge_key,
+                           %s::float8 AS used, to_timestamp(%s::float8) AS resets_at,
+                           %s::float8 AS window_s, %s::text AS account,
+                           to_timestamp(%s::float8) AS produced_at, %s::text AS source
+                )
                 INSERT INTO quota_gauge_readings (harness, gauge_key, used, resets_at, window_s,
-                                                  account)
-                SELECT %s, %s, %s, to_timestamp(%s), %s, %s
+                                                  account, produced_at, source)
+                SELECT harness, gauge_key, used, resets_at, window_s, account,
+                       produced_at, source
+                  FROM candidat c
                  WHERE NOT EXISTS (
-                     SELECT 1 FROM (
-                         SELECT used, resets_at, observed_at FROM quota_gauge_readings
-                          WHERE harness = %s AND gauge_key = %s
-                            AND account IS NOT DISTINCT FROM %s
-                          ORDER BY observed_at DESC, id DESC LIMIT 1) d
-                      WHERE d.used = %s
-                        AND d.resets_at IS NOT DISTINCT FROM to_timestamp(%s)
-                        AND d.observed_at > now() - interval '10 minutes')
+                     SELECT 1 FROM quota_gauge_readings r
+                      WHERE r.harness = c.harness AND r.gauge_key = c.gauge_key
+                        AND r.account IS NOT DISTINCT FROM c.account
+                        AND r.used = c.used
+                        AND r.resets_at IS NOT DISTINCT FROM c.resets_at
+                        AND r.observed_at > now() - interval '10 minutes'
+                        AND (
+                            (r.produced_at IS NOT NULL
+                             AND (c.produced_at IS NULL
+                                  OR r.produced_at > c.produced_at))
+                            OR
+                            (r.produced_at IS NOT DISTINCT FROM c.produced_at
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM quota_gauge_readings n
+                                  WHERE n.harness = r.harness
+                                    AND n.gauge_key = r.gauge_key
+                                    AND n.account IS NOT DISTINCT FROM r.account
+                                    AND n.produced_at IS NOT DISTINCT FROM r.produced_at
+                                    AND (n.observed_at > r.observed_at
+                                         OR (n.observed_at = r.observed_at
+                                             AND n.id > r.id))))
+                        )
+                )
                 RETURNING id
                 """,
                 (g["harness"], g["key"], float(g["used"]), g.get("resets_at"),
-                 float(g["window_s"]), account, g["harness"], g["key"], account,
-                 float(g["used"]), g.get("resets_at")),
+                 float(g["window_s"]), account, produced, g.get("source")),
             )
             inserted += len(rows)
         return inserted
@@ -410,7 +509,8 @@ class Operations(interface.Operations):
     def gauge_history(self, *, since_s, harness, account=None) -> list[dict]:
         sql = ("SELECT harness, gauge_key AS key, used,"
                " extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,"
-               " extract(epoch from observed_at)::float8 AS observed_ts, account"
+               " extract(epoch from observed_at)::float8 AS observed_ts,"
+               " extract(epoch from produced_at)::float8 AS produced_ts, source, account"
                " FROM quota_gauge_readings"
                " WHERE observed_at >= now() - make_interval(secs => %s)")
         params: list = [float(since_s)]
@@ -424,17 +524,39 @@ class Operations(interface.Operations):
         return _sans_compte_nul(self.db.query(sql, tuple(params)))
 
     def latest_gauges(self, *, since_s) -> list[dict]:
+        """L94 : le DERNIER relevé de chaque jauge, par instant de PRODUCTION
+        (#1132) : un relevé périmé réinséré ne remplace plus le frais."""
         return self.db.query(
             """
             SELECT DISTINCT ON (harness, account, gauge_key)
                    harness, gauge_key AS key, used,
                    extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
-                   extract(epoch from observed_at)::float8 AS observed_ts, account
+                   extract(epoch from observed_at)::float8 AS observed_ts,
+                   extract(epoch from produced_at)::float8 AS produced_ts, source, account
               FROM quota_gauge_readings
              WHERE observed_at >= now() - make_interval(secs => %s)
-             ORDER BY harness, account, gauge_key, observed_at DESC, id DESC
+             ORDER BY harness, account, gauge_key,
+                      produced_at DESC NULLS LAST, observed_at DESC, id DESC
             """,
             (float(since_s),))
+
+    def gauge_latest(self, *, harness, account) -> list[dict]:
+        """#1132 : le dernier relevé CONNU de chaque jauge d'un compte nommé,
+        sans limite d'âge : le plus récent par instant de production (NULL en
+        dernier), puis par insertion. Sert à l'exécuteur pour ne pas juger un
+        compte sur son seul flux local quand un autre état a produit plus frais."""
+        return self.db.query(
+            """
+            SELECT DISTINCT ON (gauge_key)
+                   harness, gauge_key AS key, used,
+                   extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
+                   extract(epoch from observed_at)::float8 AS observed_ts,
+                   extract(epoch from produced_at)::float8 AS produced_ts, source, account
+              FROM quota_gauge_readings
+             WHERE harness = %s AND account = %s
+             ORDER BY gauge_key, produced_at DESC NULLS LAST, observed_at DESC, id DESC
+            """,
+            (harness, account))
 
     def assigners(self, *, since_s) -> list[str]:
         rows = self.db.query(

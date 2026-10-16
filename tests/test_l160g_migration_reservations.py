@@ -94,13 +94,15 @@ class ReservationImportTest(PgTestCase):
 
     def test_collision_and_existing_lot_reservation_not_overwritten(self):
         other = self.lot("Other", 3)
-        storage.of(self.db).work.reserve_migration(other, self.slug, 324, 0,
-                                                  actor="orch", note="reserved %(number)s")
+        storage.of(self.db).work.reserve_migration(
+            other, self.slug, 324, 0, actor="orch", note="reserved %(number)s",
+            issue_ref=work.get(self.db, other)["issue_ref"])
         with self.assertRaisesRegex(work.WorkError, "already held"):
             self.run_import(apply=True)
         self.assertIsNone(work.get(self.db, self.a)["migration"])
-        storage.of(self.db).work.reserve_migration(self.a, self.slug, 327, 0,
-                                                  actor="orch", note="reserved %(number)s")
+        storage.of(self.db).work.reserve_migration(
+            self.a, self.slug, 327, 0, actor="orch", note="reserved %(number)s",
+            issue_ref=work.get(self.db, self.a)["issue_ref"])
         with self.assertRaisesRegex(work.WorkError, "different reservation"):
             self.run_import(apply=True)
         self.assertEqual(work.get(self.db, self.a)["migration"], 327)
@@ -116,7 +118,8 @@ class ReservationImportTest(PgTestCase):
             if item_id == self.b and not raced:
                 raced.append(True)
                 original(WorkItems(conn), other, self.slug, 324, 0,
-                         actor="other", note="concurrent %(number)s")
+                         actor="other", note="concurrent %(number)s",
+                         issue_ref="%s#3" % self.slug)
             return original(registry, item_id, *args, **kwargs)
 
         with mock.patch.object(WorkItems, "reserve_migration", new=race):

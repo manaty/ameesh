@@ -54,7 +54,9 @@ AGENT_COLUMNS = """
     -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
     -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
     -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
-    session_harness, session_cwd, session_origin
+    session_harness, session_cwd, session_origin,
+    operator_paused, operator_pause_reason, operator_pause_by, operator_pause_for,
+    extract(epoch from operator_pause_at)::float8 as operator_pause_ts
 """
 
 
@@ -106,7 +108,7 @@ def canon_governed_sql(alias: str = "agent_registry") -> str:
         "a": a, "max": LINEAGE_MAX}
 
 
-def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
+def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = False) -> str:
     """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
 
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
@@ -134,20 +136,28 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     paramètre lié (`%s`) : elle s'insère telle quelle dans une requête
     paramétrée, avec les deux pilotes. Utilisée par `claimable()` et
     `claim()` ; à réutiliser telle quelle pour `ameesh attach` (C9).
+
+    `probe=True` (L232b) : la réclamation d'un agent **nommé** (le pas de tour
+    du contrôleur) passe par `ameesh_agent_claims_open`, qui rouvre la
+    fermeture de release au seul agent sonde enrôlé de l'hôte. Les décisions
+    d'ordonnancement (`claimable`, `wakeable`, aperçu) gardent le prédicat
+    strict d'une fermeture.
     """
     a = _alias(alias)
     # L42 (0031) : l'état est celui du canon DE L'AGENT sur son hôte (colonne
     # `canon` ; NULL = canon par défaut, clé '') — un canon invalide ne ferme
     # que ses propres agents et leurs éphémères (qui portent son canon)
-    return """(ameesh_host_claims_open(%(a)s.host) AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
+    open_sql = ("ameesh_agent_claims_open(%(a)s.host, %(a)s.name)" if probe
+                else "ameesh_host_claims_open(%(a)s.host)")
+    sql = """(""" + open_sql + """ AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
        OR (EXISTS (SELECT 1 FROM canon_state s
                     WHERE s.host = %(a)s.host AND s.canon = coalesce(%(a)s.canon, '')
                       AND s.status = 'ok')
            AND coalesce(%(a)s.placement_ok, false)
            AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
                    %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
-                   %(a)s.credential_mode))))""" % {
-        "governed": canon_governed_sql(a), "a": a}
+                   %(a)s.credential_mode))))"""
+    return sql % {"governed": canon_governed_sql(a), "a": a}
 
 
 def placement_admitted_sql(alias: str = "agent_registry") -> str:
@@ -195,6 +205,12 @@ def name_lock_key(name: str) -> str:
 # --------------------------------------------------------------------------
 
 class Agents(interface.Agents):
+
+    def operator_pause(self, name, *, paused, reason, actor, principal) -> dict | None:
+        rows = self.db.query(
+            "SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",
+            (name, paused, reason, actor, principal))
+        return rows[0] if rows else None
 
     def upsert(self, name, *, chantier, harness, host, cwd, session_id, status,
                status_text, model, budget_usd, mode=None) -> dict:
@@ -308,6 +324,8 @@ class Agents(interface.Agents):
                    canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
+                   p.operator_paused, p.operator_pause_reason, p.operator_pause_by,
+                   p.operator_pause_for, p.operator_pause_ts,
                    __GOVERNED__ AS canon_governed,
                    (SELECT s.status FROM canon_state s WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_status,
@@ -319,6 +337,12 @@ class Agents(interface.Agents):
                        AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
                    __CLAIM_OK__ AS canon_claim_ok
             FROM agent_mesh_overview o
+            LEFT JOIN LATERAL (
+                SELECT operator_paused, operator_pause_reason, operator_pause_by,
+                       operator_pause_for,
+                       extract(epoch from operator_pause_at)::float8 AS operator_pause_ts
+                  FROM agent_registry WHERE name = o.name
+            ) p ON true
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
                .replace("__CLAIM_OK__", canon_claim_predicate_sql("o"))
@@ -557,7 +581,9 @@ class Leases(interface.Leases):
         """
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
-        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
+        # L232b : réclamation d'un agent nommé (pas de tour du contrôleur) —
+        # seul l'agent sonde de la fermeture de release rouvre la condition.
+        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True))
         rows = self.db.query(sql, (name, owner, ttl_seconds, owner, owner, owner, owner))
         return rows[0] if rows else None
 
@@ -847,7 +873,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, handoff_fenced, pending_prompt, lease_owner, lease_epoch,
+                SELECT name, status, handoff_fenced, operator_paused, pending_prompt, lease_owner, lease_epoch,
                        lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
@@ -861,8 +887,9 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.pending_prompt IS NOT NULL
+               AND NOT verrou.operator_paused
                AND NOT verrou.handoff_fenced
-               AND ameesh_host_claims_open(r.host)
+               AND ameesh_agent_claims_open(r.host, r.name)
                AND verrou.status <> 'stopped'
                AND verrou.lease_expires_at > clock_timestamp()
             RETURNING verrou.pending_prompt
@@ -875,7 +902,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, handoff_fenced, lease_owner, lease_epoch, lease_expires_at
+                SELECT name, status, handoff_fenced, operator_paused, lease_owner, lease_epoch, lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -885,7 +912,8 @@ class Leases(interface.Leases):
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
                AND NOT verrou.handoff_fenced
-               AND ameesh_host_claims_open(r.host)
+               AND NOT verrou.operator_paused
+               AND ameesh_agent_claims_open(r.host, r.name)
                AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
             RETURNING r.name
             """,
@@ -903,6 +931,8 @@ class Leases(interface.Leases):
                        ELSE current_prompt || E'\n\n' || pending_prompt
                    END,
                    current_prompt = NULL,
+                   status = CASE WHEN operator_paused AND status = 'running'
+                                 THEN 'queued' ELSE status END,
                    updated_at = now()
              WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
                AND current_prompt IS NOT NULL

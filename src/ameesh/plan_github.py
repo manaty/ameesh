@@ -75,6 +75,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import weakref
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -345,6 +346,80 @@ def _atomic_write(path: str, data: dict) -> None:
         raise
 
 
+def reads_scope(base: str | None, token: str | None = None) -> str:
+    """La portée du cache partagé (#848, N4) : la base d'API et une empreinte
+    non réversible du client (le jeton). Deux bases ou deux jetons ne se
+    partagent plus les mêmes entrées, même sur un état d'hôte commun ; le
+    jeton lui-même n'entre jamais dans une clé ni dans un fichier."""
+    digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:12] \
+        if token else "anon"
+    return "%s|%s" % (str(base or API_BASE).rstrip("/"), digest)
+
+
+#: instances vivantes du processus : leurs compteurs en mémoire restent
+#: visibles (`counters`) et partent une fois à la fin du passage (N3) —
+#: jamais un verrou et une réécriture par hit de cache.
+_LIVE_READS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _merge_counters(data: dict, pending: dict, clock) -> list[str]:
+    """Fusionne `pending` dans `data["counters"]` ; rend les noms fusionnés."""
+    counters = data.setdefault("counters", {})
+    if not isinstance(counters, dict):
+        counters = data["counters"] = {}
+    merged = []
+    for name, n in pending.items():
+        counters[name] = int(counters.get(name) or 0) + int(n)
+        merged.append(name)
+    if merged:
+        counters["updated"] = float(clock())
+    return merged
+
+
+def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> None:
+    """Écrit une fois les compteurs en mémoire dans `quota.json` (N3).
+
+    Un état d'hôte disparu (dossier temporaire nettoyé, poste effacé) n'est
+    pas ressuscité pour y écrire des compteurs. Jamais bloquant : une panne
+    (droits, disque) laisse `pending` intact pour le prochain essai."""
+    if not pending:
+        return
+    if not os.path.isdir(state_dir):
+        return
+    for directory in (root, os.path.join(root, "reads")):
+        with contextlib.suppress(OSError):
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+    if not os.path.isdir(root):
+        return
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    merged = False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = {}
+        try:
+            with open(quota_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+        _merge_counters(data, pending, clock)
+        _atomic_write(quota_path, data)
+        merged = True
+    except (OSError, ValueError):
+        merged = False
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    if merged:
+        for name in list(pending):
+            pending.pop(name, None)
+
+
 class SharedReads:
     """Cache disque et quota GitHub partagés par les processus d'un hôte (#848).
 
@@ -365,18 +440,39 @@ class SharedReads:
     Le cache ne garde que des réponses JSON de l'API, jamais le jeton ;
     racine 0700, fichiers 0600, écriture atomique. Une panne du cache
     (disque plein, droits) ne fait jamais échouer une lecture : elle la
-    laisse simplement repayée."""
+    laisse simplement repayée.
+
+    N1 : une construction ou une lecture ne crée aucun dossier — le cache
+    naît à sa première écriture, et un `state_dir` vide est refusé plutôt
+    que de fabriquer un chemin relatif. N3 : les compteurs s'agrègent en
+    mémoire et s'écrivent une fois par passage (`flush`, fin de processus),
+    jamais un verrou par hit. N4 : la clé d'une entrée porte la base d'API
+    et une empreinte non réversible du jeton."""
 
     def __init__(self, state_dir, *, clock=time.time, ttl: float = READS_TTL,
-                 max_entries: int = READS_MAX):
-        self.root = os.path.join(str(state_dir), READS_DIR)
+                 max_entries: int = READS_MAX, scope: str = ""):
+        state_dir = str(state_dir or "").strip()
+        if not state_dir:
+            raise ValueError("state_dir is required for the shared reads cache")
+        self.state_dir = state_dir
+        self.root = os.path.join(state_dir, READS_DIR)
         self.clock = clock
         self.ttl = float(ttl)
         self.max_entries = int(max_entries)
+        self.scope = str(scope or "")
         self._reads_dir = os.path.join(self.root, "reads")
         self._quota_path = os.path.join(self.root, "quota.json")
         self._lock_path = os.path.join(self.root, ".lock")
         self._stores = 0
+        self._pending: dict = {}
+        _LIVE_READS.add(self)
+        # N3 : les compteurs en attente partent une fois, à la fin du passage
+        # (objet libéré ou processus terminé), sans ressusciter un état disparu.
+        weakref.finalize(self, _write_counters, self.state_dir, self.root,
+                         self._lock_path, self._quota_path, self._pending, self.clock)
+
+    def _ensure_dirs(self) -> None:
+        """La racine du cache (0700), créée avant une écriture, jamais pour lire."""
         for directory in (self.root, self._reads_dir):
             with contextlib.suppress(OSError):
                 os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -395,7 +491,12 @@ class SharedReads:
 
     # -- entrées du cache ---------------------------------------------------
     def _entry_path(self, path: str) -> str:
-        digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:40]
+        """La clé d'une entrée : la portée (base, client) puis le chemin REST.
+
+        N4 : deux bases d'API ou deux jetons ne partagent plus la même entrée
+        de cache sur un état commun ; le jeton n'apparaît que par empreinte."""
+        digest = hashlib.sha256(
+            ("%s\n%s" % (self.scope, path)).encode("utf-8")).hexdigest()[:40]
         return os.path.join(self._reads_dir, digest + ".json")
 
     def cached(self, path: str) -> ReadEntry | None:
@@ -421,6 +522,7 @@ class SharedReads:
     def store(self, path: str, value, *, etag: str | None = None,
               read_ts=None) -> None:
         now = float(self.clock() if read_ts is None else read_ts)
+        self._ensure_dirs()
         try:
             _atomic_write(self._entry_path(path),
                           {"path": path, "value": value, "etag": etag or None,
@@ -484,20 +586,40 @@ class SharedReads:
                 if isinstance(quota, dict)}
 
     def counters(self) -> dict:
+        """Les compteurs partagés : le disque, plus ceux encore en mémoire dans
+        ce processus pour le même cache (`_LIVE_READS`)."""
         counters = self._load().get("counters")
-        return dict(counters) if isinstance(counters, dict) else {}
+        merged = dict(counters) if isinstance(counters, dict) else {}
+        for reads in list(_LIVE_READS):
+            if reads.root != self.root:
+                continue
+            for name, n in reads._pending.items():
+                merged[name] = int(merged.get(name) or 0) + int(n)
+        return merged
+
+    def _merge_pending(self, data: dict) -> list[str]:
+        """Fusionne les compteurs en mémoire dans `data` ; rend leurs noms."""
+        return _merge_counters(data, self._pending, self.clock)
 
     def count(self, name: str, n: int = 1) -> None:
-        """Un compteur partagé (hits, stale, refused…) ; jamais bloquant."""
+        """Un compteur partagé (hits, stale, refused…) ; jamais bloquant.
+
+        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (ou la fin
+        du processus) fait une seule écriture par passage, au lieu d'un verrou
+        et d'une réécriture de `quota.json` à chaque hit de cache."""
         try:
-            with self._locked():
-                data = self._load()
-                counters = data.setdefault("counters", {})
-                counters[name] = int(counters.get(name) or 0) + int(n)
-                counters["updated"] = float(self.clock())
-                _atomic_write(self._quota_path, data)
-        except (OSError, ValueError):
+            key = str(name)
+            self._pending[key] = self._pending.get(key, 0) + int(n)
+        except (TypeError, ValueError):
             return
+
+    def flush(self) -> None:
+        """Écrit une fois les compteurs agrégés depuis le dernier `flush` (N3).
+
+        Sans compteur en attente, ne touche à rien. Une panne (droits, disque)
+        laisse les compteurs en mémoire : le prochain passage réessaiera."""
+        _write_counters(self.state_dir, self.root, self._lock_path,
+                        self._quota_path, self._pending, self.clock)
 
     def note(self, headers, *, status: int, now=None) -> float | None:
         """Enregistre le quota lu dans les en-têtes, compte la requête.
@@ -512,9 +634,11 @@ class SharedReads:
         retry = _int_or_none(header_of(headers, "Retry-After"))
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
             or DEFAULT_RESOURCE
+        self._ensure_dirs()
         try:
             with self._locked():
                 data = self._load()
+                merged = self._merge_pending(data)
                 quotas = data.setdefault("quota", {})
                 if not isinstance(quotas, dict):
                     quotas = data["quota"] = {}
@@ -540,6 +664,8 @@ class SharedReads:
                 quota["blocked_until"] = blocked if blocked > now else 0.0
                 quota["checked"] = now
                 _atomic_write(self._quota_path, data)
+                for name in merged:
+                    self._pending.pop(name, None)
                 return quota["blocked_until"] or None
         except (OSError, ValueError):
             return None
@@ -572,7 +698,8 @@ class Api:
         self.last_read: ReadMeta | None = None
         self.clock = clock
         self.reads = reads if reads is not None else (
-            SharedReads(cache_dir, clock=clock, ttl=ttl) if cache_dir else None)
+            SharedReads(cache_dir, clock=clock, ttl=ttl,
+                        scope=reads_scope(self.base, self.token)) if cache_dir else None)
         self._open = opener or urllib.request.urlopen
 
     def _request_headers(self, path: str, entry: ReadEntry | None) -> dict:
@@ -714,8 +841,11 @@ def client(*, env=None, gh: str | None = None, timeout: float = 60.0,
     appelé et l'appelant dit le manque. `cache_dir` (l'état de l'hôte) active
     le cache et le quota partagés (#848) ; sans lui, rien n'est gardé."""
     env = os.environ if env is None else env
-    reads = SharedReads(cache_dir, clock=clock, ttl=ttl) if cache_dir else None
-    if token_of(env):
+    token = token_of(env)
+    reads = SharedReads(cache_dir, clock=clock, ttl=ttl,
+                        scope=reads_scope(env.get("GITHUB_API_URL"), token)) \
+        if cache_dir else None
+    if token:
         return Api(env=env, timeout=timeout, reads=reads, ttl=ttl, clock=clock)
     if not allow_gh:
         return None
@@ -731,7 +861,11 @@ def quota_stats(state_dir) -> dict:
     """Le quota et les compteurs partagés de l'hôte (#848), pour les vues.
 
     Rend `{"quota": {ressource: {...}}, "counters": {...}}`, vide sans cache
-    encore écrit : `core` et `graphql` ne se confondent pas."""
+    encore écrit : `core` et `graphql` ne se confondent pas. Un `state_dir`
+    vide est refusé (N1) : la vue ne fabrique pas de chemin relatif, et une
+    lecture ne crée aucun dossier."""
+    if not str(state_dir or "").strip():
+        return {"quota": {}, "counters": {}}
     reads = SharedReads(state_dir)
     return {"quota": reads.quotas(), "counters": reads.counters()}
 
@@ -801,11 +935,17 @@ def _iso_ts(text: str | None) -> float | None:
 
 
 def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
-                   by_issue: dict | None = None):
+                   by_issue: dict | None = None, *, union_packages: bool = False):
     """Les lots qu'une PR désigne : lignes `ameesh-work:`, `Closes #n` (via
     `issue_ref`), fiches (`packages_of_pr`), et branche `lot/<id>-…` d'un
     dépôt même sans fiche. Rend `(targets, by_issue)` — `by_issue` n'est
-    construit qu'à la demande (une fois par relevé)."""
+    construit qu'à la demande (une fois par relevé).
+
+    #1693 (N2) : `union_packages` ajoute les lots des fiches nommées à ceux
+    des lignes explicites au lieu de les ignorer. La rétention d'une PR
+    ouverte (`open_lots`) couvre ainsi toute la fiche qu'elle livre, même si
+    elle ne nomme qu'un de ses lots ; la fermeture, elle, reste précise et
+    garde la ligne explicite pour seul verdict (`union_packages=False`)."""
     explicit = work_items_of_pr(pr)
     closes = issues_of_pr(pr, repo)
     if closes:
@@ -825,19 +965,49 @@ def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
             if item is None or not item.get("branch") \
                     or short_branch(item["branch"]) == pr["headRefName"]:
                 explicit = [int(head.group(1))]
-    if explicit:
+    if explicit and not union_packages:
         return [(i, None) for i in explicit], by_issue
-    return ([(int(item["id"]), pid) for pid in packages
-             for item in st.work.by_package(pid)], by_issue)
+    package_targets = [(int(item["id"]), pid) for pid in packages
+                       for item in st.work.by_package(pid)]
+    if explicit:
+        targets = [(i, None) for i in explicit]
+        seen = {i for i, _pid in targets}
+        return targets + [(i, pid) for i, pid in package_targets if i not in seen], by_issue
+    return package_targets, by_issue
 
 
-def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None) -> str | None:
+#: #1693 (N3) : profondeur de journal relue avant de reposer un constat
+#: `stage merged` — une note intercalée ne doit pas faire réécrire le même
+#: constat, sans relire tout le journal d'un lot à chaque relevé.
+_STAGE_DEDUP_EVENTS = 50
+
+#: #1693 (N1) : préfixe de la note qui annule une fusion (work.CORRECTIONS).
+_ANNULMENT_NOTE = "correction: merged → build"
+
+
+def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None,
+                  ref: str = "", *, annulled_ts: float | None = None,
+                  merged_ts: float | None = None) -> str | None:
     """#759 : pourquoi une PR fusionnée NE ferme PAS ce lot (None : elle ferme).
 
     Une PR qui se déclare finale pour le lot (`ameesh-work: <id> final`) ferme
     toujours. Sinon le lot reste ouvert si une PR ouverte le désigne encore,
     ou si sa branche déclarée n'est pas celle de la PR fusionnée (autre étape,
-    gel en attente) : son journal porte alors `stage merged`."""
+    gel en attente) : son journal porte alors `stage merged`.
+
+    #1693 (N1) : une PR fusionnée avant la DERNIÈRE correction `merged → build`
+    du lot (`annulled_ts`, vue cx2) ne le referme pas, même déclarée finale :
+    sa fusion a été annulée, et le lot attend un transport fusionné APRÈS la
+    correction. Le critère d'instant couvre les corrections répétées, qu'un
+    simple `pr_ref` laisserait passer (il ne porte que la dernière PR fermante,
+    pas l'historique) ; l'égalité `pr_ref == ref` reste le repli quand la date
+    de fusion manque."""
+    if annulled_ts is not None and merged_ts is not None and merged_ts <= annulled_ts:
+        return ("stage merged: PR %s — fusion antérieure à la dernière correction "
+                "merged → build, transport suivant attendu" % ref)
+    if ref and (item.get("pr_ref") or "") == ref:
+        return ("stage merged: PR %s a déjà fermé ce lot (rouvert depuis), "
+                "transport suivant attendu" % ref)
     if int(item["id"]) in final_lots(pr.get("body")):
         return None
     reasons = []
@@ -881,7 +1051,16 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     #759 : une PR fusionnée ne ferme un lot que si aucune autre PR ouverte ni
     branche déclarée du lot n'y reste liée, sauf si elle se déclare finale
     pour ce lot (`ameesh-work: <id> final`) ; sinon le lot reste ouvert et son
-    journal porte `stage merged`."""
+    journal porte `stage merged`. #1693 (N1) : la PR qui a déjà fermé le lot
+    (rouvert par correction `merged → build`) ne le referme pas.
+
+    #1693 (N2) : une PR qui nomme une **fiche** (branche `lot/<fiche>-…` ou
+    ligne `ameesh-lot: <fiche>`) désigne tous les lots de la fiche, à la
+    fermeture comme à la rétention — une PR de fiche ouverte retient donc ses
+    lots jusqu'à sa fusion, et sa fusion les ferme tous. C'est la contrepartie
+    voulue de la livraison par fiche (`packages_of_pr`, L29) ; le relevé ne
+    réduit pas cette portée à la fiche.
+    """
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
                      "--json", "number,headRefName,isCrossRepository,body,state,mergeCommit,mergedBy,"
@@ -891,13 +1070,25 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     open_prs = open_prs_of_repo(gh, repo)
     st = storage.of(db)
     idents = [p["id"] for p in st.packages.all() if p.get("kind") in work_mod.LINKABLE_KINDS]
+    # #1693 (N1, cx2) : une PR fusionnée AVANT la dernière correction
+    # `merged → build` d'un lot ne peut plus le fermer — sa fusion a été
+    # annulée, quel que soit le nombre de corrections et de transports depuis
+    # (le seul `pr_ref` ne porte que la dernière PR, pas l'historique). Un
+    # relevé global suffit : les corrections sont rares (`work.CORRECTIONS`).
+    annulled: dict[int, float] = {}
+    for ev in st.work.events_noted(_ANNULMENT_NOTE, 0.0):
+        if ev.get("state") == "build":
+            item_id = int(ev["work_item_id"])
+            annulled[item_id] = max(annulled.get(item_id, 0.0),
+                                    float(ev.get("created_ts") or 0.0))
     results: list[dict] = []
     by_issue: dict | None = None
     # #759 : les lots encore désignés par une PR ouverte ne se ferment pas
     open_lots: dict[int, list[str]] = {}
     for pr in sorted(open_prs, key=lambda p: int(p.get("number") or 0)):
         ref = "%s#%s" % (repo, pr.get("number"))
-        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
+        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue,
+                                           union_packages=True)
         # L118b : une PR ouverte qui ne livre qu'une partie du lot le retient
         # aussi — `ameesh-work-partial:` n'est pas une ligne `ameesh-work:`,
         # elle n'apparaît donc pas dans `targets` (#759, incident #147).
@@ -928,15 +1119,22 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                 entry.update(result="later", detail="work item created after the merge: not closed")
             else:
                 # #759 : un lot encore lié (PR ouverte, autre branche déclarée)
-                # n'est pas fermé par cette PR ; un lot déjà fermé suit son sort
-                text = (_stage_reason(item, pr, open_lots.get(item_id))
+                # n'est pas fermé par cette PR ; un lot déjà fermé suit son sort.
+                # #1693 (N1) : pas non plus par une fusion antérieure à la
+                # dernière correction merged → build (voir `_stage_reason`).
+                text = (_stage_reason(item, pr, open_lots.get(item_id), ref,
+                                      annulled_ts=annulled.get(item_id),
+                                      merged_ts=merged_ts)
                         if item["state"] not in work_mod.MERGED_STATES
                         and item["state"] != "closed" else None)
                 if text:
                     if not dry_run:
-                        # un relevé répété ne remplit pas le journal du même constat
-                        previous = work_mod.events(db, item_id, 1)
-                        if not previous or previous[0].get("note") != text:
+                        # #1693 (N3) : un relevé répété ne répète pas le même
+                        # constat, même si une autre note s'est intercalée depuis
+                        # (relance, correction) — la dédup lit le journal récent,
+                        # pas seulement sa dernière ligne.
+                        recent = work_mod.events(db, item_id, _STAGE_DEDUP_EVENTS)
+                        if not any((e.get("note") or "") == text for e in recent):
                             work_mod.note(db, item_id, text, actor=actor)
                     entry.update(result="stage-merged",
                                  detail=text + (" (dry run)" if dry_run else ""))

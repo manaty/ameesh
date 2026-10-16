@@ -1,23 +1,23 @@
 ---
 type: Exploration
 status: exploration
-title: "Provisionnement d’ameesh-approve hébergé"
+title: "Provisioning a hosted ameesh-approve"
 ---
 
-# Provisionnement d’ameesh-approve hébergé
+# Provisioning a hosted ameesh-approve
 
-## Problème
+## Problem
 
-Les modes hébergés d’ameesh-approve demandent une installation cohérente par équipe, avec domaine, état et identité isolés. Le code de passerelle, le TLS local et le rôle de lecture seule existent déjà ; leur présence ne prouve pas que les offres hébergées sont déployées.
+The hosted modes of ameesh-approve require a consistent installation per team, with an isolated domain, state and identity. The gateway code, the local TLS and the read-only role already exist; their presence does not prove that the hosted offerings are deployed.
 
 ## Intuitions
 
-Distinguer les primitives existantes du provisionnement côté hébergeur pourrait clarifier le choix entre relais depuis un PC, page dédiée et serveur propre. Une préparation réversible pourrait préserver le RP ID et laisser l’enrôlement à l’humain.
+Separating the existing primitives from provisioning on the provider's side could clarify the choice between a relay from a PC, a dedicated page and a dedicated server. A reversible preparation could preserve the RP ID and leave enrolment to the human.
 
-## Questions ouvertes
+## Open questions
 
-- Quel état doit appartenir à l’équipe plutôt qu’à son hébergeur ?
-- Comment constater une installation incomplète et reprendre sans fusionner deux identités ?
-- Quelles preuves permettent de distinguer code disponible et service réellement actif ?
+- Which state should belong to the team rather than to its provider?
+- How can an incomplete installation be noticed and resumed without merging two identities?
+- Which evidence tells available code apart from a service that is actually running?
 
-Contexte existant : [Contrat des trois modes d’hébergement](../ameesh-approve-hebergement-equipes.md), [Étude du provisionnement des hôtes](../etudes/l232-autonomous-host-provisioning.md). Ces références éclairent la question ; elles ne promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Contract of the three hosting modes](../ameesh-approve-hebergement-equipes.md), [Study of host provisioning](../etudes/l232-autonomous-host-provisioning.md). These references inform the question; they do not promote this card to a study or to decided work.

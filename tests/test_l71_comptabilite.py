@@ -19,6 +19,7 @@ import json
 import os
 import time
 import unittest
+from unittest import mock
 
 from ameesh import accounts, balance, cost, registry
 
@@ -31,6 +32,13 @@ from .test_l30_accounts import _Base as ComptesBase, _codex_rollout
 def _rate_limit(used: float, resets_at: float) -> dict:
     return {"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
         "five_hour": {"utilization": used, "resetsAt": resets_at}}}}
+
+
+def _rate_limit_overage(used: float, resets_at: float) -> dict:
+    """Un relevé Claude qui déclare l'overage (L226b) : les deux drapeaux."""
+    event = _rate_limit(used, resets_at)
+    event["rate_limit_info"].update(overageStatus="allowed", isUsingOverage=True)
+    return event
 
 
 class HarnaisDuRegistreTest(Sandbox, PgTestCase):
@@ -59,6 +67,37 @@ class HarnaisDuRegistreTest(Sandbox, PgTestCase):
     def test_un_harnais_connu_autre_que_claude_est_ignore(self):
         self.events("d1", _rate_limit(0.99, self.now + 3600))
         self.assertEqual(self.book().claude_gauges(), [])
+
+    def test_jauges_claude_toujours_un_gauges_jamais_une_liste_nue(self):
+        """#1661 : chaque chemin de `claude_gauges` rend un `Gauges` (liste +
+        `overage`) : le chemin vide comme le chemin par compte, servi par le
+        journal ou par le cache d'observations, qui doit garder l'overage."""
+        vide = self.book().claude_gauges()
+        self.assertIsInstance(vide, cost.Gauges)
+        self.assertEqual(vide, [])
+        self.assertIsNone(vide.overage)
+        self.assertIsInstance(self.book().claude_gauges("c1", "c1"), cost.Gauges)
+
+        self.events("c2", _rate_limit_overage(0.42, self.now + 3600))
+        book = self.book()
+        direct = book.claude_gauges()
+        self.assertIsInstance(direct, cost.Gauges)
+        self.assertTrue(direct.overage.capable)
+        self.assertTrue(direct.overage.in_use)
+        with mock.patch.object(cost, "_claude_account_tail",
+                               wraps=cost._claude_account_tail) as read:
+            par_compte = book.claude_gauges("c2", "c2")      # lit le journal
+            encore = book.claude_gauges("c2", "c2")          # servi par le cache
+            self.assertEqual(read.call_count, 1)
+        for gauges in (par_compte, encore):
+            self.assertIsInstance(gauges, cost.Gauges)
+            self.assertEqual([round(g.used, 2) for g in gauges], [0.42])
+            self.assertTrue(gauges.overage.capable)
+            self.assertTrue(gauges.overage.in_use)
+        encore.clear()                       # la copie rendue est à l'appelant
+        garde = book.claude_gauges("c2", "c2")
+        self.assertEqual([round(g.used, 2) for g in garde], [0.42])
+        self.assertTrue(garde.overage.in_use)
 
     def test_cost_report_harnais_du_registre_et_dossiers_hors_agents(self):
         os.makedirs(os.path.join(self.state, "fils"), exist_ok=True)

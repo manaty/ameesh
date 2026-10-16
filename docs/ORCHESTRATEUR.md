@@ -58,7 +58,10 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   parente), sinon son application (`--app`). Un lot sans équipe connue
   attend l'orchestrateur.
 * Ordre : priorité, puis dates prévues (début, fin, livraison), puis
-  ancienneté. Un orchestrateur ne se sert pas lui-même.
+  ancienneté. Un orchestrateur ne se sert pas lui-même tant qu'un autre
+  preneur est là ; ses candidats passent en dernier et, s'il prend un lot
+  faute d'autre preneur, la note d'attribution porte la trace du repli
+  (#1739).
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
@@ -365,13 +368,23 @@ le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
 commit de fusion et une note qui dit comment la fusion a été constatée.
 
 À la main, quand le relevé ne peut pas la voir (lot sans assigné, autre
-hôte, commit qui ne le désigne pas) :
+hôte), depuis un clone du dépôt du lot :
 
 ```
-ameesh work merged <id> --sha <commit de fusion> [--note "…"]
+ameesh work merged <id> --sha <commit de fusion> [--repo <clone local>] [--note "…"]
 ```
 
 depuis tout état ouvert, en une fois ; l'acteur est votre identité liée.
+La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
+(ou le dépôt configuré pour son projet), puis le commit dans sa cible.
+Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
+de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
+Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
+pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
+n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
+dossier courant. La lecture reste locale : récupérer la cible au préalable
+si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
@@ -407,6 +420,27 @@ dans le fil du lot. Un échec sort le lot de la file et réveille son agent ;
 l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
+
+## Intégration par paquets §12 : contrôle d'inclusion avant le feu
+
+Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
+lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
+et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
+à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+
+```sh
+scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
+    --head origin/integration/paquet-23h-20261015 \
+    --expected-file "$TMPDIR/admissions-23h.txt"
+```
+
+Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
+composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
+ne suffit pas après un revert (#1638). Sans liste attendue, il sort `2`, sauf
+`--no-expected` qui assume le contrôle partiel. Un contenu *partiel* ou *vide*
+est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
+bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
+`docs/PAQUET-INCLUSION.md`.
 
 ## Le lot en cours
 
@@ -583,7 +617,10 @@ relis :
 ## Livraison et déploiements
 
 Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
-restée 4 h fusionnée sans être déployée :
+restée 4 h fusionnée sans être déployée, actualisées selon le
+[canon « Processus de lot » §14](https://github.com/manaty/home/blob/c838dd3e94bf/processus/lots.md#14-staging-et-prod-dameesh)
+(owner, 2026-10-14 vers 02:45, session bureau Claude
+`17076001-2b29-414c-a288-06791a5d9719`), source unique :
 
 1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
    propriétaire se fusionne avant tout nouveau chantier.
@@ -592,23 +629,33 @@ restée 4 h fusionnée sans être déployée :
    `deploy/mise-a-jour` (vérifier, sauvegarder, migrer, installer, redémarrer
    hors tour, contrôler, retour possible). Le propriétaire et les agents
    touchés sont prévenus après coup.
-3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,
+3. **Le staging d'ameesh se déploie sans go du propriétaire ni procédure de
+   release**, y compris sur pc-smichea, pour une nouvelle fonction, une version
+   mineure ou une migration additive. Suivre `deploy/mise-a-jour/` : migrations
+   additives avant de relancer les exécuteurs, VM d'agents d'abord, pc-smichea
+   en dernier et seulement si les VM sont saines (runners redémarrés publiant
+   leur vivacité, `ameesh doctor` vert et courrier test livré). Un hôte malsain
+   revient à la version précédente (étape `retour`) et le déploiement s'arrête.
+   Les hôtes ameesh-agents-1, ameesh-agents-2, manaty-mesh-1 et pc-smichea sont
+   le staging ; la prod est une installation utilisée hors du mesh qui construit
+   ameesh. **Un déploiement en prod se prépare entièrement** (nouvelle fonction,
    version mineure, migration qui change le comportement) : étiquette posée,
    `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
-   verifier <REF>` passés, plan de retour connu (étape `retour`). Ils sont
-   proposés au propriétaire dès son retour, en premier point, avec les choix
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Il est
+   proposé au propriétaire dès son retour, en premier point, avec les choix
    possibles : version seule ou `main` entier, migrations, risques. Une
-   consigne de veille ne se contente jamais d'interdire « tout déploiement »
-   sans le préparer. Les gestes en production d'un projet, les dépenses et les
+   consigne de veille prépare le staging sans lui appliquer cette attente.
+   Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
    packages, review before CI, sober proofs (canon « Processus de lot » §§3, 6,
    12) — and changes only through a reviewed commit.
-4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
-   un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
-   d'exécuteur du poste le lance dans une unité systemd distincte :
+4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
+   exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
+   Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance
+   donc dans une unité systemd distincte :
    `systemd-run --user --unit=ameesh-redemarrer-$(date +%s) bash
    deploy/mise-a-jour/poste.sh redemarrer <REF>`. Un `setsid` ou un `nohup`
    ne suffit pas : le script reste dans le groupe de contrôle de l'unité de

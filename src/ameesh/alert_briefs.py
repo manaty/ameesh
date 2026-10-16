@@ -29,7 +29,11 @@ from . import sous_utilisation
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
-                 "critical_budget_pause", "idle_actionable_lot", "slo_breach")
+                 "critical_budget_pause", "idle_actionable_lot", "slo_breach",
+                 # #1466 : une pause qui dure est un plafond périmé, un compte
+                 # retiré ou une configuration que l'exécuteur ne lit pas ; les
+                 # orchestrateurs peuvent vérifier, l'auditeur suit
+                 "budget_pause_long")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -132,12 +136,19 @@ def _stale_lot(alert: dict) -> str:
     hold = ("if the lot is parked on another open lot, declare the dependency that stops "
             "the reminders (the alert stops while the wait is planned): "
             "ameesh work dependencies %d --add <blocker>" % lot)
+    # #1664 : une porte hors mesh (fenêtre opérateur, décision humaine sans
+    # demande ouverte) n'est portée par aucun lot ; le pilote la consigne en
+    # hold, qui éteint la relance comme une dépendance déclarée.
+    park = ("if it is parked on a gate no open lot carries (operator window, human "
+            "decision), the pilot records the hold that stops the reminders: "
+            "ameesh work note %d \"hold: <reason>\" (the pilot lifts it with an "
+            "\"unhold: <reason>\" note or a state change)" % lot)
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
-            "--sha <reviewed head>; %s; otherwise %s; if it is no longer needed: ameesh work "
+            "--sha <reviewed head>; %s; %s; otherwise %s; if it is no longer needed: ameesh work "
             "close %d --abandoned (or --superseded-by <id>)."
-            % (head, lot, lot, hold, move, lot))
+            % (head, lot, lot, hold, park, move, lot))
 
 
 def _plan_underused(alert: dict) -> str:
@@ -238,6 +249,17 @@ def _critical_budget_pause(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _budget_pause_long(alert: dict) -> str:
+    """#1466 : une pause budget qui dure n'est plus ordinaire. Aux
+    orchestrateurs de l'équipe et aux auditeurs."""
+    return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
+            "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
+            "the runner reads (ameesh doctor; a profile can diverge from the host's "
+            "config.json); free an account, fix the profile, or have the runner restart, "
+            "then `ameesh resume` the agent if its runner is not live."
+            % (alert.get("detail") or "?"))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
     des lots démarrables ouverts sans agent, l'écart est le sien (L165b,
@@ -258,9 +280,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné — ou du projet du lot quand aucun relecteur n'est
-    désigné (#705) ; `plan_underused`, ceux des équipes des agents au
-    repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
+    l'équipe de l'assigné (sinon celle du lot, #917) — ou du projet du lot
+    quand aucun relecteur n'est désigné (#705) ; `plan_underused`, ceux des
+    équipes des agents au repos ; `estimate_bias` (L157b), ceux de l'équipe de
+    l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
     relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
@@ -322,6 +345,13 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
             text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
             teams = _projects(by_name, alert.get("agent"))
+            if not teams:
+                # #917 : sans assigné connu, le projet du lot — sinon un lot
+                # ameesh réveillerait les orchestrateurs nexlink, et
+                # inversement (une alerte reçue pousse à assigner, ce qui
+                # entretient la liste des orchestrateurs par historique).
+                # `lot_team` reste lu pour les alertes d'avant L243.
+                teams = {(alert.get("project") or alert.get("lot_team") or "").strip()} - {""}
             if reviewer and str(reviewer) in by_name:
                 extra[str(reviewer)] = _verdict_due(alert)
         elif kind == "estimate_bias":
@@ -332,6 +362,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             teams = _projects(by_name, alert.get("agent"))
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
+            teams = _projects(by_name, alert.get("agent"))
+        elif kind == "budget_pause_long":
+            # #1466 : meme routage que `critical_budget_pause` ; L243 : les
+            # projets de l'agent (`_projects`), pas l'ancien `_team`.
+            text = _budget_pause_long(alert)
             teams = _projects(by_name, alert.get("agent"))
         else:
             text = _plan_underused(alert)
@@ -354,7 +389,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     if kind != "stale_lot":
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
-    if kind == "critical_budget_pause":
+    if kind in ("critical_budget_pause", "budget_pause_long"):
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     return out
 

@@ -30,6 +30,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -154,9 +155,14 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         # L85 (#373) : `sweep` prune le journal d'événements après la moisson
         # des baux — la doublure doit fournir le point d'entrée, borné ici.
         fake.prune_events_once = lambda *args, **kwargs: None
+        # #1425 (N2, suite #753) : le dessaisissement des agents arrêtés vient
+        # APRÈS les gardes — sous code périmé, l'exécuteur ne touche pas la
+        # file. Seule la reprise est arrêtée ici, et le dessaisissement aussi.
+        fake.release_stopped_lots_once = mock.Mock(return_value=[])
         with mock.patch.object(registry, "reap", return_value=[]), \
                 mock.patch.object(registry, "claimable") as claimable:
             runner_mod.Runner.sweep(fake)
+        fake.release_stopped_lots_once.assert_not_called()
         claimable.assert_not_called()
 
 
@@ -170,8 +176,19 @@ class SelectedTurnRefusedTest(unittest.TestCase):
     def test_run_turn_remet_la_consigne_et_refuse(self):
         runner = types.SimpleNamespace(
             draining=threading.Event(), restart_for_stale=True, runner_id="runner-1")
+        # #290 : `run_turn` refuse l'attach et prend le verrou de session
+        # avant le tour ; la doublure les satisfait sans E/S (le refus périmé
+        # testé reste dans `_run_guarded_turn`).
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
         worker = types.SimpleNamespace(
-            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True)
+            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
+            _attach_pending=lambda: False, _session_lock=mock.Mock(),
+            resident=object(), state_dir=state_dir.name)
+        # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
+        # la doublure porte la vraie logique de tour et une enveloppe inerte.
+        worker._run_guarded_turn = types.MethodType(
+            runner_mod.AgentWorker._run_guarded_turn, worker)
         with mock.patch.object(registry, "restore_prompt", return_value=True) as restore, \
                 mock.patch.object(registry, "set_status") as set_status:
             self.assertFalse(runner_mod.AgentWorker.run_turn(worker, {}))

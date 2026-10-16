@@ -95,6 +95,56 @@ including entries queued before normalization was introduced.
 Landing also requires the queue entry’s normalized source to match the selected
 project’s repository. A different or missing source refuses landing before any
 lock or queue mutation; select the correct project or requeue a legacy entry.
+
+`ci_parts` closes the completeness hole of that reading (L1651/#1650). A part
+the change set makes **due but that was never dispatched** leaves no status at
+all: a non-empty rollup of green statuses reads green, and the missing part is
+invisible — measured on a frozen head older than the plan job that announces
+the due parts (Nexlink #1368/#1470, five parts due, one dispatched). With
+`ci_parts` declared, the exact set of due parts is **recomputed**, not deduced
+from the statuses present:
+
+```json
+{
+  "ci_parts": {
+    "selector": "scripts/ci/lot-plan.mjs",
+    "rev": "develop",
+    "argv": ["node", "{selector}", "--files", "{files}", "--out", "{out}"],
+    "schema": "nexlink-lot-plan/1",
+    "due": "due"
+  }
+}
+```
+
+`selector` is repository-relative and read at the commit `rev` names (the
+project target by default); the tree of that commit is extracted with
+`git archive` into a temporary directory, never checked out. The declared
+`argv` runs there, without a shell, with `{selector}`, `{root}` (the extracted
+tree), `{files}` (the frozen head's changed names against the merge base with
+that commit, NUL-separated as `git diff --name-only -z` writes them) and
+`{out}` (the plan) substituted. The plan must carry a non-empty `schema`
+(checked against `schema` when declared) and the `due` field: a list of
+non-empty part contexts, without duplicates. Each due context must exist in
+the reading of the **frozen SHA** and be terminal-success; a part that is
+absent, pending, skipped, cancelled or red refuses admission and ejects a
+queued lot before landing. A status of another commit or an older attempt of
+the same workflow never covers the current one. No fallback: an unreadable
+configuration, a selector absent from the pinned tree, an unknown change set,
+a failing command, a missing, malformed or other-schema plan all refuse.
+
+The contract is the target's, not the branch's: a lot cannot suppress a part
+by editing its own workflows, and an old head that carries no plan job is
+judged against what its target carries today. `ci_parts.rev`, when declared,
+must name the target checked at admission and landing; a divergence refuses
+(the contract of another target proves nothing here). The proof's provenance
+(selector, commit of the target, due parts) is returned with the admission and
+traced in the queue note, for the mechanical canon of the integration train
+(#1467/#1616). A lot whose individual CI is substituted by a §12 package
+manifest is requalified by the caller: `readiness`, `enter` and `land_head`
+accept the due contexts the caller vouches for (`parts=`), and `parts=()`
+disables the per-lot proof for that gesture — the package's full-suite CI is
+then the proof, and no concurrent individual requirement is added.
+
 Authentication uses the host's existing `gh` setup. The local gates then run
 on the actual merged tree before the target push. Trial-ref workflows are a
 separate future option; this configuration uses local gates plus frozen CI.

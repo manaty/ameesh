@@ -190,6 +190,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     """
     requested = item.get("created_ts")
     merged = None
+    merge_corrected = None
     blocks = 0
     prev = None
     ev_freezes: list = []
@@ -208,13 +209,23 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         if prev == "qa" and state in ("build", "merged"):
             ev_verdicts.append((at, "ok" if state == "merged" else "blocked",
                                 ev.get("actor") or None))
-        if state == "merged" and merged is None:
+        if state == "merged" and prev != "promoted":
+            # #1693 (N4) : la DERNIÈRE entrée en merged date la livraison — un
+            # lot rouvert par correction `merged → build` puis refusionné porte
+            # deux transitions, la première annulée. Une correction depuis
+            # promoted conserve, elle, la fusion réelle.
             merged = at
+        elif prev == "merged" and state == "build":
+            # La correction annule aussi les replis depuis le journal et
+            # l'action de fusion confirmée, pas seulement le jalon SQL.
+            merge_corrected, merged = at, None
         if state in _WAITING and prev not in _WAITING:
             blocks += 1
         prev = state
 
-    rows = [r for r in (declared or []) if r.get("at_ts") is not None]
+    rows = [r for r in (declared or []) if r.get("at_ts") is not None
+            and not (r.get("kind") == "merged" and merge_corrected is not None
+                     and r["at_ts"] <= merge_corrected)]
     if any(r.get("kind") in ("frozen", "verdict") for r in rows):
         source = "milestones"
         freezes = [{"at_ts": r["at_ts"], "sha": (r.get("sha") or "").strip()}
@@ -257,7 +268,9 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
             verdicts.append({"at_ts": act["approved_ts"], "kind": "ok",
                              "actor": act.get("auth_approver") or act.get("last_actor") or None,
                              "sha": (act.get("sha") or "").strip()})
-        if act.get("state") == "confirmed" and merged is None:
+        if (act.get("state") == "confirmed" and merged is None
+                and (merge_corrected is None
+                     or (act.get("finished_ts") or 0) > merge_corrected)):
             merged = act.get("finished_ts")
 
     freezes.sort(key=lambda f: f["at_ts"])
@@ -454,6 +467,8 @@ def agent_state(row: dict) -> str:
         return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
+    if row.get("operator_paused") and status not in ("stopped", "dead"):
+        return "paused"
     if status == "blocked":
         return "paused"                 # pause budget ou comptable (L13)
     if status in ("stopped", "dead"):
@@ -515,6 +530,13 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
+        "operator_pause": ({
+            "reason": row.get("operator_pause_reason"),
+            "by": row.get("operator_pause_by"),
+            "for": row.get("operator_pause_for"),
+            "since_ts": _round(row.get("operator_pause_ts")),
+            "after_turn": state == "working",
+        } if row.get("operator_paused") else None),
     }
 
 
@@ -802,14 +824,19 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, items, now=now, packages=packages,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    # #1664 : le flux ciblé du stockage (transitions + notes hold/levée) ;
+    # jamais le journal entier ni le texte des notes ordinaires.
+    waits = planned_waits.read(
+        db, items, now=now, packages=packages,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(
+            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])),
                       events_ts=last_events.get(int(item["id"])), agent_states=states,
-                      planned_wait=holds.get(int(item["id"])),
+                      planned_wait=waits.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
@@ -1050,6 +1077,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
         elif agent["state"] in ("paused", "stopped") and agent["status_text"]:
             line("reason: %s" % agent["status_text"], "    ")
+        hold = agent.get("operator_pause")
+        if hold:
+            line("operator pause%s: %s (by %s for %s)" % (
+                " after this turn" if hold["after_turn"] else "",
+                hold["reason"], hold["by"], hold["for"]), "    ")
 
     out.append("")
     if snap["milestones"]:

@@ -8,18 +8,18 @@
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
 #   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
-#   migrer [--additif-seulement] [REF]
-#                migrations de REF, lancées depuis son instantané AVANT de
-#                l'installer : base du mesh (UNE fois), puis ancienne base ;
-#                refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#   migrer [--additif-seulement] REF
+#                migrations de REF (obligatoire), lancées depuis son instantané
+#                AVANT de l'installer : base du mesh (UNE fois), puis ancienne
+#                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
 #                installé dans le venv (dépendance psycopg comprise) ; refusé
 #                tant qu'une base n'a pas les migrations de REF
 #   role         rôle superviseur réappliqué, sur chaque base où il existe
-#   redemarrer   exécuteurs du poste un par un, chacun hors tour, puis notify,
-#                puis les exécuteurs de l'ancienne base
+#   redemarrer   exécuteurs du poste un par un (arrêt prouvé avant chaque
+#                démarrage), puis notify, puis les exécuteurs de l'ancienne base
 #   controler    doctor, budget, accounts list, projects, alerts
 #   retour       réinstalle la version précédente et redémarre (sans toucher
 #                aux bases : 0041 à 0047 sont additives)
@@ -37,9 +37,9 @@
 #   écrire, pas même un fetch (le distant est lu par ls-remote, main est
 #   $DISTANT/main local). Ces deux étapes ne lisent pas $BASCULE_ENV.
 #
-# REF (migrer, installer) : commit, branche ou étiquette du dépôt qui contient
-# ce script ; défaut : HEAD de ce dépôt. MIGRER_APRES=1 (installer) : ancien
-# ordre, pour une migration non additive (docs/BASCULE.md, L151).
+# REF : commit, branche ou étiquette du dépôt qui contient ce script.
+# Obligatoire pour migrer ; défaut HEAD pour installer. MIGRER_APRES=1
+# ne désactive jamais la garde additive de migrer (docs/BASCULE.md, L232b).
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57, jamais dans le dépôt) : VM (adresse WireGuard du serveur),
@@ -77,8 +77,6 @@ ROLE=${ROLE_SUPERVISEUR:-ameesh_superviseur}
 EXECUTOR_ROLE=${ROLE_EXECUTOR:-ameesh_executor}
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 SAUVEGARDES="$HOME/backups/ameesh"
-#: une persona reste en tour au plus ce temps avant qu'on renonce (secondes)
-ATTENTE_MAX=${ATTENTE_MAX:-7200}
 case "${1:-}" in
   publier|rattraper) ;;
   *) mkdir -p "$TRAVAIL" "$SAUVEGARDES"; chmod 700 "$TRAVAIL" ;;
@@ -149,15 +147,24 @@ verifier() {
 sauvegarder() {
   local jour dsn; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
+  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
+  # d'ouvrir le canal privé de sauvegarde, comme pour « migrer ».
   dsn_part dsn "$CONFIG" dsn || return
-  avec_mdp "$CONFIG" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG" \
+    --output "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
-  ssh_vm 'systemctl start ameesh-sauvegarde.service && systemctl is-active ameesh-sauvegarde.service || true'
+  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
+  # Un échec de backup/upload doit arrêter cette étape avant les migrations.
+  ssh_vm 'set -e
+    systemctl start ameesh-sauvegarde.service
+    test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
+    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
   if ancienne; then
     etape "ancienne base"
     dsn_part dsn "$CONFIG_RESTE" dsn || return
-    avec_mdp "$CONFIG_RESTE" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+    "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
+      --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
   fi
 }
@@ -180,7 +187,6 @@ ameesh_de() {
   local cible=$1; shift
   PYTHONPATH="$cible/src" "$VENV/bin/python" -m ameesh "$@"
 }
-installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
   local ref=${1:-HEAD} cible court
@@ -210,30 +216,22 @@ installer() {
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
-# Migrations du commit REF, lancées depuis son instantané. Avant installation,
-# seules les migrations additives passent (--additive-only) : le code en
-# place, exécuteurs et commandes des agents, tourne sur la base migrée. Une
-# fois REF installé (ancien ordre, MIGRER_APRES=1), tout passe.
+# Migrations du commit explicite REF : garde additive même si ce code est
+# déjà installé. Le lien src-current n'accorde aucune autorité de migration.
+# --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref=${1:-HEAD} cible d garde=(--additive-only) force=0
+  local ref cible d garde=(--additive-only) sha
   if [ "${1:-}" = "--additif-seulement" ]; then
-    force=1
-    ref=${2:-HEAD}
+    shift
   fi
-  cible=$(instantane "$ref")
-  # --additif-seulement : la garde tient meme quand l'instantane est deja
-  # src-current (reprise de staging, avis R1 B2) : des VM peuvent tourner un
-  # code precedent sur la base migree.
-  if [ "$force" != 1 ] && installe "$cible"; then
-    garde=()
-    etape "$(basename "$cible") déjà installé : toutes ses migrations passent"
-  else
-    etape "migrations de $(basename "$cible"), avant son installation (additives seulement)"
-  fi
+  ref=${1:?REF requis pour migrer}
+  sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
+  cible=$(instantane "$sha")
+  etape "migrations du commit $sha, additives seulement"
   etape "base du mesh (une seule fois pour tout le mesh)"
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
-  ameesh_de "$cible" migrate --dry-run
+  ameesh_de "$cible" migrate --dry-run --additive-only
   migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
@@ -247,7 +245,7 @@ migrer_base() {
   ameesh_de "$cible" migrate "$@" || code=$?
   if [ "$code" = 3 ]; then
     echo "migration non additive : le code en place casserait sur la base migrée." >&2
-    echo "Procédure à part (docs/BASCULE.md, L151) : MIGRER_APRES=1 $0 installer, puis $0 migrer, puis redemarrer, d'affilée." >&2
+    echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
   fi
   [ "$code" = 0 ] || exit "$code"
   ameesh_de "$cible" doctor --probe
@@ -332,59 +330,88 @@ proprietaire_de() {  # unit → the lease owner its runner takes: --runner-id, e
   if [ -n "$id" ]; then echo "$id"
   else echo ":$(systemctl --user show -p MainPID --value "$1")"; fi
 }
+# #1152 : arrêt PROUVÉ avant tout démarrage. Le SIGTERM de `stop` ferme
+# l'admission : le tour en cours se termine (drainage borné par
+# `drain_seconds`, sous `TimeoutStopSec`), plus aucun nouveau tour ne part. On
+# ne décide pas d'arrêter sur une lecture de statut — un tour peut partir juste
+# après elle — et on ne relance jamais au-dessus d'un processus vivant.
+# Seul `inactive` avec MainPID=0 prouve le point sûr ; `failed` est refusé :
+# après un stop il signifie que le drainage n'a pas abouti proprement (délai
+# dépassé puis SIGKILL, sortie en erreur) — on ne recouvre pas ça en silence.
+redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
+  local u=$1 etat pid
+  systemctl --user stop "$u" \
+    || { echo "$u : l'arrêt échoue — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2; return 1; }
+  etat=$(systemctl --user show -p ActiveState --value "$u") || return 1
+  pid=$(systemctl --user show -p MainPID --value "$u") || return 1
+  if [ "$etat" != inactive ] || [ "$pid" != 0 ]; then
+    echo "$u : arrêt non prouvé (ActiveState=$etat, MainPID=$pid) — aucun démarrage ; journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
+    return 1
+  fi
+  systemctl --user start "$u" \
+    || { echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2; return 1; }
+}
 
-# Redémarre les unités $2… (base $1 : mesh | ancienne) une par une, chacune
-# au premier instant où sa persona n'est pas en tour. Une persona longue en
-# tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout. Une
-# persona arrêtée dans le registre (`stopped`, arrêt du propriétaire) est
-# laissée telle quelle : son unité active n'est pas réactivée (#1131).
+# Redémarre les unités $2… (base $1 : mesh | ancienne) une par une. L'admission
+# de chaque persona est fermée par `stop` (SIGTERM) AVANT tout démarrage : le
+# tour en cours draine, borné par TimeoutStopSec, et aucun nouveau tour ne
+# part. On n'attend plus un créneau « idle » : un statut `running` à chaque
+# lecture faisait expirer la mise à jour sans même arrêter l'unité (starvation
+# de l'incident impl07, #1152/R1). Le statut sert encore à la garde `stopped`
+# (#1131) : une persona arrêtée par le propriétaire n'est pas relancée ; son
+# unité encore active est seulement rechargée sur le nouveau code (#1633),
+# sans bail ni tour, et une unité déjà arrêtée n'est pas relancée.
 redemarrer_liste() {
   local base=$1; shift
-  local restantes=("$@") suivantes debut=$SECONDS u p st avant ligne heure tenu attendu
-  while [ ${#restantes[@]} -gt 0 ]; do
-    suivantes=()
-    for u in "${restantes[@]}"; do
-      p=$(persona_de "$u")
-      [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
-      st=$(statut "$base" "$p")
-      # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
-      # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
-      # actives malgré le registre `stopped`).
-      if [ "$st" = stopped ]; then
-        echo "$p : arrêté dans le registre — unité $u ignorée, pas de redémarrage (systemctl --user disable --now $u pour la retirer)"
-        continue
+  local u p st avant ligne heure tenu attendu
+  for u in "$@"; do
+    p=$(persona_de "$u")
+    [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
+    st=$(statut "$base" "$p")
+    # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
+    # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
+    # actives malgré le registre `stopped`).
+    # #1633 : la laisser tourner sur l'ancien code faisait repartir une
+    # reprise ultérieure sur cette version. Si son unité est encore active, on
+    # la recharge sur le nouveau code — sans exiger de bail : la persona reste
+    # arrêtée, aucun tour. Une unité déjà arrêtée n'est pas relancée (elle
+    # chargera le nouveau code à son démarrage).
+    if [ "$st" = stopped ]; then
+      if systemctl --user is-active --quiet "$u"; then
+        redemarrer_hors_tour "$u" || exit 1
+        sleep 10
+        systemctl --user is-active --quiet "$u" \
+          || { echo "$u : unité d'une persona arrêtée, ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2; exit 1; }
+        echo "$p : arrêté dans le registre — unité $u rechargée sur le nouveau code, aucun tour"
+      else
+        echo "$p : arrêté dans le registre — unité $u déjà arrêtée, rien à recharger"
       fi
-      if [ "$st" = running ]; then suivantes+=("$u"); continue; fi
-      # #502: only a runner that held its lease must take it again (bail.sh)
-      ligne=$(lire_bail "$base" "$p") && heure=$(heure_base "$base") \
-        && attendu=$(proprietaire_de "$u") \
-        || { echo "$u: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
-      avant=$(bail_epoque <<<"$ligne")
-      tenu=0
-      bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
-      systemctl --user restart "$u"
-      sleep 10
-      if ! systemctl --user is-active --quiet "$u"; then
-        echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
-        exit 1
-      fi
-      if [ "$tenu" = 0 ]; then
-        echo "WARNING $p: not checked: no lease before the restart, no sign of life"
-        non_verifiees+=("$p")
-      elif ! attendu=$(proprietaire_de "$u") || ! attendre_bail "$avant" "$attendu" "$base" "$p"; then
-        echo "$u: active, but $p did not take its lease again — journalctl --user -u $u -n 50; then « $0 retour »" >&2
-        exit 1
-      fi
-      echo "$p : redémarré (était $st)"
-    done
-    restantes=("${suivantes[@]+"${suivantes[@]}"}")
-    if [ ${#restantes[@]} -gt 0 ]; then
-      if [ $((SECONDS - debut)) -gt "$ATTENTE_MAX" ]; then
-        echo "toujours en tour après ${ATTENTE_MAX}s : ${restantes[*]} — à redémarrer à la main" >&2
-        exit 1
-      fi
-      sleep 15
+      continue
     fi
+    # #502: only a runner that held its lease must take it again (bail.sh)
+    ligne=$(lire_bail "$base" "$p") && heure=$(heure_base "$base") \
+      && attendu=$(proprietaire_de "$u") \
+      || { echo "$u: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
+    avant=$(bail_epoque <<<"$ligne")
+    tenu=0
+    bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
+    # #1152 : arrêt PROUVÉ (SIGTERM, drainage) avant le démarrage ; la course
+    # entre la lecture de statut et le lancement réel est fermée par le
+    # drainage, jamais par cette lecture.
+    redemarrer_hors_tour "$u" || exit 1
+    sleep 10
+    if ! systemctl --user is-active --quiet "$u"; then
+      echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
+      exit 1
+    fi
+    if [ "$tenu" = 0 ]; then
+      echo "WARNING $p: not checked: no lease before the restart, no sign of life"
+      non_verifiees+=("$p")
+    elif ! attendu=$(proprietaire_de "$u") || ! attendre_bail "$avant" "$attendu" "$base" "$p"; then
+      echo "$u: active, but $p did not take its lease again — journalctl --user -u $u -n 50; then « $0 retour »" >&2
+      exit 1
+    fi
+    echo "$p : redémarré (était $st)"
   done
 }
 
@@ -394,7 +421,7 @@ redemarrer() {
   local unites
   non_verifiees=()
   mapfile -t unites < <(unites_mesh)
-  etape "exécuteurs du poste, base du mesh (${#unites[@]}), un par un hors tour"
+  etape "exécuteurs du poste, base du mesh (${#unites[@]}), arrêt prouvé avant démarrage"
   [ ${#unites[@]} -gt 0 ] && redemarrer_liste mesh "${unites[@]}"
   etape "ameesh-notify"
   systemctl --user restart ameesh-notify.service
@@ -402,7 +429,7 @@ redemarrer() {
   if [ -n "$UNITES_RESTE" ]; then
     # shellcheck disable=SC2206
     unites=($UNITES_RESTE)
-    etape "exécuteurs de l'ancienne base (${#unites[@]}), un par un hors tour"
+    etape "exécuteurs de l'ancienne base (${#unites[@]}), arrêt prouvé avant démarrage"
     ancienne || { echo "$CONFIG_RESTE absent : ces unités ne savent pas quelle base lire" >&2; exit 1; }
     redemarrer_liste ancienne "${unites[@]}"
   fi

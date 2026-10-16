@@ -107,3 +107,66 @@ Two consequences:
 `--take-idle 0`, `--take-lot-idle 0` and `--dry-run` keep their meaning; a
 per-agent cap (`CostBook.over`) and a host under pressure, on low battery or
 not ready still stop the pickup.
+
+# Amendment of 2026-10-13 (#804): the executor triggers the take
+
+Canon (*Processus de lot* §4) makes the free agent the one who takes the next
+ready lot of its team, without waiting for the pilot. The take of L119 and
+L165 was in practice only triggered by `ameesh notify`, and no `notify`
+process or unit was running on the agent hosts (constat of 13/10 08:0x): idle
+agents took nothing. Lot #754 fixed what the take refused (budget pause,
+token agents); #804 fixes who triggers it.
+
+**The runner triggers the take for its own agents.** Every
+`--take-interval` seconds (default 60, `AMEESH_TAKE_INTERVAL`; 0 turns the
+runner's take off), each executor calls the same `backlog.auto_take` for the
+agents it serves, on the host where they run, with the same safeguards
+(idleness, budget, hosts on hold, `balance_low`, hourly caps counted in the
+database):
+
+- only its own agents are takers (`agents=` filter); the mesh listing stays
+  whole for the guards and for notifying the orchestrators;
+- a host under pressure is passed as a local `host_pressure` alert, as
+  `ameesh notify` does with its alerts;
+- the balance is read at the moment of the pass (`sous_utilisation.balance_low`,
+  same `--balance-*` / `AMEESH_ALERT_BALANCE_*` thresholds as `ameesh alerts`)
+  and passed as a `balance_low` alert: a pay-per-token agent never takes under
+  it (owner, 13/10; #754). An unreadable balance holds the token agents and
+  leaves the plans taking;
+- the take happens before the executor claims its agents, so the taken lot
+  and its mail are served in the same pass;
+- a failing take pass never takes the executor down: it is logged and the
+  next pass retries.
+
+`ameesh notify` keeps its own take for hosts where it runs; the two share the
+database counters. The remaining place is re-read before **each** take, not
+once per pass: with one executor per host, a single read let two simultaneous
+passes each consume the same place. The counter is still read outside the
+write transaction, so two strictly simultaneous passes can exceed the cap by
+their own number; the following passes then see the updated counter. A strict
+cap would take a mesh-wide lock in the write transaction — to be decided with
+the pilot if the residual burst matters.
+
+# Amendment of 2026-10-15: a lot that waits on a prerequisite does not wait for an agent
+
+Lot #1625, framed by the pilot (mesh-design, 15/10 21:40). §3 and §6 counted
+every open lot without an assignee: one lot held back by its dependency or
+by a later planned start kept the whole mesh off the backlog, and kept
+`backlog_empty` quiet, although no agent could start it.
+
+## Amended rule (§3, §6)
+
+**Only startable lots close the gate.** A project lot is waiting for a taker
+when it has no planned wait (L368, `planned_waits.read`): no open explicit
+dependency, no open commitment whose `depends_on` names an open lot or
+package, no planned start in the future. A lot held by such a wait is waiting
+for its prerequisite; it does not stop the automatic pickup of an improvement,
+nor the `backlog_empty` alert.
+
+- A startable human lot keeps absolute priority: if one is waiting, nobody takes an
+  improvement, as before (`idle_capacity` reports it).
+- Fail-closed: if the waits cannot be read, every lot stays counted and
+  the gate stays closed.
+- Nothing else changes: agent, budget, capacity and host guards, the pickup
+  caps, and the lot pickup (L165) itself. A held lot stays in the queue,
+  and is never forced on anyone.

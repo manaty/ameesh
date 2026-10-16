@@ -106,6 +106,28 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(dups["0001"]["in_target"], MIG + "/0001_init.sql")
         self.assertEqual(radar.summary(report)["conflict"], 1)
 
+    def test_union_attribute_read_from_the_merge_target(self):
+        # #1517 : deux ajouts adjacents à une liste `merge=union` ne sont pas
+        # un conflit, même quand la copie locale a extrait un commit sans
+        # `.gitattributes` : les attributs sont lus dans l'arbre de la cible.
+        repo = os.path.join(self.tmp, "union")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "liste.txt", "a\nc\ne\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "sans attributs")
+        _write(repo, ".gitattributes", "liste.txt merge=union\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "attributs")
+        for name, entry in (("lot/1-a", "b"), ("lot/2-b", "bb")):
+            _git(repo, "checkout", "-q", "-b", name, "main")
+            _write(repo, "liste.txt", "a\n%s\nc\ne\n" % entry)
+            _git(repo, "commit", "-qam", name)
+        _git(repo, "checkout", "-q", "--detach", "main~1")
+        report = radar.scan(repo, LOTS[:2], default_target="main")
+        self.assertEqual({tuple(p["lots"]): p["state"] for p in report["pairs"]},
+                         {(1, 2): "overlap"})
+
     def test_conflict_with_target_and_origin_branch(self):
         _write(self.repo, "shared.py", "Uno\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n")
         _git(self.repo, "commit", "-qam", "main bouge")

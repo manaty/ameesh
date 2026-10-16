@@ -280,6 +280,19 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
 # avec la base : entrées abandonnées supprimées, alertes
 # ==========================================================================
 
+def _sans_detenteur(test: unittest.TestCase) -> None:
+    """Neutralise la réponse du détenteur d'une entrée de /tmp. Sur un poste
+    où un processus du même utilisateur refuse la lecture de ses fichiers
+    ouverts (gpg-agent, `ameesh-offload`…), `platform.holders` lève
+    `NotAvailable` et le ménage garde l'entrée (fail-closed, L63b) : la
+    décision testée ici est celle de l'âge et des autres garde-fous, pas celle
+    des processus — la détection réelle a ses propres tests
+    (`tests/test_l63_platform.py`)."""
+    patcher = mock.patch.object(menage, "tmp_holder", lambda *a, **k: "")
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class AbandonDbTest(_Systeme, PgTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -437,6 +450,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertEqual(recents, {heures, jours})
 
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
+        _sans_detenteur(self)
         abandon = os.path.join(self.sys, "preuve-images")
         self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwx", abandon],
                         capture_output=True)
@@ -505,6 +519,14 @@ class AbandonDbTest(_Systeme, PgTestCase):
             "agent": "a1", "detail": "test", "data": {"turn": "x"}}], actor="test")
         occupant = subprocess.Popen(["sleep", "60"], cwd=ouvert)
         self.addCleanup(occupant.kill)
+        # Même raison que `_sans_detenteur`, mais `ouvert` doit être tenue tant
+        # que l'occupant vit, puis libre : la réponse du détenteur est fixée.
+        detenteur = mock.patch.object(
+            menage, "tmp_holder",
+            side_effect=lambda p: "held by process %d (cwd: sleep 60)" % occupant.pid
+            if p == ouvert and occupant.poll() is None else "")
+        detenteur.start()
+        self.addCleanup(detenteur.stop)
         rapport = self._passage(3 * HEURE)
         sorts = {o["path"]: (o["status"], o["detail"]) for o in rapport["orphans"]}
         self.assertEqual(sorts[ouvert][0], "attend")
@@ -531,7 +553,41 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertTrue(all("deleted by cleanup once unchanged" in a["detail"]
                             for a in alertes))
 
+    def test_allow_des_processus_illisibles_debloque_la_suppression(self):
+        """L230/L162 : sur un poste à processus non dumpable (gpg-agent,
+        ssh-agent), `platform.holders` lève NotAvailable et l'entrée restait
+        gardée ; nommer le processus dans `unreadable_ok` lève le doute, la
+        suppression part. Liste vide : le refus garde l'entrée (fail-closed)."""
+        entree = os.path.join(self.sys, "clone-relecture")
+
+        def creer():
+            _write(os.path.join(entree, "f"), 5000)
+
+        self._tour(creer, impute="a1")
+        refus = menage.platform.NotAvailable(
+            "file holders", "open files of process(es) of this user unreadable: "
+            "4242 gpg-agent")
+
+        def holders(path, needle=None, allow=()):
+            if "gpg-agent" in allow:
+                return []
+            raise refus
+
+        with mock.patch.object(menage.platform, "holders", side_effect=holders):
+            garde = self._passage(3 * HEURE)
+            self.assertTrue(os.path.exists(entree))
+            self.assertEqual(garde["orphans"][0]["status"], "attend")
+            self.assertIn("holders unreadable", garde["orphans"][0]["detail"])
+            permis = menage.Policy(orphan_min_size=1, unreadable_ok=("gpg-agent",))
+            fait = self._passage(3 * HEURE, policy=permis)
+        self.assertFalse(os.path.exists(entree))
+        self.assertEqual(fait["orphans"], [])
+        journal = storage.of(self.db).housekeeping.recent("pc", 3600, kind="orphan")
+        self.assertEqual([r["path"] for r in journal if r["action"] == "deleted"],
+                         [entree])
+
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
+        _sans_detenteur(self)
         main = _repo(self.tmp)
         relecture = os.path.join(self.sys, "relecture")
         self._tour(lambda: _git("worktree", "add", "-q", "--detach", relecture, cwd=main),

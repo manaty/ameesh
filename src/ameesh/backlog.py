@@ -14,10 +14,13 @@ et des capacités exigées. Pas de table neuve : le cycle, le journal, les
 jalons, la vue d'avancement et les alertes des lots s'appliquent tels quels.
 
 **Prise automatique** (`auto_take`, appelée à chaque passage d'`ameesh
-notify`) : un agent réveillable au repos sans lot depuis `idle_s` prend
-l'élément de plus forte valeur qui correspond à son équipe et à ses
-capacités. Le lot lui est assigné (attribution gardée de L37) et lui est
-annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
+notify`, et par l'exécuteur de chaque hôte pour ses propres agents — #804) :
+un agent réveillable au repos sans lot depuis `idle_s` prend l'élément de
+plus forte valeur qui correspond à son équipe et à ses capacités. Le lot lui
+est assigné (attribution gardée de L37) et lui est annoncé par un courrier
+lié au lot (`--lot`), qui le réveille. `agents` restreint les **preneurs** à
+un ensemble de noms (ceux de l'exécuteur) : la liste du mesh reste entière
+pour les gardes et l'avertissement des orchestrateurs. Garde-fous :
 
 * **aucun lot ne l'attend** : l'agent n'a ni lot ouvert, ni courrier non lu,
   ni consigne en attente, ni lot de session encore ouvert ; et tant qu'un lot
@@ -68,9 +71,11 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
 * ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
   (il le confie sans doute dans la foulée) ;
-* un orchestrateur ne se sert pas lui-même ; ceux de l'équipe (sinon tous)
-  reçoivent un courrier `event` lié au lot et peuvent le réassigner (`ameesh
-  work assign`) ;
+* un orchestrateur ne se sert pas lui-même tant qu'un autre preneur est là ;
+  ses candidats passent en dernier et, s'il prend un lot faute d'autre
+  preneur, la note d'attribution garde la trace du repli (#1739) ; ceux de
+  l'équipe (sinon tous) reçoivent un courrier `event` lié au lot et peuvent
+  le réassigner (`ameesh work assign`) ;
 * au plus `lot_max_per_hour` prises par heure glissante, comptées à part de
   la file.
 * **L165b** (constat du 12/10 : 13 agents au repos, 10 lots sans agent, aucun
@@ -488,6 +493,13 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     return bool((item.get("lot_team") or "").strip())
 
 
+def _lot_project(item: dict) -> str:
+    """Le projet d'un lot pour le dossier de travail : son dépôt (`app`)
+    d'abord, son équipe ensuite — même clé que `lot_workdir.project` (#811 N2 :
+    `lot_fits` filtrait sur `lot_team`, le dossier se résout sur `app`)."""
+    return (item.get("app") or item.get("lot_team") or item.get("team") or "").strip()
+
+
 def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
              others=None) -> bool:
     """Le lot vise-t-il un des projets de l'agent, et l'agent sait-il le faire ?
@@ -498,7 +510,7 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
     """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
-    team = (item.get("lot_team") or "").strip()
+    team = _lot_project(item)
     from . import projects as projects_mod
     if not team or team not in projects_mod.agent_projects(agent):   # L243: membre
         return False
@@ -515,6 +527,20 @@ def _primary_project(agent: dict) -> str:
     from . import projects as projects_mod
     names = projects_mod.agent_projects(agent)
     return names[0] if names else ""
+
+
+def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run):
+    from . import lot_workdir, work
+    reason = lot_workdir.problem(cfg, agent, project, canons=canons)
+    if reason is None:
+        return True
+    # #811 N1 : hors périmètre (raison vide) — aucune note ; un projet déclaré
+    # qui attend son dossier est noté une fois par lot.
+    if not dry_run and reason:
+        note = "L243-4: %s cannot pick up project %s: %s" % (agent["name"], project, reason)
+        if not any(e.get("note") == note for e in work.events(db, item["id"])):
+            work.note(db, item["id"], note, actor=SENDER)
+    return False
 
 
 def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
@@ -553,7 +579,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
               alerts: list | None = None, listing: list | None = None, paid=None,
               budget_check=None, dry_run: bool = False,
               lot_idle_s: float = DEFAULT_LOT_IDLE_S,
-              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None) -> list:
+              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None,
+              agents: set[str] | None = None) -> list:
     """Un passage de prise automatique ; rend les prises faites (ou prévues
     en `dry_run`) : `[{item, agent, message_id, kind, notified}]`, `kind`
     valant `lot` (lot non assigné de l'équipe, L165) ou `backlog` (file
@@ -565,15 +592,35 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     ce qui lui va, puis les agents payés au token prennent ce qu'il reste
     dans le même passage (#754, owner 13/10). Un agent en pause budget ou
     au-dessus de son plafond ne prend rien et ne bloque personne ; un agent
-    au token ne prend jamais sous une alerte `balance_low`."""
+    au token ne prend jamais sous une alerte `balance_low`.
+
+    `agents`, quand il est donné, borne les preneurs à ces noms (l'exécuteur
+    de leurs hôtes, #804) sans rétrécir `listing` : les gardes et les
+    orchestrateurs prévenus restent ceux du mesh entier."""
     from . import mail, registry, sous_utilisation, work
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+
+    # #804 : la place restante est relue avant **chaque** prise, pas une fois
+    # par passe. Les compteurs sont en base et partagés par tous les
+    # exécuteurs ; avec plusieurs passes simultanées (un exécuteur par hôte),
+    # une lecture unique laissait chacune consommer la même place. La relecture
+    # ramène la fenêtre à la durée d'une attribution ; la place reste une
+    # lecture hors de la transaction d'écriture, donc deux passes strictement
+    # simultanées peuvent encore se dépasser de leur nombre — les passes
+    # suivantes, elles, voient le compteur à jour.
+    def lot_place() -> int:
+        return int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                                LOT_TAKE_NOTE)
+
+    def place() -> int:
+        return int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                            AUTO_TAKE_NOTE)
+
     lot_room = 0
     if lot_idle_s > 0 and lot_max_per_hour > 0:
-        lot_room = int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
-                                                                    LOT_TAKE_NOTE)
+        lot_room = lot_place()
     lots = st.work.unassigned_lots(200) if lot_room > 0 else []
     # un lot tout juste créé va sans doute être confié : on lui laisse le temps
     today = time.strftime("%Y-%m-%d", time.localtime(now))
@@ -622,6 +669,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
                                                 waiting_free=waiting_free):
+            # #804 : un exécuteur ne fait prendre que ses propres agents ; les
+            # autres restent dans `listing` pour les gardes et l'avertissement.
+            if agents is not None and row["name"] not in agents:
+                continue
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue
@@ -648,8 +699,18 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 orchestras = []
         # L165b : un agent dont tous les lots attendent un autre est libre
         pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
-        for row in pool:
-            if len(taken) >= lot_room or not lots:
+        # #1739 : plus aucun autre preneur ? un orchestrateur peut se servir,
+        # mais ses candidats passent en dernier : il ne prend que les lots que
+        # les autres ont laissés, et la note d'attribution garde la trace.
+        taker_count = len(pool)
+        if lots:
+            seen = {row["name"] for row in pool}
+            pool += [row for row in candidates(lot_idle_s, skip=(), waiting_free=True)
+                     if row["name"] not in seen]
+        for index, row in enumerate(pool):
+            fallback = index >= taker_count
+            # #804 : place relue avant chaque prise (compteur partagé)
+            if not lots or len(taken) >= lot_room or lot_place() <= 0:
                 break
             if not within_budget(row):
                 continue
@@ -660,35 +721,40 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
-            # L243 : tant que le dossier de travail par lot n'existe pas
-            # (#811), la prise automatique reste sur le projet primaire — un
-            # lot d'un autre projet ne s'attribue qu'explicitement.
-            primary = _primary_project(agent)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"]), others=listing):
                     continue
-                if (item.get("lot_team") or "").strip() != primary:
+                if not _directory_ready(cfg, db, agent, item, _lot_project(item),
+                                        canons=canons, dry_run=dry_run):
                     continue
-                notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
-                                               orchestras)
+                # un orchestrateur qui se sert ne se prévient pas lui-même
+                notified = [name for name in _team_orchestrators(
+                    cfg, db, listing, item["lot_team"], orchestras)
+                    if name != row["name"]]
                 if dry_run:
                     taken.append({"item": item, "agent": row["name"], "message_id": None,
-                                  "kind": "lot", "notified": notified})
+                                  "kind": "lot", "notified": notified,
+                                  "fallback": fallback})
                     lots.remove(item)
+                    break
+                # #804 : la place est relue juste avant l'écriture — une passe
+                # concurrente a pu consommer la place depuis la sélection.
+                if lot_place() <= 0:
                     break
                 try:
                     check = work.check_assignee(db, row["name"], cfg=cfg)
                 except work.WorkError:
                     break                   # agent non réveillable : au suivant
+                note = "%s par %s, au repos" % (LOT_TAKE_NOTE, check["assignee"])
+                if fallback:
+                    note += " (aucun autre preneur ; orchestrateur)"
                 try:
                     # #540 : sous le verrou de l'agent, pas de second lot
                     # non démarré (il en a reçu un depuis sa sélection).
                     # #1242 (L165) : la prise ne vise qu'un lot intake dont
                     # toutes les dépendances sont satisfaites.
-                    done = _assign_ready(st, item, check["assignee"],
-                                         "%s par %s, au repos" % (LOT_TAKE_NOTE,
-                                                                  check["assignee"]),
+                    done = _assign_ready(st, item, check["assignee"], note,
                                          work.takes_rule(check))
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
@@ -706,18 +772,21 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     mail.send(db, SENDER, name, lot_notice(done, check["assignee"], idle_for),
                               kind="event", work_item_id=str(done["id"]), payload=payload)
                 taken.append({"item": done, "agent": check["assignee"],
-                              "message_id": message_id, "kind": "lot", "notified": notified})
+                              "message_id": message_id, "kind": "lot",
+                              "notified": notified, "fallback": fallback})
                 break
     if not queue:
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe
-    # avant toute amélioration
+    # avant toute amélioration ; un lot qu'une attente planifiée retient
+    # (dépendance, engagement, date) n'attend pas un agent (#1625)
     if taken or sous_utilisation.waiting_project_lots(
-            st.operations.open_lots_activity(500), db=db):
+            st.operations.open_lots_activity(500), db=db, now=now):
         return taken
     pool = candidates(idle_s)
     for row in pool:
-        if len(taken) >= room or not queue:
+        # #804 : place relue avant chaque prise (compteur partagé)
+        if not queue or len(taken) >= room or place() <= 0:
             break
         if not within_budget(row):
             continue
@@ -728,20 +797,21 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not auditor_mod.may_take(agent, canons):
             continue
         auditors = auditor_mod.cards([agent], canons)
-        primary = _primary_project(agent)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
                         card=auditors.get(row["name"]), others=listing):
                 continue
-            # L243 : même règle que les lots — un élément d'un autre projet
-            # attend une attribution explicite (#811).
-            team = (item.get("team") or "").strip()
-            if team and team != primary:
+            if not _directory_ready(cfg, db, agent, item, _lot_project(item),
+                                    canons=canons, dry_run=dry_run):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
                               "kind": "backlog", "notified": []})
                 queue.remove(item)
+                break
+            # #804 : la place est relue juste avant l'écriture — une passe
+            # concurrente a pu consommer la place depuis la sélection.
+            if place() <= 0:
                 break
             try:
                 check = work.check_assignee(db, row["name"], cfg=cfg)

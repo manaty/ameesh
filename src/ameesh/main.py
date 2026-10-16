@@ -14,8 +14,8 @@
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
   ameesh activity <persona> [--since 24h] [--json]   persona activity log (L59);
-  ameesh attach <agent> [--wait] [--ttl S]
-        an interactive session on the agent's lease, same session (C9);
+  ameesh attach <agent> [--wait] [--ttl S] [--max 2h]
+        bounded native access: sleep the resident, then return its lease (L82);
   ameesh list | show          observability (host, lease, unread, budget, key);
   ameesh key …                public keys (owner / agent);
   ameesh approve | approvals | verify   signed approvals;
@@ -25,6 +25,10 @@
         decision answers, chat) not attached to any work item (L130);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
+  ameesh provenance record --commit SHA | intent | created | install | show
+        #1465 : preuve exacte d'origine (acteur, session, tour, harnais) d'un
+        commit ou d'un jalon — le hook `pre-commit` atteste le commit qui vient,
+        le hook `post-commit` constate l'objet né puis écrit la preuve ;
   ameesh accounts list | use <harness> <account> | auto [harness]
         multiple accounts per provider: active, gauges, override (L30);
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
@@ -57,6 +61,15 @@
   ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
         the event log (lot transitions, turns, costs, threads, decisions, alerts) and
         its retention (365 days by default, L85);
+  ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
+        | identity <agent> [--json]
+        the gh commands run by agents, journaled per turn (who cancelled,
+        merged, labelled), and the GitHub identity an agent resolves to (#1645);
+  ameesh identity verify [JETON|-] [--issuer U --client-id C] [--domain D]
+                         [--binding subject|email]
+        vérifie un jeton d'identité OIDC et le rattache au canon (le couple
+        `{issuer, subject}` d'une fiche Member par défaut, `emails` sur choix
+        explicite) : L86, lot #377 ; sortie 3 si aucun membre ne correspond ;
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -123,6 +136,7 @@
         same output and exit code, local fallback;
   ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
+  ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
   ameesh device enroll|challenge|show   device-side enrollment, in the VM (L110);
@@ -182,7 +196,7 @@ MESH_COMMANDS = (
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
 #: adoption et reprise (L39, décision 0030)
-REPRISE_COMMANDS = ("adopt", "resume")
+REPRISE_COMMANDS = ("adopt", "resume", "pause")
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")
 #: actions sous porte et file des décisions (actions_cli)
@@ -234,6 +248,9 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command == "agent" and rest and rest[0] == "peek":
+        from . import agent_peek
+        return agent_peek.main(rest[1:])
     if command == "module":
         from . import modules
         return modules.main(rest)
@@ -253,6 +270,11 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "activity":
         from . import activity
         return activity.main(rest)
+    if command == "github" and rest[:1] in (["gestes"], ["identity"]):
+        # #1645 : journal des gestes gh des agents, identité GitHub par rôle ;
+        # `ameesh github read` (#860) et l'aide restent à github_cli
+        from . import github_identity
+        return github_identity.main(rest)
     if command == "progress":
         from . import progress
         return progress.main(rest)
@@ -306,6 +328,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "provenance":
+        # #1465 : preuve exacte d'origine d'un commit ou d'un jalon
+        from . import review_provenance
+        return review_provenance.main(rest)
     if command == "decide":
         # L124 : demandes de décision au propriétaire, et ses réponses
         from . import decisions
@@ -313,6 +339,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "session":
         from . import session_backup
         return session_backup.main(rest)
+    if command == "identity":
+        # L86 (0033 §4) : identité des humains par OIDC et rattachement au canon
+        from . import oidc
+        return oidc.main(rest)
     if command == "chat":
         # L123 : l'agent de conversation du propriétaire
         from . import chat
