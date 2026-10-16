@@ -150,14 +150,15 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
             # window resumes supervision with no operator. Before the first
             # launch a stale gate only waits: at boot the guard may not have
             # renewed a heartbeat left expired by the reboot.
+            # A late heartbeat must not reopen an already expired window.
+            if stale_since is not None and now() - stale_since >= STALE_RESUME_MAX_S:
+                return 0
             gate = gate_state(state_path, now())
             if gate != "stale":
                 stale_since = None
             elif launched:
                 if stale_since is None:
                     stale_since = now()
-                if now() - stale_since >= STALE_RESUME_MAX_S:
-                    return 0
                 stop.wait(1)
                 continue
             if gate != "available":

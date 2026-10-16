@@ -130,7 +130,8 @@ La suite dépend de la cause (#1402) :
   (600 s, l'ordre de grandeur du `restart_after_seconds` par défaut) pour
   renouveler son battement. Une porte fraîche revenue dans ce délai relance
   l'exécuteur sans opérateur ; aucun lancement n'a lieu tant qu'elle reste
-  périmée. Passé le délai, il sort 0 et seul l'opérateur le redémarre :
+  périmée. Une porte observée fraîche après l'échéance, même `stopped`,
+  ne rouvre pas la fenêtre. Passé le délai, il sort 0 et seul l'opérateur le redémarre :
   une garde durablement absente reste visible, unité inactive.
 - signal : le superviseur sort 0, et seul l'opérateur le redémarre. Avant
   son premier lancement, une porte périmée le fait seulement attendre : au

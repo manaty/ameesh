@@ -210,6 +210,34 @@ class VMSupervisor(unittest.TestCase):
         self.assertEqual(launches, [1, 2])
         self.assertEqual(calls, [['podman', 'stop', '--ignore', '--time=100', V.NAME]])
 
+    def test_stale_resume_requires_a_fresh_gate_before_the_deadline(self):
+        fresh = json.loads(self.state.read_text())
+        for elapsed, expected in ((V.STALE_RESUME_MAX_S - 1, 2),
+                                  (V.STALE_RESUME_MAX_S, 1),
+                                  (V.STALE_RESUME_MAX_S + 1, 1)):
+            with self.subTest(elapsed=elapsed):
+                self.state.write_text(json.dumps(fresh))
+                clock, launches = [100.0], []
+                def launch(_):
+                    launches.append(clock[0])
+                    if len(launches) == 1:
+                        self.state.unlink()
+                        return Process(0, running=True)
+                    return Process(0)
+                class Stop:
+                    def is_set(inner):
+                        return False
+                    def wait(inner, _):
+                        clock[0] += elapsed
+                        renewed = dict(fresh, expires_ts=clock[0] + 90,
+                                       until_ts=clock[0] + 200)
+                        self.state.write_text(json.dumps(renewed))
+                        return False
+                self.assertEqual(self.supervise(
+                    launch, Stop(), run=lambda *_, **__: Process(0),
+                    now=lambda: clock[0]), 0)
+                self.assertEqual(len(launches), expected)
+
     def test_fresh_guard_with_no_window_launches(self):
         self.state.write_text(json.dumps({'schema': 'ameesh-host-state/1', 'state': 'available',
                                          'seq': 1, 'until_ts': None, 'expires_ts': 190}))
