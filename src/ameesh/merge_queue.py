@@ -1047,6 +1047,21 @@ def radar_project(cfg, repo: str):
     return matching[0] if matching else None
 
 
+def declared_projects(cfg) -> dict:
+    """Les projets `radar.projects` de la configuration (vide : aucun profil).
+
+    #1761 : un poste agent ou pilote ne déclare pas de projet de radar et met
+    pourtant un lot en file — le clone jetable de `working_clone` lit la
+    branche fraîche sans écrire le dépôt des agents. #1467 : un hôte qui
+    DÉCLARE des projets sans que celui du dépôt y figure est diagnostiqué,
+    jamais servi par un clone implicite."""
+    from . import radar
+    try:
+        return dict(radar.settings_of(cfg).projects)
+    except radar.SettingsError as exc:
+        raise QueueError("cannot read repository landing conditions: %s" % exc) from exc
+
+
 def writer_project(cfg, repo: str, app: str = "", project=None):
     """The project identity a single-lot writer shares with the train (#1703).
 
@@ -1093,6 +1108,13 @@ def run(cfg, db, args) -> int:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
             project = radar_project(cfg, repo)
+            if (project is None and declared_projects(cfg)
+                    and plan_git._out(repo, "remote", "get-url", "origin")):
+                raise QueueError(
+                    "no radar project matches repository %s (source %s) in the loaded "
+                    "configuration: select the profile declaring radar.projects for this "
+                    "repository, including its land/protected conditions; --repo selects "
+                    "a local checkout, not a configuration profile" % (repo, source_of(repo)))
             clone, scratch = working_clone(cfg, repo, project)
             try:
                 row = enter(db, args.id, repo=repo, actor=args.actor, project=project,

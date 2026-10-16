@@ -468,10 +468,16 @@ class TrainGitTest(_Land):
 
     def test_missing_radar_profile_is_diagnosed_without_implicit_clone(self):
         args = types.SimpleNamespace(queue_command="add", repo=self.repo, id=1, actor="runner")
+        # #1761 : la garde ne vaut que pour un hôte qui DÉCLARE des projets de
+        # radar (ici un seul, qui ne correspond pas à ce dépôt) ; sans aucun
+        # projet déclaré, `queue add` garde son clone jetable.
+        cfg = dataclasses.make_dataclass("Cfg", ["state_dir", "radar"])(
+            self.cfg.state_dir,
+            {"projects": {"other": {"repo": os.path.join(self.tmp, "other-repo")}}})
         err = io.StringIO()
         with mock.patch.object(merge_queue, "radar_project", return_value=None), \
                 mock.patch.object(merge_queue, "enter") as enter, contextlib.redirect_stderr(err):
-            self.assertEqual(merge_queue.run(self.cfg, None, args), 1)
+            self.assertEqual(merge_queue.run(cfg, None, args), 1)
         enter.assert_not_called()
         self.assertIn("radar.projects", err.getvalue())
         self.assertIn("local checkout", err.getvalue())

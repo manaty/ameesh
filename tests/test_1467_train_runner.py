@@ -842,7 +842,12 @@ class TrainRunnerTest(PgTestCase):
 
     def test_missing_merge_contract_never_falls_back_to_named_fire(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
-        fields = dict(vars(rules), schema=rules.schema, ci_packet=rules.ci_packet)
+        # le calendrier compile est exige avant la politique de fusion : le
+        # gabarit doit le porter pour que le controle vise tombe (les champs de
+        # fusion, eux, manquent volontairement au SimpleNamespace).
+        fields = dict(vars(rules), schema=rules.schema, ci_packet=rules.ci_packet,
+                      packet_cutoffs=rules.packet_cutoffs, last_packet=rules.last_packet,
+                      next_packet=rules.next_packet)
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = types.SimpleNamespace(**fields)
         with self.assertRaisesRegex(train.TrainError, "explicit compiled packet merge policy"):

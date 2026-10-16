@@ -279,6 +279,14 @@ class SessionCommandAliasTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # Le banc ne peut pas lire les fichiers ouverts d'un autre processus du
+        # même uid (gpg-agent) : `platform.holders` lève alors `NotAvailable` et
+        # l'adoption est refusée à juste titre. Ces tests portent sur l'alias,
+        # pas sur la garde de session — neutralisée ici, éprouvée par test_l39
+        # et test_1037.
+        patcher = mock.patch.object(reprise, "holders", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.travail = os.path.join(self.tmp, "travail")
         os.makedirs(self.travail, exist_ok=True)
         self.register("worker", "codex", cwd=self.travail)

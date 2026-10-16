@@ -571,7 +571,8 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("pinned to workflow canon/process/site@7", err)
         self.assertIn("process_registry", err)
-        self.assertEqual(self.server.ops(), ["work.get"])
+        # #423 : la résolution d'alias précède toute opération mediée.
+        self.assertEqual(self.server.ops(), ["agents.resolve_name", "work.get"])
         self.assert_session_only()
 
     def test_work_close_lot_pinne_refuse_sans_sql(self):
@@ -585,7 +586,8 @@ class SessionTest(unittest.TestCase):
                                       "--actor", "inge-front")
         self.assertEqual(code, 1)
         self.assertIn("pinned to workflow canon/process/site@7", err)
-        self.assertEqual(self.server.ops(), ["work.get"])
+        # #423 : la résolution d'alias précède toute opération mediée.
+        self.assertEqual(self.server.ops(), ["agents.resolve_name", "work.get"])
         self.assert_session_only()
 
     def test_action_propose(self):
