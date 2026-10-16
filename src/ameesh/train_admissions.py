@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from . import land, lot_class, merge_queue, storage, work
-from .train import TrainError, identity
+from .train import MemberDeferred, TrainError, identity
 from .train_review import SHA
 
 UNAVAILABLE = set(work.MERGED_STATES) | {"closed"} | work.WAITING
@@ -83,23 +83,34 @@ class Admissions:
             raise TrainError("ambiguous train admissions")
         proofs = []
         for row in rows:
-            item = self._current(row, current)
-            requirement = self.policy(item, row, base, self.history.path)
-            if not isinstance(requirement, Requirement):
-                raise TrainError("trusted policy returned no structured review requirement")
-            requirement.check(row, base)
-            historical = self.history.qualify(row, base, required=requirement.reviews)
-            proof = dict(admission=identity(row), policy=asdict(requirement), history=historical)
-            if mode == "targeted":
-                ci = self.targeted_ci(row) if self.targeted_ci is not None else None
-                if not isinstance(ci, dict) or ci.get("head") != row["frozen_sha"] \
-                        or ci.get("status") != "green" or ci.get("complete") is not True \
-                        or not ci.get("runs"):
-                    raise TrainError("exact targeted lot CI evidence required")
-                proof["targeted_ci"] = ci
+            try:
+                proof = self._member_proof(row, current, base, mode)
+            except TrainError as exc:
+                # The engine defers this admission and its dependents only
+                # while composing. The same refusal after publication must
+                # still drain the immutable packet, never shrink its plan.
+                raise MemberDeferred(row, "admission #%s frozen=%s: %s" % (
+                    row["work_item_id"], row["frozen_sha"], exc)) from exc
             proofs.append(proof)
         return dict(schema="ameesh-train-admissions/1", source=self.source,
                     base=base, mode=mode, members=proofs)
+
+    def _member_proof(self, row, current, base, mode):
+        item = self._current(row, current)
+        requirement = self.policy(item, row, base, self.history.path)
+        if not isinstance(requirement, Requirement):
+            raise TrainError("trusted policy returned no structured review requirement")
+        requirement.check(row, base)
+        historical = self.history.qualify(row, base, required=requirement.reviews)
+        proof = dict(admission=identity(row), policy=asdict(requirement), history=historical)
+        if mode == "targeted":
+            ci = self.targeted_ci(row) if self.targeted_ci is not None else None
+            if not isinstance(ci, dict) or ci.get("head") != row["frozen_sha"] \
+                    or ci.get("status") != "green" or ci.get("complete") is not True \
+                    or not ci.get("runs"):
+                raise TrainError("exact targeted lot CI evidence required")
+            proof["targeted_ci"] = ci
+        return proof
 
     def quarantine(self, rows, reason, *, lease):
         current = {row["work_item_id"]: row for row in self.entries()}

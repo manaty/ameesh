@@ -226,11 +226,54 @@ class TrainRunnerTest(PgTestCase):
     def test_missing_provenance_cannot_publish_or_be_replaced_by_current_registry(self):
         self.receipts.clear()
         result = self.passage().step(self.db, self.now)
-        self.assertEqual(result["result"], "refused", result)
-        self.assertIn("unknown historical author", result["error"])
+        self.assertEqual(result["result"], "empty", result)
+        self.assertIn("unknown historical author", result["selection"][0]["reason"])
         self.assertEqual(self.git(self.origin, "for-each-ref", "--format=%(refname)",
                                   "refs/heads/integration/"), "")
         self.assertEqual(self.api_calls, [])
+
+    def test_missing_member_history_defers_dependents_and_publishes_independent_member(self):
+        original = self.ops.queue(None)[0]
+        added = []
+        for branch, base in (("lot/dependent", self.head), ("lot/independent", self.base)):
+            self.git(self.publisher, "checkout", "-qb", branch, base)
+            self.write(branch.rsplit("/", 1)[1], "independent reviewed fixture\n")
+            head = self.commit(branch)
+            self.git(self.publisher, "push", "-q", "origin", branch)
+            item = work.add(self.db, title=branch, app=self.project.name, source="fixture",
+                            actor="fixture", branch=branch, branch_target="main")
+            freeze = self.ops.add_milestone(item["id"], "frozen", sha=head, actor="fixture",
+                                           verdict=None, note="")
+            member = self.ops.queue_add(item["id"], target="main", frozen_sha=head,
+                note="", actor="fixture", source=original["source"], frozen_id=freeze["id"])
+            self.receipts["commit:" + head] = dataclasses.asdict(author(head))
+            for reader, family in (("r1", "claude"), ("r2", "deepseek")):
+                mark = self.ops.add_milestone(item["id"], "verdict", sha=head,
+                    actor=reader, verdict="ok", note="")
+                _, receipt = verdict(mark["id"], reader, family, commit=head)
+                receipt = dataclasses.replace(receipt, milestone={key: mark[key]
+                    for key in ("id", "actor", "at_ts", "sha", "verdict")})
+                self.receipts[receipt.subject] = dataclasses.asdict(receipt)
+            added.append(member)
+        dependent, independent = added
+        storage.of(self.db).work_dependencies.add(dependent["work_item_id"],
+            original["work_item_id"], actor="fixture")
+        self.db.execute("UPDATE merge_queue SET queued_at=to_timestamp(%s)", [self.now - 3600])
+        del self.receipts["commit:" + self.head]
+        passage = self.passage()
+        with mock.patch.object(train_ci.GitHub, "start") as dispatch:
+            result = passage.step(self.db, self.now)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([row["work_item_id"] for row in result["plan"]["members"]],
+                         [independent["work_item_id"]])
+        state = self.ops.train_read(self.key)
+        self.assertEqual({row["work_item_id"] for row in state["deferred"]},
+                         {original["work_item_id"], dependent["work_item_id"]})
+        self.assertIn("unknown historical author", state["selection"][0]["reason"])
+        self.assertEqual(state["selection"][0]["admission"], list(train.identity(original)))
+        dispatch.assert_called_once()
+        self.assertTrue(all(row["state"] == "queued" for row in self.ops.queue(None)))
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     def test_provider_and_ci_contract_are_required_before_reserving_target(self):
         for overrides, message in ((dict(provider=None), "provenance provider"),
@@ -338,9 +381,26 @@ class TrainRunnerTest(PgTestCase):
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = rules
         result = self.passage().step(self.db, self.now)
-        self.assertEqual(result["result"], "refused", result)
-        self.assertIn("missing independent", result["error"])
+        self.assertEqual(result["result"], "empty", result)
+        self.assertIn("missing independent", result["selection"][0]["reason"])
         self.assertEqual(self.api_calls, [])
+
+    def test_lost_member_history_during_ci_preserves_plan_until_terminal_outcome(self):
+        passage = self.passage()
+        with mock.patch.object(train_ci.GitHub, "start") as dispatch:
+            plan = passage.step(self.db, self.now)["plan"]
+            del self.receipts["commit:" + self.head]
+            result = passage.step(self.db, self.now + 1)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertIn("unknown historical author", result["error"])
+        state = self.ops.train_read(self.key)
+        self.assertEqual(state["phase"], "draining")
+        self.assertEqual(state["plan"], json.loads(json.dumps(plan)))
+        self.assertEqual(len(state["attempts"]), 1)
+        self.assertEqual(state["deferred"], [])
+        dispatch.assert_called_once()
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertIsNotNone(passage.epoch)
 
     def automatic_passage(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)

@@ -148,6 +148,14 @@ Missing/changed originals, missing resolvers, ambiguous index entries and
 stale contexts produce named member deferrals. During CI, withdrawal refuses
 promotion and preserves the existing plan and single CI attempt.
 
+Admission proof failures also name their exact queue identity. While composing,
+the engine defers that member and its open dependents, then qualifies the
+independent remainder before publication. An unknown author, missing review or
+stale freeze does not grant admission and does not eject the queue entry.
+After publication the same failure drains the original immutable packet;
+it cannot shrink its members or launch another CI. The consumer checks this
+boundary with real Git/SQL and an explicit CI/provenance fixture.
+
 The pilot supplied `ameesh-transport-qualification/1` on **16 October 2026,
 05:10 Paris** (lot events 30879/30881/30884). `Normalized` recognizes only
 that exact mechanical format: `schema`, `work_item_id`, `frozen_sha`, `base`,
