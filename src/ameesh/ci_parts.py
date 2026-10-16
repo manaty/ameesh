@@ -48,6 +48,16 @@ l'arbre de la cible n'est extrait qu'une fois par couple, plus à chaque
 contrôle d'atterrissage, et une entrée relue est revalidée avant d'être
 servie. N4 de #1666 : le sélecteur tourne dans sa propre session et son
 groupe de processus entier est tué quand il dépasse `PARTS_TIMEOUT`.
+
+N3 de #1666 : le sélecteur est du code de la cible, relu mais jamais de
+confiance : il tourne dans un bac à sable `bwrap` (voie (a) du pilote,
+mesh-design, 16/10/2026) — espaces de noms séparés, **réseau coupé**,
+environnement vidé, racine vide où seuls le runtime nécessaire, l'arbre de la
+cible (lecture seule), les entrées (lecture seule) et deux répertoires de
+travail et de sortie (inscriptibles, propres à la preuve) sont montés : ni
+`/`, ni `/home`, ni jeton, ni DSN de l'hôte. **Aucun repli** : sans `bwrap`,
+ou si le bac à sable ne démarre pas (espaces de noms refusés par le noyau),
+la preuve est refusée par `PartsError` — un contrat inconnu n'est pas un vert.
 """
 from __future__ import annotations
 
@@ -77,6 +87,17 @@ PARTS_REAP_TIMEOUT = 10
 PARTS_CACHE_TTL = 24 * 3600
 #: version du format de cache : une entrée d'une autre version est ignorée
 PARTS_CACHE_VERSION = 1
+#: N3 de #1666 : répertoires du runtime montés en lecture seule dans le bac à
+#: sable — de quoi lancer l'interpréteur du sélecteur, rien de l'hôte : ni `/`,
+#: ni `/home`, ni les jetons ou DSN de la session qui exécute la preuve
+SANDBOX_RUNTIME = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32")
+#: N3 de #1666 : configuration du lieur dynamique, montée en lecture seule
+#: quand elle existe (fichiers étroits) : sans elle, un binaire lié
+#: dynamiquement peut refuser de démarrer dans la racine vide du bac à sable
+SANDBOX_LINKER = ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d")
+#: N3 de #1666 : délai du témoin de démarrage du bac à sable — un bwrap
+#: bloqué ne retient pas la passe du radar
+PARTS_PROBE_TIMEOUT = 20
 #: les espaces de noms substituables dans `argv` : `radar.parse_ci_parts` les
 #: refuse à la déclaration, `due` les substitue
 PLACEHOLDERS = ("selector", "root", "files", "out")
@@ -196,6 +217,104 @@ def selector_env(root: str, home: str) -> dict:
     suffisent au contrat."""
     return {"PATH": os.environ.get("PATH") or os.defpath, "HOME": home,
             "TMPDIR": home, "GITHUB_WORKSPACE": root, "LC_ALL": "C"}
+
+
+def sandbox_binary() -> str | None:
+    """N3 de #1666 : le binaire d'isolation de l'hôte (`bwrap`), ou None.
+
+    Aucun repli n'existe : sans ce binaire, `due` refuse de prouver (le
+    sélecteur est du code de la cible, jamais exécuté sur l'hôte)."""
+    return shutil.which("bwrap")
+
+
+def sandbox_prefix(bwrap: str) -> list:
+    """N3 de #1666 : les options d'isolation du bac à sable — espaces de noms
+    séparés (`--unshare-all`, dont le réseau), environnement vidé (`--clearenv`,
+    seuls les `--setenv` du contrat entrent), racine vide (`bwrap` n'expose que
+    ce qui est monté), `/proc`, `/dev` et `/tmp` neufs."""
+    return [bwrap, "--die-with-parent", "--unshare-all", "--unshare-net",
+            "--clearenv", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+
+
+def _readonly_binds(paths) -> list:
+    """Les montages en lecture seule des chemins existants : `--ro-bind`
+    strict (un chemin déclaré mais absent fait échouer le bac à sable, donc
+    refuser la preuve, jamais l'exécuter à moitié isolé)."""
+    argv = []
+    for path in paths:
+        if os.path.exists(path):
+            argv += ["--ro-bind", path, path]
+    return argv
+
+
+def sandbox_argv(bwrap: str, argv, *, root: str, files: str, writable, env: dict) -> list:
+    """N3 de #1666 : la commande du sélecteur, enveloppée dans le bac à sable.
+
+    Le binaire du sélecteur est résolu **avant** l'entrée (l'environnement du
+    bac à sable est vide) et son préfixe d'installation est monté en lecture
+    seule s'il n'est pas déjà dans le runtime (`node` hors `/usr`, `python`
+    d'un venv). L'arbre de la cible et les entrées sont montés en lecture
+    seule ; les seuls chemins inscriptibles sont les répertoires de travail et
+    de sortie, propres à cette preuve. Rien de l'hôte n'est monté en entier :
+    pas de `/`, pas de `/home`."""
+    program = shutil.which(argv[0], path=env.get("PATH"))
+    if program is None:
+        raise PartsError("the selector %s cannot start (%s is not in PATH)"
+                         % (argv[0], argv[0]))
+    real = os.path.realpath(program)
+    bound = list(SANDBOX_RUNTIME)
+    extra = os.path.dirname(real) or "/"
+    if os.path.basename(extra) == "bin":
+        extra = os.path.dirname(extra) or "/"
+    if extra == "/":
+        raise PartsError("the selector %s is installed at the host root: it cannot be "
+                         "isolated" % argv[0])
+    if not any(extra == path or extra.startswith(path.rstrip("/") + "/")
+               for path in SANDBOX_RUNTIME):
+        bound.append(extra)
+    cmd = sandbox_prefix(bwrap)
+    cmd += _readonly_binds(bound + list(SANDBOX_LINKER))
+    cmd += ["--ro-bind", root, root, "--ro-bind", files, files]
+    for path in writable:
+        cmd += ["--bind", path, path]
+    cmd += ["--chdir", root]
+    for key in ("PATH", "HOME", "TMPDIR", "GITHUB_WORKSPACE", "LC_ALL"):
+        if key in env:
+            cmd += ["--setenv", key, env[key]]
+    return cmd + ["--", real] + list(argv[1:])
+
+
+def sandbox_ready(bwrap: str) -> str | None:
+    """N3 de #1666 : None si le bac à sable démarre réellement sur cet hôte,
+    sinon la raison du refus (message actionnable).
+
+    Un `bwrap` installé mais dont le noyau refuse les espaces de noms (ou un
+    montage) n'isole rien : le témoin démarre `true` dans le bac à sable, avec
+    le runtime réel, avant toute extraction."""
+    probe = shutil.which("true")
+    if probe is None:
+        # pas de témoin disponible : le bac à sable se prononcera sur le
+        # sélecteur lui-même (un échec de bwrap reste un refus, jamais un vert)
+        return None
+    argv = sandbox_prefix(bwrap) + _readonly_binds(
+        list(SANDBOX_RUNTIME) + list(SANDBOX_LINKER))
+    argv += ["--chdir", "/", os.path.realpath(probe)]
+    proc = None
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env={"PATH": os.defpath, "LC_ALL": "C"},
+                                start_new_session=True)
+        _out, err = proc.communicate(timeout=PARTS_PROBE_TIMEOUT)
+    except OSError as exc:
+        return "the sandbox %s cannot start (%s)" % (bwrap, exc)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        return "the sandbox %s did not answer in %d s" % (bwrap, PARTS_PROBE_TIMEOUT)
+    if proc.returncode != 0:
+        reason = (err or b"").decode("utf-8", "replace").strip()[-200:]
+        return "the sandbox %s cannot isolate this host (exit %d): %s" % (
+            bwrap, proc.returncode, reason)
+    return None
 
 
 def _plan_file(path: str, plan) -> tuple:
@@ -343,7 +462,12 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
     par couple (base, tête gelée) et par contrat. L'arbre entier de la cible
     (~71 Mo pour Nexlink) n'est plus extrait aux trois contrôles
     d'atterrissage : une preuve en cache est relue et revalidée, jamais
-    recalculée pour un autre couple. Sans `cache`, le calcul reste intact."""
+    recalculée pour un autre couple. Sans `cache`, le calcul reste intact.
+
+    N3 de #1666 : le sélecteur ne tourne que dans le bac à sable `bwrap`
+    (réseau coupé, racine vide, arbre et entrées en lecture seule). Il n'y a
+    **aucun repli** : sans `bwrap` sur l'hôte, ou si le bac à sable ne démarre
+    pas, `PartsError` — la preuve est inconnue, jamais un vert."""
     plan = getattr(project, "ci_parts", None)
     if plan is None:
         raise PartsError("project %s declares no ci_parts contract" % project.name)
@@ -374,6 +498,19 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
         hit = _cache_read(cache, key, plan, base, frozen)
         if hit is not None:
             return hit
+    #: N3 de #1666 : le sélecteur est du code de la cible ; il ne tourne que
+    #: dans le bac à sable. Sans bwrap, ou si le bac à sable ne démarre pas
+    #: (espaces de noms refusés par le noyau), la preuve est refusée avant
+    #: toute extraction — aucun repli vers l'exécution sur l'hôte.
+    bwrap = sandbox_binary()
+    if bwrap is None:
+        raise PartsError("the selector %s has no sandbox on this host (bwrap is not "
+                         "installed): the due parts cannot be proven without isolation "
+                         "(N3 of #1666)" % plan.selector)
+    why = sandbox_ready(bwrap)
+    if why is not None:
+        raise PartsError("the selector %s cannot be isolated: %s (N3 of #1666)"
+                         % (plan.selector, why))
     try:
         parent = merge_base(repo, base, frozen)
         changed = change_set(repo, parent, frozen)
@@ -391,19 +528,27 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
         files = os.path.join(tmp, "changed.nul")
         with open(files, "wb") as out:
             out.write(changed)
-        result = os.path.join(tmp, "plan.json")
+        #: N3 de #1666 : seuls ces deux répertoires sont inscriptibles dans le
+        #: bac à sable ; l'arbre et `changed.nul` y sont montés en lecture seule
+        work = os.path.join(tmp, "work")
+        outdir = os.path.join(tmp, "out")
+        os.makedirs(work)
+        os.makedirs(outdir)
+        result = os.path.join(outdir, "plan.json")
         values = {"selector": selector, "root": root, "files": files, "out": result}
         try:
             argv = [part.format(**values) for part in plan.argv]
         except (KeyError, IndexError, ValueError) as exc:
             raise PartsError("the ci_parts command uses an unknown placeholder: %s" % exc) from exc
-        env = selector_env(root, tmp)
+        env = selector_env(root, work)
+        argv = sandbox_argv(bwrap, argv, root=root, files=files,
+                            writable=(work, outdir), env=env)
         try:
             proc = subprocess.Popen(argv, cwd=root, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, env=env,
                                     start_new_session=True)
         except OSError as exc:
-            raise PartsError("the selector %s cannot start (%s: %s)"
+            raise PartsError("the selector %s cannot start in its sandbox (%s: %s)"
                              % (plan.selector, argv[0], exc)) from exc
         try:
             out, err = proc.communicate(timeout=PARTS_TIMEOUT)

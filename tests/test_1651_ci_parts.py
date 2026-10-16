@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import sys
 import time
 import unittest
@@ -76,6 +77,68 @@ CI_PARTS = {"selector": "scripts/ci/lot-plan.py",
             "argv": [sys.executable, "{selector}", "--files", "{files}", "--out", "{out}"],
             "schema": "test-lot-plan/1"}
 PARTS_CONTRACT = radar.parse_ci_parts(CI_PARTS, "`radar.projects.p`")
+
+#: N3 de #1666 : un faux `bwrap` pour les témoins de plomberie — il comprend
+#: les options d'isolation, journalise sa ligne de commande (une par
+#: invocation : le témoin de démarrage puis le sélecteur) et exécute la
+#: commande avec l'environnement du bac à sable (`--clearenv` + `--setenv`).
+#: Le bac à sable **réel** (noyau, réseau, montages) a son propre témoin,
+#: sauté quand `bwrap` n'est pas installé sur l'hôte.
+FAKE_BWRAP = '''\
+#!{python}
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+env = {{}}
+cmd = []
+index = 0
+while index < len(args):
+    arg = args[index]
+    if arg == "--":
+        cmd = args[index + 1:]
+        break
+    if arg == "--clearenv":
+        env = {{}}
+        index += 1
+    elif arg in ("--die-with-parent", "--unshare-all", "--unshare-net"):
+        index += 1
+    elif arg in ("--ro-bind", "--bind"):
+        index += 3
+    elif arg == "--setenv":
+        env[args[index + 1]] = args[index + 2]
+        index += 3
+    elif arg in ("--proc", "--dev", "--tmpfs", "--chdir"):
+        if arg == "--chdir":
+            os.chdir(args[index + 1])
+        index += 2
+    elif arg.startswith("--"):
+        raise SystemExit("fake bwrap: unknown option %r" % arg)
+    else:
+        cmd = args[index:]
+        break
+if not cmd:
+    raise SystemExit("fake bwrap: no command")
+with open({log!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\\n")
+os.execvpe(cmd[0], cmd, env)
+'''
+
+
+def fake_bwrap(path: str, log: str | None = None, fail: str | None = None) -> str:
+    """Écrit un faux `bwrap` : `fail` (un message sur stderr) simule un bac à
+    sable que le noyau refuse (espaces de noms indisponibles) ; sinon la
+    commande est exécutée et sa ligne de commande journalisée."""
+    if fail is not None:
+        source = "#!%s\nimport sys\nsys.stderr.write(%r)\nraise SystemExit(1)\n" % (
+            sys.executable, fail + "\n")
+    else:
+        source = FAKE_BWRAP.format(python=sys.executable, log=log)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(source)
+    os.chmod(path, 0o755)
+    return path
 
 
 def contexts(**states) -> dict:
@@ -141,6 +204,10 @@ class SettingsTest(unittest.TestCase):
 class _Contract(_Land):
     """Un dépôt de témoin dont la cible porte le contrat versionné."""
 
+    #: les témoins de plomberie exécutent le sélecteur via un faux `bwrap`
+    #: (N3 de #1666) ; le bac à sable réel a son propre témoin, sans faux
+    FAKE_SANDBOX = True
+
     def setUp(self):
         super().setUp()
         _write(self.repo, "scripts/ci/lot-plan.py", selector())
@@ -150,6 +217,18 @@ class _Contract(_Land):
         _git(self.repo, "push", "-q", "origin", "main")
         self.project = dataclasses.replace(self.project, ci_required=True,
                                            ci_parts=PARTS_CONTRACT)
+        if self.FAKE_SANDBOX:
+            #: N3 de #1666 : le contrat exige un bac à sable ; les témoins de
+            #: plomberie en installent un faux dans le PATH, qui journalise sa
+            #: ligne de commande et exécute le sélecteur sans isoler.
+            fake_dir = os.path.join(self.tmp, "sandbox-bin")
+            os.makedirs(fake_dir)
+            self.bwrap_log = os.path.join(self.tmp, "bwrap.argv")
+            fake_bwrap(os.path.join(fake_dir, "bwrap"), self.bwrap_log)
+            patch = mock.patch.dict(
+                os.environ, {"PATH": fake_dir + os.pathsep + os.environ.get("PATH", "")})
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def publish_main(self):
         _git(self.repo, "add", "-A")
@@ -628,3 +707,125 @@ class TimeoutGroupTest(_Contract):
             with self.assertRaisesRegex(ci_parts.PartsError, "timed out"):
                 ci_parts.due(self.project, tip, self.base(), self.repo)
         self.assertIsNone(self._grandchild())
+
+
+class SandboxTest(_Contract):
+    """N3 de #1666 : le sélecteur du dépôt ne tourne jamais sur l'hôte."""
+
+    def invocations(self):
+        with open(self.bwrap_log, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_without_bwrap_the_proof_is_refused_and_nothing_starts(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        with mock.patch.object(ci_parts, "sandbox_binary", lambda: None), \
+                mock.patch.object(ci_parts, "extract",
+                                  side_effect=AssertionError("the tree was extracted")):
+            with self.assertRaisesRegex(ci_parts.PartsError, "no sandbox"):
+                ci_parts.due(self.project, tip, self.base(), self.repo)
+        #: aucun bac à sable n'a démarré (le journal du faux bwrap n'existe
+        #: pas) et rien n'a été extrait : pas de repli vers l'exécution hôte
+        self.assertFalse(os.path.exists(self.bwrap_log))
+
+    def test_a_sandbox_that_cannot_isolate_refuses_before_any_extraction(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        dead = fake_bwrap(
+            os.path.join(self.tmp, "dead-bwrap"),
+            fail="bwrap: Creating new namespace failed: Operation not permitted")
+        with mock.patch.object(ci_parts, "sandbox_binary", lambda: dead), \
+                mock.patch.object(ci_parts, "extract",
+                                  side_effect=AssertionError("the tree was extracted")):
+            with self.assertRaisesRegex(ci_parts.PartsError, "cannot be isolated"):
+                ci_parts.due(self.project, tip, self.base(), self.repo)
+
+    def test_the_selector_runs_with_the_network_cut_and_a_read_only_tree(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        proof = ci_parts.due(self.project, tip, self.base(), self.repo)
+        self.assertEqual(proof["due"], ("lot/backend-suite",))
+        calls = self.invocations()
+        self.assertEqual(len(calls), 2)      # le témoin de démarrage, puis le sélecteur
+        probe, run = calls
+        self.assertIn("--unshare-net", probe)
+        self.assertIn("--unshare-all", run)
+        self.assertIn("--die-with-parent", run)
+        self.assertIn("--clearenv", run)
+        readonly, writable, setenv = {}, {}, {}
+        index = 0
+        while index < len(run):
+            if run[index] in ("--ro-bind", "--bind"):
+                target = readonly if run[index] == "--ro-bind" else writable
+                target[run[index + 1]] = run[index + 2]
+                index += 3
+            elif run[index] == "--setenv":
+                setenv[run[index + 1]] = run[index + 2]
+                index += 3
+            else:
+                index += 1
+        tree = [path for path in readonly if path.endswith(os.sep + "tree")]
+        self.assertEqual(len(tree), 1)
+        self.assertEqual(readonly[tree[0]], tree[0])
+        changed = [path for path in readonly if path.endswith("changed.nul")]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(readonly[changed[0]], changed[0])
+        #: ni la racine ni un répertoire personnel : le bac à sable ne voit que
+        #: le runtime, l'arbre, les entrées et sa sortie (le temporaire de la
+        #: preuve peut lui-même vivre sous un chemin personnel : ce sont ses
+        #: **parents** qui ne sont jamais montés)
+        self.assertNotIn("/", readonly)
+        expected = {path for path in list(ci_parts.SANDBOX_RUNTIME)
+                    + list(ci_parts.SANDBOX_LINKER) if os.path.exists(path)}
+        self.assertEqual(set(readonly), expected | {tree[0], changed[0]})
+        self.assertEqual(len(writable), 2)   # travail et sortie, rien d'autre
+        self.assertEqual(setenv["GITHUB_WORKSPACE"], tree[0])
+        self.assertIn(setenv["HOME"], writable)
+        self.assertEqual(setenv["TMPDIR"], setenv["HOME"])
+        self.assertEqual(run[run.index("--chdir") + 1], tree[0])
+        cmd = run[run.index("--") + 1:]
+        self.assertEqual(cmd[0], os.path.realpath(sys.executable))
+        self.assertEqual(cmd[1], os.path.join(tree[0], "scripts", "ci", "lot-plan.py"))
+        self.assertEqual(cmd[2], "--files")
+        self.assertEqual(cmd[3], changed[0])
+        self.assertEqual(cmd[4], "--out")
+        self.assertIn(os.path.dirname(cmd[5]), writable)   # le plan s'écrit dans la sortie
+
+
+#: N3 de #1666 : un sélecteur qui n'écrit un plan que si l'hôte et le réseau
+#: sont hors de portée du bac à sable réel
+REAL_SANDBOX_SELECTOR = '''\
+import json
+import os
+import socket
+import sys
+
+if os.path.exists("/etc/passwd"):
+    raise SystemExit("the host filesystem is readable")
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=2).close()
+except OSError:
+    pass
+else:
+    raise SystemExit("the network is reachable")
+out = sys.argv[sys.argv.index("--out") + 1]
+with open(out, "w", encoding="utf-8") as handle:
+    json.dump({"schema": "test-lot-plan/1", "due": ["lot/backend-suite"]}, handle)
+'''
+
+
+@unittest.skipUnless(shutil.which("bwrap"), "bwrap is not installed on this host")
+class RealSandboxTest(_Contract):
+    """N3 de #1666 : le bac à sable réel — le plan est prouvé et le sélecteur
+    ne voit ni les fichiers de l'hôte ni le réseau (sauté sans `bwrap`)."""
+
+    FAKE_SANDBOX = False
+
+    def test_the_real_sandbox_proves_the_plan_and_hides_host_and_network(self):
+        _write(self.repo, "scripts/ci/lot-plan.py", REAL_SANDBOX_SELECTOR)
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        proof = ci_parts.due(self.project, tip, self.base(), self.repo)
+        self.assertEqual(proof["due"], ("lot/backend-suite",))
+        self.assertEqual(proof["schema"], "test-lot-plan/1")

@@ -122,7 +122,13 @@ commit, frozen head, contract) under `<state>/radar/ci-parts` (N2 de #1666):
 the tree of the target is extracted once per pair instead of at every control,
 and a re-read entry is revalidated, never trusted as is. The selector runs in
 its own session and its whole process group is killed when it exceeds its
-delay (N4 de #1666).
+delay (N4 de #1666). The selector is target code: it only runs inside a
+`bwrap` sandbox (N3 de #1666) — separate namespaces, network cut, emptied
+environment, empty root exposing only the runtime, the extracted tree and the
+inputs (read-only) plus two proof-local writable directories (work and plan
+output). No host root or home directory is mounted, and **there is no
+fallback**: without `bwrap`, or if the sandbox cannot start (namespaces
+refused by the kernel), the proof is refused, never computed on the host.
 
 The contract is the target's, not the branch's: a lot cannot suppress a part
 by editing its own workflows, and an old head that carries no plan job is
