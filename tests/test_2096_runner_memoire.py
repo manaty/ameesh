@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#2096 : bornes mémoire du runner (texte final, affichage, retour des arènes).
+"""#2096 : mémoire du runner (bornes du tour, lectures du journal, arènes).
 
 Diagnostic du 16/10 (impl-05) : le socle du runner est sous 150 Mo, mais le
 pic d'un gros tour (flux de plusieurs Mo) est retenu par l'allocateur et le
-texte final restait vivant sans borne jusqu'au tour suivant. Ces tests fixent
-les deux bornes (texte final, affichage du repli de résumé), la décision de
-rendre les arènes seulement après un tour qui a fait croître le processus, et
+texte final restait vivant sans borne jusqu'au tour suivant. Deuxième volet
+(mesure du bureau, 16/10 19:35) : la taille de `events.jsonl` suivait la
+mémoire des exécuteurs — les lecteurs du journal le chargeaient et
+l'analysaient entier à chaque tour (plusieurs fois), pour n'en garder qu'une
+tranche.
+
+Ces tests fixent les bornes (texte final, affichage du repli de résumé), la
+décision de rendre les arènes seulement après un tour qui a fait croître le
+processus, les lectures du journal (tranche, comptage, session par la fin) et
 le journal du flux inchangé.
 
 Le seuil de RSS avant/après vit dans la note du lot, pas ici : un chiffre de
@@ -16,11 +22,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import stat
+import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import adapters, registry
+from ameesh import adapters, cost, registry
 from ameesh.platform import process
 from ameesh.runner import (
     AgentWorker,
@@ -225,6 +233,133 @@ class PlatformMemoryTest(unittest.TestCase):
                 self.assertFalse(process.release_free_memory())
 
 
+class JournalReadTest(unittest.TestCase):
+    """#2096 : les lecteurs du journal lisent une tranche, jamais tout le flux.
+
+    L'ancien `events()` chargeait le fichier entier puis analysait **toutes**
+    ses lignes (pic de 620 Mo mesuré pour un journal de 75 Mo, plusieurs fois
+    par tour) ; `session_of()` faisait de même pour n'en garder qu'un
+    identifiant."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-2096-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.state = os.path.join(self.tmp, "state")
+        self.agent = "a1"
+        os.makedirs(os.path.join(self.state, self.agent), exist_ok=True)
+        self.path = os.path.join(self.state, self.agent, "events.jsonl")
+
+    def write(self, *lignes, saut_final=True):
+        with open(self.path, "wb") as fh:
+            for index, ligne in enumerate(lignes):
+                if isinstance(ligne, bytes):
+                    brut = ligne
+                elif isinstance(ligne, dict):
+                    brut = json.dumps(ligne).encode("utf-8")
+                else:
+                    brut = str(ligne).encode("utf-8")
+                fin = b"\n" if (saut_final or index < len(lignes) - 1) else b""
+                fh.write(brut + fin)
+        return cost.CostBook(state_dir=self.state, db=None,
+                             tools={self.agent: "claude"})
+
+    def test_events_slice_equals_the_whole_read(self):
+        book = self.write(*[{"type": "x", "n": i} for i in range(50)])
+        tout = book.events(self.agent)
+        self.assertEqual(len(tout), 50)
+        for start, end in ((0, 50), (10, 20), (49, None), (50, None), (0, 0)):
+            self.assertEqual(book.events(self.agent, start=start, end=end),
+                             tout[start:end], "tranche %s:%s" % (start, end))
+
+    def test_events_parses_only_the_requested_slice(self):
+        book = self.write(*[{"type": "x", "n": i} for i in range(500)])
+        appels = []
+        vrai = cost.json.loads
+
+        def compte(*args, **kwargs):
+            appels.append(1)
+            return vrai(*args, **kwargs)
+
+        with mock.patch.object(cost.json, "loads", side_effect=compte):
+            out = book.events(self.agent, start=498)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(len(appels), 2)  # les 498 premières lignes sont comptées, pas analysées
+
+    def test_events_skips_an_unreadable_line(self):
+        book = self.write(b'{"type": "x", "n": 0}', b'\xff\xfe not json',
+                          b'{"type": "x", "n": 2}')
+        self.assertEqual(book.events(self.agent),
+                         [{"type": "x", "n": 0}, {"type": "x", "n": 2}])
+
+    def test_last_line_without_a_newline_is_read(self):
+        book = self.write({"n": 1}, {"n": 2}, saut_final=False)
+        self.assertEqual(book.events(self.agent), [{"n": 1}, {"n": 2}])
+        self.assertEqual(book.events(self.agent, start=1), [{"n": 2}])
+
+    def test_a_raw_line_separator_inside_a_string_keeps_its_event(self):
+        # Un harnais Node écrit U+2028 et U+0085 tels quels dans une chaîne
+        # JSON ; l'exécuteur compte les lignes sur "\n" (`events_start`), la
+        # tranche doit donc se couper de même, sans perdre l'événement.
+        book = self.write({"n": 0},
+                          '{"n": 1, "text": "a\u2028b\u0085c"}',
+                          {"n": 2})
+        with open(self.path, "rb") as fh:
+            self.assertEqual(sum(1 for _ in fh), 3)
+        self.assertEqual([e["n"] for e in book.events(self.agent)], [0, 1, 2])
+        self.assertEqual([e["n"] for e in book.events(self.agent, start=1, end=2)], [1])
+        self.assertEqual([e["n"] for e in book.events(self.agent, start=2)], [2])
+
+    def test_reverse_lines_across_block_boundaries(self):
+        lignes = [b"x" * (index * 7 % 40) + b"ligne-%d" % index for index in range(200)]
+        self.write(*lignes)
+        with open(self.path, "rb") as fh:
+            attendu = [ligne for ligne in fh.read().split(b"\n") if ligne]
+        # petit bloc : chaque ligne franchit une frontière de bloc
+        rendu = [ligne for ligne in cost._lines_reverse(self.path, bloc=16) if ligne]
+        self.assertEqual(rendu, list(reversed(attendu)))
+
+    def test_session_of_reads_from_the_end(self):
+        book = self.write(*[{"type": "x", "n": i} for i in range(300)],
+                          {"type": "result", "session_id": "s-fin"})
+        appels = []
+        vrai = cost.json.loads
+
+        def compte(*args, **kwargs):
+            appels.append(1)
+            return vrai(*args, **kwargs)
+
+        with mock.patch.object(cost.json, "loads", side_effect=compte):
+            self.assertEqual(book.session_of(self.agent), "s-fin")
+        self.assertLessEqual(len(appels), 3)  # pas les 301 lignes
+
+    def test_session_of_matches_the_forward_scan(self):
+        book = self.write({"type": "x", "session_id": "vieux"},
+                          {"type": "assistant", "parent_tool_use_id": "t",
+                           "session_id": "sous-agent"},
+                          {"type": "session", "sessionId": "deepseek-1"},
+                          {"type": "result", "session_id": "a", "thread_id": "b"})
+        self.assertEqual(book.session_of(self.agent), "b")
+        self.assertEqual(book.session_of(self.agent),
+                         cost._last_session(book.events(self.agent)))
+        self.write({"type": "x"})
+        self.assertIsNone(book.session_of(self.agent))
+
+    def test_session_reading_parses_only_the_prefix(self):
+        # `session_reading` lit les événements AVANT le tour : la tranche
+        # `end=start` doit s'arrêter là, sans analyser le tour ni la suite.
+        book = self.write(*[{"type": "x", "n": i} for i in range(200)])
+        appels = []
+        vrai = cost.json.loads
+
+        def compte(*args, **kwargs):
+            appels.append(1)
+            return vrai(*args, **kwargs)
+
+        with mock.patch.object(cost.json, "loads", side_effect=compte):
+            book.session_reading(self.agent, "claude", "s", 5)
+        self.assertEqual(len(appels), 5)  # 5 lignes du préfixe, pas les 200
+
+
 class BigTurnMemoryTest(PgTestCase):
     """Bout en bout : un gros tour garde son journal intact, mais ne garde ni
     le texte final entier, ni l'affichage, et laisse la place au tour suivant."""
@@ -263,6 +398,12 @@ class BigTurnMemoryTest(PgTestCase):
         resultats = [ligne for ligne in lignes if ligne.get("type") == "result"]
         self.assertEqual(len(resultats), 1)
         self.assertEqual(len(resultats[0]["result"]), taille)
+        # et les lecteurs du grand livre relisent ce journal par tranche : la
+        # session par la fin, la dernière ligne par son index, sans le charger.
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db,
+                             tools={"big": "claude"})
+        self.assertEqual(book.session_of("big"), "big-sess-1")
+        self.assertEqual(len(book.events("big", start=len(lignes) - 1)), 1)
 
 
 if __name__ == "__main__":
