@@ -14,10 +14,18 @@
   consommer le nonce : ameesh le consomme à l'exécution), puis enregistré —
   l'enregistrement consomme le lien.
 * `receipt` : ameesh récupère le reçu et le vérifie lui-même.
+* `create_login_request` / `login_view` / `login_submit` / `login_receipt`
+  (L232d, lot #366) : DÉFI DE CONNEXION, genre distinct. La demande signable
+  ne porte que l'hôte, le fournisseur, le compte, la portée et l'échéance ;
+  l'URL d'autorisation et le code à usage unique vivent dans l'état privé
+  (0600) et ne sortent qu'après une assertion WebAuthn (`view`). Le reçu
+  `done` | `cancel` ne contient ni code ni condensat, et il ne prouve pas le
+  grant fournisseur : la santé se vérifie séparément.
 * L44 (0031) : l'action relue porte son canon (`actions.canon`) ; les
   credentials proposés et la vérification du reçu se limitent aux
   authentificateurs de CE canon — une passkey enregistrée par un autre canon
-  ne vaut jamais pour elle.
+  ne vaut jamais pour elle. Un défi de connexion, lui, n'a pas de canon
+  d'action : il utilise le canon par défaut.
 * `create_enroll_link` / `enroll_view` / `enroll_submit` : cérémonie de
   création de passkey → fichier de PROPOSITION de canon ; jamais d'écriture
   dans `authenticators`.
@@ -33,13 +41,14 @@ import os
 import re
 import threading
 import time
+from urllib.parse import urlsplit
 
 from .. import jcs, receipts
 from ..db import DbError
 from . import duplicate, enroll, render
 from .config import ApproveConfig
 from .sources import ACTION_ID_RE, REQUESTABLE_STATES, ActionSource, ActionSourceError
-from .store import Store, new_request_id, new_token
+from .store import Store, new_login_id, new_request_id, new_token
 
 log = logging.getLogger("ameesh.approve")
 
@@ -56,6 +65,30 @@ _ASSERTION_FIELDS = frozenset({"decision", "credential_id", "authenticatorData",
 _ASSERTION_OPTIONAL = frozenset({"userHandle"})
 _ENROLL_FIELDS = frozenset({"credential_id", "clientDataJSON", "attestationObject"})
 _ENROLL_OPTIONAL = frozenset({"transports"})
+
+# -- défis de connexion (L232d, lot #366) ---------------------------------
+#: fournisseurs dont un défi peut être créé ; l'URL doit pointer un hôte
+#: officiel du fournisseur (défense en profondeur : l'adaptateur l'a déjà
+#: extraite de la sortie épinglée du CLI)
+LOGIN_PROVIDERS = ("claude", "codex", "gh")
+LOGIN_URL_DOMAINS = {
+    "claude": ("claude.ai", "claude.com", "anthropic.com"),
+    "codex": ("chatgpt.com", "openai.com"),
+    "gh": ("github.com",),
+}
+#: échéance maximale d'un défi (le fournisseur peut l'écourter)
+LOGIN_MAX_TTL = 900
+LOGIN_REQUEST_FIELDS = ("host", "provider", "account", "approver", "requested_by",
+                        "url", "code")
+LOGIN_REQUEST_OPTIONAL = ("scope", "provider_exp")
+#: décisions qui closent le défi (le reçu correspondant est signé)
+LOGIN_FINAL_DECISIONS = ("done", "cancel")
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$")
+_SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+ -]{0,255}$")
+#: URL d'autorisation ou code à usage unique, bornés (jamais journalisés)
+_LOGIN_URL_MAX = 4096
+_LOGIN_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~+/-]{0,511}$")
 
 
 class ApproveError(Exception):
@@ -319,7 +352,8 @@ class ApproveService:
     # ------------------------------------------------------------------
     # POST /a/<jeton>
     # ------------------------------------------------------------------
-    def submit(self, token: str, body) -> dict:
+    def _assertion(self, body, decisions) -> str:
+        """Valide la forme d'un corps d'assertion ; rend la décision."""
         if not isinstance(body, dict):
             raise ApproveError(400, "format", "JSON object expected")
         keys = set(body)
@@ -327,11 +361,15 @@ class ApproveService:
             raise ApproveError(400, "format", "expected fields: %s"
                                % ", ".join(sorted(_ASSERTION_FIELDS)))
         decision = body["decision"]
-        if decision not in receipts.DECISIONS:
-            raise ApproveError(400, "format", "decision: approve or deny")
+        if decision not in decisions:
+            raise ApproveError(400, "format", "decision: %s" % " or ".join(decisions))
         for name in _ASSERTION_FIELDS - {"decision"}:
             if not isinstance(body[name], str) or not _B64U_RE.fullmatch(body[name]):
                 raise ApproveError(400, "format", "%s: base64url expected" % name)
+        return decision
+
+    def submit(self, token: str, body) -> dict:
+        decision = self._assertion(body, receipts.DECISIONS)
 
         record = self._live_record(token)
         action = self._check_unchanged(record)
@@ -363,6 +401,234 @@ class ApproveService:
                  " (duplicate assumed)" if record.get("assume_duplicate") is True
                  and decision == "approve" else "", verdict.approver)
         return {"request_id": record["request_id"], "decision": decision}
+
+    # ------------------------------------------------------------------
+    # défis de connexion (L232d, lot #366)
+    #
+    # Un défi de connexion n'est PAS une action L5 : aucune empreinte
+    # d'action, aucune garde d'état d'action (les gardes L5 restent
+    # inchangées, sur leur propre chemin). La demande signable ne porte
+    # jamais l'URL ni le code : ils vivent dans `login-private` (0600) et ne
+    # sortent qu'après une assertion WebAuthn (`view`), donc jamais dans le
+    # fil, le courrier, un journal ou un reçu. Le reçu `done` ne prouve pas
+    # le grant fournisseur : la santé et le compte attendu sont vérifiés par
+    # l'appelant.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _login_url(provider: str, url) -> str:
+        if not isinstance(url, str) or not 0 < len(url) <= _LOGIN_URL_MAX:
+            raise ApproveError(400, "format", "url: https URL expected")
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname or ""
+            parts.port  # noqa: B018 - lève ValueError sur un port illisible
+        except ValueError as exc:
+            raise ApproveError(400, "format", "url unreadable: %s" % exc) from exc
+        if parts.scheme != "https" or not host or parts.username is not None \
+                or parts.password is not None:
+            raise ApproveError(400, "format", "url: https URL without credentials expected")
+        domains = LOGIN_URL_DOMAINS[provider]
+        if not any(host == domain or host.endswith("." + domain) for domain in domains):
+            raise ApproveError(400, "format", "url: %r is not an official %s host"
+                               % (host, provider))
+        return url
+
+    def create_login_request(self, body) -> dict:
+        if not isinstance(body, dict):
+            raise ApproveError(400, "format", "JSON object expected")
+        missing = [name for name in LOGIN_REQUEST_FIELDS if name not in body]
+        if missing:
+            raise ApproveError(400, "format", "missing fields: %s" % ", ".join(missing))
+        ignored = sorted(set(body) - set(LOGIN_REQUEST_FIELDS) - set(LOGIN_REQUEST_OPTIONAL))
+        if ignored:
+            log.info("login request: ignored fields %s", ", ".join(
+                re.sub(r"[^A-Za-z0-9_-]", "?", name)[:32] for name in ignored[:10]))
+        host, provider, account = body["host"], body["provider"], body["account"]
+        approver, requested_by = body["approver"], body["requested_by"]
+        if not isinstance(host, str) or not _HOST_RE.fullmatch(host):
+            raise ApproveError(400, "format", "host: host name expected")
+        if provider not in LOGIN_PROVIDERS:
+            raise ApproveError(400, "format", "provider: %s" % " or ".join(LOGIN_PROVIDERS))
+        if not isinstance(account, str) or not _ACCOUNT_RE.fullmatch(account):
+            raise ApproveError(400, "format", "account: account name expected")
+        if not isinstance(approver, str) or not _HUMAN_RE.fullmatch(approver):
+            raise ApproveError(400, "format", "approver: \"human:<id>\" expected")
+        if not isinstance(requested_by, str) or not _MEMBER_RE.fullmatch(requested_by):
+            raise ApproveError(400, "format", "requested_by: \"agent:<id>\" or \"human:<id>\"")
+        scope = body.get("scope", "")
+        if not isinstance(scope, str) or (scope and not _SCOPE_RE.fullmatch(scope)):
+            raise ApproveError(400, "format", "scope: short text expected (empty allowed)")
+        code = body["code"]
+        if not isinstance(code, str) or not _LOGIN_CODE_RE.fullmatch(code):
+            raise ApproveError(400, "format", "code: one-time code expected")
+        url = self._login_url(provider, body["url"])
+
+        now = int(self.clock())
+        ttl = LOGIN_MAX_TTL
+        provider_exp = body.get("provider_exp")
+        if provider_exp is not None:
+            if type(provider_exp) is not int or provider_exp <= now:
+                raise ApproveError(400, "format", "provider_exp: future epoch expected")
+            ttl = min(ttl, provider_exp - now)
+        if not self._credentials(approver):
+            raise ApproveError(409, "no_authenticator",
+                               "%s has no active WebAuthn authenticator" % approver)
+
+        request = {
+            "v": receipts.REQUEST_VERSION,
+            "approver": approver,
+            "login_id": "",
+            "host": host,
+            "provider": provider,
+            "account": account,
+            "scope": scope,
+            "summary_digest": "",
+            "requested_by": requested_by,
+            "nonce": _b64u(os.urandom(16)),
+            "iat": now,
+            "exp": now + int(ttl),
+        }
+        summary = render.render_login_summary(request)
+        request["summary_digest"] = render.summary_digest(summary)
+        login_id = new_login_id()
+        request["login_id"] = login_id
+        try:
+            receipts.check_request(dict(request, decision="view"))
+        except receipts.ReceiptError as exc:
+            raise ApproveError(400, "format", str(exc)) from exc
+        token = new_token()
+        record = {
+            "login_id": login_id,
+            "request": request,
+            "summary": summary,
+            "link_exp": request["exp"],     # le lien vit exactement le défi
+            "exp": request["exp"],
+            "created": now,
+        }
+        private = {"url": url, "code": code, "provider_exp": provider_exp}
+        self.store.save_login(record, token, private)
+        self.store.prune(now)
+        log.info("login challenge %s: %s/%s on %s, approver %s, requested by %s, %d s",
+                 login_id, provider, account or "(default)", host, approver, requested_by,
+                 request["exp"] - now)
+        return {
+            "login_id": login_id,
+            "link": self._link("login", token),
+            "link_exp": record["link_exp"],
+            "exp": request["exp"],
+            "host": host,
+            "provider": provider,
+            "account": account,
+            "scope": scope,
+        }
+
+    def _live_login(self, token: str) -> dict:
+        record = self.store.login_by_token(token)
+        if record is None:
+            raise ApproveError(404, "unknown_link", "unknown link")
+        if self.store.has_login_receipt(record["login_id"]):
+            raise ApproveError(410, "used", "this challenge is already settled")
+        if self.clock() >= record["link_exp"] or self.clock() >= record["request"]["exp"]:
+            raise ApproveError(410, "expired", "this challenge has expired")
+        return record
+
+    def login_view(self, token: str) -> dict:
+        """La page PUBLIQUE du défi : hôte, fournisseur, compte, portée,
+        échéance et résumé — jamais l'URL ni le code (assertion d'abord)."""
+        record = self._live_login(token)
+        request = record["request"]
+        credentials = self._credentials(request["approver"])
+        if not credentials:
+            raise ApproveError(409, "no_authenticator", "no active authenticator")
+        return {
+            "login_id": record["login_id"],
+            "request": request,
+            "summary": record["summary"],
+            "host": request["host"],
+            "provider": request["provider"],
+            "account": request["account"],
+            "scope": request["scope"],
+            "exp": request["exp"],
+            "link_exp": record["link_exp"],
+            "rp_id": self.cfg.rp_id,
+            "level": self.cfg.level,
+            "credentials": credentials,
+            "viewed": self.store.login_viewed(record["login_id"]),
+            "challenge_view": _b64u(receipts.challenge(dict(request, decision="view"))),
+            "challenge_cancel": _b64u(receipts.challenge(dict(request, decision="cancel"))),
+        }
+
+    def _login_receipt(self, record: dict, body, decision: str):
+        """Construit et VÉRIFIE le reçu d'un défi (sans consommer le nonce :
+        c'est ameesh qui le consommera en acceptant le reçu)."""
+        request = dict(record["request"], decision=decision)
+        receipt = {
+            "v": receipts.RECEIPT_VERSION,
+            "request": request,
+            "facade": "webauthn",
+            "credential_id": body["credential_id"],
+            "proof": {name: body[name]
+                      for name in ("authenticatorData", "clientDataJSON", "signature")},
+        }
+        expected = {"login_id": request["login_id"], "host": request["host"],
+                    "provider": request["provider"], "account": request["account"],
+                    "exp": request["exp"]}
+        with self.db_lock:
+            try:
+                verdict = receipts.verify_receipt(
+                    self.db, receipt, self.policy, kind="login", expected_login=expected,
+                    expect_decision=decision, consume_by=None, now=self.clock())
+            except DbError as exc:
+                raise ApproveError(503, "registry", "trust registry unreachable") from exc
+        return receipt, verdict
+
+    def login_submit(self, token: str, body) -> dict:
+        """`POST /login/<jeton>` : `view` ouvre la vue privée (assertion
+        requise AVANT tout affichage) ; `done` / `cancel` signent le reçu."""
+        decision = self._assertion(body, ("view",) + LOGIN_FINAL_DECISIONS)
+        record = self._live_login(token)
+        if decision == "done" and not self.store.login_viewed(record["login_id"]):
+            raise ApproveError(409, "not_viewed",
+                               "open the private view before signing done")
+        receipt, verdict = self._login_receipt(record, body, decision)
+        if not verdict.ok:
+            log.info("login %s: assertion refused [%s]", record["login_id"], verdict.code)
+            raise ApproveError(403, verdict.code, verdict.reason)
+        if decision == "view":
+            self.store.mark_login_viewed(record["login_id"])
+            private = self.store.login_private(record["login_id"])
+            if private is None:
+                raise ApproveError(410, "gone", "the private challenge is no longer available")
+            request = record["request"]
+            log.info("login %s: private view opened by %s", record["login_id"], verdict.approver)
+            return {
+                "login_id": record["login_id"],
+                "url": private["url"],
+                "code": private["code"],
+                "provider_exp": private.get("provider_exp"),
+                "exp": request["exp"],
+                "challenge_done": _b64u(receipts.challenge(dict(request, decision="done"))),
+                "challenge_cancel": _b64u(receipts.challenge(dict(request, decision="cancel"))),
+            }
+        if not self.store.save_login_receipt_once(record["login_id"], receipt):
+            raise ApproveError(410, "used", "this challenge is already settled")
+        self.store.drop_login_private(record["login_id"])
+        log.info("login %s: receipt %s signed by %s", record["login_id"], decision,
+                 verdict.approver)
+        return {"login_id": record["login_id"], "decision": decision}
+
+    def login_receipt(self, login_id: str) -> tuple[int, bytes | dict]:
+        """`GET /login-receipts/<id>` : le reçu (200), en attente (202), échu (410)."""
+        raw = self.store.login_receipt_bytes(login_id)
+        if raw is not None:
+            return 200, raw
+        record = self.store.get_login(login_id)
+        if record is None:
+            raise ApproveError(404, "unknown_request", "unknown challenge")
+        if self.clock() >= record["link_exp"] or self.clock() >= record["request"]["exp"]:
+            return 410, {"status": "expired", "login_id": login_id}
+        return 202, {"status": "pending", "login_id": login_id,
+                     "link_exp": record["link_exp"]}
 
     # ------------------------------------------------------------------
     # GET /receipts/<id>

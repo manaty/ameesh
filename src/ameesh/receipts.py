@@ -94,6 +94,14 @@ FACADES = ("webauthn", "ed25519", "device-es256")
 HUMAN_FACADES = frozenset({"webauthn", "device-es256"})
 LEVELS = ("standard", "eleve")
 DECISIONS = ("approve", "deny")
+#: décisions d'un reçu de DÉFI DE CONNEXION (L232d, lot #366) : la vue privée
+#: ne s'ouvre que sur assertion (`view`), puis l'humain signe `done` (il a
+#: terminé le parcours fournisseur) ou `cancel`. Aucun code, aucune URL ni
+#: condensat de l'un ou l'autre n'entre dans la demande signée.
+LOGIN_DECISIONS = ("view", "done", "cancel")
+#: champs qu'un appelant peut lier dans `expected_login` (le reste du reçu
+#: n'est jamais cru sur parole)
+LOGIN_BINDING_FIELDS = ("login_id", "host", "provider", "account", "scope", "exp")
 ACTION_CLASSES = ("read", "reversible", "irreversible", "costly")
 ACTION_DIGEST_FIELDS = ("action_id", "project", "connector", "operation", "target",
                         "args", "amount", "currency", "policy_version")
@@ -112,6 +120,7 @@ FACADE = "facade_refused"
 KIND = "kind"
 UNBOUND = "unbound"
 ACTION_MISMATCH = "action_mismatch"
+LOGIN_MISMATCH = "login_mismatch"
 DIGEST_MISMATCH = "digest_mismatch"
 DECISION = "decision"
 EXPIRED = "expired"
@@ -142,6 +151,7 @@ _NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 _HUMAN_RE = re.compile(r"^human:%s$" % _NAME)
 _MEMBER_RE = re.compile(r"^(human|agent):%s$" % _NAME)
 _ACTION_ID_RE = re.compile(r"^act_[0-9A-Za-z]{26}$")
+_LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_:.=-]{1,1024}$")
 _IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -155,6 +165,10 @@ _RECEIPT_FIELDS = frozenset({"v", "request", "facade", "credential_id", "proof"}
 _COMMON_FIELDS = frozenset({"v", "approver", "decision", "summary_digest", "requested_by",
                             "nonce", "iat", "exp"})
 _ACTION_FIELDS = _COMMON_FIELDS | {"action_id", "digest"}
+#: demande d'un défi de connexion : ni action ni empreinte d'action ; le lien
+#: porte l'hôte, le fournisseur, le compte, la portée et l'échéance (le code
+#: et l'URL restent dans l'état privé du service, jamais ici)
+_LOGIN_FIELDS = _COMMON_FIELDS | {"login_id", "host", "provider", "account", "scope"}
 _STANDING_FIELDS = _COMMON_FIELDS | {"standing"}
 _STANDING_KEYS = frozenset({"connector", "operations", "class", "max_amount", "currency", "until"})
 _PROOF_FIELDS = {
@@ -346,6 +360,7 @@ class ReceiptVerdict:
     decision: str = ""
     action_id: str = ""
     digest: str = ""
+    login_id: str = ""
     nonce: str = ""
     challenge: str = ""
     iat: int = 0
@@ -417,12 +432,19 @@ def _check_standing(standing, iat: int) -> None:
 
 
 def check_request(request) -> str:
-    """Valide la forme d'une demande ; renvoie sa nature (`action` | `standing`)."""
+    """Valide la forme d'une demande ; renvoie sa nature
+    (`action` | `standing` | `login`)."""
     if not isinstance(request, dict):
         raise ReceiptError("request: object expected")
     keys = set(request)
-    kind = "standing" if "standing" in keys else "action"
-    expected = _STANDING_FIELDS if kind == "standing" else _ACTION_FIELDS
+    if "standing" in keys:
+        kind = "standing"
+    elif "login_id" in keys:
+        kind = "login"
+    else:
+        kind = "action"
+    expected = {"standing": _STANDING_FIELDS, "login": _LOGIN_FIELDS,
+                "action": _ACTION_FIELDS}[kind]
     if keys != expected:
         raise ReceiptError("request (%s): missing fields %s, extra %s"
                            % (kind, sorted(expected - keys), sorted(keys - expected)))
@@ -430,7 +452,10 @@ def check_request(request) -> str:
         raise ReceiptError("request.v: %d expected" % REQUEST_VERSION)
     if not isinstance(request["approver"], str) or not _HUMAN_RE.fullmatch(request["approver"]):
         raise ReceiptError("request.approver: \"human:<id>\" expected (an agent never approves)")
-    if request["decision"] not in DECISIONS:
+    if kind == "login":
+        if request["decision"] not in LOGIN_DECISIONS:
+            raise ReceiptError("request.decision (login): view, done or cancel expected")
+    elif request["decision"] not in DECISIONS:
         raise ReceiptError("request.decision: approve or deny")
     if not isinstance(request["summary_digest"], str) or not _DIGEST_RE.fullmatch(request["summary_digest"]):
         raise ReceiptError("request.summary_digest: \"sha256:<hex>\" expected")
@@ -448,6 +473,17 @@ def check_request(request) -> str:
             raise ReceiptError("request.action_id: \"act_\" + 26 characters expected")
         if not isinstance(request["digest"], str) or not _DIGEST_RE.fullmatch(request["digest"]):
             raise ReceiptError("request.digest: \"sha256:<hex>\" expected")
+    elif kind == "login":
+        if not isinstance(request["login_id"], str) or not _LOGIN_ID_RE.fullmatch(request["login_id"]):
+            raise ReceiptError("request.login_id: \"lgn_\" + 26 characters expected")
+        for name in ("host", "provider"):
+            value = request[name]
+            if not isinstance(value, str) or not _IDENT_RE.fullmatch(value):
+                raise ReceiptError("request.%s: enrolled identifier expected" % name)
+        for name in ("account", "scope"):
+            value = request[name]
+            if not isinstance(value, str) or (value and not _IDENT_RE.fullmatch(value)):
+                raise ReceiptError("request.%s: identifier expected (empty allowed)" % name)
     else:
         _check_standing(request["standing"], iat)
     return kind
@@ -677,8 +713,8 @@ def _verify_webauthn(parsed: Receipt, key: cose.PublicKey, policy: Policy,
 
 def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
             expected_digest: str | None, expected_action_id: str | None,
-            expect_decision: str | None, consume_by: str | None,
-            now: float | None) -> tuple[ReceiptVerdict, Receipt | None]:
+            expected_login: dict | None, expect_decision: str | None,
+            consume_by: str | None, now: float | None) -> tuple[ReceiptVerdict, Receipt | None]:
     policy = policy or Policy()
     moment = time.time() if now is None else float(now)
     ctx: dict = {}
@@ -695,6 +731,7 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         kind=parsed.kind, approver=request["approver"], facade=parsed.facade,
         credential_id=parsed.credential_id, decision=request["decision"],
         action_id=request.get("action_id", ""), digest=request.get("digest", ""),
+        login_id=request.get("login_id", ""),
         nonce=request["nonce"], challenge=parsed.challenge.hex(),
         iat=request["iat"], exp=request["exp"], standing=request.get("standing"),
     )
@@ -708,9 +745,40 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     if parsed.kind == "standing" and consume_by:
         return refuse(KIND, "a standing receipt is consumed by registering the grant "
                             "(register_standing), not here")
-    if consume_by and (expected_digest is None or expected_action_id is None):
-        return refuse(UNBOUND, "consuming a receipt requires the expected digest and action_id "
-                               "(otherwise it would authorize any action)")
+    if expected_login is not None:
+        if parsed.kind != "login":
+            return refuse(KIND, "expected_login given for a receipt of kind %s"
+                          % parsed.kind)
+        if not isinstance(expected_login, dict) or not expected_login:
+            return refuse(FORMAT, "expected_login: non-empty object expected")
+        unknown = sorted(set(expected_login) - set(LOGIN_BINDING_FIELDS))
+        if unknown:
+            return refuse(FORMAT, "expected_login: unknown fields %s" % unknown)
+        for name in sorted(expected_login):
+            expected = expected_login[name]
+            if name == "exp":
+                if type(expected) is not int or request["exp"] != expected:
+                    return refuse(LOGIN_MISMATCH, "the challenge expires at %s, not at %r"
+                                  % (request["exp"], expected))
+                continue
+            actual = request.get(name, "")
+            if not isinstance(expected, str) or not _same(expected, actual):
+                return refuse(LOGIN_MISMATCH, "the challenge is for %s %r, not %r"
+                              % (name, actual, expected))
+    elif parsed.kind == "login" and (expected_digest is not None
+                                     or expected_action_id is not None):
+        return refuse(KIND, "a login receipt is bound by expected_login (host, provider, "
+                            "account, expiry), not by an action digest")
+    if consume_by:
+        if parsed.kind == "login":
+            required = {"login_id", "host", "provider", "account", "exp"}
+            if not isinstance(expected_login, dict) or not required <= set(expected_login):
+                return refuse(UNBOUND, "consuming a login receipt requires expected_login "
+                                       "with %s (otherwise it would authorize any challenge)"
+                              % sorted(required))
+        elif expected_digest is None or expected_action_id is None:
+            return refuse(UNBOUND, "consuming a receipt requires the expected digest and "
+                                   "action_id (otherwise it would authorize any action)")
     if expected_action_id is not None and request.get("action_id") != expected_action_id:
         return refuse(ACTION_MISMATCH, "the receipt is for %s, not for %s"
                       % (request.get("action_id") or "a grant", expected_action_id))
@@ -790,6 +858,7 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
 def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
                    kind: str | None = "action", expected_digest: str | None = None,
                    expected_action_id: str | None = None,
+                   expected_login: dict | None = None,
                    expect_decision: str | None = "approve", consume_by: str | None = None,
                    now: float | None = None) -> ReceiptVerdict:
     """Vérifie un reçu ; le consomme (une fois, atomiquement) si `consume_by`.
@@ -797,8 +866,11 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     Sans `consume_by`, le nonce est seulement contrôlé (non encore consommé) :
     le verdict n'autorise alors rien à lui seul — la porte consomme. Consommer
     exige `expected_digest` ET `expected_action_id` (recalculés par la porte
-    depuis l'action, jamais lus dans le reçu).
-    `kind=None` accepte les deux natures ; `expect_decision=None` les deux
+    depuis l'action, jamais lus dans le reçu) ; pour un reçu de défi de
+    connexion (`login`), `expected_login` (login_id, host, provider, account,
+    exp — champs de `LOGIN_BINDING_FIELDS`) les remplace : il est recalculé par
+    l'appelant depuis SA demande, jamais lu dans le reçu.
+    `kind=None` accepte les trois natures ; `expect_decision=None` toutes les
     décisions.
     `now` ne règle que les contrôles faits ici : une consommation recontrôle
     exp et iat en SQL, après le dernier verrou, à l'heure réelle de la base
@@ -807,8 +879,8 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     """
     verdict, _parsed = _verify(
         db, receipt, policy, kind=kind, expected_digest=expected_digest,
-        expected_action_id=expected_action_id, expect_decision=expect_decision,
-        consume_by=consume_by, now=now)
+        expected_action_id=expected_action_id, expected_login=expected_login,
+        expect_decision=expect_decision, consume_by=consume_by, now=now)
     return verdict
 
 
@@ -859,7 +931,7 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
     policy = policy or Policy()
     verdict, parsed = _verify(
         db, receipt, policy, kind="standing", expected_digest=None, expected_action_id=None,
-        expect_decision="approve", consume_by=None, now=now)
+        expected_login=None, expect_decision="approve", consume_by=None, now=now)
     if not verdict.ok or parsed is None:
         return verdict, None
     standing = parsed.request["standing"]

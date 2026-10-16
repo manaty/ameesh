@@ -10,6 +10,11 @@ utilisateur Unix que les agents, et son état reste chez lui.
                                          consommation du lien
     <état>/enroll/<sha256(jeton)>.json  un jeton d'enrôlement
     <état>/enroll-used/<sha256(jeton)>  marque d'usage d'un jeton d'enrôlement
+    <état>/login-requests/<login_id>.json  la demande de défi (sans URL ni code)
+    <état>/login-links/<sha256(jeton)>     → login_id
+    <état>/login-private/<login_id>.json   l'URL et le code (0600, jamais signés)
+    <état>/login-views/<login_id>          marque « vue ouverte par assertion »
+    <état>/login-receipts/<login_id>.json  le reçu signé (done | cancel)
 
 Les jetons de lien ne sont jamais écrits en clair : seul leur SHA-256 l'est
 (nom de fichier), et la valeur relue est comparée à temps constant.
@@ -33,9 +38,12 @@ from .config import ensure_private_dir
 
 _CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz"
 REQUEST_ID_RE = re.compile(r"^req_[0-9a-z]{26}$")
+LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
-_SUBDIRS = ("requests", "links", "receipts", "enroll", "enroll-used")
+_SUBDIRS = ("requests", "links", "receipts", "enroll", "enroll-used",
+            "login-requests", "login-links", "login-private", "login-views",
+            "login-receipts")
 
 #: rétention après échéance (élagage opportuniste)
 KEEP_REQUESTS = 86400
@@ -53,6 +61,11 @@ def token_hash(token: str) -> str:
 
 def new_request_id() -> str:
     return "req_" + "".join(secrets.choice(_CROCKFORD) for _ in range(26))
+
+
+def new_login_id() -> str:
+    """Identifiant d'un défi de connexion (L232d) — même alphabet que les demandes."""
+    return "lgn_" + "".join(secrets.choice(_CROCKFORD) for _ in range(26))
 
 
 class Store:
@@ -174,6 +187,97 @@ class Store:
     def has_receipt(self, request_id: str) -> bool:
         return os.path.exists(self._path("receipts", request_id + ".json"))
 
+    # -- défis de connexion (L232d, lot #366) --------------------------------
+    #
+    # Un défi a DEUX états distincts : la demande signable (`login-requests`,
+    # qui ne porte ni URL ni code) et le charge utile privé (`login-private`,
+    # 0600, URL + code à usage unique). La vue n'est ouverte qu'après
+    # assertion ; le marqueur `login-views` est distinct du reçu, sinon le
+    # premier affichage consommerait le lien avant la signature.
+    def save_login(self, record: dict, token: str, private: dict) -> None:
+        login_id = record["login_id"]
+        if not LOGIN_ID_RE.fullmatch(login_id):
+            raise ValueError("invalid login_id")
+        digest = token_hash(token)
+        record = dict(record, token_hash=digest)
+        private = dict(private, login_id=login_id)
+        paths = [
+            (self._path("login-private", login_id + ".json"), self._dump(private)),
+            (self._path("login-requests", login_id + ".json"), self._dump(record)),
+            (self._path("login-links", digest), login_id.encode("ascii")),
+        ]
+        written = []
+        try:
+            for path, data in paths:
+                if not self._write(path, data, exclusive=True):
+                    raise ValueError("login_id or token already used")
+                written.append(path)
+        except Exception:
+            for path in written:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            raise
+
+    def get_login(self, login_id: str) -> dict | None:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return None
+        return self._read_json(self._path("login-requests", login_id + ".json"))
+
+    def login_by_token(self, token: str) -> dict | None:
+        if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
+            return None
+        digest = token_hash(token)
+        raw = self._read(self._path("login-links", digest))
+        if raw is None:
+            return None
+        login_id = raw.decode("ascii", "replace")
+        record = self.get_login(login_id)
+        if record is None or not hmac.compare_digest(
+                str(record.get("token_hash", "")).encode(), digest.encode()):
+            return None
+        return record
+
+    def login_private(self, login_id: str) -> dict | None:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return None
+        return self._read_json(self._path("login-private", login_id + ".json"))
+
+    def drop_login_private(self, login_id: str) -> bool:
+        """Efface l'URL et le code (expiration, annulation, erreur) — le
+        marqueur de vue et la demande restent, eux, dans l'état du service."""
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return False
+        try:
+            os.unlink(self._path("login-private", login_id + ".json"))
+            return True
+        except FileNotFoundError:
+            return False
+
+    def mark_login_viewed(self, login_id: str) -> bool:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return False
+        return self._write(self._path("login-views", login_id),
+                           str(int(time.time())).encode("ascii"), exclusive=True)
+
+    def login_viewed(self, login_id: str) -> bool:
+        return os.path.exists(self._path("login-views", login_id))
+
+    def save_login_receipt_once(self, login_id: str, receipt: dict) -> bool:
+        if not LOGIN_ID_RE.fullmatch(login_id):
+            raise ValueError("login_id invalide")
+        return self._write(self._path("login-receipts", login_id + ".json"),
+                           jcs.canonicalize(receipt), exclusive=True)
+
+    def login_receipt_bytes(self, login_id: str) -> bytes | None:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return None
+        return self._read(self._path("login-receipts", login_id + ".json"))
+
+    def has_login_receipt(self, login_id: str) -> bool:
+        return os.path.exists(self._path("login-receipts", login_id + ".json"))
+
     # -- enrôlement ----------------------------------------------------------
     def save_enroll(self, record: dict, token: str) -> None:
         digest = token_hash(token)
@@ -243,4 +347,27 @@ class Store:
                     except FileNotFoundError:
                         pass
                 removed += 1
+        for name in os.listdir(self._path("login-requests", "")):
+            if not name.endswith(".json"):
+                continue
+            login_id = name[:-5]
+            record = self.get_login(login_id)
+            if record is None:
+                continue
+            exp = float(record.get("exp") or 0)
+            if exp + KEEP_RECEIPTS < now:
+                try:
+                    os.unlink(self._path("login-receipts", name))
+                except FileNotFoundError:
+                    pass
+            if exp + KEEP_REQUESTS < now and not self.has_login_receipt(login_id):
+                for path in (self._path("login-links", str(record.get("token_hash", "x"))),
+                             self._path("login-private", name),
+                             self._path("login-views", login_id),
+                             self._path("login-requests", name)):
+                    try:
+                        os.unlink(path)
+                        removed += 1
+                    except (FileNotFoundError, IsADirectoryError):
+                        pass
         return removed

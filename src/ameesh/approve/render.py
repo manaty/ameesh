@@ -34,6 +34,9 @@ from .. import jcs
 from . import duplicate
 
 SUMMARY_VERSION = "ameesh-summary/1"
+#: résumé d'un défi de connexion (L232d) : jamais l'URL ni le code, jamais un
+#: condensat de l'un ou de l'autre — hôte, fournisseur, compte, portée, échéance
+LOGIN_SUMMARY_VERSION = "ameesh-login-summary/1"
 #: un résumé plus long n'est plus relisable par un humain sur un téléphone
 MAX_SUMMARY = 32 * 1024
 
@@ -133,6 +136,32 @@ def render_summary(action: dict, approver: str, requested_by: str, *,
 
 def summary_digest(summary: str) -> str:
     return "sha256:" + hashlib.sha256(summary.encode("utf-8")).hexdigest()
+
+
+def login_summary_lines(request: dict) -> list[tuple[str, str]]:
+    """Les champs du résumé d'un défi de connexion (L232d).
+
+    Ni l'URL d'autorisation ni le code à usage unique n'y figurent — pas même
+    par un condensat : le résumé est signé et rejoint le reçu, qui ne doit
+    lever aucun secret.
+    """
+    return [
+        ("host", request["host"]),
+        ("provider", request["provider"]),
+        ("account", request["account"] or "(default)"),
+        ("scope", request["scope"] or "(not specified)"),
+        ("expires", _moment(request["exp"])),
+        ("requested by", request["requested_by"]),
+        ("approver", request["approver"]),
+    ]
+
+
+def render_login_summary(request: dict) -> str:
+    """Le résumé signé d'un défi de connexion (par son empreinte)."""
+    lines = [LOGIN_SUMMARY_VERSION]
+    lines += ["%s: %s" % (label, visible(value)) for label, value in
+              login_summary_lines(request)]
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -313,3 +342,92 @@ def enroll_page(view: dict) -> str:
         "</main>"
     ) % (attributes, _e(view["approver"]), _e(view["rp_id"]), _e(_moment(view["exp"])))
     return _page("Enrollment — ameesh", body, base="../")
+
+
+#: étapes concrètes par fournisseur (aucune valeur dynamique : ni l'URL ni le
+#: code n'y entrent, la page ne les reçoit qu'après l'assertion)
+LOGIN_STEPS = {
+    "claude": (
+        "Open the official link below in a browser (never a QR code shown on a computer).",
+        "Select the account or organisation named above and approve the requested access.",
+        "If the provider displays a code to give back to the command, keep it private.",
+        "Come back to this page and press \"I finished\"."),
+    "codex": (
+        "Open the official link below in a browser.",
+        "Sign in to the account named above.",
+        "If the page asks for a code, enter the one-time code shown here, and confirm the "
+        "host and account named on this page.",
+        "Come back to this page and press \"I finished\"."),
+    "gh": (
+        "Open the official link below in a browser.",
+        "If the page asks for a code, enter the one-time code shown here.",
+        "Review the requested scopes, then click the provider's Authorize button.",
+        "Come back to this page and press \"I finished\"."),
+}
+
+
+def login_page(view: dict) -> str:
+    """Page d'un défi de connexion (L232d, lot #366).
+
+    Elle ne contient NI l'URL d'autorisation NI le code : ceux-ci ne sont
+    rendus par le JavaScript qu'après une assertion WebAuthn acceptée par le
+    service (`view`). Le lien seul est donc muet.
+    """
+    request = view["request"]
+    non_ascii = "Warning: contains non-ASCII characters (lookalike risk)"
+    fields = [
+        _field("Provider", view["provider"],
+               warn=non_ascii if has_non_ascii(view["provider"]) else ""),
+        _field("Host", view["host"],
+               warn=non_ascii if has_non_ascii(view["host"]) else ""),
+        _field("Account", view["account"] or "(default)",
+               warn=non_ascii if has_non_ascii(view["account"]) else ""),
+        _field("Scope", view["scope"] or "(not specified)",
+               warn=non_ascii if has_non_ascii(view["scope"]) else ""),
+        _field("Requested by", request["requested_by"]),
+        _field("Approver", request["approver"]),
+        _field("Challenge valid until", _moment(view["exp"])),
+    ]
+    steps = "".join("<li>%s</li>\n" % _e(step)
+                    for step in LOGIN_STEPS.get(view["provider"], LOGIN_STEPS["gh"]))
+    data = {
+        "kind": "login",
+        "login-id": view["login_id"],
+        "provider": view["provider"],
+        "rp-id": view["rp_id"],
+        "challenge-view": view["challenge_view"],
+        "challenge-cancel": view["challenge_cancel"],
+        "credentials": ",".join(view["credentials"]),
+        "level": view["level"],
+    }
+    attributes = " ".join("data-%s=\"%s\"" % (name, _e(value)) for name, value in data.items())
+    body = (
+        "<main id=\"ameesh-login\" %s>\n"
+        "<h1>Connection to <code>%s</code></h1>\n"
+        "<p class=\"lead\">An agent requests a <strong>%s</strong> connection on the host "
+        "<code>%s</code>, for the account <code>%s</code>. The official link and its "
+        "one-time code are shown only after you sign with your passkey.</p>\n"
+        "<dl class=\"fields\">\n%s\n</dl>\n"
+        "<p class=\"lead\">If you did not request this connection, cancel it.</p>\n"
+        "<section class=\"private\" id=\"login-private\" hidden>\n"
+        "<h2>Private challenge — do not share</h2>\n"
+        "<p class=\"notice\">Shown once, after your assertion. Never photograph it, never "
+        "paste it into agent-mail, a lot thread or a chat: anyone with this code can sign "
+        "in to the account.</p>\n"
+        "<ol class=\"steps\">\n%s</ol>\n"
+        "<p class=\"digest\">Official link: <code id=\"login-url\"></code></p>\n"
+        "<p class=\"digest\">One-time code: <code id=\"login-code\"></code></p>\n"
+        "</section>\n"
+        "<div class=\"buttons\">\n"
+        "<button id=\"login-open\" type=\"button\" class=\"approve\">Show the private "
+        "challenge</button>\n"
+        "<button id=\"login-done\" type=\"button\" class=\"approve\" hidden>I finished</button>\n"
+        "<button id=\"login-cancel\" type=\"button\" class=\"deny\">Cancel the request</button>\n"
+        "</div>\n"
+        "<p id=\"status\" role=\"status\" aria-live=\"polite\"></p>\n"
+        "<noscript><p>JavaScript is required to sign with your passkey.</p></noscript>\n"
+        "</main>"
+    ) % (attributes, _e(visible(view["provider"])), _e(visible(view["provider"])),
+         _e(visible(view["host"])), _e(visible(view["account"] or "(default)")),
+         "\n".join(fields), steps)
+    return _page("Connection challenge — ameesh", body, base="../")

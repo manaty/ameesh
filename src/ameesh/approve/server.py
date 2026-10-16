@@ -8,8 +8,15 @@ Routes :
                               assume_duplicate?})
     GET  /receipts/<id>       jeton de service — le reçu (200), en attente (202),
                               échu sans reçu (410)
+    POST /login-requests      jeton de service — crée un DÉFI DE CONNEXION
+                              (L232d : hôte, fournisseur, compte, portée,
+                              échéance) ; rend le lien, jamais l'URL ni le code
+    GET  /login-receipts/<id> jeton de service — le reçu du défi (200 | 202 | 410)
     GET  /a/<jeton>           page d'approbation
     POST /a/<jeton>           assertion WebAuthn → reçu (approve | deny)
+    GET  /login/<jeton>       page du défi : sans URL ni code (lien muet)
+    POST /login/<jeton>       assertion WebAuthn → `view` (ouvre la vue privée,
+                              rend URL + code) | `done` | `cancel` → reçu
     GET  /enroll/<jeton>      page d'enrôlement
     POST /enroll/<jeton>      attestation → proposition de canon
     GET  /static/<fichier>    approve.js, approve.css
@@ -79,8 +86,11 @@ _TOKEN_PATH = r"([A-Za-z0-9_-]{43})"
 _ROUTES = (
     ("api", "POST", re.compile(r"^/requests$")),
     ("api", "GET", re.compile(r"^/receipts/(req_[0-9a-z]{26})$")),
+    ("login-api", "POST", re.compile(r"^/login-requests$")),
+    ("login-api", "GET", re.compile(r"^/login-receipts/(lgn_[0-9a-z]{26})$")),
     ("health", "GET", re.compile(r"^/health$")),
     ("approve", "GET POST", re.compile(r"^/a/%s$" % _TOKEN_PATH)),
+    ("login", "GET POST", re.compile(r"^/login/%s$" % _TOKEN_PATH)),
     ("enroll", "GET POST", re.compile(r"^/enroll/%s$" % _TOKEN_PATH)),
     ("static", "GET", re.compile(r"^/static/([a-z]+\.(?:js|css))$")),
 )
@@ -88,7 +98,7 @@ _ROUTES = (
 #: fermeture (sinon le noyau répond RST et le client perd la réponse)
 DRAIN_LIMIT = 1024 * 1024
 _SECRET_RE = re.compile(r"[A-Za-z0-9_-]{32,}")
-_PATH_SECRET_RE = re.compile(r"/(a|enroll)/[^/?\s]*")
+_PATH_SECRET_RE = re.compile(r"/(a|enroll|login)/[^/?\s]*")
 
 
 def redact(text: str) -> str:
@@ -199,7 +209,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         self._send(status, page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _error(self, kind: str, exc: ApproveError, extra: tuple = ()) -> None:
-        if kind in ("approve", "enroll") and self.command == "GET":
+        if kind in ("approve", "enroll", "login") and self.command == "GET":
             titles = {404: "Unknown link", 410: "Unusable link", 409: "Obsolete request",
                       429: "Too many requests", 503: "Service unavailable"}
             self._html(exc.status, render.message_page(
@@ -236,7 +246,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if len(hosts) != 1:
             return False
         host = hosts[0].strip().lower()
-        if kind in ("api", "health"):
+        if kind in ("api", "login-api", "health"):
             allowed = self.server.local_hosts
             if self.server.service.cfg.api_via_public:
                 allowed = allowed | self.server.public_hosts
@@ -323,8 +333,8 @@ class ApproveHandler(BaseHTTPRequestHandler):
             # corps lu (borné) AVANT les contrôles d'autorisation : la réponse
             # d'erreur part sur une connexion propre
             body = self._read_body() if self.command == "POST" else b""
-            if kind == "api":
-                return self._api(value, body)
+            if kind in ("api", "login-api"):
+                return self._api(kind, value, body)
             return self._human(kind, value, body)
         except ApproveError as exc:
             self._discard_body()
@@ -344,7 +354,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
             raise ApproveError(404, "not_found", "not found")
         self._send(200, entry[0], entry[1])
 
-    def _api(self, request_id: str | None, raw: bytes) -> None:
+    def _api(self, kind: str, reference: str | None, raw: bytes) -> None:
         if self.headers.get("Origin") is not None:
             raise ApproveError(403, "origin", "service API: no browser allowed")
         authorization = self.headers.get("Authorization") or ""
@@ -353,11 +363,16 @@ class ApproveHandler(BaseHTTPRequestHandler):
                 presented.strip()):
             raise ApproveError(401, "unauthorized", "service token missing or invalid")
         service = self.server.service
-        if self.command == "POST":
-            return self._json(201, service.create_request(load_json_body(raw)))
-        if not REQUEST_ID_RE.fullmatch(request_id or ""):
-            raise ApproveError(404, "not_found", "not found")
-        status, payload = service.receipt(request_id)
+        if kind == "login-api":
+            if self.command == "POST":
+                return self._json(201, service.create_login_request(load_json_body(raw)))
+            status, payload = service.login_receipt(reference)
+        else:
+            if self.command == "POST":
+                return self._json(201, service.create_request(load_json_body(raw)))
+            if not REQUEST_ID_RE.fullmatch(reference or ""):
+                raise ApproveError(404, "not_found", "not found")
+            status, payload = service.receipt(reference)
         if isinstance(payload, bytes):
             return self._send(status, payload, "application/json; charset=utf-8")
         return self._json(status, payload)
@@ -375,10 +390,14 @@ class ApproveHandler(BaseHTTPRequestHandler):
             body = load_json_body(raw)
             if kind == "approve":
                 return self._json(200, service.submit(token, body))
+            if kind == "login":
+                return self._json(200, service.login_submit(token, body))
             return self._json(200, service.enroll_submit(
                 token, body, origin=self.headers.get("Origin")))
         if kind == "approve":
             return self._html(200, render.approval_page(service.link_view(token)))
+        if kind == "login":
+            return self._html(200, render.login_page(service.login_view(token)))
         return self._html(200, render.enroll_page(service.enroll_view(token)))
 
 

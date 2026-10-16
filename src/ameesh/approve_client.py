@@ -4,6 +4,10 @@
     POST /requests        dépose une demande d'approbation ; rend le lien à
                           usage unique à ouvrir sur le téléphone
     GET  /receipts/<id>   le reçu signé (200), en attente (202), échu (410)
+    POST /login-requests  dépose un DÉFI DE CONNEXION (L232d) : l'URL et le code
+                          vont dans l'état privé du service, jamais dans la
+                          réponse ni dans le fil
+    GET  /login-receipts/<id>  le reçu du défi (200 | 202 | 410)
     GET  /health          la politique publiée par le service (RP ID,
                           origines, profil), sans jeton : `ameesh approve-check`
 
@@ -49,6 +53,7 @@ from urllib.parse import urlsplit
 from .config import Config
 
 REQUEST_ID_RE = re.compile(r"^req_[0-9a-z]{26}$")
+LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
 _TLS_NAME_RE = re.compile(
     r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 TIMEOUT = 15.0
@@ -258,6 +263,42 @@ def fetch_receipt(cfg: Config, request_id: str) -> tuple[str, bytes | dict]:
     if not REQUEST_ID_RE.fullmatch(request_id or ""):
         raise ApproveClientError("format", "request id \"req_...\" expected")
     status, payload = _call(cfg, "GET", "/receipts/" + request_id)
+    if status == 200:
+        return "signed", payload
+    if status == 202:
+        return "pending", _json(payload)
+    if status == 410:
+        return "expired", _json(payload)
+    raise _refusal(status, payload)
+
+
+def create_login_request(cfg: Config, *, host: str, provider: str, account: str,
+                         approver: str, requested_by: str, url: str, code: str,
+                         scope: str = "", provider_exp: int | None = None) -> dict:
+    """`POST /login-requests` (L232d) : le service garde l'URL et le code en
+    privé (0600) et ne rend que le lien à faire signer par l'humain."""
+    body = {"host": host, "provider": provider, "account": account, "approver": approver,
+            "requested_by": requested_by, "url": url, "code": code}
+    if scope:
+        body["scope"] = scope
+    if provider_exp is not None:
+        body["provider_exp"] = provider_exp
+    status, payload = _call(cfg, "POST", "/login-requests", body)
+    if status != 201:
+        raise _refusal(status, payload)
+    data = _json(payload)
+    if not LOGIN_ID_RE.fullmatch(str(data.get("login_id") or "")) \
+            or not isinstance(data.get("link"), str):
+        raise ApproveClientError("format", "unreadable response from ameesh-approve", status)
+    return data
+
+
+def fetch_login_receipt(cfg: Config, login_id: str) -> tuple[str, bytes | dict]:
+    """`GET /login-receipts/<id>` : ("signed", octets du reçu) | ("pending",
+    infos) | ("expired", infos). Toute autre réponse : ApproveClientError."""
+    if not LOGIN_ID_RE.fullmatch(login_id or ""):
+        raise ApproveClientError("format", "login id \"lgn_...\" expected")
+    status, payload = _call(cfg, "GET", "/login-receipts/" + login_id)
     if status == 200:
         return "signed", payload
     if status == 202:

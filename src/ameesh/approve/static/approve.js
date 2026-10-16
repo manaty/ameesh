@@ -137,6 +137,104 @@
     });
   }
 
+  // -- défi de connexion (L232d) -------------------------------------------
+  // Le lien seul est muet : l'URL et le code ne sont demandés au service
+  // qu'après une assertion (`view`) acceptée. Ils ne sont jamais écrits dans
+  // le document HTML initial, seulement dans ces deux <code> par textContent.
+  function login(root) {
+    var data = root.dataset;
+    var privateSection = document.getElementById("login-private");
+    var openButton = document.getElementById("login-open");
+    var doneButton = document.getElementById("login-done");
+    var cancelButton = document.getElementById("login-cancel");
+    var doneChallenge = "";
+
+    function sign(decision, challenge) {
+      setBusy(true);
+      return new Promise(function (resolve, reject) {
+        navigator.credentials.get({
+          publicKey: {
+            challenge: fromB64u(challenge),
+            rpId: data.rpId,
+            allowCredentials: ids(data.credentials),
+            userVerification: "required",
+            timeout: 120000,
+            hints: ["client-device", "security-key"]
+          }
+        }).then(function (credential) {
+          var response = credential.response;
+          post({
+            decision: decision,
+            credential_id: toB64u(credential.rawId),
+            authenticatorData: toB64u(response.authenticatorData),
+            clientDataJSON: toB64u(response.clientDataJSON),
+            signature: toB64u(response.signature)
+          }).then(function (result) {
+            if (result.ok) {
+              resolve(result.data);
+            } else {
+              setBusy(false);
+              say("Refused by the service (" + (result.data.error || result.status) + "): " +
+                (result.data.message || ""), "error");
+              reject(new Error("refused"));
+            }
+          }).catch(function () {
+            setBusy(false);
+            say("Network error: try again.", "error");
+            reject(new Error("network"));
+          });
+        }, function () {
+          setBusy(false);
+          say("Signing cancelled or refused by the device.", "error");
+          reject(new Error("cancelled"));
+        });
+      });
+    }
+
+    openButton.addEventListener("click", function () {
+      if (!supported()) {
+        return;
+      }
+      say("Signing: follow your device's instructions…");
+      sign("view", data.challengeView).then(function (payload) {
+        document.getElementById("login-url").textContent = payload.url || "";
+        document.getElementById("login-code").textContent = payload.code || "";
+        available(payload.challengeDone);
+        privateSection.hidden = false;
+        openButton.hidden = true;
+        doneButton.hidden = false;
+        setBusy(false);
+        say("Private challenge shown. Do not share it.", "done");
+      }).catch(function () {});
+    });
+
+    function available(challenge) {
+      doneChallenge = challenge || "";
+    }
+
+    doneButton.addEventListener("click", function () {
+      if (!doneChallenge) {
+        return;
+      }
+      say("Signing: follow your device's instructions…");
+      sign("done", doneChallenge).then(function () {
+        setBusy(true);
+        say("Done signed and recorded. You can close this page.", "done");
+      }).catch(function () {});
+    });
+
+    cancelButton.addEventListener("click", function () {
+      if (!supported()) {
+        return;
+      }
+      say("Signing: follow your device's instructions…");
+      sign("cancel", data.challengeCancel).then(function () {
+        setBusy(true);
+        say("Cancellation signed and recorded. You can close this page.", "done");
+      }).catch(function () {});
+    });
+  }
+
   // -- enrôlement ----------------------------------------------------------
   function enrollment(root) {
     var data = root.dataset;
@@ -192,6 +290,10 @@
     var root = document.getElementById("ameesh-approval");
     if (root) {
       approval(root);
+    }
+    root = document.getElementById("ameesh-login");
+    if (root) {
+      login(root);
     }
     root = document.getElementById("ameesh-enroll");
     if (root) {
