@@ -133,8 +133,12 @@ en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
 La ligne `account_active` garde le **dernier compte choisi** pour une
 nouvelle session (et le forçage) ; elle change en base par
 comparer-et-changer (`storage.accounts`) : deux workers qui font le même
-choix n'écrivent qu'une bascule. Les retenues (`account_holds`) de 0027 §3 ne
-sont plus posées : le choix par retard sur le rythme les remplace.
+choix n'écrivent qu'une bascule. Les retenues de rythme (`account_holds`) de
+0027 §3 ne sont plus posées : le choix par retard sur le rythme les remplace ;
+la table sert désormais à publier pour tout l'hôte l'**overage** d'un compte
+qu'une bascule vient de quitter (#1883, `OVERAGE_HOLD_S`) — une règle absolue
+que les autres runners ne peuvent pas déduire de leur propre lecture quand
+deux configurations lisent deux dossiers sous le même nom de compte.
 """
 from __future__ import annotations
 
@@ -163,6 +167,16 @@ RESERVE = 0.10
 OVERAGE_CAP = 0.80          #: an account that may be billed beyond its plan stops early
 PRIMARY_PRIORITY = 100      #: the default account comes last
 OTHER_PRIORITY = 50
+#: #1883 : durée d'une retenue d'overage publiée pour l'hôte. Quand un runner
+#: QUITTE un compte en dépassement, il publie ce fait en base
+#: (`account_holds`) : les autres processus du même hôte écartent le compte —
+#: leur configuration peut lire un autre dossier sous le même nom (le 16/10,
+#: deux définitions de « secondaire » lisaient, l'une son dépassement,
+#: l'autre un compte à 34 %, et le choix partagé basculait en boucle). La
+#: retenue est datée : une lecture isolée n'immobilise pas le compte au-delà
+#: du délai, et une lecture locale saine n'est jamais bloquée par une retenue
+#: qu'aucune bascule n'a posée.
+OVERAGE_HOLD_S = 600.0
 #: `overage` setting: read from the harness's journals, or declared
 OVERAGE_MODES = ("auto", "allowed", "none")
 #: windows up to this length are "short" (`short_window_cap`): 5 h for both plans
@@ -527,8 +541,34 @@ def parse(raw) -> dict[str, list[Profile]]:
                 pace_ceiling_end=pace_ceiling_end,
                 pace_ceiling_end_hours=pace_ceiling_end_hours,
             ))
+        _refuse_shared_homes(harness, profiles)
         out[harness] = profiles
     return out
+
+
+def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
+    """#1883 : deux comptes déclarés ne peuvent pas lire le MÊME dossier.
+
+    Un compte `config_dir` sans `path` désigne le dossier par défaut du
+    harnais : le déclarer à côté d'un autre compte qui y résout fait lire les
+    jauges d'un compte sous le nom de l'autre — le 16/10, le choix a vu
+    « secondaire » tantôt dans son dossier (5 h à 100 %, en dépassement),
+    tantôt dans celui du primaire (34 %), et a basculé en boucle en lançant
+    des tours facturés au-delà du forfait. La comparaison est faite sur le
+    chemin **résolu** (`realpath`) : deux liens vers le même dossier sont le
+    même compte. Refus à la lecture de la configuration, jamais un choix
+    silencieux."""
+    seen: dict[str, str] = {}
+    for profile in profiles:
+        if profile.kind != "config_dir":
+            continue
+        home = os.path.realpath(profile.home())
+        if home in seen:
+            raise AccountError(
+                "`accounts.%s`: accounts %r and %r resolve to the same "
+                "configuration directory (%s) — one reading cannot stand for two "
+                "accounts" % (harness, seen[home], profile.name, home))
+        seen[home] = profile.name
 
 
 def profiles(cfg, harness: str) -> list[Profile]:
@@ -1373,6 +1413,32 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     return why
 
 
+def _hold_overage(store, host: str, harness: str, profile: Profile, now: float,
+                  agent: str | None) -> None:
+    """#1883 : publie sur l'hôte qu'un compte quitté **est** en dépassement.
+
+    `account_holds` portait les retenues de rythme de 0027 §3, remplacées par
+    le classement (0034) ; elle sert ici à une **règle absolue** : un compte
+    facturé au-delà de son plan n'est pris par aucun runner de l'hôte, même
+    quand la lecture locale d'un autre processus ne voit pas le dépassement
+    (deux configurations peuvent lire deux dossiers sous le même nom). La
+    retenue n'est posée QUE par une bascule réelle qui quitte ce compte : une
+    pause, ou une lecture locale saine, ne bloque personne."""
+    store.hold(host, harness, profile.name, now + OVERAGE_HOLD_S,
+               "%s plan: in overage (billed beyond the plan)%s"
+               % (harness, ", seen by %s" % agent if agent else ""))
+
+
+def _held_for_overage(store, host: str, harness: str, now: float) -> set[str]:
+    """#1883 : les comptes retenus pour overage sur cet hôte, encore valides."""
+    held: set[str] = set()
+    for name, hold in store.holds(host, harness).items():
+        until = hold.get("until_ts")
+        if until is not None and float(until) > now:
+            held.add(name)
+    return held
+
+
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
@@ -1488,6 +1554,15 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                       why="continuity: the session stays on %s, under its threshold" % own.name)
     for profile in items:
         ev(profile)
+    # L226b/#1883 : une retenue d'overage posée par un AUTRE processus de
+    # l'hôte (une bascule qui a quitté ce compte en dépassement) l'écarte du
+    # classement, même si la lecture locale le dit sain — c'est la lecture qui
+    # divergeait le 16/10. Le forçage (étape 1) et la continuité d'une session
+    # déjà engagée (étape 2) passent avant : un geste humain et un tour en
+    # cours ne sont pas bloqués par la lecture d'un autre runner.
+    held = _held_for_overage(store, host, harness, now)
+    if held:
+        candidates = [p for p in candidates if p.name not in held]
     # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
     ranked = rank(candidates, cache, now)
     if not ranked and not paced:
@@ -1538,7 +1613,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     and reading_outdated(cache[p.name].gauges, now)]
         why = "%sall %s accounts at threshold — %s" % (
             pause_label(cache), harness, _label(cache))
-        if withheld:
+        if held:
+            why = ("%sno %s account to place: %s held for overage seen on this "
+                   "host — %s" % (pause_label(cache), harness,
+                                  ", ".join(sorted(held)), _label(cache)))
+        elif withheld:
             why = ("%sno %s account to place: reading older than every open "
                    "window (%s) — %s" % (pause_label(cache), harness,
                                          ", ".join(withheld), _label(cache)))
@@ -1571,6 +1650,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     if store.switch(host, harness, expected=active.name, to=target.name, kind="bascule",
                     reason=why, agent=agent):
         store.release(host, harness, target.name)  # retenue d'avant 0034, s'il en reste
+        # #1883 : on quitte `active` alors qu'il est en dépassement — le
+        # publier pour l'hôte, afin que les autres runners ne le reprennent pas
+        # sur la foi de leur propre lecture (dossiers différents sous le même
+        # nom de compte).
+        left_ev = cache.get(active.name)
+        if left_ev is not None and in_overage(left_ev.gauges, now):
+            _hold_overage(store, host, harness, active, now, agent)
         return Choice(target, target, switched=switched, why=why)
     # course : un autre worker a changé le dernier choix entre-temps ; un
     # forçage posé entre-temps prime, évalué comme en 1 (L226b : un primaire
