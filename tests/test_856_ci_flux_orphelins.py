@@ -430,6 +430,22 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(dernier < bilan or "if: always()" in job[dernier:sweep],
                         "bilan rouge : le checkout doit rester `if: always()`")
 
+    def test_chaque_flux_a_un_job_homonyme(self):
+        """#856 : `orphaned()` retrouve le job par son nom, au caractère près.
+
+        Le sweep apparie le check « tests (flux) X » au job X ; un libellé
+        abrégé (ex. « autre-FS » face au job « autre système de fichiers ») ne
+        trouve aucun job et retombe sur l'état de l'exécution, encore active
+        pendant le sweep : l'orphelin n'est jamais conclu (B de la relecture
+        du 16/10)."""
+        texte = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        jobs = set(re.findall(r"^    name: (.+)$", texte, re.M))
+        flux = re.findall(r"FLUX_NOM: tests \(flux\) (.+)$", texte, re.M)
+        self.assertTrue(flux, "aucun flux déclaré dans tests.yml")
+        for nom in flux:
+            self.assertIn(nom, jobs,
+                          "le check « tests (flux) %s » n'a pas de job homonyme" % nom)
+
 
 if __name__ == "__main__":
     unittest.main()

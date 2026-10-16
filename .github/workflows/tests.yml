@@ -494,7 +494,7 @@ jobs:
       checks: write  # L161c : check run « tests (flux) »
     env:
       AMEESH_DRIVER: psycopg
-      FLUX_NOM: tests (flux) autre-FS ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+      FLUX_NOM: tests (flux) autre système de fichiers ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
       AMEESH_PLAFOND_MIN: "45"
     steps:
       - *debut
