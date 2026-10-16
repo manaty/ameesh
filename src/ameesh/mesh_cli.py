@@ -241,6 +241,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
             "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS", "BUDGET",
             "KEY", "SEEN"))
+        session_differs = False
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
@@ -250,15 +251,27 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
+            # #1250 : la colonne dit le harnais de la session VIVANTE (L242b) ;
+            # une étoile signale qu'il diffère du harnais déclaré, et le pied
+            # explique la marque (la déclaration reste lisible dans `show`).
+            live = registry.live_harness(row)
+            declared = row.get("harness") or ""
+            starred = bool(live) and live != declared
+            if starred:
+                session_differs = True
             print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
-                (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
+                ((live or "?")[:9] + ("*" if starred else "")),
+                (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
             ))
+        if session_differs:
+            print("* session harness: the live session runs under another "
+                  "harness than the declared one (L242b)")
         # Les lots sur la même vue (0018 point 5) : le compte par phase et ce
         # qui attend le plus, pour que `ameesh list` dise où en est le travail.
         if lots:
@@ -797,6 +810,12 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         print("harness  : %-9s host: %-12s status: %s%s" % (
             row.get("harness") or "?", row.get("host") or "—", row.get("status"),
             (" (%s)" % row["status_text"]) if row.get("status_text") else ""))
+        # L242b/#1250 : le harnais DÉCLARÉ ne dit pas sous lequel la session
+        # tourne (harnais emprunté) ; quand la session vivante en a un autre,
+        # la ligne le dit — c'est la lecture qui a produit le cas #1024.
+        live = registry.live_harness(row)
+        if live and live != (row.get("harness") or ""):
+            print("session harness: %s" % live)
         if row.get("stop_reason"):
             print("stopped  : %s" % row["stop_reason"])
         # L37 (0030) : mode explicite ; un agent externe exige un responsable
