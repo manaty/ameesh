@@ -92,7 +92,14 @@ The reviewer of a review can be **designated on entry to `qa`** (#705):
 a design agent designates, never the lot's assignee. The wait then names that
 reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
-designate one.
+designate one. Two corrections are gestures of the same authority (#1979):
+`ameesh work reviewer <id> --remove` removes a designation made by mistake
+(the lot goes back to waiting for a reviewer, and the alert asks for one
+again); `ameesh work reviewer <id> --no-verdict` marks "verdict not required"
+when no re-verdict is due (mechanical composition resolution, canon §11
+bis/#87, a verdict kept from a reviewed head) — the lot then waits only for
+its merge and no reminder reaches a reviewer. Designating a reviewer lifts
+the waiver; a current blocking verdict refuses it (a fix is due).
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,

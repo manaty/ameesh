@@ -1506,11 +1506,17 @@ class WorkItems(Domain):
         fail (None) — the lot never ends waiting with no request."""
 
     @abc.abstractmethod
-    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str) -> dict | None:
+    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str,
+                           event: str | None = None) -> dict | None:
         """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
         et journalise ; None (rien d'écrit) si le lot n'est plus en `qa` ou si
         son assigné est devenu le relecteur (la règle est relue dans
         l'écriture, pas seulement avant : #705 r2, B1).
+
+        #1979 : `reviewer` vide efface la désignation et `event` remplace la
+        ligne de journal par défaut (« reviewer X designated ») — il porte
+        alors le retrait, ou la marque « verdict non requis » de
+        `work.waive_review` (`work.REVIEWER_NONE`).
 
         La colonne vient de la migration 0421 : avant elle, la lecture s'en
         passe (`item_columns`) et l'écriture est refusée avec la marche à
