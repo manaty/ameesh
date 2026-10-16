@@ -112,9 +112,6 @@ _ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in 
 #: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
 #: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
 READ_ERRORS = ("canon-git-error", "frontmatter-invalid", "federation-invalid")
-#: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
-#: relus par un exécuteur redémarré et par `ameesh resume` (#424 r4 : dans
-#: leur dossier, `CRITICAL_DIR`)
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -481,6 +478,9 @@ def fully_read(canon) -> bool:
 #: invalide, fichier ou dossier dont on ne peut se fier) — « inconnu » vaut
 #: critique
 UNKNOWN = "unknown"
+#: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
+#: relus par un exécuteur redémarré et par `ameesh resume` (#424 r4 : dans
+#: leur dossier, `CRITICAL_DIR`)
 #: #424 r4 : le dossier du cache (0700, à nous ; verrouillé lui-même) et ses
 #: données (renommées seules)
 CRITICAL_DIR, CRITICAL_DATA = "critical-known", "known.json"
