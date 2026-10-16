@@ -78,7 +78,7 @@ class L36CliTest(PgTestCase):
         self.assertIn("deepseek9*", row)
         host_col = header.index("HOST")
         # la colonne HOST tronque à 10 (comme l'en-tête le suppose)
-        self.assertEqual(row[host_col:host_col + 10], self.cfg.host[:10])
+        self.assertEqual(row[host_col:host_col + 10].rstrip(), self.cfg.host[:10])  # colonne complétée : un hôte court (« laptop ») est suivi d'espaces
 
     def test_attribution_a_un_inconnu_refusee_et_l_attente_le_dit(self):
         # L37 (0030) : l'avertissement de L36 est devenu un refus
