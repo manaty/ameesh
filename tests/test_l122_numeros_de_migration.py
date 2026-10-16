@@ -16,7 +16,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import db as db_mod, migrations, work
+from ameesh import db as db_mod, migrations, storage, work
 from ameesh.db import DbError
 from ameesh.storage.postgres import work as pg_work
 
@@ -524,7 +524,8 @@ class ReservationTest(PgTestCase):
                     try:
                         out["row"] = pg_work.WorkItems(conn).reserve_migration(
                             new["id"], "manaty/nexlink", None, 9503 + 10 * k,
-                            note="migration %(number)s reserved (témoin)", actor="t")
+                            note="migration %(number)s reserved (témoin)", actor="t",
+                            issue_ref="manaty/nexlink#%d" % (171 + k))
                     except Exception as exc:   # noqa: BLE001 - rapporté par l'assertion
                         out["row"] = exc
                     finally:
@@ -570,6 +571,41 @@ class ReservationTest(PgTestCase):
         self.assertIn("migration 9200 reserved in manaty/ameesh", proc.stdout)
         proc = self.mesh("work", "migration", str(a["id"]), "--release")
         self.assertIn("no migration reserved", proc.stdout)
+
+    def test_reference_changee_pendant_le_scan_refusee(self):
+        """#1830 : la référence qui décide du dépôt est lue avant le scan ;
+        une correction concurrente pendant ce scan ne doit pas laisser
+        issue_ref d'un dépôt avec migration_repo d'un autre."""
+        lot = self._lot("fenêtre", "manaty/ameesh", 1)
+        observed = work.get(self.db, lot["id"])
+        work.set_issue_ref(self.db, lot["id"], "manaty/nexlink#1567", actor="human:owner")
+        live = work.get(self.db, lot["id"])
+        with mock.patch.object(work, "get", side_effect=[observed, live]):
+            with self.assertRaises(work.WorkError) as ctx:
+                work.reserve_migration(self.db, lot["id"], repo=self.ameesh)
+        self.assertIn("issue reference changed meanwhile", str(ctx.exception))
+        got = work.get(self.db, lot["id"])
+        self.assertIsNone(got["migration"])
+        self.assertIsNone(got["migration_repo"])
+        self.assertEqual(got["issue_ref"], "manaty/nexlink#1567")
+
+    def test_cas_storage_refuse_une_reference_observee_perimee(self):
+        """#1830 : le storage n'écrit pas sous une référence observée qui
+        n'est plus celle du lot ; la référence exacte passe."""
+        lot = self._lot("cas", "manaty/ameesh", 2)
+        observed = work.get(self.db, lot["id"])
+        work.set_issue_ref(self.db, lot["id"], "manaty/nexlink#1567", actor="human:owner")
+        store = storage.of(self.db).work
+        self.assertIsNone(store.reserve_migration(
+            lot["id"], "manaty/ameesh", 9703, 0,
+            note="migration %(number)s reserved (témoin)", actor="t",
+            issue_ref=observed["issue_ref"]))
+        self.assertIsNone(work.get(self.db, lot["id"])["migration"])
+        row = store.reserve_migration(
+            lot["id"], "manaty/nexlink", 9701, 0,
+            note="migration %(number)s reserved (témoin)", actor="t",
+            issue_ref="manaty/nexlink#1567")
+        self.assertEqual((row["migration"], row["migration_repo"]), (9701, "manaty/nexlink"))
 
 
 class CorrectionIssueRefTest(PgTestCase):
@@ -637,6 +673,41 @@ class CorrectionIssueRefTest(PgTestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("correction refused", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], "manaty/nexlink#1567")
+
+    def test_reservation_arrivee_entre_lecture_et_ecriture(self):
+        """#1654 : la lecture (garde du dépôt) et le CAS ne sont pas atomiques ;
+        une réservation prise entre les deux ne doit pas passer en silence. Le
+        CAS couvre la réservation lue : refus explicite, issue intacte."""
+        lot = self._lot()
+        observed = work.get(self.db, lot["id"])   # lue AVANT la réservation
+        nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                         NEXLINK.directory, ["376_b.sql"])
+        work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
+        live = work.get(self.db, lot["id"])
+        with mock.patch.object(work, "get", side_effect=[observed, live]):
+            with self.assertRaises(work.WorkError) as ctx:
+                work.set_issue_ref(self.db, lot["id"], "manaty/ameesh#1603",
+                                   actor="human:owner")
+        self.assertIn("reservation changed meanwhile", str(ctx.exception))
+        got = work.get(self.db, lot["id"])
+        self.assertEqual(got["issue_ref"], "manaty/nexlink#1567")
+        self.assertEqual((got["migration"], got["migration_repo"]), (453, "manaty/nexlink"))
+
+    def test_cas_storage_couvre_la_reservation_observee(self):
+        """#1654 : le storage resserre le CAS quand l'appelant fournit la
+        réservation lue ; sans observation, le CAS d'origine est conservé
+        (les appelants qui ne lisent pas la réservation ne changent pas)."""
+        lot = self._lot()
+        observed = work.get(self.db, lot["id"])
+        nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                         NEXLINK.directory, ["376_b.sql"])
+        work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
+        store = storage.of(self.db).work
+        self.assertFalse(store.set_issue_ref(lot["id"], "manaty/ameesh#1603",
+                                             current=observed["issue_ref"],
+                                             migration_repo=observed.get("migration_repo")))
+        self.assertTrue(store.set_issue_ref(lot["id"], "manaty/ameesh#1603",
+                                            current=observed["issue_ref"]))
 
 
 def _drivers():

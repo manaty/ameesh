@@ -79,6 +79,21 @@ class UnreadableTurnWindowTest(unittest.TestCase):
                 self.row["ended_ts"] = invalid
                 self.assertEqual(self.review([self.END + self.SLACK + 1]), [])
 
+    def test_text_timestamps_are_unknown_dates_not_exceptions(self):
+        """#1691: the `psql` pilot reads an infinite `timestamptz` back as the
+        text `'Infinity'`; it must be an unknown date (the turn is kept), never
+        a TypeError raised into the runner loop, which promises not to raise."""
+        after = self.END + self.SLACK + 1
+        self.row["started_ts"] = "Infinity"
+        self.assertEqual(self.review([after]), [])
+        self.row.update(started_ts=self.START, ended_ts="Infinity")
+        self.assertEqual(self.review([after]), [])
+        self.row["ended_ts"] = "not-a-date"
+        self.assertEqual(self.review([after]), [])
+        # an unreadable process whose stamp is text stays unknown too.
+        self.row.update(started_ts=self.START, ended_ts=self.END)
+        self.assertEqual(self.review(["Infinity"]), [])
+
     def test_no_end_preserves_the_old_conservative_rule(self):
         for status in ("running", "orphan"):
             with self.subTest(status=status):

@@ -107,6 +107,9 @@ elif 'show' in args:
         print('{ path=/bin/runner ; argv[]=/bin/runner run --runner-id '
               'runner-' + unit.split('@')[1].removesuffix('.service') + '@host-agents ; }')
 elif 'is-active' in args:
+    # le marqueur ne vise que l'unité du runner : les autres restent actives
+    if (state / 'unit-inactive').exists() and 'ameesh-runner' in unit:
+        sys.exit(3)
     print('active')
 '''
 
@@ -389,6 +392,34 @@ class VmAgentsInstallTest(VmAgentsHarness):
         p = self.run_vm('installer', self.target)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertFalse((self.state / 'systemctl.log').exists())
+
+    def test_a_stopped_persona_active_unit_is_reloaded_into_the_new_code(self):
+        # #1131/#1633 : la persona arrêtée par le propriétaire n'est pas
+        # réactivée (aucun bail exigé, aucun tour), mais son unité encore
+        # active recharge le nouveau code — sinon une reprise ultérieure
+        # repartait sur l'ancienne version.
+        (self.state / 'agents.json').write_text(json.dumps([
+            dict(name='dev9', host='host-agents', mode='execute', status='idle'),
+            dict(name='old1', host='host-agents', mode='execute', status='stopped')]))
+        p = self.run_vm('redemarrer')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('restart ameesh-runner-agent@old1.service',
+                      (self.state / 'systemctl.log').read_text())
+        self.assertIn('old1 : arrêté dans le registre', p.stdout)
+        self.assertIn('nouveau code', p.stdout)
+        self.assertNotIn('old1 : redémarré (était', p.stdout)
+
+    def test_a_stopped_persona_inactive_unit_is_not_started(self):
+        # #1633 : unité déjà arrêtée — aucune relance : elle chargera le
+        # nouveau code à son démarrage.
+        (self.state / 'agents.json').write_text(json.dumps([
+            dict(name='old1', host='host-agents', mode='execute', status='stopped')]))
+        (self.state / 'unit-inactive').touch()
+        p = self.run_vm('redemarrer')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('restart ameesh-runner-agent@old1.service',
+                         (self.state / 'systemctl.log').read_text())
+        self.assertIn('déjà arrêtée', p.stdout)
 
     def test_install_refuses_when_previous_code_is_untraceable(self):
         self._src_containing_only(self.target)

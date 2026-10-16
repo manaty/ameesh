@@ -162,6 +162,11 @@ from .work_dependencies import WorkDependencies
 import abc
 from typing import Any, Callable, Protocol, Sequence, TypedDict
 
+#: #1654 : observation NON fournie au CAS `set_issue_ref` — le contrôle de la
+#: réservation (`migration_repo`) n'est alors pas appliqué, les appelants qui
+#: ne lisent pas la réservation gardent le CAS d'origine.
+UNCHECKED = object()
+
 
 class Domain(abc.ABC):
     """Opérations d'un domaine, liées à une connexion ou une transaction."""
@@ -206,6 +211,15 @@ class Agents(Domain):
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """La ligne de l'agent, ou None."""
+
+    @abc.abstractmethod
+    def operator_pause(self, name: str, *, paused: bool, reason: str,
+                       actor: str, principal: str) -> dict | None:
+        """Native human hold: row lock, state and audit in one atomic statement.
+
+        No status/prompt/lease changes; repeated state has no new event.
+        External agents are returned unchanged. Not exposed to executors.
+        """
 
     @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:
@@ -1278,7 +1292,7 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
-                          floor: int, *, note: str, actor: str,
+                          floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:
         """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
         ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
@@ -1286,9 +1300,11 @@ class WorkItems(Domain):
         l'index unique : deux réservations simultanées ne prennent jamais le
         même numéro ; la perdante réessaie avec une attente aléatoire croissante,
         dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
-        si le lot n'est plus ouvert ; DbError si `number` est pris par un autre
-        lot ; `ReservationContention` si le budget du prochain libre est
-        épuisé. `release` libère la réservation."""
+        si le lot n'est plus ouvert, ou si `issue_ref` — la référence lue par
+        l'appelant — a changé entre-temps (#1830 : NULL et chaîne vide
+        confondus) ; DbError si `number` est pris par un autre lot ;
+        `ReservationContention` si le budget du prochain libre est épuisé.
+        `release` libère la réservation, sans condition sur la référence."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
@@ -1454,10 +1470,12 @@ class WorkItems(Domain):
         même verrou, mais le lot reste où il est et `PendingLot` est levée.
         `ready_only` (L165) exige un lot intake sans assigné dont toutes les
         dépendances sont satisfaites ; vérifié sous verrou dans la même
-        transaction que l'attribution. La réservation manuelle garde son
-        comportement par défaut. #705 : si le nouvel assigné est le relecteur
-        désigné, la désignation tombe dans la même écriture (le journal la
-        nomme) — un relecteur ne relit pas son propre travail."""
+        transaction que l'attribution. `current` doit alors être NULL : toute
+        autre valeur est une erreur d'appel (`ValueError` immédiate, avant le
+        verrou) et non un None silencieux (#1696). La réservation manuelle
+        garde son comportement par défaut. #705 : si le nouvel assigné est le
+        relecteur désigné, la désignation tombe dans la même écriture (le
+        journal la nomme) — un relecteur ne relit pas son propre travail."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
@@ -1659,11 +1677,17 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def set_issue_ref(self, item_id: int, issue_ref: str | None, *,
-                      current: str | None) -> bool:
+                      current: str | None,
+                      migration_repo: object = UNCHECKED) -> bool:
         """Pose `issue_ref` si le lot porte encore `current` (NULL et chaîne
         vide confondus) : faux si la valeur a changé entre-temps (un autre
         projecteur l'a posée). Ni journal ni `updated_at` : une projection
-        n'est pas une activité du lot."""
+        n'est pas une activité du lot.
+
+        #1654 : `migration_repo` est l'observation de l'appelant ; fournie,
+        elle resserre le CAS sur la réservation (`IS NOT DISTINCT FROM`, NULL
+        compris), pour qu'une réservation prise entre la lecture et l'écriture
+        ne passe pas en silence. `UNCHECKED` (défaut) garde le CAS d'origine."""
 
     @abc.abstractmethod
     def recent_or_cited(self, *, since_ts: float, ids: Sequence[int]) -> list[dict]:

@@ -965,6 +965,153 @@ class ImportGraphTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
                                                       guaranteed=True), known)
+    def test_guaranteed_edges_stop_at_a_module_level_termination(self):
+        # #1627 : une terminaison atteignable à l'import (`raise` gardé, garde
+        # d'exception, exit, assert faux) laisse les imports suivants possibles,
+        # jamais garantis — sinon le plan certifie un chargement qui peut ne pas
+        # avoir eu lieu. Sens conservateur : une preuve en moins, jamais une
+        # fausse preuve.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "raise gardé": "import os\n"
+                           "if not os.environ.get('PG'):\n"
+                           "    raise RuntimeError\n"
+                           "import ameesh.db\n",
+            "raise dans un except": "try:\n"
+                                    "    import psycopg\n"
+                                    "except ImportError:\n"
+                                    "    raise SystemExit\n"
+                                    "import ameesh.db\n",
+            "exit": "exit()\nimport ameesh.db\n",
+            "quit": "quit()\nimport ameesh.db\n",
+            "os._exit": "import os\nos._exit(1)\nimport ameesh.db\n",
+            "os._exit aliasé": "from os import _exit as bye\nbye(1)\nimport ameesh.db\n",
+            "sys.exit": "import sys\nsys.exit(1)\nimport ameesh.db\n",
+            "sys.exit aliasé": "import sys as s\ns.exit(1)\nimport ameesh.db\n",
+            "exit importé": "from sys import exit as bye\nbye(1)\nimport ameesh.db\n",
+            "assert faux": "assert False\nimport ameesh.db\n",
+            "raise avant, import dans le même corps de classe":
+                "class C:\n    raise RuntimeError\n    import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # un garde mort ne termine rien : `if TYPE_CHECKING:` ne s'exécute pas
+        dead = ("from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    raise RuntimeError\n"
+                "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(dead, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        # le corps d'une fonction ne tourne pas à l'import : son raise ne coupe
+        # pas la preuve du corps du module
+        deferred = ("def broken():\n    raise RuntimeError\n"
+                    "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(deferred, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        nested = ("def factory():\n"
+                  "    class C:\n        raise RuntimeError\n"
+                  "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(nested, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+
+    def test_exit_expressions_stop_proofs_before_class_body_and_after_assert(self):
+        # #1474 : les bases et décorateurs s'évaluent avant le corps de classe ;
+        # une sortie dans un assert s'exécute aussi, même sans assert faux.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import sys\nclass C(sys.exit(1)):\n    import ameesh.db\n",
+            "@exit()\nclass C:\n    import ameesh.db\n",
+            "import os as o\nclass C(metaclass=o._exit(1)):\n    import ameesh.db\n",
+            "from sys import exit as bye\nassert bye(1)\nimport ameesh.db\n",
+            "import os\nassert os._exit(1)\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+
+    def test_exit_expressions_stop_proofs_in_function_definitions(self):
+        # #1474 : décorateurs, valeurs par défaut et annotations d'une fonction
+        # ou d'un lambda s'évaluent à la définition ; seul le corps est différé.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "@exit()\ndef f():\n    pass\nimport ameesh.db\n",
+            "@exit()\nasync def f():\n    pass\nimport ameesh.db\n",
+            "import sys\ndef f(x=sys.exit(1)):\n    pass\nimport ameesh.db\n",
+            "import os as o\ndef f(*, x=o._exit(1)):\n    pass\nimport ameesh.db\n",
+            "def f(x: quit()):\n    pass\nimport ameesh.db\n",
+            "g = lambda a=quit(): 0\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        for source in ("def f():\n    exit()\nimport ameesh.db\n",
+                       "f = lambda: exit()\nimport ameesh.db\n",
+                       "@staticmethod\ndef f(x=1):\n    import os\nimport ameesh.db\n"):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_exit_expressions_keep_prior_dead_and_deferred_proofs(self):
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import ameesh.db\nclass C(exit()):\n    pass\n",
+            "if False:\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def factory():\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def unused():\n    assert quit()\nimport ameesh.db\n",
+            "class C:\n    import ameesh.db\n    quit()\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_reassigned_exit_symbols_stay_conservative(self):
+        # #1474 : un symbole de terminaison réaffecté (`sys = ...`, puis un
+        # `bye = ...` sur un nom importé de sys/os) n'est pas suivi — la
+        # réaffectation peut être conditionnelle, donc la preuve reste coupée :
+        # une preuve perdue, jamais une preuve fausse. L'arête de sélection
+        # possible est conservée.
+        known = {"src/ameesh/db.py"}
+        reassigned = {
+            "sys rebindé": "import sys\n"
+                           "sys = None\n"
+                           "sys.exit(1)\n"
+                           "import ameesh.db\n",
+            "sys rebindé sans sortie": "import sys\n"
+                                       "class Fake:\n"
+                                       "    @staticmethod\n"
+                                       "    def exit(code):\n"
+                                       "        return None\n"
+                                       "sys = Fake\n"
+                                       "sys.exit(0)\n"
+                                       "import ameesh.db\n",
+            "exit importé puis rebindé": "from sys import exit as bye\n"
+                                         "bye = print\n"
+                                         "bye('x')\n"
+                                         "import ameesh.db\n",
+            "exit builtin rebindé": "exit = print\n"
+                                    "exit('x')\n"
+                                    "import ameesh.db\n",
+            "os._exit aliasé puis rebindé": "from os import _exit as bye\n"
+                                            "bye = print\n"
+                                            "bye('x')\n"
+                                            "import ameesh.db\n",
+        }
+        for why, source in reassigned.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
@@ -2107,8 +2254,17 @@ def _run_bodies(text: str) -> list[str]:
 
 
 _BRANCH_REF = re.compile(r"github\.(base|head)_ref")
+# #1559: the value YAML reads is the same expression whatever the spacing
+# inside `${{ }}` and whether the scalar is quoted (`"${{ … }}"`,
+# `'${{ … }}'`), and a tab or extra spaces after the colon still open the
+# mapping value. Everything else stays an escape (fail closed).
+_BRANCH_REF_EXPR = r"\$\{\{\s*github\.(?:base|head)_ref\s*\}\}"
 _BRANCH_REF_ENV = re.compile(
-    r"^[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}\s*(?:#.*)?$")
+    "^[A-Z][A-Z0-9_]*:[ \t]+(?:"
+    + _BRANCH_REF_EXPR
+    + '|"' + _BRANCH_REF_EXPR + '"'
+    + "|'" + _BRANCH_REF_EXPR + "'"
+    + r")[ \t]*(?:#.*)?$")
 _ANY_KEY = re.compile(
     r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"{\[][^#]*?)\s*:(?:\s+|$)(?P<rest>.*)$""")
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_.-]+:(?:\s+&[A-Za-z0-9_.-]+)?\s*(?:#.*)?$")
@@ -2181,12 +2337,16 @@ def _under_env(lines: list[str], k: int, structural: set[int]) -> bool:
         if j not in structural or not line.strip() or line.lstrip().startswith("#"):
             continue
         dash, key = _dash_column(line), _key_column(line)
+        # #1559: an anchor or a tag before the key (`- &s env:`) does not
+        # change the mapping; only node properties are seen through, a scalar
+        # on the way still fails the witness.
+        _, content = _node_properties(line[key:])
         if key < col:
-            if not _BARE_KEY.match(line[key:]) or (
-                    first and line[key:].split(":", 1)[0] != "env"):
+            if not _BARE_KEY.match(content) or (
+                    first and content.split(":", 1)[0] != "env"):
                 return False
         elif dash is not None and dash < col:
-            if first or not _ITEM.match(line[key:]):
+            if first or not _ITEM.match(content):
                 return False
         else:
             continue
@@ -2216,9 +2376,43 @@ def _branch_ref_escapes(text: str) -> list[str]:
     return escapes
 
 
-_RUNNER_SELECTION = re.compile(r"^runs-on:[ \t]*\$\{\{.*\}\}[ \t]*(?:#.*)?$")
+_RUNNER_SELECTION = re.compile(
+    r"^runs-on:[ \t]*(?:"
+    r"\$\{\{.*\}\}"                       # valeur nue
+    r"|\"\$\{\{.*\}\}\""                  # valeur a guillemets doubles
+    r"|'\$\{\{.*\}\}'"                    # valeur a guillemets simples
+    r")[ \t]*(?:#.*)?$")
 _BRANCH_REF_COMPARED = re.compile(
-    r"startsWith\(github\.(?:base|head)_ref,\s*'[^',()]*'\)")
+    r"startsWith\(\s*github\.(?:base|head)_ref\s*,\s*'(?:[^',()]|'')*'\)")
+
+
+def _job_level(lines: list[str], k: int, structural: set[int]) -> bool:
+    """Is line `k` a direct key of a job mapping, under `jobs:`?
+
+    #1563: the `runs-on:` exemption is job-level only. A `runs-on:` nested in
+    a step mapping, a strategy or any other level is not the label GitHub
+    reads for a job; it stays text and the witness keeps refusing an
+    interpolation there (fail closed).
+    """
+    col, ancestors = _key_column(lines[k]), []
+    for j in range(k - 1, -1, -1):
+        line = lines[j]
+        if j not in structural or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash, key = _dash_column(line), _key_column(line)
+        if dash is not None and dash < col:
+            return False                     # un item de sequence sur le chemin
+        if key < col:
+            if not _BARE_KEY.match(line[key:]):
+                return False
+            ancestors.append(j)
+            col = key
+            if len(ancestors) == 2:
+                break
+    if len(ancestors) != 2:
+        return False
+    _job, jobs = ancestors
+    return _key_column(lines[jobs]) == 0 and lines[jobs].startswith("jobs:")
 
 
 def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
@@ -2234,6 +2428,15 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     The compared literal is a single argument: dev4's N, a quoted literal that
     spans arguments of a `format()` (`'…startsWith(github.head_ref, ', …`)
     must not absolve the interpolated reference that follows.
+
+    #1563: the `runs-on:` exemption is bound to the job level (`_job_level`)
+    and reads the YAML spellings GitHub reads for the value: bare or quoted
+    (`"${{ … }}"`, `'${{ … }}'`), spaces after `startsWith(` and around the
+    literal, and `''` for an apostrophe inside a compared literal. Two forms
+    stay documented fail-closed limits: a `${{` opened on one line and closed
+    on another (`_left_open` refuses the unclosed flow), and a single-quoted
+    value whose compared literal uses the `''` escape, which the witness does
+    not decode.
     """
     line = lines[k]
     col = _key_column(line)
@@ -2242,6 +2445,8 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     if _BRANCH_REF_ENV.match(line[col:]) and _under_env(lines, k, structural):
         return True
     if _RUNNER_SELECTION.match(line[col:]) is None:
+        return False
+    if not _job_level(lines, k, structural):
         return False
     return not _BRANCH_REF.search(_BRANCH_REF_COMPARED.sub("", line[col:]))
 
@@ -2334,10 +2539,40 @@ class RunBodiesTest(unittest.TestCase):
                              '          HEAD_REF: ${{ github.head_ref }}\n',
             "env first in the item": '      - env:\n'
                                      '          BASE_REF: ${{ github.base_ref }}\n',
+            # #1559: YAML reads the same env value under these legitimate
+            # spellings; only the semantics must count, not the exact form.
+            "quoted value": '      - name: s\n        env:\n'
+                            '          HEAD_REF: "${{ github.head_ref }}"\n'
+                            '        run: echo "$HEAD_REF"\n',
+            "single quoted value": '      - name: s\n        env:\n'
+                                   "          BASE_REF: '${{ github.base_ref }}'\n"
+                                   '        run: echo "$BASE_REF"\n',
+            "no inner spaces": '      - name: s\n        env:\n'
+                               '          HEAD_REF: ${{github.head_ref}}\n'
+                               '        run: echo "$HEAD_REF"\n',
+            "two spaces after colon": '      - name: s\n        env:\n'
+                                      '          BASE_REF:  ${{ github.base_ref }}\n'
+                                      '        run: echo "$BASE_REF"\n',
+            "anchor before the env key": '      - &s env:\n'
+                                         '          BASE_REF: ${{ github.base_ref }}\n'
+                                         '        run: echo "$BASE_REF"\n',
         }
         for name, step in allowed.items():
             with self.subTest(name=name):
                 self.assertEqual([], _branch_ref_escapes(steps + step))
+        # #1559: the same values, read by YAML in a `run:` body instead of an
+        # `env:` value, stay escapes: the witness follows the semantics.
+        for name, body in {
+            "quoted": 'BASE_REF: "${{ github.base_ref }}"\n',
+            "single quoted": "BASE_REF: '${{ github.base_ref }}'\n",
+            "no inner spaces": 'HEAD_REF: ${{github.head_ref}}\n',
+            "two spaces after colon": 'BASE_REF:  ${{ github.base_ref }}\n',
+        }.items():
+            with self.subTest(run=name):
+                self.assertNotEqual([], _branch_ref_escapes(
+                    steps + '      - run: |\n          ' + body))
+        self.assertNotEqual([], _branch_ref_escapes(
+            steps + '      - &s run: |\n          BASE_REF: ${{ github.base_ref }}\n'))
         self.assertEqual([], _branch_ref_escapes(
             "env:\n  BASE_REF: ${{ github.base_ref }}\n"
             "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
@@ -2358,6 +2593,40 @@ class RunBodiesTest(unittest.TestCase):
                      "\n      run: echo ok\"\n"):
             with self.subTest(bare=bare):
                 self.assertNotEqual([], _branch_ref_escapes("jobs:\n  a:\n" + bare))
+
+    def test_runner_selection_is_job_level_and_reads_yaml_spellings(self):
+        # #1563: l'exemption suit les formes YAML que GitHub lit pour un vrai
+        # `runs-on:` de job, et rien d'autre.
+        compared = "startsWith(github.head_ref, 'refs/heads/integration/')"
+        for name, line in {
+            "nue": "    runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared,
+            "guillemets doubles": (
+                "    runs-on: \"${{ %s && 'pool' || 'ci' }}\"\n" % compared),
+            "espace apres startsWith(": (
+                "    runs-on: ${{ startsWith( github.head_ref, "
+                "'refs/heads/integration/') && 'pool' || 'ci' }}\n"),
+            "apostrophe doublee": (
+                "    runs-on: ${{ startsWith(github.head_ref, "
+                "'refs/heads/it''s/') && 'pool' || 'ci' }}\n"),
+        }.items():
+            with self.subTest(forme=name):
+                self.assertEqual([], _branch_ref_escapes("jobs:\n  a:\n" + line))
+        # La meme ligne nichee dans un mapping d'etape ou une matrice n'est pas
+        # le `runs-on:` d'un job : elle reste une evasion (echec ferme).
+        for name, text in {
+            "mapping d'etape": ("jobs:\n  a:\n    steps:\n      - name: s\n"
+                                "        runs-on: ${{ %s && 'pool' || 'ci' }}\n"
+                                % compared),
+            "matrice": ("jobs:\n  a:\n    strategy:\n      matrix:\n"
+                        "        runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared),
+        }.items():
+            with self.subTest(hors_job=name):
+                self.assertNotEqual([], _branch_ref_escapes(text))
+        # Une expression `${{` ouverte sur une ligne et fermee sur une autre
+        # reste refusee : limite d'echec ferme documentee sur _branch_ref_allowed.
+        self.assertNotEqual([], _branch_ref_escapes(
+            "jobs:\n  a:\n    runs-on: ${{\n"
+            "      startsWith(github.head_ref, 'refs/heads/integration/') }}\n"))
 
     def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
         # YAML ignores indentation inside quotes, even after an anchor/tag.

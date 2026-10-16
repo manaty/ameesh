@@ -29,11 +29,15 @@ def _sans_processus(test: unittest.TestCase) -> None:
     retrait. Un démon non « dumpable » (gpg-agent, `ameesh-offload`) ou un
     zombie laisse un doute qui retient tout retrait : la décision testée ici
     est celle des garde-fous git (propre, poussé, âge), pas celle des
-    processus — `worktree_in_use` et `platform.user_paths` ont leurs propres
-    tests."""
-    patcher = mock.patch.object(platform, "user_paths", lambda *a, **k: platform.UserPaths())
-    patcher.start()
-    test.addCleanup(patcher.stop)
+    processus — la lecture réelle (`platform.user_paths`, `platform.holders`)
+    a ses propres tests (`tests/test_l63_platform.py`). #1805 : les deux
+    entrées de la couche plateforme sont neutralisées, pas seulement
+    `user_paths` (`worktree_in_use` lit `holders`)."""
+    for name, answer in (("user_paths", lambda *a, **k: platform.UserPaths()),
+                         ("holders", lambda *a, **k: [])):
+        patcher = mock.patch.object(platform, name, answer)
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 class _Cfg:
@@ -320,6 +324,48 @@ class WorktreeEtatTest(_Tmp):
         self.assertIsNone(menage.cited_lot("agent/nx-compute-runner-n-n"))
         self.assertIsNone(menage.cited_lot(""))
 
+    def test_cited_lots_are_tried_in_order(self):
+        """#1694: a branch citing several numeric groups lists its candidates
+        in trial order — last group first under agent/review, first group
+        first under lot/work."""
+        self.assertEqual(menage.cited_lots("review/claude2-t3-unit-459-460-r2"),
+                         [460, 459])
+        self.assertEqual(menage.cited_lots("agent/mty-nxl-impl-04-1229-x"), [1229, 4])
+        self.assertEqual(menage.cited_lots("lot/1665-menage-worktrees"), [1665])
+        self.assertEqual(menage.cited_lots("main"), [])
+        # cited_lot keeps its single-candidate role: the first candidate.
+        self.assertEqual(menage.cited_lot("review/claude2-t3-unit-459-460-r2"), 460)
+
+    def test_the_right_lot_wins_among_the_candidates(self):
+        """#1694: the first candidate owned by the agent wins; a candidate
+        owned by another agent proves nothing, and the folder name is only
+        read when the branch cites no number (#1665)."""
+        class _Registre:
+            ROWS = {460: {"assignee": "a2"}, 459: {"assignee": "a1"},
+                    12: {"assignee": "a1"}, 999: {"assignee": "a2"}}
+
+            def get(self, ident):
+                return self.ROWS.get(ident)
+
+        class _Base:
+            work = _Registre()
+
+        branche = "review/claude2-t3-unit-459-460-r2"
+        with mock.patch.object(menage.storage, "of", return_value=_Base()):
+            self.assertEqual(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", branche), "459")
+            # both candidates are the agent's: the trial order decides (460).
+            _Registre.ROWS[460] = {"assignee": "a1"}
+            self.assertEqual(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", branche), "460")
+            # a cited lot of another agent does not fall back to the folder.
+            self.assertIsNone(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", "lot/999-x"))
+            # no number cited: the folder names the lot, as in #1665.
+            self.assertEqual(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", ""), "12")
+            self.assertEqual(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", "main"),
+                             "12")
+
     def test_registre_illisible_ne_prouve_rien(self):
         """#1665 : un registre des lots illisible ne rattache rien (None),
         sans faire échouer le ménage."""
@@ -333,12 +379,20 @@ class WorktreeEtatTest(_Tmp):
             self.assertIsNone(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", ""))
 
     def test_processus_dans_le_worktree(self):
+        """#1805 : la table des processus est injectée (déterministe) ; la
+        lecture réelle de /proc a ses tests (`tests/test_l63_platform.py`).
+        Le cas d'un processus vivant dans le worktree reste couvert."""
         wt = os.path.join(self.base, "wt")
         os.makedirs(wt)
+        vus: list[dict] = []
+        patcher = mock.patch.object(platform, "holders", lambda *a, **k: list(vus))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.assertFalse(menage.worktree_in_use(wt))
         proc = subprocess.Popen(["sleep", "30"], cwd=wt)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
+        vus.append({"pid": proc.pid, "why": "working directory", "cmd": "sleep 30"})
         self.assertTrue(menage.worktree_in_use(wt))
 
     def test_processus_dans_le_worktree_os_muet(self):
@@ -536,6 +590,7 @@ class MenageDbTest(PgTestCase):
         return wt
 
     def test_fin_de_lot_retire_le_propre_garde_le_reste(self):
+        _sans_processus(self)
         main = _repo(self.tmp)
         fini, ouvert = self._lot("fini"), self._lot("ouvert")
         propre = self._suivi(main, "propre", fini)
@@ -660,6 +715,7 @@ class MenageDbTest(PgTestCase):
         """#1665 : un worktree déjà suivi « non attribué » dont la branche
         nomme un lot assigné à l'agent suit la fin de ce lot (il est retiré
         s'il est propre et intégré), et le journal porte le lot."""
+        _sans_processus(self)
         main = _repo(self.tmp)
         registry.upsert(self.db, "a1", harness="claude", host="pc",
                         cwd=os.path.join(self.tmp, "a1"))
@@ -748,6 +804,7 @@ class MenageDbTest(PgTestCase):
         self.assertIn("fini-non-integre", _git("branch", "--list", "fini-non-integre", cwd=main))
 
     def test_garde_fous_age_tour_en_cours_verrou_et_integration(self):
+        _sans_processus(self)
         main = _repo(self.tmp)
         fini = self._lot("fini")
         jeune = self._suivi(main, "jeune", fini)

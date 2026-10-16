@@ -205,9 +205,13 @@ la liste ; le callback est refusé hors d'un `frozen`.
 - l'adaptateur d'activation : règles et familles de `mechanics.load`, `required`
   et `risk` de `reviews_for(paths)`, `policy_ref = rules.commit`, pilote à
   notifier (`notify`) — aucune source machine unique du pilote de projet
-  n'existe aujourd'hui, et le port refuse un destinataire vide ou hors du
-  registre —, et décision explicite sur l'échec de désignation (le callback
-  transactionnel annule le gel s'il lève) ;
+  n'existe aujourd'hui ; hors hook, le port refuse un destinataire vide ou hors
+  du registre sans rien écrire ; **au gel (hook), #1634** : un destinataire vide
+  ou hors registre (pilote à notifier ou relecteur) n'annule plus le gel —
+  aucun courrier ne part, la marque du gel est une attente (`why` nomme le
+  destinataire manquant, réessayable par une reprise hors hook) et une note
+  lisible au journal du lot le dit ; les autres échecs du callback annulent
+  encore le gel, décision à prendre avec l'adaptateur ;
 - la commande de lecture / reprise (`ameesh work reviewers <lot>` ou
   équivalent) pour rattraper un gel resté sans désignation ;
 - preuve de livraison sur un **gel réel** : désignation sans agent, tête exacte

@@ -342,8 +342,12 @@ def _process_fragment(process) -> tuple[str, str]:
             proj = _clip(proj, canon_mod.PROCESS_PROJECTION_MAX)
         corps = proj
     elif _octets(corps) > canon_mod.PROCESS_BODY_MAX:
+        # #1624 (N2) : la carte peut tenir entière dans le bloc (jusqu'à
+        # ~11 900 o) ; ce diagnostic annonce donc une coupe POSSIBLE, pas une
+        # coupe acquise — seul le constat de coupe du bloc est exact.
         diag = ('the card "%s" has no short projection (%d bytes of rules): '
-                "the brief keeps what fits" % (process.title, _octets(corps)))
+                "the brief may keep only what fits"
+                % (process.title, _octets(corps)))
     return "\n".join(entete) + ("\n\n" + corps if corps else ""), diag
 
 
@@ -436,8 +440,20 @@ def _diag_block(diagnostics, cap: int) -> str:
         if _octets(texte) <= cap:
             return texte
         gardees.pop()
-    # une seule ligne, plus longue que le plafond : la couper sans casser l'UTF-8
-    return _clip(lignes[0], cap).rstrip() + "\n"
+    # #1624 (N1) : même la première ligne dépasse le plafond. La couper sans
+    # casser l'UTF-8 en réservant son saut de ligne et, s'il reste des lignes à
+    # taire, la ligne d'agrégat : le résultat tient dans `cap` (jamais cap+1) et
+    # la perte des lignes suivantes reste dite.
+    if reste > 1:
+        suite = ("%s… %d more rule diagnostics (`canon check`)"
+                 % (RULES_DIAG_PREFIX, reste - 1))
+        coupe = _clip(lignes[0], max(0, cap - _octets(suite) - 2)).rstrip()
+        if coupe:
+            return coupe + "\n" + suite + "\n"
+        # la première ligne elle-même ne tient pas : le résumé seul, s'il tient
+        return suite + "\n" if _octets(suite + "\n") <= cap else ""
+    coupe = _clip(lignes[0], max(0, cap - 1)).rstrip()
+    return coupe + "\n" if coupe else ""
 
 
 def _rules_bloc(rules: str, limit: int, diagnostics=()) -> str:
@@ -461,11 +477,19 @@ def _rules_bloc(rules: str, limit: int, diagnostics=()) -> str:
         coupe = ("the rules block is cut: %d bytes of rules, the end is not "
                  "injected" % _octets(rules))
         diag_coupe = _diag_block([coupe], cap)
-        diag = _diag_block(diags, max(0, cap - _octets(diag_coupe))) + diag_coupe
-        place = place_total - _octets(diag)
-        if place <= 6:
-            # même sans diagnostics, le texte des règles prime
-            diag, place = "", place_total
+        diag_reduit = _diag_block(diags, max(0, cap - _octets(diag_coupe)))
+        place_reduit = place_total - _octets(diag_reduit)
+        if _octets(rules) <= place_reduit:
+            # #1624 (N3) : la seconde passe a raccourci les diagnostics ; les
+            # règles tiennent alors entières et le constat de coupe serait une
+            # sur-déclaration — il n'est pas posé.
+            diag, place = diag_reduit, place_reduit
+        else:
+            diag = diag_reduit + diag_coupe
+            place = place_total - _octets(diag)
+            if place <= 6:
+                # même sans diagnostics, le texte des règles prime
+                diag, place = "", place_total
     return entete + diag + _clip_rules(rules, place) + pied
 
 
@@ -1013,6 +1037,9 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     row = registry.get(db, name)
     if row is None:
         raise RepriseError("unknown agent: %s" % name)
+    if row.get("operator_paused"):
+        raise RepriseError("%s is operator paused: use ameesh resume %s --operator --reason <reason>"
+                           % (name, name))
     if (row.get("mode") or "execute") == "externe":
         raise RepriseError("%s is an external agent (human session): ameesh does not restart "
                            "it; use \"ameesh adopt %s --session <id> --harness <h>\" "
@@ -1150,6 +1177,13 @@ def cmd_adopt(cfg: Config, args) -> int:
 
 
 def cmd_resume(cfg: Config, args) -> int:
+    if getattr(args, "operator", False):
+        from . import agent_pause
+        if args.brief is not None or args.fresh:
+            print("ameesh resume --operator does not replace the session or instruction",
+                  file=sys.stderr)
+            return 1
+        return agent_pause.cmd_cli(cfg, args, paused=False)
     try:
         brief = _read_brief(args.brief)
     except OSError as exc:
@@ -1181,6 +1215,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ameesh", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
+    p_pause = sub.add_parser("pause", help="operator pause: finish the turn, start no new one")
+    p_pause.add_argument("agent")
+    p_pause.add_argument("--reason", required=True)
+    p_pause.add_argument("--human", default=None, help="local human (same as ameesh serve)")
+    p_pause.add_argument("--json", action="store_true")
+    from . import agent_pause
+    p_pause.set_defaults(func=lambda cfg, args: agent_pause.cmd_cli(cfg, args, paused=True))
     p_ad = sub.add_parser("adopt", help="existing interactive session → runner (L39)")
     p_ad.add_argument("agent")
     p_ad.add_argument("--session", required=True, help="harness session id")
@@ -1206,11 +1247,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_re.add_argument("--fresh", action="store_true",
                       help="forget the session: new session on a deterministic brief")
     p_re.add_argument("--json", action="store_true")
+    p_re.add_argument("--operator", action="store_true", help="lift only an operator pause")
+    p_re.add_argument("--reason", default="", help="required with --operator")
+    p_re.add_argument("--human", default=None, help="local human for --operator")
     p_re.set_defaults(func=cmd_resume)
     return parser
 
 
-COMMANDS = ("adopt", "resume")
+COMMANDS = ("adopt", "resume", "pause")
 
 
 def main(argv: list[str] | None = None) -> int:

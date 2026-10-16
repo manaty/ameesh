@@ -480,7 +480,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
     en plus de celle du lot — la branche d'intégration d'un paquet en
     composition, dont les fichiers renumérotés ne doivent pas compter contre
-    la réservation. Rend le lot, avec `migration_file`."""
+    la réservation. Rend le lot, avec `migration_file`. Une correction
+    concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
+    `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
 
     item = get(db, item_id)
@@ -495,6 +497,7 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         layout = migration_layout(item, cfg)
         row = storage.of(db).work.reserve_migration(
             item_id, item.get("migration_repo"), None, 0, actor=actor, release=True,
+            issue_ref=item.get("issue_ref"),
             note="migration %s released (%s)" % (layout.label(current), layout.repo))
         if row is None:
             raise WorkError("lot %s is no longer open: no reservation" % item_id)
@@ -530,7 +533,8 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
             layout.label(current) if current is not None else "none")
     try:
         row = storage.of(db).work.reserve_migration(item_id, slug, number, floor, note=note,
-                                                    actor=actor)
+                                                    actor=actor,
+                                                    issue_ref=item.get("issue_ref"))
     except storage.ReservationContention as exc:
         # #478 : budget de réessais épuisé sous la rafale — message lisible,
         # jamais la DbError brute de l'index unique
@@ -545,6 +549,13 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
             layout.label(number), slug, holder["id"] if holder else "?",
             holder["title"] if holder else "concurrent reservation")) from exc
     if row is None:
+        # #1830 : le CAS a échoué ; si le lot est encore ouvert et que sa
+        # référence d'issue a bougé pendant le scan du dépôt, le dire — sinon
+        # c'est la fermeture du lot qui a refusé.
+        again = get(db, item_id)
+        if (again is not None and again["state"] not in ("merged", "promoted", "closed")
+                and (again.get("issue_ref") or "") != (item.get("issue_ref") or "")):
+            raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
         raise WorkError("lot %s is no longer open: no reservation" % item_id)
     return _with_file(row, cfg)
 
@@ -616,7 +627,13 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
                             "issue reference and reserve again" % (
                                 item_id, migration_layout(item, cfg).label(item["migration"]),
                                 item.get("migration_repo"), item_id))
-    if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref")):
+    if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref"),
+                                             migration_repo=item.get("migration_repo")):
+        # #1654 : le CAS couvre aussi la réservation lue ; si l'issue n'a pas
+        # bougé, c'est une réservation arrivée entre la lecture et l'écriture.
+        again = get(db, item_id)
+        if again is not None and ((again.get("issue_ref") or "").strip() or None) == current:
+            raise WorkError("lot %s: migration reservation changed meanwhile, retry" % item_id)
         raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
     note(db, item_id, "issue_ref %s → %s" % (current or "—", clean or "—"), actor=actor)
     return get(db, item_id) or item
