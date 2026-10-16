@@ -1567,8 +1567,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
-            if item.get("reviewer"):
-                print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
+            from .work_reviewers import designated
+            if designated(item):
+                print("reviewer : %s (designated for the review, #2076)" %
+                      ", ".join(designated(item)))
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -1684,12 +1686,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 if args.correct is not None else ""))
             return 0
         if args.work_command == "reviewer":
-            # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
+            # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
             # sans aller-retour build/qa ; c'est la commande que l'alerte
             # `stale_lot` recommande à l'orchestrateur du projet.
-            item = work.designate_reviewer(cfg, db, args.id, args.agent, actor=args.actor)
-            print("lot #%d: reviewer %s (state %s, designated by %s)" % (
-                item["id"], item["reviewer"], item["state"],
+            item = work.designate_reviewer(cfg, db, args.id, args.agent,
+                                          actor=args.actor, remove=args.remove)
+            print("lot #%d: reviewer %s %s (state %s, by %s)" % (
+                item["id"], args.agent, "removed" if args.remove else "designated", item["state"],
                 args.actor or "the bound identity"))
             return 0
         if args.work_command == "merged":
@@ -2592,11 +2595,13 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
-        help="#705: designate (or change) the reviewer of a lot already in qa, "
+        help="#2076: add a designated reviewer of a lot already in qa, "
              "without a build/qa round trip")
     pw_reviewer.add_argument("id", type=int)
     pw_reviewer.add_argument("agent", metavar="AGENT",
                              help="a registry agent, or human:<id>; never the lot's assignee")
+    pw_reviewer.add_argument("--remove", action="store_true",
+                             help="explicitly withdraw this reviewer's designation")
     pw_reviewer.add_argument("--actor", default="",
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")

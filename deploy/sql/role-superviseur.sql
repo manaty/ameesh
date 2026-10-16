@@ -612,7 +612,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'change_size',
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte
         -- stale_lot le nomme, le superviseur doit donc le lire
-        'reviewer'
+        'reviewer', 'reviewers'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[

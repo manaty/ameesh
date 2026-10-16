@@ -357,8 +357,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
             text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
             teams = _projects(by_name, alert.get("agent"))
-            if reviewer and str(reviewer) in by_name:
-                extra[str(reviewer)] = _verdict_due(alert)
+            for name in str(reviewer or "").split(","):
+                name = name.strip()
+                if name in by_name:
+                    extra[name] = _verdict_due(alert)
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = _projects(by_name, alert.get("agent"))

@@ -777,8 +777,8 @@ def check_reviewer_choice(db: Db, item: dict, reviewer: str, *, cfg=None) -> str
 
 
 def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
-                       actor: str | None = None) -> dict:
-    """#705 : désigne (ou change) le relecteur d'un lot **déjà en `qa`**.
+                       actor: str | None = None, remove: bool = False) -> dict:
+    """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
 
     Geste de pilote : mêmes autorités que la correction (`corrector`) — un
     humain, un orchestrateur ou un agent de conception. Le relecteur doit être
@@ -794,8 +794,12 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
             "review (ameesh work move %s qa --reviewer <agent>), or with "
             "ameesh work reviewer %s <agent> once it is in qa"
             % (item_id, item["state"], item_id, item_id))
-    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
-    row = storage.of(db).work.designate_reviewer(item_id, name, actor=who)
+    # Removal must work even if the reviewer has left the registry.
+    name = (reviewer or "").strip() if remove else check_reviewer_choice(
+        db, item, reviewer, cfg=cfg)
+    if not name:
+        raise WorkError("empty reviewer")
+    row = storage.of(db).work.designate_reviewer(item_id, name, actor=who, remove=remove)
     if row is None:
         # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
         # et elle, le lot a pu quitter qa ou recevoir `name` comme assigné.
@@ -1660,6 +1664,9 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             raise WorkError(
                 "--reviewer: work_items.reviewer is missing (migration 0421): "
                 "run \"ameesh migrate\", then move the lot to qa with its reviewer")
+        if not _pg.has_reviewers(db):
+            raise WorkError("--reviewer: work_items.reviewers is missing (migration 0456): "
+                            "run \"ameesh migrate\", then move the lot to qa with its reviewers")
         actor = corrector(getattr(db, "cfg", None), db, actor, what="designation")
     item = get(db, item_id)
     if item is None:
@@ -1741,7 +1748,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 "qa, or %s now holds it): the move is written; check the lot "
                 "(ameesh work show %s) and designate the reviewer once it is in qa"
                 % (item_id, state, reviewer, reviewer, item_id))
-        row["reviewer"] = reviewer      # le CLI et les appelants le lisent
+        row["reviewer"] = designated["reviewer"]
+        row["reviewers"] = designated.get("reviewers")
     return row
 
 

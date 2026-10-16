@@ -173,6 +173,8 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     if state == "build":
         return _waiting("build", assignee)
     # qa : en revue
+    if jalons.get("pending_reviewers"):
+        return _waiting("verdict", jalons["pending_reviewers"])
     if jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current"):
         merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
         last = merges[-1] if merges else None

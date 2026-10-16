@@ -224,7 +224,7 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "second")
         rows = work.list_items(self.db, limit=10)
         plan.annotate(self.db, rows)
-        self.assertEqual(rows[0]["waiting_for"]["label"], "verdict by second")
+        self.assertEqual(rows[0]["waiting_for"]["label"], "verdict by premier, second")
         # le journal garde la désignation
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("reviewer second" in n for n in notes), notes)
@@ -353,13 +353,13 @@ class ReviewerDesignationTest(PgTestCase):
         rows = work.list_items(self.db, limit=10)
         plan.annotate(self.db, rows)
         self.assertEqual(rows[0]["waiting_for"]["what"], "verdict")
-        self.assertEqual(rows[0]["waiting_for"]["who"], "second")
+        self.assertEqual(rows[0]["waiting_for"]["who"], "premier, second")
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("reviewer second" in n for n in notes), notes)
 
         self._stale(lot["id"])
         alert = self._stale_alert(lot["id"])
-        self.assertEqual(alert["waiting"]["who"], "second")
+        self.assertEqual(alert["waiting"]["who"], "premier, second")
         briefs = self._briefs(alert)
         self.assertIn("ameesh work milestone %d verdict" % lot["id"], briefs["second"])
 
@@ -508,6 +508,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot()
         proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
         self.db.__dict__.pop("_has_reviewer", None)
@@ -549,6 +550,11 @@ class ReviewerDesignationTest(PgTestCase):
         self.db.execute("ALTER TABLE work_items ADD COLUMN IF NOT EXISTS"
                         " reviewer text NOT NULL DEFAULT ''")
         self.db.__dict__.pop("_has_reviewer", None)
+        # DROP COLUMN also drops its UPDATE OF trigger. Restore the schema
+        # used by subsequent tests, including compatibility for old writers.
+        with open(os.path.join(REPO, "src/ameesh/migrations/0456_work_item_reviewers.sql"),
+                  encoding="utf-8") as fh:
+            self.db.execute(fh.read())
 
     def test_lectures_avant_la_migration_0421(self):
         """#705 (revue r1, P2-3) : la prod peut être en 0373 ; sans la colonne,
@@ -556,6 +562,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
         self.db.__dict__.pop("_has_reviewer", None)
@@ -589,6 +596,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot()
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
         daemon = self.connect()                 # née avant 0421, aucun cache

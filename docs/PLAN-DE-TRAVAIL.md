@@ -94,6 +94,16 @@ reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
 designate one.
 
+Several reviewers can be designated for the same lot (#2076): repeat
+`ameesh work reviewer <id> <agent>` to add a name. `work show` and the JSON
+`reviewers` list retain them all. The wait and alerts name each reviewer
+whose verdict on the frozen head is still due; one GO does not complete the
+other reviews. Withdraw a designation explicitly with
+`ameesh work reviewer <id> <agent> --remove` (the same authority is required).
+Assigning or delegating the lot to a reviewer removes that person's
+designation and preserves the others. Migration 0456 keeps the legacy
+`reviewer` field for older runners during an upgrade.
+
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
 `AMEESH_STALE_AFTER`, default 6 h) is **stale**: it is reported with the

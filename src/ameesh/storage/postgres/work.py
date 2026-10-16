@@ -82,7 +82,25 @@ def item_columns(db, ref: str | None = None) -> str:
         reviewer = "reviewer"
     else:
         reviewer = "''::text AS reviewer"
-    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer)
+    # to_jsonb keeps reads compatible with schemas predating 0456, without
+    # another catalogue round trip (including bounded progress/list reads).
+    reviewers = "to_jsonb(%s)->'reviewers' AS reviewers" % (ref or "work_items")
+    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer + ", " + reviewers)
+
+
+def has_reviewers(db) -> bool:
+    if getattr(db, "_has_reviewers", False):
+        return True
+    found = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        " AND column_name = 'reviewers'"))
+    if found:
+        try:
+            db._has_reviewers = True
+        except Exception:
+            pass
+    return found
 
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
@@ -428,31 +446,40 @@ class WorkItems(interface.WorkItems):
                                     why="état %s" % state, actor=actor)
             return rows[0]
 
-    def designate_reviewer(self, item_id, reviewer, *, actor) -> dict | None:
-        """#705 : pose (ou change) le relecteur désigné d'un lot en `qa`, et le
-        journalise ; None si le lot n'est plus en `qa` (rien d'écrit). La
-        colonne vient de la migration 0421 : sans elle, l'écriture est refusée
-        avec la marche à suivre (les lectures, elles, s'en passent)."""
+    def designate_reviewer(self, item_id, reviewer, *, actor, remove=False) -> dict | None:
+        """Ajoute ou retire un relecteur en `qa`, avec sa ligne de journal.
+
+        Les écritures exigent 0421 et 0456 ; les lectures restent possibles
+        avant ces migrations. La mise à jour conditionnelle et le trigger
+        sérialisent les désignations et les changements de responsable."""
         if not has_reviewer(self.db):
             raise DbError("work_items.reviewer is missing (migration 0421): "
                           "run \"ameesh migrate\", then designate the reviewer")
+        if not has_reviewers(self.db):
+            raise DbError("work_items.reviewers is missing (migration 0456): "
+                          "run \"ameesh migrate\", then designate the reviewers")
         with self.db.transaction() as tx:
-            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor)
+            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor, remove=remove)
 
-    def _designate_reviewer(self, item_id, reviewer, actor) -> dict | None:
+    def _designate_reviewer(self, item_id, reviewer, actor, *, remove=False) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
         avant, un `assign` a pu la changer entre-temps."""
+        expression = ("array_remove(reviewers, %s)" if remove else
+                      "CASE WHEN %s = ANY(reviewers) THEN reviewers"
+                      " ELSE array_append(reviewers, %s) END")
+        params = [reviewer] if remove else [reviewer, reviewer]
         rows = self.db.query(
-            "UPDATE work_items SET reviewer = %%s, updated_at = now()"
-            " WHERE id = %%s AND state = 'qa'"
-            "   AND assignee IS DISTINCT FROM %%s"
-            " RETURNING %s" % item_columns(self.db),
-            (reviewer, int(item_id), reviewer))
+            "UPDATE work_items SET reviewers = " + expression + ", updated_at = now()"
+            " WHERE id = %s AND state = 'qa'"
+            "   AND (assignee IS DISTINCT FROM %s OR %s)"
+            " RETURNING " + item_columns(self.db),
+            tuple(params + [int(item_id), reviewer, bool(remove)]))
         if not rows:
             return None
-        self._event(int(item_id), "qa", "reviewer %s designated" % reviewer, actor)
+        self._event(int(item_id), "qa", "reviewer %s %s" % (
+            reviewer, "removed" if remove else "designated"), actor)
         return rows[0]
 
     def assign(self, item_id, assignee, *, current, note, actor,

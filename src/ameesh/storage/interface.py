@@ -1506,14 +1506,15 @@ class WorkItems(Domain):
         fail (None) — the lot never ends waiting with no request."""
 
     @abc.abstractmethod
-    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str) -> dict | None:
-        """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
+    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str,
+                           remove: bool = False) -> dict | None:
+        """#2076 : ajoute un relecteur désigné (ou le retire explicitement),
         et journalise ; None (rien d'écrit) si le lot n'est plus en `qa` ou si
-        son assigné est devenu le relecteur (la règle est relue dans
+        son assigné est devenu le relecteur à ajouter (la règle est relue dans
         l'écriture, pas seulement avant : #705 r2, B1).
 
-        La colonne vient de la migration 0421 : avant elle, la lecture s'en
-        passe (`item_columns`) et l'écriture est refusée avec la marche à
+        Les colonnes viennent des migrations 0421 et 0456 : avant elles, la
+        lecture s'en passe (`item_columns`) et l'écriture est refusée avec la marche à
         suivre. Un exécuteur médié ne désigne jamais de relecteur (opération
         refusée au contrat L107/L109) : la désignation est un geste
         d'orchestrateur ou d'humain (`work.designate_reviewer`)."""
