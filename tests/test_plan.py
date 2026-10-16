@@ -1279,7 +1279,9 @@ class ContentMergeTest(_PlanDb):
                 tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                          (item["id"],))
                 thread.start()
-                self._wait_lock("FOR UPDATE")
+                # Le verrou de ligne précède désormais l'UPDATE pour respecter
+                # l'ordre dépôt -> lot des réservations de migration (#711).
+                self._wait_lock("SELECT migration_repo FROM work_items WHERE id =")
                 tx.query("INSERT INTO work_item_milestones (work_item_id, kind, sha)"
                          " VALUES (%s, 'frozen', %s) RETURNING id", (item["id"], "d" * 40))
             thread.join(10)
