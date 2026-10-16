@@ -1732,9 +1732,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     args.actor or "the bound identity"))
             return 0
         if args.work_command == "merged":
+            def _declare_constat(constat: dict) -> None:
+                # #1400 : le constat (lot/app/titre + sujet du commit, et la
+                # forme de la preuve) est montré AVANT l'écriture ; l'état du
+                # lot ne change qu'après.
+                print("declaring merge: lot #%d (%s: %s)"
+                      % (constat["id"], constat["app"] or "?", constat["title"]))
+                print("commit %s (%s): %s"
+                      % (constat["sha"][:12], constat["how"], constat["subject"]))
+
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
                                actor=args.actor, repo=args.repo, migration_landed=args.migration_landed,
-                               cfg=cfg)
+                               cfg=cfg, announce=_declare_constat)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
             elif done["result"] == "landed":

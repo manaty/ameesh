@@ -631,6 +631,38 @@ class RunTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("WARNING lot not declared", text)
 
+    def test_a_lot_refused_or_refrozen_by_the_recorder_keeps_the_merge(self):
+        # #1400 (complément #1292) : un constat `refused` ou `refrozen` de
+        # close_merged ne défait pas la fusion ; `recorded` reste absent et
+        # `record_warning` porte le détail, sans code d'erreur.
+        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
+               "tip": "d" * 40}
+        details = {
+            "refused": "lot pinned to workflow wf: transitions go through process_registry",
+            "refrozen": "new freeze declared in the meantime: not closed, review again",
+        }
+        for result, detail in details.items():
+            with self.subTest(result=result):
+                with mock.patch.object(merge_pr.work, "close_merged",
+                                       return_value={"result": result, "detail": detail,
+                                                     "item": {"id": 1003, "state": "qa"}}):
+                    code, text = self.run_with(out, args=self.args(lot=1003, json=True))
+                self.assertEqual(code, 0)
+                data = json.loads(text)
+                self.assertEqual(data["state"], "merged")   # la fusion est un fait
+                self.assertNotIn("recorded", data)
+                self.assertIn(detail, data["record_warning"])
+                # le constat humain dit la fusion et l'avertissement, pas un échec
+                with mock.patch.object(merge_pr.work, "close_merged",
+                                       return_value={"result": result, "detail": detail,
+                                                     "item": {"id": 1003, "state": "qa"}}):
+                    code, text = self.run_with(out, args=self.args(lot=1003, json=False))
+                self.assertEqual(code, 0)
+                self.assertIn("PR #7 merged", text)
+                self.assertIn("WARNING lot not declared", text)
+                self.assertIn(detail, text)
+
     def test_an_unknown_actor_declares_nothing(self):
         # N2 (#1253): the merged milestone is never attributed to
         # UNKNOWN_ACTOR — the merge is a fact that is kept, the declaration is

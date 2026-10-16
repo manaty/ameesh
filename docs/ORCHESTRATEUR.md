@@ -381,8 +381,14 @@ La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
 Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
 de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
 Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
-pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
-n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+pas. Depuis #1400, la branche enregistrée du lot est reconnue dans un vrai
+commit de fusion (forme GitHub `Merge pull request #N from
+<propriétaire>/<branche>` comprise ; le propriétaire doit être celui du
+dépôt canonique, la branche homonyme d'un fork ne prouve rien), et le
+constat — lot, projet, titre et sujet du commit — est affiché avant toute
+écriture ; aucun `--force`. Un refus affiche le projet et le titre du lot ;
+aucun état ni jalon n'est écrit. Le SHA abrégé accepté est conservé sous sa
+forme complète.
 Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
 dossier courant. La lecture reste locale : récupérer la cible au préalable
 si nécessaire. Un commit sans rattachement ne ferme pas le lot.

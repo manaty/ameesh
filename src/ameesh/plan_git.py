@@ -852,6 +852,12 @@ LOT_BRANCH_MERGE_RE = re.compile(
 #: branche fusionnée (« Merge pull request #N from owner/<branche> ») : la PR
 #: porteuse d'un gel, même sans citer le lot, a un corps à lire
 GITHUB_MERGE_PR_RE = re.compile(r"^Merge pull request #([1-9][0-9]{0,17}) from \S+")
+#: #1400 : la source d'une fusion GitHub (« Merge pull request #N from
+#: <propriétaire>/<branche> ») : le propriétaire est le premier segment, la
+#: branche le reste (elle peut contenir des `/`, `agent/…`)
+GITHUB_MERGE_SOURCE_RE = re.compile(
+    r"^Merge pull request #(?P<pr>[1-9][0-9]{0,17}) from "
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<branch>\S+?)[ \t]*$")
 #: `#<id>` dans le titre d'un commit de fusion (« Merge #93 … », « … (#91) ») ;
 #: ni `PR#9`, ni `depot#9`, ni `##9`, ni `#9a`
 HASH_REF_RE = re.compile(r"(?<![\w/#&])#([1-9][0-9]{0,17})(?!\w)")
@@ -976,6 +982,31 @@ def _mentions(message: str, branch: str) -> bool:
             return True
         start = message.find(branch, start + 1)
     return False
+
+
+def recorded_branch_merge(title: str, branch: str, *, owner: str) -> bool:
+    """#1400 : ce titre de fusion désigne-t-il la branche ENREGISTRÉE du lot ?
+
+    Deux formes, jamais une simple mention : la fusion locale qui nomme la
+    branche telle quelle (« Merge branch 'agent/x' », y compris
+    « remote-tracking … 'origin/agent/x' » — `origin` est le remote vérifié du
+    clone), et la fusion GitHub (« Merge pull request #N from
+    <propriétaire>/<branche> »). Pour la forme GitHub, le propriétaire cité doit
+    être `owner`, celui du dépôt canonique du lot : une branche homonyme venue
+    d'un fork (dépôt étranger) ne prouve rien. La comparaison est exacte :
+    `agent/x-2` ne cite pas `agent/x`.
+    """
+    text = (title or "").strip()
+    branch = (branch or "").strip()
+    if not text or not branch:
+        return False
+    if re.match(r"^Merge (?:remote-tracking )?branch '(?:origin/)?%s'"
+                r"(?: into [^\s]+)?$" % re.escape(branch), text):
+        return True
+    match = GITHUB_MERGE_SOURCE_RE.match(text)
+    if not match or match.group("branch") != branch:
+        return False
+    return match.group("owner").lower() == (owner or "").strip().lower()
 
 
 def merge_mentioning(repo: str, branch: str, head: str,

@@ -143,6 +143,35 @@ class MergedCommandTest(_Base):
         proc = self.mesh("work", "merged", str(lot["id"]))          # --sha obligatoire
         self.assertEqual(proc.returncode, 2)
 
+    def test_le_constat_est_affiche_avant_l_ecriture(self):
+        # #1400 : lot/app/titre et sujet du commit sont montrés avant que le
+        # lot ne change d'état ; la branche ENREGISTRÉE du lot est reconnue
+        # dans un vrai commit de fusion GitHub (propriétaire canonique).
+        lot = work.add(self.db, title="déclaration de fusion", app="nexlink",
+                       issue_ref="acme/web#12")
+        self.db.execute("UPDATE work_items SET branch = %s WHERE id = %s",
+                        ("agent/cx3-declaration", lot["id"]))
+        _git(self.repo, "commit", "--allow-empty", "-qm", "Base")
+        _git(self.repo, "checkout", "-qb", "agent/cx3-declaration")
+        with open(os.path.join(self.repo, "livre.txt"), "w") as fh:
+            fh.write("work\n")
+        _git(self.repo, "add", "livre.txt")
+        _git(self.repo, "commit", "-qm", "Work")
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "--no-ff", "agent/cx3-declaration", "-qm",
+             "Merge pull request #12 from acme/agent/cx3-declaration")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        proc = self.mesh("work", "merged", str(lot["id"]), "--sha", sha, "--repo", self.repo,
+                         env=self.env(AGENT_MAIL_NAME="claude1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("declaring merge: lot #%d (nexlink: déclaration de fusion)" % lot["id"],
+                      proc.stdout)
+        self.assertIn("commit %s (recorded branch): Merge pull request #12 from "
+                      "acme/agent/cx3-declaration" % sha[:12], proc.stdout)
+        self.assertLess(proc.stdout.index("declaring merge"),
+                        proc.stdout.index("→ merged"))
+        self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
+
     def test_commit_d_un_autre_lot_ne_modifie_ni_etat_ni_jalon(self):
         mine = work.add(self.db, title="redemption", app="nexlink", issue_ref="acme/web#9")
         other = work.add(self.db, title="git identity")

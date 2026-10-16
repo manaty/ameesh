@@ -1446,14 +1446,21 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
 
 def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
-                           cfg=None) -> str:
-    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture."""
+                           cfg=None, announce=None) -> str:
+    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture.
+
+    `announce` (facultatif, #1400) : appelé avec le constat `{id, app, title,
+    sha, subject, how}` une fois la preuve lue et acceptée, AVANT que
+    l'appelant n'écrive quoi que ce soit ; un refus de preuve ne l'appelle
+    pas.
+    """
     from . import plan_git
     from .canon import GitError
 
     label = "lot #%s (%s: %s)" % (item["id"], item.get("app") or "?", item["title"])
     try:
-        checkout = _checkout(lot_repository(item, cfg), repo, cfg)
+        slug = lot_repository(item, cfg)
+        checkout = _checkout(slug, repo, cfg)
         commit = plan_git._commit(checkout, sha)
         if not commit:
             raise WorkError("commit %s not found in the lot's repository" % sha)
@@ -1477,22 +1484,32 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
             if cited.group("branch") != item["branch"]:
                 how = None
         if not how and item.get("branch"):
-            # A recorded agent/feature branch may also be named in a real
-            # merge title; a mere mention in a review body proves nothing.
+            # #1400 : une branche enregistrée du lot (agent/…) est reconnue
+            # dans un VRAI commit de fusion — forme GitHub « from
+            # <propriétaire>/<branche> » comprise —, à condition que le
+            # propriétaire soit celui du dépôt canonique du lot (une branche
+            # homonyme d'un fork ne prouve rien) ; une simple mention dans un
+            # corps de revue ou un commit ordinaire ne prouve rien.
             parents = plan_git._out(checkout, "show", "-s", "--format=%P", commit)
             if (parents and len(parents.split()) >= 2
-                    and plan_git._mentions(title, item["branch"])):
+                    and plan_git.recorded_branch_merge(
+                        title, item["branch"], owner=slug.split("/", 1)[0])):
                 how = "recorded branch"
         if not how:
             raise WorkError("commit does not designate this lot: use ameesh-work: %s "
                             "in the commit message (a PR number alone is not a lot)" % lot)
+        if announce is not None:
+            announce({"id": lot, "app": item.get("app") or "",
+                      "title": item.get("title") or "", "sha": commit,
+                      "subject": title, "how": how})
         return commit
     except (WorkError, GitError, plan_git.MergeProbeError) as exc:
         raise WorkError("%s: merge declaration refused: %s" % (label, exc)) from exc
 
 
 def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
-           repo: str | None = None, migration_landed: int | None = None, cfg=None) -> dict:
+           repo: str | None = None, migration_landed: int | None = None, cfg=None,
+           announce=None) -> dict:
     """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
     (fusion locale sur la branche cible) se déclare en une fois.
 
@@ -1503,6 +1520,13 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     remplacé) n'est jamais rouvert : WorkError. Rend le constat de
     `close_merged`. Le commit doit être lisible dans le dépôt du lot, désigner
     ce lot et être entré dans sa cible ; aucune lecture réseau ni force.
+
+    `announce` (facultatif, #1400) : le callback du constat, appelé avec
+    `{id, app, title, sha, subject, how}` après la lecture de la preuve (une
+    branche enregistrée est reconnue dans un vrai commit de fusion, GitHub
+    comprise) et AVANT toute écriture ; un refus de preuve ne l'appelle pas, un
+    refus d'écriture (gel déclaré entre-temps) l'a déjà appelé et laisse
+    l'état inchangé.
 
     `migration_landed` (#1567) : le numéro de migration réellement atterri,
     quand la renumérotation du paquet a changé celui de la réservation (452 au
@@ -1519,7 +1543,7 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     if item["state"] not in (*MERGED_STATES, "closed"):
-        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg)
+        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
