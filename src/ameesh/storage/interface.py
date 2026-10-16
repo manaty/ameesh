@@ -1468,10 +1468,12 @@ class WorkItems(Domain):
         même verrou, mais le lot reste où il est et `PendingLot` est levée.
         `ready_only` (L165) exige un lot intake sans assigné dont toutes les
         dépendances sont satisfaites ; vérifié sous verrou dans la même
-        transaction que l'attribution. La réservation manuelle garde son
-        comportement par défaut. #705 : si le nouvel assigné est le relecteur
-        désigné, la désignation tombe dans la même écriture (le journal la
-        nomme) — un relecteur ne relit pas son propre travail."""
+        transaction que l'attribution. `current` doit alors être NULL : toute
+        autre valeur est une erreur d'appel (`ValueError` immédiate, avant le
+        verrou) et non un None silencieux (#1696). La réservation manuelle
+        garde son comportement par défaut. #705 : si le nouvel assigné est le
+        relecteur désigné, la désignation tombe dans la même écriture (le
+        journal la nomme) — un relecteur ne relit pas son propre travail."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
