@@ -589,7 +589,9 @@ class WorkItems(interface.WorkItems):
         transaction qui écrit (codex r1, #409) : deux `notify` sur deux hôtes
         ne dépassent ni le plafond ni ne donnent deux lots au même preneur ;
         un agent sorti de pause entre le contrôle git et l'écriture garde son
-        lot (sa ligne reste verrouillée jusqu'au commit)."""
+        lot (sa ligne reste verrouillée jusqu'au commit). `assignee` None rend
+        le lot à la file d'équipe (assigné NULL, L165) : le contrôle du
+        preneur n'a pas lieu."""
         with self.db.transaction() as tx:
             tx.query(_HANDOFF_LOCK)
             taken = tx.query(
@@ -598,8 +600,9 @@ class WorkItems(interface.WorkItems):
                 "   AND starts_with(note, %s)", (float(window_s), note_prefix))
             if int(taken[0]["n"]) >= int(max_per_window):
                 return None
-            if tx.query("SELECT 1 FROM work_items WHERE assignee = %%s"
-                        "   AND state NOT IN %s LIMIT 1" % _CLOSED, (assignee,)):
+            if assignee is not None and tx.query(
+                    "SELECT 1 FROM work_items WHERE assignee = %%s"
+                    "   AND state NOT IN %s LIMIT 1" % _CLOSED, (assignee,)):
                 return None
             if not tx.query("SELECT 1 FROM agent_registry WHERE name = %s"
                             "   AND status = 'blocked' AND starts_with(status_text, %s)"

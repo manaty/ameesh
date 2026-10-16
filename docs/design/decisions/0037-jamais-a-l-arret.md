@@ -147,6 +147,24 @@ their own number; the following passes then see the updated counter. A strict
 cap would take a mesh-wide lock in the write transaction — to be decided with
 the pilot if the residual burst matters.
 
+# Amendment of 2026-10-13 (2): a paused plan agent hands its ready lots back
+
+Same owner instruction, lot #757. The lots of a **non-critical Claude agent
+paused on budget** no longer all wait for a free DeepSeek taker:
+
+- a **non-started** lot (`intake`) returns to the team queue (assignee
+  cleared, one journal note): the automatic take above gives it to the first
+  free capable agent of the team, plan agents first, DeepSeek or Codex — a
+  plan agent at its ceiling no longer keeps a ready lot out of the queue;
+- a **started** lot (`build`) keeps the direct L233b handoff (branch, git
+  state and what remains to do travel with it), by a free DeepSeek **or
+  Codex** agent of the same project.
+
+Never handled, as before: a lot under review or frozen, a sensitive or
+reserved one, one waiting for a decision, one whose last assignment came from
+a human. The rolling hourly ceiling (`--handoff-max-per-hour`) counts returns
+and handoffs together; the cross-family review rule is unchanged.
+
 # Amendment of 2026-10-15: a lot that waits on a prerequisite does not wait for an agent
 
 Lot #1625, framed by the pilot (mesh-design, 15/10 21:40). §3 and §6 counted
