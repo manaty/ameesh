@@ -99,6 +99,36 @@ class DetachSweepTest(_Base):
         self.sync()
         self.assertEqual(work.get(self.db, n)["branch"], "lot/%d-neuve" % n)
 
+    def test_fusion_nommee_de_branche_detachee_ne_ferme_pas(self):
+        for target in ("develop", "main"):
+            with self.subTest(target=target):
+                lot = self.blocked_lot()
+                n = lot["id"]
+                name = "lot/%d-supplantee" % n
+                self.branch(name)
+                work.set_branch(self.db, n, name, actor="orch")
+                work.detach_branch(self.db, n, reason="PR supplantée")
+                _git(self.repo, "checkout", "-q", target)
+                _git(self.repo, "merge", "-q", "--no-ff", "-m",
+                     "Merge branch '%s'" % name, name)
+                self.assertEqual(self.sync()["merged"], 0)
+                self.assertEqual(work.get(self.db, n)["state"], "blocked")
+                self.assertIsNone(work.get(self.db, n)["branch"])
+                # Le retour explicite rétablit aussi cette preuve de livraison.
+                work.set_branch(self.db, n, name, target, actor="pilote")
+                self.assertEqual(self.sync()["merged"], 1)
+                _git(self.repo, "checkout", "-q", "develop")
+
+    def test_citation_explicite_du_lot_detache_reste_une_preuve(self):
+        lot = self.blocked_lot()
+        n = lot["id"]
+        name = "lot/%d-supplantee" % n
+        self.branch(name)
+        work.detach_branch(self.db, n, name, reason="PR supplantée")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch '%s'\n\nameesh-work: %d" % (name, n), name)
+        self.assertEqual(self.sync()["merged"], 1)
+
     def test_prefixe_sans_confusion(self):
         lot = self.lot()
         n = lot["id"]
@@ -159,4 +189,3 @@ class DetachRadarTest(PgTestCase):
         work.set_branch(self.db, lots[1]["id"], LOTS[1]["branch"], actor="pilote")
         self.assertEqual(sorted(s["to"] for s in radar.run_pass(cfg, self.db, ci=None)[0]["mail"]),
                          ["a1", "a2"])
-

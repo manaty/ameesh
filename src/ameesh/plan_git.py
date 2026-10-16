@@ -1493,6 +1493,11 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
             partial = (merge, "merge commit %s declares itself partial "
                        "(\"ameesh-work-partial: %d\"): lot kept open"
                        % (merge["sha"][:12], lot))
+    if not row.get("branch"):
+        # #2102 : le nom détaché n'est pas non plus une preuve implicite
+        # dans un titre de fusion (cible déclarée ou ref d'intégration).
+        citing = [m for m in citing if m["how"] != "lot-branch"
+                  or not work_mod.is_detached(st, lot, merge_branch(m["message"]))]
     reverted_cite = None
     if citing:
         # #1825 : une fusion citante annulée par un revert n'a rien livré —
