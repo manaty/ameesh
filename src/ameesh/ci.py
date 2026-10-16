@@ -738,29 +738,37 @@ class Watcher:
         return runs
 
     def tick(self, db) -> list[dict]:
-        """Un relevé de chaque dépôt ; rend les envois et retraits."""
+        """Un relevé de chaque dépôt ; rend les envois et retraits.
+
+        #1813 : les compteurs du cache de lectures partent à la fin du
+        passage (`flush_reads`), même si le quota a coupé la boucle — le
+        client du runner vit toute la vie du processus, une suite de hits
+        restait sinon invisible sur disque jusqu'à la requête suivante."""
         from . import plan_github
 
-        repos = self.repos()
-        if not repos or self.dry_run:
-            return []
-        if self.api is None:
-            self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
-                              ttl=self._cache_ttl(), clock=self.clock)
-        out: list[dict] = []
-        for repo in repos:
-            try:
-                out += self.watch(db, repo)
-            except plan_github.GithubRateLimited as exc:
-                # quota épuisé : aucun autre appel ne part avant le reset
-                when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) \
-                    if exc.reset else "unknown"
-                self.log("CI %s: GitHub quota exhausted (reset at %s): pass stopped"
-                         % (repo, when))
-                break
-            except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
-                self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
-        return out
+        try:
+            repos = self.repos()
+            if not repos or self.dry_run:
+                return []
+            if self.api is None:
+                self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
+                                  ttl=self._cache_ttl(), clock=self.clock)
+            out: list[dict] = []
+            for repo in repos:
+                try:
+                    out += self.watch(db, repo)
+                except plan_github.GithubRateLimited as exc:
+                    # quota épuisé : aucun autre appel ne part avant le reset
+                    when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) \
+                        if exc.reset else "unknown"
+                    self.log("CI %s: GitHub quota exhausted (reset at %s): pass stopped"
+                             % (repo, when))
+                    break
+                except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
+                    self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
+            return out
+        finally:
+            plan_github.flush_reads(getattr(self.cfg, "state_dir", None))
 
     # -- un dépôt --------------------------------------------------------------
     def watch(self, db, repo: str) -> list[dict]:
