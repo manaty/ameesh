@@ -102,7 +102,7 @@ CONTENUS = {
 FERMEES = {
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
-    "agent_mesh_overview": {"roles"},
+    "agent_mesh_overview": {"roles", "aliases"},  # #423 : 0418 avant 0428 sur un schéma neuf
     # #1883 (0451) : l'identité d'un compte est l'empreinte sha256 du dossier
     # résolu qu'il lit — jamais le chemin. Le propriétaire est alerté du conflit
     # par notify (`account_identity`) et le lot n'ouvre aucun accès distant
