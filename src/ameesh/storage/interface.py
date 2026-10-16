@@ -335,7 +335,9 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def clear_session(self, name: str, owner: str, epoch: int) -> bool:
-        """Oublie la session, fencé par un bail valide."""
+        """Oublie la session, fencé par un bail valide ; l'oubli est durable
+        (`session_reset_at` posé dans la même écriture), pour qu'un fichier
+        local non retiré ne ressuscite pas la session (#794)."""
 
     @abc.abstractmethod
     def hold_note(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
@@ -771,6 +773,33 @@ class Accounts(Domain):
         un autre worker a déjà basculé : rien n'est écrit."""
 
     @abc.abstractmethod
+    def switch_guarded(self, host: str, harness: str, *, expected: str | None, to: str,
+                       kind: str, reason: str, agent: str | None, now: float,
+                       hold_reason: str | None = None,
+                       hold_until: float | None = None) -> bool:
+        """#1883 : bascule validée contre les retenues, en UNE transaction.
+
+        Même contrat que `switch` (compare-and-changer `expected`, un forçage
+        manuel n'est pas défait par l'automate), PLUS, sous le **même verrou**
+        de la ligne `account_active` :
+
+        * une retenue **valide** de `to` (`until_ts > now`) refuse la bascule :
+          rien n'est écrit, l'appelant relit l'actif — c'est ce qui ferme la
+          course « classement sur un instantané, retenue publiée entre-temps »
+          (R1 auditeur, B2) ;
+        * quand `hold_reason` est donné, pose (ou rafraîchit) la retenue du
+          compte **quitté** dans la même transaction — le compte qu'on quitte
+          en dépassement devient indisponible pour les autres workers au même
+          instant où la bascule est visible ;
+        * les retenues **échues** de `to` sont nettoyées dans la même
+          transaction (R2 auditeur, B2) : un nettoyage APRÈS le commit
+          effacerait une retenue publiée entre-temps par la bascule d'un autre
+          runner, qui attend le même verrou.
+
+        Faux sans rien écrire : compte vu changé, forçage manuel en place,
+        aucun changement, ou retenue valide sur `to`."""
+
+    @abc.abstractmethod
     def set_auto(self, host: str, harness: str, *, reason: str,
                  expected: str | None = None) -> bool:
         """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
@@ -791,6 +820,35 @@ class Accounts(Domain):
     @abc.abstractmethod
     def release(self, host: str, harness: str, account: str) -> None:
         """Retire la retenue d'un compte (il redevient éligible)."""
+
+    @abc.abstractmethod
+    def identities(self, host: str, harness: str, since: float) -> dict[str, list[dict]]:
+        """#1883 : les empreintes de dossier publiées pour ce couple (hôte,
+        harnais), encore vivantes depuis `since` (epoch) :
+        {account: [{identity, last_ts}]}. Deux empreintes sous le même nom
+        sont deux dossiers résolus : le compte est refusé au placement. Jamais
+        un chemin, seulement une empreinte (secret d'hôte)."""
+
+    @abc.abstractmethod
+    def publish_identity(self, host: str, harness: str, account: str,
+                         identity: str) -> None:
+        """#1883 : publie (ou rafraîchit) l'empreinte du dossier résolu
+        `identity` du compte, pour que les autres processus de l'hôte
+        détectent un même nom déclaré vers deux dossiers différents."""
+
+    @abc.abstractmethod
+    def placement_state(self, host: str, harness: str, since: float) -> dict:
+        """#1883 (R3 auditeur, B1) : retenues ET identités d'un couple (hôte,
+        harnais), lues en UNE transaction sous le verrou de placement.
+
+        Rend `{"holds": {account: {until_ts, reason}}, "identities":
+        {account: [{identity, last_ts}]}}`, les identités encore vivantes
+        depuis `since` (epoch). Toute publication de retenue
+        (`switch_guarded`, `hold`) prend le même verrou : aucune retenue ne
+        peut être publiée entre la lecture des retenues et celle des
+        identités — c'est l'état cohérent sur lequel `accounts.choose` valide
+        son choix (R3 auditeur, B1). `holds` et `identities` seuls restent des
+        lectures d'un jeu, sans cohérence entre eux."""
 
     @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
@@ -873,7 +931,8 @@ class Mailbox(Domain):
 
     @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
-        """Messages non remis, du plus ancien au plus récent."""
+        """Messages non remis, du plus ancien au plus récent, avec leur lot
+        (`work_item_id`, #794 : le brief d'un lot ne montre que son fil)."""
 
     @abc.abstractmethod
     def unread_active(self, recipient: str, limit: int) -> list[dict]:
@@ -884,6 +943,14 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis marqués `payload.urgent`."""
+
+    @abc.abstractmethod
+    def unread_mid_turn(self, recipient: str, limit: int) -> list[dict]:
+        """L514/#885 : les messages non remis qu'une remise mi-tour peut
+        livrer — verdict, arbitrage, message d'un humain, urgent
+        (`mail.mid_turn`) —, du plus ancien au plus récent, sans s'arrêter
+        aux `UNREAD_LIMIT` premiers non-lus : un verdict derrière plus de 200
+        non-lus est vu au prochain point sûr, pas à la fin du tour."""
 
     @abc.abstractmethod
     def get(self, message_id: int) -> dict | None:
@@ -1311,6 +1378,17 @@ class WorkItems(Domain):
         """L122 : le lot (id, titre, état) qui a réservé ce numéro du dépôt."""
 
     @abc.abstractmethod
+    def record_landed_migration(self, item_id: int, number: int, repo: str, *,
+                                note: str, actor: str) -> dict | None:
+        """#1567 : enregistre (ou corrige) le numéro atterri d'un lot déjà
+        fusionné ou promu, journalisé dans la même transaction ; None si le lot
+        n'est pas dans un état terminal. La réservation n'est pas touchée."""
+
+    @abc.abstractmethod
+    def migration_landed_holder(self, number: int, repo: str) -> dict | None:
+        """#1567 : le lot (id, titre, état) qui nomme déjà ce numéro atterri."""
+
+    @abc.abstractmethod
     def record_resolution(self, item_id: int, other_id: int, *, commit: str, lot_tip: str,
                           other_tip: str, ref: str | None, files: list[str], note: str,
                           actor: str) -> dict | None:
@@ -1405,7 +1483,12 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
-        """Un lot, ou None."""
+        """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
+        révision Process pinnée, '' quand il n'y en a pas — y compris sur une
+        base d'avant la migration 0452). Les commandes historiques
+        (`work.move`/`close`/`close_merged`) lisent la garde par cette
+        interface, jamais par un SELECT brut : celui-ci est refusé sur une
+        connexion d'exécuteur médié."""
 
     @abc.abstractmethod
     def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
@@ -1478,7 +1561,7 @@ class WorkItems(Domain):
         journal la nomme) — un relecteur ne relit pas son propre travail."""
 
     @abc.abstractmethod
-    def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
+    def handoff(self, item_id: int, assignee: str | None, *, current: str, state: str,
                 paused_prefix: str, note_prefix: str, window_s: float,
                 max_per_window: int, note: str, actor: str) -> dict | None:
         """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
@@ -1489,7 +1572,10 @@ class WorkItems(Domain):
         (`blocked`, `status_text` commençant par `paused_prefix`, ligne
         verrouillée jusqu'à la fin) ; `assignee` n'a aucun lot ouvert ; moins
         de `max_per_window` notes commençant par `note_prefix` dans les
-        `window_s` dernières secondes."""
+        `window_s` dernières secondes.
+
+        `assignee` None rend le lot à la file d'équipe (assigné NULL, L165) :
+        aucun contrôle du preneur n'a lieu, les autres tiennent."""
 
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
@@ -1591,11 +1677,14 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
-                     pr_ref: str | None, frozen_id: int | None = None) -> dict | None:
+                     pr_ref: str | None, frozen_id: int | None = None,
+                     landed: tuple[int, str] | None = None) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
         dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
-        `merged` (commit, auteur de la fusion) dans la même transaction."""
+        `merged` (commit, auteur de la fusion) dans la même transaction.
+        `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
+        écrit dans la même transaction."""
 
     @abc.abstractmethod
     def close(self, item_id: int, *, current: str, reason: str, superseded_by: int | None,
@@ -2546,6 +2635,12 @@ class Operations(Domain):
         epoch, échéance recontrôlée). Faux si le bail n'est plus le nôtre."""
 
     @abc.abstractmethod
+    def set_dormant(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
+        """L76 T2 : le texte de statut d'un résident endormi, en une écriture
+        conditionnelle — seulement si l'agent est `idle` et que le bail
+        (owner, epoch, échéance) est encore le nôtre. Faux sinon."""
+
+    @abc.abstractmethod
     def listing(self, *, today: str | None = None) -> list[dict]:
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
         `status_since_ts`, début du motif affiché (`status_reason_since_ts`), bail
@@ -3127,7 +3222,11 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
-        sont plus assignés à leur agent ; rend les lignes supprimées."""
+        sont plus assignés à leur agent ; rend les lignes supprimées. Ne touche
+        pas au registre : la session ACTIVE d'un lot fini est fermée par
+        l'agent qui la détient, à son tour suivant, sous son bail (#794,
+        revue Claude B1 : ce balayage n'a pas le bail et peut tomber en plein
+        tour)."""
 
 
 # --------------------------------------------------------------------------

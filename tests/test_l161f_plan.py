@@ -385,6 +385,31 @@ class MapTest(unittest.TestCase):
         self.assertIn("no test is guaranteed to load: src/ameesh/code.py", out["phase2_why"])
         self.assertEqual(out["classes"]["test_a"], ["P3", ""])
 
+    def test_incomplete_map_keeps_the_full_suite(self):
+        # #1716 : #1690 nomme un artefact de mesure illisible sans rendre la
+        # carte suspecte ; un bloc couvert par l'artefact perdu ressortait donc
+        # avec le seul module lisible et la sélection se réduisait en silence.
+        # La carte est inutilisable : suite complète.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        card = self.repo.card()
+        card["measure"] = {"parts": 5, "processus": 4, "artefacts_incomplets": [
+            {"fichier": "cov/.coverage.coupee",
+             "erreur": "DataError: file is not a database"}]}
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in parts.modules()}
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=self.repo.path)
+        self.assertFalse(out["map"]["used"])
+        self.assertIn("unreadable measure artefact", out["map"]["problem"])
+        self.assertFalse(out["phase2_safe"])
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                               base_ref="main", head_ref="lot/1716-carte-incomplete")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("map not usable", p["selection"]["why"])
+        self.assertIn("unreadable measure artefact", p["selection"]["why"])
+
     def test_new_file_is_covered_by_the_test_that_imports_it(self):
         # #1339 : un fichier nouveau, inconnu de la carte, est couvert par le
         # test du lot qui l'importe (graphe d'import statique) ; la suite
@@ -776,6 +801,18 @@ class MapTest(unittest.TestCase):
         stranger = dict(card, commit="0" * 40)
         self.assertIn("not an ancestor", plan.map_problem(stranger, NOW, "HEAD",
                                                           self.repo.path)[0])
+        # #1716 : une carte bâtie sur des mesures incomplètes (#1690) ne peut
+        # plus réduire la sélection à l'insu du plan. L'ancienne graphie
+        # `mesure` (L148 stage 6) est lue aussi.
+        for cle in ("measure", "mesure"):
+            with self.subTest(cle):
+                incomplet = dict(card, **{cle: {"artefacts_incomplets": [
+                    {"fichier": "cov/.coverage.coupee", "erreur": "DataError"}]}})
+                why, _ = plan.map_problem(incomplet, NOW, "HEAD", self.repo.path)
+                self.assertIn("unreadable measure artefact", why)
+                self.assertIn("cov/.coverage.coupee", why)
+        vide = dict(card, measure={"parts": 5, "processus": 5, "artefacts_incomplets": []})
+        self.assertEqual(plan.map_problem(vide, NOW, "HEAD", self.repo.path), ("", 0.0))
 
     def test_map_problem_partial_measure(self):
         """#1257 R1 B3 : une carte dont la fusion a écarté des couvertures est
@@ -1387,7 +1424,11 @@ class PartialMeasureTest(unittest.TestCase):
         # carte fraîche et ancêtre de HEAD : seule la perte la rend inutilisable
         card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
         self.assertEqual(len(card["mesure"]["couverture_ignoree"]), 1)
-        mesure = dict(card["mesure"], couverture_ignoree=[])
+        # #1690 : le meme artefact tronque est aussi nomme dans
+        # `artefacts_incomplets` ; le temoin du temoin doit retirer les DEUX
+        # projections de la perte, sinon il n'est plus sain.
+        mesure = dict(card["mesure"], couverture_ignoree=[],
+                      artefacts_incomplets=[])
         saine = dict(card, measure=mesure, mesure=mesure)  # témoin du témoin
         self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
         probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
@@ -1976,22 +2017,19 @@ class LotBranchTest(unittest.TestCase):
         self.assertIn(f"candidates: `{self.mods[0]}`", text)
 
     def test_parts_shrink_to_the_estimate(self):
-        # #1343 (composition paquet 11h) : population simulée explicite. Le
-        # témoin portait sur `self.mods` (les modules réellement découverts,
-        # 235 à sa mesure) : passé 300 s d'estimation, chaque module de plus
-        # changeait le nombre de parts attendu. La population est ici fixée
-        # (235 modules), et `test_count` neutralisé pour que rien ne dépende
-        # des fichiers du dépôt.
-        population = [f"test_simule_{i:03d}.py" for i in range(235)]
+        # Liste fixe (#1800) : le témoin porte sur la formule de découpage
+        # (235 modules × 2 s = 470 s -> deux parts), pas sur l'inventaire du
+        # dépôt, qui grandit à chaque paquet et ferait basculer l'attente.
+        # Noms synthétiques : test_count, qui lit un fichier réel, est neutralisé.
+        mods = [f"test_fixe_{i:03d}" for i in range(235)]
 
         def card(seconds):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
-                                for m in population}}
+                                for m in mods}}
         with mock.patch.object(plan.parts, "test_count", lambda module, tests=None: 1):
-            self.assertEqual(plan.lot_part_count("psycopg", population[:10], card(1.0)), 1)
-            # 235 modules × 2 s = 470 s -> deux parts
-            self.assertEqual(plan.lot_part_count("psycopg", population, card(2.0)), 2)
-            self.assertGreaterEqual(plan.lot_part_count("psycopg", population, card(5.0)), 4)
+            self.assertEqual(plan.lot_part_count("psycopg", mods[:10], card(1.0)), 1)
+            self.assertEqual(plan.lot_part_count("psycopg", mods, card(2.0)), 2)
+            self.assertGreaterEqual(plan.lot_part_count("psycopg", mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):
         # un lot très large (60 s par module) reste dans PARTS : quatre parts

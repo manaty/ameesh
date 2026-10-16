@@ -18,7 +18,8 @@ import time
 import unittest
 from contextlib import contextmanager
 
-from ameesh import exploitation, mail, notify, projects, registry, storage, undeliverable
+from ameesh import (exploitation, fastmail, mail, notify, projects, registry, storage,
+                    undeliverable)
 from ameesh.backend import PgBackend
 from ameesh.scoped_db import ScopedDb
 
@@ -442,10 +443,14 @@ class RenvoiTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dry run: 2 pending message(s) for claude3 (stopped)", proc.stdout)
         self.assertEqual(len(mail.unread(self.db, "claude3")), 2)
+        # #1689 (N1) : le renvoi dépose sans passer par `mail.send` ; le
+        # marqueur local du destinataire doit dire « à vérifier » sans TTL.
+        fastmail.note(self.cfg, "mesh-design", pending=False, unread=0)
         proc = self.mesh("mail", "forward", "claude3", "mesh-design",
                          env=self.env(AGENT_MAIL_NAME="orchestrateur"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("2 message(s) re-delivered from claude3 (stopped) to mesh-design", proc.stdout)
+        self.assertTrue(fastmail.read_marker(self.cfg, "mesh-design")["pending"])
         self.assertEqual(mail.unread(self.db, "claude3"), [])
         copies = mail.unread(self.db, "mesh-design")
         self.assertEqual([(c["sender"], c["body"], c["kind"]) for c in copies],
@@ -710,6 +715,57 @@ class SweepTest(_Base):
         self.assertEqual(payload["forwarded"][0]["new"], "mesh-design")
         self.assertEqual(self.pending("claude3"), [])
         self.assertEqual(self.mesh("mail", "sweep", "--days", "-1").returncode, 2)
+
+    def test_essaye_les_successeurs_dans_l_ordre(self):
+        """#1396/N3 : le premier successeur arrêté ne fait plus expirer le
+        courrier quand un suivant est vivant (les deux sont essayés dans
+        l'ordre)."""
+        self.agent("a-mort")
+        self.stop("a-mort")
+        registry.set_session(self.db, "claude3", "s-claude3")
+        binds = storage.of(self.db).session_bindings
+        for harness, agent in (("claude", "a-mort"), ("codex", "mesh-design")):
+            binds.bind(host=self.cfg.host, harness=harness, session_id="s-claude3",
+                       agent=agent, pid=None, created_by="human:proprio")
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport 1.")
+        self.age(8)                       # au-delà de la rétention : sans le 2e, il expirerait
+        report = undeliverable.sweep(self.cfg, self.db, dry_run=True)
+        self.assertEqual(report["expired"], [])
+        [refused] = report["refused"]
+        self.assertEqual((refused["old"], refused["new"]), ("claude3", "a-mort"))
+        [fwd] = report["forwarded"]
+        self.assertEqual((fwd["old"], fwd["new"], fwd["count"], fwd["dry_run"]),
+                         ("claude3", "mesh-design", 1, True))
+        self.assertEqual(len(self.pending("claude3")), 1)          # dry-run : rien bougé
+        report = undeliverable.sweep(self.cfg, self.db)
+        self.assertEqual(report["expired"], [])
+        [refused] = report["refused"]
+        self.assertEqual((refused["old"], refused["new"]), ("claude3", "a-mort"))
+        [fwd] = report["forwarded"]
+        self.assertEqual((fwd["old"], fwd["new"], fwd["count"]),
+                         ("claude3", "mesh-design", 1))
+        self.assertEqual(self.pending("claude3"), [])
+        self.assertEqual(self.pending("mesh-design"), ["Rapport 1."])
+
+    def test_cli_sweep_signale_les_refus(self):
+        """#1396/N2 : un renvoi refusé reste visible et rend non-zéro, au lieu
+        d'être masqué par « no dead letter » (retention 0 = jamais expiré)."""
+        self.lie()
+        self.stop("mesh-design")
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        out = self.mesh("mail", "sweep", "--days", "0")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("re-delivery to mesh-design refused", out.stderr)
+        self.assertIn("no dead letter swept", out.stdout)
+        self.assertNotIn("no dead letter to sweep", out.stdout)
+        self.assertEqual(self.pending("claude3"), ["Rapport."])    # rien n'a bougé
+        out = self.mesh("mail", "sweep", "--days", "0", "--json")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        payload = json.loads(out.stdout)
+        self.assertEqual((payload["forwarded"], payload["expired"]), ([], []))
+        self.assertEqual(payload["refused"][0]["new"], "mesh-design")
 
     def test_expire_un_nom_absent_du_registre(self):
         """Nom absent : rien à verrouiller, l'absence est constatée dans

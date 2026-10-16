@@ -66,6 +66,27 @@ class BriefsTest(unittest.TestCase):
         self.assertLess(text.index("ameesh work dependencies 42"),
                         text.index("ameesh mail send dev1"))
 
+    def test_stale_lot_candidat_de_paquet_ne_propose_pas_de_relance(self):
+        """#1773 : en qa, une attente de fusion (gel + verdict acquis) est un
+        candidat de paquet : le brief ne propose ni relance ni réassignation —
+        le composeur/pilote porte l'atterrissage — mais l'alerte reste, avec
+        les portes de clôture."""
+        candidat = dict(STALE, lot_state="qa", waiting_for="fusion")
+        text = alert_briefs.briefs(candidat, self.listing,
+                                   auditor_names=["auditeur"])["orch"]
+        self.assertIn("candidate for its merge packet/queue", text)
+        self.assertIn("do not nudge its assignee or reassign it", text)
+        self.assertNotIn("ameesh mail send dev1", text)
+        self.assertNotIn("ameesh work assign 42", text)
+        self.assertIn("ameesh work merged 42 --sha", text)
+        self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
+        self.assertIn("ameesh work close 42 --abandoned", text)
+        # un lot qui attend autre chose que sa fusion garde la relance
+        correction = dict(STALE, waiting_for="correction")
+        text = alert_briefs.briefs(correction, self.listing,
+                                   auditor_names=["auditeur"])["orch"]
+        self.assertIn("ameesh mail send dev1", text)
+
     def test_stale_lot_ne_reveille_pas_l_auditeur(self):
         """L713 : lu à la passe de l'auditeur, pas poussé ; les autres alertes si."""
         briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
@@ -76,10 +97,41 @@ class BriefsTest(unittest.TestCase):
                                                       auditor_names=["auditeur"]))
 
     def test_stale_lot_sans_assigne(self):
+        # aucun exécuteur vivant : à tous (le premier revenu agit), la prise
+        # du lot restant atomique (`--claim`)
         alert = dict(STALE, agent=None)
         briefs = alert_briefs.briefs(alert, self.listing)
-        self.assertEqual(sorted(briefs), ["orch", "orch-b"])     # équipe inconnue : tous
-        self.assertIn("ameesh work assign 42 <agent>", briefs["orch"])
+        self.assertEqual(sorted(briefs), ["orch", "orch-b"])
+        self.assertIn("ameesh work assign 42 <agent> --claim", briefs["orch"])
+        # exécuteurs vivants : un seul destinataire, choisi par le lot
+        listing = _listing(("orch", "a"), ("orch-b", "b"), ("dev1", "a"),
+                           ("dev2", "b"), ("auditeur", ""))
+        for row in listing[:2]:
+            row.update(lease_live=True, lease_owner="runner-" + row["name"])
+        briefs = alert_briefs.briefs(alert, listing)
+        self.assertEqual(list(briefs), ["orch"])                 # #1026 : un seul
+        # le choix est stable et réparti : le lot suivant va à l'autre
+        self.assertEqual(list(alert_briefs.briefs(dict(alert, lot=43), listing)),
+                         ["orch-b"])
+        # B1 bureau : le vivier est d'abord restreint au PROJET du lot (#705) ;
+        # sans ce filtre, le lot 43 partait à orch-b (projet b) et un lot
+        # ameesh pouvait n'être briefé qu'à un orchestrateur d'un autre projet.
+        projet_a = dict(alert, project="a")
+        self.assertEqual(list(alert_briefs.briefs(projet_a, listing)), ["orch"])
+        self.assertEqual(list(alert_briefs.briefs(dict(projet_a, lot=43), listing)),
+                         ["orch"])
+        # projet sans orchestrateur : repli sur tous, choix par lot inchangé
+        self.assertEqual(list(alert_briefs.briefs(dict(alert, project="c"), listing)),
+                         ["orch"])
+        # L713 : le stale_lot sans assigné ne réveille pas l'auditeur (il le lit
+        # à sa passe) ; l'orchestrateur choisi reste le seul destinataire
+        briefs = alert_briefs.briefs(alert, listing, auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["orch"])
+        # un seul exécuteur vivant : c'est lui, quel que soit le lot
+        listing[0].update(lease_live=False)
+        self.assertEqual(list(alert_briefs.briefs(alert, listing)), ["orch-b"])
+        self.assertEqual(list(alert_briefs.briefs(dict(alert, lot=43), listing)),
+                         ["orch-b"])
 
     def test_plan_underused(self):
         briefs = alert_briefs.briefs(PLAN, self.listing, auditor_names=["auditeur"])
@@ -94,7 +146,7 @@ class BriefsTest(unittest.TestCase):
                  "orchestrators": ["orch"], "threshold": 1800.0,
                  "detail": "1 agent au repos. Action : répartir"}
         briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
-        self.assertIn("ameesh work assign", briefs["orch"])
+        self.assertIn("ameesh work assign <lot> <agent> --claim", briefs["orch"])
         self.assertIn("Action : répartir", briefs["auditeur"])
         # #1608 : bloqué -> l'auditeur ne reçoit pas l'ordre d'assigner ;
         # démarrable -> il le reçoit

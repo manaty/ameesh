@@ -44,7 +44,7 @@ import os
 import time
 
 from . import db as db_mod
-from . import fil, registry, storage
+from . import fastmail, fil, registry, storage
 
 #: `mail_undeliverable` : courrier en attente depuis 15 min
 DEFAULT_THRESHOLD_S = 900.0
@@ -584,6 +584,11 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
         # concurrent gagne ici, jamais entre la lecture et la copie.
         raise Refused(str(exc)) from None
     if moved:
+        # #1689 (N1) : les copies sont déposées dans la boîte du nouveau
+        # destinataire sans passer par `mail.send` ; son chemin rapide doit les
+        # voir sans attendre le TTL. Un destinataire d'un autre hôte n'a pas de
+        # marqueur ici : `bump` ne crée rien.
+        fastmail.bump(cfg, new)
         project = fil.project_for(cfg, team_of(new_row), team_of(old_row))
         fil.record(
             cfg, db, sender=actor, recipients=[new],
@@ -664,9 +669,11 @@ def sweep(cfg, db, *, days=None, now=None, dry_run=False, actor="ameesh:mail-swe
 
     * un agent arrêté dont le successeur est connu (`successor` : la session de
       l'arrêté est liée à un agent vivant) : le courrier lui est re-livré
-      (`forward`, tracé au fil), quel que soit son âge ; si le successeur est
-      lui-même arrêté, le renvoi est refusé, noté, et le courrier suit la
-      rétention ci-dessous au lieu d'attendre indéfiniment ;
+      (`forward`, tracé au fil), quel que soit son âge ; #1396/N3 : les
+      successeurs sont essayés dans l'ordre, un premier arrêté ne fait plus
+      expirer le courrier quand un suivant est vivant ; si tous sont arrêtés,
+      chaque refus est noté et le courrier suit la rétention ci-dessous au lieu
+      d'attendre indéfiniment ;
     * sinon, le courrier attendu depuis plus de `days` jours
       (`mail_dead_letter_days`, 0 = aucune expiration) est expiré
       (`mailbox.expire_dead_letters` : remis, `meta.expired`), et le fil porte
@@ -691,43 +698,48 @@ def sweep(cfg, db, *, days=None, now=None, dry_run=False, actor="ameesh:mail-swe
         row = rows.get(name)
         if row is not None and row.get("status") != "stopped":
             continue                  # relancé entre les deux lectures : sa boîte est lue
-        heir = None
+        heirs: list[str] = []
         if row is not None:
             if bindings is None:
                 bindings = _bindings(db)
             heir = successor(db, row, bindings=bindings)
-        if heir:
-            target = heir.split(", ")[0]
+            heirs = [t for t in (heir or "").split(", ") if t]
+        # #1396/N3 : tous les successeurs sont essayés dans l'ordre ; un premier
+        # successeur arrêté ne fait plus expirer le courrier quand un suivant est
+        # vivant. Chaque refus reste au rapport, et le balayage ne s'arrête qu'une
+        # fois le courrier remis (ou tous les successeurs refusés).
+        forwarded = False
+        for target in heirs:
             if dry_run:
                 try:
                     moved = forward(cfg, db, name, target, actor=actor, now=now, dry_run=True)
                 except Refused as exc:
                     report["refused"].append({"old": name, "new": target, "reason": str(exc)})
-                else:
-                    if moved["messages"]:
-                        report["forwarded"].append({
-                            "old": name, "new": target, "count": len(moved["messages"]),
-                            "dry_run": True,
-                            "messages": [int(m["id"]) for m in moved["messages"]]})
-                        continue
-                heir = None
+                    continue
+                count = len(moved["messages"])
+                action = {"old": name, "new": target, "count": count, "dry_run": True,
+                          "messages": [int(m["id"]) for m in moved["messages"]]}
             else:
                 try:
                     moved = forward(cfg, db, name, target, actor=actor, now=now)
                 except Refused as exc:
-                    # successeur lui-même mort : le courrier reste, et suit la
-                    # rétention ci-dessous plutôt que d'attendre indéfiniment
+                    # successeur lui-même mort : on essaie le suivant ; si tous
+                    # refusent, le courrier suit la rétention ci-dessous plutôt
+                    # que d'attendre indéfiniment
                     report["refused"].append({"old": name, "new": target, "reason": str(exc)})
-                    heir = None
-                else:
-                    if moved["forwarded"]:
-                        report["forwarded"].append({
-                            "old": name, "new": target, "count": len(moved["forwarded"]),
-                            "messages": [int(r["original_id"]) for r in moved["forwarded"]],
-                            "senders": sorted({r.get("sender") for r in moved["forwarded"]
-                                               if r.get("sender")})})
-                        continue
-                    heir = None       # rien à renvoyer (déjà remis entre-temps)
+                    continue
+                count = len(moved["forwarded"])
+                action = {"old": name, "new": target, "count": count,
+                          "messages": [int(r["original_id"]) for r in moved["forwarded"]],
+                          "senders": sorted({r.get("sender") for r in moved["forwarded"]
+                                             if r.get("sender")})}
+            if count:
+                report["forwarded"].append(action)
+                forwarded = True
+            # rien à renvoyer (déjà remis entre-temps) : inutile d'essayer les autres
+            break
+        if forwarded:
+            continue
         due = cutoff is not None and group["oldest_ts"] is not None \
             and float(group["oldest_ts"]) <= cutoff
         if not due:

@@ -3957,7 +3957,7 @@
   }
  ],
  "refused": {
-  "interface_total": 412,
+  "interface_total": 420,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4003,10 +4003,14 @@
    "accounts": [
     "hold",
     "holds",
+    "identities",
     "init_active",
+    "placement_state",
+    "publish_identity",
     "release",
     "set_auto",
     "switch",
+    "switch_guarded",
     "switches"
    ],
    "action_source": [
@@ -4217,6 +4221,7 @@
     "pending_recipients_sorted",
     "unread_active",
     "unread_counts",
+    "unread_mid_turn",
     "unread_total",
     "withdraw"
    ],
@@ -4235,6 +4240,7 @@
     "record_balance",
     "request_restart",
     "resume",
+    "set_dormant",
     "set_settings",
     "turns"
    ],
@@ -4349,6 +4355,7 @@
     "measure",
     "measure_candidates",
     "migration_holder",
+    "migration_landed_holder",
     "milestones",
     "open_by_ref",
     "open_for",
@@ -4360,6 +4367,7 @@
     "queue_remove",
     "queue_update",
     "recent_or_cited",
+    "record_landed_migration",
     "record_resolution",
     "reference",
     "refresh_package_parents",
