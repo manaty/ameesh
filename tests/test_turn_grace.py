@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -649,17 +650,33 @@ class SousMoissonneurTest(_Base):
         cwd = os.path.join(self.tmp, "work", "fond-code")
         os.makedirs(cwd, exist_ok=True)
         self.register("fond-code", "claude", cwd=cwd, prompt="lance le travail")
+        fini = os.path.join(self.tmp, "travail-fini")
         proc = self.runner_popen(
             "--agents", "fond-code", "--poll", "1",
-            env=self.env(AMEESH_TEST_BACKGROUND="sleep 4; exit 3",
+            env=self.env(AMEESH_TEST_BACKGROUND=(
+                "while [ ! -e %s ]; do sleep 0.1; done; exit 3" % shlex.quote(fini)),
                          AMEESH_TURN_GRACE_SECONDS="120"))
         try:
-            self.wait_for(lambda: len(self.turns()) >= 1, timeout=30)
-            # fin du travail constatée par le fil `fond`, ressource fermée
-            self.wait_for(lambda: [r["status"] for r in self._ressources("fond-code")][:1]
-                          == ["done"], timeout=40, interval=0.5)
+            tour = self.wait_for(self.turns, timeout=60)[0]["env"]["AMEESH_TURN_ID"]
+
+            def ressource(status):
+                lignes = self.db.query(
+                    "SELECT status, extract(epoch from ended_at)::float8 AS ended_ts"
+                    " FROM turn_resources WHERE turn_id = %s", (tour,))
+                if (lignes and lignes[0]["status"] == status
+                        and lignes[0]["ended_ts"] is not None):
+                    return lignes[0]
+                return None
+
+            # #1917 : le travail reste vivant jusqu'à son inscription en grâce
+            # (running + ended_at), même si la fin du tour prend plus de 4 s.
+            self.wait_for(lambda: ressource("running"), timeout=60, interval=0.5)
+            with open(fini, "w", encoding="utf-8"):
+                pass
+            # Même tour, cette fois réellement fermé par le fil `fond`.
+            self.wait_for(lambda: ressource("done"), timeout=60, interval=0.5)
             mail.send(self.db, "pair", "fond-code", "et ensuite ?")
-            self.wait_for(lambda: len(self.turns()) >= 2, timeout=30)
+            self.wait_for(lambda: len(self.turns()) >= 2, timeout=60)
         finally:
             proc.terminate()
             sortie, _ = proc.communicate(timeout=60)
