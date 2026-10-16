@@ -191,6 +191,8 @@ class PauseTest(PgTestCase):
         worker = object.__new__(AgentWorker)
         threading.Thread.__init__(worker)
         worker.db, worker.name, worker.proc = self.db, "worker", None
+        # #289 (L81) : maybe_rotate lit d'abord l'entretien résident sous le verrou du worker
+        worker.lock, worker.resident = threading.Lock(), None
         worker.rotation_forcee = "forced by restart"
         worker.runner = mock.Mock()
         with mock.patch.object(worker, "_held_by_pressure", return_value=False), \
