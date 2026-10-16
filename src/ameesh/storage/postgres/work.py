@@ -814,13 +814,24 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="", frozen_id=None, packet=None, packet_initial=False) -> dict | None:
+                  source="", frozen_id=None, packet=None, packet_initial=False, lease=None) -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state, app, branch, branch_target, type FROM work_items WHERE id = %s"
                            " AND state NOT IN ('merged', 'promoted', 'closed')"
                            " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
                 return None
+            if lease is not None:
+                key, owner, epoch = lease
+                held = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                                (key,))
+                if not held or (held[0]["owner"], held[0]["epoch"]) != (owner, epoch):
+                    return None
+                # Check after acquiring the row lock: waiting cannot extend
+                # the lease through a transaction-start timestamp.
+                if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                                " AND expires_at > clock_timestamp()", (key,)):
+                    return None
             latest = tx.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
                               " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
             latest_id = latest[0]["id"] if latest else None
@@ -859,9 +870,12 @@ class WorkItems(interface.WorkItems):
                 "   generation = nextval('merge_queue_generation_seq'), landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
                 "   updated_at = now()")
+            # Packet cutoff eligibility starts at insertion, not at an
+            # enclosing transaction's BEGIN before it waited for these locks.
             inserted = tx.query(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
-                " VALUES (%s, %s, %s, %s, %s, %s)"
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id, queued_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, "
+                + ("clock_timestamp()" if packet is not None else "now()") + ")"
                 " ON CONFLICT (work_item_id)" + conflict + " RETURNING work_item_id",
                 (int(item_id), target, frozen_sha, actor or "", source or "", latest_id))
             if not inserted:

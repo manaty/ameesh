@@ -260,6 +260,10 @@ class Engine:
                 state["phase"] = "invalidated"
                 state = self._save(state)
             if state is None or state["phase"] in TERMINAL:
+                enroll = getattr(self.ports, "enroll", None)
+                if callable(enroll):
+                    enroll(epoch)
+                    self._held()
                 rows = self.ports.entries()
                 if self.policy.build_beta:
                     # A late admission belongs to the next packet, even if

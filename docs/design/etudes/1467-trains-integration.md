@@ -270,6 +270,18 @@ restent possibles sans ce bootstrap et les retraits tracés restent refusés.
 Les reports sont nommés par lot et les candidats indépendants poursuivent.
 Aucun statut CI individuel n'est créé et la commande individuelle garde sa porte existante.
 Ce port explicite n'est pas raccordé à un profil actif.
+Le cadrage mesh-design du 16 octobre à 15:33 autorise sa liaison explicite
+dans `Passage.runtime` : `candidate` assemble l'inventaire et l'inscription
+avec les mêmes lecteurs que les admissions. Le moteur l'appelle sous le bail
+cible, seulement avant un nouveau manifeste ; file, journal et reçu sont
+écrits après contrôle transactionnel du même propriétaire et de la même
+époque. Le timestamp SQL à l'INSERT conserve la coupure : aucune inscription
+tardive n'est vieillie pour rejoindre le paquet courant. Sans source
+`initial`, une nouvelle inscription reste inconnue ; les reprises typées
+fonctionnent sur une connexion et un clone reconstruits. Le
+[contrat de sélection](../../../reviews/1467-selection-contract/README.md#raccord-explicite-au-passage)
+décrit les ports et témoins. Aucune source d'histoire initiale, de durée ou de
+CI/événements Nexlink n'est choisie par ce raccord.
 
 Le fournisseur de politique reste obligatoire : il reçoit le lot courant,
 l'admission, la base exacte et le dépôt d'historique. Il doit rendre un

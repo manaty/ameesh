@@ -3,7 +3,7 @@
 
 A candidate is neither a queue generation nor historical review/CI evidence.
 The published branch, exact provenance and policy still need qualification
-before enrollment; no provider or runner hook is installed here.
+before enrollment; no provider or live runner profile is selected here.
 """
 from __future__ import annotations
 
@@ -123,19 +123,19 @@ class Enrollment:
             raise TrainError("explicit initial queue-history qualification reader required")
         self.initial = initial
 
-    def enroll_many(self, candidates, base, *, actor):
+    def enroll_many(self, candidates, base, *, actor, lease=None):
         ids = [row["work_item_id"] for row in candidates]
         if len(ids) != len(set(ids)):
             raise TrainError("ambiguous candidate enrollment batch")
         admitted, deferred = [], []
         for candidate in candidates:
             try:
-                admitted.append(self.enroll(candidate, base, actor=actor))
+                admitted.append(self.enroll(candidate, base, actor=actor, lease=lease))
             except TrainError as exc:
                 deferred.append(dict(work_item_id=candidate["work_item_id"], reason=str(exc)))
         return dict(admitted=admitted, deferred=deferred)
 
-    def enroll(self, candidate, base, *, actor):
+    def enroll(self, candidate, base, *, actor, lease=None):
         prepared = self.preparation.prepare(candidate, base)
         subject = prepared["subject"]
         # Historical queue_remove deleted its row without a typed receipt.
@@ -146,9 +146,9 @@ class Enrollment:
         row = self.preparation.ops.queue_add(subject["work_item_id"], target=subject["target"],
             frozen_sha=subject["frozen_sha"], frozen_id=subject["frozen_id"], source=subject["source"],
             packet=prepared["item"], packet_initial=initial is True,
-            actor=actor, note="packet enrollment; complete packet CI remains due")
+            actor=actor, note="packet enrollment; complete packet CI remains due", lease=lease)
         if row is None:
-            raise TrainError("packet enrollment #%s refused: subject, freeze or queue changed/withdrawn, "
+            raise TrainError("packet enrollment #%s refused: reservation lost, subject, freeze or queue changed/withdrawn, "
                              "or queue-history-unknown" %
                              subject["work_item_id"])
         self.preparation.repository.check_members(subject["target"], [row])

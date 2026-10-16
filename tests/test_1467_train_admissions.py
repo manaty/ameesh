@@ -385,6 +385,29 @@ class PacketAllocationTest(PgTestCase):
     def allocate(self, ops=None, **changes):
         return (ops or self.ops).queue_add(self.item, **dict(self.arguments, **changes))
 
+    def test_packet_timestamp_uses_insertion_time_inside_an_existing_transaction(self):
+        with self.db.transaction() as tx:
+            cutoff = tx.query("SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+            row = self.allocate(storage.of(tx).work)
+        self.assertGreaterEqual(row["queued_ts"], cutoff)
+
+    def test_packet_allocation_and_replay_refuse_a_lost_or_expired_lease(self):
+        key, owner = "fixture:main", "train:fixture"
+        epoch = self.ops.land_lock(key, owner, 1800)
+        before = work.events(self.db, self.item)
+        for lease in ((key, "other", epoch), (key, owner, epoch + 1), ("missing", owner, epoch)):
+            with self.subTest(lease=lease):
+                self.assertIsNone(self.allocate(lease=lease))
+        self.assertEqual(work.events(self.db, self.item), before)
+        self.assertEqual(self.ops.queue(None), [])
+        row = self.allocate(lease=(key, owner, epoch))
+        before = work.events(self.db, self.item)
+        self.db.execute("UPDATE merge_locks SET expires_at = clock_timestamp() - interval '1 second'"
+                        " WHERE target = %s", (key,))
+        self.assertIsNone(self.allocate(lease=(key, owner, epoch)))
+        self.assertEqual(self.ops.queue(None), [row])
+        self.assertEqual(work.events(self.db, self.item), before)
+
     def test_restart_reuses_exact_generation_without_new_event_or_sequence_allocation(self):
         row = self.allocate()
         before = work.events(self.db, self.item)

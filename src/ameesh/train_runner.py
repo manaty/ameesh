@@ -15,18 +15,22 @@ import time
 from dataclasses import asdict, replace
 
 from . import (merge_queue, radar, resolutions, train, train_admissions,
-               train_ci, train_fire, train_git, train_history, train_policy,
+               train_candidates, train_ci, train_fire, train_git, train_history, train_policy,
                train_runtime, train_store)
 
 
 class Passage:
     def __init__(self, cfg, project, *, owner, policy, policy_path,
                  policy_commit, workflows, provider, mechanics, notify, impact=None,
-                 reservation=None, transports=None):
+                 reservation=None, transports=None, candidate=None, initial=None):
         if not isinstance(owner, str) or not owner.strip():
             raise train.TrainError("explicit runner reservation owner required")
         if not isinstance(policy, train.Policy) or not callable(notify):
             raise train.TrainError("explicit train policy and diagnostic callback required")
+        if candidate is not None and not callable(candidate):
+            raise train.TrainError("explicit freeze_candidate reader required")
+        if initial is not None and (candidate is None or not callable(initial)):
+            raise train.TrainError("initial queue history requires an explicit candidate reader")
         self.cfg, self.project, self.owner = cfg, project, owner
         self.policy, self.policy_path, self.policy_commit = policy, policy_path, policy_commit
         self.workflows, self.provider, self.notify = workflows, provider, notify
@@ -34,6 +38,7 @@ class Passage:
         self.impact = impact
         self.reservation = reservation
         self.transports = transports
+        self.candidate, self.initial = candidate, initial
         self.maintenance_at = None
         self.epoch = None
 
@@ -115,9 +120,15 @@ class Passage:
         authority = fires(self.cfg, ledger) if rules.merge_named_fire else fires(ledger, rules)
         history = train_history.Recorded(db, clone.path, provider=self.provider, review_rules=rules)
         admissions = train_admissions.Admissions(db, self.project, history, policy=requirement)
+        inventory = enrollment = None
+        if self.candidate is not None:
+            inventory = train_candidates.Inventory(db, self.project, candidate=self.candidate)
+            preparation = train_candidates.Preparation(db, self.project,
+                repository=repository, history=history, policy=requirement)
+            enrollment = train_candidates.Enrollment(preparation, admissions, initial=self.initial)
         return train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
             fires=authority, admissions=admissions,
-            target=target, policy=policy, notify=self.notify)
+            target=target, policy=policy, notify=self.notify, inventory=inventory, enrollment=enrollment)
 
     def step(self, db, now):
         """One bounded event/pass; never wait for CI and never retain ``db``."""
@@ -142,7 +153,10 @@ class Passage:
                               target=runtime.target_branch, policy=runtime.policy)
         engine.epoch = self.epoch
         try:
-            return engine.step(now)
+            result = engine.step(now)
+            if runtime.enrollment_result is not None:
+                result["enrollment"] = runtime.enrollment_result
+            return result
         finally:
             self.epoch = engine.epoch
             self.maintenance_at = (runtime.ledger.next_maintenance()

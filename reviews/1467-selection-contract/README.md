@@ -236,12 +236,59 @@ manifeste, puis promeut le commit exact de la CI complète.
 
 Git et SQL sont réels ; candidat, provenance, calendrier, qualification
 initiale du schéma jetable, CI et autorité restent des fixtures explicites.
-Le témoin appelle lui-même l'inscription : `Passage` ne réalise pas encore
-cet inventaire ni cette inscription. Le futur raccord actif devra conserver
-l'horodatage réel et traiter les admissions après coupure au créneau suivant,
-sans vieillir artificiellement une génération pour l'inclure dans un paquet.
+Ce premier témoin appelle lui-même l'inscription. Le raccord explicite décrit
+ci-dessous prépare maintenant son appel par `Passage`, sans profil actif.
 Ce témoin ciblé passe avec psycopg (53,3 s) et psql (105,3 s), sous
 `ameesh heavy`, sans rejeu de suite ni CI distante.
+
+### Raccord explicite au passage
+
+Source : **mesh-design, 16 octobre 2026 à 15:33**, autorise la préparation
+du raccord `Inventory`/`Enrollment` vers `Passage.runtime`, en conservant
+`queued_ts`, la coupure et la réservation cible. Aucun nouveau fait ne
+qualifie l'histoire initiale, une échéance absolue ou les suites/événements
+Nexlink.
+
+`Passage(..., candidate=qualified_plan_git.freeze_candidate,
+initial=qualified_initial_queue_history)` lie l'inventaire, la préparation
+et l'inscription à la même connexion, au même clone privé, au même lecteur
+historique et à la même politique compilée que les admissions du runtime.
+Sans lecteur `candidate`, le moteur autonome conserve le parcours des
+générations déjà en file ; aucun fournisseur n'est choisi par défaut.
+Sans lecteur `initial`, une inscription nouvelle reste `queue-history-unknown`,
+et la reprise d'une allocation typée existante demeure possible.
+
+Le moteur appelle ce raccord seulement après acquisition du bail cible et
+avant sélection d'un nouveau manifeste. Un autre titulaire, une pause ou un
+manifeste en cours empêchent cet appel. Le raccord transmet le triplet exact
+`(key, owner, epoch)` à `queue_add` : après le verrou du lot, la transaction
+verrouille la ligne du bail, compare propriétaire/époque et relit son échéance
+avec `clock_timestamp()`, avant allocation ou reprise. Une réservation perdue
+pendant la qualification ne peut donc écrire file, journal ou reçu.
+
+L'horodatage packet est pris par `clock_timestamp()` à l'INSERT, même dans
+une transaction englobante : son début ne vieillit pas l'admission. Le filtre
+de coupure reste ensuite celui du moteur. Une nouvelle génération inscrite
+après la coupure attend le prochain créneau, sans remplacement de son
+horodatage. Le résultat du passage expose `enrollment.admitted/deferred` ;
+les refus par lot sont aussi remis au callback de diagnostic. Les candidats
+indépendants et les admissions déjà en file conservent leurs contrôles.
+
+Les témoins du raccord couvrent : inscription réelle puis reprise au créneau
+suivant sur une connexion/clone reconstruits, manifeste actif inchangé,
+absence d'histoire initiale nommée sans écriture, concurrent refusé avant
+lecture de candidature, et changement d'époque sur une seconde connexion
+entre qualification et allocation. Deux témoins SQL vérifient séparément
+le refus des baux absents/erronés/expirés et l'horodatage dans une transaction
+englobante. Ces bancs gardent candidat, provenance, calendrier, histoire
+initiale du schéma jetable et CI comme fixtures explicites.
+Validation : 51 contrôles ciblés psycopg (16 allocation, 4 raccord, 12 service,
+19 contrat médié), puis 43 psql (16 allocation, 8 passages nouveaux/existants,
+19 moteur). Le seul nouveau parcours de coupure/reprise a ensuite été
+revérifié avec les deux pilotes après suppression de l'hypothèse de date
+fixe : 19,0 s et 28,2 s. Les coupures de ce témoin sont ancrées aux faits
+SQL observés, sans attente d'horloge ni date courante supposée. Exécutions
+sous `ameesh heavy`, aucune suite générale ou CI distante.
 
 ## Port de transport qualifié
 

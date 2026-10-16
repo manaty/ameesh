@@ -1160,7 +1160,8 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
                   actor: str, source: str = "", frozen_id: int | None = None,
-                  packet: dict | None = None, packet_initial: bool = False) -> dict | None:
+                  packet: dict | None = None, packet_initial: bool = False,
+                  lease: tuple | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
@@ -1174,7 +1175,9 @@ class WorkItems(Domain):
         paths do not isolate receipts from a trusted role's arbitrary SQL.
         A first insertion also needs `packet_initial=True` from the caller's qualified history
         provider: absence of a queue row cannot prove never-withdrawn for
-        historical lots. It cannot override a recorded withdrawal."""
+        historical lots. It cannot override a recorded withdrawal.
+        `lease` (#1467): optional `(target key, owner, epoch)`, locked after
+        the lot and checked live before allocation/replay, in this transaction."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,

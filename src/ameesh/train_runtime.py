@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Explicit #1467 ports, without an executor hook or enabled configuration.
+"""Explicit #1467 ports, without an enabled executor configuration.
 
 Admissions is a mandatory trusted provider: complete current queue facts,
 dependencies, historical review proofs and quarantine under the target lease.
@@ -13,7 +13,7 @@ from .train import TrainError, digest, identity, ordered
 
 class Runtime:
     def __init__(self, *, ledger, repository, ci, fires, admissions, target,
-                 policy, notify):
+                 policy, notify, inventory=None, enrollment=None):
         target = merge_queue._remote_branch(target)
         if ledger.key != land.lock_key(repository.project, target) or fires.ledger is not ledger:
             raise TrainError("runtime adapters must share the exact target reservation")
@@ -21,9 +21,29 @@ class Runtime:
             raise TrainError("trusted historical admission provider required")
         if ci.slug != radar.github_slug(repository.project):
             raise TrainError("CI contract must name the runtime repository")
+        if (inventory is None) != (enrollment is None):
+            raise TrainError("candidate inventory and enrollment must be supplied together")
+        if enrollment is not None and (enrollment.admissions is not admissions
+                or enrollment.preparation.repository is not repository
+                or inventory.project is not repository.project):
+            raise TrainError("candidate intake must share the runtime's exact qualification ports")
         self.ledger, self.repository, self.ci_adapter = ledger, repository, ci
         self.fires, self.admissions = fires, admissions
         self.target_branch, self.policy, self.notify = target, policy, notify
+        self.inventory, self.enrollment = inventory, enrollment
+        self.enrollment_result = None
+
+    def enroll(self, epoch):
+        """Intake only before a new manifest, under its target reservation."""
+        if self.enrollment is None:
+            return
+        self._held(epoch)
+        candidates = self.inventory.read()["candidates"]
+        self.enrollment_result = self.enrollment.enroll_many(candidates, self.target(),
+            actor=self.ledger.owner, lease=(self.ledger.key, self.ledger.owner, epoch))
+        self._held(epoch)
+        if self.enrollment_result["deferred"]:
+            self.notify("candidate enrollment deferred", self.enrollment_result)
 
     def acquire(self, epoch):
         return self.ledger.acquire(epoch)

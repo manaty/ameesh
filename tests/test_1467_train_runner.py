@@ -162,6 +162,106 @@ class TrainRunnerTest(PgTestCase):
         self.assertFalse(os.path.exists(self.cfg.state_dir))
         self.assertEqual(self.api_calls, [])
 
+    def packet_intake(self):
+        original = self.ops.queue(None)[0]
+        item_id = original["work_item_id"]
+        self.db.execute("DELETE FROM merge_queue WHERE work_item_id = %s", (item_id,))
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (item_id,))
+        freeze = next(mark for mark in self.ops.milestones(item_id, None)
+                      if mark["id"] == original["frozen_id"])
+        # Explicit #1756 boundary fixture; its real object has a separate probe.
+        reader = mock.Mock(return_value=dict(sha=self.head, origin="frozen", declared=freeze, causes=[]))
+        return original, reader
+
+    def test_passage_intake_replays_real_generation_at_next_cutoff_then_keeps_active_manifest(self):
+        original, reader = self.packet_intake()
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        # Observe the cutoff before allocation rather than assuming today's
+        # SQL time falls after the fixture's historical calendar date.
+        slot = self.db.query("SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        rules.last_packet = lambda now: slot
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage(candidate=reader, initial=lambda db, **context: True)
+        result = passage.step(self.db, slot)
+        self.assertEqual(result["result"], "idle", result)
+        entry = result["enrollment"]["admitted"][0]["entry"]
+        self.assertGreater(entry["generation"], original["generation"])
+        self.assertEqual(result["enrollment"]["deferred"], [])
+        self.assertEqual(self.api_calls, [])
+        self.assertIsNone(self.ops.train_read(self.key))
+        slot = entry["queued_ts"] - 1
+        rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
+        shutil.rmtree(passage.repository_path())
+        other_db = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other_db.close)
+        restarted = self.passage(candidate=reader)  # No initial-history fixture on replay.
+        result = restarted.step(other_db, slot + 1)
+        self.assertEqual(result["result"], "idle", result)
+        self.assertEqual(result["enrollment"]["admitted"][0]["entry"], entry)
+        result = restarted.step(other_db, slot + 3600)
+        self.assertEqual(result["result"], "ci", result)
+        plan = result["plan"]
+        self.assertEqual([train.identity(row) for row in plan["members"]], [train.identity(entry)])
+        self.assertEqual(self.git(self.origin, "rev-parse", plan["branch"]), plan["head"])
+        reader.reset_mock()
+        result = restarted.step(other_db, slot + 3601)
+        self.assertEqual(result["result"], "awaiting-fire", result)
+        self.assertNotIn("enrollment", result)
+        reader.assert_not_called()
+        self.assertEqual(train.digest(self.ops.train_read(self.key)["plan"]), train.digest(plan))
+        self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+        self.assertEqual(self.ops.queue(None)[0]["generation"], entry["generation"])
+        self.assertEqual(self.notices, [])
+
+    def test_passage_intake_without_initial_history_names_the_refusal_without_allocation(self):
+        original, reader = self.packet_intake()
+        before = work.events(self.db, original["work_item_id"])
+        result = self.passage(candidate=reader).step(self.db, self.now)
+        self.assertEqual(result["result"], "idle", result)
+        self.assertEqual(result["enrollment"]["admitted"], [])
+        refused = result["enrollment"]["deferred"]
+        self.assertEqual([row["work_item_id"] for row in refused], [original["work_item_id"]])
+        self.assertIn("queue-history-unknown", refused[0]["reason"])
+        self.assertEqual(self.ops.queue(None), [])
+        self.assertEqual(work.events(self.db, original["work_item_id"]), before)
+        self.assertEqual(self.api_calls, [])
+        self.assertEqual(self.notices, ["candidate enrollment deferred"])
+
+    def test_competing_passage_cannot_read_candidates_or_allocate_without_target_reservation(self):
+        _, reader = self.packet_intake()
+        runtime = self.passage().runtime(self.db)
+        epoch = runtime.acquire(None)
+        self.addCleanup(runtime.release, epoch)
+        passage = self.passage(owner="competing", candidate=reader,
+                               initial=lambda db, **context: True)
+        self.assertEqual(passage.step(self.db, self.now), {"result": "busy"})
+        reader.assert_not_called()
+        self.assertEqual(self.ops.queue(None), [])
+        self.assertFalse(os.path.exists(passage.repository_path()))
+        self.assertEqual(self.api_calls, [])
+
+    def test_passage_intake_refuses_epoch_lost_after_qualification_before_allocation(self):
+        original, reader = self.packet_intake()
+        before = work.events(self.db, original["work_item_id"])
+        other_db = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other_db.close)
+
+        def initial(db, **context):
+            other_db.execute("UPDATE merge_locks SET owner = 'other', epoch = epoch + 1"
+                             " WHERE target = %s", (self.key,))
+            return True
+
+        result = self.passage(candidate=reader, initial=initial).step(self.db, self.now)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertIn("reservation lost", result["error"])
+        self.assertEqual(result["enrollment"]["admitted"], [])
+        self.assertEqual(self.ops.queue(None), [])
+        self.assertEqual(work.events(self.db, original["work_item_id"]), before)
+        self.assertEqual(self.db.query("SELECT * FROM integration_train_queue_receipts"), [])
+        self.assertIsNone(self.ops.train_read(self.key))
+        self.assertEqual(self.api_calls, [])
+
     def test_new_clone_reads_real_history_then_lands_exact_ci_head_across_connections(self):
         passage = self.passage()
         result = passage.step(self.db, self.now)
