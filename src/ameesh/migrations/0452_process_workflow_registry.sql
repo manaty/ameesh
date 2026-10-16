@@ -65,22 +65,27 @@ end $$;
 -- premier niveau, objet imbriqué, feuille), et n'accepte que la forme pleine.
 do $$
 begin
-    if not exists (select 1 from pg_constraint
-                    where conrelid = 'work_item_events'::regclass
-                      and conname = 'work_item_events_receipt_complete') then
-        alter table work_item_events add constraint work_item_events_receipt_complete
-            check (command_id is null
-                   or (workflow_stage is not null
-                       and workflow_version is not null
-                       and evidence is not null
-                       and jsonb_typeof(evidence) = 'object'
-                       and evidence->>'schema' = 'process-receipt/1'
-                       and jsonb_typeof(evidence->'intent') = 'object'
-                       and evidence->'intent'->>'sha256' ~ '^[0-9a-f]{64}$'
-                       and jsonb_typeof(evidence->'command') = 'object'
-                       and evidence->'command'->>'action' in
-                           ('advance', 'hold', 'release', 'transfer')
-                       and jsonb_typeof(evidence->'authority') = 'object'
-                       and jsonb_typeof(evidence->'verification') = 'object') is true);
-    end if;
+    -- N11 (relecture Claude) : un simple `if not exists` laisserait l'ANCIENNE
+    -- définition (sans `IS TRUE`) sur une base de banc qui a déjà appliqué la
+    -- 0452 d'avant le durcissement. On repart donc de la définition courante :
+    -- suppression si présente, puis ajout. Aucune donnée n'est perdue ; un
+    -- reçu écrit sous l'ancienne règle laxiste et invalide sous la nouvelle
+    -- fait échouer l'ajout — voulu : le contrat a changé, la ligne doit être
+    -- corrigée. Les lignes d'historique (command_id NULL) restent valides.
+    alter table work_item_events
+        drop constraint if exists work_item_events_receipt_complete;
+    alter table work_item_events add constraint work_item_events_receipt_complete
+        check (command_id is null
+               or (workflow_stage is not null
+                   and workflow_version is not null
+                   and evidence is not null
+                   and jsonb_typeof(evidence) = 'object'
+                   and evidence->>'schema' = 'process-receipt/1'
+                   and jsonb_typeof(evidence->'intent') = 'object'
+                   and evidence->'intent'->>'sha256' ~ '^[0-9a-f]{64}$'
+                   and jsonb_typeof(evidence->'command') = 'object'
+                   and evidence->'command'->>'action' in
+                       ('advance', 'hold', 'release', 'transfer')
+                   and jsonb_typeof(evidence->'authority') = 'object'
+                   and jsonb_typeof(evidence->'verification') = 'object') is true);
 end $$;

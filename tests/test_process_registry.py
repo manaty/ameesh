@@ -32,7 +32,9 @@ vérificateurs par le seam documenté.
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
+import os
 import threading
 import unittest
 import uuid
@@ -43,7 +45,7 @@ from ameesh import storage
 from ameesh import work
 from ameesh.db import DbError
 
-from .support import PgTestCase
+from .support import REPO, PgTestCase
 
 try:  # tranche A (#1918), pas encore fusionnée au moment d'écrire ces tests
     from ameesh import process_workflow as pw
@@ -1007,6 +1009,30 @@ class RegistryTest(PgTestCase):
                     insert(evidence)
         self.assertEqual(len(self.events(lot)), 1)
 
+    def test_migration_reappliquee_reinstalle_la_contrainte_durcie(self):
+        """N11 (relecture Claude) : une base de banc qui avait appliqué la 0452
+        d'avant le durcissement gardait l'ancien CHECK laxiste ; la
+        réapplication du fichier repart de la définition courante
+        (`drop constraint` + `add`)."""
+        lot = self.pinned()
+        self.db.execute("ALTER TABLE work_item_events"
+                        " DROP CONSTRAINT work_item_events_receipt_complete")
+        self.db.execute(
+            "ALTER TABLE work_item_events ADD CONSTRAINT"
+            " work_item_events_receipt_complete CHECK (command_id is null"
+            "  or evidence->>'schema' = 'process-receipt/1')")
+        [path] = glob.glob(os.path.join(REPO, "src", "ameesh", "migrations",
+                                        "0452_*.sql"))
+        with open(path, encoding="utf-8") as fh:
+            self.db.script(fh.read())
+        with self.assertRaises(DbError):
+            self.db.execute(
+                "INSERT INTO work_item_events (work_item_id, state, command_id,"
+                "  workflow_stage, workflow_version, evidence)"
+                " VALUES (%s, 'build', %s::uuid, 'implementation', %s, '{}'::jsonb)",
+                (lot, str(uuid.uuid4()), ACME_VERSION))
+        self.assertEqual(self.events(lot), [])
+
     def test_migration_etape_sans_reference_refusee(self):
         with self.assertRaises(DbError):
             self.db.execute(
@@ -1078,6 +1104,24 @@ class RegistryTest(PgTestCase):
         self.assertEqual(refused["result"], "refused")
         self.assertIn("process_registry", refused["detail"])
         self.assertEqual(self.row(lot)["state"], "build")
+        self.assertEqual(self.events(lot), [])
+
+    def test_les_ecritures_legacy_filtrent_le_lot_pinne_dans_le_sql(self):
+        """N8 (relecture Claude) : la garde applicative lit `workflow_ref` hors
+        du verrou du lot ; entre cette lecture et l'UPDATE, une adoption
+        concurrente (qui garde l'état) laissait passer le move legacy. Le
+        filtre est dans le SQL : la couche de stockage ne touche plus un lot
+        pinné, même appelée avec l'instantané d'avant l'adoption."""
+        lot = self.pinned(stage="review", state="qa")
+        store = storage.of(self.db).work
+        self.assertIsNone(store.move(lot, "build", current="qa", loops=1,
+                                     note="n", actor="test"))
+        self.assertIsNone(store.close(
+            lot, current="qa", reason="abandoned", superseded_by=None,
+            sha="", actor="test", note="n"))
+        self.assertIsNone(store.close_merged(
+            lot, current="qa", sha="a" * 40, actor="test", note="n", pr_ref=None))
+        self.assertEqual(self.row(lot)["state"], "qa")
         self.assertEqual(self.events(lot), [])
 
     def test_read_sources_ne_declare_que_le_reel(self):

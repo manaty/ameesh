@@ -18,7 +18,8 @@ import time
 from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
-from .work_dependencies import _DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK
+from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
+                                _UNPINNED)
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -387,7 +388,10 @@ class WorkItems(interface.WorkItems):
         d'écrit), puis journalise la transition. `held` (L233) : et si une
         demande de décision ouverte le tient — vérifiée dans la même
         instruction, la demande verrouillée (voir l'interface). Un passage
-        vers un état terminal libère la réservation de migration (#956)."""
+        vers un état terminal libère la réservation de migration (#956).
+        Un lot pinné sur une révision Process (`workflow_ref`) n'est jamais
+        déplacé ici : la garde est aussi dans le SQL, pour la course entre la
+        lecture de l'appelant et l'adoption concurrente (#1922/N8)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
         sql = """
             UPDATE work_items
@@ -397,9 +401,10 @@ class WorkItems(interface.WorkItems):
                    closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
                    started_at = CASE WHEN %s IN ('build', 'qa')
                                      THEN coalesce(started_at, now()) ELSE started_at END
-             WHERE id = %s AND state = %s __HELD__
+             WHERE id = %s AND state = %s AND __UNPINNED__ __HELD__
             RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", item_columns(self.db)).replace("__HELD__", _HELD if held else "")
+            """.replace("__COLUMNS__", item_columns(self.db)).replace(
+                "__UNPINNED__", _UNPINNED).replace("__HELD__", _HELD if held else "")
         params = ((state, loops, state, state, int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
         if state not in ("merged", "promoted", "closed"):
@@ -1336,11 +1341,14 @@ class WorkItems(interface.WorkItems):
         la transaction qui porte aussi le réveil des dépendants (L385 suite),
         et un `UPDATE` suivi d'un `None` n'était annulé que par SA transaction
         — sous une transaction englobante, la ligne serait restée modifiée.
+        Un lot pinné sur une révision Process n'est jamais fermé ici : le
+        filtre est dans le SQL (#1922/N8).
         """
         number, repo = landed if landed else (None, None)
         with self.db.transaction() as tx:
             locked = tx.query(
-                "SELECT id FROM work_items WHERE id = %s AND state = %s FOR UPDATE",
+                "SELECT id FROM work_items WHERE id = %s AND state = %s AND "
+                + _UNPINNED + " FOR UPDATE",
                 (int(item_id), current))
             if not locked:
                 return None
@@ -1358,9 +1366,10 @@ class WorkItems(interface.WorkItems):
                        pr_ref = coalesce(%s, pr_ref),
                        migration_landed = coalesce(%s, migration_landed),
                        migration_landed_repo = coalesce(%s, migration_landed_repo)
-                 WHERE id = %s AND state = %s
+                 WHERE id = %s AND state = %s AND __UNPINNED__
                 RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", item_columns(self.db)),
+                """.replace("__COLUMNS__", item_columns(self.db)).replace(
+                    "__UNPINNED__", _UNPINNED),
                 (pr_ref, number, repo, int(item_id), current))
             if not rows:
                 return None
@@ -1376,16 +1385,18 @@ class WorkItems(interface.WorkItems):
         """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
         si le lot y est encore ; journal et jalon `closed` dans la même
         transaction. `delivered` (#988) écrit en plus le jalon `delivered`, qui
-        porte le `sha` de la tête relue."""
+        porte le `sha` de la tête relue. Un lot pinné sur une révision Process
+        n'est jamais fermé ici : le filtre est dans le SQL (#1922/N8)."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
                 UPDATE work_items
                    SET state = 'closed', close_reason = %s, superseded_by = %s,
                        updated_at = now(), closed_at = now()
-                 WHERE id = %s AND state = %s
+                 WHERE id = %s AND state = %s AND __UNPINNED__
                 RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", item_columns(self.db)),
+                """.replace("__COLUMNS__", item_columns(self.db)).replace(
+                    "__UNPINNED__", _UNPINNED),
                 (reason, superseded_by, int(item_id), current))
             if not rows:
                 return None

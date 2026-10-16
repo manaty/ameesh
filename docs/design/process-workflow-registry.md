@@ -123,7 +123,12 @@ sources = pr.read_sources(context)                # collections réelles, dans l
    traverse pas (`held`) : seule une `release` vérifiée en sort.
 7. Un lot pinné (`workflow_ref` non NULL) n'est écrit que par ce module :
    `work.move`, `work.close` et `work.close_merged` le refusent — le constat de
-   fusion seul ne pose pas `merged`.
+   fusion seul ne pose pas `merged`. Le filtre est aussi **dans le SQL** de ces
+   écritures historiques (et de la réouverture `release_unassigned` de #1668) :
+   une adoption concurrente, qui garde l'état, ne laisse plus passer un move
+   legacy entre la lecture et l'UPDATE, et une retenue `blocked` du registre ne
+   tombe pas à la fermeture d'un prérequis (elle n'est levée que par une
+   commande `release` vérifiée).
 8. Ordre des verrous : `agent_mailbox` (demandes de décision ouvertes du lot)
    **avant** `work_items`, comme la réponse du propriétaire
    (`decisions.answer` ferme la demande, puis déplace le lot) : pas
@@ -132,7 +137,7 @@ sources = pr.read_sources(context)                # collections réelles, dans l
 
 ## Preuves
 
-`tests/test_process_registry.py` (59 cas, deux pilotes) : rejeu après
+`tests/test_process_registry.py` (61 cas, deux pilotes) : rejeu après
 connexion fraîche, même clé concurrente, deux commandes à la même version,
 conflit de charge, acteur inconnu/arrêté/`dead`, bail d'un autre runner, époque
 périmée, bail échu, course avec révocation (verrou `FOR SHARE` tenu), retenues
@@ -141,11 +146,17 @@ d'un booléen, avance depuis une retenue refusée, réponse avant reprise,
 réponse concurrente sans interblocage), terminal jamais rouvert (y compris par
 adoption), adoption sans régression de cœur, transfert/rejeu/régression,
 API publique sans injection de vérificateurs, `work.move`/`close`/`close_merged`
-refusés sur un lot pinné, `read_sources` fail-closed, annulation par trigger,
-historique intact, contraintes de la migration (`IS TRUE`). Un cas de **seam
+refusés sur un lot pinné (y compris la couche de stockage appelée avec
+l'instantané d'avant l'adoption : le filtre `workflow_ref` est dans le SQL),
+`read_sources` fail-closed, annulation par trigger,
+historique intact, contraintes de la migration (`IS TRUE`, y compris la
+réapplication du fichier qui réinstalle la définition durcie). Un cas de **seam
 réel avec la tranche C** (`process_verifiers.install_verifiers` sur le registre
 public : avance gardée `planning`, retenue, reprise, `waiting_human` par
 `read_sources`) tourne dès que C est présent, sinon il est sauté — C n'est pas
-encore dans `main`. Le module est
+encore dans `main`. `tests/test_l385_work_dependencies.py` garde la réouverture
+#1668 : un dépendant pinné, retenu `blocked`, non assigné, n'est pas rouvert à
+la fermeture de son dernier prérequis (B4) — sa retenue ne tombe que par une
+`release` vérifiée. Le module est
 déclaré dans `tests/parts/pilote-psql.txt` (transaction, verrous, concurrence :
 comportement des deux pilotes).
