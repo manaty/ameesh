@@ -42,9 +42,18 @@ def _rows(runtime, args):
 
 
 def _buildx_available(runtime):
-    """Whether the docker CLI exposes the buildx plugin (client-side probe)."""
+    """Return False only when the CLI explicitly reports buildx is absent."""
     result = _run(runtime, ['buildx', 'version'])
-    return result is not None and result.returncode == 0
+    if result is None:
+        return None
+    if result.returncode == 0:
+        return True
+    message = ('%s\n%s' % (getattr(result, 'stdout', '') or '',
+                            getattr(result, 'stderr', '') or '')).lower()
+    if 'buildx' in message and ('unknown command' in message
+                               or 'is not a docker command' in message):
+        return False
+    return None
 
 
 def collect(runtime, *, now=None) -> dict | None:
@@ -77,10 +86,10 @@ def collect(runtime, *, now=None) -> dict | None:
     if cache is None:
         # Debian docker.io ships no buildx plugin (agents-1/2): the cache is
         # not measurable here, a durable fact rather than a failed measure.
-        if _buildx_available(runtime):
-            out['errors'].append('default builder cache inventory unavailable')
-        else:
+        if _buildx_available(runtime) is False:
             out['build_cache_unsupported'] = True
+        else:
+            out['errors'].append('default builder cache inventory unavailable')
     else:
         try:
             total = reclaimable = 0

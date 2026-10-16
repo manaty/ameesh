@@ -9,12 +9,12 @@ from ameesh import containers, docker_storage as D, exploitation, menage
 
 
 class DockerStorageTest(unittest.TestCase):
-    def runtime(self, volumes=(), cache=(), cache_rc=0, buildx_rc=0):
+    def runtime(self, volumes=(), cache=(), cache_rc=0, buildx_rc=0, buildx_error=""):
         calls = []
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
             if argv[1:3] == ['buildx', 'version']:
-                return SimpleNamespace(returncode=buildx_rc, stdout='', stderr='')
+                return SimpleNamespace(returncode=buildx_rc, stdout='', stderr=buildx_error)
             rows = volumes if argv[1] == 'volume' else cache
             return SimpleNamespace(returncode=cache_rc if argv[1] == 'buildx' else 0,
                                    stdout='\n'.join(json.dumps(r) for r in rows))
@@ -55,7 +55,8 @@ class DockerStorageTest(unittest.TestCase):
 
     def test_missing_buildx_is_unsupported_not_a_permanent_error(self):
         runtime, calls = self.runtime([{'Name': 'v', 'Labels': ''}],
-                                      cache_rc=1, buildx_rc=1)
+                                      cache_rc=1, buildx_rc=1,
+                                      buildx_error="docker: unknown command: docker buildx")
         data = D.collect(runtime, now=1000)
         self.assertIsNone(data['build_cache_bytes'])
         self.assertEqual(data['errors'], [])
@@ -71,6 +72,33 @@ class DockerStorageTest(unittest.TestCase):
         self.assertEqual(data['errors'], ['default builder cache inventory unavailable'])
         self.assertEqual([a['type'] for a in D.findings(data, menage.Policy(), 'pc', 1000)],
                          ['docker_storage_unavailable'])
+
+    def test_buildx_probe_failure_does_not_claim_plugin_absent(self):
+        for mode in ('timeout', 'oserror', 'generic', 'broken'):
+            with self.subTest(mode=mode):
+                runtime, _ = self.runtime(cache_rc=1, buildx_rc=1,
+                                          buildx_error='plugin crashed')
+                original = runtime.run
+
+                def run(argv, **kwargs):
+                    if argv[1:3] == ['buildx', 'version']:
+                        if mode == 'timeout':
+                            raise subprocess.TimeoutExpired(argv, 4)
+                        if mode == 'oserror':
+                            raise OSError('unavailable')
+                        if mode == 'broken':
+                            return SimpleNamespace(returncode=1, stdout='',
+                                stderr='failed to fetch metadata: docker-buildx: permission denied')
+                    return original(argv, **kwargs)
+
+                runtime.run = run
+                data = D.collect(runtime, now=1000)
+                self.assertFalse(data['build_cache_unsupported'])
+                self.assertIsNone(data['build_cache_bytes'])
+                self.assertEqual(data['errors'],
+                                 ['default builder cache inventory unavailable'])
+                self.assertEqual([a['type'] for a in D.findings(
+                    data, menage.Policy(), 'pc', 1000)], ['docker_storage_unavailable'])
 
     def test_malformed_cache_never_becomes_zero(self):
         for row in ({'Size': '-1', 'Reclaimable': True, 'Shared': False},
