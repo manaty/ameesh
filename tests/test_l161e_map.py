@@ -9,6 +9,7 @@ chaque processus ; `tests/support.py` relève les tables par classe ;
 """
 from __future__ import annotations
 
+import ast
 import datetime
 import gzip
 import importlib.util
@@ -20,7 +21,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
+
+from unittest import mock
 
 from tests import support
 
@@ -290,6 +294,10 @@ def _coverage_disponible() -> bool:
     return True
 
 
+#: #1690 : même sonde, gardée sous son nom d'origine pour ses témoins.
+_coverage_installe = _coverage_disponible
+
+
 class CouvertureTronqueeTest(unittest.TestCase):
     """#1257 : une couverture tronquée (processus tué pendant l'écriture de sa
     donnée) ne fait plus échouer la fusion de la carte ; elle est ignorée et
@@ -521,6 +529,149 @@ class CouvertureTronqueeTest(unittest.TestCase):
                    for info in blocs.values() for m in info["modules"]}
         self.assertIn("test_l2", modules)
         self.assertNotIn("test_l1", modules)  # aucune ligne partielle versée
+class _FauxCoverageException(Exception):
+    pass
+
+
+class _FauxDataError(_FauxCoverageException):
+    pass
+
+
+class _FauxCoverageData:
+    """CoverageData minimal : `.coverage.coupee` est illisible, le reste vide."""
+
+    def __init__(self, basename=None):
+        self.basename = str(basename)
+
+    def read(self):
+        if self.basename.endswith(".coverage.coupee"):
+            raise _FauxDataError("file is not a database")
+
+    def measured_contexts(self):
+        return {"tests.test_l1.T.test_a"}
+
+    def measured_files(self):
+        return []
+
+    def contexts_by_lineno(self, fichier):
+        return {}
+
+
+class ArtefactIncompletTest(unittest.TestCase):
+    """#1690 : un artefact de mesure illisible est signalé, jamais compté."""
+
+    @staticmethod
+    def _faux_module():
+        faux = types.ModuleType("coverage")
+        faux.CoverageData = _FauxCoverageData
+        faux.CoverageException = _FauxCoverageException
+        # #1257 x #1690 : l'union lit l'exception dans `coverage.exceptions`
+        # (chemin déjà utilisé par #1257) ; la doublure l'expose donc aussi.
+        exceptions = types.ModuleType("coverage.exceptions")
+        exceptions.CoverageException = _FauxCoverageException
+        exceptions.DataError = _FauxDataError
+        faux.exceptions = exceptions
+        faux.__version__ = "faux"
+        return faux
+
+    def _merge(self, dossiers: list[pathlib.Path]) -> dict:
+        faux = self._faux_module()
+        with mock.patch.dict(sys.modules, {"coverage": faux,
+                                           "coverage.exceptions": faux.exceptions}):
+            return carte.merge([str(d) for d in dossiers], "abc")
+
+    def test_artefact_illisible_signale_et_non_compte(self):
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        coupee = dossier / "mesure-psycopg-3"
+        (coupee / "cov").mkdir(parents=True)
+        (coupee / "cov" / ".coverage.coupee").write_bytes(b"tronque")
+        lisible = dossier / "mesure-psycopg-1"
+        (lisible / "cov").mkdir(parents=True)
+        (lisible / "cov" / ".coverage.bon").write_bytes(b"vide")
+        c = self._merge([coupee, lisible])
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 1)   # le lisible seul compte
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage.coupee")])
+        self.assertIn("FauxDataError", mesure["artefacts_incomplets"][0]["erreur"])
+        self.assertIn(".coverage.coupee", carte.summary(c))
+
+    @unittest.skipUnless(_coverage_installe(),
+                         "coverage requis pour un artefact réellement tronqué")
+    def test_fichier_coverage_tronque_reel(self):
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-3"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage").write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
+        c = carte.merge([str(part)], "abc")
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 0)
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertIn(".coverage", carte.summary(c))
+
+    def test_artefact_vide_signale_sans_lecture(self):
+        """#1707 : 0 octet est écarté avant l'import de coverage lui-même."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-4"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage"
+        vide.write_bytes(b"")
+        with mock.patch.dict(sys.modules, {"coverage": None}):
+            c = carte.merge([str(part)], "abc")
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 0)
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertIn("0 octet", mesure["artefacts_incomplets"][0]["erreur"])
+        self.assertIn(".coverage", carte.summary(c))
+        self.assertEqual(vide.stat().st_size, 0)  # read() aurait écrit le schéma
+
+    @unittest.skipUnless(_coverage_installe(),
+                         "coverage requis pour un artefact réellement vide")
+    def test_fichier_coverage_vide_reel_non_compte(self):
+        """#1707 : un .coverage de 0 octet n'est pas un processus mesuré."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-4"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage"
+        vide.write_bytes(b"")
+        c = carte.merge([str(part)], "abc")
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 0)
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertEqual(vide.stat().st_size, 0)  # la lecture n'a pas eu lieu
+    @unittest.skipUnless(_coverage_installe(),
+                         "coverage requis pour suivre la connexion SQLite")
+    def test_artefact_illisible_ferme_la_connexion_sqlite(self):
+        # #1716 (accessoire de la relecture dev4) : un `read()` en échec
+        # laisse la connexion SQLite ouverte dans `CoverageData._dbs` (le
+        # `with` de coverage n'est jamais entré) ; la fusion la ferme au lieu
+        # de la laisser au ramasse-miettes.
+        import coverage
+
+        fermetures = []
+
+        class Suivi(coverage.CoverageData):
+            def close(self, force: bool = False) -> None:
+                fermetures.append(force)
+                return super().close(force=force)
+
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-3"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage").write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
+        with mock.patch.object(coverage, "CoverageData", Suivi):
+            c = carte.merge([str(part)], "abc")
+        self.assertEqual([i["fichier"] for i in c["mesure"]["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertEqual(fermetures, [True])
 
 
 def _mesure_possible() -> bool:
@@ -557,6 +708,117 @@ class BoutEnBoutTest(unittest.TestCase):
                          ["test_bin_launchers"])
         self.assertGreaterEqual(c["mesure"]["processus"], 2)
         self.assertEqual(c["mesure"]["processus_sans_contexte"], 0)
+
+
+# --------------------------------------------------------------------------
+# #1632 : contrat d'attribution de la mesure
+# --------------------------------------------------------------------------
+
+_ARBRES: dict = {}
+
+
+def _fichier_module(nom: str):
+    """Le fichier d'un module `tests.x…` du dépôt, None s'il n'existe pas."""
+    base = REPO.joinpath(*nom.split("."))
+    for chemin in (base.with_suffix(".py"), base / "__init__.py"):
+        if chemin.is_file():
+            return chemin
+    return None
+
+
+def _arbre(chemin):
+    if chemin not in _ARBRES:
+        _ARBRES[chemin] = ast.parse(chemin.read_text(encoding="utf-8"))
+    return _ARBRES[chemin]
+
+
+def _liens(chemin) -> dict:
+    """Nom lié au niveau module -> (module, nom d'origine) pour les
+    `from … import …` (relatifs compris). Seul le niveau module compte : une
+    importation dans une fonction ne lie rien pour le collecteur unittest."""
+    liens = {}
+    for node in _arbre(chemin).body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        base = node.module or ""
+        if node.level:
+            base = "tests" + (f".{base}" if base else "")
+        for alias in node.names:
+            liens[alias.asname or alias.name] = (base, alias.name)
+    return liens
+
+
+def _classe(chemin, nom: str):
+    for node in _arbre(chemin).body:
+        if isinstance(node, ast.ClassDef) and node.name == nom:
+            return node
+    return None
+
+
+def _a_des_tests(module: str, nom: str, vus=None) -> bool:
+    """La classe `nom` de `module` porte-t-elle au moins un test (le sien ou un
+    hérité) — c'est-à-dire unittest la collecterait-il ? Une base hors du
+    dépôt de test (`unittest.TestCase`, `tests.support`) est supposée sans
+    test : le témoin ne mord que sur ce qu'il sait lire."""
+    vus = set() if vus is None else vus
+    if (module, nom) in vus:
+        return False
+    vus.add((module, nom))
+    chemin = _fichier_module(module)
+    if chemin is None:
+        return False
+    noeud = _classe(chemin, nom)
+    liens = _liens(chemin)
+    if noeud is None:
+        return _a_des_tests(*liens[nom], vus) if nom in liens else False
+    for item in noeud.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and item.name.startswith("test"):
+            return True
+    for base in noeud.bases:
+        if isinstance(base, ast.Attribute):   # _x.BaseTest
+            valeur = base.value
+            if isinstance(valeur, ast.Name) and valeur.id in liens:
+                module_base, nom_base = liens[valeur.id]
+                if _fichier_module(f"{module_base}.{nom_base}") \
+                        and _a_des_tests(f"{module_base}.{nom_base}", base.attr, vus):
+                    return True
+            continue
+        nom_base = base.id if isinstance(base, ast.Name) else None
+        if nom_base is None:
+            continue
+        if _classe(chemin, nom_base) is not None:
+            if _a_des_tests(module, nom_base, vus):
+                return True
+        elif nom_base in liens and _a_des_tests(*liens[nom_base], vus):
+            return True
+    return False
+
+
+class AttributionContractTest(unittest.TestCase):
+    """#1632 : `scripts/test-parts.py` attribue un test au module qui l'a DÉFINI
+    (`type(test).__module__`, `_module_of`), et `map.couverture_incomplete`
+    refuse une carte dont un module est mesuré hors de la part que le plan lui
+    assigne. Lier au niveau module une classe de test CONCRÈTE venue d'un autre
+    module la fait exécuter — et mesurer — dans la part du module importateur,
+    alors que le plan l'assigne au module d'origine : « mesure hors de sa part »,
+    carte jamais publiée. L'utiliser comme base se fait par le module
+    (`from . import test_x as _x` puis `_x.BaseTest`), qui ne collecte rien.
+    Une base abstraite (sans test, comme `_Base`) reste libre de tout lien :
+    unittest la collecte mais n'en tire aucun test."""
+
+    def test_aucune_classe_de_test_concrete_etrangere_liee_au_module(self):
+        fautes = []
+        for fichier in sorted((REPO / "tests").glob("test_*.py")):
+            module = f"tests.{fichier.stem}"
+            for lie, (cible, nom) in sorted(_liens(fichier).items()):
+                if cible == module:
+                    continue
+                if _a_des_tests(cible, nom):
+                    fautes.append(
+                        f"{fichier.name} : {lie} = {cible}.{nom} porte des tests ; "
+                        "lie le module et non la classe")
+        self.assertEqual([], fautes)
 
 
 if __name__ == "__main__":

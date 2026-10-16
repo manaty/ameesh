@@ -251,7 +251,7 @@ class QaEvidenceTest(PgTestCase):
 
     def go_and_merge(self):
         work.milestone(self.db, self.lot, "verdict", verdict="ok", sha="abcdef1234")
-        return work.merged(self.db, self.lot, sha="abcdef1234")
+        return work.close_merged(self.db, self.lot, sha="abcdef1234")
 
     # -- rôle et portée ---------------------------------------------------
 
