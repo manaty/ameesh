@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import grp
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -466,7 +467,8 @@ class Installeur:
         fichier par le compte. Seul le reçu (ou la catégorie d'erreur) revient.
         """
         owner, group = self._owner_ids(destination)
-        if owner == 0:
+        if owner == 0 or group == 0:
+            # le fils ne doit garder ni l'uid ni le gid de root.
             raise Refused('destination_bridge')
         reader, writer = os.pipe()
         pid = os.fork()
@@ -988,6 +990,125 @@ class Journal:
             raise Uncertain('journal') from None
 
 
+class Intentions:
+    """Livraisons en cours côté mesh : la version tirée survit à un échec ambigu.
+
+    Une intention (référence, hôte, compte, opération, version, destination)
+    est écrite durablement avant l'envoi et retirée au premier reçu décidé
+    (`ok` vrai ou faux). Après un échec ambigu (`Uncertain`), la livraison
+    suivante du même triplet rejoue la même version : le helper la reconnaît
+    (rejeu sans réécriture) ou l'installe, au lieu de voir une autre version
+    sur une destination gérée (`rotation_required`). Aucune valeur ni
+    empreinte n'y est écrite.
+    """
+
+    def __init__(self, root: Path, *, uid: int | None = None):
+        self.root = Path(root)
+        self.uid = os.geteuid() if uid is None else uid
+
+    def _ensure(self) -> Path:
+        # le parent (racine du journal) naît privé lui aussi : `mkdir -p`
+        # laisserait le masque décider de son mode.
+        for directory in (self.root.parent, self.root):
+            if not directory.exists():
+                directory.mkdir(mode=0o700, exist_ok=True)
+        try:
+            info = self.root.lstat()
+        except OSError:
+            raise Refused('intent_root') from None
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != self.uid or stat.S_IMODE(info.st_mode) & 0o077):
+            raise Refused('intent_root')
+        return self.root
+
+    @staticmethod
+    def _key(reference: str, host: str, account: str) -> dict:
+        return {'reference': reference, 'host': host, 'account': account}
+
+    def _path(self, key: dict) -> Path:
+        # nom dérivé des seuls identifiants publics du triplet, jamais de la valeur.
+        name = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+        return self._ensure() / (name + '.json')
+
+    @contextlib.contextmanager
+    def locked(self, reference: str, host: str, account: str):
+        # Garder le même inode : supprimer le verrou permettrait deux détenteurs.
+        path = self._path(self._key(reference, host, account)).with_suffix('.lock')
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError:
+            raise Refused('intent_lock') from None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise Refused('intent_lock')
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused('delivery_busy') from None
+            yield
+        finally:
+            os.close(fd)
+
+    def get(self, reference: str, host: str, account: str) -> dict | None:
+        key = self._key(reference, host, account)
+        path = self._path(key)
+        if not path.exists():
+            return None
+        try:
+            entry = json.loads(_read_private(path, owners=(self.uid,), modes=(0o600,),
+                                             limit=8192))
+        except (Refused, ValueError):
+            raise Refused('intent_record') from None
+        if (not isinstance(entry, dict)
+                or set(entry) != {'reference', 'host', 'account', 'operation',
+                                  'version', 'destination'}
+                or {name: entry[name] for name in key} != key
+                or entry['operation'] not in ('install', 'rotate')
+                or not isinstance(entry['version'], str) or not VERSION.match(entry['version'])
+                or not isinstance(entry['destination'], dict)):
+            raise Refused('intent_record')
+        return entry
+
+    def put(self, entry: dict) -> None:
+        path = self._path(self._key(entry['reference'], entry['host'], entry['account']))
+        temporary = path.with_name('.%s.tmp-%s' % (path.name, secrets.token_hex(8)))
+        data = json.dumps(entry, sort_keys=True, separators=(',', ':')).encode()
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            _fsync_directory(path.parent)
+        except OSError:
+            raise Uncertain('intent') from None
+        finally:
+            if temporary.exists():
+                with contextlib.suppress(OSError):
+                    temporary.unlink()
+
+    def clear(self, reference: str, host: str, account: str) -> None:
+        path = self._path(self._key(reference, host, account))
+        try:
+            path.unlink()
+            _fsync_directory(path.parent)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise Uncertain('intent') from None
+
+
+def _fsync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class Livraison:
     """Côté mesh : résout une référence allowlistée et la livre par transport.
 
@@ -999,32 +1120,51 @@ class Livraison:
     """
 
     def __init__(self, politique: Politique, transport, journal: Journal, *,
-                 lecteur: Lecteur | None = None, boundary=None, timeout: float = 30.0):
+                 lecteur: Lecteur | None = None, boundary=None, timeout: float = 30.0,
+                 intentions: Intentions | None = None):
         self.politique = politique
         self.transport = transport
         self.journal = journal
         self.lecteur = lecteur or Lecteur(politique)
         self.boundary = boundary
         self.timeout = timeout
+        self.intentions = intentions or Intentions(journal.root / 'intents',
+                                                   uid=journal.uid)
 
     def deliver(self, reference: str, host: str, account: str, *,
                 operation: str = 'install') -> dict:
         if operation not in ('install', 'rotate'):
             raise Refused('operation')
+        with self.intentions.locked(reference, host, account):
+            return self._deliver(reference, host, account, operation=operation)
+
+    def _deliver(self, reference: str, host: str, account: str, *, operation: str) -> dict:
         destination = self.politique.destination(reference, host, account)
+        pending = self.intentions.get(reference, host, account)
+        if pending is not None and (pending['operation'] != operation
+                                    or pending['destination'] != destination.document()):
+            # une livraison incertaine se rejoue à l'identique ou se tranche :
+            # une autre opération ou une autre destination ne la remplace pas.
+            raise Refused('pending_delivery')
         if operation == 'rotate':
+            # la frontière est tenue à chaque tentative, rejeu compris.
             if self.boundary is None:
                 raise Refused('boundary_unavailable')
             if not self.boundary(host, account):
                 raise Refused('busy')
         value = self.lecteur.read(reference)
-        version = secrets.token_hex(16)
+        version = pending['version'] if pending else secrets.token_hex(16)
         request = {'protocol': PROTOCOL, 'operation': operation,
                    'reference': reference, 'version': version, 'bytes': len(value),
                    'destination': destination.document()}
         payload = frame(request, value)
+        if pending is None:
+            self.intentions.put({'reference': reference, 'host': host, 'account': account,
+                                 'operation': operation, 'version': version,
+                                 'destination': destination.document()})
         self.journal.record(reference=reference, host=host, account=account,
-                            operation=operation, version=version, category='intent')
+                            operation=operation, version=version,
+                            category='retry' if pending else 'intent')
         try:
             answer = self.transport.exchange(payload, self.timeout)
         except SecretError:
@@ -1035,6 +1175,9 @@ class Livraison:
                                 category='transport')
             raise Uncertain('transport') from None
         receipt = self._receipt(answer, request)
+        # reçu décidé : l'intention est soldée ; un nouvel essai tire une
+        # nouvelle version (et un refus `rotation_required` est alors juste).
+        self.intentions.clear(reference, host, account)
         self.journal.record(reference=reference, host=host, account=account,
                             operation=operation, version=version,
                             category=receipt['category'])
