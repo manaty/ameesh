@@ -189,6 +189,24 @@ class EchecsRapidesTest(PgTestCase):
         self.assertFalse((row["status_text"] or "").startswith("session lock held"),
                          row["status_text"])
 
+    def test_statut_de_verrou_repose_apres_reprise_de_consigne(self):
+        worker = self._worker()
+        worker.deferred_lock_grace = lambda: 0.0
+        worker.deferred_reason = worker.DEFERRED_STATUS
+        with mock.patch("ameesh.runner.log") as journal:
+            for _ in range(2):
+                # Le vrai pick prend la consigne et ecrit running ; le report
+                # la restaure sans remettre le statut de verrou (#1914).
+                self.assertEqual(registry.take_pending_prompt(
+                    self.db, worker.name, worker.runner.runner_id, worker.epoch), "tour")
+                registry.restore_prompt(self.db, worker.name,
+                                        worker.runner.runner_id, worker.epoch)
+                worker._deferred_turn()
+                row = registry.get(self.db, worker.name)
+                self.assertEqual(row["status"], "blocked")
+                self.assertEqual(row["status_text"], worker.DEFERRED_STATUS)
+        self.assertEqual(journal.call_count, 1)
+
     def test_attach_demande_ne_pose_pas_le_statut_de_verrou(self):
         """#1914 : seul un verrou tenu par un tiers est rendu visible — un
         attach demandé reste un report silencieux au pas court (#1686 N2

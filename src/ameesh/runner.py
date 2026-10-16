@@ -4071,15 +4071,17 @@ class AgentWorker(threading.Thread):
         self.deferred_wait_s = min(self.DEFERRED_RETRY_MAX,
                                    max(2.0 * self.DEFERRED_RETRY,
                                        2.0 * self.deferred_wait_s))
-        if self.deferred_alerted:
-            return self.deferred_wait_s
+        premier_report = not self.deferred_alerted
         self.deferred_alerted = True
         texte = ("%s on %s: another process holds session-use; turns deferred "
                  "without failure, retries spaced"
                  % (self.DEFERRED_STATUS, self.runner.host or "this host"))
-        log("[%s] %s (streak %d, %.0fs)" % (self.name, texte, self.deferred_streak,
-                                            maintenant - self.deferred_since))
+        if premier_report:
+            log("[%s] %s (streak %d, %.0fs)" % (self.name, texte, self.deferred_streak,
+                                                maintenant - self.deferred_since))
         try:
+            # pick() reprend la consigne et ecrit running a chaque essai :
+            # reposer la marque apres chaque report, sans repeter le journal.
             # Blocage marqué, fencé par le bail : rien n'est posé sur un agent
             # arrêté ni par-dessus un autre blocage (budget, auth, hôte…).
             registry.set_marked_block(self.db, self.name, self.runner.runner_id,
