@@ -134,10 +134,19 @@ class PlatformTest(unittest.TestCase):
                     # ligne de commande
                     exclus = platform.holders(chemin, "sid-l63-xyz", exclude=[nomme.pid])
                     self.assertNotIn(nomme.pid, [h["pid"] for h in exclus])
-                    # personne ne tient un autre fichier
+                    # personne ne tient un autre fichier — sauf sur un hôte où
+                    # l'OS cache les fichiers ouverts d'un processus tiers du
+                    # même utilisateur (gpg-agent non dumpable, L63b) : le refus
+                    # est alors la réponse documentée, pas une liste vide non
+                    # vérifiée.
                     autre = os.path.join(tmp, "autre.jsonl")
                     open(autre, "w").close()
-                    self.assertEqual(platform.holders(autre, "sid-absent"), [])
+                    try:
+                        vides = platform.holders(autre, "sid-absent")
+                    except platform.NotAvailable as exc:
+                        self.assertIn("unreadable", str(exc))
+                    else:
+                        self.assertEqual(vides, [])
 
     def test_detenteurs_d_un_dossier(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +359,29 @@ class PlatformTest(unittest.TestCase):
             with self.subTest(nom):
                 self.assertEqual(process._doubt_psutil(PS(proc), 4242, os.getuid(),
                                                        allow), attendu)
+
+    def test_detenteur_verifie_malgre_un_tiers_illisible(self):
+        """#1749 : un détenteur vérifié tient l'entrée ; le refus d'un
+        processus tiers du même utilisateur (gpg-agent non dumpable) ne jette
+        plus cette réponse positive — le ménage gardait sinon tout /tmp
+        (« holders unreadable »). Le doute ne vaut que sans détenteur."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        moi = "%d %d %d %d" % ((os.getuid(),) * 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            cible = os.path.join(tmp, "tenu")
+            open(cible, "w").close()
+            racine = self._faux_proc("gpg-agent", moi)
+            # ce processus-ci tient `cible` : le /proc simulé porte son lien
+            os.symlink(cible, os.path.join(racine, str(os.getpid()), "fd", "3"))
+            with mock.patch.object(platform, "psutil", None), \
+                    mock.patch.object(platform.process, "PROC", racine), \
+                    mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                    mock.patch.object(platform.process, "service_managers",
+                                      return_value=frozenset()), \
+                    mock.patch.object(platform, "SYSTEM", "linux"):
+                found = platform.holders(cible)
+        self.assertEqual([h["pid"] for h in found], [os.getpid()])
 
     def test_un_processus_qui_se_termine_n_est_pas_un_doute(self):
         """CI #377 r2 : un `git` en fin de vie refuse son `fd` avant d'être
