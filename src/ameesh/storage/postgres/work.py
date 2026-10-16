@@ -390,7 +390,7 @@ class WorkItems(interface.WorkItems):
             sql += " AND assignee = %s"
             params.append(assignee)
         sql += " ORDER BY updated_at DESC LIMIT %s"
-        params.append(int(limit))
+        params.append(None if limit is None else int(limit))
         return self.db.query(sql, tuple(params))
 
     def move(self, item_id, state, *, current, loops, note, actor,
@@ -816,7 +816,19 @@ class WorkItems(interface.WorkItems):
             " ORDER BY d.resolved_at, d.id" % _DELEGATION_COLUMNS,
             (float(since_ts),))
 
-    def note(self, item_id, state, text, actor) -> None:
+    def note(self, item_id, state, text, actor, *, once=False) -> None:
+        if once:
+            with self.db.transaction() as tx:
+                rows = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                                (int(item_id),))
+                if not rows:
+                    raise DbError("lot %s not found" % item_id)
+                if tx.query("SELECT id FROM work_item_events"
+                            " WHERE work_item_id = %s AND note = %s LIMIT 1",
+                            (int(item_id), text)):
+                    return
+                WorkItems(tx).note(item_id, rows[0]["state"], text, actor)
+            return
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
@@ -858,7 +870,7 @@ class WorkItems(interface.WorkItems):
              WHERE work_item_id = %s
              ORDER BY id DESC LIMIT %s
             """,
-            (int(item_id), int(limit)),
+            (int(item_id), None if limit is None else int(limit)),
         )
 
     def events_noted(self, prefix, since_ts) -> list[dict]:
@@ -883,7 +895,7 @@ class WorkItems(interface.WorkItems):
              WHERE work_item_id = %s
              ORDER BY at DESC, id DESC LIMIT %s
             """,
-            (int(item_id), int(limit)),
+            (int(item_id), None if limit is None else int(limit)),
         )
 
     def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
@@ -914,8 +926,8 @@ class WorkItems(interface.WorkItems):
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
-            tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                     (int(item_id),))
+            items = tx.query("SELECT id, app, branch_target FROM work_items"
+                             " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
                 """
                 INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, verdict, note)
@@ -936,6 +948,17 @@ class WorkItems(interface.WorkItems):
                     " ON CONFLICT (subject) DO NOTHING",
                     ("milestone:%d" % int(milestone["id"]), proof["sha"], proof["actor"],
                      proof["session"], proof["turn"], proof["harness"], int(item_id)))
+            if kind == "verdict" and items:
+                from ... import merge_queue, train_events
+                item = items[0]
+                try:
+                    train_events.emit(tx, kind="verdict", project=item.get("app") or "",
+                        target=merge_queue._remote_branch(item.get("branch_target") or ""))
+                except ValueError:
+                    # An old/unscoped lot has no train routing subject. The
+                    # milestone remains valid; SQL/transport errors still roll
+                    # back its transaction, so a committed verdict loses no hint.
+                    pass
             if on_frozen is not None:
                 on_frozen(tx, milestone, threads)
         return milestone
@@ -1200,30 +1223,79 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="", frozen_id=None) -> dict | None:
+                  source="", frozen_id=None, packet=None, packet_initial=False, lease=None) -> dict | None:
         with self.db.transaction() as tx:
-            lot = tx.query("SELECT state FROM work_items WHERE id = %s"
+            lot = tx.query("SELECT state, app, branch, branch_target, type FROM work_items WHERE id = %s"
                            " AND state NOT IN ('merged', 'promoted', 'closed')"
                            " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
                 return None
+            if lease is not None:
+                key, owner, epoch = lease
+                held = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                                (key,))
+                if not held or (held[0]["owner"], held[0]["epoch"]) != (owner, epoch):
+                    return None
+                # Check after acquiring the row lock: waiting cannot extend
+                # the lease through a transaction-start timestamp.
+                if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                                " AND expires_at > clock_timestamp()", (key,)):
+                    return None
             latest = tx.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
                               " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
             latest_id = latest[0]["id"] if latest else None
             if frozen_id is not None and frozen_id != latest_id:
                 return None
-            tx.execute(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
-                " VALUES (%s, %s, %s, %s, %s, %s)"
-                " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
+            if packet is not None:
+                fields = ("app", "branch", "branch_target", "type")
+                if frozen_id is None or lot[0]["state"] != "qa" \
+                        or set(packet) != set(fields) | {"resolved_target"} \
+                        or packet["resolved_target"] != target \
+                        or any(lot[0][key] != packet[key] for key in fields):
+                    return None
+                current = self._queue_row(tx, item_id)
+                markers = tx.query("SELECT kind, frozen_id, generation FROM integration_train_queue_receipts"
+                                   " WHERE work_item_id = %s ORDER BY id", (int(item_id),))
+                allocated = None
+                for receipt in markers:
+                    if receipt.get("frozen_id") != frozen_id:
+                        continue
+                    if receipt.get("kind") == "removed":
+                        return None
+                    if receipt.get("kind") == "packet":
+                        allocated = receipt.get("generation")
+                if current is not None:
+                    same = (current["generation"], current["target"], current["frozen_id"],
+                            current["frozen_sha"], current["source"], current["state"])
+                    return current if same == (allocated, target, frozen_id, frozen_sha, source, "queued") else None
+                if allocated is not None:
+                    return None  # the allocated entry was withdrawn; do not resurrect it
+                if packet_initial is not True:
+                    return None  # absence is ambiguous for legacy DELETE-only writers
+            conflict = (" DO NOTHING" if packet is not None else
+                " DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
                 "   source = excluded.source, frozen_id = excluded.frozen_id,"
                 "   generation = nextval('merge_queue_generation_seq'), landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
-                "   updated_at = now()",
+                "   updated_at = now()")
+            # Packet cutoff eligibility starts at insertion, not at an
+            # enclosing transaction's BEGIN before it waited for these locks.
+            inserted = tx.query(
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id, queued_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, "
+                + ("clock_timestamp()" if packet is not None else "now()") + ")"
+                " ON CONFLICT (work_item_id)" + conflict + " RETURNING work_item_id",
                 (int(item_id), target, frozen_sha, actor or "", source or "", latest_id))
+            if not inserted:
+                return None
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
-            return self._queue_row(tx, item_id)
+            row = self._queue_row(tx, item_id)
+            if packet is not None:
+                tx.execute("INSERT INTO integration_train_queue_receipts"
+                           " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
+                           (row["work_item_id"], row["generation"], row["frozen_id"]))
+            return row
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
                      note="", actor="", clear_rank=False, lease=None,
@@ -1272,12 +1344,17 @@ class WorkItems(interface.WorkItems):
 
     def queue_remove(self, item_id, *, note, actor) -> bool:
         with self.db.transaction() as tx:
+            # Same order as allocation/refreeze: a withdrawal cannot vanish
+            # between a packet's check for absence and its insertion.
+            lot = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query("DELETE FROM merge_queue WHERE work_item_id = %s"
-                            " RETURNING work_item_id", (int(item_id),))
+                            " RETURNING work_item_id, generation, frozen_id", (int(item_id),))
             if not rows:
                 return False
-            lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            tx.execute("INSERT INTO integration_train_queue_receipts"
+                       " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'removed')",
+                       (rows[0]["work_item_id"], rows[0]["generation"], rows[0]["frozen_id"]))
             return True
 
     def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
@@ -1305,6 +1382,118 @@ class WorkItems(interface.WorkItems):
             " WHERE target = %s AND owner = %s AND epoch = %s RETURNING target",
             (key, owner, int(epoch)))
         return bool(rows)
+
+    def train_read(self, key) -> dict | None:
+        rows = self.db.query(
+            "SELECT revision, document FROM integration_trains WHERE target_key = %s", (key,))
+        if not rows:
+            return None
+        document = rows[0]["document"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        return dict(document, revision=int(rows[0]["revision"]))
+
+    def train_save(self, key, document, *, revision, owner, epoch) -> dict | None:
+        with self.db.transaction() as tx:
+            held = tx.query("SELECT owner, epoch"
+                            " FROM merge_locks WHERE target = %s FOR UPDATE", (key,))
+            if not held or held[0]["owner"] != owner or int(held[0]["epoch"]) != epoch:
+                return None
+            # Recheck after the row lock, never using a pre-lock clock.
+            live = tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                            " AND expires_at > clock_timestamp()", (key,))
+            if not live:
+                return None
+            rows = tx.query(
+                "INSERT INTO integration_trains (target_key, revision, document)"
+                " SELECT %s, 1, %s::jsonb WHERE %s = 0"
+                " ON CONFLICT (target_key) DO NOTHING RETURNING revision",
+                (key, json.dumps(document), int(revision))) if revision == 0 else tx.query(
+                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb,"
+                " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
+                " RETURNING revision", (json.dumps(document), key, int(revision)))
+            return dict(document, revision=int(rows[0]["revision"])) if rows else None
+
+    @staticmethod
+    def _train_fire(rows):
+        if not rows:
+            return None
+        row = dict(rows[0])
+        document = row.pop("document")
+        if isinstance(document, str):
+            document = json.loads(document)
+        return dict(document, **row)
+
+    def train_fire_read(self, key, plan_id) -> dict | None:
+        return self._train_fire(self.db.query(
+            "SELECT id, document, state, changed_by, owner, epoch,"
+            " extract(epoch from created_at)::float8 AS created_ts"
+            " FROM integration_train_fires WHERE target_key = %s AND plan_id = %s"
+            " ORDER BY id DESC LIMIT 1", (key, plan_id)))
+
+    def train_fire_give(self, key, document) -> dict | None:
+        with self.db.transaction() as tx:
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s FOR UPDATE", (key,)):
+                return None
+            # Serialize both a regrant and a plan revision with the claim.
+            rows = tx.query("SELECT document FROM integration_trains WHERE target_key = %s",
+                            (key,))
+            current = rows[0]["document"] if rows else {}
+            if isinstance(current, str):
+                current = json.loads(current)
+            if current.get("plan") != document["plan"] or current.get("phase") not in (
+                    "publishing", "ci-intent", "ci", "ready"):
+                return None
+            ops = WorkItems(tx)
+            old = ops.train_fire_read(key, document["plan"]["id"])
+            if old and old["state"] != "revoked":
+                return None
+            tx.execute("INSERT INTO integration_train_fires"
+                       " (target_key, plan_id, document, state, changed_by)"
+                       " VALUES (%s, %s, %s::jsonb, 'active', %s)",
+                       (key, document["plan"]["id"], json.dumps(document), document["actor"]))
+            return ops.train_fire_read(key, document["plan"]["id"])
+
+    def train_fire_change(self, key, fire_id, state, *, actor, owner=None, epoch=None) -> dict | None:
+        expected = {"revoked": "active", "promoting": "active", "landed": "promoting"}
+        if state not in expected:
+            raise ValueError("train fire transition: revoked | promoting | landed expected")
+        with self.db.transaction() as tx:
+            locks = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                             (key,))
+            if not locks:
+                return None
+            if state != "revoked":
+                if owner is None or epoch is None or locks[0]["owner"] != owner \
+                        or int(locks[0]["epoch"]) != epoch:
+                    return None
+                if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                                " AND expires_at > clock_timestamp()", (key,)):
+                    return None
+            rows = tx.query("SELECT document, owner, epoch FROM integration_train_fires"
+                            " WHERE target_key = %s AND id = %s AND state = %s FOR UPDATE",
+                            (key, int(fire_id), expected[state]))
+            if not rows:
+                return None
+            document = rows[0]["document"]
+            if isinstance(document, str):
+                document = json.loads(document)
+            if state != "revoked":
+                # The engine must have durably entered promoting on this
+                # exact plan, under the same target reservation.
+                if not tx.query("SELECT 1 FROM integration_trains WHERE target_key = %s"
+                                " AND document->>'phase' = 'promoting'"
+                                " AND document->'plan' = %s::jsonb",
+                                (key, json.dumps(document["plan"]))):
+                    return None
+                # A new live holder may finish a previous holder's claim
+                # after observing the exact remote head. It cannot reactivate
+                # the fire or retry the effect; business code supplies that
+                # fresh observation before requesting this transition.
+            tx.execute("UPDATE integration_train_fires SET state = %s, changed_by = %s,"
+                       " owner = %s, epoch = %s, updated_at = clock_timestamp() WHERE id = %s",
+                       (state, actor, owner, epoch, int(fire_id)))
+            return WorkItems(tx).train_fire_read(key, document["plan"]["id"])
 
     def queue(self, target=None) -> list[dict]:
         return self.db.query(

@@ -3767,6 +3767,15 @@
       "type": "string"
      },
      "required": true
+    },
+    {
+     "name": "once",
+     "kind": "keyword",
+     "schema": {
+      "type": "boolean"
+     },
+     "required": false,
+     "default": false
     }
    ],
    "result": {
@@ -4400,6 +4409,11 @@
     "items",
     "land_lock",
     "land_unlock",
+    "train_read",
+    "train_save",
+    "train_fire_read",
+    "train_fire_give",
+    "train_fire_change",
     "link_package",
     "lock_deep_analysis",
     "mark_started",

@@ -1,0 +1,977 @@
+{
+  "schema": "ameesh-train-ci-audit-draft/1",
+  "status": "unqualified",
+  "project": "nexlink",
+  "target": "develop",
+  "base": "d73f3602898f878b40f1cd49ea69f770fe23a426",
+  "lot_1470": "6553d3ae11741f4163d6e65b450c97a40e9e2c17",
+  "union_tree": "a252cec5d7569d2a645b32a7f03c014f68363da8",
+  "union": "git merge-tree --write-tree <base> <lot_1470>; no branch, push or CI",
+  "sources": {
+    ".github/workflows/backend-suite.yml": "6c2ce989a772434c5447969679aded2c0870b538",
+    ".github/workflows/civil-crypto.yml": "62e34144c4055b9c91f82bf658506399435aa4ec",
+    ".github/workflows/compute-gh-bridge.yml": "992f3ca3e4b019dec1e20fe56967da0960e46ec8",
+    ".github/workflows/compute.yml": "c1acab4712ad34e50380c955148b577a1c6e276e",
+    ".github/workflows/desktop-suite.yml": "725dab6537df5c458ab541972748f2b094e3d651",
+    ".github/workflows/host-key.yml": "008d1116e736e53f84d67d1987696b2f2733d5de",
+    ".github/workflows/host-rust.yml": "29c939c0a7ab8208aaa031e368270cfec68e3422",
+    ".github/workflows/lot-plan.yml": "1f00554743aee01a0ab13e85b54f147ca6427f3e",
+    ".github/workflows/lot-status.yml": "853fe8211687d89655811b7fac385337848ea67a",
+    ".github/workflows/message-crypto.yml": "94a45ee13d0dd02baa18f94877c4835a73e91146",
+    ".github/workflows/mobile-native-harness.yml": "6529e9691fd4bb7a3a3f755495fd493c5aafa35b",
+    ".github/workflows/mobile-suite.yml": "5d74653346ae46acae5b061e5497591f6277a28f",
+    ".github/workflows/nexlink-key.yml": "72a39ed943e3d4d0014e8f5ea568d714bf42640e",
+    ".github/workflows/node-channel.yml": "b24754128a4cbfb085db751af64f9fa7353a9a5c",
+    ".github/workflows/node-oplog.yml": "438a80b62acca043f0c084bc9ae8434db35a1b67",
+    ".github/workflows/page-host.yml": "a4b05dd8adb37a1d34fea2be85b64a6e05b0daa7",
+    ".github/workflows/remote-help-ts.yml": "3e9f41fcf570bd182037c146145e577390d511b7",
+    ".github/workflows/rollback-checks.yml": "4f53a0468232973a0dd4ba03b8fe4d524488e878",
+    ".github/workflows/routing-library.yml": "a9ed85d45607546f40b5ebfca7799dfdd1d748c5",
+    ".github/workflows/scripts-suite.yml": "e87487a08dc4c1d1e26a8a6d6b353e34f1dfd0c7",
+    ".github/workflows/sql-invariant.yml": "7ac0e296df63ba75840cbb105184f22731f5fc0e",
+    ".github/workflows/sync-checks.yml": "6dbd490b08bb709a1f6964e2fc83a71ea4cdd778",
+    ".github/workflows/website-suite.yml": "4cfd096fc1ce6efce3681a91f8f72cd502f67bfd",
+    "scripts/ci/backend-docs-only.mjs": "575694a6a86d7d90aa8f3fc11740b649b3343e00",
+    "scripts/ci/backend-runs.mjs": "b3419266f24499575b96230d8fcb13500a4f1b1d",
+    "scripts/ci/change-set.mjs": "4f72857235625d74647fc393e8aade609faa976b",
+    "scripts/ci/lot-plan.mjs": "9d09fa633fbda358db5f16ca2971a61a9d4547cf",
+    "scripts/ci/related-tests.mjs": "d9a1d03191a3cdda7d4ec9fe1d7780b1b675b46f",
+    "scripts/ci/scripts-suite.mjs": "3041193e83b41e315ac8700c48ab8a43ced741b8"
+  },
+  "candidate_code_workflows": [
+    {
+      "path": ".github/workflows/backend-suite.yml",
+      "jobs": [
+        {
+          "id": "changed-paths",
+          "name": "changed-paths",
+          "condition": "github.event_name == 'push' && github.ref == 'refs/heads/develop'",
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "backend",
+          "name": "backend",
+          "condition": "always() && needs.changed-paths.outputs.docs_only != 'true'",
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/civil-crypto.yml",
+      "jobs": [
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "python",
+          "name": "python",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/compute.yml",
+      "jobs": [
+        {
+          "id": "github-bridge",
+          "name": "github-bridge",
+          "condition": "github.event_name == 'workflow_dispatch' && inputs.bridge_recipe && github.repository == 'manaty/nexlink' && github.ref == 'refs/heads/develop'",
+          "matrix": null,
+          "reusable": "./.github/workflows/compute-gh-bridge.yml"
+        },
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "sync",
+          "name": "sync",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/desktop-suite.yml",
+      "jobs": [
+        {
+          "id": "desktop",
+          "name": "desktop",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "desktop-platform",
+          "name": "Desktop suite (${{ matrix.os }})",
+          "condition": "github.event_name == 'workflow_dispatch' && vars.CI_HOSTED_DESKTOP == 'on'",
+          "matrix": {
+            "os": [
+              "windows-latest",
+              "macos-latest"
+            ]
+          },
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/host-key.yml",
+      "jobs": [
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "python",
+          "name": "python",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/host-rust.yml",
+      "jobs": [
+        {
+          "id": "host",
+          "name": "host",
+          "condition": null,
+          "matrix": {
+            "os": "${{ (github.event_name == 'workflow_dispatch' && inputs.windows_only == true) && fromJSON('[\"windows-latest\"]') || ((github.event_name == 'workflow_dispatch' && vars.CI_HOSTED_DESKTOP == 'on') && fromJSON('[\"ubuntu-latest\",\"windows-latest\",\"macos-latest\"]') || fromJSON('[\"ubuntu-latest\"]')) }}"
+          },
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/message-crypto.yml",
+      "jobs": [
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "backend-copy",
+          "name": "backend-copy",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "python",
+          "name": "python",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/mobile-native-harness.yml",
+      "jobs": [
+        {
+          "id": "harness",
+          "name": "harness",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/mobile-suite.yml",
+      "jobs": [
+        {
+          "id": "mobile",
+          "name": "mobile",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/nexlink-key.yml",
+      "jobs": [
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "python",
+          "name": "python",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "drift",
+          "name": "drift",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/node-channel.yml",
+      "jobs": [
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "python",
+          "name": "python",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/node-oplog.yml",
+      "jobs": [
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "python",
+          "name": "python",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/page-host.yml",
+      "jobs": [
+        {
+          "id": "typescript",
+          "name": "typescript",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "sync",
+          "name": "sync",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/remote-help-ts.yml",
+      "jobs": [
+        {
+          "id": "shared",
+          "name": "shared",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "drift",
+          "name": "drift",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "website-remote-mock",
+          "name": "website-remote-mock",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "backend",
+          "name": "backend",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "wp10-wake-sampler",
+          "name": "wp10-wake-sampler",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/rollback-checks.yml",
+      "jobs": [
+        {
+          "id": "all",
+          "name": "all",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/routing-library.yml",
+      "jobs": [
+        {
+          "id": "vectors",
+          "name": "vectors",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/scripts-suite.yml",
+      "jobs": [
+        {
+          "id": "scripts",
+          "name": "scripts",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/sql-invariant.yml",
+      "jobs": [
+        {
+          "id": "sql-rules",
+          "name": "sql-rules",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/sync-checks.yml",
+      "jobs": [
+        {
+          "id": "all",
+          "name": "all",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    },
+    {
+      "path": ".github/workflows/website-suite.yml",
+      "jobs": [
+        {
+          "id": "website",
+          "name": "website",
+          "condition": null,
+          "matrix": null,
+          "reusable": null
+        },
+        {
+          "id": "lot-plan",
+          "name": "lot-plan",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-plan-retry",
+          "name": "lot-plan-retry",
+          "condition": "${{ always() && needs.lot-plan.result != 'success'\n    && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-plan.yml"
+        },
+        {
+          "id": "lot-pending",
+          "name": "lot-pending",
+          "condition": "${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        },
+        {
+          "id": "lot-status",
+          "name": "lot-status",
+          "condition": "${{ always() && github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}",
+          "matrix": null,
+          "reusable": "./.github/workflows/lot-status.yml"
+        }
+      ]
+    }
+  ],
+  "excluded_special_gate": ".github/workflows/docs-gate.yml owns documentation-only changes; not a code suite",
+  "open_questions": [
+    "Pilot qualification of the complete code suite list and platform scope is required before constructing a runnable contract.",
+    "Auxiliary lot-plan/lot-status and retry jobs cannot replace executable suite outcomes.",
+    "Hosted desktop/platform opt-ins and compute device bridge must not be activated implicitly.",
+    "No actual integration/train-* dispatch has been executed; packet-5 run evidence is scoped to packet-5.",
+    "This draft enumerates workflows and selection sources; it does not yet pin every transitive executable script/package configuration."
+  ]
+}
