@@ -328,7 +328,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('quota_gauge_readings', ARRAY[
         'id', 'harness', 'gauge_key', 'used', 'resets_at', 'window_s', 'observed_at',
-        'account'
+        'account', 'produced_at', 'source'
     ]),
     ('provider_balances', ARRAY[
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
