@@ -137,7 +137,10 @@ state = Path(os.environ['FAKE_STATE'])
 assert os.environ.get('FAKE_REMOTE') == '1', 'registry must be read on the host'
 scenario = (state / 'scenario').read_text().strip()
 agents = json.loads((state / 'agents.json').read_text())
-if sys.argv[1:] == ['list', '--json']:
+if sys.argv[1:] in (['--version'], ['version']):
+    # #1969 : le contrôle d'avant bascule interroge le point d'entrée.
+    print('ameesh 1.9.0 (fake)')
+elif sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error':
         sys.exit(1)
     print(json.dumps(agents))
@@ -201,10 +204,11 @@ if info.is_dir():
 '''
 
 # #1969 : le helper de bascule crée un venv versionné (`python3 -m venv`). Sous
-# ce banc, `python3` est ce stub : il fabrique un venv factice dont le pip est
-# celui du harnais (journalisé), le python répond aux contrôles d'imports et le
-# script console porte le shebang attendu. Toute autre invocation va au vrai
-# python (c'est lui qui exécute le helper).
+# ce banc, `python3` est ce stub : il fabrique un venv factice dont le python
+# répond aux sondes de base (DB_PYTHON), le pip est celui du harnais
+# (journalisé) et `ameesh` reste le stub du registre — avec les shebangs du venv
+# versionné, pour que la bascule n'assèche aucune commande. Toute autre
+# invocation va au vrai python (c'est lui qui exécute le helper).
 PYTHON3 = r'''#!@@SHEBANG@@
 import os, sys
 from pathlib import Path
@@ -213,15 +217,22 @@ if argv[:2] == ['-m', 'venv'] and len(argv) >= 3:
     dest = Path(argv[2])
     (dest / 'bin').mkdir(parents=True)
     (dest / 'lib/python3.11/site-packages/ameesh-1.9.0.dist-info').mkdir(parents=True)
+    python = dest / 'bin/python'
+    # `bin/python` : les sondes `-c` du harnais (DB_PYTHON) ; sinon il exécute le
+    # script reçu (c'est ce que fait le shebang `#!<venv>/bin/python` d'ameesh).
+    python.write_text('#!/usr/bin/env python3\n'
+                      'import os, sys\n'
+                      "if sys.argv[1:2] == ['-c']:\n"
+                      '    exec(compile(%r, %r, %r))\n'
+                      'else:\n'
+                      '    os.execv(%r, [%r] + sys.argv[1:])\n'
+                      % (@@DBPY@@, 'db-python', 'exec', @@PY@@, @@PY@@))
+    python.chmod(0o755)
     pip = dest / 'bin/pip'
     pip.write_text(@@PIP@@)
     pip.chmod(0o755)
-    python = dest / 'bin/python'
-    python.write_text('#!/bin/sh\nif [ "$1" = "-c" ]; then exit 0; fi\nexec '
-                      + @@PYREPR@@ + ' "$@"\n')
-    python.chmod(0o755)
     ameesh = dest / 'bin/ameesh'
-    ameesh.write_text('#!%s\nimport sys\nsys.exit(0)\n' % python)
+    ameesh.write_text(@@AMEESH@@.replace('#!/usr/bin/env python3', '#!%s' % python, 1))
     ameesh.chmod(0o755)
     sys.exit(0)
 os.execv(@@PY@@, [@@PY@@] + argv)
@@ -265,7 +276,8 @@ class VmAgentsHarness(unittest.TestCase):
         (self.bin / 'python3').write_text(
             PYTHON3.replace('@@SHEBANG@@', sys.executable)
                    .replace('@@PIP@@', repr(PIP))
-                   .replace('@@PYREPR@@', repr(sys.executable))
+                   .replace('@@DBPY@@', repr(DB_PYTHON))
+                   .replace('@@AMEESH@@', repr(AMEESH))
                    .replace('@@PY@@', repr(sys.executable)))
         (self.bin / 'python3').chmod(0o755)
         for name, text in [('ssh', SSH), ('scp', SCP), ('runuser', RUNUSER), ('id', ID),
