@@ -926,6 +926,14 @@ class Mailbox(Domain):
         """Messages non remis marqués `payload.urgent`."""
 
     @abc.abstractmethod
+    def unread_mid_turn(self, recipient: str, limit: int) -> list[dict]:
+        """L514/#885 : les messages non remis qu'une remise mi-tour peut
+        livrer — verdict, arbitrage, message d'un humain, urgent
+        (`mail.mid_turn`) —, du plus ancien au plus récent, sans s'arrêter
+        aux `UNREAD_LIMIT` premiers non-lus : un verdict derrière plus de 200
+        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+
+    @abc.abstractmethod
     def get(self, message_id: int) -> dict | None:
         """Un message par son id."""
 

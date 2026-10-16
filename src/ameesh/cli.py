@@ -824,6 +824,43 @@ class _Remise:
                 pass
         return self.msgs
 
+    def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
+        """L514/#885 : réserve les SEULS messages qui ne peuvent pas attendre.
+
+        Lecture préalable sans verrou (`mail.unread_mid_turn` : le filtre est
+        dans la requête, pas dans les `UNREAD_LIMIT` premiers non-lus), puis une
+        seule réservation des ids éligibles. Rien d'éligible : aucun geste
+        d'écriture — ni verrou de registre, ni libération des autres non-lus
+        (le churn d'un `PostToolUse`), et un verdict derrière plus de 200
+        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+        if not self.pg:
+            tous = self.bk.unread(self.name)
+            gardes = [m for m in tous if mail.mid_turn(m)]
+            self.msgs = gardes if limite is None else gardes[:max(0, limite)]
+            self.reste = len(gardes) - len(self.msgs)
+            return self.msgs
+        if limite is not None and limite <= 0:
+            # borne du tour épuisée : rien à montrer, et rien à écrire (même
+            # une urgence attend le tour suivant, comme `garder(..., 0)`).
+            self.msgs = []
+            self.reste = 0
+            return []
+        taille = mail.UNREAD_LIMIT if limite is None else limite
+        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille)
+        ids = [int(m["id"]) for m in voulus if m.get("id") is not None]
+        if not ids:
+            self.msgs = []
+            self.reste = 0
+            return []
+        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                            ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                            limit=taille)
+        self.ouverte = bool(rows)
+        self.msgs = [mail.normalize(row) for row in rows]
+        # comme `prendre` : une lecture pleine peut cacher d'autres éligibles
+        self.reste = 1 if len(rows) >= taille else 0
+        return self.msgs
+
     def restants_apres(self) -> int:
         """#1604 : non-lus restants après cette remise, sans nouvelle requête.
 
@@ -1214,8 +1251,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # `limite=None` — la borne L514 du paquet garde ses deux chemins.
             limite = borne - etat["remis"] if etat is not None and borne else None
             if event == "PostToolUse" and mid_turn_filtered(tool, binding):
-                # L514: in a dsh or codex turn, only what must not wait
-                msgs = remise.garder(mail.mid_turn, limite) if remise.prendre() else []
+                # L514/#885: in a dsh or codex turn, only what must not wait
+                msgs = remise.prendre_mi_tour(limite)
             else:
                 msgs = remise.prendre(limite)
             avis = ""

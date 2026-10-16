@@ -133,6 +133,21 @@ def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     return storage.of(db).mailbox.unread_urgent(recipient, limit)
 
 
+def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
+    """L514/#885 : les non-lus qu'une remise mi-tour peut livrer — verdict,
+    arbitrage, message d'un humain, urgent (`mid_turn`) —, filtrés DANS la
+    requête : un verdict derrière plus de `UNREAD_LIMIT` non-lus est vu.
+
+    Chemin médié : `mailbox.unread_mid_turn` n'est pas dans le contrat 1.1, il
+    lit `mailbox.unread` (admis) et filtre ici, comme `unread_active` — au plus
+    les `UNREAD_LIMIT` premiers non-lus, la limite du contrat."""
+    st = storage.of(db)
+    if getattr(st, "driver", None) == "mediated":
+        rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
+        return [row for row in rows if mid_turn(row)][:int(limit)]
+    return st.mailbox.unread_mid_turn(recipient, limit)
+
+
 def get(db: Db, message_id: int) -> dict | None:
     """Un message par son id (l'écouteur NOTIFY ne porte que l'id)."""
     return storage.of(db).mailbox.get(message_id)
