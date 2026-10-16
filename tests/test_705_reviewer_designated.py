@@ -75,6 +75,15 @@ class ReviewerMilestonesTest(unittest.TestCase):
         self.assertTrue(jalons["verdict_required"])
         self.assertEqual(progress.lot_state("qa", jalons), "review")
 
+    def test_verdict_non_requis_et_bloquant_perime(self):
+        """#1979 : un verdict bloquant périmé ne barre pas la dispense (même
+        règle que `stagnation.waiting`) ; un bloquant courant, si."""
+        jalons = {"verdict_kind": "blocked", "verdict_current": False,
+                  "verdict_required": False}
+        self.assertEqual(progress.lot_state("qa", jalons), "approved")
+        jalons["verdict_current"] = True
+        self.assertEqual(progress.lot_state("qa", jalons), "review")
+
 
 class ReviewerBriefsTest(unittest.TestCase):
     """#705 : routage de l'alerte `stale_lot` d'un lot en qa (textes et destinataires)."""
@@ -487,6 +496,34 @@ class ReviewerDesignationTest(PgTestCase):
         rows = work.list_items(self.db, limit=10)
         plan.annotate(self.db, rows)
         self.assertEqual(rows[0]["waiting_for"]["what"], "merge")
+
+    def test_la_dispense_vaut_pour_la_tete_de_sa_revue(self):
+        """#1979 (relecture ameesh-dev2) : un gel d'une autre tête, ou une
+        sortie de qa, lève la dispense — la revue suivante est due ; un gel
+        renouvelé sur le même commit la garde."""
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.milestone(self.db, lot["id"], "frozen", sha="a" * 40, actor="chef")
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.milestone(self.db, lot["id"], "frozen", sha="a" * 12, actor="chef")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], work.REVIEWER_NONE)
+
+        work.milestone(self.db, lot["id"], "frozen", sha="c" * 40, actor="chef")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
+        rows = work.list_items(self.db, limit=10)
+        plan.annotate(self.db, rows)
+        self.assertEqual(rows[0]["waiting_for"]["what"], "verdict")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("verdict required again" in n for n in notes), notes)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.move(self.db, lot["id"], "build", actor="chef")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
 
     def test_une_designation_leve_la_dispense(self):
         """#1979 : désigner un relecteur après la dispense rend la revue due."""

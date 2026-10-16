@@ -742,7 +742,7 @@ _ASSIGNEE_HINT = ("register the agent (agent-runner register <name> <harness> �
 #: elle, le registre affiche un faux « waiting: verdict » et les rappels
 #: partent à un relecteur qui n'a rien à relire. Le jeton commence par un
 #: caractère que `config.NAME_RE` refuse : il ne peut pas désigner un agent.
-REVIEWER_NONE = "-none"
+REVIEWER_NONE = _pg.REVIEWER_NONE
 
 
 def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
@@ -847,8 +847,8 @@ def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict
     composition mécanique (canon §11 bis/#87), verdict conservé d'une tête
     relue. Le registre cesse alors d'attendre un verdict (l'attente devient la
     fusion) et les rappels ne partent plus à un relecteur. Désigner un
-    relecteur, ou retirer la marque (`clear_reviewer`), rend la revue à
-    nouveau due."""
+    relecteur, retirer la marque (`clear_reviewer`), sortir de qa ou geler
+    une autre tête rend la revue à nouveau due."""
     who, item = _review_item(cfg, db, item_id, actor)
     # Un verdict bloquant COURANT demande une correction, pas une dispense :
     # la marque dormirait et dispenserait la revue suivante à tort. Les

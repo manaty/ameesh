@@ -340,8 +340,9 @@ def lot_state(work_state: str, jalons: dict) -> str:
             current = (jalons.get("verdict") or 0) >= last_frozen
         # #1979 : dispensé de re-verdict, le lot n'est pas « en revue » : il
         # est prêt à fusionner, comme après un verdict `ok` courant. Un verdict
-        # bloquant courant garde la main (une correction est due).
-        if jalons.get("verdict_kind") != "blocked" \
+        # bloquant COURANT garde la main (une correction est due), comme dans
+        # `stagnation.waiting`.
+        if not (jalons.get("verdict_kind") == "blocked" and current) \
                 and jalons.get("verdict_required", True) is False:
             return "approved"
         if jalons.get("verdict_kind") == "ok" and current:
