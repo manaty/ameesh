@@ -4,12 +4,12 @@ Recomposition après la CI rouge du run `38941239652` sur l'ancienne tête
 `16ec0d9356b35fbcb22fb75fba488a6772aca105` : retrait des lots fautifs sur attribution de première main du composeur
 (courrier bureau 18:05Z, arbitrage pilote mesh-design 18:08Z), diagnostic
 reporté au paquet suivant. Base : `origin/main` `dffe30ea`. Branche : `integration/paquet-h-20261016-1700`.
-Tête de composition : `e7009bb49`. Exécuteur désigné : **mty-amh-impl-01** (composeur,
+Tête de composition : `06e55d232`. Exécuteur désigné : **mty-amh-impl-01** (composeur,
 CI et fusion). Unités incluses : 18. Gels et avis des lots conservés
 (contenus constants, §11bis/12) ; aucune nouvelle relecture.
 
 La colonne « commit de composition » porte la preuve d'inclusion : chaque lot a
-son commit dans la branche (`git log dffe30ea..e7009bb49`). Les résolutions d'union sont
+son commit dans la branche (`git log dffe30ea..06e55d232`). Les résolutions d'union sont
 signées dans le message du commit correspondant.
 
 ## Admissions retenues à la coupure
@@ -86,6 +86,9 @@ signées dans le message du commit correspondant.
   dynamique `tests (dispatch)` et le portier restent.
 - Retraits mécaniques : `d9a80c1a7` (réparations #1467/#423), `d77716c19`
   (`interface.py`, apporté par #1359), `33c798527` (#1359) non rejoués.
+- `contract.json` : l'entrée refusée `operations.state_lots_activity`, classée
+  par le compteur de #1359, est retirée avec lui (l'opération n'existe plus dans
+  l'interface) ; compteurs dérivés **64/364/428**, `test_l107` 22 OK, rejoué.
 
 ## Contrôles de composition
 
