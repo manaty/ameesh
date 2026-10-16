@@ -772,7 +772,11 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     # règle « le relecteur n'est pas l'assigné » compare deux orthographes.
     row = registry.get(db, name)
     if row is not None:
-        return row["name"]
+        if isinstance(row, dict):
+            return row.get("name") or name
+        # Doublure de registre (tests #705 r2 N2) : pas un mapping, on garde
+        # l'orthographe demandée, comme avant #423.
+        return name
     cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     human = known_human(db, name, cfg)
     if human:
