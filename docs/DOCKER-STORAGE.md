@@ -1,34 +1,69 @@
-# Docker storage: observation and owner cleanup (#411)
+# Docker storage: observation, declared-disposable volume retention (#2003) and owner cleanup (#411)
 
-Housekeeping samples Docker storage without deleting volumes, images or build
-cache, even during `ameesh menage --apply`. It counts `dangling=true` volumes
+Housekeeping samples Docker storage and counts `dangling=true` volumes
 (no container references, including stopped containers), and reads the
-**default Docker builder's** BuildKit metadata. Each CLI call has the runtime's
-deadline, capped at 10 seconds. It avoids `docker system df` and recursive
-volume-size scans, which were slow during the owner's concurrent prune.
-Podman and an absent Docker runtime are not measured by this feature.
+**default Docker builder's** BuildKit metadata. The observation itself deletes
+nothing. Each CLI call has the runtime's deadline, capped at 10 seconds. It
+avoids `docker system df` and recursive volume-size scans, which were slow
+during the owner's concurrent prune. Podman and an absent Docker runtime are
+not measured by this feature.
 
-`ameesh menage --json` exposes `measure.docker_storage`; the text report
-shows the orphan count and private reclaimable cache bytes. The periodic
-housekeeping pass persists the same summary. `ameesh alerts` reads these
-persisted samples, without launching Docker. No migration is required.
+Since #2003 the same pass also **reaps the dangling volumes the mesh has
+declared disposable**, and only those: conservation is the default, and the
+declaration is explicit. `scripts/pg-up.sh` labels a lot bench's volume
+`ameesh.bench=disposable` only when its caller declares that bench disposable
+(`AMEESH_PG_DISPOSABLE=1`, the per-agent bench of the README); without that
+declaration it creates no label, so the volume is kept whatever its creation
+time. A shared bench (`ameesh-pg`/`agent-mesh-pg`, default volume
+`${NAME}-data`, historically `ameesh-pg-data`) is deliberately persistent and is
+**never labelled**, even if the declaration is passed: its data survives the
+container, which is that script's contract. A labelled disposable volume is
+deleted only after `docker_volume_idle` (default 24 h) of **continuous
+absence**, measured by the successive housekeeping passes: each pass journals
+the episode (`episode_since`, plus the volume's creation identity), a first
+sighting never deletes, a volume referenced again closes the episode, and a
+name recreated under the same volume opens a new one. Creation age is used as
+identity and reporting information, never as the idle delay.
 
-The default thresholds in the Host card's `policy.housekeeping` are:
+Nothing else is ever deleted automatically: an anonymous volume
+(`com.docker.volume.anonymous`) carries no mesh provenance and is never reaped
+here — a mesh container labelled `ameesh.turn` is removed with its anonymous
+volumes (`docker rm -f -v`), which is what actually stops the leak; a named
+volume without the label, or with a non-disposable label, is listed in the
+bounded `others` section with its exact `docker volume rm` command so a human
+decides. A disposable volume whose creation identity is unreadable is flagged
+without a command, since the episode's identity cannot be established. This
+preserves the #411 rule (existing named volumes are kept). `docker volume rm`
+itself refuses a volume still mounted, so a `docker run` racing the reap wins.
+Set `docker_volumes: false` in the Host card to disable reaping on one host.
+
+`ameesh menage --json` exposes `measure.docker_storage` and `measure.volumes`;
+the text report shows the orphan count, the volumes being reaped or kept, and
+the undeclared ones with their command. The periodic housekeeping pass
+persists the same summary. `ameesh alerts` reads these persisted samples,
+without launching Docker. No migration is required.
+
+The default thresholds and retention in the Host card's `policy.housekeeping`
+are:
 
 ```yaml
 docker_orphan_volumes_alert: 100
 docker_build_cache_alert: 20GiB
+docker_volumes: true          # reap declared-disposable dangling volumes
+docker_volume_idle: 24h       # continuous absence before such a volume is reaped
 ```
 
-The strictest threshold across the host's canons wins. Alerts
-`docker_orphan_volumes` and `docker_build_cache` are pushed to the responsible
-human by the standard notification routing. Errors and samples older than
-30 minutes produce `docker_storage_unavailable`: unknown is never reported
-as zero. A host needs a housekeeping sample before these alerts are available.
-The cache threshold counts private reclaimable records, excluding shared
-records and records in use. Reported total cache size is logical record
-accounting, not a promise of physical disk space recovered, especially with
-shared layers or btrfs. Other builders require a separate operator inventory.
+The strictest threshold across the host's canons wins; the longest
+`docker_volume_idle` wins, and one canon that sets `docker_volumes: false`
+disables reaping for that host. Alerts `docker_orphan_volumes` and
+`docker_build_cache` are pushed to the responsible human by the standard
+notification routing. Errors and samples older than 30 minutes produce
+`docker_storage_unavailable`: unknown is never reported as zero. A host needs a
+housekeeping sample before these alerts are available. The cache threshold
+counts private reclaimable records, excluding shared records and records in
+use. Reported total cache size is logical record accounting, not a promise of
+physical disk space recovered, especially with shared layers or btrfs. Other
+builders require a separate operator inventory.
 
 Sources: [Docker volume lifecycle](https://docs.docker.com/engine/storage/volumes/),
 [BuildKit cache accounting](https://docs.docker.com/reference/cli/docker/buildx/du/).
@@ -96,7 +131,10 @@ retains a cache budget and does not request `--all`, volume deletion or image
 pruning. It can recover less than the measured 45.28 GB because age and
 retention further restrict eligibility. Request an owner decision through
 `ameesh decide ask --lot 411 --needs-signature`; this document and the manifest
-are the reviewable scope. No cleanup is performed by the monitoring code.
+are the reviewable scope. The monitoring code performed no cleanup at the time
+of #411; #2003 (16 October 2026) later added the declared-disposable volume
+retention described at the top of this document, which only ever touches a
+dangling volume carrying `ameesh.bench=disposable`.
 
 Once the owner's volume prune has finished, refresh the read-only inventory
 before executing any separately approved action. If anonymous volumes remain,

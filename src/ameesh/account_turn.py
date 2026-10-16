@@ -61,6 +61,13 @@ def _harness(worker) -> str:
     return own_harness(worker)
 
 
+def session_model(worker, book) -> str:
+    """Le modèle du prochain tour de l'agent sur son harnais, comme le runner
+    le passe : celui du registre (`ameesh set <agent> model=…`), sinon l'état
+    local (`<state>/<agent>/model`) ; '' si aucun (#1580 tranche 3)."""
+    return (getattr(worker, "agent", None) or {}).get("model") or book.model_of(worker.name)
+
+
 def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None) -> str | None:
     """Choisit le compte du prochain tour. None : aucun compte déclaré.
 
@@ -87,7 +94,10 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
                                  agent=worker.name, paced=pause,
                                  session_account=session_account(worker, items),
-                                 critical=is_critical(worker), margin=bool(margin))
+                                 critical=is_critical(worker), margin=bool(margin),
+                                 # #1580 (tranche 3) : les seaux propres au
+                                 # modèle de l'agent comptent pour lui seul
+                                 model=session_model(worker, book))
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -142,7 +152,11 @@ def fallback(worker, reason: str, limits=None) -> str:
                 choice = accounts.choose(
                     worker.db, worker.cfg.host, harness, items, book, agent=worker.name,
                     critical=True, session_account=session_account(worker, items)
-                    if session_harness(worker) == harness else None)
+                    if session_harness(worker) == harness else None,
+                    # #1580 (tranche 3) : sous un harnais emprunté, le tour
+                    # part sans modèle (runner) : modèle inconnu, les seaux
+                    # de modèle sont écartés
+                    model="")
                 if choice.profile is None or choice.auth_blocked:
                     continue
                 profile = choice.profile
@@ -456,7 +470,7 @@ def continuity(worker) -> bool:
 
 
 def summary_possible(old, book, items, now: float | None = None, *,
-                     sick: dict | None = None) -> tuple[bool, str]:
+                     sick: dict | None = None, model=None) -> tuple[bool, str]:
     """L'ancien compte peut-il encore porter le tour de résumé d'une rotation ?
     (L39, décision 0030) `(vrai, "")` ou `(faux, raison)`.
 
@@ -481,7 +495,8 @@ def summary_possible(old, book, items, now: float | None = None, *,
             sick[old.name].get("reason") or "?")
     now = time.time() if now is None else now
     try:
-        gauges = accounts.gauges_of(book, old, items) if book is not None else []
+        gauges = (accounts.gauges_of(book, old, items, model=model, now=now)
+                  if book is not None else [])
     except Exception as exc:
         # L226b : jauges illisibles — pas d'appel de modèle dans le doute
         return False, "%s gauges unreadable (%s)" % (old.harness, exc)
@@ -693,7 +708,8 @@ def _fallback_available(cfg, db, name: str, own: str, limites, *, now: float,
 
 def _is_critical(cfg, db, name: str, row: dict) -> bool:
     """`auditor.is_critical` sans exécuteur (rôles du canon, orchestrateurs
-    déclarés) : rôles illisibles, l'agent est jugé ordinaire."""
+    déclarés). Rôles illisibles : repli critique (#424 r6, fail-closed), comme
+    `auditor.is_critical` et `Runner.is_critical`."""
     from . import auditor as auditor_mod
     from . import sous_utilisation
 
@@ -701,8 +717,8 @@ def _is_critical(cfg, db, name: str, row: dict) -> bool:
         canons = auditor_mod.load_all(cfg, strict=False) if cfg is not None else []
         declared = sous_utilisation.declared_orchestrators()
         return auditor_mod.is_critical(cfg, db, name, canons, declared=declared, agent=row)
-    except Exception:  # noqa: BLE001 - rôles illisibles : le choix ordinaire
-        return False
+    except Exception:  # noqa: BLE001 - rôles illisibles : repli critique (#424 r6)
+        return True
 
 
 def rotate_harness(worker, old_harness: str, new_harness: str, session: str) -> bool:
@@ -751,7 +767,10 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
                                      tools={worker.name: harness})
             possible, raison = summary_possible(
                 old, book, accounts.profiles(worker.cfg, harness),
-                sick=auth_failure.failing(worker.db, worker.cfg.host, harness))
+                sick=auth_failure.failing(worker.db, worker.cfg.host, harness),
+                # #1580 (tranche 3) : le seau d'un autre modèle ne bloque pas
+                # le résumé de cet agent
+                model=session_model(worker, book))
         except Exception as exc:
             possible, raison = False, "state of the old account unreadable (%s)" % exc
         if not possible:

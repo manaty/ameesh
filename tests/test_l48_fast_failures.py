@@ -41,7 +41,8 @@ class EchecsRapidesTest(PgTestCase):
 
     def _boucle(self, worker, resultats):
         """Fait tourner `run()` sur une suite de tours simulés (True = réussi,
-        False = échec rapide, None = échec lent), sans attente réelle."""
+        False = échec rapide, None = échec lent, « differe » = tour reporté
+        #1686), sans attente réelle."""
         suite = iter(resultats)
 
         def tour(_spec):
@@ -49,6 +50,12 @@ class EchecsRapidesTest(PgTestCase):
             if r == "fin":
                 worker.stopping.set()
                 return True
+            if r == "differe":
+                # #1686 N2 : tour reporté (attach ou verrou de session) ; il
+                # n'a pas échoué et `fast_failure` garde la valeur du tour
+                # précédent, comme dans le worker réel (le chemin court ne
+                # repasse pas par `_run_guarded_turn`).
+                return None
             worker.fast_failure = r is False
             return bool(r)
 
@@ -86,3 +93,25 @@ class EchecsRapidesTest(PgTestCase):
         worker = self._worker(max_fast_failures=2)
         self._boucle(worker, [None, None, None, False])
         self.assertNotEqual(registry.get(self.db, "rapide")["status"], "stopped")
+
+    def test_tour_differe_ne_compte_pas_comme_un_echec(self):
+        """#1686 N2 : un tour reporté (attach demandé ou verrou de session tenu)
+        n'a pas échoué — la consigne est restaurée. Il ne compte ni comme échec
+        rapide, ni comme échec lent : pas d'attente d'échec (5 s), seulement le
+        pas court de nouvelle tentative (0,5 s)."""
+        worker = self._worker(max_fast_failures=2)
+        attentes = self._boucle(worker, ["differe", "differe", "differe", False])
+        self.assertEqual(secondes(attentes), [0.5, 0.5, 0.5, 5.0])
+        self.assertNotEqual(registry.get(self.db, "rapide")["status"], "stopped")
+
+    def test_tour_differe_ne_remet_pas_la_serie_a_zero(self):
+        """Un report ne masque pas les échecs rapides qui l'entourent : la série
+        continue de compter et l'agent s'arrête au seuil, sans attente après
+        l'arrêt."""
+        worker = self._worker(max_fast_failures=2)
+        attentes = self._boucle(worker, [False, "differe", False])
+        self.assertEqual(secondes(attentes), [5.0, 0.5])
+        self.assertEqual(worker.fast_failures, 2)
+        row = registry.get(self.db, "rapide")
+        self.assertEqual(row["status"], "stopped")
+        self.assertEqual(row["stop_reason"], "erreur")

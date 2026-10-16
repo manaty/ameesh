@@ -86,6 +86,39 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
+    def test_branche_citee_d_un_autre_lot_n_est_pas_reprise(self):
+        """#1646 : la branche du parent d'un lot empilé, citée par un courrier,
+        ne devient pas la branche du lot — sa fusion le clorait sans son delta."""
+        parent = work.add(self.db, title="parent empilé", assignee="dev1",
+                          branch="agent/dev1-parent")
+        enfant = work.add(self.db, title="suite empilée", assignee="dev2")
+        proc = self.send("dev2", "Reprends sur agent/dev1-parent puis pousse.", "--from",
+                         "orch", "--lot", str(enfant["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("branch agent/dev1-parent already belongs to lot #%d" % parent["id"],
+                      proc.stderr)
+        self.assertIsNone(work.get(self.db, enfant["id"])["branch"])
+        self.assertEqual(work.get(self.db, parent["id"])["branch"], "agent/dev1-parent")
+        # une branche que personne ne porte reste posée (inchangé)
+        proc = self.send("dev2", "Ta branche : agent/dev2-enfant.", "--from", "orch",
+                         "--lot", str(enfant["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, enfant["id"])["branch"], "agent/dev2-enfant")
+
+    def test_branche_citee_d_un_autre_lot_sur_new_lot(self):
+        """#1646 : même garde à la création par courrier."""
+        parent = work.add(self.db, title="parent empilé", assignee="dev1",
+                          branch="agent/dev1-parent")
+        proc = self.send("dev2", "Nouveau lot, base agent/dev1-parent.", "--from", "orch",
+                         "--new-lot", "suite du parent", "--estimate", "1h", "--app", "p",
+                         "--new-project")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = work.list_items(self.db, assignee="dev2")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["branch"])
+        self.assertIn("branch agent/dev1-parent already belongs to lot #%d" % parent["id"],
+                      proc.stderr)
+
     def test_lot_d_un_autre_agent_jamais_repris(self):
         lot = work.add(self.db, title="implémentation", assignee="dev1")
         proc = self.send("dev2", "Relis le lot de dev1.", "--from", "orch", "--lot",
@@ -429,6 +462,20 @@ class BranchMergeTest(_Base):
         report = self.sync()
         self.assertEqual(report["results"][0]["how"], "vu-ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_show_etiquette_la_tete_vue_au_balayage(self):
+        """#1899 : la tête en avance affichée vient du dernier balayage, pas de
+        la forge — deux triages faux le 16/10 l'ont lue comme la tête réelle."""
+        self.branch("agent/dev1-cache", "c1")
+        lot = self.lot("agent/dev1-cache")
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        tete = work.get(self.db, lot["id"])["branch_head"]
+        self.assertTrue(tete)
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("tête en avance vue au dernier balayage : %s" % tete[:12], proc.stdout)
+        self.assertIn("vérifier à la forge", proc.stdout)
+        self.assertNotIn("last commit seen ahead", proc.stdout)
 
     def test_squash_puis_branche_supprimee(self):
         self.branch("agent/dev1-sq", "s1", "s2")

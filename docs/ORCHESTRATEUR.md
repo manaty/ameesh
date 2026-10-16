@@ -611,7 +611,10 @@ relis :
 ## Livraison et déploiements
 
 Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
-restée 4 h fusionnée sans être déployée :
+restée 4 h fusionnée sans être déployée, actualisées selon le
+[canon « Processus de lot » §14](https://github.com/manaty/home/blob/c838dd3e94bf/processus/lots.md#14-staging-et-prod-dameesh)
+(owner, 2026-10-14 vers 02:45, session bureau Claude
+`17076001-2b29-414c-a288-06791a5d9719`), source unique :
 
 1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
    propriétaire se fusionne avant tout nouveau chantier.
@@ -620,14 +623,23 @@ restée 4 h fusionnée sans être déployée :
    `deploy/mise-a-jour` (vérifier, sauvegarder, migrer, installer, redémarrer
    hors tour, contrôler, retour possible). Le propriétaire et les agents
    touchés sont prévenus après coup.
-3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,
+3. **Le staging d'ameesh se déploie sans go du propriétaire ni procédure de
+   release**, y compris sur pc-smichea, pour une nouvelle fonction, une version
+   mineure ou une migration additive. Suivre `deploy/mise-a-jour/` : migrations
+   additives avant de relancer les exécuteurs, VM d'agents d'abord, pc-smichea
+   en dernier et seulement si les VM sont saines (runners redémarrés publiant
+   leur vivacité, `ameesh doctor` vert et courrier test livré). Un hôte malsain
+   revient à la version précédente (étape `retour`) et le déploiement s'arrête.
+   Les hôtes ameesh-agents-1, ameesh-agents-2, manaty-mesh-1 et pc-smichea sont
+   le staging ; la prod est une installation utilisée hors du mesh qui construit
+   ameesh. **Un déploiement en prod se prépare entièrement** (nouvelle fonction,
    version mineure, migration qui change le comportement) : étiquette posée,
    `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
-   verifier <REF>` passés, plan de retour connu (étape `retour`). Ils sont
-   proposés au propriétaire dès son retour, en premier point, avec les choix
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Il est
+   proposé au propriétaire dès son retour, en premier point, avec les choix
    possibles : version seule ou `main` entier, migrations, risques. Une
-   consigne de veille ne se contente jamais d'interdire « tout déploiement »
-   sans le préparer. Les gestes en production d'un projet, les dépenses et les
+   consigne de veille prépare le staging sans lui appliquer cette attente.
+   Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,

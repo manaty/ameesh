@@ -564,6 +564,26 @@ class ResidentRunnerTest(PgTestCase):
         controles = [e["control"] for e in self._trace() if "control" in e]
         self.assertEqual(controles.count("initialize"), 2)   # démarrage + sonde
 
+    def test_a_push_of_the_probe_never_enters_the_next_turn(self):
+        # #1337 (#1780, dev2) : le CLI pousse sa liste de commandes
+        # (`system/commands_changed`) de façon asynchrone après la réponse à
+        # `initialize` — donc après le drain qui précède l'envoi, quand le
+        # tour est déjà ouvert. Cette poussée n'est pas un événement du tour :
+        # elle n'entre pas dans le flux (le faux harnais trace qu'il a poussé).
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_PUSH_AFTER": "0.4"}):
+            _runner, worker = self._worker()
+            self.assertTrue(self._turn(worker, "un"))
+            rp = worker.resident
+            self._probe_due(rp)
+            self.assertTrue(self._turn(worker, "SLOW deux"))
+        self.assertIs(worker.resident, rp)
+        self.assertTrue([e for e in self._trace() if e.get("push")],
+                        "the fake harness pushed nothing")
+        with open(worker._path("events.jsonl"), encoding="utf-8") as fh:
+            flux = fh.read()
+        self.assertNotIn("commands_changed", flux)
+        self.assertIn("ECHO:SLOW deux", flux)
+
     def test_a_silent_resident_before_a_turn_serves_it_one_per_event(self):
         # T3 (#285): probed before the turn; silent -> stopped, T2 failure
         # series, and the turn runs on its own harness (no fresh resident)
