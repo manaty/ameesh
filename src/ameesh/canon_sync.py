@@ -11,6 +11,14 @@ canonique seulement (voir `sync_authenticators`) :
   avant tout contrôle (clé indépendante du clone, de l'hôte et du chemin) ;
   sous ce verrou, le dernier commit appliqué (journal `authenticator_syncs`)
   est relu et un commit qui n'en descend pas n'est jamais écrit ;
+* **le clone suit le journal** (L814) : le journal est unique par canon, tous
+  hôtes confondus ; `sync` rattrape le clone de l'hôte AVANT de le juger —
+  fetch quand un dernier commit appliqué est inconnu du dépôt, relecture, puis
+  fast-forward du checkout à la révision lue, seulement après les contrôles de
+  confiance et de monotonie (une révision non fusionnée refuse sans déplacer le
+  checkout). Un checkout qui ne peut pas la contenir (clone divergé,
+  modifications locales) fait refuser l'écriture des authentificateurs : jamais
+  de registre en avance sur ce que l'hôte a ;
 * **la branche canonique ne vient jamais du commit lu** (B2) : configuration
   de l'hôte (`AMEESH_CANON_REF` / `canon_ref`), sinon manifeste du dernier
   commit appliqué, sinon amorçage explicite (`canon sync --bootstrap-ref`,
@@ -137,6 +145,8 @@ from dataclasses import dataclass, field
 
 from . import canon as canon_mod
 from . import fil
+from . import harnesses
+from . import mechanics
 from . import placement as placement_mod
 from . import receipts, registry, storage
 from . import visibility as visibility_mod
@@ -156,7 +166,11 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
                "priority", "admitted_hosts", "admitted_tags", "memory_repository",
                "visibility_ok", "visibility_diagnostic",
-               "placement_ok", "placement_diagnostic", "placement_ref", "projects")
+               "placement_ok", "placement_diagnostic", "placement_ref", "projects",
+               # L244 (#420) : les rôles déclarés d'une fiche Agent/Persona,
+               # persistés pour le garde SQL du rôle QA. Le vocabulaire est
+               # celui des fiches (L242c, #414) ; aucune criticité n'est écrite.
+               "roles")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -178,6 +192,23 @@ class CanonUnreadable(canon_mod.CanonError):
         self.host = host
         self.diagnostic = diagnostic
         self.findings = findings
+
+
+class CanonStale(canon_mod.CanonError):
+    """Processus plus vieux que le paquet installé (L780) : rien n'est écrit.
+
+    Un exécuteur non redémarré après une livraison porte l'ancien code — dont
+    l'ancien validateur de descripteurs — alors que le paquet sur disque a
+    changé. Ses constats ne valent pas pour le paquet en place : `sync`
+    s'arrête AVANT toute écriture, `canon_state` reste celui du dernier passage
+    valide (les responsables et les placements aussi), et l'appelant demande un
+    redémarrage entre deux tours.
+    """
+
+    def __init__(self, host: str, reason: str):
+        super().__init__("outdated code, canon unchanged: %s" % reason)
+        self.host = host
+        self.reason = reason
 
 
 @dataclass
@@ -289,6 +320,8 @@ class SyncReport:
     packages: "PackageSync | None" = None
     #: #538 : règles de travail (fiches Process) poussées aux agents de l'hôte
     processes: "ProcessSync | None" = None
+    #: #1616 : paramètres mécaniques compilés du canon appliqué (constat)
+    mechanics: "MechanicsSync | None" = None
 
     @property
     def errors(self) -> list[Finding]:
@@ -313,7 +346,9 @@ class SyncReport:
                                    if self.authenticators is not None else None),
                 "packages": self.packages.to_dict() if self.packages is not None else None,
                 "processes": (self.processes.to_dict()
-                              if self.processes is not None else None)}
+                              if self.processes is not None else None),
+                "mechanics": (self.mechanics.to_dict()
+                              if self.mechanics is not None else None)}
 
 
 # --------------------------------------------------------------------------
@@ -674,6 +709,163 @@ def last_applied(db: Db, canon: str = "") -> dict | None:
     return row
 
 
+def _floor_commits(canon: Canon, last: dict) -> list[tuple[canon_mod.Source, str]]:
+    """[(source git, dernier commit appliqué de ce membre)] pour ce canon lu."""
+    pairs: list[tuple[canon_mod.Source, str]] = []
+    if not canon.sources:
+        return pairs
+    root = canon.sources[0]
+    if root.mode == "git" and last.get("root_commit"):
+        pairs.append((root, last["root_commit"]))
+    floors = last.get("commits") or {}
+    for source in canon.sources[1:]:
+        floor = floors.get(source.member)
+        if source.mode == "git" and floor:
+            pairs.append((source, floor))
+    return pairs
+
+
+def _mutable_tracking_ref(source: canon_mod.Source) -> bool:
+    """La révision lue est-elle une ref de suivi distante, qu'un fetch avance ?
+
+    `origin/main`, la forme que `canon.load` donne au manifeste : oui. Un SHA,
+    une expression de révision, `HEAD`, une branche locale ou une ref explicite :
+    non — un fetch ne les avance pas, une relecture seule ne peut donc pas
+    rattraper le clone et le refus de monotonie doit rester tel quel (R1 #814)."""
+    tracked = canon_mod.remote_branch(source.repo, source.rev)
+    if not tracked:
+        return False
+    name = source.rev
+    if name.startswith("refs/remotes/"):
+        name = name[len("refs/remotes/"):]
+    return name == tracked
+
+
+def _catch_up_needed(canon: Canon, last: dict) -> tuple[bool, bool]:
+    """(relire, fetcher) : ce clone est-il en retard sur le journal ?
+
+    `fetch` quand un dernier commit appliqué est INCONNU du dépôt : un commit
+    connu mais absent de ce qui est lu (historique réécrit, `--ref` d'une autre
+    branche) ne sera pas apporté par un fetch ; relire suffit à reprendre les
+    références qu'un autre passage vient de fetcher (L814).
+
+    `fetch` AUSSI quand un floor CONNU descend strictement la révision lue sur
+    une ref de suivi distante : le suivi local est périmé (le commit du journal
+    a été vu par un autre chemin : autre ref, aperçu, fetch ciblé), et relire
+    sans fetch retrouverait la même révision — la monotonie refuserait à chaque
+    passe sans jamais rattraper le clone (R1 #814). Un floor connu absent d'une
+    révision divergente, d'un commit explicite ou d'une branche locale n'est pas
+    apporté par un fetch : la relecture seule et le refus restent."""
+    reread = fetch = False
+    for source, floor in _floor_commits(canon, last):
+        if source.commit == floor:
+            continue                  # déjà ce que le journal a appliqué : rien à lire
+        if canon_mod.git_commit(source.repo, floor) is None:
+            return True, True
+        if not canon_mod.git_contains(source.repo, floor, source.commit):
+            reread = True
+            if (canon_mod.git_contains(source.repo, source.commit, floor)
+                    and _mutable_tracking_ref(source)):
+                fetch = True
+    return reread, fetch
+
+
+def _follow_checkout(canon: Canon) -> str:
+    """Le clone canonique contient-il la révision lue ? Sinon, l'avance
+    (fast-forward seulement) ; rend le refus, à ne pas écrire au registre.
+
+    Un canon illisible ne suit jamais : rien n'a pu être vérifié (R2 cx2)."""
+    if not canon.sources:
+        return ""
+    root = canon.sources[0]
+    if root.mode != "git" or root.prefix or canon.untrusted or not canon.readable:
+        return ""                      # clone dédié seulement : jamais un dépôt partagé
+    head = canon_mod.git_commit(root.repo, "HEAD")
+    if head and canon_mod.git_contains(root.repo, root.commit, head):
+        return ""                      # le checkout contient déjà la révision lue
+    error = canon_mod.git_fast_forward(root.repo, root.commit)
+    if error:
+        # un autre passage a pu avancer le checkout entre-temps (plusieurs
+        # exécuteurs par hôte) : le refus ne vaut que si HEAD ne contient
+        # toujours pas la révision lue
+        head = canon_mod.git_commit(root.repo, "HEAD")
+        if head and canon_mod.git_contains(root.repo, root.commit, head):
+            error = ""
+    if not error:
+        # l'écart signalé à la lecture n'existe plus ; les modifications
+        # locales, elles, restent signalées (elles n'ont pas été touchées)
+        canon.load_findings[:] = [f for f in canon.load_findings
+                                  if f.code != "canon-local-divergence"]
+        return ""
+    head = canon_mod.git_commit(root.repo, "HEAD") or "?"
+    return ("canon checkout %s @ %s does not contain the applied revision %s and "
+            "cannot fast-forward it (%s): authenticator registry unchanged — bring "
+            "the checkout up to date (git -C %s merge --ff-only %s)"
+            % (root.repo, head[:12], root.commit[:12], error, root.repo,
+               root.commit[:12]))
+
+
+def catch_up(db: Db, canon: Canon, host: str, key: str | None = None, *,
+             trusted_ref: str | None = None,
+             bootstrap_ref: str = "") -> tuple[Canon, str]:
+    """Rattrape le clone de l'hôte sur le journal du canon (L814).
+
+    Le journal des authentificateurs est unique par canon, tous hôtes
+    confondus : un hôte dont le clone n'a pas fetché lit un commit antérieur
+    au dernier commit appliqué et `_check_descends` le refuse — sans jamais
+    pouvoir se rattraper, aucune passe ne fetchant d'elle-même. Ici, quand un
+    dernier commit appliqué est inconnu du dépôt, les dépôts du canon sont
+    fetchés et le canon relu UNE fois ; quand il est connu mais absent de ce
+    qui est lu, le canon est relu — avec fetch si un floor connu descend la
+    révision lue sur une ref de suivi distante (suivi local périmé, `_catch_up_needed`),
+    sans fetch sinon (historique divergent, `--ref` explicite ou branche locale).
+
+    Puis le checkout du clone canonique suit la révision lue
+    (`canon.git_fast_forward`, fast-forward seulement) — mais seulement après
+    les contrôles de confiance et de monotonie (`_verify`) sur le canon relu :
+    une révision non fusionnée lue par `--ref` ne doit pas avancer le checkout
+    avant d'être refusée (relecture R1/R2 du 13/10). Un canon illisible, à
+    l'entrée comme après la relecture, n'avance jamais le checkout : la lecture
+    en échec conserve la source racine, mais rien n'a pu être vérifié et le
+    refus `CanonUnreadable` suit (R2 cx2, 13/10). `trusted_ref` (None : la
+    configuration de l'hôte pour ce canon) et `bootstrap_ref` sont ceux de
+    l'appelant ; ils refont foi sous le verrou (`_sync_locked`). Rend
+    `(canon, refus)` : `refus` n'est non vide que si le canon relu ne passe
+    pas ces contrôles, ou si le checkout ne peut pas contenir cette révision
+    (clone divergé, modifications locales écrasées) — `sync_authenticators`
+    refuse alors d'écrire, registre et checkout inchangés.
+
+    Lecture seule pour le registre : l'appelant reste seul juge (`_verify`,
+    sous le verrou, relit le journal)."""
+    if key is None:
+        key = state_key(db, canon, host)
+    if trusted_ref is None:
+        trusted_ref = configured_ref(db, canon)
+    last = last_applied(db, key)
+    if last is not None:
+        reread, fetch = _catch_up_needed(canon, last)
+        if reread or fetch:
+            canon = canon_mod.load(canon.root, ref=canon.rev, untrusted=canon.untrusted,
+                                   fetch=fetch, default=canon.is_default)
+    # L814 (R1/R2) : contrôles AVANT toute mutation du checkout — sinon un ref
+    # non fusionné, descendant du dernier appliqué, avance HEAD puis se fait
+    # refuser : registre intact mais canon local modifié.
+    if not canon.readable:
+        # R2 cx2 : la source racine est ajoutée avant la lecture des membres et
+        # des fiches ; une GitError/OSError ultérieure rend `readable` faux sans
+        # vider `sources`. Rien n'a pu être vérifié (ni branche canonique, ni
+        # monotonie) : le checkout ne bouge pas, la passe refuse ensuite
+        # (CanonUnreadable). Un `--ref` descendant non fusionné ne déplace donc
+        # jamais HEAD.
+        return canon, ""
+    if not canon.untrusted and canon.sources:
+        try:
+            _verify(canon, last, trusted_ref, bootstrap_ref)
+        except _Refused as exc:
+            return canon, str(exc)
+    return canon, _follow_checkout(canon)
+
+
 def _applied_branch(root: canon_mod.Source, last: dict) -> str:
     """La branche canonique selon le manifeste du DERNIER commit appliqué
     (`ref` de son membre racine), sinon celle contre laquelle ce commit a été
@@ -899,7 +1091,7 @@ def registry_members(canon: Canon) -> list[dict]:
 
 def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
                         bootstrap_ref: str = "", host: str = "",
-                        key: str | None = None) -> AuthenticatorSync:
+                        key: str | None = None, checkout_block: str = "") -> AuthenticatorSync:
     """Canon → registre des authentificateurs (§8.2) : le SEUL point d'entrée.
 
     Écriture de confiance. Rien n'est écrit si le canon est illisible ou lu
@@ -932,6 +1124,10 @@ def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
     L44 (0031) : `key` est le canon du registre et du journal ('' = canon par
     défaut ; None : `state_key(db, canon, host)`, la clé de son état). Tout
     — journal, monotonie, retard, révocations — est borné à ce canon.
+
+    `checkout_block` (L814) : le clone de l'hôte ne peut pas contenir la
+    révision lue (clone divergé, modifications locales) — un refus y est
+    inscrit AVANT l'écriture, le registre reste inchangé (`catch_up`).
     """
     if key is None:
         key = state_key(db, canon, host)
@@ -949,7 +1145,8 @@ def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
                                  canon=key)
     try:
         return storage.of(db).authenticators.under_registry_lock(
-            lambda lock: _sync_locked(lock, canon, trusted_ref, bootstrap_ref, host, key))
+            lambda lock: _sync_locked(lock, canon, trusted_ref, bootstrap_ref, host, key,
+                                      checkout_block))
     except receipts.RegistryLockError as exc:
         return AuthenticatorSync(AUTH_REFUSED, "%s: transaction rolled back" % exc, canon=key)
     except _Concurrent as exc:
@@ -965,16 +1162,23 @@ def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
 
 
 def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,
-                 bootstrap_ref: str, host: str, key: str = "") -> AuthenticatorSync:
+                 bootstrap_ref: str, host: str, key: str = "",
+                 checkout_block: str = "") -> AuthenticatorSync:
     """Contrôles et écritures, dans la transaction et sous le verrou du
     registre (`lock` : son jeton ; `lock.db` : la transaction) — pour le
-    registre et le journal du canon `key` seulement (L44)."""
+    registre et le journal du canon `key` seulement (L44).
+
+    `checkout_block` (L814) : refus d'`catch_up` — contrôles faits, le clone de
+    l'hôte ne contient pas la révision lue ; rien n'est écrit."""
     tx = lock.db
     last = last_applied(tx, key)
     try:
         branch, trust, notes = _verify(canon, last, trusted_ref, bootstrap_ref)
     except _Refused as exc:
         return AuthenticatorSync(AUTH_REFUSED, str(exc), canon=key)
+    if checkout_block:
+        return AuthenticatorSync(AUTH_REFUSED, checkout_block, trust=trust, branch=branch,
+                                 notes=notes, canon=key)
     ahead, unread = _lag(tx, canon, key)
     if ahead:
         return AuthenticatorSync(AUTH_REFUSED, (
@@ -1128,7 +1332,7 @@ def _same(row: dict, values: dict) -> bool:
         if key == "budget_usd":
             old = None if old is None else float(old)
             new = None if new is None else float(new)
-        if key in ("capabilities", "projects"):
+        if key in ("capabilities", "projects", "roles"):
             old = None if old is None else list(old)
         if old != new:
             return False
@@ -1160,9 +1364,27 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     """
     if trusted_ref is None:
         trusted_ref = configured_ref(db, canon)
+    # L780 : un processus plus vieux que le paquet installé ne juge pas le
+    # canon — son validateur peut refuser un descripteur neuf légitime
+    # (`codex.json` : `modes` sans `flag`, refusé par l'ancien code). Rien
+    # n'est écrit : `canon_state`, responsables et placements restent au
+    # dernier passage valide, l'hôte se ferme (fail closed) le temps du
+    # redémarrage de l'exécuteur.
+    stale = harnesses.stale_reason()
+    if stale:
+        raise CanonStale(host, stale)
     # L42 (0031) : clé d'état et identité effective de CE canon ; seules ses
     # lignes (colonne `canon`, NULL = canon par défaut) sont lues et écrites
     key = state_key(db, canon, host)
+    # L814 : le journal des authentificateurs est global par canon ; la passe
+    # rattrape le clone (fetch, relecture, fast-forward du checkout) AVANT de
+    # le juger — sinon un hôte dont le clone n'a pas fetché refuse sans fin.
+    # Les contrôles de confiance et de monotonie passent avant le fast-forward
+    # (R1/R2) ; `checkout_block` non vide : contrôle refusé ou checkout qui ne
+    # peut pas contenir la révision lue, les authentificateurs refuseront
+    # d'écrire (registre et checkout inchangés).
+    canon, checkout_block = catch_up(db, canon, host, key, trusted_ref=trusted_ref,
+                                     bootstrap_ref=bootstrap_ref)
     ident = key or canon.id
     owner = (ident, canon.is_default)
 
@@ -1181,6 +1403,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     if status != CANON_OK:
         record_state(db, host, status, diagnostic, canon, key=key)
     block = canon_mod.blocking(findings)
+    #: L780 : le canon est invalide POUR CET HÔTE (erreur sans sujet, ou liée à
+    #: sa fiche Host). La réclamation est déjà fermée par `canon_state` : une
+    #: telle erreur ne doit pas détruire le dernier responsable résolu.
+    host_wide = bool(block.global_errors or block.by_host.get(host))
     actions: list[SyncAction] = []
 
     # L31 (0029) : une fiche `Placement` est une ADMISSION (hôtes nommés ou
@@ -1237,7 +1463,18 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # l'agent est (ou devient) de cet hôte : il reçoit les règles
             process_agents.add(name)
         reasons = block.reasons(name, [host])
-        responsible = canon.resolve_human(agent.responsible) if not reasons else None
+        # L780 (R14) : une erreur PROPRE à l'agent vide son responsable — sa
+        # fiche ne le confirme plus. Une erreur d'hôte ou sans sujet, elle,
+        # ferme déjà toute réclamation par `canon_state` (fail closed) et ne
+        # détruit pas le dernier responsable résolu (`keep last_good`) :
+        # l'attribution d'un lot reste ouverte (L46), et la réparation du canon
+        # rend les agents réclamables sans réécriture manuelle.
+        if block.by_agent.get(name):
+            responsible = None
+        elif host_wide:
+            responsible = row["responsible"] if row is not None else None
+        else:
+            responsible = canon.resolve_human(agent.responsible)
         verdict = placement_mod.evaluate(canon, name, host)
         # L31 (0029) : règle de visibilité, repliée dans le verdict de placement
         # (fail closed ; sans dépôt de mémoire, sans objet).
@@ -1265,6 +1502,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # stays the primary one for the readers of a single project
             "team": agent.team,
             "projects": agent.effective_projects,
+            # L244 (#420): les rôles déclarés, vocable des fiches (L242c, #414),
+            # pour que le garde SQL du verdict QA les lise au registre.
+            "roles": agent.roles,
             "provider": agent.provider,
             "credential_mode": admission.credential_mode or agent.credential_mode,
             # `approve` n'entre jamais au registre (R8) ; la fiche est de toute
@@ -1344,8 +1584,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if unverifiable:
             # Fiche invérifiable : ni arrêté (le retrait n'est pas constaté), ni
             # réclamable (son responsable n'est plus confirmé par le canon, son
-            # placement non plus).
-            _clear_responsible(db, name, host, owner)
+            # placement non plus). L780 : seul un membre NON LU, dont la fiche
+            # n'est pas confirmée, vide le responsable ; un canon globalement
+            # invalide garde le dernier responsable résolu (keep last_good) —
+            # `canon_state` ferme déjà la réclamation.
+            if member not in loaded:
+                _clear_responsible(db, name, host, owner)
             verdict = placement_mod.Verdict(
                 name, host, False, "unverifiable placement: %s" % unverifiable,
                 row.get("placement_ref"))
@@ -1396,6 +1640,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     _inherit_placements(db, host, canon)
     packages = sync_packages(db, canon, findings, ident=ident)
     findings.extend(packages.findings)
+    # #1616 : compilation des paramètres mécaniques du canon appliqué. Un
+    # document absent ou mal formé est un CONSTAT, jamais une fermeture du
+    # canon : les consommateurs raccordés, eux, refusent (lecteur strict).
+    machine = sync_mechanics(canon)
     processes = ProcessSync()
     if status == CANON_OK:
         # #538 : les règles de travail modifiées partent aux agents de cet hôte
@@ -1411,13 +1659,14 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     # journal (clé `key`, celle de son état) ; un refus ou une erreur de l'un
     # n'est inscrit que dans SON état et ne touche pas le registre de l'autre.
     authenticators = sync_authenticators(db, canon, trusted_ref=trusted_ref,
-                                         bootstrap_ref=bootstrap_ref, host=host, key=key)
+                                         bootstrap_ref=bootstrap_ref, host=host, key=key,
+                                         checkout_block=checkout_block)
     # jamais silencieux : diagnostic durable (canon_state) et fil
     record_authenticators(db, host, authenticators, key)
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
                       actions=actions, findings=findings, status=status,
                       diagnostic=diagnostic, authenticators=authenticators,
-                      packages=packages, processes=processes)
+                      packages=packages, processes=processes, mechanics=machine)
 
 
 # --------------------------------------------------------------------------
@@ -1472,6 +1721,19 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
 
     with db.transaction() as tx:
         st = storage.of(tx)
+        # #802/#831 : au démarrage d'un hôte, N exécutants synchronisent le même
+        # canon en parallèle. Sans sérialisation, chacun lit le même état
+        # initial (`before`), rejoue les mêmes upserts et attend les verrous de
+        # ligne du premier : la file de verrous dépasse statement_timeout, le
+        # sync échoue et la porte d'hôte reste fermée (« canon not read in
+        # full, no claim »). Le verrou est pris AVANT la lecture
+        # (`packages.lock_sync`) : une fois le premier sync commité, les
+        # suivants relisent l'état à jour et n'écrivent rien. Lié à la
+        # transaction, il est relâché au commit comme au rollback ; un seul
+        # verrou par schéma, tous canons confondus — les identifiants de
+        # paquets sont globaux (le premier canon qui en déclare un le garde),
+        # et la bascule du canon par défaut écrit la même colonne.
+        st.packages.lock_sync()
         before = {row["id"]: row for row in st.packages.all(include_absent=True)}
         seen: set[str] = set()
         for package in canon.packages:
@@ -1510,6 +1772,86 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
         st.packages.retire(gone)
         done.retired = sorted(gone)
         done.relinked = st.work.refresh_package_parents()
+    return done
+
+
+# --------------------------------------------------------------------------
+# paramètres mécaniques (#1616)
+# --------------------------------------------------------------------------
+
+@dataclass
+class MechanicsSync:
+    """#1616 : le bloc mécanique (`processus/mecanique.yaml`) compilé au commit
+    appliqué. Constat : un document absent ou invalide ne ferme pas le canon
+    (les consommateurs raccordés refusent, eux, par [`mechanics.load`])."""
+
+    #: `ok` (compilé), `absent` (pas de document au commit), `invalid`
+    #: (schéma ou règle refusés), `untrusted` (pas de commit exact)
+    status: str = "absent"
+    schema: str = ""
+    timezone: str = ""
+    cutoffs: list[str] = field(default_factory=list)
+    #: cadence des paquets horaires (#1757) ; liste vide = aucune cadence déclarée
+    packets: list[str] = field(default_factory=list)
+    max_in_build: int = 0
+    ci: dict = field(default_factory=dict)
+    reviews: dict = field(default_factory=dict)
+    projects: list[str] = field(default_factory=list)
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        out = {"status": self.status, "schema": self.schema,
+               "timezone": self.timezone, "cutoffs": list(self.cutoffs),
+               "packets": list(self.packets),
+               "max_in_build": self.max_in_build, "ci": dict(self.ci),
+               "reviews": dict(self.reviews), "projects": list(self.projects)}
+        if self.error:
+            out["error"] = _clip(self.error)
+        return out
+
+
+def sync_mechanics(canon: Canon) -> MechanicsSync:
+    """Compile `processus/mecanique.yaml` au commit exact du canon appliqué."""
+    done = MechanicsSync()
+    if not canon.sources:
+        done.status = "untrusted"
+        done.error = "no canon source"
+        return done
+    source = canon.sources[0]
+    if source.mode != "git" or not source.commit:
+        done.status = "untrusted"
+        done.error = "no exact canon commit applied"
+        return done
+    if source.prefix:
+        # le lecteur strict lit `processus/mecanique.yaml` à la racine Git du
+        # canon : sous un sous-répertoire, il lirait un autre fichier que celui
+        # du canon appliqué — refus explicite, jamais un document voisin
+        done.status = "invalid"
+        done.error = ("canon under a sub-directory (%s): the mechanics are read "
+                      "at the Git root only" % source.prefix)
+        return done
+    try:
+        document = mechanics.load_global(source.repo, source.commit)
+    except mechanics.MechanicsAbsent as exc:
+        done.status = "absent"
+        done.error = str(exc)
+        return done
+    except mechanics.MechanicsError as exc:
+        done.status = "invalid"
+        done.error = str(exc)
+        return done
+    done.status = "ok"
+    done.schema = document.schema
+    done.timezone = document.timezone
+    done.cutoffs = list(document.cutoffs)
+    done.packets = list(document.packet_cutoffs)
+    done.max_in_build = document.max_in_build
+    done.ci = {"packet": document.ci_packet,
+               "incident_label": document.ci_incident_label}
+    done.reviews = {"families": list(document.families),
+                    "exclude_author_family": document.exclude_author_family,
+                    "distinct_families": document.distinct_families}
+    done.projects = sorted(item.name for item in document.overrides)
     return done
 
 

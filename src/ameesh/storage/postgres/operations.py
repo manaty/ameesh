@@ -18,6 +18,7 @@ from typing import Any
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
+from .work import has_reviewer
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
@@ -57,6 +58,13 @@ class Operations(interface.Operations):
             " WHERE name = %s RETURNING name", tuple(params + [name]))
         return bool(rows)
 
+    def set_dormant(self, name, owner, epoch, status_text) -> bool:
+        return bool(self.db.query(
+            "UPDATE agent_registry SET status_text = %s, updated_at = now()"
+            " WHERE name = %s AND status = 'idle' AND lease_owner = %s"
+            "   AND lease_epoch = %s AND lease_expires_at > clock_timestamp()"
+            " RETURNING name", (status_text, name, owner, int(epoch))))
+
     def set_session_work_item(self, name, owner, epoch, work_item) -> bool:
         rows = self.db.query(
             """
@@ -82,13 +90,15 @@ class Operations(interface.Operations):
         today = today or _dt.date.today().isoformat()
         return self.db.query(
             """
-            SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
+            SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   r.effort, r.tier,
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause
                    r.last_error,  -- L106 : le détail de « hôte non prêt »
@@ -97,6 +107,8 @@ class Operations(interface.Operations):
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
                    extract(epoch from r.lease_expires_at)::float8 AS lease_expires_ts,
                    extract(epoch from r.status_since)::float8     AS status_since_ts,
+                   -- #1521 : le début du motif affiché (status_text), pas du statut
+                   extract(epoch from r.status_reason_since)::float8 AS status_reason_since_ts,
                    extract(epoch from r.last_turn_at)::float8     AS last_turn_ts,
                    extract(epoch from r.updated_at)::float8       AS updated_ts,
                    extract(epoch from r.restart_requested_at)::float8 AS restart_requested_ts,
@@ -230,7 +242,23 @@ class Operations(interface.Operations):
                    cwd = coalesce(%s::text, r.cwd),
                    session_id = %s,
                    session_account = %s::text,
+                   -- #1037 : la session adoptée est connue AVANT tout tour ;
+                   -- son ouverture est celle du harnais adopté (le déclencheur
+                   -- de 0384 garde les trois tant que origin = session).
+                   session_harness = %s,
+                   session_cwd = coalesce(%s::text, r.cwd),
+                   session_origin = %s,
                    session_work_item = NULL,
+                   -- #1037 : un changement de harnais DÉCLARÉ emporte les
+                   -- réglages du harnais précédent : les garder ferait lancer
+                   -- le nouveau harnais avec le modèle, l'effort ou le tier de
+                   -- l'ancien (r.harness = la valeur d'avant l'UPDATE).
+                   model = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                                THEN NULL ELSE r.model END,
+                   effort = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                                 THEN NULL ELSE r.effort END,
+                   tier = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                               THEN NULL ELSE r.tier END,
                    session_reset_at = clock_timestamp(),
                    pending_prompt = concat_ws(E'\\n\\n', %s::text,
                                               r.current_prompt, r.pending_prompt),
@@ -249,7 +277,8 @@ class Operations(interface.Operations):
             RETURNING r.name, verrou.session_id AS previous_session,
                       verrou.mode AS previous_mode, verrou.harness AS previous_harness
             """,
-            (name, harness, host, cwd, session_id, session_account, prompt, status_text),
+            (name, harness, host, cwd, session_id, session_account, harness, cwd,
+             session_id, harness, harness, harness, prompt, status_text),
         )
         return rows[0] if rows else None
 
@@ -314,9 +343,18 @@ class Operations(interface.Operations):
             " ORDER BY updated_at DESC, id DESC", (name,))
 
     def open_lots_activity(self, limit) -> list[dict]:
-        return self.db.query(
-            """
+        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
+        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
+        reviewer = ("w.reviewer" if has_reviewer(self.db)
+                    else "''::text AS reviewer")
+        # #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
+        # `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
+        # migration. `released_by` en écarte les dépendants pinnés, dont la
+        # retenue ne tombe que par une commande `release` du registre.
+        sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+                   w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
@@ -333,14 +371,16 @@ class Operations(interface.Operations):
              WHERE w.state NOT IN """ + _CLOSED + """
              ORDER BY last_activity_ts ASC, w.id
              LIMIT %s
-            """,
-            (int(limit) if limit is not None else None,))
+            """).replace("__REVIEWER__", reviewer)
+        return self.db.query(
+            sql, (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
-               " input_tokens, cached_input_tokens, output_tokens,"
-               " extract(epoch from recorded_at)::float8 AS recorded_ts"
+               " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
+               " extract(epoch from recorded_at)::float8 AS recorded_ts,"
+               " extract(epoch from started_at)::float8 AS started_ts"
                " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
                " AND void_reason IS NULL")
         params: list = [float(since_s)]

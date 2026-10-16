@@ -16,15 +16,25 @@ from unittest import mock
 
 from ameesh import radar, work
 
-from .support import SRC, PgTestCase, child_env
+from .support import EMPTY_CONFIG, SRC, PgTestCase, child_env
 
 MIG = "src/ameesh/migrations"
 
 
+def git_env():
+    """Environnement des git du banc (#1943) : hermétique à la configuration de
+    l'agent (`~/.gitconfig`, `/etc/gitconfig` : rerere, autocrlf, hooks…), qui
+    ne doit pas changer le verdict d'un test (canon §3 : même verdict sur tous
+    les postes). Même isolation que les autres bancs du dépôt (`test_canon`,
+    `test_1277`, `scripts/l160g-mergiraf.py`)."""
+    return dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
+                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+
 def _git(repo, *args):
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, env=env)
+    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                          env=git_env())
     if proc.returncode != 0:
         raise AssertionError("git %s : %s" % (" ".join(args), proc.stderr))
     return proc.stdout.strip()
@@ -106,6 +116,28 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(dups["0001"]["in_target"], MIG + "/0001_init.sql")
         self.assertEqual(radar.summary(report)["conflict"], 1)
 
+    def test_union_attribute_read_from_the_merge_target(self):
+        # #1517 : deux ajouts adjacents à une liste `merge=union` ne sont pas
+        # un conflit, même quand la copie locale a extrait un commit sans
+        # `.gitattributes` : les attributs sont lus dans l'arbre de la cible.
+        repo = os.path.join(self.tmp, "union")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "liste.txt", "a\nc\ne\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "sans attributs")
+        _write(repo, ".gitattributes", "liste.txt merge=union\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "attributs")
+        for name, entry in (("lot/1-a", "b"), ("lot/2-b", "bb")):
+            _git(repo, "checkout", "-q", "-b", name, "main")
+            _write(repo, "liste.txt", "a\n%s\nc\ne\n" % entry)
+            _git(repo, "commit", "-qam", name)
+        _git(repo, "checkout", "-q", "--detach", "main~1")
+        report = radar.scan(repo, LOTS[:2], default_target="main")
+        self.assertEqual({tuple(p["lots"]): p["state"] for p in report["pairs"]},
+                         {(1, 2): "overlap"})
+
     def test_conflict_with_target_and_origin_branch(self):
         _write(self.repo, "shared.py", "Uno\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n")
         _git(self.repo, "commit", "-qam", "main bouge")
@@ -117,6 +149,60 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(against[4], ("clean", []))
         self.assertIn(5, against)
         self.assertEqual(report["migrations"], [])     # sonde non déclarée
+
+    def test_pair_uses_target_attributes_when_only_one_tip_has_them(self):
+        # #1610 : un lot antérieur aux attributs et un lot plus récent se
+        # composent selon la cible, quel que soit leur ordre d'énumération.
+        repo = os.path.join(self.tmp, "transition")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "liste.txt", "a\nc\ne\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "base")
+        _git(repo, "checkout", "-qb", "lot/1-a")
+        _write(repo, "liste.txt", "a\nb\nc\ne\n")
+        _git(repo, "commit", "-qam", "ancien lot")
+        _git(repo, "checkout", "-q", "main")
+        _write(repo, ".gitattributes", "liste.txt merge=union\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "attributs cible")
+        _git(repo, "checkout", "-qb", "lot/2-b")
+        _write(repo, "liste.txt", "a\nbb\nc\ne\n")
+        _git(repo, "commit", "-qam", "nouveau lot")
+        _git(repo, "checkout", "-q", "--detach", "main~1")
+        before = _git(repo, "count-objects", "-v")
+        for lots in (LOTS[:2], list(reversed(LOTS[:2]))):
+            with self.subTest(order=[lot["id"] for lot in lots]):
+                report = radar.scan(repo, lots, default_target="main")
+                self.assertEqual([p["state"] for p in report["pairs"]], ["overlap"])
+                self.assertTrue(all(p["state"] == "clean"
+                                    for p in report["against_target"]))
+        self.assertEqual(_git(repo, "count-objects", "-v"), before)
+
+    def test_pair_cache_tracks_target_attributes_without_moving_tips(self):
+        repo = os.path.join(self.tmp, "attributes-cache")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "liste.txt", "a\nc\ne\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "base")
+        for name, entry in (("lot/1-a", "b"), ("lot/2-b", "bb")):
+            _git(repo, "checkout", "-qb", name, "main")
+            _write(repo, "liste.txt", "a\n%s\nc\ne\n" % entry)
+            _git(repo, "commit", "-qam", name)
+        _git(repo, "checkout", "-q", "main")
+        cache = radar.Cache()
+        first = radar.scan(repo, LOTS[:2], default_target="main", cache=cache)
+        self.assertEqual(first["pairs"][0]["state"], "conflict")
+        _write(repo, ".gitattributes", "liste.txt merge=union\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "attributs cible")
+        second = radar.scan(repo, LOTS[:2], default_target="main", cache=cache)
+        self.assertEqual(second["pairs"][0]["state"], "overlap")
+        self.assertEqual(first["pairs"][0]["tips"], second["pairs"][0]["tips"])
+        _git(repo, "revert", "--no-edit", "HEAD")
+        third = radar.scan(repo, LOTS[:2], default_target="main", cache=cache)
+        self.assertEqual(third["pairs"][0]["state"], "conflict")
 
     def test_cache_skips_unchanged_pairs(self):
         cache = radar.Cache()
@@ -159,6 +245,60 @@ class SettingsTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=raw):
                 radar.parse_settings(raw)
 
+    def test_full_suite_is_declared_by_workflow_file(self):
+        """L756: la suite complète est une identité (le fichier de workflow),
+        jamais un nom d'affichage libre."""
+        raw = {"projects": {"x": {"repo": "/r", "full_suite":
+                                  [".github/workflows/backend-suite.yml",
+                                   ".github/workflows/desktop-suite.yaml"]}}}
+        project = radar.parse_settings(raw).projects["x"]
+        self.assertEqual(project.full_suite, (".github/workflows/backend-suite.yml",
+                                              ".github/workflows/desktop-suite.yaml"))
+        single = radar.parse_settings({"projects": {
+            "x": {"repo": "/r", "full_suite": ".github/workflows/a.yml"}}}).projects["x"]
+        self.assertEqual(single.full_suite, (".github/workflows/a.yml",))
+        self.assertEqual(single.full_suite_required, ())
+        self.assertEqual(single.full_suite_tolerated, ())
+        named = radar.parse_settings({"projects": {"x": {"repo": "/r", "full_suite": [
+            {"path": ".github/workflows/tests.yml",
+             "jobs": ["plan", "psycopg *"], "tolerate": ["bilan des impactés"]},
+            ".github/workflows/backend-suite.yml"]}}}).projects["x"]
+        self.assertEqual(named.full_suite, (".github/workflows/tests.yml",
+                                            ".github/workflows/backend-suite.yml"))
+        self.assertEqual(named.full_suite_required,
+                         ((".github/workflows/tests.yml", ("plan", "psycopg *")),))
+        self.assertEqual(named.full_suite_tolerated,
+                         ((".github/workflows/tests.yml", ("bilan des impactés",)),))
+        for bad in (["Backend suite"],                                # un nom libre
+                    ["backend-suite.yml"],                            # hors .github/workflows
+                    [".github/workflows/a.txt"],                      # pas un workflow
+                    ["/etc/.github/workflows/a.yml"],                 # absolu
+                    [".github/workflows/../a.yml"],                   # remonte
+                    [".github/workflows/a.yml", ".github/workflows/a.yml"],  # doublon
+                    [{"path": ".github/workflows/a.yml"},             # jobs manquants
+                     {"path": ".github/workflows/a.yml", "jobs": []},
+                     {"path": ".github/workflows/a.yml", "jobs": [1]},
+                     {"path": ".github/workflows/a.yml", "jobs": ["a", "a"]},
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"], "extra": 1},
+                     {"path": ".github/workflows/a.yml", "jobs": ["*"]},      # * seul
+                     {"path": ".github/workflows/a.yml", "jobs": ["a*b"]},    # * non final
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"],
+                      "tolerate": ["a"]},                            # requis et toléré
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"],
+                      "tolerate": [1]},
+                     {"path": ".github/workflows/a.yml",
+                      "tolerate": ["a"]},                              # toléré sans requis
+                     {"jobs": ["a"]},
+                     {"path": 1, "jobs": ["a"]},
+                     [{"path": ".github/workflows/a.yml", "jobs": ["a"]},
+                      ".github/workflows/a.yml"]],                    # doublon entre formes
+                    [1],
+                    "Backend suite"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    radar.parse_settings({"projects": {"x": {"repo": "/r",
+                                                             "full_suite": bad}}})
+
 
 class ConflictsCommandTest(unittest.TestCase):
     """`ameesh conflicts` lit le journal de l'hôte, sans base."""
@@ -172,7 +312,7 @@ class ConflictsCommandTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def conflicts(self, *args):
-        env = child_env(AMEESH_STATE=self.state, AMEESH_CONFIG="/nonexistent",
+        env = child_env(AMEESH_STATE=self.state, AMEESH_CONFIG=EMPTY_CONFIG,
                         AMEESH_DSN="postgresql://injoignable.invalid/x")
         env["PYTHONPATH"] = SRC
         return subprocess.run([sys.executable, "-m", "ameesh.main", "conflicts", *args],
@@ -225,6 +365,31 @@ class RunPassTest(PgTestCase):
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM agent_mailbox")[0]["n"], 0)
         # sans `radar.projects` : rien
         self.assertEqual(radar.run_pass(self.cfg, self.db), [])
+
+
+class BancGitHermetiqueTest(unittest.TestCase):
+    """#1943 : le banc git des tests ne dépend pas de la config globale de
+    l'agent — `test_l160e` voyait un `.git/rr-cache` créé par le
+    `rerere.enabled=true` de son poste et rougissait (canon §3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l160b-hermetique-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = make_repo(self.tmp)
+
+    def test_une_config_globale_hostile_n_atteint_pas_le_banc(self):
+        hostile = os.path.join(self.tmp, "gitconfig")
+        with open(hostile, "w", encoding="utf-8") as fh:
+            fh.write("[rerere]\n\tenabled = true\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": hostile,
+                                          "GIT_CONFIG_NOSYSTEM": ""}):
+            # le conflit non résolu est le geste qui, sous rerere global,
+            # laissait le rr-cache que l'assertion « dépôt intact » voyait
+            _git(self.repo, "checkout", "-q", "-b", "conflit", "lot/2-b")
+            with self.assertRaises(AssertionError):
+                _git(self.repo, "merge", "-q", "--no-ff", "--no-commit", "lot/1-a")
+            self.assertFalse(os.path.exists(
+                os.path.join(self.repo, ".git", "rr-cache")))
 
 
 if __name__ == "__main__":

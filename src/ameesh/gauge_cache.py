@@ -37,6 +37,9 @@ class GaugeCache:
             self._entries.pop(path, None)
             if len(readings) > self.max_accounts:
                 return
+            # #1132 : un relevé est (estampille, production, Gauges) ; le cache
+            # en garde une copie — la lecture partagée ne doit pas être mutée
+            # par un appelant — avec l'overage porté par les `Gauges` (#1649).
             frozen = {account: (stamp, produced, copy(gauges))
                       for account, (stamp, produced, gauges) in readings.items()}
             self._entries[path] = (signature, frozen)

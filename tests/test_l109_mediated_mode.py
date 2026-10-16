@@ -50,6 +50,10 @@ class MedieBase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l109-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        self.config_vide = os.path.join(self.tmp, "config-vide.json")
+        with open(self.config_vide, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         self.cfg = dataclasses.replace(
             config_mod.Config(), backend="mediated", exec_url="https://mesh.exemple",
             state_dir=os.path.join(self.tmp, "etat"), v0_state=os.path.join(self.tmp, "v0"),
@@ -157,7 +161,7 @@ class GardesTest(MedieBase):
     def test_register_refuse(self):
         from ameesh import runner as runner_mod
         env = {"AMEESH_BACKEND": "mediated", "AMEESH_EXEC_URL": "https://mesh.exemple",
-               "AMEESH_CONFIG": os.path.join(self.tmp, "absent.json")}
+               "AMEESH_CONFIG": self.config_vide}
         with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(runner_mod.main(["register", "x", "dsh"]), 2)
 
@@ -212,6 +216,23 @@ class BailEtPanneTest(MedieBase):
         self.db.book.hold("inge-front", runner.runner_id, 42)
         agent = {"name": "inge-front", "harness": "dsh", "cwd": self.tmp, "status": "queued"}
         return AgentWorker(runner, agent, lease)
+
+    def test_reglement_sans_reservation_locale_ne_bloque_pas_le_marqueur(self):
+        """#1469 : le backend médié n'a pas d'enveloppe de compte locale."""
+        worker = self._worker()
+        # r2 : le marqueur n'est effacé que s'il est encore celui de ce tour
+        self.responder.script["pending_spend.get"] = {
+            "agent": "inge-front", "start_index": 0, "turn": "prompt", "model": "m",
+            "created_ts": 123.0}
+        self.responder.script["pending_spend.clear"] = True
+        usage = types.SimpleNamespace(reread_tokens=0, session=None)
+        with mock.patch("ameesh.cost.CostBook") as book:
+            book.return_value.record.return_value = usage
+            self.assertTrue(worker._compta_ecrit({
+                "start": 0, "created_ts": 123.0, "turn": "prompt", "model": "m"}))
+        self.assertFalse(worker._compta_en_echec)
+        self.assertIn("pending_spend.clear", self.transport.ops())
+        self.assertFalse(any(op.startswith("budgets.") for op in self.transport.ops()))
 
     def test_provider_health_stays_on_the_relay_server(self):
         worker = self._worker()
@@ -342,8 +363,12 @@ class SessionTest(unittest.TestCase):
         self.responder = self.server.responder
         self.responder.script["leases.state"] = {
             "lease_owner": OWNER, "lease_epoch": 42, "status": "running", "live": True}
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        config_vide = os.path.join(self.tmp, "config-vide.json")
+        with open(config_vide, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         env = {
-            "AMEESH_CONFIG": os.path.join(self.tmp, "absent.json"),
+            "AMEESH_CONFIG": config_vide,
             "AMEESH_STATE": os.path.join(self.tmp, "etat"),
             "AGENT_MAIL_STATE": os.path.join(self.tmp, "v0"),
             "AGENT_MAIL_CONFIG": os.path.join(self.tmp, "conf"),
@@ -402,18 +427,29 @@ class SessionTest(unittest.TestCase):
         # range le message.
         self.responder.script["work.get"] = {"id": 812, "app": "canon"}
         self.responder.script["threads.index"] = None
+        # L361c : le compte du fil vient du census, porté par `threads.recount`
+        self.responder.script["threads.recount"] = 1791640000
         code, out, err = self.ameesh("mail", "send", "coord", "PR prête pour relecture.",
                                      "--lot", "812")
         self.assertEqual(code, 0, err)
         self.assertIn("coord", out)
         # contrat 1.1 : le fil est indexé depuis la session, auteur `agent:<nom>`
         self.assertEqual(self.server.ops(), ["leases.state", "agents.overview",
-                                             "mailbox.send", "work.get", "threads.index"])
+                                             "mailbox.send", "work.get", "threads.index",
+                                             "threads.recount"])
         index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
         self.assertEqual(index["body"]["kwargs"]["author"], "agent:inge-front")
         self.assertEqual(index["body"]["kwargs"]["project"], "canon")
         self.assertEqual(index["body"]["kwargs"]["lot"], "812")
+        self.assertIs(index["body"]["kwargs"]["count"], False)
         self.assertEqual(index["body"]["fence"]["epoch"], 42)
+        # L361c : le census du fil est porté par la même session, sous le même lot
+        recount = [r for r in self.session_requests()
+                   if r["body"]["op"] == "threads.recount"][0]
+        self.assertEqual(recount["body"]["kwargs"]["project"], "canon")
+        self.assertEqual(recount["body"]["kwargs"]["lot"], "812")
+        self.assertIsInstance(recount["body"]["kwargs"]["kept"], int)
+        self.assertIsInstance(recount["body"]["kwargs"]["end"], int)
         req = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.send"][-1]
         self.assertEqual(req["body"]["args"][:2], ["inge-front", "coord"])
         self.assertTrue(req["headers"].get(C.IDEMPOTENCY_HEADER))
@@ -430,6 +466,7 @@ class SessionTest(unittest.TestCase):
             "recipient_project": "canon"}
         self.responder.script["work.get"] = None
         self.responder.script["threads.index"] = None
+        self.responder.script["threads.recount"] = 1791640000
         code, out, err = self.ameesh("mail", "send", "coord", "Lot d'un autre projet.",
                                      "--lot", "900")
         self.assertEqual(code, 0, err)
@@ -496,8 +533,11 @@ class SessionTest(unittest.TestCase):
     def test_work_note_et_move(self):
         # les états des jeux dorés (`doing`, `review`) ne sont pas ceux de
         # `work.STATES` : lot scripté dans un état réel
+        # B5 (#1922) : le vrai `work.get` porte `workflow_ref` ('' pour un lot
+        # non pinné) ; la garde des commandes historiques le lit dans
+        # l'élément, sans SELECT brut — interdit sur une connexion médiée.
         lot = {"id": 812, "project": "site", "title": "Page d'accueil", "state": "build",
-               "assignee": "inge-front", "loops": 0}
+               "assignee": "inge-front", "loops": 0, "workflow_ref": ""}
         self.responder.script["work.get"] = lot
         self.responder.script["work.move"] = dict(lot, state="qa")
         self.responder.script["work.note"] = None
@@ -509,6 +549,35 @@ class SessionTest(unittest.TestCase):
                                      "--actor", "inge-front")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.server.ops(), ["work.get", "work.note", "work.get", "work.move"])
+        self.assert_session_only()
+
+    def test_work_move_lot_pinne_refuse_sans_sql(self):
+        # B5 (#1922) : un lot pinné sur une révision Process ne bouge que par
+        # le registre ; la session le refuse depuis l'élément de `work.get`,
+        # sans SELECT brut et sans envoyer `work.move`.
+        lot = {"id": 815, "project": "site", "title": "Page d'accueil",
+               "state": "build", "assignee": "inge-front", "loops": 0,
+               "workflow_ref": "canon/process/site@7"}
+        self.responder.script["work.get"] = lot
+        code, _out, err = self.ameesh("work", "move", "815", "qa", "--actor", "inge-front")
+        self.assertEqual(code, 1)
+        self.assertIn("pinned to workflow canon/process/site@7", err)
+        self.assertIn("process_registry", err)
+        self.assertEqual(self.server.ops(), ["work.get"])
+        self.assert_session_only()
+
+    def test_work_close_lot_pinne_refuse_sans_sql(self):
+        # même garde pour la fermeture d'un lot pinné (#1922) : la session la
+        # refuse depuis la lecture, pas depuis un SELECT brut.
+        lot = {"id": 816, "project": "site", "title": "Page d'accueil",
+               "state": "build", "assignee": "inge-front", "loops": 0,
+               "workflow_ref": "canon/process/site@7"}
+        self.responder.script["work.get"] = lot
+        code, _out, err = self.ameesh("work", "close", "816", "--abandoned",
+                                      "--actor", "inge-front")
+        self.assertEqual(code, 1)
+        self.assertIn("pinned to workflow canon/process/site@7", err)
+        self.assertEqual(self.server.ops(), ["work.get"])
         self.assert_session_only()
 
     def test_action_propose(self):

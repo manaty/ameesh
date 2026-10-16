@@ -67,9 +67,14 @@ for _name in list(os.environ):
 #: ~/.config/agent-mesh/config.json) n'est jamais lue : ses canons imposent un
 #: responsable humain, fixent fils et hôte. Les tests de configuration posent
 #: leur propre AMEESH_CONFIG. HOME reste celui du poste (~/.pgpass du banc).
-ABSENT_CONFIG = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-config-"), "absent.json")
-os.environ["AMEESH_CONFIG"] = ABSENT_CONFIG
-os.environ["AGENT_MESH_CONFIG"] = ABSENT_CONFIG
+#: « Aucune config » se dit par un fichier VIDE mais EXISTANT : un chemin
+#: explicite absent est refusé (#1127), et un chemin absent ne peut donc plus
+#: servir de sentinelle.
+EMPTY_CONFIG = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-config-"), "empty.json")
+with open(EMPTY_CONFIG, "w", encoding="utf-8") as _fh:
+    _fh.write("{}\n")
+os.environ["AMEESH_CONFIG"] = EMPTY_CONFIG
+os.environ["AGENT_MESH_CONFIG"] = EMPTY_CONFIG
 # la surcharge AMEESH_CODEX_SESSIONS prime sur CODEX_HOME : jamais héritée
 os.environ.pop("AMEESH_CODEX_SESSIONS", None)
 TEST_DSN = os.environ.get(
@@ -81,6 +86,33 @@ TEST_DSN = os.environ.get(
 )
 REQUIRE_DB = os.environ.get(
     "AMEESH_REQUIRE_DB", os.environ.get("AGENT_MESH_REQUIRE_DB", "1")) != "0"
+#: L142 : le banc ne dépend pas non plus de l'umask de la session appelante
+#: (0002 sur certains hôtes, 0022 en CI). Les fixtures d'arbres de confiance
+#: créent répertoires 0700 et fichiers 0644 et les vérifient ; un umask
+#: permissif rendait leurs sous-répertoires groupables et la suite rouge.
+os.umask(0o022)
+
+#: #749 : préfixe des sorties négatives volontaires qu'un test surface dans le
+#: journal. Le bilan de la suite complète (`scripts/test-parallele.sh`) cherche
+#: un verdict unittest en début de ligne (`^(Ran |OK|FAILED)`) : une sortie
+#: qu'un test attend exprès — « ROLE CONTRACT FAILED » (message de production
+#: de deploy/sql/role-executor.sql), « FAILED: neither the cache nor a local
+#: npm ci » — ne doit pas pouvoir passer pour un échec. On la préfixe au
+#: moment où le test la surface (message d'assertion) ; on ne renomme jamais
+#: le message de production à la source (décision mesh-design 13/10/2026,
+#: #749 point 3). Convention figée par tests/test_expected_output.py.
+ATTENDU = "attendu: "
+
+
+def attendu(texte: str) -> str:
+    """#749 : préfixe chaque ligne d'une sortie négative volontaire.
+
+    À passer en message d'assertion quand le test vérifie un échec attendu :
+    `self.assertIn("refusé", proc.stderr, attendu(proc.stderr))`. La
+    vérification porte sur la sortie brute ; seule la trace écrite au journal
+    est préfixée."""
+    return "\n".join(ATTENDU + ligne if ligne else ligne
+                     for ligne in texte.splitlines())
 
 
 def apply_authenticators(db, members, **kwargs) -> dict:
@@ -138,6 +170,11 @@ os.environ["AMEESH_SYSTEMCTL"] = ""
 os.environ["AMEESH_SESSION_STORE_CHECK"] = "0"
 EMPTY_POWER_SUPPLY = tempfile.mkdtemp(prefix="ameesh-test-power-")
 os.environ["AMEESH_POWER_SUPPLY_DIR"] = EMPTY_POWER_SUPPLY
+#: #1580 (tranche 3) : jamais les jauges du widget omarchy du poste (pc-smichea
+#: en a de fraîches, dans ~/.local/state/omarchy/agents/usage) ; un test qui en
+#: veut pointe la variable sur son propre dossier
+EMPTY_USAGE_WIDGET = tempfile.mkdtemp(prefix="ameesh-test-usage-")
+os.environ["AMEESH_USAGE_WIDGET_DIR"] = EMPTY_USAGE_WIDGET
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
                  "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
     os.environ.pop(_bin_var, None)
@@ -383,8 +420,11 @@ class PgTestCase(unittest.TestCase):
         base.update(extra)
         return child_env(**base)
 
-    def connect(self, schema: str | None = None):
-        return db_mod.connect(dataclasses.replace(self.cfg, schema=schema or self.schema))
+    def connect(self, schema: str | None = None, **overrides):
+        """Connexion au schéma du test ; `overrides` remplace des champs de la
+        configuration sur cette connexion (ex. `statement_timeout_ms`)."""
+        return db_mod.connect(dataclasses.replace(
+            self.cfg, schema=schema or self.schema, **overrides))
 
     def cli(self, *args: str, env: dict | None = None, stdin: str | None = None,
             timeout: float = 60.0) -> subprocess.CompletedProcess:

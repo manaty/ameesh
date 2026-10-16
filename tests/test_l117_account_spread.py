@@ -82,8 +82,8 @@ class RepartitionTest(_Base):
         self.assertEqual(choice.profile.name, "secondaire")
         self.assertEqual(choice.switched["from"], "primaire")
         self.assertEqual(choice.why,
-                         "no reading: 0% used, furthest behind its pace; "
-                         "ahead of: tertiaire no reading: 0% used, primaire "
+                         "no reading: unverified, tried first (L117); "
+                         "ahead of: tertiaire no reading: unverified, primaire "
                          "codex-10080min 35% used (pace 55%)")
         # la bascule en base porte la même raison
         self.assertEqual(self.db.query("SELECT reason FROM account_switches")[0]["reason"],
@@ -92,14 +92,14 @@ class RepartitionTest(_Base):
         cfg = mock.Mock(host=self.cfg.host, accounts={"codex": self.declared})
         rows = accounts.report(cfg, self.db, self._book(), now=now, record=False)
         self.assertEqual([r["account"] for r in rows if r["next"]], ["secondaire"])
-        self.assertIn("↳ next choice for a new session: no reading: 0% "
-                      "used, furthest behind its pace; ahead of: tertiaire",
+        self.assertIn("↳ next choice for a new session: no reading: unverified, "
+                      "tried first (L117); ahead of: tertiaire",
                       accounts.format_rows(rows))
 
     def test_spread_over_successive_new_sessions(self):
-        """Chaque nouvelle session va au compte le plus en retard ; l'usage
-        qu'elle produit le fait reculer dans le classement : les trois comptes
-        servent, aucun n'est laissé de côté."""
+        """Chaque nouvelle session va au compte dont le budget s'évapore le
+        plus vite (#1789/N1) ; l'usage qu'elle produit le fait reculer dans le
+        classement : les trois comptes servent, aucun n'est laissé de côté."""
         items = self._items()
         now = float(int(time.time()))
         usage = {"primaire": 35.0}
@@ -117,9 +117,14 @@ class RepartitionTest(_Base):
             _codex_weekly(accounts.by_name(items, name).path, usage[name], resets[name])
         self.assertEqual(sequence[:2], ["secondaire", "tertiaire"])
         self.assertEqual(set(sequence), {"primaire", "secondaire", "tertiaire"})
-        self.assertEqual(sequence, ["secondaire", "tertiaire", "secondaire", "tertiaire",
-                                    "primaire", "primaire"])
-        self.assertEqual(len(self._bascules()), 5)
+        # le primaire perd 0,65 de sa semaine en 3 j 20 h (≈0,007/h), les deux
+        # autres 0,96 en 7 jours (≈0,0057/h) : il est drainé d'abord, puis les
+        # deux comptes neufs se partagent le reste
+        self.assertEqual(sequence, ["secondaire", "tertiaire", "primaire", "primaire",
+                                    "primaire", "secondaire"])
+        # une bascule par changement de compte : quatre seulement, le primaire
+        # étant drainé trois sessions de suite
+        self.assertEqual(len(self._bascules()), 4)
 
     def test_account_at_threshold_is_excluded(self):
         """Le compte le plus en retard sur 7 jours, mais au seuil sur 5 h, n'est
@@ -216,8 +221,8 @@ class RangSansBaseTest(unittest.TestCase):
         self.assertEqual([p.name for p in accounts.rank(items, evaluations, now)],
                          ["secondaire", "tertiaire", "primaire"])
         self.assertEqual(accounts.reason_of(accounts.rank(items, evaluations, now), evaluations, now),
-                         "no reading: 0% used, furthest behind its pace; "
-                         "ahead of: tertiaire no reading: 0% used, primaire seven_day "
+                         "no reading: unverified, tried first (L117); "
+                         "ahead of: tertiaire no reading: unverified, primaire seven_day "
                          "35% used (pace 55%)")
 
     def test_expired_reading_counts_as_zero(self):

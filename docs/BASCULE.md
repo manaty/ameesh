@@ -723,7 +723,8 @@ only publish**.
    ```bash
    python3 -m venv /tmp/ameesh-l35 && /tmp/ameesh-l35/bin/pip install -q <dépôt ameesh au gel L35>
    git clone -q <url du dépôt du canon> /tmp/canon-l35     # throwaway copy, ~/canon intact
-   AMEESH_CONFIG=/tmp/aucune-config.json /tmp/ameesh-l35/bin/ameesh canon check \
+   printf '{}\n' > /tmp/ameesh-config-vide.json            # chemin explicite = fichier existant (#1127)
+   AMEESH_CONFIG=/tmp/ameesh-config-vide.json /tmp/ameesh-l35/bin/ameesh canon check \
        --canon /tmp/canon-l35 --ref origin/<branche-PR> --host pc-smichea
    #   expected: 0 errors, no host-policy-invalid, admission-cwd-inherited
    #   or host-work-dir-missing
@@ -1250,11 +1251,14 @@ migrated database, which every update since L60 already verifies. So we migrate
 for the content of each version):
 
 1. `poste.sh verifier`, `poste.sh sauvegarder`.
-2. `poste.sh migrer [REF]`: extracts the `src-<sha>` snapshot of REF and runs
+2. `poste.sh migrer [REF]` (REF defaults to HEAD, as for `installer`, #1245;
+   the L232b release controller always migrates the snapshot of its pinned
+   commit): extracts the `src-<sha>` snapshot of REF and runs
    **its** `ameesh migrate --additive-only`, without installing it
    (`PYTHONPATH=<instantané>/src`, with the venv's Python). Mesh database, only
    once, then the old database. `migrate --dry-run` first displays each
    missing migration, "additive" or "NON additive" (NOT additive) with the reason.
+   Both preview and execution retain `--additive-only` even if REF is installed.
 3. `poste.sh installer [REF]`: refuses as long as `doctor --probe` of the new
    code reports a missing migration, on the mesh database or the old one.
 4. `poste.sh role`, `poste.sh redemarrer`, then `vm.sh installer [REF]` and
@@ -1277,13 +1281,11 @@ migrations delivered up to 0051 are additive (verified by
 `tests/test_migrations_additives.py`).
 
 **Non-additive migration: separate procedure.** `poste.sh migrer` stops
-before writing. We then go back to the old order, in one go and without delay,
-knowing the window during which the agents' commands fail:
-`MIGRER_APRES=1 poste.sh installer REF`, `poste.sh migrer REF` (REF installed:
-all its migrations apply), `poste.sh redemarrer`. Such a migration
-is prepared and proposed to the owner (orchestrator prompt,
-"Livraison et déploiements" (Delivery and deployments)); rollback then requires
-the database backup.
+before writing, even when REF is installed or `MIGRER_APRES=1` is set.
+A separate owner-approved migration plan must name its exact commit, backup,
+drain and recovery procedure. An installed symlink cannot authorise a
+non-additive migration; this command never disables its additive guard.
+Rollback of such a separately approved operation requires the database backup.
 
 **New dependency.** The new code is run with the packages of the venv
 in place. If REF adds a dependency that `ameesh migrate` needs,

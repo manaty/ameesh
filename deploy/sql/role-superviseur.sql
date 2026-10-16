@@ -160,7 +160,26 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L39 (0033) : NOM du compte d'origine de la session (jamais un profil)
         'session_account',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- #810 (0428) : la vue est recréée avec `r.*` et expose donc les
+        -- colonnes de `agent_registry` apparues depuis 0033 ; accordées ici à
+        -- l'identique de la table (mêmes données, mêmes refus de contenu).
+        -- L60 (0041) : plafond de contexte (un nombre)
+        'context_max_tokens',
+        -- L105 (0046) : plafonds du tour (des nombres)
+        'turn_max_seconds', 'turn_mail_max',
+        -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
+        'turn_grace_seconds',
+        -- L232a (0371) : clôture de passage entre hôtes
+        'handoff_fenced',
+        -- L165b (0384) : réveil sur lot actionnable et session (mêmes réglages)
+        'lot_wake', 'session_harness', 'session_cwd', 'session_origin',
+        -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+        'projects',
+        -- 0403 : attente de bail depuis (un instant)
+        'lease_wait_since',
+        -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
+        'workstream'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
@@ -175,6 +194,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'placement_profile',
         -- L232a (0371) : clôture de passage entre hôtes
         'handoff_fenced',
+        -- #1521 (0446) : début du motif de statut, sans contenu
+        'status_reason_since',
         -- L26 (0027) : réglages et état de session, sans contenu
         'session_policy', 'effort', 'tier', 'session_work_item',
         'status_since', 'restart_requested_at', 'session_reset_at',
@@ -201,7 +222,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
         'projects',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
-        'workstream'
+        'workstream',
+        -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
+        -- pas de contenu) — comme `projects`, le garde QA les lit
+        'roles'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -255,7 +279,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'version', 'name', 'checksum', 'applied_at'
     ]),
     ('spend_pending', ARRAY[
-        'agent', 'start_index', 'turn', 'model', 'created_at'
+        'agent', 'start_index', 'turn', 'model', 'created_at',
+        -- #796 (0423) : lot et tour du marqueur comptable, gardés pour la
+        -- réparation d'un tour interrompu (de l'état, aucun contenu)
+        'work_item_id', 'turn_id'
     ]),
     ('standing_approvals', ARRAY[
         'id', 'approver', 'authenticator_id', 'connector', 'operations',
@@ -317,6 +344,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
     ]),
+    -- L232b (0417) : la fermeture de release, lue par `ameesh_host_gate_state`
+    -- (`host` seulement ; périmètre d'opération et reçus exclus)
+    ('host_release_fences', ARRAY['host']),
     ('host_handoffs', ARRAY[
         'id', 'agent', 'source', 'target', 'state', 'fenced',
         'memory_bytes', 'disk_bytes', 'reserved_until', 'created_at', 'updated_at'
@@ -348,6 +378,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
+        -- L498 (0439) : le cgroup délégué du tour (chemin d'état, pas un secret)
+        'cgroup',
         'started_at', 'ended_at', 'status'
     ]),
     -- ménage (L73, 0045) : journal (chemins, tailles, commandes proposées)
@@ -379,7 +411,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L225 (0059) : raison d'un tour facturé au repli prudent
         'price_fallback',
         -- L225 (0059) : écritures de cache Claude du tour
-        'cache_write_tokens'
+        'cache_write_tokens',
+        -- #1469 (0443) : compte de facturation qui porte la dépense
+        'billing_account',
+        -- #796 (0423) : lot servi, début du tour et lien aux ressources du tour
+        'work_item_id', 'started_at', 'turn_id'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
     -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
@@ -458,6 +494,28 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('budget_events', ARRAY[
         'id', 'scope', 'window_s', 'old_usd', 'new_usd', 'actor', 'at'
     ]),
+    -- #1469 (0443) : enveloppe par compte de facturation et réservations des
+    -- tours, de l'ÉTAT comptable (montants, jour, clé), aucun contenu
+    ('account_budgets', ARRAY[
+        'billing_account', 'usd_per_day', 'tz', 'set_by', 'updated_at'
+    ]),
+    ('account_reservations', ARRAY[
+        'id', 'billing_account', 'agent', 'usd', 'period', 'state', 'spend_key',
+        'created_at', 'closed_at', 'closed_by'
+    ]),
+    -- L85 (0396): the event log, identifiers and states only, never free text
+    ('ameesh_events', ARRAY[
+        'id', 'type', 'object', 'project', 'data', 'tx', 'created_at'
+    ]),
+    -- the retention's watermark: the greatest position (tx, id) it deleted
+    ('ameesh_events_pruned', ARRAY[
+        'one', 'tx', 'id', 'at'
+    ]),
+    -- #928 (0448): the journal's random identity, in every position; it names
+    -- a log, it carries no content and no secret
+    ('ameesh_events_journal', ARRAY[
+        'one', 'journal'
+    ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when)
     ('agent_watches', ARRAY[
         'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'
@@ -472,15 +530,42 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
     -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
-    -- est un CONTENU)
+    -- est un CONTENU). `run_attempt` (#901, 0429) : quel essai de l'exécution
+    -- relancée (`gh run rerun`) porte la ligne.
     ('ci_runs', ARRAY[
         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
-        'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
-        'urgent_message_id', 'verdict_message_id'
+        'status', 'superseded_by', 'url', 'workflow', 'first_seen_at', 'concluded_at',
+        'urgent_message_id', 'verdict_message_id',
+        -- #747 (0424) : de l'ÉTAT, l'attente et l'exécution séparées ;
+        -- created_at = création GitHub du run, started_at = premier relevé
+        -- `in_progress` (l'extrait de sortie reste un contenu, ailleurs)
+        'created_at', 'started_at', 'run_attempt'
     ]),
     ('ci_test_failures', ARRAY[
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
-        'duration_s', 'failed_at', 'message_id', 'recorded_at'
+        'duration_s', 'failed_at', 'message_id', 'recorded_at', 'run_attempt'
+    ]),
+    -- #845 (0426) : garde de la CI par l'API — état des runners et de la file
+    -- (même nature que ci_runs : identifiants, noms, horodatages, comptages,
+    -- aucun contenu)
+    ('ci_runner_state', ARRAY[
+        'repo', 'runner_id', 'name', 'busy', 'job', 'busy_since', 'stuck_since',
+        'seen_at'
+    ]),
+    ('ci_queue_state', ARRAY[
+        'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
+    ]),
+    -- #845 (0426, revue N/P2 2328) : la fenêtre du relevé de la garde, son
+    -- coût réel et sa couverture (même nature : horodatages, comptages,
+    -- codes) — l'état qui dit si la garde est aveugle, sans contenu
+    ('ci_guard_scan', ARRAY[
+        'repo', 'started_at', 'finished_at', 'calls', 'runs', 'covered',
+        'complete', 'reason'
+    ]),
+    -- #845 : le relevé par exécution non conclue (cache du relevé borné)
+    ('ci_guard_run', ARRAY[
+        'repo', 'run_id', 'attempt', 'status', 'queued', 'oldest_id',
+        'oldest_at', 'runners', 'seen_at'
     ]),
     -- Session history (L52, 0032 §2): which sessions, when and where;
     -- no content (transcripts stay in harness storage).
@@ -523,10 +608,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
         -- L122 (0053) : numéro de migration réservé par le lot, et son
-        -- dépôt (#443, 0390)
-        'migration', 'migration_repo',
+        -- dépôt (#443, 0390) ; #1567 : le numéro réellement atterri, quand la
+        -- renumérotation du paquet a changé celui de la réservation
+        'migration', 'migration_repo', 'migration_landed', 'migration_landed_repo',
         -- L157b (0054) : taille déclarée du changement
-        'change_size'
+        'change_size',
+        -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte
+        -- stale_lot le nomme, le superviseur doit donc le lire
+        'reviewer'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[
@@ -549,7 +638,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'work_item_id', 'measured_at', 'started_at', 'merged_at', 'total_minutes',
         'agent_minutes', 'ci_minutes', 'review_minutes', 'human_minutes', 'ci_runs',
         'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
-        'measured_size', 'declared_size'
+        'measured_size', 'declared_size',
+        -- #796 (0423) : provenance des minutes d'agent ('turns' | 'states')
+        'agent_source'
     ]),
     -- L160e (0058): merge queue per target (lot, frozen commit, rank, state:
     -- STATE, no content) and the per-target merge lease

@@ -65,7 +65,30 @@ redevient éligible au premier relevé au-dessus (solde rechargé).
    relevé compte pour 0 % utilisé, donc passe en premier ; à égalité, la
    capacité inutilisée qui **expire le plus tôt** (`expiry`, la règle 0034 du
    matin), puis l'ordre déclaré ;
-4. sinon pause : tous les comptes sont au seuil.
+4. sinon pause : tous les comptes sont au seuil, ou écartés faute d'un relevé
+   assez récent pour placer (voir « Fraîcheur du relevé »).
+
+**Fraîcheur du relevé** (#1561) : un relevé **périmé** — une fenêtre datée
+s'est remise à zéro depuis la lecture (typiquement la fenêtre de 5 h) alors
+qu'une autre court encore (les 7 jours) — n'est plus un instantané courant de
+l'état du compte : la fenêtre encore ouverte n'en est qu'une borne
+inférieure, le compte a pu servir depuis. Un tel compte est **non vérifié** :
+il ne passe jamais avant un compte à relevé courant, et sa raison le dit
+(`explain`) au lieu d'annoncer un « 30 % utilisé » trompeur ; il reste
+**essayé** faute de mieux (L71), son premier tour rapportant sa jauge.
+#1672 **borne cet essai** : un relevé plus vieux que ce qui reste de
+**chaque** fenêtre encore ouverte est une information trop ancienne pour
+engager un tour — prudence, pas preuve d'un quota atteint —, le compte est
+écarté du placement (`rank`) et, sans compte plaçable, le choix **pause** ; la
+remise à zéro qui motive la pause le rouvre (L71, 0 %). Le 15/10, le choix
+automatique a pris un compte Claude à sa limite hebdomadaire sur la foi d'un
+relevé de 30 % vieux de quatre jours. La **continuité** garde son chemin —
+une session déjà sur le compte y reste, c'est son tour qui rapporte la jauge —,
+et un forçage manuel reste souverain. Un relevé **absent** garde la règle
+L117 : un compte jamais utilisé compte pour 0 % et passe en premier, pour ne
+pas laisser un forfait inutilisé.
+Le relevé porte son horodatage (`Gauge.read_at`) : marqueur de compte Claude,
+date du journal de session Codex.
 
 **Failover order and caps** (L226b, owner decision 2026-10-07, "primaries
 last, capped"): step 3 ranks by the account's `priority` first (the harness's
@@ -74,6 +97,15 @@ the lowest of its pace cap (or `short_window_cap` on the short window), the
 account's fixed `cap` (50 % for the default account) and `overage_cap`
 (80 %) when the account may be billed beyond its plan; an account in overage
 is never chosen. These caps apply to continuity too (`limits`, `evaluate`).
+
+**Plafond de rythme par compte et fin de fenêtre** (#1176, décision de
+l'owner du 2026-10-14) : `pace_ceiling` remplace les 90 % en dur, et
+`pace_ceiling_end` relève le plafond dans les `pace_ceiling_end_hours`
+dernières heures avant la remise à zéro d'une fenêtre — **seulement** quand
+l'overage y est impossible, prouvé par un relevé frais (`overage_impossible`) :
+un compte dont l'overage est possible, inconnu ou dont la preuve est périmée
+garde son plafond de base (et `overage_cap` s'il peut être facturé). Le refus
+d'overage et la coupure d'un tour sur `isUsingOverage` sont inchangés.
 
 **Authentication failure** (L226b, table `credential_health`): an account
 reported `failing` (by the L226a sentinel or by a turn that failed on
@@ -88,30 +120,43 @@ Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
 Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
 de compte qui précède chaque tour ; Codex : les journaux de session du
 `CODEX_HOME` du compte. Une fenêtre dont `resets_at` est passé compte pour
-0 % (`Gauge.used_at`, L71) : un compte sans relevé récent est essayé, pas
-écarté — son premier tour rapporte sa jauge.
+0 % (`Gauge.used_at`, L71) ; une fois **toutes** les fenêtres datées remises à
+zéro, le relevé redevient courant (0 %) et le compte replaçable. Un relevé
+seulement **partiel** ne place plus de session quand il est plus vieux que
+toute fenêtre encore ouverte (#1672, « Fraîcheur du relevé ») ; en deçà, il
+reste plaçable après les relevés courants.
 
-Chaque choix porte sa raison (`Choice.why`, « sans relevé : 0 % utilisé, le
-plus en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
+Chaque choix porte sa raison (`Choice.why`, « no reading: unverified, le plus
+en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
 (rythme 55 %) »), journalisée par l'exécuteur (`account_turn.choose`).
 
 La ligne `account_active` garde le **dernier compte choisi** pour une
 nouvelle session (et le forçage) ; elle change en base par
 comparer-et-changer (`storage.accounts`) : deux workers qui font le même
-choix n'écrivent qu'une bascule. Les retenues (`account_holds`) de 0027 §3 ne
-sont plus posées : le choix par retard sur le rythme les remplace.
+choix n'écrivent qu'une bascule. Les retenues de rythme (`account_holds`) de
+0027 §3 ne sont plus posées : le choix par retard sur le rythme les remplace ;
+la table sert désormais à publier pour tout l'hôte l'**overage** d'un compte
+qu'une bascule vient de quitter (#1883, `OVERAGE_HOLD_S`) — une règle absolue
+que les autres runners ne peuvent pas déduire de leur propre lecture quand
+deux configurations lisent deux dossiers sous le même nom de compte.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
+from .cost import PACE_CEILING, reading_outdated, stale_reading
+
+#: #1469: a billing account id (`openai-manaty`), the same on every host
+BILLING_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 TYPES = ("config_dir", "api_key_env")
 #: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
@@ -123,10 +168,28 @@ RESERVE = 0.10
 OVERAGE_CAP = 0.80          #: an account that may be billed beyond its plan stops early
 PRIMARY_PRIORITY = 100      #: the default account comes last
 OTHER_PRIORITY = 50
+#: #1883 : durée d'une retenue d'overage publiée pour l'hôte. Quand un runner
+#: QUITTE un compte en dépassement, il publie ce fait en base
+#: (`account_holds`) : les autres processus du même hôte écartent le compte —
+#: leur configuration peut lire un autre dossier sous le même nom (le 16/10,
+#: deux définitions de « secondaire » lisaient, l'une son dépassement,
+#: l'autre un compte à 34 %, et le choix partagé basculait en boucle). La
+#: retenue est datée : une lecture isolée n'immobilise pas le compte au-delà
+#: du délai, et une lecture locale saine n'est jamais bloquée par une retenue
+#: qu'aucune bascule n'a posée.
+OVERAGE_HOLD_S = 600.0
 #: `overage` setting: read from the harness's journals, or declared
 OVERAGE_MODES = ("auto", "allowed", "none")
 #: windows up to this length are "short" (`short_window_cap`): 5 h for both plans
 SHORT_WINDOW_S = 6 * 3600.0
+#: #1176 : relèvement de fin de fenêtre. Dans les `pace_ceiling_end_hours`
+#: dernières heures avant `resets_at`, le plafond de rythme d'un compte dont
+#: l'overage est **impossible** (prouvé par un relevé frais, voir
+#: `overage_impossible`) monte jusqu'à `pace_ceiling_end`. Sans
+#: `pace_ceiling_end` déclaré, aucun relèvement : le plafond de base tient.
+PACE_CEILING_END_HOURS = 6.0
+#: Raison affichée du plafond effectif (`accounts list`) quand il est relevé.
+CEILING_REASON_END = "end of window, overage impossible"
 
 
 def _account_key(harness: str, key: str, default: str = "") -> str:
@@ -220,6 +283,21 @@ class Profile:
     #: pace). Configured per account in the host's `accounts` key; there is no
     #: implicit value, neither by name nor by default folder.
     pace_multiplier: float = 1.0
+    #: #1469: the provider billing account this profile spends from, shared by
+    #: every key, profile name, agent and host that bills it (`account_budget`);
+    #: empty = no daily account envelope applies
+    billing_account: str = ""
+    #: #1469: dollars reserved before each turn on that billing account (the
+    #: bound of one turn), settled at the real cost when the turn ends
+    reserve_usd: float = 2.0
+    #: #1176: the account's own pace ceiling (default `cost.PACE_CEILING`),
+    #: and its end-of-window raise. Within `pace_ceiling_end_hours` of a
+    #: window's `resets_at`, the ceiling rises to `pace_ceiling_end` when the
+    #: account's overage is impossible (fresh proof, `overage_impossible`);
+    #: `None` = no raise, the base ceiling always holds.
+    pace_ceiling: float = PACE_CEILING
+    pace_ceiling_end: float | None = None
+    pace_ceiling_end_hours: float = PACE_CEILING_END_HOURS
     #: Vrai pour un profil issu de la configuration de l'hôte (`parse`) : un
     #: profil déclaré sans `path` désigne le dossier par défaut du harnais, pas
     #: celui de l'environnement de l'exécuteur (L1078). Faux pour un profil
@@ -297,6 +375,57 @@ def _pace_multiplier(harness: str, name: str, value) -> float:
     return multiplier
 
 
+def _ratio(harness: str, name: str, key: str, value) -> float:
+    """Un plafond de compte dans ]0, 1] (#1176), validé strictement."""
+    if isinstance(value, bool):
+        raise AccountError("account %s/%s: %s must be in ]0, 1]" % (harness, name, key))
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise AccountError("account %s/%s: unreadable %s" % (harness, name, key))
+    if not math.isfinite(number) or not 0 < number <= 1:
+        raise AccountError("account %s/%s: %s must be in ]0, 1]" % (harness, name, key))
+    return number
+
+
+def _pace_ceiling(harness: str, name: str, item: dict) -> tuple[float, float | None, float]:
+    """(`pace_ceiling`, `pace_ceiling_end`, `pace_ceiling_end_hours`) d'un
+    profil compte (#1176), validés strictement.
+
+    Absent : 0.90 (`cost.PACE_CEILING`), aucun défaut implicite selon le
+    harnais, le nom ou le dossier. `pace_ceiling_end` absent : aucun
+    relèvement. `pace_ceiling_end_hours` absent avec un `pace_ceiling_end`
+    déclaré : 6 h ; déclaré seul (sans `pace_ceiling_end`), c'est une erreur —
+    un réglage sans effet serait un piège.
+    """
+    ceiling = (PACE_CEILING if item.get("pace_ceiling") is None
+               else _ratio(harness, name, "pace_ceiling", item.get("pace_ceiling")))
+    end, hours = item.get("pace_ceiling_end"), item.get("pace_ceiling_end_hours")
+    if end is None:
+        if hours is not None:
+            raise AccountError("account %s/%s: pace_ceiling_end_hours without "
+                               "pace_ceiling_end" % (harness, name))
+        return ceiling, None, PACE_CEILING_END_HOURS
+    end = _ratio(harness, name, "pace_ceiling_end", end)
+    if end < ceiling:
+        raise AccountError("account %s/%s: pace_ceiling_end must be >= pace_ceiling"
+                           % (harness, name))
+    if hours is None:
+        return ceiling, end, PACE_CEILING_END_HOURS
+    if isinstance(hours, bool):
+        raise AccountError("account %s/%s: pace_ceiling_end_hours must be a finite "
+                           "number > 0" % (harness, name))
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        raise AccountError("account %s/%s: unreadable pace_ceiling_end_hours"
+                           % (harness, name))
+    if not math.isfinite(hours) or hours <= 0:
+        raise AccountError("account %s/%s: pace_ceiling_end_hours must be a finite "
+                           "number > 0" % (harness, name))
+    return ceiling, end, hours
+
+
 def parse(raw) -> dict[str, list[Profile]]:
     """`{harnais: [Profile, …]}` depuis la clé `accounts` de la configuration.
 
@@ -361,6 +490,19 @@ def parse(raw) -> dict[str, list[Profile]]:
                 raise AccountError("account %s/%s: priority must be an integer"
                                    % (harness, name))
             pace_multiplier = _pace_multiplier(harness, name, item.get("pace_multiplier"))
+            billing = str(item.get("billing_account") or "")
+            if billing and not BILLING_RE.match(billing):
+                raise AccountError("account %s/%s: invalid billing_account %r"
+                                   % (harness, name, billing))
+            try:
+                reserve = float(item.get("reserve_usd", 2.0))
+            except (TypeError, ValueError):
+                raise AccountError("account %s/%s: unreadable reserve_usd" % (harness, name))
+            if not reserve > 0 or reserve == float("inf"):
+                raise AccountError("account %s/%s: reserve_usd must be positive"
+                                   % (harness, name))
+            pace_ceiling, pace_ceiling_end, pace_ceiling_end_hours = _pace_ceiling(
+                harness, name, item)
             overage = str(item.get("overage") or "auto")
             if overage not in OVERAGE_MODES:
                 raise AccountError("account %s/%s: overage must be one of %s"
@@ -395,9 +537,51 @@ def parse(raw) -> dict[str, list[Profile]]:
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
                 pace_multiplier=pace_multiplier, declared=True,
+                billing_account=billing, reserve_usd=reserve,
+                pace_ceiling=pace_ceiling,
+                pace_ceiling_end=pace_ceiling_end,
+                pace_ceiling_end_hours=pace_ceiling_end_hours,
             ))
+        _refuse_shared_homes(harness, profiles)
         out[harness] = profiles
     return out
+
+
+def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
+    """#1883 : deux comptes ne peuvent pas DÉCLARER le même dossier.
+
+    Un compte `config_dir` qui porte un `path` désigne ce dossier ; un compte
+    sans `path` suit le dossier par défaut du harnais. Deux comptes dont l'un
+    au moins **déclare** un dossier ne doivent pas résoudre vers le même — le
+    16/10, le choix a vu « secondaire » tantôt dans son dossier (5 h à 100 %,
+    en dépassement), tantôt dans celui du primaire (34 %), et a basculé en
+    boucle en lançant des tours facturés au-delà du forfait. La comparaison est
+    faite sur le chemin **résolu** (`realpath`) : deux liens vers le même
+    dossier sont le même compte. Refus à la lecture de la configuration, jamais
+    un choix silencieux.
+
+    Deux comptes sans `path` ne déclarent rien : ils lisent le même dossier par
+    défaut, et c'est la spécification de L94 (`pace_multiplier` d'un compte
+    déclaré se lit sans exiger un dossier à chacun). Les refuser rendait
+    `accounts.parse` silencieusement vide pour les lecteurs qui l'attrapent
+    (`sous_utilisation._declared_profiles`) : le rythme retombait à ×1 sans
+    alerte, et la sous-utilisation disparaissait — la CI du 16/10 a rougi là
+    (`test_le_rythme_percu_suit_le_multiplicateur_du_profil`)."""
+    seen: dict[str, tuple[str, bool]] = {}
+    for profile in profiles:
+        if profile.kind != "config_dir":
+            continue
+        home = os.path.realpath(profile.home())
+        declare = bool(profile.path)
+        if home in seen:
+            other, other_declares = seen[home]
+            if declare or other_declares:
+                raise AccountError(
+                    "`accounts.%s`: accounts %r and %r resolve to the same "
+                    "configuration directory (%s) — one reading cannot stand for two "
+                    "accounts" % (harness, other, profile.name, home))
+        else:
+            seen[home] = (profile.name, declare)
 
 
 def profiles(cfg, harness: str) -> list[Profile]:
@@ -610,12 +794,17 @@ class Evaluation:
     profile: Profile
     reason: str = ""                     #: '' = sous le seuil
     gauges: list = field(default_factory=list)
-    until: float | None = None           #: heure de libération si au seuil (#777)
+    until: float | None = None           #: heure de libération si au seuil
+                                         #: (#777) : croisement du rythme ou
+                                         #: remise à zéro (#898)
     problems: list = field(default_factory=list)
     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
     held: tuple | None = None
     #: L226b: {gauge key: (cap, label)}, the cap each window is held to
     limits: dict = field(default_factory=dict)
+    #: #1176 : {clé de jauge: Ceiling}, le plafond de rythme effectif du compte
+    #: (de base ou relevé en fin de fenêtre), avec sa raison
+    ceilings: dict = field(default_factory=dict)
     #: L226b: held back by an absolute rule (in overage, past a fixed cap),
     #: not only by its pace: no budget setting lifts it
     hard: bool = False
@@ -655,19 +844,90 @@ def primary_of(harness: str, items: list[Profile], environ=None) -> Profile | No
     return None
 
 
-def gauges_of(book, profile: Profile, items: list[Profile], environ=None) -> list:
-    """Les jauges de forfait du compte, lues dans SES journaux (L1078).
+def model_scoped(gauges, model):
+    """Les jauges qui comptent pour une session de modèle `model`.
 
-    Le primaire d'un relevé Claude est le compte **par défaut du harnais**
-    (`primary_of`), pas le premier profil de la liste. Un compte Codex est lu
-    dans son propre dossier de sessions : le dossier par défaut du harnais
-    pour un profil déclaré sans dossier, jamais le `CODEX_HOME` ambiant de
-    l'exécuteur, qui peut être celui d'un autre compte.
+    #1580 (tranche 3) : un seau propre à un modèle (`Gauge.scope`, le `title`
+    du widget omarchy) ne compte que pour une session de ce modèle. `model`
+    `None` : pas de session (affichage) — tous les seaux sont rendus ;
+    `''` : session de modèle inconnu — les seaux de modèle sont **écartés**,
+    jamais attribués au hasard. Les fenêtres générales passent toujours.
     """
+    if model is None or not any(getattr(g, "scope", "") for g in gauges):
+        return gauges
+    session = (model or "").strip().lower()
+    kept = [g for g in gauges
+            if not getattr(g, "scope", "") or (session and g.scope in session)]
+    if len(kept) == len(gauges):
+        return gauges
+    from .cost import Gauges  # import local : accounts n'importe pas cost
+    try:
+        return Gauges(kept, getattr(gauges, "overage", None))
+    except TypeError:           # un lecteur qui rend une simple liste
+        return kept
+
+
+def _widget_key(profile: Profile, items: list) -> str:
+    """#1789/N3 : la clé du fichier du widget pour ce compte.
+
+    Le widget nomme ses fichiers d'après le dossier de configuration
+    (`~/.claude` → `claude.json`, `~/.claude-secondary` →
+    `claude-secondary.json`) : `snapshot_key`. Deux dossiers déclarés de même
+    nom ne s'y distinguent pas ; la clé passe alors au **chemin complet**
+    (empreinte courte), que le widget n'écrit pas — le lecteur reste inerte
+    plutôt que d'afficher les jauges d'un autre compte (une clé fondée sur le
+    nom du compte lirait, elle, le fichier d'un autre dossier)."""
+    from . import widget_usage
+    key = widget_usage.snapshot_key(profile)
+    if sum(widget_usage.snapshot_key(p) == key for p in items
+           if p.harness == "claude" and p.kind == "config_dir") > 1:
+        chemin = os.path.realpath(profile.home()).encode("utf-8")
+        return "path-%s" % hashlib.sha1(chemin).hexdigest()[:12]
+    return key
+
+
+def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
+              model=None, now: float | None = None) -> list:
+    """Les jauges de forfait du compte.
+
+    L1078 : le primaire d'un relevé Claude est le compte **par défaut du
+    harnais** (`primary_of`), pas le premier profil de la liste ; un compte
+    Codex est lu dans son propre dossier de sessions, jamais le `CODEX_HOME`
+    ambiant de l'exécuteur, qui peut être celui d'un autre compte.
+
+    #1580 (tranche 3) : le fichier du widget omarchy d'abord quand il est
+    frais (il porte les seaux propres à un modèle, invisibles des journaux),
+    ses drapeaux d'overage repris du journal ; sinon les journaux
+    `rate_limit_event.unifiedWindows`, comme avant. `model` filtre les seaux
+    de modèle (`model_scoped`).
+
+    #1789/N3 : le widget ne se lit que pour un compte à dossier de
+    configuration. Une clé API n'en a pas — `home()` retombe sur le dossier
+    par défaut, et `accounts list` afficherait les jauges du primaire sur sa
+    ligne ; les journaux, eux, sont nommés par compte (`primary_of`)."""
+    if profile.harness == "claude" and profile.kind == "config_dir":
+        from . import widget_usage
+        primary = primary_of(profile.harness, items, environ)
+        primary_name = primary.name if primary is not None else None
+        gauges = widget_usage.read(profile, now=now,
+                                   key=_widget_key(profile, items))
+        if gauges is not None:
+            journal = book.claude_gauges(account=profile.name,
+                                         primary=primary_name)
+            overage = getattr(journal, "overage", None)
+            if overage is not None:
+                gauges.overage = overage
+        else:
+            gauges = book.claude_gauges(account=profile.name,
+                                        primary=primary_name)
+        return model_scoped(gauges, model)
     if profile.harness == "claude":
         primary = primary_of(profile.harness, items, environ)
-        return book.claude_gauges(account=profile.name,
-                                  primary=primary.name if primary is not None else None)
+        return model_scoped(
+            book.claude_gauges(
+                account=profile.name,
+                primary=primary.name if primary is not None else None),
+            model)
     if profile.harness == "codex":
         # Un seul mécanisme (cost.CostBook) : argument > AMEESH_CODEX_SESSIONS >
         # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte qui désigne un
@@ -705,6 +965,92 @@ def overage_capable(profile: Profile, overage) -> bool:
     return bool(overage is not None and overage.capable)
 
 
+# --------------------------------------------------------------------------
+# #1176 : plafond de rythme par compte et relèvement de fin de fenêtre
+# --------------------------------------------------------------------------
+
+class Ceiling(NamedTuple):
+    """Le plafond de rythme effectif d'une fenêtre (#1176).
+
+    * `value` : le plafond à appliquer à `now` (`pace_ceiling`, ou
+      `pace_ceiling_end` quand le relèvement s'applique) ;
+    * `reason` : '' pour le plafond de base, `CEILING_REASON_END` quand il est
+      relevé (affiché par `accounts list`) ;
+    * `from_ts` : l'heure à partir de laquelle le relèvement s'applique
+      (`resets_at` moins `pace_ceiling_end_hours`) quand il est configuré ET
+      prouvé ; None sinon. Sert à annoncer la fin de pause ;
+    * `end` : le plafond relevé, None sans relèvement.
+    """
+
+    value: float
+    reason: str = ""
+    from_ts: float | None = None
+    end: float | None = None
+
+
+def overage_impossible(gauges, now: float) -> bool:
+    """L'overage est-il impossible pour ce compte, prouvé par un relevé frais ?
+
+    Une seule source, jamais une déclaration de configuration : le relevé de
+    jauges, `overage.capable` **explicitement faux** (Claude `overageStatus`,
+    Codex `credits.has_credits`) et frais — au moins une fenêtre encore en
+    cours (un relevé dont toutes les fenêtres sont remises à zéro est périmé,
+    L71), et pas en overage.
+
+    #1176 (B2) : le `.claude.json` du compte a été retiré de cette preuve.
+    Son `cachedExtraUsageDisabledReason` peut dater d'une autre fenêtre, et
+    le mtime du **contenant** ne date pas la valeur : Claude Code réécrit ce
+    fichier pour d'autres raisons (une clé étrangère ajoutée suffisait à
+    faire relever le plafond alors que la capacité d'overage restait
+    inconnue). Aucune preuve fraîche rattachée à la capacité n'étant
+    démontrable, la suppression conservatrice s'impose : information
+    inconnue, absente ou périmée ⇒ pas de relèvement.
+
+    Toute autre situation — information absente, inconnue, périmée, ou
+    overage possiblement facturé — vaut « non » : le plafond de base tient.
+    """
+    read = getattr(gauges, "overage", None)
+    if read is None or read.capable is not False:
+        return False
+    if in_overage(gauges, now):
+        return False
+    return any(not g.reset_passed(now) for g in gauges)
+
+
+def pace_ceiling(profile: Profile, gauges, gauge, now: float) -> Ceiling:
+    """Le plafond de rythme effectif de cette fenêtre, et sa raison (#1176).
+
+    Le plafond de base est `profile.pace_ceiling` (défaut `PACE_CEILING`).
+    Dans les `pace_ceiling_end_hours` dernières heures avant la remise à zéro
+    de la fenêtre (`resets_at`), il monte à `pace_ceiling_end` si — et
+    seulement si — `overage_impossible` le prouve pour ce compte. Une fenêtre
+    sans date, un relèvement non déclaré, une preuve absente ou périmée
+    laissent le plafond de base : jamais de relèvement dans le doute.
+    """
+    base = profile.pace_ceiling
+    end = profile.pace_ceiling_end
+    if end is None or end <= base or not gauge.resets_at:
+        return Ceiling(base)
+    if in_overage(gauges, now):
+        # un compte en overage n'est jamais choisi : son plafond ne se relève pas
+        return Ceiling(base)
+    from_ts = float(gauge.resets_at) - profile.pace_ceiling_end_hours * 3600.0
+    left = float(gauge.resets_at) - now
+    if left < 0.0:
+        return Ceiling(base)
+    if not overage_impossible(gauges, now):
+        return Ceiling(base)
+    if now >= from_ts:
+        return Ceiling(end, CEILING_REASON_END, from_ts, end)
+    return Ceiling(base, from_ts=from_ts, end=end)
+
+
+def pace_ceilings(profile: Profile, gauges, now: float) -> dict:
+    """{clé de jauge: Ceiling} pour toutes les fenêtres du compte (#1176)."""
+    return {gauge.key: pace_ceiling(profile, gauges, gauge, now)
+            for gauge in gauges}
+
+
 def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tuple[float, str]]:
     """[(cap, label)]: the caps that hold on every window of the account
     whatever its pace (L226b): its fixed cap (`account_cap`), and
@@ -725,7 +1071,7 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
 
 
 def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
-           reserve: bool = False) -> dict:
+           reserve: bool = False, ceilings: dict | None = None) -> dict:
     """{gauge key: (cap, label)}: the usage each window of the account is held
     to (L226b), the lowest of
     * the pace cap of the guard (0019), or on the short window the account's
@@ -735,16 +1081,33 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
 
     `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
     non-critical agent): the pace cap, or the short window cap that replaces
-    it, is lowered by `RESERVE`, and never exceeds the pace cap minus
-    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered. #777 :
-    la réserve ne s'applique pas sous `PACE_MARGIN` d'écoulé — le plafond de
-    rythme y vaut `max(écoulé, marge)`, il ne bloque pas le début de fenêtre.
+    it, is lowered by `RESERVE` —
+    `max(min(PACE_CEILING, multiplier × elapsed + PACE_MARGIN) − RESERVE,
+    PACE_MARGIN)` — and the fixed caps are not lowered. #777 : tant que
+    `multiplier × elapsed ≤ RESERVE` (soit `≤ PACE_MARGIN` quand la réserve
+    vaut la marge) la réserve ne s'applique pas, le plafond de rythme y vaut
+    la marge (10 points) et non `multiplier × écoulé + marge − RESERVE` — à
+    8 % d'écoulé avec `multiplier = 2` il vaut 16 % (#1028 P3) ; l'énoncé de
+    la décision du propriétaire (« plafond = max(écoulé, marge) ») décrit ce
+    début de fenêtre. En fin de fenêtre le seuil vaut
+    `PACE_CEILING − RESERVE` (80 %), il ne suit plus `max(écoulé, marge)`
+    (#1028 N1).
+
+    `ceilings` (#1176, `pace_ceilings`) : les plafonds effectifs déjà
+    calculés pour ce compte ; sans eux, ils le sont ici. Le plafond de rythme
+    est celui du compte (`pace_ceiling`), ou son plafond de fin de fenêtre
+    quand `overage_impossible` le prouve.
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
     cut = RESERVE if reserve else 0.0
+    if ceilings is None:
+        ceilings = pace_ceilings(profile, gauges, now)
     out = {}
     for gauge in gauges:
-        pace = (gauge.held_cap(now, cut, profile.pace_multiplier), "pace cap")
+        ceiling = ceilings.get(gauge.key)
+        pace = (gauge.held_cap(now, cut, profile.pace_multiplier,
+                               ceiling.value if ceiling is not None
+                               else profile.pace_ceiling), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
             base = (max(0.0, profile.short_window_cap - cut), "short window cap")
             if reserve:
@@ -758,7 +1121,7 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
 
 
 def _release(profile: Profile, depasses, hard, now: float,
-             cut: float) -> tuple[float | None, object | None]:
+             cut: float, ceilings: dict | None = None) -> tuple[float | None, object | None]:
     """La fenêtre qui bloque le plus longtemps, et l'heure où elle libère.
 
     Ne se rattrapent pas par l'écoulé, et attendent donc leur remise à zéro :
@@ -773,39 +1136,69 @@ def _release(profile: Profile, depasses, hard, now: float,
     relevé (il porte alors le libellé « pace cap »), mais il ne rattrape
     jamais un usage au-dessus du plafond court — voir #777 r2, un compte
     `short_window_cap` 0,75 à 70 % d'usage avec 30 % d'écoulé.
+
+    `ceilings` (#1176) : le plafond effectif de chaque fenêtre. Un relèvement
+    de fin de fenêtre déjà prouvé peut libérer la fenêtre avant sa remise à
+    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro — et pas
+    avant que le rythme ait rattrapé l'usage sous le plafond relevé
+    (#1506, qui reprend le contrat de #1227 N1).
     """
     dated = []
     for gauge in depasses:
         if not gauge.resets_at:
             return None, None
+        ceiling = (ceilings or {}).get(gauge.key)
         short = (profile.short_window_cap is not None
                  and gauge.window_s <= SHORT_WINDOW_S)
         if any(gauge is held for held, _ in hard) or (
                 short and gauge.used_at(now) >= max(0.0, profile.short_window_cap - cut)):
             free = float(gauge.resets_at)
         else:
-            free = gauge.free_at(now, cut, profile.pace_multiplier)
+            free = gauge.free_at(now, cut, profile.pace_multiplier,
+                                 ceiling.value if ceiling is not None
+                                 else profile.pace_ceiling)
             if free is None:
                 return None, None
+            if (ceiling is not None and ceiling.from_ts is not None
+                    and ceiling.end is not None and ceiling.from_ts > now
+                    and gauge.used_at(now) < ceiling.end - cut):
+                # #1506 (reprend #1227 N1) : le relèvement ne libère qu'une
+                # fois le rythme rattrapé sous le plafond relevé. Annoncer
+                # `from_ts` seul promettait une pause que l'usage ne tenait pas
+                # encore à cette heure-là ; l'heure juste est la plus tardive
+                # des deux, sans jamais dépasser la libération calculée au
+                # plafond courant.
+                raised = gauge.free_at(now, cut, profile.pace_multiplier,
+                                       ceiling.end)
+                if raised is not None:
+                    free = min(free, max(float(ceiling.from_ts), raised))
         dated.append((free, gauge))
     return max(dated, key=lambda pair: pair[0])
 
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
              environ=None, *, record: bool = True, critical: bool = False,
-             reserve: bool = False) -> Evaluation:
+             reserve: bool = False, model=None) -> Evaluation:
     """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret.
 
     `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit.
     `critical` (L242b) : pour un agent critique, sans le plafond implicite de
     50 % du compte par défaut (`fixed_caps`). `reserve` : pour un agent non
-    critique, le rythme moins `RESERVE` (`limits`)."""
+    critique, le rythme moins `RESERVE` (`limits`). `model` (#1580 tranche 3) :
+    le modèle de la session ; `None` = pas de session (affichage), tous les
+    seaux comptent, `''` = modèle inconnu, les seaux de modèle sont écartés
+    (`gauges_of`).
+
+    #1176 : le plafond de rythme est celui du compte (`pace_ceiling`), relevé
+    en fin de fenêtre (`pace_ceiling_end`) quand `overage_impossible` le
+    prouve ; le refus d'overage (`in_overage`) et ses règles sont inchangés.
+    """
     result = Evaluation(profile)
     result.problems = check(profile, environ)
     if result.problems:
         result.reason = "unusable profile: %s" % "; ".join(result.problems)
         return result
-    result.gauges = gauges_of(book, profile, items, environ)
+    result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
@@ -819,7 +1212,9 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # (none dated, or a reading without windows: no date, never a guess)
         result.until = max(resets) if resets and len(resets) == len(spent) else None
         return result
-    result.limits = limits(profile, result.gauges, now, critical=critical, reserve=reserve)
+    result.ceilings = pace_ceilings(profile, result.gauges, now)
+    result.limits = limits(profile, result.gauges, now, critical=critical, reserve=reserve,
+                           ceilings=result.ceilings)
     depasses = []
     for gauge in result.gauges:
         # fenêtre remise à zéro depuis le relevé : vierge (L71 : `used_at`
@@ -835,20 +1230,25 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         gauge, (cap, label) = hard[0] if hard else (depasses[0],
                                                     result.limits[depasses[0].key])
         result.held = (gauge.key, gauge.used)
+        ceiling = result.ceilings.get(gauge.key)
+        raised = ", %s" % ceiling.reason if ceiling is not None and ceiling.reason else ""
         if label == "pace cap":
             result.reason = ("plan %s %s: %.0f%% used with %.0f%% of the window elapsed "
-                             "(pace cap %.0f%%)" % (
+                             "(pace cap %.0f%%%s)" % (
                                  profile.harness, gauge.key, gauge.used * 100,
-                                 gauge.elapsed(now) * 100, cap * 100))
+                                 gauge.elapsed(now) * 100, cap * 100, raised))
         else:
             result.reason = "%s plan %s: %.0f%% used (%s %.0f%%)" % (
                 profile.harness, gauge.key, gauge.used * 100, label, cap * 100)
         if reserve and not hard:
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
         # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
-        # plus longtemps ; #777 : à l'heure où elle libère vraiment.
+        # plus longtemps ; #777, #898 : à l'heure où elle libère vraiment —
+        # croisement du rythme, ou remise à zéro quand il ne rattrape plus ;
+        # #1176 : le relèvement de fin de fenêtre peut la libérer avant la
+        # remise à zéro.
         result.until, late = _release(profile, depasses, hard, now,
-                                      RESERVE if reserve else 0.0)
+                                      RESERVE if reserve else 0.0, result.ceilings)
         if late is not None:
             result.held = (late.key, late.used)
         return result
@@ -941,6 +1341,36 @@ def expiry(gauges, now: float) -> tuple | None:
     return best
 
 
+def lost_at_reset(gauges, now: float) -> float:
+    """#1580 (propriétaire, 2026-10-15) : le budget qui sera **perdu à la
+    remise à zéro** si rien ne le consomme d'ici là — la capacité inutilisée
+    (`1 − utilisé`, 0034 §5/L74) de la fenêtre qui se remet à zéro le plus
+    tôt (`expiry`). 0.0 : rien n'expire (aucune fenêtre en cours : relevé
+    échu, non daté ou absent — une lecture périmée n'annonce aucune perte).
+
+    C'est la part en jeu ; `lost_rate` en fait le score du choix en la
+    rapportant au temps qui reste."""
+    found = expiry(gauges, now)
+    return found[1] if found is not None else 0.0
+
+
+def lost_rate(gauges, now: float) -> float:
+    """#1789/N1 : la part perdue **par seconde** d'ici la remise à zéro — la
+    capacité inutilisée de la fenêtre qui se remet à zéro le plus tôt
+    (`lost_at_reset`), rapportée au temps qui reste.
+
+    C'est le score principal du choix : entre deux comptes utilisables,
+    consommer d'abord celui dont le budget s'évapore le plus vite, et non le
+    plus en retard sur son rythme — le retard ne dit pas ce qui sera perdu.
+    L'ordre déclaré, la fraîcheur et la garde de budget ne bougent pas. 0.0 :
+    rien n'expire (relevé échu, non daté ou absent, remise à zéro passée)."""
+    found = expiry(gauges, now)
+    if found is None:
+        return 0.0
+    remaining = float(found[0]) - now
+    return found[1] / remaining if remaining > 0 else 0.0
+
+
 def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | None]:
     """Le retard du compte sur son rythme (L117, amendement 0034 du 2026-10-10) :
     `(rapport, jauge)` de sa fenêtre **la plus contraignante**, où le rapport
@@ -970,14 +1400,29 @@ def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | N
 
 def explain(result: Evaluation, now: float) -> str:
     """Le retard d'un compte sur son rythme, lisible : « seven_day 35 %
-    utilisé (rythme 55 %) », « sans relevé : 0 % utilisé »."""
-    _ratio, gauge = lag(result.gauges, now, result.limits)
-    if gauge is None:
+    utilisé (rythme 55 %) », « sans relevé : non vérifié ».
+
+    #1561 : un relevé périmé (une fenêtre remise à zéro depuis, l'autre
+    encore ouverte) ne se lit plus comme une mesure courante — la raison dit
+    « non vérifié » et rappelle la dernière valeur connue. Un relevé absent
+    est « non vérifié » aussi : sa valeur n'est pas un 0 % mesuré (L117 le
+    fait passer premier, mais la raison ne ment pas)."""
+    gauges = result.gauges
+    if not gauges:
+        return "no reading: unverified"
+    if stale_reading(gauges, now):
+        last = lag(gauges, now, result.limits)[1]
+        suffix = (", last %s %.0f%%" % (last.key, last.used * 100)
+                  if last is not None else "")
+        return "stale reading (window reset since the reading): unverified" + suffix
+    _ratio, gauge = lag(gauges, now, result.limits)
+    if gauge is None:                       # jamais avec des jauges : ceinture
         return "no reading: 0% used"
-    if all(g.reset_passed(now) for g in result.gauges):
+    if all(g.reset_passed(now) for g in gauges):
         return "stale reading (window reset): 0% used"
     cap, label = result.limits.get(gauge.key) or (
-        gauge.pace_cap(now, result.profile.pace_multiplier), "pace cap")
+        gauge.pace_cap(now, result.profile.pace_multiplier, result.profile.pace_ceiling),
+        "pace cap")
     bound = ("pace %.0f%%" % (cap * 100)) if label == "pace cap" \
         else "%s %.0f%%" % (label, cap * 100)
     if not gauge.resets_at:
@@ -986,64 +1431,287 @@ def explain(result: Evaluation, now: float) -> str:
     return "%s %.0f%% used (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
 
 
+def placeable(result: Evaluation, now: float) -> bool:
+    """#1672 : ce relevé autorise-t-il le **placement** d'une session ?
+
+    Un relevé **partiel** (une fenêtre datée remise à zéro, une autre encore
+    ouverte) reste plaçable tant que son âge ne dépasse pas ce qui reste de
+    **chaque** fenêtre encore ouverte (`cost.reading_outdated`) : au-delà,
+    c'est une information trop ancienne pour engager un tour — le 15/10, un
+    relevé de 30 % vieux de quatre jours a envoyé un tour sur un compte Claude
+    à sa limite hebdomadaire. C'est une **prudence**, pas la preuve d'un quota
+    atteint : le relevé n'est qu'une borne inférieure, et la remise à zéro qui
+    rend la pause nécessaire la rouvre (L71, 0 %).
+
+    Oui pour un relevé **absent** (L117 : un compte jamais utilisé passe en
+    premier), pour un relevé **courant** et pour un relevé dont toutes les
+    fenêtres datées sont échues (L71, 0 %). La continuité et le forçage ne
+    passent pas par ici."""
+    return not result.gauges or not reading_outdated(result.gauges, now)
+
+
+def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
+    """La clé de classement d'un compte (0034 amendée, #1561, #1580).
+
+    * la fraîcheur du relevé (#1561) : sans relevé d'abord (L117, amendement
+      0034 du 2026-10-10 — un compte jamais utilisé compte pour 0 % et passe
+      en premier, pour ne pas laisser un forfait inutilisé), puis un relevé
+      courant, puis un relevé périmé, qui ne passe jamais avant un état
+      vérifié ;
+    * la perte par seconde d'ici la remise à zéro (`lost_rate`, la plus
+      rapide d'abord, #1789/N1) ;
+    * le retard sur le rythme (`lag`, le plus petit rapport d'abord) ;
+    * l'échéance de la capacité inutilisée (la plus proche d'abord, 0034 §1) ;
+    * la part de fenêtre perdue à cette remise à zéro (`lost_at_reset`, la
+      plus grosse d'abord) ;
+    * l'ordre déclaré (`priority`, L226b « primaries last »).
+
+    Le budget qui s'évapore passe avant le retard et l'ordre déclaré : demande
+    du propriétaire du 2026-10-15 (#1580) — le choix automatique ne suit plus
+    un ordre fixe de priorités, il consomme d'abord ce qui sera perdu à la
+    remise à zéro. Le retard reste le critère suivant : à perte égale, il
+    équilibre les comptes et porte les plafonds fixes (L226b)."""
+    result = evaluations[profile.name]
+    gauges = result.gauges
+    found = expiry(gauges, now)
+    # #1561 : absent (0, L117), courant (1), périmé (2) — le périmé après tout
+    # état vérifié ; #1580/#1789 : le budget perdu avant le retard, lui-même
+    # avant l'ordre déclaré.
+    if not gauges:
+        freshness = 0
+    elif stale_reading(gauges, now):
+        freshness = 2
+    else:
+        freshness = 1
+    return (freshness,
+            -round(lost_rate(gauges, now), 9),
+            round(lag(gauges, now, result.limits)[0], 6),
+            found[0] if found is not None else float("inf"),
+            -round(lost_at_reset(gauges, now), 6),
+            priority(profile))
+
+
 def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
-    """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
+    """Les comptes plaçables, du premier à consommer au dernier (0034 amendée).
 
-    Clé : L226b, the failover order first (`priority`: the default account
-    last, owner decision 2026-10-07), then le retard sur le rythme (`lag`, le
-    plus petit rapport d'abord), puis l'échéance de la capacité inutilisée (la
-    plus proche d'abord ; sans fenêtre en cours, après), puis l'ordre déclaré.
+    Clé (#1561, #1580, #1789) : d'abord un relevé **courant** — un compte dont
+    le relevé est périmé (une fenêtre remise à zéro depuis la lecture, une autre
+    encore ouverte) ne passe jamais avant un compte dont l'état est vérifié,
+    quel que soit l'ordre de bascule ; puis le budget **qui s'évapore** — la
+    perte par seconde d'ici la remise à zéro (`lost_rate`, la plus rapide
+    d'abord, #1789/N1), le retard sur le rythme (`lag`, le plus petit rapport
+    d'abord), l'échéance de la capacité inutilisée (la plus proche d'abord ;
+    sans fenêtre en cours, après), la part perdue à cette remise à zéro
+    (`lost_at_reset`, la plus grosse d'abord, #1580) ; puis l'ordre déclaré
+    (`priority`, L226b « le compte par défaut en dernier », décision owner du
+    2026-10-07).
+
+    #1672 : ce dernier recours est **borné**. Un relevé plus vieux que ce qui
+    reste de chaque fenêtre encore ouverte (`cost.reading_outdated`) est une
+    information trop ancienne pour engager un tour : il **écarte** le compte du
+    placement — le 15/10, le choix automatique a pris un compte Claude à sa
+    limite hebdomadaire sur la foi d'un relevé de 30 % vieux de quatre jours,
+    et le tour a été refusé ; sans compte plaçable, le choix pause. La
+    continuité (`choose`, étape 2) garde son chemin : une session déjà sur le
+    compte y reste et son tour rapporte la jauge ; un forçage manuel reste
+    souverain.
+
+    Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
+    un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
+    laisser un forfait inutilisé. Un relevé dont **toutes** les fenêtres
+    datées sont remises à zéro est courant (L71, 0 %) : le compte est
+    replaçable.
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
-    (`Evaluation.hard`)."""
-    def key(pair):
-        index, profile = pair
-        result = evaluations[profile.name]
-        gauges = result.gauges
-        found = expiry(gauges, now)
-        return (priority(profile), round(lag(gauges, now, result.limits)[0], 6),
-                found[0] if found is not None else float("inf"), index)
+    (`Evaluation.hard`) — ni un compte à relevé trop ancien, dont l'état réel
+    est inconnu."""
     usable = [(i, p) for i, p in enumerate(items)
-              if (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
-    return [p for _i, p in sorted(usable, key=key)]
+              if placeable(evaluations[p.name], now)
+              and (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
+    return [p for _i, p in sorted(
+        usable, key=lambda pair: _rank_key(pair[1], evaluations, now) + (pair[0],))]
 
 
 def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     """La raison du choix d'une nouvelle session (journal, `accounts list`) :
-    « sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant :
-    primaire seven_day 35 % utilisé (rythme 55 %) »."""
+    « no reading: unverified, tried first (L117) ; avant : primaire seven_day
+    35 % utilisé (rythme 55 %) ». Un relevé périmé (#1561) n'apparaît que
+    faute de relevé courant, et le dit.
+
+    L'ordre déclaré ne s'annonce que s'il a réellement décidé, les critères de
+    budget étant à égalité (`_rank_key`, #1580) ; la perte par seconde
+    s'annonce de même quand c'est elle qui a décidé (#1789/N1)."""
     first = ranked[0]
-    if len(ranked) > 1 and priority(first) < priority(ranked[1]):
-        # L226b: the failover order decided, not the pace
-        why = "%s, first in the failover order (priority %d)" % (
-            explain(evaluations[first.name], now), priority(first))
+    gauges = evaluations[first.name].gauges
+    if not gauges:
+        # L117 (amendement 0034 du 2026-10-10) : un compte jamais utilisé
+        # compte pour 0 % et passe en premier — la raison le dit, sans
+        # prétendre à un 0 % mesuré (#1561).
+        why = "no reading: unverified, tried first (L117)"
+    elif stale_reading(gauges, now):
+        # #1561 : aucun relevé courant n'est disponible ; il est essayé faute
+        # de mieux (L71), pas choisi sur un rythme qui n'est plus mesuré.
+        # #1672 ne l'écarte que lorsqu'il est plus vieux que toute fenêtre
+        # encore ouverte (`placeable`) ; ici il reste dans le rang.
+        why = "%s, tried (no current reading)" % explain(evaluations[first.name], now)
     else:
-        why = "%s, furthest behind its pace" % explain(evaluations[first.name], now)
+        why = None
+        if len(ranked) > 1:
+            mine = _rank_key(first, evaluations, now)
+            other = _rank_key(ranked[1], evaluations, now)
+            if mine[0] == other[0] and mine[1] != other[1]:
+                # #1789/N1: the budget that evaporates fastest decided (the
+                # freshness of the two readings is equal, so it really is the
+                # first criterion that differs)
+                why = "%s, losing its budget fastest" % explain(
+                    evaluations[first.name], now)
+            elif mine[:-1] == other[:-1] and mine[-1] != other[-1]:
+                # L226b: the failover order decided, the budget criteria tied
+                why = "%s, first in the failover order (priority %d)" % (
+                    explain(evaluations[first.name], now), priority(first))
+        if why is None:
+            why = "%s, furthest behind its pace" % explain(evaluations[first.name], now)
     if len(ranked) > 1:
         why += "; ahead of: %s" % ", ".join(
             "%s %s" % (p.name, explain(evaluations[p.name], now)) for p in ranked[1:])
     return why
 
 
+def _overage_reason(harness: str, agent: str | None) -> str:
+    """#1883 : le motif publié dans `account_holds` pour un compte quitté en
+    dépassement (`account_holds` portait les retenues de rythme de 0027 §3,
+    remplacées par le classement 0034 ; elle sert ici à une **règle absolue** :
+    un compte facturé au-delà de son plan n'est pris par aucun runner de
+    l'hôte, même quand la lecture locale d'un autre processus ne voit pas le
+    dépassement. La retenue n'est posée QUE par une bascule réelle qui quitte
+    ce compte, dans la transaction de la bascule : une pause, ou une lecture
+    locale saine, ne bloque personne."""
+    return ("%s plan: in overage (billed beyond the plan)%s"
+            % (harness, ", seen by %s" % agent if agent else ""))
+
+
+def _held_for_overage(store, host: str, harness: str, now: float) -> set[str]:
+    """#1883 : les comptes retenus pour overage sur cet hôte, encore valides.
+
+    Lecture d'un seul jeu (`holds`), pour les chemins qui n'ont pas besoin de
+    la cohérence retenues/identités (`_etat_placement` la donne)."""
+    return _holds_valid(store.holds(host, harness), now)
+
+
+#: #1883 : vivacité d'une empreinte de dossier publiée pour l'hôte — une
+#: configuration divergente qui cesse de tourner cesse d'être un conflit après
+#: cette fenêtre, sinon un profil retiré bloquerait le compte pour toujours.
+IDENTITY_WINDOW_S = 3600.0
+
+
+def identity_of(profile: Profile) -> str | None:
+    """#1883 : l'empreinte du dossier résolu d'un compte `config_dir`.
+
+    Jamais le chemin : un dossier de configuration est un secret d'hôte, seuls
+    des noms et des empreintes passent par la base (`storage.accounts`). None
+    pour un compte sans dossier (clé d'API), qui n'a pas d'identité à défendre.
+    """
+    if profile.kind != "config_dir":
+        return None
+    return hashlib.sha256(os.path.realpath(profile.home()).encode("utf-8")).hexdigest()
+
+
+def _publish_identities(store, host: str, harness: str, items: list[Profile]) -> None:
+    """#1883 (R3 auditeur, B2) : publie l'empreinte du dossier résolu de chaque
+    compte `config_dir` de ce processus.
+
+    Écriture NARROW (`account_identities` seulement), faite par TOUT processus
+    qui peut placer un tour, choix critique compris : sans elle, deux
+    configurations exclusivement critiques ne se voient jamais et le conflit
+    d'identité n'existe pour personne. La simulation (L39) ne publie jamais."""
+    for profile in items:
+        empreinte = identity_of(profile)
+        if empreinte is not None:
+            store.publish_identity(host, harness, profile.name, empreinte)
+
+
+def _conflicts_of(vues: dict, items: list[Profile]) -> set[str]:
+    """#1883 : les comptes dont une empreinte vivante contredit la leur."""
+    conflits: set[str] = set()
+    for profile in items:
+        empreinte = identity_of(profile)
+        if empreinte is None:
+            continue
+        if any(vue["identity"] != empreinte for vue in vues.get(profile.name, [])):
+            conflits.add(profile.name)
+    return conflits
+
+
+def _holds_valid(holds: dict, now: float) -> set[str]:
+    """#1883 : les comptes dont la retenue court encore à `now`."""
+    return {name for name, hold in holds.items()
+            if hold.get("until_ts") is not None and float(hold["until_ts"]) > now}
+
+
+def _etat_placement(store, host: str, harness: str, items: list[Profile],
+                    now: float) -> tuple[set[str], set[str]]:
+    """#1883 (R3 auditeur, B1) : retenues valides et identités contredites,
+    lues ENSEMBLE en une transaction sous le verrou de placement.
+
+    Rend `(retenus, conflits)`. C'est le seul état sur lequel une décision de
+    placement est validée : une retenue publiée pendant la lecture des
+    identités ne peut plus être manquée (les deux jeux viennent de
+    `store.placement_state`, pas de deux lectures séparées)."""
+    etat = store.placement_state(host, harness, now - IDENTITY_WINDOW_S)
+    return _holds_valid(etat["holds"], now), _conflicts_of(etat["identities"], items)
+
+
+#: #1883 (R3 auditeur, B1) : nombre de reprises de la validation finale de
+#: `choose`. Chaque reprise rejoue `decide` sur un état relu sous le verrou de
+#: placement ; si l'état bouge encore à la borne, le tour est refusé — aucun
+#: compte peut-être retenu n'est rendu.
+VALIDATION_ESSAIS = 3
+
+
+def identity_conflicts(store, host: str, harness: str, items: list[Profile],
+                       now: float, *, publish: bool = True) -> set[str]:
+    """#1883 (arbitrage pilote, option a) : les comptes dont l'identité est
+    contredite par une autre configuration de l'hôte.
+
+    `publish=True` publie d'abord les empreintes de CE processus, puis relit
+    celles des autres (`placement_state`, sous le verrou de placement) : deux
+    empreintes **vivantes** (vues depuis `IDENTITY_WINDOW_S`) sous le même
+    (hôte, harnais, nom) sont deux dossiers différents derrière le même nom.
+    Le compte est alors refusé au placement — prendre la lecture de l'un pour
+    une preuve saine de l'autre est exactement l'incident de #1883 (le
+    « secondaire » de deux profils de pc-smichea, l'un à 47 %, l'autre à
+    34 %). `publish=False` (alertes, simulation : aucune écriture partagée) se
+    contente de relire."""
+    if publish:
+        _publish_identities(store, host, harness, items)
+    etat = store.placement_state(host, harness, now - IDENTITY_WINDOW_S)
+    return _conflicts_of(etat["identities"], items)
+
+
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
-           paced: bool = True, critical: bool = False, margin: bool = False) -> Choice:
+           paced: bool = True, critical: bool = False, margin: bool = False,
+           model: str = "") -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
     l'agent (None : pas de session, ou session neuve) — elle le garde tant
     qu'il est sous son seuil (0034 §4).
 
-    Seule écriture : le dernier compte choisi (`account_active`,
-    comparer-et-changer, journalisé `bascule`) et l'historique des jauges.
-    Une erreur de base remonte : l'appelant suspend (fail-closed).
+    Écritures : le dernier compte choisi (`account_active`,
+    comparer-et-changer, journalisé `bascule`), l'historique des jauges, et
+    l'empreinte du dossier résolu des comptes `config_dir` (`account_identities`,
+    pour que les autres processus de l'hôte voient un même nom déclaré vers
+    deux dossiers ; jamais en simulation). Une erreur de base remonte :
+    l'appelant suspend (fail-closed).
 
     `simulate=True` (L39, `ameesh resume`) : le compte que choisirait le
     prochain tour, SANS AUCUNE écriture (ni bascule, ni historique des
-    jauges) ; `switched` dit la bascule qui aurait lieu.
+    jauges, ni empreinte d'identité) ; `switched` dit la bascule qui aurait
+    lieu.
 
     `paced=False` (garde de budget désactivée, L30) : quand aucun compte
     n'est sous son seuil, le rythme est levé — mais jamais les règles
@@ -1056,12 +1724,20 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     forçage (un forçage au seuil ne le retient pas s'il reste un compte) ;
     sans autre compte, le compte par défaut sert au-delà de son plafond
     implicite de 50 % (jamais en overage ; rythme et `overage_cap` tenus,
-    même avec `paced=False`), en dernier.
+    même avec `paced=False`), en dernier. #1883 (R3 auditeur, B2) : il publie
+    en revanche l'empreinte de son dossier (écriture narrow,
+    `account_identities`) — sans quoi deux configurations exclusivement
+    critiques ne se verraient jamais.
 
     `margin` (L242b (3), #389 r1) : un agent critique qui tourne sous un
     harnais emprunté ne revient au sien qu'avec la réserve des non-critiques
     (`RESERVE`) sous le rythme — sans cette marge, chaque franchissement du
     plafond coûterait une rotation avec résumé.
+
+    `model` (#1580 tranche 3) : le modèle de la session qui va tourner ; ses
+    seaux propres (widget omarchy) comptent pour lui seul. Défaut `''` :
+    modèle inconnu, les seaux de modèle sont écartés — jamais attribués au
+    hasard ; l'appelant qui connaît le modèle de l'agent le passe.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
@@ -1077,7 +1753,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         if profile.name not in cache:
             cache[profile.name] = evaluate(book, profile, items, now, environ,
                                            record=not simulate,
-                                           reserve=margin or not critical)
+                                           reserve=margin or not critical,
+                                           model=model)
         return cache[profile.name]
 
     active_name = row.get("account")
@@ -1094,124 +1771,263 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     active = by_name(items, active_name) or items[0]
     # L226b : un compte en échec d'authentification n'est jamais choisi
     sick = auth_failure.failing(db, host, harness)
-    candidates = healthy(items, sick)
+    # L226b/#1883 (R1 auditeur, B1) : les retenues d'overage publiées par les
+    # AUTRES processus de l'hôte priment sur tout placement — forçage,
+    # continuité comme classement. Un compte facturé au-delà du plan ne reçoit
+    # aucun tour, même si la lecture locale d'ici le dit sain (deux
+    # configurations peuvent lire deux dossiers sous le même nom) : c'est le
+    # contrat « jamais de dépassement ».
+    # #1883 (arbitrage pilote, option a) : deux configurations de l'hôte qui
+    # déclarent le même nom vers deux dossiers résolus rendent toute lecture
+    # ambiguë — le compte est refusé au placement (et signalé à l'owner), pas
+    # pris pour une preuve saine.
+    # #1883 (R3 auditeur, B1/B2) : les empreintes de CE processus sont publiées
+    # (sauf en simulation, L39 ; y compris pour un choix critique, sans quoi
+    # deux configurations exclusivement critiques ne se voient jamais), PUIS
+    # les retenues et les identités sont lues ENSEMBLE, en une transaction sous
+    # le verrou de placement : aucune retenue publiée pendant la lecture des
+    # identités n'est manquée. Le point de validation final relit ce même état.
+    if not simulate:
+        _publish_identities(store, host, harness, items)
+    retenus, conflits = _etat_placement(store, host, harness, items, now)
 
-    # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
-    # échec d'authentification est rendu tel quel : la garde de l'exécuteur
-    # bloque l'agent, elle ne bascule pas contre un geste humain)
-    def forced(profile: Profile) -> Choice:
-        current = ev(profile)
-        if current.ok or (not paced and current.unpaced_ok):
-            return Choice(profile, profile, forced=True,
-                          why="forced (ameesh accounts use)")
-        return Choice(None, profile, reason="account %s forced (ameesh accounts use): %s"
-                      % (profile.name, current.reason), forced=True)
+    # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu d'écartés
+    # (retenues d'overage, identités en conflit) ; `choose` la rejoue sur un
+    # jeu FRAIS avant de rendre un compte (voir la reprise après l'appel).
+    def decide(retenus: set[str], conflits: set[str]) -> Choice:
+        """La décision de placement pour un jeu d'écartés donné.
 
-    if row.get("forced"):
-        held = forced(active)
-        if held.profile is not None:
-            return held
-        # L226b (bureau, 2026-10-12): a forced account at its threshold does
-        # not hold the agent while another healthy account is under its own —
-        # the force is lifted (journaled `auto`) and the automatic choice runs
-        free = [p for p in candidates if p.name != active.name
-                and (ev(p).ok if paced else ev(p).unpaced_ok)]
+        Un compte retenu ou d'identité contredite ne reçoit aucun tour : ces
+        écartés priment sur le forçage, la continuité et le classement.
+        Les jeux sont relus à l'instant du placement (R2 auditeur, B1)."""
+        nonlocal row, cache
+        candidates = healthy(items, sick)
+        ecartes = retenus | conflits
+
+        # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
+        # échec d'authentification est rendu tel quel : la garde de l'exécuteur
+        # bloque l'agent, elle ne bascule pas contre un geste humain)
+        def forced(profile: Profile) -> Choice:
+            current = ev(profile)
+            if profile.name in conflits:
+                return Choice(None, profile, reason=(
+                    "account %s forced (ameesh accounts use): declared with another "
+                    "folder by a second configuration of this host" % profile.name),
+                    forced=True)
+            if profile.name in retenus:
+                return Choice(None, profile, reason=(
+                    "account %s forced (ameesh accounts use): in overage for another "
+                    "runner of this host" % profile.name), forced=True)
+            if current.ok or (not paced and current.unpaced_ok):
+                return Choice(profile, profile, forced=True,
+                              why="forced (ameesh accounts use)")
+            return Choice(None, profile, reason="account %s forced (ameesh accounts use): %s"
+                          % (profile.name, current.reason), forced=True)
+
+        if row.get("forced"):
+            held = forced(active)
+            if held.profile is not None:
+                return held
+            # L226b (bureau, 2026-10-12): a forced account at its threshold does
+            # not hold the agent while another healthy account is under its own —
+            # the force is lifted (journaled `auto`) and the automatic choice runs.
+            # #1672 : le remplaçant doit être réellement plaçable — un compte à
+            # relevé périmé ne lève pas le forçage pour une pause.
+            free = [p for p in candidates if p.name != active.name
+                    and p.name not in ecartes
+                    and placeable(ev(p), now)
+                    and (ev(p).ok if paced else ev(p).unpaced_ok)]
+            if critical:
+                pass        # L242b : choix propre à l'agent, le forçage reste aux autres
+            elif not free:
+                return held
+            elif not simulate and not store.set_auto(
+                    host, harness, expected=active.name,
+                    reason="forced account %s at threshold (%s); %s free"
+                    % (active.name, cache[active.name].reason, free[0].name)):
+                # #295: the row changed since it was read — a human forced another
+                # account meanwhile: that force holds (never lifted in the same turn)
+                row = store.active(host, harness) or {}
+                now_forced = by_name(items, row.get("account"))
+                if row.get("forced") and now_forced is not None:
+                    return forced(now_forced)
+
+        # 2. continuité : la session garde son compte tant qu'il est sous son seuil
+        # (les autres comptes ne sont alors pas relus : rien à choisir). Un compte
+        # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
+        # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
+        own = by_name(items, session_account) if session_account else None
+        if (own is not None and own in candidates and own.name not in ecartes
+                and ev(own).ok):
+            return Choice(own, active, kept=True,
+                          why="continuity: the session stays on %s, under its "
+                              "threshold" % own.name)
+        for profile in items:
+            ev(profile)
+        # #1883 : jamais de placement sur un compte qu'un autre runner a fui en
+        # dépassement, ni sur un nom que deux configurations déclarent vers
+        # deux dossiers
+        if ecartes:
+            candidates = [p for p in candidates if p.name not in ecartes]
+        # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
+        ranked = rank(candidates, cache, now)
+        if not ranked and not paced:
+            # L226b: past its pace a healthy account stays usable, never past an
+            # absolute rule
+            ranked = rank(candidates, cache, now, paced=False)
+        beyond = False
+        if not ranked and critical:
+            # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
+            # agent critique seulement, en dernier (jamais en overage) ; au retour
+            # d'un emprunt, avec la même marge (#389 r2)
+            relaxed = dict(cache)
+            for profile in candidates:
+                if profile.default and profile.cap is None:
+                    relaxed[profile.name] = evaluate(book, profile, items, now, environ,
+                                                     record=False, critical=True,
+                                                     reserve=margin)
+            # le rythme tient ici même garde désactivée (#324 r1)
+            ranked = rank(candidates, relaxed, now)
+            if ranked:
+                beyond = True
+                cache = relaxed
+        if not ranked:
+            blocked = [p for p in items if p.name in sick
+                       and (cache[p.name].ok if paced else cache[p.name].unpaced_ok)]
+            if blocked:
+                # L226b : des comptes sous leur seuil, mais aucun sain — jamais de
+                # repli payé en plus : le compte en panne est rendu, la garde de
+                # l'exécuteur tient l'agent en `auth_blocked` et l'alerte part
+                stuck = active if active in blocked else blocked[0]
+                return Choice(stuck, active, auth_blocked=True,
+                              why="no healthy %s account: %s" % (
+                                  harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
+                                      "reason") or "authentication failing")
+                                      for p in items if p.name in sick)))
+            # #1672 : un relevé plus vieux que toute fenêtre encore ouverte est
+            # écarté du placement — le dire, plutôt que de le compter comme « au
+            # seuil » (le relevé ne mesure plus l'état du compte). C'est une
+            # prudence sur une information ancienne, pas la preuve d'un quota.
+            # la remise à zéro la plus proche d'une fenêtre encore ouverte rouvre
+            # le compte (L71) : l'annoncer, comme pause_label le fait au seuil
+            from .cost import until_label
+            withheld = ["%s until %s" % (p.name, until_label(min(
+                            float(g.resets_at) for g in cache[p.name].gauges
+                            if g.resets_at and not g.reset_passed(now)), now))
+                        for p in items
+                        if p.name not in sick and cache[p.name].gauges
+                        and reading_outdated(cache[p.name].gauges, now)]
+            why = "%sall %s accounts at threshold — %s" % (
+                pause_label(cache), harness, _label(cache))
+            ecartes_why = []
+            if conflits:
+                ecartes_why.append(
+                    "%s declared with different folders by two configurations of "
+                    "this host" % ", ".join(sorted(conflits)))
+            if retenus:
+                ecartes_why.append("%s held for overage seen on this host"
+                                   % ", ".join(sorted(retenus)))
+            if ecartes_why:
+                why = ("%sno %s account to place: %s — %s"
+                       % (pause_label(cache), harness, "; ".join(ecartes_why),
+                          _label(cache)))
+            elif withheld:
+                why = ("%sno %s account to place: reading older than every open "
+                       "window (%s) — %s" % (pause_label(cache), harness,
+                                             ", ".join(withheld), _label(cache)))
+            return Choice(None, active, reason=why)
+        target = ranked[0]
+        why = reason_of(ranked, cache, now)
+        if beyond:
+            why = ("critical agent: %s beyond its %.0f%% cap, every other account at "
+                   "threshold (owner decision 2026-10-12); %s" % (
+                       target.name, PRIMARY_CAP * 100, why))
+        left = own if own is not None else (active if target.name != active.name else None)
+        if left is not None and left.name in sick:
+            why = "%s authentication failing (%s); %s" % (
+                left.name, sick[left.name].get("reason") or "?", why)
+        elif left is not None and not cache[left.name].ok:
+            why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
         if critical:
-            pass        # L242b : choix propre à l'agent, le forçage reste aux autres
-        elif not free:
-            return held
-        elif not simulate and not store.set_auto(
-                host, harness, expected=active.name,
-                reason="forced account %s at threshold (%s); %s free"
-                % (active.name, cache[active.name].reason, free[0].name)):
-            # #295: the row changed since it was read — a human forced another
-            # account meanwhile: that force holds (never lifted in the same turn)
-            row = store.active(host, harness) or {}
-            now_forced = by_name(items, row.get("account"))
-            if row.get("forced") and now_forced is not None:
-                return forced(now_forced)
+            # L242b : jamais le dernier choix partagé ; la bascule est celle de
+            # l'agent (depuis le compte de sa session, sinon le choix partagé)
+            origin = own if own is not None else active
+            moved = None
+            if target.name != origin.name:
+                moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
+            return Choice(target, active, switched=moved, why=why, per_agent=True)
+        if target.name == active.name:
+            # #1883 (R2 auditeur, B1) : rien n'est écrit ici — c'est le point de
+            # validation de `choose` qui relit la retenue de ce retour, comme de
+            # tous les autres.
+            return Choice(target, active, why=why)
+        switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}
+        if simulate:
+            return Choice(target, target, switched=switched, why=why)
+        # L226b/#1883 (R1 auditeur, B2) : la retenue valide sur la CIBLE est
+        # revérifiée DANS la transaction de bascule, sous le même verrou que les
+        # autres workers — un classement sur un instantané périmé ne fait jamais
+        # partir un tour sur un compte retenu. La retenue du compte quitté en
+        # dépassement est posée dans la MÊME transaction.
+        left_ev = cache.get(active.name)
+        quitte_en_overage = left_ev is not None and in_overage(left_ev.gauges, now)
+        if store.switch_guarded(
+                host, harness, expected=active.name, to=target.name, kind="bascule",
+                reason=why, agent=agent, now=now,
+                hold_reason=_overage_reason(harness, agent) if quitte_en_overage else None,
+                hold_until=(now + OVERAGE_HOLD_S) if quitte_en_overage else None):
+            # #1883 (R2 auditeur, B2) : les retenues échues de la cible sont
+            # nettoyées DANS la transaction de bascule, sous le verrou ; un
+            # `release` ici effacerait une retenue publiée après la validation.
+            return Choice(target, target, switched=switched, why=why)
+        # refusée : un autre worker a changé le compte, ou une retenue est apparue
+        # sur la cible entre le classement et la bascule. Ne JAMAIS rendre une
+        # cible retenue : le tour partirait facturé au-delà du forfait.
+        fresh = store.active(host, harness) or {}
+        if target.name in _held_for_overage(store, host, harness, now):
+            return Choice(None, by_name(items, fresh.get("account")) or active,
+                          reason="no %s account to place: %s held for overage seen on "
+                                 "this host" % (harness, target.name))
+        # course : un forçage posé entre-temps prime, évalué comme en 1 (L226b :
+        # un primaire au-dessus de son plafond ou un compte en overage n'est pas lancé)
+        if fresh.get("forced"):
+            return forced(by_name(items, fresh.get("account")) or active)
+        return Choice(target, by_name(items, fresh.get("account")) or target, why=why)
 
-    # 2. continuité : la session garde son compte tant qu'il est sous son seuil
-    # (les autres comptes ne sont alors pas relus : rien à choisir)
-    own = by_name(items, session_account) if session_account else None
-    if own is not None and own in candidates and ev(own).ok:
-        return Choice(own, active, kept=True,
-                      why="continuity: the session stays on %s, under its threshold" % own.name)
-    for profile in items:
-        ev(profile)
-    # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
-    ranked = rank(candidates, cache, now)
-    if not ranked and not paced:
-        # L226b: past its pace a healthy account stays usable, never past an
-        # absolute rule
-        ranked = rank(candidates, cache, now, paced=False)
-    beyond = False
-    if not ranked and critical:
-        # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
-        # agent critique seulement, en dernier (jamais en overage) ; au retour
-        # d'un emprunt, avec la même marge (#389 r2)
-        relaxed = dict(cache)
-        for profile in candidates:
-            if profile.default and profile.cap is None:
-                relaxed[profile.name] = evaluate(book, profile, items, now, environ,
-                                                 record=False, critical=True,
-                                                 reserve=margin)
-        # le rythme tient ici même garde désactivée (#324 r1)
-        ranked = rank(candidates, relaxed, now)
-        if ranked:
-            beyond = True
-            cache = relaxed
-    if not ranked:
-        blocked = [p for p in items if p.name in sick
-                   and (cache[p.name].ok if paced else cache[p.name].unpaced_ok)]
-        if blocked:
-            # L226b : des comptes sous leur seuil, mais aucun sain — jamais de
-            # repli payé en plus : le compte en panne est rendu, la garde de
-            # l'exécuteur tient l'agent en `auth_blocked` et l'alerte part
-            stuck = active if active in blocked else blocked[0]
-            return Choice(stuck, active, auth_blocked=True,
-                          why="no healthy %s account: %s" % (
-                              harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
-                                  "reason") or "authentication failing")
-                                  for p in items if p.name in sick)))
-        return Choice(None, active, reason="%sall %s accounts at threshold — %s"
-                      % (pause_label(cache), harness, _label(cache)))
-    target = ranked[0]
-    why = reason_of(ranked, cache, now)
-    if beyond:
-        why = ("critical agent: %s beyond its %.0f%% cap, every other account at "
-               "threshold (owner decision 2026-10-12); %s" % (
-                   target.name, PRIMARY_CAP * 100, why))
-    left = own if own is not None else (active if target.name != active.name else None)
-    if left is not None and left.name in sick:
-        why = "%s authentication failing (%s); %s" % (
-            left.name, sick[left.name].get("reason") or "?", why)
-    elif left is not None and not cache[left.name].ok:
-        why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
-    if critical:
-        # L242b : jamais le dernier choix partagé ; la bascule est celle de
-        # l'agent (depuis le compte de sa session, sinon le choix partagé)
-        origin = own if own is not None else active
-        moved = None
-        if target.name != origin.name:
-            moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
-        return Choice(target, active, switched=moved, why=why, per_agent=True)
-    if target.name == active.name:
-        return Choice(target, active, why=why)
-    switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}
-    if simulate:
-        return Choice(target, target, switched=switched, why=why)
-    if store.switch(host, harness, expected=active.name, to=target.name, kind="bascule",
-                    reason=why, agent=agent):
-        store.release(host, harness, target.name)  # retenue d'avant 0034, s'il en reste
-        return Choice(target, target, switched=switched, why=why)
-    # course : un autre worker a changé le dernier choix entre-temps ; un
-    # forçage posé entre-temps prime, évalué comme en 1 (L226b : un primaire
-    # au-dessus de son plafond ou un compte en overage n'est pas lancé)
-    fresh = store.active(host, harness) or {}
-    if fresh.get("forced"):
-        return forced(by_name(items, fresh.get("account")) or active)
-    return Choice(target, by_name(items, fresh.get("account")) or target, why=why)
+    # #1883 (R2 auditeur, B1) : point unique de validation de TOUT retour qui
+    # lance un tour (hors `auth_blocked`, que la garde de l'exécuteur ne lance
+    # pas). Les retenues d'overage ET les identités contredites sont relues
+    # ENSEMBLE (`_etat_placement`, une transaction sous le verrou de
+    # placement), après la lecture des jauges comme après la bascule : un
+    # compte qu'un autre runner de l'hôte vient de fuir en dépassement, ou
+    # qu'une seconde configuration déclare vers un autre dossier, ne reçoit pas
+    # de tour — même si le forçage, la continuité ou le classement l'ont retenu
+    # sur un instantané périmé.
+    # #1883 (R3 auditeur, B1) : la reprise est validée à son tour. La décision
+    # rejouée sur l'état frais peut choisir un compte dont une retenue est
+    # publiée pendant son classement ; chaque reprise repasse donc par la même
+    # relecture, et une borne franchie refuse le tour (`VALIDATION_ESSAIS`) —
+    # jamais un compte peut-être retenu rendu.
+    choice = decide(retenus, conflits)
+    for _ in range(VALIDATION_ESSAIS):
+        if choice.profile is None or choice.auth_blocked:
+            return choice
+        frais, conflits_frais = _etat_placement(store, host, harness, items, now)
+        if (choice.profile.name not in frais
+                and choice.profile.name not in conflits_frais):
+            return choice
+        # reprise : la décision est rejouée sur l'état frais — forçage levé
+        # pour un compte libre, continuité rompue, compte écarté du classement.
+        # Le compte actif partagé est relu : une bascule de la décision
+        # précédente a pu le déplacer.
+        row = store.active(host, harness) or row
+        active_name = row.get("account")
+        active = by_name(items, active_name) or active
+        choice = decide(frais, conflits_frais)
+    return Choice(None, active, reason=(
+        "no %s account to place: the placement state changed on every re-read "
+        "(a hold or an identity conflict was published while deciding); "
+        "retrying next turn" % harness))
 
 
 def healthy(items: list[Profile], sick: dict) -> list[Profile]:
@@ -1275,6 +2091,10 @@ def report(cfg, db, book, *, now: float | None = None,
     commandes d'affichage (`ameesh accounts list`, `ameesh cost report`) ;
     le relevé revient aux exécuteurs (avant chaque tour) ou à une demande
     explicite.
+
+    Chaque jauge porte son plafond effectif (`pace_ceiling`, #1176) et sa
+    raison (`ceiling_reason`, vide pour le plafond de base) : le relèvement de
+    fin de fenêtre s'y lit, comme dans la raison du compte.
     """
     now = time.time() if now is None else now
     declared = parse(getattr(cfg, "accounts", None) or {})
@@ -1286,8 +2106,10 @@ def report(cfg, db, book, *, now: float | None = None,
         active = store.active(cfg.host, harness) if store else None
         holds = store.holds(cfg.host, harness) if store else {}
         active_name = (active or {}).get("account") or items[0].name
+        evaluations = {}
         for profile in items:
             result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+            evaluations[profile.name] = result
             hold = holds.get(profile.name) or {}
             rows.append({
                 "harness": harness,
@@ -1301,22 +2123,38 @@ def report(cfg, db, book, *, now: float | None = None,
                 "problems": list(result.problems),
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
+                # #1075/#1028 : le rythme du compte, pour les affichages qui
+                # lisent ses jauges hors d'`evaluate` (cost.report, progress) ;
+                # #1227 N3 : ces lecteurs recalculent le plafond de rythme du
+                # compte, pas seulement sa valeur
+                "pace_multiplier": profile.pace_multiplier,
                 # L226b: failover order and overage flags
                 "priority": priority(profile),
                 "overage": _overage_row(profile, result.gauges, now),
                 "gauges": [
                     # L71 : une fenêtre échue compte pour 0 % ; le dernier
-                    # relevé reste lisible (`last_used`)
+                    # relevé reste lisible (`last_used`) ; #1176 : le plafond
+                    # effectif de la fenêtre et sa raison ; #1561 : `read_at`
+                    # date le relevé, `stale` (posé par `_forecast`) dit qu'il
+                    # n'est plus un instantané courant.
                     {"key": g.key, "used": g.used_at(now), "last_used": g.used,
                      "cap": (result.limits.get(g.key)
-                             or (g.pace_cap(now, result.profile.pace_multiplier),))[0],
+                             or (g.pace_cap(now, result.profile.pace_multiplier,
+                                            result.profile.pace_ceiling),))[0],
+                     "pace_ceiling": (result.ceilings.get(g.key)
+                                      or Ceiling(result.profile.pace_ceiling)).value,
+                     "ceiling_reason": (result.ceilings.get(g.key)
+                                        or Ceiling(result.profile.pace_ceiling)).reason,
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
-                     "reset_passed": g.reset_passed(now)}
+                     "reset_passed": g.reset_passed(now),
+                     "read_at": getattr(g, "read_at", None)}
                     for g in result.gauges
                 ],
                 "_gauges": list(result.gauges),
+                "_limits": result.limits,
+                "_ceilings": result.ceilings,
             })
-        _forecast(rows[len(rows) - len(items):], items, now)
+        _forecast(rows[len(rows) - len(items):], items, now, evaluations)
     return rows
 
 
@@ -1332,19 +2170,28 @@ def _overage_row(profile: Profile, gauges, now: float) -> dict:
             "in_use": in_overage(gauges, now)}
 
 
-def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
+def _forecast(rows: list[dict], items: list[Profile], now: float,
+              evaluations: dict) -> None:
     """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
     remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
     échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
-    (`next`, avec sa raison `why`, la même que celle du choix — L117)."""
-    evaluations = {}
+    (`next`, avec sa raison `why`, la même que celle du choix — L117).
+
+    #1561 : un relevé périmé n'annonce ni perte ni échéance — la capacité
+    inutilisée qu'il décrit (30 % d'une fenêtre de 7 j encore ouverte) n'est
+    qu'une borne inférieure, et l'annonce « 70 % perdus à la remise à zéro »
+    était fausse. Le compte porte `stale` pour les affichages.
+
+    #1580 : les `Evaluation` réellement calculées par `report` sont reprises
+    telles quelles — reconstruire ici des évaluations sans plafonds changeait
+    les rapports de rythme (plafonds fixes, plafond court, `pace_multiplier`)."""
     for row, profile in zip(rows, items):
-        result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"])
-        evaluations[profile.name] = result
-        row["losses"] = [
+        stale = bool(row["_gauges"]) and stale_reading(row["_gauges"], now)
+        row["stale"] = stale
+        row["losses"] = [] if stale else [
             {"key": g.key, "resets_at": found[0], "in_s": found[0] - now, "lost": found[1]}
             for g in row["_gauges"] for found in [g.expiring(now)] if found is not None]
-        found = expiry(row["_gauges"], now)
+        found = None if stale else expiry(row["_gauges"], now)
         row["expires_in_s"] = (found[0] - now) if found is not None else None
         row["next"] = False
         row["why"] = ""
@@ -1367,13 +2214,23 @@ def format_rows(rows: list[dict]) -> str:
         actif = ("forced" if row["forced"] else "yes") if row["active"] else ""
         etat = "ok" if row["ok"] else "limit" if not row["problems"] else "invalid"
         gauges = ", ".join(
-            "%s %.0f%% (pace %.0f%%%s)" % (
+            "%s %.0f%% (pace %.0f%%%s%s)" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
+                # #1176 : le plafond effectif et sa raison, quand il est relevé
+                ", ceiling %.0f%%, %s" % (g["pace_ceiling"] * 100, g["ceiling_reason"])
+                if g.get("ceiling_reason") else "",
                 ", reset passed, last reading %.0f%%"
                 % (g.get("last_used", g["used"]) * 100) if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
             row["harness"], row["account"], actif, etat, gauges))
+        if row.get("stale"):
+            # #1561 : le relevé n'est plus un instantané courant (une fenêtre
+            # remise à zéro, une autre encore ouverte) — la valeur lue n'est
+            # qu'une borne inférieure, pas un « 30 % utilisé » d'aujourd'hui.
+            lines.append("%-9s %-14s %-7s %-8s ↳ reading not current: "
+                         "window reset since the reading (unverified)"
+                         % ("", "", "", ""))
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
         if row.get("losses"):

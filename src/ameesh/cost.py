@@ -39,6 +39,7 @@ sont donc la même écriture — un tour rejoué après panne ne perd pas son co
 """
 from __future__ import annotations
 
+import datetime as _dt
 import glob
 import json
 import os
@@ -46,7 +47,7 @@ import re
 import math
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 from . import config as config_mod
 from . import harnesses
@@ -58,7 +59,7 @@ from .gauge_cache import CLAUDE_GAUGES
 DEFAULT_PRICES = {
     # #475: DeepSeek's official peak price, read on 2026-10-12 at
     # https://api-docs.deepseek.com/quick_start/pricing (cache miss, cache hit,
-    # output). Off-peak hours cost half; the peak price is the upper bound.
+    # output). This is the peak price; off-peak hours are in `PRICE_PERIODS`.
     "deepseek-flash": [0.30, 0.006, 1.20],
     "deepseek-pro": [0.55, 0.14, 2.19],
     "gpt-6.1-sol": [1.25, 0.125, 10.0],
@@ -102,6 +103,26 @@ PROMPT_TIERS = {
     "claude-haiku-5-5": (100_000, [0.10, 0.01, 0.50]),
 }
 
+#: #513 : heures de pointe DeepSeek, relues le 2026-10-12 sur
+#: https://api-docs.deepseek.com/quick_start/pricing : 01:00-04:00 et
+#: 06:00-10:00 UTC, du lundi au vendredi ; toute autre heure est creuse,
+#: week-ends compris. Les jours fériés chinois, creux eux aussi, ne sont pas
+#: connus ici : ils restent au prix de pointe (majorant).
+DEEPSEEK_PEAK_UTC = ((1, 4), (6, 10))
+#: jours de la semaine des heures de pointe (`datetime.weekday`, lundi = 0)
+DEEPSEEK_PEAK_DAYS = (0, 1, 2, 3, 4)
+
+#: #513 : modèles facturés selon l'HEURE de chaque tour. `DEFAULT_PRICES` porte
+#: le prix de pointe ; `off_peak`, celui des heures creuses (même page, même
+#: date : la moitié du prix de pointe). Un tour entièrement creux paie
+#: `off_peak` ; un tour dont une partie est en pointe, ou dont l'heure est
+#: inconnue, paie la pointe (majorant). Seulement au tarif officiel : un
+#: barème local qui renomme le prix du modèle n'a pas d'heures creuses.
+PRICE_PERIODS = {
+    "deepseek-flash": {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
+                       "off_peak": [0.15, 0.003, 0.60]},
+}
+
 #: Fenêtres nommées par les jauges, en secondes.
 KNOWN_WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 
@@ -136,6 +157,10 @@ def paid_harnesses_of(host: str | None = None) -> tuple[str, ...]:
 
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
 PACE_MARGIN = 0.10
+#: Plafond de rythme par défaut (0019 §2). Un compte peut régler le sien
+#: (`accounts.<harnais>[i].pace_ceiling`, #1176) et le relever dans les
+#: dernières heures de la fenêtre quand l'overage y est impossible
+#: (`pace_ceiling_end`).
 PACE_CEILING = 0.90
 #: L242b : plancher du rapport réel/estimé qui corrige l'estimation entre deux
 #: relevés de solde (`CostBook.paid_hour`) — jamais une dépense comptée nulle
@@ -232,12 +257,20 @@ class Gauge:
     used: float                     #: 0..1 (le harnais publie des pourcents)
     resets_at: float | None         #: epoch, ou None si le harnais ne le dit pas
     window_s: float
+    #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
+    #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
+    read_at: float | None = None
     #: #1132 : instant de PRODUCTION du relevé (epoch), None quand le flux ne
     #: le date pas (sans marqueur, ou Codex) — l'heure d'insertion n'en tient
     #: pas lieu, un relevé périmé ne doit pas se faire passer pour frais.
     produced_at: float | None = None
     #: #1132 : journal d'origine du relevé (nom de l'agent), '' si inconnu.
     source: str = ""
+    #: #1580 (tranche 3) : le modèle auquel ce seau est propre (le `title` du
+    #: widget omarchy, ex. « Fable Weekly » → « fable »), '' pour une fenêtre
+    #: générale. Un seau propre à un modèle ne compte que pour une session de
+    #: ce modèle (`accounts.gauges_of`) ; l'affichage les montre tous.
+    scope: str = ""
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -245,16 +278,22 @@ class Gauge:
             return 1.0
         return min(max(1.0 - (self.resets_at - now) / self.window_s, 0.0), 1.0)
 
-    def pace_cap(self, now: float, multiplier: float = 1.0) -> float:
-        """Le plafond de rythme : min(90 %, part écoulée × `multiplier` + 10 points).
+    def pace_cap(self, now: float, multiplier: float = 1.0,
+                 ceiling: float = PACE_CEILING) -> float:
+        """Le plafond de rythme : min(`ceiling`, part écoulée × `multiplier` + 10 points).
 
         `multiplier` (#1075, bureau 13/10) : multiplicateur de rythme propre au
         compte (`accounts`, `pace_multiplier`, défaut 1.0), posé à 2.0 sur le
         compte principal Codex pour consommer sa réserve de forfait sans
         remise à zéro. Il ne touche que la part écoulée : l'utilisation
         relevée, les remises à zéro et les plafonds fixes ne changent pas.
+
+        `ceiling` (#1176) : le plafond du compte (`accounts`, `pace_ceiling`,
+        défaut `PACE_CEILING`), ou son plafond de fin de fenêtre
+        (`pace_ceiling_end`) quand le relèvement s'applique. Les autres termes
+        — marge, part écoulée, utilisation relevée — sont inchangés.
         """
-        return min(PACE_CEILING, self.elapsed(now) * multiplier + PACE_MARGIN)
+        return min(ceiling, self.elapsed(now) * multiplier + PACE_MARGIN)
 
     def used_at(self, now: float) -> float:
         """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
@@ -267,25 +306,40 @@ class Gauge:
         return 0.0 if self.reset_passed(now) else self.used
 
     def held_cap(self, now: float, reserve: float = 0.0,
-                 multiplier: float = 1.0) -> float:
+                 multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float:
         """Le seuil effectif de la fenêtre : le rythme moins `reserve` (L242b),
         jamais sous `PACE_MARGIN` quand une réserve s'applique.
 
-        La réserve protège la fin de fenêtre ; elle ne doit pas bloquer son
-        début (#777, décision du propriétaire du 2026-10-13 : « pas de réserve
-        sur une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »).
-        Une fenêtre à 1 % d'écoulé garde donc 10 points, pas 1.
+        Exactement `min(PACE_CEILING, multiplier × écoulé + PACE_MARGIN) −
+        reserve`, plancher `PACE_MARGIN` :
+        * **début de fenêtre** : tant que `multiplier × écoulé ≤ reserve`
+          (soit `≤ PACE_MARGIN` quand la réserve vaut la marge), la réserve ne
+          s'applique pas et le seuil vaut la marge (10 points), pas
+          `multiplier × écoulé + marge − réserve` — une fenêtre à 1 % d'écoulé
+          garde donc 10 points, pas 1 ; à 8 % d'écoulé avec `multiplier = 2`
+          le seuil vaut 16 %, pas 10 % (#1028 P3). C'est l'énoncé de la
+          décision du propriétaire du 2026-10-13 (#777) : « pas de réserve sur
+          une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »,
+          exact pour `multiplier = 1` et `reserve = PACE_MARGIN` tant qu'on
+          reste sous le plafond de fin de fenêtre ;
+        * **fin de fenêtre** : le seuil plafonne à `PACE_CEILING − reserve`
+          (80 % avec la réserve de 10 points) et ne suit plus l'écoulé —
+          l'énoncé `max(écoulé, marge)` n'y vaut plus (#1028 N1).
+
+        `ceiling` (#1176) est transmis à `pace_cap` : le plafond du compte ou
+        son plafond de fin de fenêtre.
         """
-        cap = max(0.0, self.pace_cap(now, multiplier) - reserve)
+        cap = max(0.0, self.pace_cap(now, multiplier, ceiling) - reserve)
         return max(cap, PACE_MARGIN) if reserve else cap
 
     def exceeded(self, now: float, reserve: float = 0.0,
-                 multiplier: float = 1.0) -> bool:
-        """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant."""
-        return self.used_at(now) >= self.held_cap(now, reserve, multiplier)
+                 multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> bool:
+        """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant,
+        `ceiling` (#1176) est celui du compte."""
+        return self.used_at(now) >= self.held_cap(now, reserve, multiplier, ceiling)
 
     def free_at(self, now: float, reserve: float = 0.0,
-                multiplier: float = 1.0) -> float | None:
+                multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float | None:
         """L'heure où la fenêtre cesse de bloquer, ou None si elle ne la dit
         pas (`resets_at` absent).
 
@@ -295,16 +349,23 @@ class Gauge:
         celle où l'écoulé dépasse l'usage »). Un usage au-delà du plafond
         (`PACE_CEILING` moins la réserve) n'est jamais rattrapé : seule la
         remise à zéro libère la fenêtre, et c'est elle qu'on annonce.
+
+        La part cherchée est l'inverse exact de `held_cap` :
+        `(used + reserve − PACE_MARGIN) / multiplier`. Aucun plancher
+        `PACE_MARGIN` ne s'y applique (#1028 N2) : une jauge bloquée a
+        `used ≥ held_cap ≥ PACE_MARGIN`, donc la part est déjà positive ; le
+        plancher ne changeait rien pour `reserve ≥ PACE_MARGIN` et annonçait
+        une libération trop tardive en dessous (le seuil, lui, garde le sien).
+
+        `ceiling` (#1176) est le plafond effectif du compte à `now`.
         """
         if not self.resets_at:
             return None
         used = self.used_at(now)
-        if used >= PACE_CEILING - reserve:
+        if used >= ceiling - reserve:
             return float(self.resets_at)
-        share = used + reserve - PACE_MARGIN
-        if reserve:
-            share = max(share, PACE_MARGIN)
-        share = min(max(share / multiplier, 0.0), 1.0)
+        share = (used + reserve - PACE_MARGIN) / multiplier
+        share = min(max(share, 0.0), 1.0)
         return float(self.resets_at) - self.window_s * (1.0 - share)
 
     def reset_passed(self, now: float) -> bool:
@@ -326,6 +387,67 @@ class Gauge:
         if not self.resets_at or self.reset_passed(now):
             return None
         return float(self.resets_at), max(0.0, 1.0 - float(self.used or 0.0))
+
+
+def stale_reading(gauges, now: float) -> bool:
+    """Le relevé n'est plus un instantané courant du compte (#1561).
+
+    * **absent** (aucune jauge) : rien ne dit l'état du compte ;
+    * **partiel** : une fenêtre datée s'est remise à zéro alors qu'une autre
+      court encore — la fenêtre ouverte n'est plus qu'une borne inférieure
+      (le compte a pu servir depuis, ici ou ailleurs) ;
+    * **non daté** : l'âge du relevé (`read_at`) dépasse sa plus courte
+      fenêtre.
+
+    Un relevé dont **toutes** les fenêtres datées sont remises à zéro n'est
+    pas périmé : la suivante est vierge, 0 % (L71). Un relevé sans âge connu
+    n'est pas présumé périmé : une source qui ne date pas garde son sens, et
+    le choix la traite comme avant.
+    """
+    gauges = list(gauges)
+    if not gauges:
+        return True
+    dated = [g for g in gauges if g.resets_at]
+    if dated:
+        passed = [g.reset_passed(now) for g in dated]
+        return any(passed) and not all(passed)
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
+    if not stamps:
+        return False
+    return now - min(stamps) > min(g.window_s for g in gauges)
+
+
+def reading_outdated(gauges, now: float) -> bool:
+    """#1672 : le relevé **partiel** est-il trop vieux pour engager un tour ?
+
+    `stale_reading` dit qu'un relevé partiel — une fenêtre datée remise à zéro,
+    une autre encore ouverte — n'est plus un instantané courant ; il reste
+    néanmoins informatif pour les fenêtres encore ouvertes tant que son âge
+    (`now - read_at`) ne dépasse pas ce qui leur reste (`resets_at - now`).
+    Au-delà, la remise à zéro qui rendra le relevé caduc est plus proche que le
+    trou d'observation : **prudence sur une information ancienne**, pas la
+    preuve d'un quota atteint. Le cas réel du 15/10 : relevé de 30 % vieux de
+    quatre jours, fenêtre 7 j à 9 h de sa remise à zéro — le choix automatique
+    y a envoyé un tour, refusé par la limite hebdomadaire.
+
+    Faux pour un relevé **courant** (aucune fenêtre datée remise à zéro) et
+    pour un relevé dont **toutes** les fenêtres datées sont échues (L71, la
+    suivante est vierge à 0 %). Faux sans âge connu (`read_at` absent : une
+    date manquante ne prouve aucune péremption de plus). Faux dès qu'**une**
+    fenêtre encore ouverte reste plus longue que l'âge : le relevé garde du
+    sens pour elle.
+    """
+    dated = [g for g in gauges if g.resets_at]
+    if not any(g.reset_passed(now) for g in dated):
+        return False
+    opened = [g for g in dated if not g.reset_passed(now)]
+    if not opened:
+        return False                    # L71 : toutes échues, la suivante est vierge
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
+    if not stamps:
+        return False
+    age = now - min(stamps)
+    return all(age > float(g.resets_at) - now for g in opened)
 
 
 @dataclass(frozen=True)
@@ -423,6 +545,27 @@ PRICE_FAMILY = {
 }
 
 
+def foreign_harness_model(harness: str, model: str | None) -> bool:
+    """Le modèle nommé appartient-il **positivement** à la famille d'un autre
+    harnais ? (#1268)
+
+    Garde de lancement : une ligne de registre héritée d'une bascule de harnais
+    (#1037) peut porter `model=claude-…` avec `harness=codex` ; passer ce modèle
+    au harnais du tour provoque un 400 côté fournisseur (incident orchestrateur
+    du 14/10). On ne refuse jamais sur une supposition : un identifiant dont
+    aucune famille n'est reconnue n'est pas étranger.
+    """
+    nom = str(model or "").strip().lower()
+    if not nom:
+        return False
+    for harnais, prefixes in PRICE_FAMILY.items():
+        if harnais == harness:
+            continue
+        if any(nom.startswith(prefixe) for prefixe in prefixes):
+            return True
+    return False
+
+
 #: suffixes qu'un harnais ajoute à l'identifiant d'un modèle sans en changer
 #: le tarif : variante de contexte (`claude-opus-4-6[1m]`), instantané daté
 #: (`claude-haiku-4-5-20251001`)
@@ -459,6 +602,45 @@ def prompt_tier(prices: dict, model: str | None) -> tuple | None:
     if tier is None or list(prices[name]) != DEFAULT_PRICES.get(name):
         return None
     return tier
+
+
+def is_peak(period: dict, ts: float) -> bool:
+    """#513 : l'instant `ts` est-il dans les heures de pointe de `period` ?"""
+    moment = _dt.datetime.fromtimestamp(float(ts), _dt.timezone.utc)
+    return moment.weekday() in period["peak_days"] and any(
+        low <= moment.hour < high for low, high in period["peak_utc"])
+
+
+#: #513 : au-delà, un tour n'est jamais creux (horloge déréglée, marqueur
+#: ancien) — la marche heure par heure reste bornée
+PERIOD_MAX_S = 2 * 86400
+
+
+def period_price(prices: dict, model: str | None, started: float | None,
+                 ended: float | None) -> list | None:
+    """#513 : le prix creux d'un tour de `started` à `ended`, ou None (pointe).
+
+    Creux seulement si le modèle a des heures creuses (`PRICE_PERIODS`) au
+    tarif officiel, et si TOUT l'intervalle est hors pointe : les bornes de
+    pointe tombent sur des heures pleines UTC, on vérifie donc chaque heure
+    commencée. Heure inconnue, intervalle à l'envers ou trop long : None."""
+    name = priced_name(prices, model)
+    period = PRICE_PERIODS.get(name or "")
+    if period is None or list(prices[name]) != DEFAULT_PRICES.get(name):
+        return None
+    try:
+        low, high = float(started), float(ended)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(low) and math.isfinite(high)) or high < low \
+            or high - low > PERIOD_MAX_S:
+        return None
+    moment = low
+    while moment <= high:
+        if is_peak(period, moment):
+            return None
+        moment = (math.floor(moment / 3600.0) + 1) * 3600.0
+    return None if is_peak(period, high) else list(period["off_peak"])
 
 
 def price_of(prices: dict, harness: str, model: str | None) -> list:
@@ -642,26 +824,41 @@ class CostBook:
         except OSError:
             return ""
 
-    def events(self, agent: str, start: int = 0, tail: bool = False) -> list:
-        """Les événements JSONL d'un agent, à partir de la ligne `start`."""
+    def events(self, agent: str, start: int = 0, tail: bool = False,
+               end: int | None = None) -> list:
+        """Les événements JSONL d'un agent, de la ligne `start` (incluse) à la
+        ligne `end` (exclue ; None = fin du flux).
+
+        #2096 : le flux est lu **en flux**, jamais chargé entier. Un journal de
+        200 Mo rendait une liste de tous ses événements (pic de plusieurs
+        centaines de Mo par lecture, et plusieurs lectures par tour) alors
+        qu'un tour n'en veut que la tranche ; les lignes hors de la tranche
+        sont comptées en C, jamais analysées, et la lecture reprend à l'octet
+        de `start`. Avec `tail`, seule la fin du fichier est lue et les index
+        partent du début de cette fin (inchangé)."""
         path = os.path.join(self.agent_dir(agent), "events.jsonl")
-        raw = _read_tail(path) if tail else _read_all(path)
-        out = []
-        for index, line in enumerate(raw.splitlines()):
-            if index < start:
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            # Un `[]` ou un `null` est une ligne JSON valide mais pas un événement :
-            # la garder ferait planter le premier `.get` venu (sonde codex2).
-            if isinstance(event, dict):
-                out.append(event)
-        return out
+        if tail:
+            return _parse_events(_read_tail(path).splitlines(), start, end)
+        try:
+            with open(path, "rb") as flux:
+                offset = _byte_offset_of_line(flux, start)
+                if offset is None:
+                    return []
+                fin = None if end is None else _byte_offset_of_line(flux, end)
+                if fin is not None and fin <= offset:
+                    return []  # tranche vide (end <= start)
+                flux.seek(offset)
+                brut = flux.read() if fin is None else flux.read(fin - offset)
+        except OSError:
+            return []
+        # la tranche lue est exactement [start, end) : tout ce qu'elle contient
+        # est dans la tranche, et un octet invalide écarte sa ligne (JSON
+        # illisible) au lieu de faire échouer toute la lecture. Coupée sur
+        # "\n" seul, comme le compte de l'exécuteur (`events_start`) : un
+        # `splitlines()` couperait aussi sur U+2028 ou U+0085, qu'un harnais
+        # écrit tels quels dans une chaîne JSON, et perdrait l'événement.
+        texte = brut.decode("utf-8", "replace")
+        return _parse_events(texte.split("\n"), 0)
 
     # -- jauges de forfait --------------------------------------------------
     def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
@@ -695,7 +892,7 @@ class CostBook:
                 continue
             if newest is None or _reading_rank(found) >= _reading_rank(newest):
                 newest = found
-        return newest[2] if newest else []
+        return newest[2] if newest else Gauges()
 
     def _claude_gauges_of(self, account: str, primary: str | None) -> list:
         """Read the newest gauges for one Claude account (L30).
@@ -741,12 +938,18 @@ class CostBook:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or _reading_rank(found) >= _reading_rank(best)):
                 best = found
-        # A caller must not mutate the cached list seen by another CostBook.
-        if best is None:
-            return self._gauges_with_history(account, [])
-        return self._gauges_with_history(account, best[2])
+        # A caller must not mutate the cached list seen by another CostBook;
+        # the copy keeps the reading's overage flags (L226b, #1649).
+        # No reading: an empty Gauges (overage None), the same type as a
+        # reading, so a direct `.overage` read never meets a bare list (N1 impl-04).
+        # #1132 : la lecture locale (overage compris) est complétée par
+        # l'historique partagé ; le type `Gauges` est conservé sur ce chemin
+        # aussi — #1132 rendait une liste nue, l'historique ne porte pas les
+        # drapeaux d'overage.
+        reading = Gauges(best[2], best[2].overage) if best else Gauges()
+        return self._gauges_with_history(account, reading)
 
-    def _gauges_with_history(self, account: str, gauges) -> list:
+    def _gauges_with_history(self, account: str, gauges: "Gauges") -> "Gauges":
         """#1132 : complète la lecture locale par l'historique partagé (0027/0434).
 
         Un exécuteur ne voit que SON dossier d'état : la mesure la plus récente
@@ -756,43 +959,43 @@ class CostBook:
         mesure locale ; une mesure non datée ne remplace jamais une mesure
         datée. Lecture seule, jamais fatale : sans base, en panne, ou sans
         relevé daté, la lecture locale est rendue.
+
+        L'historique ne porte pas les drapeaux d'overage : la copie rendue
+        garde ceux de la lecture locale, avec le type `Gauges` (#1649).
         """
         if self.db is None:
-            return list(gauges)
+            return gauges
         try:
             rows = self._gauge_latest("claude", account)
         except Exception:  # historique facultatif : jamais fatal à la garde
-            return list(gauges)
+            return gauges
         known = {row.get("key"): row for row in rows if row.get("produced_ts") is not None}
         if not known:
-            return list(gauges)
+            return gauges
         merged, changed = [], False
         for gauge in gauges:
             row = known.get(gauge.key)
             if row is not None and (gauge.produced_at is None
                                     or float(row["produced_ts"]) > float(gauge.produced_at)):
+                produced = float(row["produced_ts"])
                 merged.append(Gauge("claude", gauge.key, float(row["used"]),
                                     row.get("resets_at_ts"), float(row["window_s"]),
-                                    produced_at=float(row["produced_ts"]),
+                                    read_at=produced, produced_at=produced,
                                     source=row.get("source") or ""))
                 changed = True
             else:
                 merged.append(gauge)
         if not gauges:
             for key in sorted(known):
-                row = known[key]
+                row, produced = known[key], float(known[key]["produced_ts"])
                 merged.append(Gauge("claude", key, float(row["used"]),
                                     row.get("resets_at_ts"), float(row["window_s"]),
-                                    produced_at=float(row["produced_ts"]),
+                                    read_at=produced, produced_at=produced,
                                     source=row.get("source") or ""))
                 changed = True
         if not changed:
-            return list(gauges)
-        # Le chemin par COMPTE rend une liste simple, comme avant #1132 : les
-        # drapeaux d'overage restent portés par la lecture SANS compte, et un
-        # drapeau local périmé ne doit pas être recollé à une mesure fraîche
-        # venue de l'historique.
-        return list(merged)
+            return gauges
+        return Gauges(merged, gauges.overage)
 
     def _gauge_latest(self, harness: str, account: str) -> list:
         """Le dernier relevé connu de chaque jauge d'un compte (#1132)."""
@@ -814,6 +1017,10 @@ class CostBook:
             key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
         )[-CODEX_FILES:]
         for path in reversed(files):
+            try:
+                read_at = os.path.getmtime(path)
+            except OSError:
+                read_at = None
             limits = None
             for line in _read_tail(path, 2_000_000).splitlines():
                 line = line.strip()
@@ -840,6 +1047,7 @@ class CostBook:
                     _fraction(value.get("used_percent"), percent=True),
                     _epoch(value.get("resets_at")),
                     minutes * 60 if minutes else float(KNOWN_WINDOWS["seven_day"]),
+                    read_at,
                 ))
             if gauges:
                 return Gauges(gauges, _codex_overage(limits, gauges))
@@ -901,6 +1109,11 @@ class CostBook:
         Le seuil est celui de la décision 0019 §2 :
         `utilisation >= min(90 %, part écoulée de la fenêtre + 10 points)`,
         moins `reserve` pour un agent non critique (L242b (2), `held_cap`).
+
+        Sans compte déclaré : c'est le rythme **nominal** (`multiplier = 1.0`)
+        qui s'applique. Un harnais à comptes déclarés passe par
+        `accounts.choose`/`accounts.evaluate`, qui portent le
+        `pace_multiplier` de son profil (#1075, #1028).
         """
         now = self.clock()
         held = [gauge for gauge in self.gauges(harness) if gauge.exceeded(now, reserve)]
@@ -910,9 +1123,10 @@ class CostBook:
         # comptes déclarés (`accounts.pause_label`) ; sans compte déclaré,
         # c'est le compte par défaut du harnais. #373 r2 : la pause dure
         # jusqu'à la libération la plus tardive des fenêtres qui bloquent —
-        # aucune date si l'une d'elles n'est pas datée. #777 : la libération
-        # est l'heure où le rythme rattrape l'usage (`free_at`), pas la remise
-        # à zéro, sauf pour un usage que le rythme ne rattrape plus.
+        # aucune date si l'une d'elles n'est pas datée. #777, #898 : la
+        # libération est l'heure où le rythme rattrape l'usage (`free_at`),
+        # pas la remise à zéro, sauf pour un usage que le rythme ne rattrape
+        # plus.
         head = ""
         if all(gauge.resets_at for gauge in held):
             free, gauge = max(((float(g.free_at(now, reserve)), g) for g in held),
@@ -986,7 +1200,9 @@ class CostBook:
                                   int(row["cum_output_tokens"] or 0)]
                     if row["cum_input_tokens"] is not None else None,
                 }
-        before = self.events(agent)[:max(0, start)] if start else []
+        # #2096 : le préfixe seul est demandé — inutile de lire (et d'analyser)
+        # les événements du tour qui suit, encore moins de charger le journal.
+        before = self.events(agent, end=max(0, start)) if start else []
         current = ""
         found: dict = {}
         for event in before:
@@ -1017,6 +1233,18 @@ class CostBook:
         session neuve, None sans marqueur (flux d'avant L71 : comportement
         historique, le premier relevé d'une session vaut le tour).
         """
+        marker = self.turn_marker(agent, start)
+        return None if marker is None else str(marker.get("resume") or "")
+
+    def turn_started(self, agent: str, start: int) -> float | None:
+        """#513 : l'heure de début du tour, lue dans son marqueur, ou None."""
+        marker = self.turn_marker(agent, start) or {}
+        value = marker.get("ts")
+        return float(value) if isinstance(value, (int, float)) \
+            and not isinstance(value, bool) else None
+
+    def turn_marker(self, agent: str, start: int) -> dict | None:
+        """Le dernier marqueur de tour (L71) avant la ligne `start`, ou None."""
         path = os.path.join(self.agent_dir(agent), "events.jsonl")
         found = None
         try:
@@ -1031,7 +1259,7 @@ class CostBook:
                     except ValueError:
                         continue
                     if isinstance(event, dict) and event.get("type") == TURN_MARKER:
-                        found = str(event.get("resume") or "")
+                        found = event
         except OSError:
             return None
         return found
@@ -1142,17 +1370,41 @@ class CostBook:
         nouveau `thread.started`, et la session se perdrait alors sur la ligne —
         le relevé suivant, comparé au mauvais repère, compterait un tour de trop
         (sonde codex2, B5). La session se résout donc en amont et se transmet.
+
+        #2096 : lue **de la fin vers le début**, elle n'a plus à charger ni à
+        analyser le journal entier à chaque tour ; la dernière session est
+        presque toujours dans les derniers blocs. Le parcours reste complet
+        quand il faut (flux sans session, ou que des sous-agents en fin de
+        flux), et rend la même session que le parcours direct.
         """
-        return _last_session(self.events(agent)) or None
+        path = os.path.join(self.agent_dir(agent), "events.jsonl")
+        for ligne in _lines_reverse(path):
+            ligne = ligne.strip()
+            if not ligne:
+                continue
+            try:
+                event = json.loads(ligne)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            trouve = _session_event(event)
+            if trouve:
+                return trouve
+        return None
 
     def turn_usage(self, agent: str, start: int = 0, session: str | None = None,
-                   model: str | None = None) -> TurnUsage:
+                   model: str | None = None, ended: float | None = None) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
 
         Le repère de cumul (dernier `total_cost_usd` Claude, dernier usage Codex)
         est lu dans le grand livre : la différence se calcule donc entre deux
         tours, pas entre deux lectures d'un même tour — et un tour sans relevé ne
         l'efface pas.
+
+        #513 : un modèle à heures creuses (`PRICE_PERIODS`) est facturé à
+        l'heure du tour, de son marqueur à `ended` (défaut : maintenant ; un
+        compte rejoué plus tard n'en est que plus souvent en pointe).
         """
         harness = self.tool_of(agent)
         # Le modèle **effectif du lancement** est passé par l'exécuteur ; le
@@ -1174,6 +1426,9 @@ class CostBook:
         # L225 : la marque (`price_fallback` ou `void_reason`) ne vaut que pour
         # un tour effectivement compté au barème, avec des jetons.
         triplet, marque = price_for(prices, harness or "deepseek", model)
+        if triplet and not marque:
+            triplet = period_price(prices, model, self.turn_started(agent, start),
+                                   time.time() if ended is None else ended) or triplet
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
         tier = prompt_tier(prices, model) if not marque else None
         cum = self.baseline(agent, harness, session)
@@ -1289,7 +1544,10 @@ class CostBook:
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
-               key: str | None = None) -> TurnUsage:
+               key: str | None = None, ended: float | None = None,
+               work_item_id: int | None = None,
+               started_at: float | None = None,
+               turn_id: str | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -1302,6 +1560,14 @@ class CostBook:
         `key` (L60) : la clé du marqueur comptable du tour. Un marqueur rejoué
         après une écriture réussie mais pas effacée (exécuteur arrêté entre les
         deux) ne réécrit pas la ligne : avant L60, il la doublait.
+
+        `work_item_id` et `started_at` (#796) : le lot servi par le tour et son
+        instant de début (epoch, horloge de la base), lus sur le marqueur
+        comptable. Ils viennent du **marqueur**, jamais de la mémoire de
+        l'appelant : une réparation par un autre worker écrit la même
+        attribution, ou aucune si elle n'y était pas. `turn_id` (#796) :
+        l'identifiant du tour (`turn_resources.turn_id`), même provenance, pour
+        relier la ligne à ses ressources.
         """
         if self.db is None:
             raise CostError("record without a database: the cumulative baseline lives in turn_costs")
@@ -1309,7 +1575,7 @@ class CostBook:
         # **Résolue une fois**, sur tout le flux, puis transmise au calcul comme à
         # l'insertion : la ligne et le repère doivent porter la même session.
         session_id = session or self.session_of(agent)
-        usage = self.turn_usage(agent, start, session=session_id, model=model)
+        usage = self.turn_usage(agent, start, session=session_id, model=model, ended=ended)
         # L30 : le compte du tour est celui du dernier marqueur AVANT le tour.
         account = self.account_at(agent, start, usage.harness)
         cum_usd = cum_input = cum_cached = cum_out = None
@@ -1338,7 +1604,12 @@ class CostBook:
             cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
             account=account, spend_key=key, void_reason=usage.void_reason,
             price_fallback=usage.price_fallback,
-            cache_write_tokens=usage.cache_write_tokens)
+            cache_write_tokens=usage.cache_write_tokens,
+            # #796 (0423) : le lot du tour et son début, portés par le marqueur
+            work_item_id=None if work_item_id is None else int(work_item_id),
+            started_at=None if started_at is None else float(started_at),
+            # #796 (0423) : l'identifiant du tour, pour le relier à ses ressources
+            turn_id=turn_id)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
@@ -1407,21 +1678,35 @@ class CostBook:
           nommé couvre les lignes qu'aucune série nommée ne couvre.
 
         Soldes ou grand livre illisibles : l'estimation seule."""
-        ledger_hour = self.spent("all", 3600, harnesses=paid)
+        return self.paid_spent(paid, 3600.0)
+
+    def paid_spent(self, paid: Sequence[str], seconds: float = 3600.0,
+                   agent: str = "all") -> float:
+        """#513 : `paid_hour` sur les `seconds` dernières secondes, pour le
+        mesh (`agent="all"`) ou pour un agent. La dépense mesurée (baisse des
+        soldes) fait foi ; l'estimation du grand livre ne sert qu'entre deux
+        relevés, corrigée par le rapport réel/estimé de son compte.
+
+        La fenêtre décide d'abord ce que le mesh compte de chaque baisse
+        (L242b, `paid_hour`) ; un agent reçoit, de ce montant, la part de ses
+        estimations dans celles de son compte **dans la fenêtre**. Une baisse
+        sans estimation dans la fenêtre n'est attribuable à personne : la part
+        de l'agent est nulle (le mesh garde, lui, le repli temporel)."""
+        ledger = self.spent(agent, seconds, harnesses=paid)
         if self.db is None or not paid:
-            return ledger_hour
+            return ledger
         # l'heure réelle, comme les relevés et le grand livre (datés par la
         # base) — pas `self.clock`, l'horloge des jauges
         now = time.time()
-        start = now - 3600.0
         try:
-            return self._paid_hour(list(paid), start, now)
+            return self._paid_spent(list(paid), now - float(seconds), now, agent)
         except Exception:  # noqa: BLE001 - soldes illisibles : l'estimation
-            return ledger_hour
+            return ledger
 
-    def _paid_hour(self, paid: list, start: float, now: float) -> float:
+    def _paid_spent(self, paid: list, start: float, now: float, agent: str) -> float:
         from . import balance
-        rows = storage.of(self.db).operations.balances(provider=None, since_s=3600.0 + 1.0)
+        rows = storage.of(self.db).operations.balances(provider=None,
+                                                       since_s=now - start + 1.0)
         series: dict = {}
         for row in sorted(rows, key=lambda r: float(r["observed_ts"])):
             if row["provider"] in paid and row["currency"] == "USD" \
@@ -1430,14 +1715,18 @@ class CostBook:
         series = {key: points for key, points in series.items() if len(points) >= 2}
         # tout l'intervalle depuis le plus ancien relevé, sans coupure (#373
         # r2) : une estimation écartée ferait paraître toute la baisse dans
-        # l'heure. Il reste borné : `balances` ne rend, avant l'heure, que le
-        # dernier relevé de chaque série.
+        # la fenêtre. Il reste borné : `balances` ne rend, avant la fenêtre,
+        # que le dernier relevé de chaque série.
         oldest = min([float(points[0]["observed_ts"]) for points in series.values()]
                      + [start])
         lines = storage.of(self.db).turn_costs.paid_lines(oldest, harnesses=paid)
 
         def estimated(mine, low, high):
             return sum(float(line["usd"]) for line in mine if low < float(line["ts"]) <= high)
+
+        def counted(mine):
+            return mine if agent == "all" else [line for line in mine
+                                                if line.get("agent") == agent]
 
         total = 0.0
         for harness in paid:
@@ -1449,33 +1738,52 @@ class CostBook:
                 mine = [line for line in spent
                         if (line.get("account") == acct if acct is not None
                             else line.get("account") not in named)]
-                real_all = real_in = 0.0
-                for prev, cur in zip(points, points[1:]):
-                    low, high = float(prev["observed_ts"]), float(cur["observed_ts"])
-                    drop = max(0.0, float(prev["total"]) - float(cur["total"]))
-                    real_all += drop
-                    if high <= start or not drop:
-                        continue
-                    pair = estimated(mine, low, high)
-                    if low >= start:
-                        share = 1.0
-                    elif pair >= balance.GAP_MIN_USD:
-                        share = estimated(mine, start, high) / pair
-                    else:
-                        share = (high - start) / (high - low)
-                    real_in += drop * share
-                first = float(points[0]["observed_ts"])
-                last = float(points[-1]["observed_ts"])
+                ours = counted(mine)
+                pairs = [(float(prev["observed_ts"]), float(cur["observed_ts"]),
+                          max(0.0, float(prev["total"]) - float(cur["total"])))
+                         for prev, cur in zip(points, points[1:])]
+                first, last = pairs[0][0], pairs[-1][1]
                 est_all = estimated(mine, first, last)
                 ratio = 1.0
                 if est_all >= balance.GAP_MIN_USD:
-                    ratio = max(PAID_RATIO_FLOOR, real_all / est_all)
-                outside = estimated(mine, start, min(first, now)) \
-                    + estimated(mine, max(last, start), now)
+                    ratio = max(PAID_RATIO_FLOOR, sum(p[2] for p in pairs) / est_all)
+                real_in = 0.0
+                for low, high, drop in pairs:
+                    if high <= start or not drop:
+                        continue
+                    pair = estimated(mine, low, high)
+                    # la fenêtre décide d'abord ce que le mesh compte de cette
+                    # baisse (L242b, inchangé) : l'intervalle entier, sinon la
+                    # part de l'estimation du compte, sinon le prorata temporel
+                    if low >= start:
+                        share = drop
+                    elif pair >= balance.GAP_MIN_USD:
+                        share = drop * estimated(mine, start, high) / pair
+                    else:
+                        share = drop * (high - start) / (high - low)
+                    if agent == "all":
+                        real_in += share
+                        continue
+                    # #513 r3 (B/P2 de la relecture) : l'agent reçoit une part
+                    # de ce que le mesh compte DÉJÀ sur la fenêtre, répartie
+                    # comme ses propres estimations dans la fenêtre ; `part <=
+                    # window` (mêmes lignes, filtrées), donc sa part est bornée
+                    # par `share`. #513 r2 : dès qu'il y a une estimation
+                    # (`window > 0`), l'ancien repli `part * ratio` (ratio 1,0
+                    # sous le seuil) laissait l'agent sous son plafond quand le
+                    # compte entier restait sous `GAP_MIN_USD` (0,40 $ estimés
+                    # pour 0,80 $ de baisse). Sans estimation dans la fenêtre,
+                    # rien n'est attribuable (`part` est nul, `part * ratio`
+                    # aussi) : le mesh garde le repli temporel de L242b.
+                    window = estimated(mine, max(low, start), high)
+                    part = estimated(ours, max(low, start), high)
+                    real_in += share * part / window if window > 0 else part * ratio
+                outside = estimated(ours, start, min(first, now)) \
+                    + estimated(ours, max(last, start), now)
                 total += real_in + outside * ratio
             # les comptes qu'aucune série ne couvre : leur estimation
             if None not in covered:
-                total += sum(float(line["usd"]) for line in spent
+                total += sum(float(line["usd"]) for line in counted(spent)
                              if float(line["ts"]) > start
                              and line.get("account") not in named)
         return total
@@ -1502,6 +1810,9 @@ class CostBook:
         (`daily_usd`) et pour les plafonds propres à l'agent
         (`agent_limits`, sa seule dépense payée au token). Un plafond nul ou
         absent ne s'applique pas.
+
+        #513 : tous ces plafonds comptent la dépense mesurée sur les soldes
+        (`paid_spent`), l'estimation ne servant qu'entre deux relevés.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
         reason = self.pace_exceeded(harness, reserve) if (harness and pace) else ""
@@ -1516,8 +1827,7 @@ class CostBook:
         # L70 : plafonds du mesh (heure, jour glissant), puis ceux de l'agent
         for window, cap in ((3600, self.hourly_usd), (86400, self.daily_usd)):
             if cap and cap > 0:
-                total = (self.paid_hour(paid) if window == 3600
-                         else self.spent("all", window, harnesses=paid))
+                total = self.paid_spent(paid, window)
                 held = cap * hourly_share if window == 3600 else cap
                 if total >= held:
                     return ("%s budget (pay-per-token): %.2f $ over %s "
@@ -1528,7 +1838,7 @@ class CostBook:
         if agent != "all":
             for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
                 if cap and cap > 0 and window in WINDOW_LABELS:
-                    total = self.spent(agent, window, harnesses=paid)
+                    total = self.paid_spent(paid, window, agent)
                     if total >= cap:
                         return ("%s budget of agent %s (pay-per-token): %.2f $ over %s "
                                 "(cap %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
@@ -1536,12 +1846,17 @@ class CostBook:
         return ""
 
     # -- rapport ------------------------------------------------------------
-    def report(self, accounts: dict | None = None, *, record: bool = False) -> list:
+    def report(self, accounts: dict | None = None, *, record: bool = False,
+               multipliers: dict | None = None) -> list:
         """Une ligne par agent : harnais, modèle, dépense 1 h/24 h, jauges.
 
         `accounts` (L30) : `{harnais: (compte actif, [Gauge…])}` pour les
         harnais à comptes déclarés ; leurs jauges sont alors celles du compte
-        actif, et la ligne nomme ce compte (`account`).
+        actif, et la ligne nomme ce compte (`account`). `multipliers` (#1028,
+        #1075) : `{harnais: multiplicateur du compte actif}`, le
+        `pace_multiplier` du profil (`accounts.report`) — le plafond affiché
+        suit le rythme du compte, jamais le rythme nominal ; un harnais absent
+        garde 1.0.
 
         L71 : une **lecture** — l'historique des jauges n'est écrit que si
         `record` est vrai. Avec un registre, seuls ses agents sont listés (les
@@ -1550,6 +1865,7 @@ class CostBook:
         rows = []
         now = self.clock()
         accounts = accounts or {}
+        multipliers = multipliers or {}
         try:
             paid = set(paid_harnesses_of())
         except CostError:
@@ -1586,7 +1902,7 @@ class CostBook:
                         "used": g.used_at(now),          # L71 : 0 si fenêtre échue
                         "last_used": g.used,
                         "reset_passed": g.reset_passed(now),
-                        "cap": g.pace_cap(now),
+                        "cap": g.pace_cap(now, multipliers.get(harness, 1.0)),
                         "elapsed": g.elapsed(now),
                         "resets_at": g.resets_at,
                     }
@@ -1758,8 +2074,12 @@ def _claude_call_usages(events: Sequence[dict]) -> list[dict]:
     return out
 
 
-def _claude_windows(event: dict) -> list | None:
-    """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles."""
+def _claude_windows(event: dict, read_at: float | None = None) -> list | None:
+    """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles.
+
+    `read_at` (#1561) : l'horodatage du relevé — le marqueur de compte qui
+    précède le tour, ou la date du flux pour un flux sans marqueur.
+    """
     info = event.get("rate_limit_info") or {}
     windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
     if not isinstance(windows, dict):
@@ -1767,7 +2087,8 @@ def _claude_windows(event: dict) -> list | None:
     return [
         Gauge("claude", key, _fraction(value.get("utilization")),
               _epoch(value.get("resetsAt")),
-              float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])))
+              float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])),
+              read_at)
         for key, value in windows.items() if isinstance(value, dict)
     ]
 
@@ -1785,12 +2106,26 @@ def _claude_overage(event: dict) -> Overage:
 
 def _codex_overage(limits: dict, gauges: list) -> Overage:
     """The overage flags of a Codex `rate_limits` object (L226b): credits
-    let the account go on, billed, once a window is at 100 %."""
+    let the account go on, billed, once a window is at 100 %.
+
+    #1176 (B1) : un objet `credits` vide, partiel, ou dont les champs ne sont
+    pas des booléens ne prouve RIEN — `capable` reste None (inconnu), et
+    aucun relèvement de fin de fenêtre ne s'appuie dessus. Seule une capacité
+    explicite (`has_credits` ou `unlimited` vrai) rend True ; une incapacité
+    n'est rendue False que si elle est explicite (`has_credits` faux) et non
+    contredite par `unlimited` vrai.
+    """
     credits = limits.get("credits")
     if not isinstance(credits, dict):
         return Overage()
-    capable = credits.get("has_credits") is True or credits.get("unlimited") is True
-    return Overage(capable, capable and any(g.used >= 1.0 for g in gauges))
+    has_credits, unlimited = credits.get("has_credits"), credits.get("unlimited")
+    if has_credits is True or unlimited is True:
+        capable: bool | None = True
+    elif has_credits is False:
+        capable = False
+    else:
+        capable = None
+    return Overage(capable, capable is True and any(g.used >= 1.0 for g in gauges))
 
 
 def _find_rate_limits(node, depth: int = 0):
@@ -1854,32 +2189,115 @@ def _codex_config_model(path: str) -> str:
     return ""
 
 
+def _byte_offset_of_line(flux, numero: int, bloc: int = 1 << 20) -> int | None:
+    """L'offset du début de la ligne `numero` (0 = la première) d'un flux binaire.
+
+    Compte les sauts de ligne par blocs, sans décoder ni garder une ligne :
+    c'est le saut rapide de `events(start=…)` sur un journal de plusieurs
+    centaines de Mo. None quand le flux a moins de lignes (appelant : aucun
+    événement dans la tranche)."""
+    if numero <= 0:
+        return 0
+    flux.seek(0)
+    vues = 0
+    offset = 0
+    while True:
+        morceau = flux.read(bloc)
+        if not morceau:
+            return None
+        debut = 0
+        while True:
+            i = morceau.find(b"\n", debut)
+            if i < 0:
+                break
+            vues += 1
+            if vues == numero:
+                return offset + i + 1
+            debut = i + 1
+        offset += len(morceau)
+
+
+def _parse_events(lines: Iterable[str], start: int, end: int | None = None) -> list:
+    """Les événements JSONL des lignes `[start, end)` (#2096).
+
+    Les lignes hors de la tranche sont comptées sans être analysées : c'est
+    tout l'intérêt du flux — le journal peut faire des centaines de Mo, la
+    tranche d'un tour quelques kilo-octets. Un `[]` ou un `null` est une ligne
+    JSON valide mais pas un événement : le garder ferait planter le premier
+    `.get` venu (sonde codex2)."""
+    out = []
+    for index, line in enumerate(lines):
+        if index < start:
+            continue
+        if end is not None and index >= end:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            out.append(event)
+    return out
+
+
+def _lines_reverse(path: str, bloc: int = 1 << 20) -> Iterator[bytes]:
+    """Les lignes d'un fichier, de la dernière à la première (#2096).
+
+    Lit par blocs depuis la fin et recolle la ligne à cheval sur deux blocs :
+    la mémoire reste bornée par le bloc et la plus longue ligne, jamais par le
+    fichier. Les lignes sont rendues en octets, décodées par l'appelant."""
+    try:
+        with open(path, "rb") as flux:
+            flux.seek(0, os.SEEK_END)
+            pos = flux.tell()
+            reste = b""
+            while pos > 0:
+                debut = max(0, pos - bloc)
+                flux.seek(debut)
+                donnees = flux.read(pos - debut) + reste
+                pos = debut
+                parties = donnees.split(b"\n")
+                reste = parties[0]  # peut-être la fin d'une ligne antérieure
+                for ligne in reversed(parties[1:]):
+                    yield ligne
+            if reste:
+                yield reste
+    except OSError:
+        return
+
+
+def _session_event(event: dict) -> str:
+    """Ce qu'un événement apporte à la session courante (L60, L221).
+
+    Vide pour un événement de sous-agent ; sinon sa clé `session` si elle est
+    remplie, à défaut le dernier identifiant non vide (`session_id`,
+    `thread_id`, `sessionId` — l'ordre des remplacements du relevé direct)."""
+    if event.get("parent_tool_use_id"):
+        return ""                # L221 : la session d'un sous-agent n'est pas celle du tour
+    found = ""
+    for key in ("session_id", "thread_id", "sessionId"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            found = value
+    session = event.get("session")
+    if isinstance(session, str) and session:
+        found = session
+    return found
+
+
 def _last_session(events: Iterable[dict]) -> str:
     """L'identifiant de session/fil le plus récent du flux, s'il y en a un.
 
     `sessionId` est la clé du harnais DeepSeek (`{"type": "session",
     "sessionId": …}`) et du pont ACP : sans elle, les tours DeepSeek étaient
     inscrits au grand livre sans session (L60)."""
-    found = None
+    found = ""
     for event in events:
-        if event.get("parent_tool_use_id"):
-            continue                 # L221 : la session d'un sous-agent n'est pas celle du tour
-        for key in ("session_id", "thread_id", "sessionId"):
-            value = event.get(key)
-            if isinstance(value, str) and value:
-                found = value
-        session = event.get("session")
-        if isinstance(session, str) and session:
-            found = session
-    return found or ""
-
-
-def _read_all(path: str) -> str:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
-    except OSError:
-        return ""
+        found = _session_event(event) or found
+    return found
 
 
 def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
@@ -1972,9 +2390,9 @@ def _marker_ts(event: dict) -> float | None:
 def _reading_rank(found) -> tuple:
     """#1132 : classe une mesure par son instant de PRODUCTION.
 
-    Une mesure non datée (flux sans marqueur) ne date pas le fichier : le mtime
-    ne sert qu'à départager deux mesures non datées entre elles, jamais à
-    battre une mesure datée (`(False, mtime) < (True, ts)`).
+    Une mesure non datée (flux sans marqueur) ne date pas le fichier : l'heure
+    du fichier ne sert qu'à départager deux mesures non datées entre elles,
+    jamais à battre une mesure datée (`(False, mtime) < (True, ts)`).
     """
     stamp, produced = found[0], found[1]
     return (produced is not None, produced if produced is not None else stamp)
@@ -1982,7 +2400,12 @@ def _reading_rank(found) -> tuple:
 
 def _stamp_gauges(gauges: list, produced: float | None, agent: str,
                   overage: Overage | None) -> Gauges:
-    """#1132 : chaque fenêtre porte sa provenance (production, journal)."""
+    """#1132 : chaque fenêtre porte sa provenance (production, journal).
+
+    `read_at` (#1561) garde l'horodatage du relevé posé par `_claude_windows` ;
+    `produced_at` (#1132) est la provenance que lisent l'historique partagé
+    (0434) et la réconciliation.
+    """
     return Gauges([replace(gauge, produced_at=produced, source=agent or "")
                    for gauge in gauges], overage)
 
@@ -2007,24 +2430,26 @@ def _last_claude_reading(events: list, agent: str, mtime: float):
     """Le MEILLEUR `rate_limit_event` d'un flux, daté par son marqueur (#1132).
 
     Rend `(estampille, production, Gauges)` : `production` est le ts du dernier
-    marqueur de compte vu avant l'événement (None pour un flux sans marqueur),
-    `estampille` le mtime du fichier quand il n'y a pas de marqueur — il ne
-    sert qu'à départager deux mesures non datées. Les mesures du flux sont
-    classées par `_reading_rank`, jamais par leur ordre de lecture : un rejeu
-    publié APRÈS une mesure fraîche du même journal ne masque plus celle-ci.
+    marqueur de compte vu avant l'événement (None pour un flux sans marqueur ou
+    pour un rejeu), `estampille` l'heure du fichier quand il n'y a pas de
+    marqueur — elle ne sert qu'à départager deux mesures non datées. Les
+    mesures du flux sont classées par `_reading_rank`, jamais par leur ordre de
+    lecture : un rejeu publié APRÈS une mesure fraîche du même journal ne
+    masque plus celle-ci.
     """
     produced, best = None, None
     for event in events:
         if _is_claude_marker(event):
             produced = _marker_ts(event)
         elif event.get("type") == "rate_limit_event":
-            gauges = _claude_windows(event)
+            stamp = produced if produced is not None else mtime
+            gauges = _claude_windows(event, stamp)
             if gauges is None:
                 continue
             at = produced
             if _replayed(gauges, at):
                 at = None                 # rejeu : jamais daté
-            found = (at if at is not None else mtime, at,
+            found = (stamp, at,
                      _stamp_gauges(gauges, at, agent, _claude_overage(event)))
             if best is None or _reading_rank(found) >= _reading_rank(best):
                 best = found
@@ -2033,6 +2458,11 @@ def _last_claude_reading(events: list, agent: str, mtime: float):
 
 def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dict:
     """Attribute all accounts in one pass; None is a verified legacy stream.
+
+    Each reading is (stamp, produced, Gauges): the overage flags stay on the
+    gauges (L226b, #1649) and the production instant (#1132) is the marker ts
+    of the publishing turn, never the file mtime — which only breaks ties
+    between undated streams.
 
     #1132 : chaque mesure porte sa provenance. `produced_at` est le ts du
     marqueur du tour qui l'a publiée — jamais le mtime du fichier, qui ne sert
@@ -2051,7 +2481,7 @@ def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dic
             produced = _marker_ts(event)
             stamp = produced if produced is not None else 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
-            gauges = _claude_windows(event)
+            gauges = _claude_windows(event, stamp)
             if gauges is None:
                 continue
             at = produced

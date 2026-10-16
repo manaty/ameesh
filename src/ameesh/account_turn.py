@@ -61,6 +61,13 @@ def _harness(worker) -> str:
     return own_harness(worker)
 
 
+def session_model(worker, book) -> str:
+    """Le modèle du prochain tour de l'agent sur son harnais, comme le runner
+    le passe : celui du registre (`ameesh set <agent> model=…`), sinon l'état
+    local (`<state>/<agent>/model`) ; '' si aucun (#1580 tranche 3)."""
+    return (getattr(worker, "agent", None) or {}).get("model") or book.model_of(worker.name)
+
+
 def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None) -> str | None:
     """Choisit le compte du prochain tour. None : aucun compte déclaré.
 
@@ -87,7 +94,10 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
                                  agent=worker.name, paced=pause,
                                  session_account=session_account(worker, items),
-                                 critical=is_critical(worker), margin=bool(margin))
+                                 critical=is_critical(worker), margin=bool(margin),
+                                 # #1580 (tranche 3) : les seaux propres au
+                                 # modèle de l'agent comptent pour lui seul
+                                 model=session_model(worker, book))
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -142,7 +152,11 @@ def fallback(worker, reason: str, limits=None) -> str:
                 choice = accounts.choose(
                     worker.db, worker.cfg.host, harness, items, book, agent=worker.name,
                     critical=True, session_account=session_account(worker, items)
-                    if session_harness(worker) == harness else None)
+                    if session_harness(worker) == harness else None,
+                    # #1580 (tranche 3) : sous un harnais emprunté, le tour
+                    # part sans modèle (runner) : modèle inconnu, les seaux
+                    # de modèle sont écartés
+                    model="")
                 if choice.profile is None or choice.auth_blocked:
                     continue
                 profile = choice.profile
@@ -456,7 +470,7 @@ def continuity(worker) -> bool:
 
 
 def summary_possible(old, book, items, now: float | None = None, *,
-                     sick: dict | None = None) -> tuple[bool, str]:
+                     sick: dict | None = None, model=None) -> tuple[bool, str]:
     """L'ancien compte peut-il encore porter le tour de résumé d'une rotation ?
     (L39, décision 0030) `(vrai, "")` ou `(faux, raison)`.
 
@@ -481,7 +495,8 @@ def summary_possible(old, book, items, now: float | None = None, *,
             sick[old.name].get("reason") or "?")
     now = time.time() if now is None else now
     try:
-        gauges = accounts.gauges_of(book, old, items) if book is not None else []
+        gauges = (accounts.gauges_of(book, old, items, model=model, now=now)
+                  if book is not None else [])
     except Exception as exc:
         # L226b : jauges illisibles — pas d'appel de modèle dans le doute
         return False, "%s gauges unreadable (%s)" % (old.harness, exc)
@@ -521,6 +536,188 @@ def paid_cap(worker, harness: str) -> str:
         raise
     except Exception as exc:  # noqa: BLE001 - dans le doute, pas de résumé
         return "paid cap unreadable (%s)" % exc
+
+
+def turn_hold(cfg, db, name: str, row: dict, *, now: float | None = None) -> str:
+    """#1021 : la tenue budget/rythme qui empêche le prochain tour de `name`,
+    ou '' — lue là où la garde de l'exécuteur la calcule.
+
+    Un lot confié à un agent que son exécuteur ne réveillera pas dort (#885,
+    #886, #967, assignés à des agents Codex en pause budget) : l'attribution
+    (`work.check_assignee`) doit donc voir la tenue, pas seulement la
+    réveillabilité du registre. Deux sources, sans aucune écriture ni journal
+    (appelable d'un tour de CLI) :
+
+    * la pause DÉJÀ ANNONCÉE par l'exécuteur (`status` `blocked` et
+      `status_text` « budget : … », la règle de `handoff.paused`) : elle vient
+      de l'hôte de l'agent, seul à connaître ses comptes — elle vaut donc
+      aussi pour un agent d'un autre hôte ;
+    * une évaluation FRAÎCHE, quand l'agent est sur CET hôte et que son
+      harnais a des comptes déclarés : la pause n'est écrite qu'au sondage
+      suivant de son exécuteur (quelques secondes) et une attribution ne doit
+      pas passer dans cette fenêtre. Mêmes règles que `Runner.budget_reason` :
+      `accounts.choose` en simulation (réserve des non-critiques, L226b ;
+      rythme levé si la garde est coupée), puis les plafonds du mesh pour le
+      tour payé au token ; un agent critique cède à un harnais de repli qui a
+      de la marge (L242b (3)), sauf tenue d'authentification (le repli
+      n'existe pas dans l'exécuteur pour celle-ci : `auth_ready` bloque).
+
+    Les comptes d'un autre hôte ne sont pas lisibles ici (leurs journaux sont
+    sur son disque) : pour un agent distant, seule la pause annoncée est
+    jugée, rafraîchie à chaque sondage de son exécuteur. Sans comptes déclarés,
+    de même : c'est la pause annoncée qui tranche.
+    """
+    from . import budget as budget_mod
+    from . import handoff
+
+    if handoff.paused(row):
+        return (row.get("status_text") or "")[len(budget_mod.PAUSE_PREFIX):].strip()
+    host = getattr(cfg, "host", None) if cfg is not None else None
+    if not host or (row.get("host") or "") != host:
+        return ""
+    harness = row.get("harness") or ""
+    try:
+        items = accounts.profiles(cfg, harness)
+    except accounts.AccountError as exc:
+        return "invalid account configuration: %s" % exc
+    if not items:
+        return ""
+    now = time.time() if now is None else float(now)
+    limites = budget_mod.current(cfg, db)
+    critical = _is_critical(cfg, db, name, row)
+    paced = limites.per_hour > 0
+    margin = not critical
+    environ = _declared_environ(cfg)
+    try:
+        reason, auth = _own_hold(cfg, db, name, harness, items, limites, now=now,
+                                 critical=critical, paced=paced, margin=margin,
+                                 environ=environ)
+        # L242b (3) : le repli ne lève qu'une tenue BUDGET. Une tenue
+        # d'authentification (`choice.auth_blocked`) est conservée par
+        # l'exécuteur — `account_turn.choose` retient le compte malade sans
+        # raison budget, aucun repli n'est engagé, puis `auth_ready` bloque
+        # l'agent : la lever par un repli fictif ferait dormir le lot.
+        # Comme `Runner._critical_fallback` : jamais une configuration ni un
+        # état de comptes illisibles.
+        if reason and not auth and critical \
+                and not reason.startswith(("invalid account configuration",
+                                            "account state unavailable")) \
+                and _fallback_available(cfg, db, name, harness, limites,
+                                        now=now, environ=environ):
+            return ""
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError as exc:
+        # état des comptes illisible : le tour ne partirait pas (fail-closed),
+        # comme `Runner.budget_ok` (« account state unavailable »)
+        return "account state unavailable (%s)" % db_mod.explain(exc)
+    return reason
+
+
+def _declared_environ(cfg) -> dict:
+    """L'environnement du processus, complété des clés DÉCLARÉES
+    (`api_key_env`) : leur présence dans ce shell n'est pas ce que juge une
+    attribution — une variable vide ici est tenue pour déclarée, c'est
+    l'exécuteur qui la porte.
+
+    L'exécuteur, sur le même hôte, porte la clé au lancement du tour
+    (`accounts.launch_env`) ; un problème d'authentification réel se lit
+    `auth_blocked` sur la ligne de l'agent, pas ici. Sans ce complément, un
+    `ameesh work assign` lancé d'un shell sans la clé refuserait tout agent
+    d'un hôte à comptes `api_key_env` (« missing key variable ») — un faux
+    positif du même genre que la tenue qu'on veut voir.
+    """
+    environ = dict(os.environ)
+    try:
+        declared = accounts.parse(getattr(cfg, "accounts", None) or {})
+    except accounts.AccountError:
+        return environ
+    for items in declared.values():
+        for profile in items:
+            if profile.key_env and not environ.get(profile.key_env):
+                environ[profile.key_env] = "declared"
+    return environ
+
+
+def _own_hold(cfg, db, name: str, harness: str, items: list, limites, *, now: float,
+              critical: bool, paced: bool, margin: bool,
+              environ=None) -> tuple[str, bool]:
+    """`(raison de tenue sur le harnais de l'agent, tenue d'authentification)`,
+    `('', False)` si un tour peut partir.
+
+    Réplique la décision de `Runner.budget_reason` sans exécuteur : le compte
+    (ou la pause), puis le plafond payé au token restant — sauf garde de
+    rythme coupée (`paced=False`), où l'exécuteur (`Runner.budget_ok`) ne juge
+    que les règles absolues de L226b, déjà vues par `accounts.choose`."""
+    book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, tools={name: harness},
+                             **limites.book_kwargs())
+    choice = accounts.choose(db, cfg.host, harness, items, book, now=now, agent=name,
+                             environ=environ, simulate=True, critical=critical,
+                             paced=paced, margin=margin)
+    if choice.profile is None:
+        return choice.reason, False
+    if choice.auth_blocked:
+        return choice.why, True
+    if not paced:
+        # B1 de la R1 (#1021) : avec `limites.per_hour <= 0` l'exécuteur ne
+        # consulte pas `book.over` du tout (ni plafond journalier du mesh, ni
+        # plafond propre à l'agent) ; les appliquer ici refuserait un tour que
+        # l'exécuteur autorise.
+        return "", False
+    part = getattr(cfg, "noncritical_hourly_share", 0.75) if margin else 1.0
+    return book.over(name, pace=False, hourly_share=part), False
+
+
+def _fallback_available(cfg, db, name: str, own: str, limites, *, now: float,
+                        environ=None) -> bool:
+    """Un harnais de repli peut-il porter le tour ? (L242b (3) : un agent
+    critique en pause sur son harnais tourne sous un autre s'il a de la
+    marge). La même décision que `fallback`, sans ses effets (ni journal, ni
+    `_borrowed`) : ici on ne fait que juger une attribution."""
+    for harness in getattr(cfg, "critical_fallback_harnesses", None) or ():
+        if harness == own:
+            continue
+        try:
+            adapters.adapter_for(harness)
+        except Exception:  # noqa: BLE001 - harnais absent de l'hôte : suivant
+            continue
+        try:
+            items = accounts.profiles(cfg, harness)
+        except accounts.AccountError:
+            continue
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, tools={name: harness},
+                                 **limites.book_kwargs())
+        try:
+            if items:
+                choice = accounts.choose(db, cfg.host, harness, items, book, now=now,
+                                         agent=name, environ=environ, simulate=True,
+                                         critical=True)
+                if choice.profile is None or choice.auth_blocked:
+                    continue
+            elif book.pace_exceeded(harness):
+                continue
+            if book.over(name, pace=False):
+                continue
+        except db_mod.Unavailable:
+            raise
+        except Exception:  # noqa: BLE001 - état illisible : harnais suivant
+            continue
+        return True
+    return False
+
+
+def _is_critical(cfg, db, name: str, row: dict) -> bool:
+    """`auditor.is_critical` sans exécuteur (rôles du canon, orchestrateurs
+    déclarés) : rôles illisibles, l'agent est jugé ordinaire."""
+    from . import auditor as auditor_mod
+    from . import sous_utilisation
+
+    try:
+        canons = auditor_mod.load_all(cfg, strict=False) if cfg is not None else []
+        declared = sous_utilisation.declared_orchestrators()
+        return auditor_mod.is_critical(cfg, db, name, canons, declared=declared, agent=row)
+    except Exception:  # noqa: BLE001 - rôles illisibles : le choix ordinaire
+        return False
 
 
 def rotate_harness(worker, old_harness: str, new_harness: str, session: str) -> bool:
@@ -569,7 +766,10 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
                                      tools={worker.name: harness})
             possible, raison = summary_possible(
                 old, book, accounts.profiles(worker.cfg, harness),
-                sick=auth_failure.failing(worker.db, worker.cfg.host, harness))
+                sick=auth_failure.failing(worker.db, worker.cfg.host, harness),
+                # #1580 (tranche 3) : le seau d'un autre modèle ne bloque pas
+                # le résumé de cet agent
+                model=session_model(worker, book))
         except Exception as exc:
             possible, raison = False, "state of the old account unreadable (%s)" % exc
         if not possible:

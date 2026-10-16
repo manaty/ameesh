@@ -41,7 +41,9 @@ from __future__ import annotations
 import os
 import time
 
+from . import accounts as accounts_mod
 from . import cost as cost_mod
+from . import planned_waits
 from . import storage
 
 UNDERUSE_TYPES = ("plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
@@ -99,6 +101,20 @@ LOTS_WAITING_ON_OTHERS = ("qa", "waiting_human", "blocked")
 ORCHESTRATOR_ROLES = ("orchestrateur", "orchestrator")
 #: L165b : rôles de l'agent de conception, prévenu aussi d'`idle_capacity`
 DESIGN_ROLES = ("conception", "design")
+#: L242c : rôles qui rendent un agent critique (jamais en pause budget tant
+#: qu'un compte a de la marge), par défaut ; une organisation les règle par
+#: `critical_roles` dans son federation.yaml (manaty/home#25)
+CRITICAL_ROLES = ("orchestrateur", "conception", "auditeur", "relecture")
+#: L242c : les autres noms reconnus d'un rôle dans `roles`/`role` d'une fiche
+ROLE_SYNONYMS = {"orchestrateur": ("orchestrator",), "conception": ("design",),
+                 "auditeur": ("auditor",), "relecture": ("review", "reviewer")}
+_ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in aliases}
+#: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
+#: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
+READ_ERRORS = ("canon-git-error", "frontmatter-invalid", "federation-invalid")
+#: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
+#: relus par un exécuteur redémarré et par `ameesh resume` (#424 r4 : dans
+#: leur dossier, `CRITICAL_DIR`)
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -186,9 +202,17 @@ def _common_responsible(rows) -> str | None:
 # --------------------------------------------------------------------------
 
 def _gauge(row: dict) -> cost_mod.Gauge:
-    return cost_mod.Gauge(row["harness"], row["key"], float(row.get("used") or 0.0),
+    """La jauge d'une ligne d'historique, portée par modèle restituée.
+
+    #1789/N6 : la clé d'un seau propre à un modèle porte sa portée
+    (`seven_day@fable`, #1580) — l'historique ne stocke pas le `scope` ; le
+    relire ici évite qu'un seau de modèle soit pris pour la fenêtre générale
+    du compte (alertes de sous-utilisation, `plan_underused`)."""
+    key = row["key"]
+    _, _, scope = key.partition("@")
+    return cost_mod.Gauge(row["harness"], key, float(row.get("used") or 0.0),
                           row.get("resets_at_ts"), float(row.get("window_s") or 0.0)
-                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]))
+                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]), scope=scope)
 
 
 def expiring(gauge, now: float) -> tuple | None:
@@ -222,11 +246,47 @@ def latest_account_gauges(db, now: float) -> dict:
     return out
 
 
+def _declared_profiles(cfg) -> dict:
+    """{harnais : [Profile]} de la configuration, sans lever (#1227 N3)."""
+    if cfg is None:
+        return {}
+    try:
+        return accounts_mod.parse(getattr(cfg, "accounts", None) or {})
+    except accounts_mod.AccountError:
+        return {}
+
+
+def _declared_pace(items: list, account: str | None) -> tuple[float, float]:
+    """(multiplicateur, plafond de rythme) du compte déclaré (#1227 N3).
+
+    Le relevé de `latest_account_gauges` nomme son compte : on lit le réglage
+    du profil correspondant (`pace_ceiling`, `pace_multiplier`) au lieu des
+    90 % et du ×1 en dur, qui contredisaient `limits` (#1075, #1176). Un
+    compte non déclaré, ou un relevé sans compte sur un harnais à plusieurs
+    comptes, garde les défauts : jamais un plafond inventé. Le relèvement de
+    fin de fenêtre n'est pas reproduit ici — il exige la preuve fraîche
+    d'overage impossible, que lit `accounts.evaluate` — le diagnostic reste
+    donc conservateur (jamais au-dessus du plafond de `limits`).
+    """
+    profile = None
+    if items:
+        if account:
+            profile = accounts_mod.by_name(items, account)
+        elif len(items) == 1:
+            profile = items[0]
+    if profile is None:
+        return 1.0, cost_mod.PACE_CEILING
+    return profile.pace_multiplier, profile.pace_ceiling
+
+
 def plan_underused(db, listing: list, now: float, *,
                    tail_s: float = DEFAULT_PLAN_TAIL_S,
                    used_pct: float = DEFAULT_PLAN_USED_PCT,
                    pace_gap_pct: float = DEFAULT_PLAN_PACE_GAP_PCT,
-                   paid=None, held=()) -> list:
+                   paid=None, held=(), cfg=None) -> list:
+    """`cfg` (#1227 N3) : la configuration des comptes déclarés — le rythme et
+    le plafond du compte nommé par le relevé remplacent les 90 % et le ×1 en
+    dur ; un compte absent, inconnu ou ambigu garde les défauts."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -234,18 +294,25 @@ def plan_underused(db, listing: list, now: float, *,
     out: list = []
     spend = None
     spend_read = False
+    declared = _declared_profiles(cfg)
     for (harness, account), gauges in sorted(latest_account_gauges(db, now).items(),
                                               key=lambda kv: (kv[0][0], kv[0][1] or "")):
+        multiplier, ceiling = _declared_pace(declared.get(harness) or [], account)
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
+        # #1789/N6 : un seau propre à un modèle (#1580 tranche 3) ne rend pas
+        # la capacité générale du compte inutilisable — seules les fenêtres
+        # générales se taisent entre elles ; un seau de modèle reste alerte.
+        blocking = [(g, seen) for g, seen in live if not getattr(g, "scope", "")]
         for gauge, seen in live:
-            if any(other.exceeded(now) for other, _ in live if other is not gauge):
+            if any(other.exceeded(now, 0.0, multiplier, ceiling)
+                   for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
             elapsed = gauge.elapsed(now)
-            cap = gauge.pace_cap(now)
+            cap = gauge.pace_cap(now, multiplier, ceiling)
             used = float(gauge.used or 0.0)
             reason = None
             tail = min(float(tail_s), PLAN_TAIL_MAX_FRACTION * gauge.window_s)
@@ -322,17 +389,354 @@ def _bare(name: str) -> str:
 def role_orchestrators(canons, roles=None) -> set:
     """Les agents dont la fiche Agent du canon nomme un rôle d'orchestrateur
     (`roles` ou `role` : `orchestrateur`, `orchestrator`), ou l'un des
-    `roles` donnés."""
-    wanted = {str(r).strip().lower() for r in (roles or ORCHESTRATOR_ROLES)}
+    `roles` donnés (synonymes dans les deux sens, L242c)."""
+    wanted = {_canonical(r) for r in (roles or ORCHESTRATOR_ROLES)}
     found = set()
     for canon in canons or []:
         for agent in getattr(canon, "agents", None) or []:
-            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
-            fiche_roles = data.get("roles") or data.get("role") or []
-            if isinstance(fiche_roles, str):
-                fiche_roles = [fiche_roles]
-            if any(str(r).strip().lower() in wanted for r in fiche_roles):
+            if wanted & set(_card_roles(agent)):
                 found.add(agent.title)
+    return found
+
+
+def _canonical(role) -> str:
+    """Le nom d'un rôle, en minuscules, synonyme ramené au rôle (L242c,
+    #424 r1 : `review` et `relecture` se reconnaissent dans les deux sens)."""
+    role = str(role).strip().lower()
+    return _ROLE_OF.get(role, role)
+
+
+def _card_roles(agent) -> list:
+    """Les rôles d'une fiche Agent tels que le canon les a validés (`roles`
+    analysé : une valeur invalide n'en donne aucun, #424 r1), sinon `role:`
+    s'il est un texte ; ramenés à leur nom (`_canonical`). Une fiche sans
+    analyse (objet factice) : le frontmatter, liste de textes ou texte."""
+    data = getattr(getattr(agent, "fiche", None), "data", None) or {}
+    if hasattr(agent, "roles"):
+        named = agent.roles
+    else:
+        named = data.get("roles")
+        if isinstance(named, str):
+            named = [named]
+        elif not (isinstance(named, list) and all(isinstance(r, str) for r in named)):
+            named = None
+    if named is None:
+        single = data.get("role")
+        named = [single] if isinstance(single, str) else []
+    return [role for role in (_canonical(r) for r in named) if role]
+
+
+def roles_declared(canons) -> bool:
+    """L242c : une fiche Agent d'un des canons déclare-t-elle des rôles ?
+    Alors seuls les rôles désignent ses orchestrateurs (plus de déduction par
+    les lots confiés)."""
+    return any(_card_roles(agent)
+               for canon in canons or [] for agent in getattr(canon, "agents", None) or [])
+
+
+def _owners(row, canons) -> list:
+    """Les canons propriétaires de `row` (un canon sans `owns` : tous)."""
+    return [c for c in canons or []
+            if getattr(c, "owns", None) is None or c.owns((row or {}).get("canon"))]
+
+
+def _card(canon, name):
+    return next((a for a in getattr(canon, "agents", None) or [] if a.title == name), None)
+
+
+def deduces(row, canons) -> bool:
+    """L242c (#424 r1) : la déduction par les lots confiés vaut pour un agent
+    dont l'organisation (son canon propriétaire) ne déclare aucun rôle."""
+    return not roles_declared(_owners(row, canons))
+
+
+def card_role(row, canons, roles) -> bool:
+    """La fiche de l'agent `row`, dans son canon propriétaire seulement, nomme-
+    t-elle l'un des `roles` ? Une fiche homonyme d'un autre canon ne compte
+    jamais (#324 r1, #424 r1)."""
+    wanted = {_canonical(r) for r in roles}
+    for canon in _owners(row, canons):
+        if not getattr(canon, "readable", True):
+            continue
+        definition = _card(canon, row["name"])
+        if definition is not None and wanted & set(_card_roles(definition)):
+            return True
+    return False
+
+
+def critical_roles(canon) -> tuple:
+    """L242c : les rôles critiques d'une organisation (`critical_roles` de son
+    federation.yaml, liste ; vide : aucun), sinon `CRITICAL_ROLES` ; chacun
+    ramené à son nom (`_canonical`)."""
+    declared = (getattr(canon, "federation", None) or {}).get("critical_roles")
+    if isinstance(declared, str):
+        declared = [declared]
+    if not isinstance(declared, (list, tuple)):
+        declared = CRITICAL_ROLES
+    return tuple(dict.fromkeys(role for role in (_canonical(r) for r in declared
+                                                 if isinstance(r, str)) if role))
+
+
+def fully_read(canon) -> bool:
+    """L242c (#424 r2) : le canon s'est-il lu en entier ? Pas s'il est
+    illisible, ni si une fiche ou son manifeste n'a pu être lu (`READ_ERRORS`
+    de niveau erreur dans `load_findings`) : une fiche manquante ne doit pas
+    faire perdre un rôle en silence."""
+    if not getattr(canon, "readable", True):
+        return False
+    return not any(getattr(f, "code", None) in READ_ERRORS
+                   and getattr(f, "severity", None) == "error"
+                   for f in getattr(canon, "load_findings", None) or ())
+
+
+#: L242c (#424 r3) : verdict perdu (cache absent, illisible, corrompu, valeur
+#: invalide, fichier ou dossier dont on ne peut se fier) — « inconnu » vaut
+#: critique
+UNKNOWN = "unknown"
+#: #424 r4 : le dossier du cache (0700, à nous ; verrouillé lui-même) et ses
+#: données (renommées seules)
+CRITICAL_DIR, CRITICAL_DATA = "critical-known", "known.json"
+
+
+class _Untrusted(OSError):
+    """#424 r4 : le dossier du cache n'est pas digne de confiance."""
+
+
+def _memory_path(cfg) -> str | None:
+    state = getattr(cfg, "state_dir", None)
+    return os.path.join(state, CRITICAL_DIR) if state else None
+
+
+def _memory_dir(cfg, *, create: bool) -> int | None:
+    """#424 r4 : le dossier du cache, ouvert sans suivre de lien
+    (`O_DIRECTORY|O_NOFOLLOW`, relatif au dossier d'état), à nous et en 0700 —
+    tout le reste s'ouvre relativement à lui (`dir_fd`) : un parent remplacé ou
+    lié ne redirige rien. None s'il n'existe pas (et `create` faux) ;
+    `_Untrusted` s'il n'est pas digne de confiance.
+
+    Résiduel accepté (#424 r5, mesh-design) : le dossier d'état lui-même
+    s'ouvre en suivant les liens, sans contrôle de propriétaire. Le détourner
+    suppose une action malveillante sous le même UID dans le dossier d'état
+    de l'exécuteur, hors de notre modèle de menace."""
+    import stat
+    state = os.open(cfg.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        if create:
+            try:
+                os.mkdir(CRITICAL_DIR, 0o700, dir_fd=state)
+            except FileExistsError:
+                pass
+        try:
+            fd = os.open(CRITICAL_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, dir_fd=state)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:      # ELOOP / ENOTDIR : un lien, un fichier
+            raise _Untrusted("critical cache dir: %s" % exc) from exc
+    finally:
+        os.close(state)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        os.close(fd)
+        raise _Untrusted("critical cache dir: not ours, or not 0700")
+    return fd
+
+
+def _read_memory(folder: int):
+    """#424 r4 : `(état, données)` du cache dans le dossier `folder` : `missing`,
+    `ok` (le dict tel qu'écrit, valeurs invalides comprises) ou `corrupt`
+    (illisible, pas du JSON objet, lien, pas un fichier ordinaire, pas à nous,
+    lisible par d'autres)."""
+    import json
+    import stat
+    try:
+        fd = os.open(CRITICAL_DATA, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=folder)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "corrupt", None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
+                or st.st_mode & 0o077:
+            return "corrupt", None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return "corrupt", None
+    finally:
+        os.close(fd)
+    return ("ok", data) if isinstance(data, dict) else ("corrupt", None)
+
+
+def critical_memory(cfg) -> dict | None:
+    """Les derniers verdicts lus : {agent: True|False|None}, None pour une
+    valeur invalide. {} sans dossier d'état configuré (la mémoire du processus
+    seule). None (fail-closed, tout y est inconnu) : cache absent (#424 r4 :
+    effacé ou masqué, jamais « rien n'a été lu »), illisible, corrompu, ou
+    dont on ne peut se fier (`_memory_dir`, `_read_memory`)."""
+    if _memory_path(cfg) is None:
+        return {}
+    try:
+        folder = _memory_dir(cfg, create=False)
+    except OSError:
+        return None
+    if folder is None:
+        return None
+    try:
+        state, data = _read_memory(folder)
+    finally:
+        os.close(folder)
+    if state != "ok":
+        return None
+    return {str(k): v if isinstance(v, bool) else None for k, v in data.items()}
+
+
+def remembered(memory: dict | None, name: str):
+    """Le dernier verdict lu de `name` : True, False, ou `UNKNOWN` (vaut
+    critique, `critical_verdict`) — cache perdu, valeur invalide, ou nom
+    absent du cache (#424 r6 : jamais lu, ou cache recréé depuis par un
+    agent d'un autre canon ; aucun « non » faute de lecture)."""
+    if memory is None or name not in memory:
+        return UNKNOWN
+    value = memory[name]
+    return value if isinstance(value, bool) else UNKNOWN
+
+
+def remember_critical(cfg, name: str, verdict: bool) -> bool:
+    """Retient le verdict lu de `name` ; vrai quand le disque le porte (déjà,
+    ou une fois écrit) — comparé au disque, jamais à la mémoire du processus
+    (#424 r4). Sous un verrou (`flock` sur le dossier lui-même, ouvert une
+    fois : aucun chemin de verrou à remplacer) : relecture, mise à jour, fichier temporaire exclusif, fsync, renommage des
+    seules données, fsync du dossier, mode 0600. Un cache corrompu n'est
+    jamais réécrit (il reste « inconnu », critique) ; ses valeurs invalides
+    sont gardées telles quelles. Ne lève jamais : l'appelant réessaie.
+
+    Résiduel accepté (#424 r5, mesh-design) : le dossier du cache remplacé
+    entre son ouverture et le `flock` : l'écriture va dans le dossier
+    détaché, la lecture suivante voit le nouveau (absent ou corrompu :
+    critique). Cela suppose une action malveillante sous le même UID dans le
+    dossier d'état de l'exécuteur, hors de notre modèle de menace."""
+    import fcntl
+    import json
+    if _memory_path(cfg) is None:
+        return False
+    try:
+        folder = _memory_dir(cfg, create=True)
+    except OSError:
+        return False
+    if folder is None:
+        return False
+    tmp = None
+    try:
+        fcntl.flock(folder, fcntl.LOCK_EX)
+        state, known = _read_memory(folder)
+        if state == "corrupt":
+            return False
+        known = dict(known or {})
+        if known.get(name) is verdict:
+            return True
+        known[name] = verdict
+        tmp = ".%s.%d.%s" % (CRITICAL_DATA, os.getpid(), os.urandom(6).hex())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o600, dir_fd=folder)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(known, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CRITICAL_DATA, src_dir_fd=folder, dst_dir_fd=folder)
+        tmp = None
+        os.fsync(folder)
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp, dir_fd=folder)
+            except OSError:
+                pass
+        os.close(folder)
+
+
+def critical_by_role(row, canons) -> bool | None:
+    """L242c : l'agent du registre `row` porte-t-il un rôle critique de son
+    organisation, dans la fiche de son canon propriétaire ? La persona
+    `auditeur` l'est sans fiche tant que le rôle auditeur est critique.
+    None (#424 r1) : son canon propriétaire n'est pas chargé ou illisible —
+    inconnu, jamais « non » (`critical_verdict`) ; de même s'il n'a été lu
+    qu'en partie (#424 r2, `fully_read`)."""
+    from .alert_briefs import AUDITOR_NAME
+    owners = _owners(row, canons)
+    if not owners or not all(fully_read(c) for c in owners):
+        return None
+    for canon in owners:
+        roles = critical_roles(canon)
+        if row.get("name") == AUDITOR_NAME and "auditeur" in roles:
+            return True
+        if card_role(row, [canon], roles):
+            return True
+    return False
+
+
+#: #424 r7 : les agents d'un canon étranger déjà signalés par ce processus
+_FOREIGN_WARNED: set = set()
+
+
+def foreign_canon(row, canons, *, complete: bool) -> str | None:
+    """#424 r7 (mesh-design) : le canon de `row` quand AUCUN canon de l'hôte ne
+    le possède, tous les canons configurés chargés (`complete`) ET lus en
+    entier (`fully_read`, #424 r8) — un état connu et permanent, pas une
+    panne : l'agent garde le verdict d'avant L242c (non critique). Un canon
+    configuré mais illisible ou pas encore chargé, ou dont le manifeste n'a
+    pas pu être lu, n'est pas étranger : son identité peut être restée le nom
+    du dossier (`canon.py`, `_identify` avant manifeste), donc rien ne prouve
+    que l'agent n'est d'aucun canon — le verdict connu/cache puis la règle
+    fail-safe s'appliquent (#424 r8). None sinon."""
+    if (not complete or not canons
+            or not all(fully_read(c) for c in canons)     # #424 r8
+            or _owners(row, canons)):
+        return None
+    return (row or {}).get("canon") or "?"
+
+
+def warn_foreign(name: str) -> bool:
+    """#424 r7 : vrai la première fois seulement (un avertissement par
+    processus et par agent d'un canon étranger)."""
+    if name in _FOREIGN_WARNED:
+        return False
+    _FOREIGN_WARNED.add(name)
+    return True
+
+
+def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
+    """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
+    l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire
+    illisible (#424 r1) : le dernier verdict lu (`known`, `remembered`) ;
+    sinon — perdu, invalide, jamais lu (#424 r6) — critique (fail-safe).
+    Jamais une baisse silencieuse ; la surcharge `critical_agents` se juge
+    avant."""
+    from .alert_briefs import AUDITOR_NAME
+    if not configured and not canons:
+        return row.get("name") == AUDITOR_NAME, False
+    verdict = critical_by_role(row, canons)
+    if verdict is not None:
+        return verdict, False
+    if isinstance(known, bool):
+        return known, True
+    return True, True
+
+
+def critical_candidates(canons) -> set:
+    """Les noms qui PEUVENT être critiques par leur rôle (toute fiche, tout
+    canon) : un nom hors de cet ensemble évite la lecture du registre."""
+    from .alert_briefs import AUDITOR_NAME
+    found = {AUDITOR_NAME}
+    for canon in canons or []:
+        roles = critical_roles(canon)
+        if roles:
+            found |= role_orchestrators([canon], roles)
     return found
 
 
@@ -347,9 +751,11 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
                   roles=ORCHESTRATOR_ROLES, history: bool = True) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
-    `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
-    a confié des lots (délégation ou `work assign`) dans les 30 derniers
-    jours, sauf avec `history=False` (#740). Seulement des agents du registre."""
+    `role`) nomme un orchestrateur (ou l'un des `roles` donnés) dans le canon
+    propriétaire de l'agent (#424 r1), ou agent qui a confié des lots
+    (délégation ou `work assign`) dans les 30 derniers jours — tant que son
+    organisation ne déclare aucun rôle (L242c, `deduces`) — sauf avec
+    `history=False` (#740). Seulement des agents du registre."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -358,13 +764,16 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    found |= role_orchestrators(canons, roles)
-    try:
-        if history:
-            found |= {_bare(n) for n in storage.of(db).operations.assigners(
-                since_s=ASSIGNERS_SINCE_S)}
-    except Exception:
-        pass
+    found |= {row["name"] for row in listing if card_role(row, canons, roles)}
+    if history:
+        deducing = [row for row in listing if deduces(row, canons)]
+        if deducing:
+            try:
+                assigners = {_bare(n) for n in storage.of(db).operations.assigners(
+                    since_s=ASSIGNERS_SINCE_S)}
+            except Exception:
+                assigners = set()
+            found |= {row["name"] for row in deducing if row["name"] in assigners}
     # L123 : le chat du propriétaire transmet, il ne répartit pas
     from .chat import is_chat_agent
     chats = {row["name"] for row in listing if is_chat_agent(row)}
@@ -462,23 +871,86 @@ def is_backlog_item(lot: dict) -> bool:
             and lot.get("state") == "intake")
 
 
-def waiting_project_lots(lots: list) -> list:
+def waiting_project_lots(lots: list, *, db=None) -> list:
     """Les lots du projet ouverts sans assigné (hors file d'amélioration) : du
     travail demandé qui attend qu'on le confie. Tant qu'il y en a, la prise
-    automatique s'abstient (0037) et `idle_capacity` le signale."""
-    return [lot for lot in lots
-            if not (lot.get("assignee") or "").strip()
-            and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
+    automatique s'abstient (0037) et `idle_capacity` le signale. Quand la base
+    est fournie, seuls les lots sans dependance explicite ouverte attendent
+    un preneur ; les autres attendent leurs amonts."""
+    waiting = [lot for lot in lots
+               if not (lot.get("assignee") or "").strip()
+               and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
+    if not waiting or db is None:
+        return waiting
+    blocked = {int(edge["work_item_id"]) for edge in
+               storage.of(db).work_dependencies.for_items([lot["id"] for lot in waiting])
+               if edge["blocking"]}
+    return [lot for lot in waiting if int(lot["id"]) not in blocked]
+
+
+def _budget_held(cfg, db, rows: list) -> dict:
+    """#1021 : `{agent: raison}` des agents dont le prochain tour est tenu
+    (budget, rythme ou authentification), lu là où l'exécuteur le calcule
+    (`account_turn.turn_hold`). `cfg` None (appelant sans hôte) : rien n'est
+    jugé. Une tenue illisible laisse l'agent dans l'alerte : c'est
+    l'attribution qui tranche, fail-closed."""
+    if cfg is None:
+        return {}
+    from . import account_turn
+    from . import db as db_mod
+    held = {}
+    for row in rows:
+        try:
+            reason = account_turn.turn_hold(cfg, db, row["name"], row)
+        except db_mod.Unavailable:
+            raise
+        except Exception:  # noqa: BLE001 - une lecture en échec ne masque pas l'alerte
+            continue
+        if reason:
+            held[row["name"]] = reason
+    return held
+
+
+def split_startable(waiting_lots: list, waits: dict) -> tuple:
+    """#1608 : sépare les lots confiables (`startable`) de ceux qu'une attente
+    planifiée retient (`{id: attente}` de L368). Un orchestrateur à qui l'on
+    propose un lot bloqué l'assigne pour rien : le brief ne propose que les
+    premiers et nomme le bloqueur des seconds."""
+    startable = [lot for lot in waiting_lots if int(lot["id"]) not in waits]
+    blocked = {int(lot["id"]): waits[int(lot["id"])]
+               for lot in waiting_lots if int(lot["id"]) in waits}
+    return startable, blocked
+
+
+def waiting_text(blocked: dict, limit: int = 6) -> str:
+    """« #12 waits on #3, #4; #15 is scheduled for 2026-10-16 » (L368)."""
+    parts = []
+    for ident, wait in sorted(blocked.items())[:limit]:
+        if wait.get("what") == "dependency":
+            parts.append("#%d waits on %s" % (
+                ident, ", ".join("#%d" % int(i) for i in wait.get("lots") or ())))
+        elif wait.get("what") == "scheduled":
+            parts.append("#%d is scheduled for %s" % (ident, wait.get("start")))
+        else:
+            parts.append("#%d is waiting" % ident)
+    if len(blocked) > limit:
+        parts.append("…")
+    return "; ".join(parts)
 
 
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
                   lots: list | None = None, designers=(), held=(), held_hosts=(),
-                  pressured: dict | None = None) -> list:
+                  pressured: dict | None = None, cfg=None) -> list:
     """#254 : `held`, les agents d'un hôte en pause, ni comptés ni à
     réveiller ; `held_hosts` (hôtes en pause) et `pressured` ({hôte:
     verdict} des hôtes sous pression, relevé frais) ne sont jamais proposés :
-    leurs agents sont laissés de côté et nommés."""
+    leurs agents sont laissés de côté et nommés.
+
+    #1021 : `cfg` (l'hôte qui juge) — un agent encore `idle` dont les comptes
+    viennent de franchir le seuil n'est pas proposé non plus : la pause n'est
+    écrite qu'au sondage suivant de son exécuteur, et l'attribution le refuse
+    déjà (`work.check_assignee`)."""
     if idle_s <= 0:
         return []
     pressured = pressured or {}
@@ -491,11 +963,20 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     spared = sorted((row["name"], row.get("host")) for row in idle
                     if row.get("host") in pressured)
     idle = [row for row in idle if row.get("host") not in pressured]
+    # #1021 : la tenue budget/rythme, lue là où l'exécuteur la calcule
+    budget_held = _budget_held(cfg, db, idle)
+    if budget_held:
+        idle = [row for row in idle if row["name"] not in budget_held]
     if not idle:
         return []
     if lots is None:
         lots = storage.of(db).operations.open_lots_activity(500)
+    # #1608 : la liste garde les lots retenus par une attente et les classe
+    # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
+    # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
     waiting_lots = waiting_project_lots(lots)
+    waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
+    startable_lots, blocked_lots = split_startable(waiting_lots, waits)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
                and row.get("oldest_unread_ts") is not None
@@ -514,12 +995,23 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         parts.append("%d open lot(s) without an assignee (%s)" % (
             len(waiting_lots), ", ".join("#%d" % int(l["id"]) for l in waiting_lots[:8])
             + (", …" if len(waiting_lots) > 8 else "")))
+        if startable_lots:
+            parts.append("%d startable now: %s" % (
+                len(startable_lots),
+                ", ".join("#%d" % int(l["id"]) for l in startable_lots[:8])
+                + (", …" if len(startable_lots) > 8 else "")))
+        if blocked_lots:
+            parts.append("%d waiting for a prerequisite: %s" % (
+                len(blocked_lots), waiting_text(blocked_lots)))
     if backlog:
         parts.append("mail waiting at %s" % ", ".join(
             sorted(row["name"] for row in backlog)))
     if on_hold:
         parts.append("left out, their host on hold: %s" % ", ".join(
             "%s on %s" % pair for pair in on_hold))
+    if budget_held:
+        parts.append("left out, next turn held: %s" % ", ".join(
+            "%s (%s)" % (name, reason) for name, reason in sorted(budget_held.items())))
     if spared:
         parts.append("left out, their host under pressure: %s" % "; ".join(
             "%s on %s (%s)" % (name, host, ", ".join(
@@ -544,6 +1036,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   "(ameesh work assign <lot> <agent>)" % ", ".join(asleep))
     else:
         action = "dispatch: ameesh work assign <lot> <agent>, or write to the orchestrator"
+    if waiting_lots and not startable_lots:
+        action = "no startable lot: clear the named prerequisite before assigning work"
     detail = "; ".join(parts) + ". Action: " + action
     responsible = None
     for name in attached + asleep + list(orchestras):
@@ -555,6 +1049,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         "idle_capacity", None, None, len(names), idle_s, detail,
         reason="forfait_au_repos" if aggravating else "travail_en_attente",
         agents=names, lots=[int(l["id"]) for l in waiting_lots[:50]],
+        startable_lots=[int(l["id"]) for l in startable_lots[:50]],
+        blocked_lots={str(i): w for i, w in sorted(blocked_lots.items())[:50]},
         paid_working=paid_working, orchestrators=list(orchestras),
         designers=[n for n in designers if n not in orchestras],
         responsible=responsible)]
@@ -567,30 +1063,47 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     Rend `{orchestrateur: texte}` : à chacun, les agents au repos sans lot de
     SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (un lot
     ne dit pas son équipe : tous). Un orchestrateur sans agent à occuper ne
-    reçoit rien ; il n'est jamais cité dans sa propre liste."""
+    reçoit rien ; il n'est jamais cité dans sa propre liste.
+
+    #1608 : seuls les lots sans attente planifiée sont proposés (L368) ; les
+    autres sont nommés avec leur bloqueur, pour qu'un orchestrateur ne les
+    assigne pas pour rien. Une alerte sans `startable_lots` (producteur plus
+    ancien, test) garde le comportement d'avant."""
     if alert.get("type") != "idle_capacity":
         return {}
+    from . import projects as projects_mod
     by_name = {row["name"]: row for row in listing}
     titles = lot_titles or {}
     lots = [int(l) for l in alert.get("lots") or ()]
+    startable = alert.get("startable_lots")
+    startable = lots if startable is None else [int(i) for i in startable]
+    blocked = {int(k): v for k, v in (alert.get("blocked_lots") or {}).items()}
     out = {}
     for orch in list(alert.get("orchestrators") or ()) + list(alert.get("designers") or ()):
-        team = ((by_name.get(orch) or {}).get("team") or "").strip()
+        mine = set(projects_mod.agent_projects(by_name.get(orch) or {}))
         names = [n for n in alert.get("agents") or () if n != orch and (
-            not team or ((by_name.get(n) or {}).get("team") or "").strip() == team)]
+            not mine or mine & set(projects_mod.agent_projects(by_name.get(n) or {})))]
         if not names:
             continue
         parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "
                  "than %s: %s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
-        if lots:
+        if startable:
             parts.append("Open lots without an agent: %s." % ", ".join(
                 "#%d%s" % (i, " \"%s\"" % titles[i] if titles.get(i) else "")
-                for i in lots[:12]) + (" …" if len(lots) > 12 else ""))
+                for i in startable[:12]) + (" …" if len(startable) > 12 else ""))
+        elif lots:
+            parts.append("No startable open lot without an agent: %s." % waiting_text(blocked))
         else:
             parts.append("No open lot without an agent.")
-        parts.append("Give them work tied to a lot: ameesh mail send <agent> "
-                     "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
-                     "<agent>.")
+        if startable and blocked:
+            parts.append("Waiting for a prerequisite: %s." % waiting_text(blocked))
+        if startable or not lots:
+            parts.append("Give them work tied to a lot: ameesh mail send <agent> "
+                         "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
+                         "<agent> --claim.")
+        else:
+            parts.append("Do not assign a lot that waits (its blocker is named above): clear the "
+                         "blocker, or create a startable lot (ameesh work add, or --new-lot \"title\").")
         out[orch] = " ".join(parts)
     return out
 
@@ -779,10 +1292,12 @@ def backlog_empty(db, listing: list, now: float, *,
     idle = idle_agents(listing, now, idle_s)
     if not idle:
         return []
-    if storage.of(db).work.backlog(open_only=True, limit=1):
+    # #1696 (N2 de #1242) : une file dont tous les éléments sont bloqués n'est
+    # pas prenable — même filtre `ready_only` que la prise automatique (L165).
+    if storage.of(db).work.backlog(open_only=True, limit=1, ready_only=True):
         return []
     # des lots du projet attendent un preneur : c'est `idle_capacity` qui parle
-    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500)):
+    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db):
         return []
     names = sorted(row["name"] for row in idle)
     return [_alert(
@@ -823,7 +1338,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         canons = []
     paid = paid_harnesses(getattr(cfg, "host", None))
     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
-                         pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held)
+                         pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held, cfg=cfg)
     orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
                                canons=canons)
     for alert in out:
@@ -838,7 +1353,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         pressured = {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
                          designers=designers, held=held, held_hosts=held_hosts,
-                         pressured=pressured)
+                         pressured=pressured, cfg=cfg)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons)

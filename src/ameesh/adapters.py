@@ -142,6 +142,27 @@ def bound_summary(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
     return garde + SUMMARY_CUT_NOTE % (len(garde), len(text), limit)
 
 
+#: #2096 : borne du texte final qu'un tour garde en mémoire (`last_final`), en
+#: caractères. Le flux d'un gros tour peut rendre plusieurs mégaoctets ; la
+#: réponse finale entière restait vivante jusqu'au tour suivant et son pic
+#: n'était jamais rendu (RSS des exécuteurs). La tête seule suffit à tout ce
+#: qui la lit : `turn_summary` n'en garde que `SUMMARY_MAX_CHARS` (la coupe y
+#: est identique puisque cette borne est plus grande ; seule la note de coupe
+#: compte alors la tête gardée au lieu du texte d'origine),
+#: `auth_failure.classify` ne lit un résultat que sous `MAX_RESULT_CHARS`
+#: (600), et `rate_limit.classify` ne le lit jamais (#1397).
+FINAL_MAX_CHARS = 64_000
+
+
+def bound_final(text: str, limit: int = FINAL_MAX_CHARS) -> str:
+    """Le texte final gardé pour le tour : la tête seule au-delà de `limit`.
+
+    Aucun marqueur : la coupe reste invisible pour les lecteurs (voir
+    `FINAL_MAX_CHARS`), et `bound_summary` dit déjà sa propre coupe."""
+    text = text or ""
+    return text if len(text) <= limit else text[:limit]
+
+
 #: Le résumé de reprise ouvre la session neuve dans un cadre écrit par
 #: l'exécuteur. L'exécuteur ne passe qu'un texte par tour, dans le rôle
 #: « utilisateur » du harnais (aucun descripteur ne déclare de canal système) :
@@ -227,6 +248,16 @@ IDLE_PROMPT = (
     "Resuming: if your lot is neither frozen nor merged, continue it; otherwise "
     "take up your assignment (board, workstream). If you have nothing to do, "
     "say so with agent-mail send orchestrateur, then stop."
+)
+#: #1270 : reprise cadencée d'un tour tombé sur une panne passagère du
+#: fournisseur, quand ce tour ne laissait aucune consigne en attente (courrier,
+#: événements, reprise : le courrier est soldé au lancement)
+RETRY_PROMPT = (
+    "Retry: your previous turn stopped on a transient provider error (rate "
+    "limit, overload, server or stream error); the runner waited, then resumes "
+    "it. Pick up where it stopped without redoing what is done: if that turn "
+    "brought messages or events you have not handled yet, handle them first, "
+    "then continue your lot. If nothing is left to do, stop."
 )
 
 #: #408 (L165b, règle 1) : réveil sur un lot actionnable de l'agent au repos
@@ -754,7 +785,14 @@ class ClaudeStream(StreamReader):
             if event.get("session_id") and principal:
                 out["session"] = event["session_id"]
             if event.get("is_error"):
-                out["error"] = event.get("subtype") or "harness error"
+                # #1397 : un `result` marqué `is_error` est le texte du CLI
+                # (canal fournisseur), pas le dernier message libre du modèle.
+                # Il entre donc dans `error`, que `rate_limit.classify` lit —
+                # un quota Claude n'apparaît que là. Un `result` non marqué
+                # reste ignoré du classement.
+                sous_type = event.get("subtype") or "harness error"
+                texte = str(event.get("result") or "").strip()
+                out["error"] = "%s: %s" % (sous_type, texte) if texte else sous_type
         return out
 
 
@@ -1179,6 +1217,10 @@ class HarnessAdapter:
             # outils voisins d'un harnais mise) est aussi visible du harnais
             base = out.get("PATH") or os.environ.get("PATH") or os.defpath
             out["PATH"] = os.pathsep.join([*prepend, base])
+        if self.key == "deepseek" and platform.is_linux():
+            from . import deepseek_cgroup
+            out["NODE_OPTIONS"] = deepseek_cgroup.node_options(
+                out.get("NODE_OPTIONS", os.environ.get("NODE_OPTIONS", "")))
         return out
 
     # -- lecture -----------------------------------------------------------

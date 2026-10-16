@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import io
+import json
 import os
 import tempfile
 import threading
@@ -79,6 +80,109 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(first.ts, second.ts)
         last = self.expire()["last"]
         self.assertEqual((last.id, last.text), (ids[2], "second"))
+
+    def census_complet(self):
+        """Le tuple du census complet — (entrées gardées, ligne d'index de la
+        plus récente, fin logique) — la référence du census du post (#1764 N6 :
+        comparer le tuple entier, pas seulement le compte ou l'extrait)."""
+        entries, whole_end = self.transport.census(THREAD)
+        newest = max(reversed(entries), key=lambda e: e.ts) if entries else None
+        return (len(entries), fil._index_row(newest), whole_end)
+
+    def assert_census_after_post(self, expected_last=None):
+        """Le census retenu par le post est exactement celui d'une relecture
+        complète."""
+        kept, last, end = self.transport.census_after_post(THREAD)
+        self.assertEqual((kept, last, end), self.census_complet())
+        if expected_last is not None:
+            self.assertEqual(last["excerpt"], expected_last)
+
+    def test_census_after_post_matches_a_full_read(self):
+        """#1670 : le census déduit par `post` de sa propre marche (réparation
+        d'une écriture interrompue) est celui d'une lecture complète — la plus
+        récente à date égale, une entrée en retard comprise — et il est écarté
+        dès qu'un autre écrivain ou une expiration touche le fichier."""
+        self.post(entry("old", 400), entry("first", 0))
+        self.post(entry("second", 0))
+        self.assert_census_after_post("second")
+        self.post(entry("late", 3))  # date ancienne, écrite en dernier
+        self.assert_census_after_post("second")
+        # un autre écrivain (autre instance) : le census retenu est écarté
+        fil.FileTransport(self.root).post(THREAD, entry("other", 0))
+        self.assertIsNone(self.transport.census_after_post(THREAD))
+        self.post(entry("after", 0))
+        self.assert_census_after_post("after")
+        # une expiration réécrit le fil : le décalage du nouvel en-tête est pris
+        self.assertEqual(self.expire()["dropped"], 1)  # « old », en tête
+        self.post(entry("post-expiry", 0))
+        self.assert_census_after_post("post-expiry")
+
+    def test_the_census_is_the_full_read_even_with_an_expiry_shift(self):
+        """#1764 N6 : après une expiration (décalage d'en-tête), le census du
+        post reste celui d'une relecture complète — identité logique de
+        l'entrée comprise (`base`), et une entrée datée ancienne écrite après
+        l'expiration ne prend pas la place de la plus récente."""
+        self.post(entry("old", 400), entry("kept", 1))
+        self.assertEqual(self.expire()["dropped"], 1)
+        self.post(entry("late", 3))     # date ancienne, écrite en dernier
+        self.assert_census_after_post("kept")
+
+    def test_a_same_size_rewrite_forces_a_full_census(self):
+        """#1764 N1 : l'identité du census n'est pas que (périphérique, inode,
+        taille) — une réécriture de même taille change mtime/ctime_ns et le
+        census retenu est écarté."""
+        self.post(entry("old", 500))
+        self.transport.post(THREAD, entry("mine", 0))
+        self.assertIsNotNone(self.transport.census_after_post(THREAD))
+
+        raw = self.read_bytes()
+        self.assertIn(b"old", raw)
+        rewritten = raw.replace(b"old", b"OLD")     # même longueur
+        self.assertEqual(len(rewritten), len(raw))
+        with open(self.path, "r+b") as fh:
+            fh.write(rewritten)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # mtime à coup sûr différent, même sur un système à granularité
+        # grossière (ctime, lui, a bougé avec l'écriture)
+        st = os.stat(self.path)
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns - 1_000_000_000))
+        self.assertEqual(os.stat(self.path).st_size, st.st_size)
+        self.assertIsNone(self.transport.census_after_post(THREAD))
+
+    def test_a_census_error_after_the_write_does_not_fail_the_post(self):
+        """#1764 N2 : le fil est écrit ; un census qui échoue est écarté, le
+        post rend son id et l'appelant relira le fil entier."""
+        with mock.patch.object(self.transport, "_census_after",
+                               side_effect=RuntimeError("census boom")):
+            external_id = self.transport.post(THREAD, entry("mine", 0))
+        self.assertIsNotNone(external_id)
+        self.assertEqual([e.text for e in self.transport.read(THREAD)], ["mine"])
+        self.assertIsNone(self.transport.census_after_post(THREAD))
+
+    def test_a_post_without_census_does_not_read_the_latest_entry(self):
+        """#1764 N3 : une indexation locale ne demande pas de census — `post`
+        ne relit pas la plus récente entrée pour rien, et n'en retient aucun."""
+        self.post(entry("old", 500))
+        with mock.patch.object(self.transport, "_census_after",
+                               side_effect=AssertionError("census computed")):
+            external_id = self.transport.post(THREAD, entry("mine", 0),
+                                              with_census=False)
+        self.assertIsNotNone(external_id)
+        self.assertEqual([e.text for e in self.transport.read(THREAD)],
+                         ["old", "mine"])
+        self.assertIsNone(self.transport.census_after_post(THREAD))
+
+    def test_the_census_cache_is_bounded(self):
+        """#1764 N5 : `_posted` ne garde pas un census par fil sans borne —
+        le plus ancien est oublié au-delà de la borne."""
+        with mock.patch.object(fil.FileTransport, "_POSTED_MAX", 2):
+            for n in range(5):
+                self.post(entry("e%d" % n, 1),
+                          thread=fil.ThreadRef("acme", "t%d" % n))
+            self.assertEqual(list(self.transport._posted),
+                             [fil.ThreadRef("acme", "t3").key,
+                              fil.ThreadRef("acme", "t4").key])
 
     def test_next_ids_continue_as_if_nothing_expired(self):
         twin = fil.FileTransport(os.path.join(self.root, "twin"))
@@ -314,20 +418,27 @@ class TransportTest(unittest.TestCase):
 
 
 class MediatedHostTest(TransportTest):
-    """#421, option B: a mediated executor host keeps the index of before L361
-    (no lock, no recount: a lock would not hold from one remote request to
-    the next) and does not expire its threads until a server-side op does."""
+    """L361b (#499) : un hôte médié n'a ni transaction ni verrou d'une requête
+    à l'autre ; il expire ses fils locaux et met l'index à jour par UNE
+    opération serveur (`threads.recount` : verrou de la ligne, recomptage,
+    expiration dans la même transaction). Sans connexion, rien n'expire."""
 
     def remote_db(self):
         from ameesh.storage.remote.client import RemoteDb
         db = object.__new__(RemoteDb)
         db.storage = mock.Mock()
+        db.close = mock.Mock()
         return db
 
-    def test_index_without_lock_nor_recount_every_entry_counted(self):
+    def mediated_cfg(self):
+        return dataclasses.replace(config_mod.Config(), threads_dir=self.root,
+                                   backend="mediated", exec_url="http://127.0.0.1:1")
+
+    def test_mediated_index_is_an_absolute_census_not_a_count(self):
+        """L361c : l'indexation médiée porte le census du fichier (portée H),
+        comme l'expiration ; la trace de la boîte reste écrite, sans compter."""
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
         self.post(entry("old", 500), entry("kept", 1))
-        self.expire()
         db = self.remote_db()
         e = entry("new", 0)
         external_id = self.transport.post(THREAD, e)
@@ -335,42 +446,228 @@ class MediatedHostTest(TransportTest):
         threads = db.storage.threads
         threads.lock.assert_not_called()
         threads.expired.assert_not_called()
+        # la trace de la boîte : la même écriture, mais qui ne compte pas
         threads.index.assert_called_once()
         kwargs = threads.index.call_args.kwargs
-        self.assertNotIn("count", kwargs)  # the contract's default: counted
+        self.assertIs(kwargs["count"], False)
         self.assertEqual((kwargs["entry_id"], kwargs["mailbox_ids"], kwargs["location"]),
                          (external_id, [9], self.path))
+        # le compte : le census du fichier, par l'opération de l'expiration
+        threads.recount.assert_called_once()
+        kwargs = threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual(kwargs["last"]["entry_id"], external_id)
+        self.assertEqual((kwargs["project"], kwargs["lot"], kwargs["transport"],
+                          kwargs["host"], kwargs["location"]),
+                         ("acme", "361", "file", cfg.host, self.path))
+        self.assertEqual([c[0] for c in threads.mock_calls], ["index", "recount"])
 
-    def test_expiry_is_said_unavailable_and_touches_nothing(self):
+    def test_mediated_index_without_a_mailbox_message_is_one_operation(self):
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500))
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        fil.index(db, cfg, self.transport, THREAD, e, external_id)
+        threads = db.storage.threads
+        threads.index.assert_not_called()
+        threads.recount.assert_called_once()
+        self.assertEqual(threads.recount.call_args.kwargs["kept"], 2)
+
+    def test_mediated_index_reuses_the_census_of_the_post(self):
+        """#1670 : le census vient de la marche faite par `post` (réparation
+        d'une écriture interrompue) ; l'indexation médiée ne relit pas le fil,
+        et le census porté est celui d'une lecture complète."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_not_called()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual(kwargs["last"]["entry_id"], external_id)
+        self.assertEqual(self.transport.census_after_post(THREAD) is not None, True)
+
+    def test_a_writer_between_post_and_index_forces_a_full_census(self):
+        """#1670 : dès que le fichier a bougé après le `post` (ici un second
+        écrivain), le census retenu est écarté et le fil est relu."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500))
+        db = self.remote_db()
+        e = entry("mine", 0)
+        external_id = self.transport.post(THREAD, e)
+        fil.FileTransport(self.root).post(THREAD, entry("other", 0, author="agent:gamma"))
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_called_once()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual(kwargs["kept"], 3)
+        # même date, écrite après : c'est la dernière du census complet
+        self.assertEqual(kwargs["last"]["author"], "agent:gamma")
+
+    def test_an_expiry_between_post_and_index_forces_a_full_census(self):
+        """#1670 : l'expiration réécrit le fil (renommage) ; le census du
+        `post` est caduc et l'index relit le nouveau fichier."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        self.assertEqual(self.expire()["dropped"], 1)
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_called_once()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual(kwargs["kept"], 2)
+
+    def test_a_torn_tail_is_repaired_and_not_reused_as_a_census(self):
+        """#1670 : quand `post` a dû réparer une écriture interrompue, le fil
+        est relu — la marche de réparation ne vaut pas census."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("kept", 1))
+        raw = self.read_bytes()
+        with open(self.path, "wb") as fh:  # écriture interrompue en pleine entrée
+            fh.write(raw[:-4])
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        self.assertIsNone(self.transport.census_after_post(THREAD))
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_called_once()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual([x.text for x in entries][-1], "new")
+
+    def test_expiry_is_one_server_side_recount_of_the_rewritten_file(self):
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        seen = {}
+
+        def recount(**kwargs):
+            seen.update(kwargs)
+            seen["entries"] = [e.text for e in self.transport.read(THREAD)]
+            return kwargs["end"]
+
+        db.storage.threads.recount.side_effect = recount
+        reports = fil.expire(cfg, db, now=NOW)
+        self.assertEqual([(r["thread"], r["dropped"], r["kept"]) for r in reports],
+                         [(THREAD.key, 1, 1)])
+        # the file is rewritten first, and the census the op carries is the new one
+        self.assertEqual(seen["entries"], ["kept"])
+        self.assertEqual(seen["kept"], 1)
+        self.assertEqual(seen["last"]["entry_id"], self.transport.read(THREAD)[0].id)
+        self.assertIsInstance(seen["end"], int)
+        self.assertEqual((seen["project"], seen["lot"], seen["transport"], seen["host"],
+                          seen["location"]), ("acme", "361", "file", cfg.host, self.path))
+        # one operation, never the refused lock/expired/index
+        self.assertEqual([c[0] for c in db.storage.threads.mock_calls], ["recount"])
+
+    def test_a_lost_recount_is_redone_by_the_next_expiry(self):
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        db.storage.threads.recount.side_effect = RuntimeError("server lost")
+        reports = fil.expire(cfg, db, now=NOW)
+        self.assertIn("error", reports[0])
+        self.assertEqual([e.text for e in self.transport.read(THREAD)], ["kept"])
+        # nothing left to drop, but the file's expiry note is behind the index
+        db.storage.threads.recount.side_effect = None
+        db.storage.threads.recount.reset_mock()
+        reports = fil.expire(cfg, db, now=NOW)
+        self.assertEqual(reports[0]["dropped"], 0)
+        self.assertEqual(db.storage.threads.recount.call_args.kwargs["kept"], 1)
+
+    def test_a_thread_that_never_expired_is_left_to_the_index_of_before_l361(self):
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("recent", 1))
+        db = self.remote_db()
+        reports = fil.expire(cfg, db, now=NOW)
+        self.assertEqual(reports[0]["dropped"], 0)
+        db.storage.threads.recount.assert_not_called()
+
+    def test_without_a_connection_expiry_is_refused_and_touches_nothing(self):
+        cfg = self.mediated_cfg()
         self.post(entry("old", 500), entry("kept", 1))
         before = self.read_bytes()
-        db = self.remote_db()
         with self.assertRaises(fil.ExpiryUnavailable):
-            fil.expire(cfg, db, now=NOW)
+            fil.expire(cfg, None, now=NOW)
         self.assertEqual(self.read_bytes(), before)
-        self.assertEqual(db.storage.mock_calls, [])
         # a dry run reads the file only: still answered
-        self.assertEqual(fil.expire(cfg, db, now=NOW, dry_run=True)[0]["dropped"], 1)
+        self.assertEqual(fil.expire(cfg, None, now=NOW, dry_run=True)[0]["dropped"], 1)
         self.assertEqual(self.read_bytes(), before)
 
-    def test_runner_logs_it_once_per_pass(self):
+    def test_runner_expires_through_the_connection_it_holds(self):
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        fake = types.SimpleNamespace(cfg=cfg, dry_run=False, db=db)
+        with mock.patch.object(runner, "log_async") as logged:
+            reports = runner.Runner.expire_threads_once(fake, None, now=NOW, clock=0.0)
+        self.assertEqual(reports[0]["dropped"], 1)
+        self.assertEqual([c[0] for c in db.storage.threads.mock_calls], ["recount"])
+        logged.assert_called_once()
+        self.assertIn("1 entr", logged.call_args.args[0])
+        # #1482-N3 : la connexion tenue par l'exécuteur n'est pas fermée par l'expiration
+        db.close.assert_not_called()
+        # r8/l361b: le throttle quotidien se compte sur l'horloge monotone ; sans
+        # `clock` explicite le temoin dependait de la duree de vie de la machine
+        # (monotonic > 86400 s -> la deuxieme passe n'etait plus retenue).
+        self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600,
+                                                            clock=3600.0))
+
+    def test_runner_closes_the_connection_it_opened_itself(self):
+        # #1482-N3 : la connexion ouverte pour l'expiration quotidienne est
+        # fermée ; celle que l'exécuteur tient déjà ne l'est pas.
+        cfg = self.mediated_cfg()
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        from ameesh import db as db_mod
+        fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
+        with mock.patch.object(db_mod, "connect", return_value=db) as connect, \
+                mock.patch.object(runner, "log_async"):
+            reports = runner.Runner.expire_threads_once(fake, None, now=NOW)
+        connect.assert_called_once()
+        db.close.assert_called_once()
+        self.assertEqual([r["dropped"] for r in reports], [1])
+
+    def test_runner_says_the_missing_index_once_per_pass(self):
+        cfg = self.mediated_cfg()
         self.post(entry("old", 500), entry("kept", 1), thread=fil.ThreadRef("other"))
         self.post(entry("old", 500), entry("kept", 1))
+        before = self.read_bytes()
+        from ameesh import db as db_mod
         fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
-        with mock.patch.object(runner, "log_async") as logged:
-            self.assertIsNone(runner.Runner.expire_threads_once(fake, self.remote_db(), now=NOW))
-        self.assertEqual(logged.call_count, 1)
-        self.assertIn("thread expiry skipped", logged.call_args.args[0])
-        self.assertIn("mediated", logged.call_args.args[0])
-        self.assertIsNone(runner.Runner.expire_threads_once(fake, self.remote_db(),
-                                                            now=NOW + 3600))
+        with mock.patch.object(db_mod, "connect",
+                               side_effect=db_mod.DbError("no token")) as connect, \
+                mock.patch.object(runner, "log_async") as logged:
+            self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW))
+            self.assertEqual(logged.call_count, 1)
+            self.assertIn("thread expiry skipped", logged.call_args.args[0])
+            self.assertIn("no token", logged.call_args.args[0])
+            # the day is counted anyway: no new attempt before tomorrow
+            self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600))
+        connect.assert_called_once()
+        self.assertEqual(self.read_bytes(), before)
 
-
-    def test_host_mediated_refused_too(self):
-        # r8: `host_mediated` with another backend keeps its threads local;
-        # its database unavailable, `fil expire` still refuses, no connection
+    def test_host_mediated_without_a_connection_is_refused_too(self):
+        # r8: `host_mediated` keeps its threads local whatever the backend;
+        # without the index, `fil expire` refuses, and the connection is tried
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root,
                                   host_mediated=True)
         self.assertNotEqual(cfg.backend, "mediated")
@@ -381,10 +678,10 @@ class MediatedHostTest(TransportTest):
         from ameesh import db as db_mod
         with mock.patch.object(fil, "transport_for", return_value=self.transport), \
                 mock.patch.object(db_mod, "connect",
-                                  side_effect=db_mod.Unavailable("no credentials")) as connect, \
+                                  side_effect=db_mod.DbError("no credentials")) as connect, \
                 self.assertRaises(fil.ExpiryUnavailable):
             fil.cmd_expire(cfg, types.SimpleNamespace(days=None, dry_run=False))
-        connect.assert_not_called()
+        connect.assert_called_once()
         self.assertEqual(self.read_bytes(), before)
 
     def test_notice_thread_survives_an_error(self):
@@ -409,29 +706,23 @@ class MediatedHostTest(TransportTest):
         self.assertIn("thread expiry notice failed (RuntimeError: boom)",
                       logged.call_args_list[0].args[0])
 
-    def mediated_cfg(self):
-        return dataclasses.replace(config_mod.Config(), threads_dir=self.root,
-                                   backend="mediated", exec_url="http://127.0.0.1:1")
-
-    def test_refused_by_the_configuration_without_a_connection(self):
-        # r7: the mediated server unreachable, no token: still refused, the
-        # files untouched and no connection tried by `fil expire`
+    def test_mediated_cli_expires_through_the_server_op(self):
         cfg = self.mediated_cfg()
         self.post(entry("old", 500), entry("kept", 1))
-        before = self.read_bytes()
-        with self.assertRaises(fil.ExpiryUnavailable):
-            fil.expire(cfg, None, now=NOW)
-        args = types.SimpleNamespace(days=None, dry_run=False)
+        db = self.remote_db()
         from ameesh import db as db_mod
+        out = io.StringIO()
         with mock.patch.object(fil, "transport_for", return_value=self.transport), \
-                mock.patch.object(db_mod, "connect",
-                                  side_effect=db_mod.Unavailable("no token")) as connect, \
-                self.assertRaises(fil.ExpiryUnavailable):
-            fil.cmd_expire(cfg, args)
-        connect.assert_not_called()
-        self.assertEqual(self.read_bytes(), before)
+                mock.patch.object(db_mod, "connect", return_value=db), \
+                contextlib.redirect_stdout(out):
+            code = fil.cmd_expire(cfg, types.SimpleNamespace(days=None, dry_run=False))
+        self.assertEqual(code, 0)
+        self.assertIn("1 entry expired before", out.getvalue())
+        db.storage.threads.recount.assert_called_once()
+        db.close.assert_called_once()
+        self.assertEqual([e.text for e in self.transport.read(THREAD)], ["kept"])
 
-    def test_dry_run_reports_and_says_unavailable(self):
+    def test_mediated_dry_run_reports_without_the_index(self):
         cfg = self.mediated_cfg()
         self.post(entry("old", 500), entry("kept", 1))
         before = self.read_bytes()
@@ -439,10 +730,9 @@ class MediatedHostTest(TransportTest):
         with mock.patch.object(fil, "transport_for", return_value=self.transport), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = fil.cmd_expire(cfg, types.SimpleNamespace(days=None, dry_run=True))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertIn("1 entry would expire", out.getvalue())
-        self.assertIn("not available on a mediated executor host", err.getvalue())
-        self.assertIn("nothing would expire", err.getvalue())
+        self.assertEqual(err.getvalue(), "")
         self.assertEqual(self.read_bytes(), before)
 
     def test_runner_says_it_without_housekeeping(self):
@@ -464,7 +754,7 @@ class MediatedHostTest(TransportTest):
                 fake.stop.set()
             self.assertEqual(logged.call_count, 1)
             self.assertIn("thread expiry skipped", logged.call_args.args[0])
-            self.assertIn("mediated", logged.call_args.args[0])
+            self.assertIn("index unavailable", logged.call_args.args[0])
         # in --once, nothing scheduled
         fake = types.SimpleNamespace(cfg=cfg, once=True, mediated=True,
                                      _start_thread_expiry_notice=mock.Mock())
@@ -499,6 +789,22 @@ class IndexAndOutboxTest(PgTestCase):
         transport = fil.transport_for(self.cfg)
         self.assertEqual(transport.read(fil.ThreadRef("acme", "10"))[0].id,
                          rows["10"]["last_entry_id"])
+
+    def test_a_local_index_asks_no_census_of_the_post(self):
+        """#1764 N3 : sur une base locale, `record` ne demande pas de census au
+        transport — l'indexation locale n'en lit aucun (le census ne sert qu'à
+        l'exécuteur médié)."""
+        calls = []
+        real_post = fil.FileTransport.post
+
+        def spy(self, thread, entry, **kw):
+            calls.append(kw)
+            return real_post(self, thread, entry, **kw)
+
+        with mock.patch.object(fil.FileTransport, "post", spy):
+            fil.record(self.cfg, self.db, sender="alpha", recipients=["beta"],
+                       text="local", project="acme", lot="n3")
+        self.assertEqual([kw.get("with_census") for kw in calls], [False])
 
     def index_row(self, lot):
         rows = self.db.query("SELECT entries, last_excerpt, last_entry_id, last_mailbox_id"
@@ -653,6 +959,131 @@ class IndexAndOutboxTest(PgTestCase):
         self.assertEqual(log.drain_threads(), 1)
         self.assertEqual([e.text for e in fil.transport_for(self.cfg).read(
             fil.ThreadRef("acme", "361"))], ["old question"])
+
+
+class RecountTest(PgTestCase):
+    """L361b : l'opération serveur d'un hôte médié — verrou de la ligne,
+    recomptage absolu depuis le census du fichier et expiration en une seule
+    transaction ; un recomptage plus récent n'est jamais écrasé."""
+
+    PROJ, LOT, HOST = "acme", "361b", "host-1"
+    #: la plus récente d'un census d'indexation (L361c)
+    LAST = {"entry_id": "acme/361b#30", "author": "agent:a", "excerpt": "trois",
+            "ts": 2.0, "mailbox_id": None}
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("DELETE FROM thread_index")
+        from ameesh import storage
+        self.threads = storage.of(self.db).threads
+        self.key = dict(project=self.PROJ, lot=self.LOT, transport="file", host=self.HOST)
+
+    def row(self):
+        rows = self.db.query(
+            "SELECT location, entries, last_entry_id, last_excerpt, counted_until"
+            "  FROM thread_index"
+            " WHERE project = %s AND lot = %s AND transport = 'file' AND host = %s",
+            (self.PROJ, self.LOT, self.HOST))
+        return rows[0] if rows else None
+
+    def test_recount_locks_counts_and_expires_in_one_operation(self):
+        self.threads.index(**self.key, location="/threads/acme/361b.md",
+                           entry_id="acme/361b#10", mailbox_ids=[], author="agent:a",
+                           excerpt="x", ts=1.0, trace={})
+        self.assertIsNone(self.row()["counted_until"])
+        value = self.threads.recount(**self.key, location="/threads/acme/361b.md",
+                                     kept=0, last=None, end=42)
+        self.assertEqual(value, 42)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["counted_until"]),
+                         (0, None, 42))
+
+    def test_a_newer_recount_is_not_overwritten(self):
+        self.threads.recount(**self.key, location="x", kept=3,
+                             last={"entry_id": "acme/361b#30", "author": "agent:a",
+                                   "excerpt": "trois", "ts": 2.0, "mailbox_id": None},
+                             end=90)
+        value = self.threads.recount(**self.key, location="x", kept=1, last=None, end=42)
+        self.assertEqual(value, 90)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["counted_until"]),
+                         (3, "acme/361b#30", 90))
+
+    def test_at_equal_end_the_expiry_is_applied(self):
+        # à fin logique constante, seule une expiration change le fil
+        self.threads.recount(**self.key, location="x", kept=5, last=None, end=42)
+        value = self.threads.recount(**self.key, location="x", kept=2, last=None, end=42)
+        self.assertEqual(value, 42)
+        self.assertEqual(self.row()["entries"], 2)
+
+    def test_recount_creates_the_row_of_an_unknown_thread(self):
+        value = self.threads.recount(**self.key, location="x", kept=0, last=None, end=7)
+        self.assertEqual(value, 7)
+        self.assertEqual(self.row()["counted_until"], 7)
+
+    def test_a_stale_census_never_erases_a_newer_index(self):
+        """L361c : l'indexation médiée est un census absolu (portée H). La
+        trace ne compte pas ; un recomptage d'expiration plus court, arrivé
+        après le census de l'indexation, ne recule pas et ne double rien."""
+        self.threads.recount(**self.key, location="x", kept=2, last=None, end=100)
+        # la trace de l'indexation : écrite, mais `+1` local désactivé
+        self.threads.index(**self.key, location="x", entry_id="acme/361b#30",
+                           mailbox_ids=[], author="agent:a", excerpt="x", ts=2.0,
+                           trace={}, count=False)
+        self.assertEqual(self.row()["entries"], 2)
+        # le census de l'indexation, plus récent que le recomptage d'expiration
+        self.threads.recount(**self.key, location="x", kept=3,
+                             last={"entry_id": "acme/361b#30", "author": "agent:a",
+                                   "excerpt": "trois", "ts": 2.0, "mailbox_id": None},
+                             end=120)
+        # un recomptage périmé (census d'avant l'indexation) ne l'écrase pas
+        self.assertEqual(self.threads.recount(**self.key, location="x", kept=2,
+                                              last=None, end=100), 120)
+        row = self.row()
+        self.assertEqual((row["entries"], row["counted_until"]), (3, 120))
+
+    def test_an_index_census_at_equal_end_is_stale_after_the_expiry(self):
+        """L361c, témoin inverse : l'expiration préserve la fin logique
+        (`end`), donc un census d'indexation lu avant elle a le même `end`.
+        Arrivé après le recount de l'expiration, il est périmé : il ne
+        ressuscite ni les entrées ni `last_*`."""
+        self.threads.recount(**self.key, location="x", kept=3, last=dict(self.LAST), end=120)
+        # l'expiration, de même fin logique : le fil ne garde qu'une entrée
+        self.assertEqual(self.threads.recount(**self.key, location="x", kept=1,
+                                              last=None, end=120), 120)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["last_excerpt"]),
+                         (1, None, ""))
+        # le census d'indexation, lu avant l'expiration, arrive après elle
+        self.assertEqual(self.threads.recount(**self.key, location="x", kept=3,
+                                              last=dict(self.LAST), end=120), 120)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["last_excerpt"],
+                          row["counted_until"]), (1, None, "", 120))
+
+    def test_a_trace_write_counts_nothing_and_quotes_nothing(self):
+        """L361c : la trace de la boîte (`count` faux) écrit `meta` et
+        `location`, jamais `entries` ni `last_*` : une entrée retirée par une
+        expiration passée avant l'écriture de trace ne reste pas citée."""
+        msg = self.db.query("INSERT INTO agent_mailbox (sender, recipient, body)"
+                            " VALUES ('agent:a', 'agent:b', 'x') RETURNING id")[0]["id"]
+        self.threads.recount(**self.key, location="x", kept=1,
+                             last={"entry_id": "acme/361b#20", "author": "agent:a",
+                                   "excerpt": "deux", "ts": 1.0, "mailbox_id": None},
+                             end=120)
+        before = self.row()
+        self.threads.index(**self.key, location="y", entry_id="acme/361b#30",
+                           mailbox_ids=[msg], author="agent:a", excerpt="trois",
+                           ts=3.0, trace={"fil": {"id": "acme/361b#30"}}, count=False)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["last_excerpt"],
+                          row["counted_until"]),
+                         (before["entries"], before["last_entry_id"],
+                          before["last_excerpt"], before["counted_until"]))
+        self.assertEqual(row["location"], "y")  # la trace rafraîchit `location`
+        meta = self.db.query("SELECT meta FROM agent_mailbox WHERE id = %s", (msg,))[0]["meta"]
+        meta = meta if isinstance(meta, dict) else json.loads(meta)
+        self.assertEqual(meta.get("fil"), {"id": "acme/361b#30"})
 
 
 if __name__ == "__main__":

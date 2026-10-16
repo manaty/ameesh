@@ -29,6 +29,18 @@ APPROVED_OPERATORS = {
     'ameesh-agents-1': 'ameesh',
     'ameesh-agents-2': 'ameesh',
 }
+#: Pool sizing (#532). Session mode holds one server session per client
+#: session, so a host of runners needs one client slot and one server slot per
+#: resting or working session, plus the CLI bursts. The original 100 clients /
+#: 32+8 servers / 40 total saturated on 2026-10-13 (40 active, 60 waiting,
+#: then `no more connections allowed`): these are the values applied by hand on
+#: pc-smichea and kept here so a redeployment does not lower them again.
+#: `default_pool_size + reserve_pool_size` must not exceed
+#: `max_db_connections`; the three hosts stay under the server's 300.
+MAX_CLIENT_CONN = 250
+DEFAULT_POOL_SIZE = 64
+RESERVE_POOL_SIZE = 16
+MAX_DB_CONNECTIONS = 80
 
 
 def approved_home():
@@ -133,6 +145,36 @@ def socket_conninfo(dsn, socket_dir):
     return psycopg.conninfo.make_conninfo(**params)
 
 
+def pool_ini(dbname, upstream, port, *, socket_dir, auth_file, admin_user, tls):
+    """The reviewed [pgbouncer] configuration, sizing included (#532)."""
+    return f'''[databases]
+{dbname} = host={upstream} port={port} dbname={dbname}
+
+[pgbouncer]
+listen_addr =
+listen_port = 6432
+unix_socket_dir = {socket_dir}
+unix_socket_mode = 0600
+auth_type = trust
+auth_file = {auth_file}
+admin_users = {admin_user}
+pool_mode = session
+server_reset_query = DISCARD ALL
+server_tls_sslmode = {tls}
+server_idle_timeout = 30
+server_lifetime = 3600
+max_client_conn = {MAX_CLIENT_CONN}
+default_pool_size = {DEFAULT_POOL_SIZE}
+reserve_pool_size = {RESERVE_POOL_SIZE}
+reserve_pool_timeout = 5
+max_db_connections = {MAX_DB_CONNECTIONS}
+track_extra_parameters = search_path,statement_timeout
+log_connections = 0
+log_disconnections = 0
+log_stats = 0
+'''
+
+
 def install(home, state, config):
     binary = home / '.local/bin/pgbouncer'
     # Refuse even a symlink or dangling symlink before running it or creating
@@ -192,32 +234,9 @@ def install(home, state, config):
         if f'PgBouncer {VERSION}' not in result.stdout:
             raise ValueError('unexpected binary version')
         create(settings / 'userlist.txt', credentials)
-        create(config, f'''[databases]
-{dbname} = host={upstream} port={port} dbname={dbname}
-
-[pgbouncer]
-listen_addr =
-listen_port = 6432
-unix_socket_dir = {state / 'socket'}
-unix_socket_mode = 0600
-auth_type = trust
-auth_file = {settings / 'userlist.txt'}
-admin_users = {user}
-pool_mode = session
-server_reset_query = DISCARD ALL
-server_tls_sslmode = {tls}
-server_idle_timeout = 30
-server_lifetime = 3600
-max_client_conn = 200
-default_pool_size = 32
-reserve_pool_size = 8
-reserve_pool_timeout = 5
-max_db_connections = 40
-track_extra_parameters = search_path,statement_timeout
-log_connections = 0
-log_disconnections = 0
-log_stats = 0
-''')
+        create(config, pool_ini(dbname, upstream, port, socket_dir=state / 'socket',
+                                auth_file=settings / 'userlist.txt', admin_user=user,
+                                tls=tls))
         # Socket DSN is persisted only in a private file, not printed.
         create(state / 'socket.dsn', socket_dsn)
         unit.parent.mkdir(parents=True, exist_ok=True)

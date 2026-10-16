@@ -142,8 +142,9 @@ class ResourcesDbTest(PgTestCase):
         return storage.of(self.db).hosts.record(row)
 
     def test_releve_dernier_et_historique(self):
+        # l'ordre des relevés ne dépend pas de la granularité de l'horloge :
+        # `sampled_at DESC, id DESC` départage deux relevés du même instant
         self.record(mem_available_bytes=1024)
-        time.sleep(0.01)
         self.record(mem_available_bytes=2048)
         hosts = storage.of(self.db).hosts
         latest = hosts.latest("pc")
