@@ -341,7 +341,7 @@ class Operations(interface.Operations):
                     else "''::text AS reviewer")
         sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
-                   w.priority, w.app, w.workstream, __REVIEWER__,
+                   w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(

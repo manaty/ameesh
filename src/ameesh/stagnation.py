@@ -211,18 +211,29 @@ def class_value(reading: dict | None) -> str | None:
     return str(reading.get("class") or "") or None
 
 
-def review_class_of(db, row: dict, *, cfg=None, memo: dict | None = None) -> str | None:
+def review_class_of(db, row: dict, *, cfg=None, memo: dict | None = None,
+                    milestones: list | None = None) -> str | None:
     """La classe de revue du lot `row`, lue une fois par passage (`memo`).
 
+    Les jalons préchargés et le canon partagé dans `memo` évitent une lecture
+    unitaire des jalons et un chargement du canon pour chaque lot.
     `lot_class.of_lot` ne lève jamais ; la lecture reste donc sûre dans une vue
     groupée, et tout doute rend None (attente prudente, #1822)."""
-    from . import lot_class
+    from . import lot_class, work
+
+    def read_canons():
+        if memo is None:
+            return work.configured_canons(cfg)
+        if "canons" not in memo:
+            memo["canons"] = work.configured_canons(cfg)
+        return memo["canons"]
 
     rid = int(row["id"])
     if memo is not None and rid in memo:
         return memo[rid]
     try:
-        value = class_value(lot_class.of_lot(db, rid, cfg=cfg, item=row))
+        value = class_value(lot_class.of_lot(db, rid, cfg=cfg, item=row,
+                                            milestones=milestones, canons=read_canons))
     except Exception:  # noqa: BLE001 - une vue ne tombe pas sur la classe
         value = None
     if memo is not None:
@@ -388,7 +399,7 @@ def describe(db, rows: list[dict], *, now: float | None = None,
         # verdict ; déjà résolue par l'appelant, elle ne l'est pas relue.
         if detail is not None and detail.get("what") == "verdict":
             cls = known[rid] if rid in known else review_class_of(
-                db, row, cfg=cfg, memo=classes)
+                db, row, cfg=cfg, memo=classes, milestones=milestones.get(rid, []))
             if cls:
                 detail = waiting(row, jalons, acts,
                                  responsible=package.get("responsible"),

@@ -17,7 +17,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import cost, lot_class, mesh_cli, plan, progress, stagnation, work
+from ameesh import (canon, cost, lot_class, mesh_cli, plan, plan_git, progress,
+                    stagnation, storage, work)
 
 from .support import PgTestCase
 
@@ -104,6 +105,28 @@ class ReviewClassOfTest(unittest.TestCase):
             self.assertEqual(stagnation.review_class_of(None, {"id": 7}, memo=memo), "light")
         self.assertEqual(of_lot.call_count, 1)
 
+    def test_jalons_groupes_et_canon_partage_entre_lots(self):
+        freeze = [{"kind": "frozen", "sha": "a" * 40}]
+        memo: dict = {}
+        with mock.patch.object(lot_class, "repository", return_value="repo"), \
+             mock.patch.object(lot_class, "default_base", return_value="main"), \
+             mock.patch.object(plan_git, "_commit", return_value="a" * 40), \
+             mock.patch.object(canon, "git_range_paths", return_value=["README.md"]), \
+             mock.patch.object(lot_class, "class_of_paths", return_value={"class": "light", "doubt": False}), \
+             mock.patch.object(work, "configured_canons", return_value=[object()]) as canons, \
+             mock.patch.object(work, "milestones", side_effect=AssertionError("lecture unitaire")) as reads:
+            classes = [stagnation.review_class_of(None, {"id": rid}, memo=memo,
+                                                  milestones=freeze) for rid in range(3)]
+        self.assertEqual(classes, ["light"] * 3)
+        reads.assert_not_called()
+        canons.assert_called_once()
+
+    def test_absence_de_gel_groupe_ne_relit_pas_la_base(self):
+        with mock.patch.object(lot_class, "repository", return_value="repo"), \
+             mock.patch.object(work, "milestones", side_effect=AssertionError("lecture unitaire")) as reads:
+            self.assertIsNone(stagnation.review_class_of(None, {"id": 7}, milestones=[]))
+        reads.assert_not_called()
+
 
 class VuesClasseTest(PgTestCase):
     """Les vues groupées : liste, show, alerte stale_lot, instantané de progrès."""
@@ -144,9 +167,10 @@ class VuesClasseTest(PgTestCase):
 
     def test_liste_leger_attend_la_fusion(self):
         rows = self._rows()
-        with self._classe(lot_class.LIGHT):
+        with self._classe(lot_class.LIGHT) as reading:
             plan.annotate(self.db, rows, cfg=self.cfg)
         self.assertEqual(rows[0]["waiting_for"]["what"], "merge")
+        self.assertIn("milestones", reading.call_args.kwargs)
 
     def test_liste_sensible_garde_le_verdict(self):
         rows = self._rows()
@@ -187,8 +211,15 @@ class VuesClasseTest(PgTestCase):
         self.assertEqual([int(r["id"]) for r in lots], [self.lot])
         self.assertEqual(lots[0]["waiting"]["what"], "merge")
 
+    def test_projection_alerte_conserve_la_cible_release(self):
+        work.set_branch(self.db, self.lot, "lot/demo", "release/1.12", actor="auteur")
+        row = next(r for r in storage.of(self.db).operations.open_lots_activity(None)
+                   if int(r["id"]) == self.lot)
+        self.assertEqual(stagnation.review_class_of(self.db, row, cfg=self.cfg), lot_class.RELEASE)
+
     def test_instantane_leger_attend_la_fusion(self):
-        with self._classe(lot_class.LIGHT):
+        with self._classe(lot_class.LIGHT) as reading:
             snap = progress.snapshot(self.db, self.cfg, since="24h", book=self._book())
         lots = {int(r["id"]): r for r in snap["lots"]}
         self.assertEqual(lots[self.lot]["waiting_for"]["what"], "merge")
+        self.assertIn("milestones", reading.call_args.kwargs)

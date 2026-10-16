@@ -820,7 +820,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     for lot, item in zip(lots, items):
         if (lot.get("waiting_for") or {}).get("what") != "verdict":
             continue
-        cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes)
+        cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes,
+                                         milestones=declared.get(int(item["id"]), []))
         if cls != lot_class.LIGHT:
             continue
         rid = int(item["id"])
