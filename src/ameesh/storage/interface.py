@@ -1381,6 +1381,14 @@ class WorkItems(Domain):
         None si le lot n'est plus ouvert."""
 
     @abc.abstractmethod
+    def attach_implicit_branch(self, item_id: int, branch: str, *, detached_prefix: str,
+                               note: str, actor: str) -> dict | None:
+        """#2102 : pose la branche implicite (L118b) d'un lot ouvert, sans
+        cible, avec une ligne de journal, seulement s'il n'a pas de branche et
+        qu'aucune ligne de son journal ne commence par `detached_prefix`
+        (détachement), vérifiés sous le verrou de la ligne du lot ; None sinon."""
+
+    @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:

@@ -452,6 +452,18 @@ def is_detached(st, item_id: int, branch: str) -> bool:
                for e in st.work.assignment_events(int(item_id), [prefix]))
 
 
+def attach_implicit_branch(db: Db, item_id: int, branch: str, *, source: str,
+                           actor: str = "") -> dict | None:
+    """L118b, #2102 : la branche implicite `lot/<id>-…` devient celle du lot,
+    journalisée, seulement si le lot n'a toujours pas de branche et qu'elle
+    n'en a pas été détachée — vérifié atomiquement par le stockage, pour
+    qu'un détachement ou une branche explicite posés pendant le relevé ne
+    soient pas écrasés. Rend le lot, ou None si rien n'est posé."""
+    note = "branch %s — %s (before: none)" % (branch, source)
+    return storage.of(db).work.attach_implicit_branch(
+        item_id, branch, detached_prefix=_detach_prefix(branch), note=note, actor=actor)
+
+
 def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: str,
                   actor: str = "") -> dict:
     """#2102 : retire la branche d'un lot ouvert (PR fermée ou supplantée),

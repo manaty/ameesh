@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from unittest import mock
 
 from ameesh import plan_git, radar, registry, storage, work
 
@@ -128,6 +129,40 @@ class DetachSweepTest(_Base):
         _git(self.repo, "merge", "-q", "--no-ff", "-m",
              "Merge branch '%s'\n\nameesh-work: %d" % (name, n), name)
         self.assertEqual(self.sync()["merged"], 1)
+
+    def during_probe(self, gesture):
+        """Le relevé, avec `gesture` joué dans `branch_probe` : après la
+        lecture du lot et de son journal, avant l'association implicite."""
+        original = plan_git.branch_probe
+
+        def probe(*args, **kwargs):
+            gesture()
+            return original(*args, **kwargs)
+
+        with mock.patch.object(plan_git, "branch_probe", side_effect=probe):
+            return self.sync()
+
+    def test_detachement_pendant_le_releve_est_garde(self):
+        # témoin mesh-design (B2) : le relevé posait la branche sans condition
+        lot = self.blocked_lot()
+        n = lot["id"]
+        name = "lot/%d-supplantee" % n
+        self.branch(name)
+        self.during_probe(lambda: work.detach_branch(
+            self.db, n, name, reason="PR supplantée pendant le relevé"))
+        item = work.get(self.db, n)
+        self.assertIsNone(item["branch"])
+        self.assertIsNone(item["branch_head"])
+        self.assertTrue(work.events(self.db, n)[0]["note"].startswith(
+            "branch detached: %s " % name))
+
+    def test_branche_explicite_pendant_le_releve_n_est_pas_ecrasee(self):
+        lot = self.lot()
+        n = lot["id"]
+        self.branch("lot/%d-devinee" % n)
+        self.during_probe(lambda: work.set_branch(self.db, n, "agent/explicite",
+                                                  actor="orch"))
+        self.assertEqual(work.get(self.db, n)["branch"], "agent/explicite")
 
     def test_prefixe_sans_confusion(self):
         lot = self.lot()

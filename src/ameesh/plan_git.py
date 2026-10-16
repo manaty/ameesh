@@ -1881,12 +1881,11 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 # #346 r2 : une pointe inchangée relevée avant la fusion
                 # partielle l'est de nouveau, puisqu'elle est encore là
                 if implicit:
-                    # L118b : la branche implicite devient celle du lot (journal)
-                    try:
-                        work_mod.set_branch(db, lot, branch, actor=actor or "git:%s" % target,
-                                            source="the merge sweep: lot/%d branch" % lot)
-                    except work_mod.WorkError:
-                        pass
+                    # L118b : la branche implicite devient celle du lot (journal) ;
+                    # #2102 : sauf détachement ou branche posés pendant le relevé
+                    work_mod.attach_implicit_branch(
+                        db, lot, branch, actor=actor or "git:%s" % target,
+                        source="the merge sweep: lot/%d branch" % lot)
                 st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
