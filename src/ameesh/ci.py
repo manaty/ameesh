@@ -369,15 +369,120 @@ def recipient_of(lot: dict | None) -> str | None:
 # relevé
 # --------------------------------------------------------------------------
 
-def gh_api(gh=None):
-    """La fonction `chemin -> JSON` de l'API GitHub, par `gh api`."""
+def gh_api(gh=None, *, cache_dir=None, ttl=None, clock=None):
+    """La fonction `chemin -> JSON` de l'API GitHub : le jeton partagé, avec
+    le cache et le quota partagés (#848) quand ils sont donnés, sinon le repli
+    local `gh api`."""
     from . import plan_github
 
-    def api(path: str):
-        nonlocal gh
-        gh = gh or plan_github.Gh()
-        return plan_github._json(gh, ["api", path])
-    return api
+    client = plan_github.client(
+        gh=gh, cache_dir=cache_dir, clock=clock or time.time,
+        ttl=plan_github.DEFAULT_CI_TTL if ttl is None else ttl)
+    if client is None:
+        raise plan_github.GithubError("no GitHub token (%s) and no local gh"
+                                      % ", ".join(plan_github.TOKEN_VARS))
+    return client.get
+
+
+#: les marqueurs canon d'un message de fusion (`plan_git.WORK_TRAILER_RE`,
+#: `ameesh-work: <id>`). Le commit composé du train #1467 en porte **un par
+#: membre** : le message entier ne désigne donc pas un lot unique.
+def _message_lots(message: str) -> list:
+    from . import plan_git
+    out = []
+    for match in plan_git.WORK_TRAILER_RE.finditer(message or ""):
+        try:
+            out.append(int(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _files_of(entry: dict) -> list:
+    return [str(f.get("filename")) for f in (entry.get("files") or ()) if f.get("filename")]
+
+
+def _author_of(entry: dict) -> str:
+    author = entry.get("author") or {}
+    if author.get("login"):
+        return str(author["login"])
+    return str(((entry.get("commit") or {}).get("author") or {}).get("name") or "")
+
+
+def _summary_of(entry: dict) -> str:
+    message = ((entry.get("commit") or {}).get("message") or "").splitlines()
+    return " ".join(message[0].split())[:160] if message else ""
+
+
+def landed_commits(repo: str, head_sha: str, api=None, *, max_lots: int = 12) -> list:
+    """#1681 : les commits de l'atterrissage qui a produit `head_sha`.
+
+    Rend `[{sha, lot, author, summary, files}]`, la forme attendue par
+    `incident.attribute` : le premier parent de la tête ouvre la comparaison
+    (`repos/<repo>/compare/<parent>...<head>`, le même client `gh api` que le
+    veilleur), et chaque commit porteur du marqueur canon `ameesh-work: <id>`
+    nomme un lot.
+
+    Trois cas, du plus précis au plus prudent :
+
+    * un seul lot — un candidat, avec les fichiers de la comparaison entière ;
+    * un paquet dont chaque lot porte **son** commit de fusion (un marqueur par
+      commit) — un candidat par lot, fichiers de son commit (lus au détail) ;
+    * un paquet composé (**plusieurs marqueurs dans un même message**, le
+      commit final multiparent du train #1467) — les lots sont nommés, mais
+      aucun fichier ne leur est attribué : l'agrégat ne se découpe pas sans la
+      preuve du manifeste (`plan.proof.members[]`), et l'agrégat donnerait à
+      chaque lot les changements des autres. Un candidat sans fichier ne fonde
+      aucune accusation (`incident.attribute`).
+
+    Sans marqueur, un candidat sans lot est rendu : il porte les fichiers, mais
+    ne peut pas fonder une accusation.
+    """
+    if not repo or not head_sha:
+        return []
+    api = api or gh_api()
+    head = api("repos/%s/commits/%s" % (repo, head_sha)) or {}
+    parents = [str(p.get("sha") or "") for p in (head.get("parents") or ()) if p.get("sha")]
+    if not parents:
+        return []
+    compare = api("repos/%s/compare/%s...%s" % (repo, parents[0], head_sha)) or {}
+    commits = list(compare.get("commits") or ())
+    by_lot: dict = {}
+    composed: list = []
+    for entry in commits:
+        lots = _message_lots((entry.get("commit") or {}).get("message") or "")
+        if len(lots) > 1:
+            composed.append((entry, lots))
+        elif lots:
+            by_lot.setdefault(lots[0], []).append(entry)
+    if composed:
+        out = []
+        for entry, lots in composed:
+            for lot in lots[:max_lots]:
+                out.append(dict(sha=str(entry.get("sha") or head_sha), lot=lot,
+                                author=_author_of(entry), summary=_summary_of(entry), files=[]))
+                max_lots -= 1
+                if max_lots <= 0:
+                    return out
+        return out
+    if not by_lot:
+        if not commits:
+            return []
+        last = commits[-1]
+        return [dict(sha=str(last.get("sha") or head_sha), lot=None, author=_author_of(last),
+                     summary=_summary_of(last), files=_files_of(compare))]
+    if len(by_lot) == 1:
+        lot, entries = next(iter(by_lot.items()))
+        last = entries[-1]
+        return [dict(sha=str(last.get("sha") or head_sha), lot=lot, author=_author_of(last),
+                     summary=_summary_of(last), files=_files_of(compare))]
+    out = []
+    for lot, entries in list(by_lot.items())[:max_lots]:
+        last = entries[-1]
+        detail = api("repos/%s/commits/%s" % (repo, last.get("sha"))) or {}
+        out.append(dict(sha=str(last.get("sha") or ""), lot=lot, author=_author_of(last),
+                        summary=_summary_of(last), files=_files_of(detail)))
+    return out
 
 
 def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
@@ -405,9 +510,12 @@ class Watcher:
     """Le relevé de la CI, mené par `ameesh notify` à chaque passage, sur
     l'hôte désigné (`github.host`). Une erreur (GitHub, base) d'un dépôt est
     journalisée une fois par passage et n'arrête ni les autres dépôts, ni
-    les alertes."""
+    les alertes. Les lectures passent par le client à jeton et son cache
+    partagé (#848) : une lecture identique n'est pas repayée à chaque
+    passage, et un quota épuisé arrête le passage sans boucle."""
 
-    def __init__(self, cfg, *, api=None, log=None, clock=None, dry_run: bool = False):
+    def __init__(self, cfg, *, api=None, log=None, clock=None, dry_run: bool = False,
+                 ttl=None):
         self.cfg = cfg
         self.api = api
         self.log = log or (lambda _text: None)
@@ -417,6 +525,17 @@ class Watcher:
         self._workflows_cache: dict[str, tuple] = {}
         #: avertissements déjà journalisés par ce passage de service
         self._warned_workflows: set = set()
+        self.ttl = None if ttl is None else float(ttl)
+
+    def _cache_ttl(self) -> float:
+        """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
+        if self.ttl is not None:
+            return self.ttl
+        from . import plan_github
+        try:
+            return plan_github.settings_of(self.cfg).ci_ttl
+        except plan_github.SettingsError:
+            return plan_github.DEFAULT_CI_TTL
 
     def settings(self):
         """Les réglages `github` validés, ou None (déjà journalisé)."""
@@ -438,6 +557,7 @@ class Watcher:
         """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
         l'API ne répond pas. Le résultat est gardé : une découverte par heure,
         une nouvelle tentative après un échec."""
+        from . import plan_github
         now = float(self.clock())
         cached = self._workflows_cache.get(repo)
         if cached is not None and now - cached[0] < cached[1]:
@@ -453,6 +573,10 @@ class Watcher:
                 if name and name not in files:
                     files.append(name)
             found = tuple(sorted(files))
+        except plan_github.GithubRateLimited:
+            # N5 #848 : le quota épuisé n'est pas une panne de découverte ; il
+            # remonte au passage, qui s'arrête et le journalise comme tel.
+            raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
             ttl = DISCOVERY_RETRY
             self.log("CI %s: workflow discovery failed (%s)"
@@ -484,15 +608,25 @@ class Watcher:
 
     def tick(self, db) -> list[dict]:
         """Un relevé de chaque dépôt ; rend les envois et retraits."""
+        from . import plan_github
+
         repos = self.repos()
         if not repos or self.dry_run:
             return []
         if self.api is None:
-            self.api = gh_api()
+            self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
+                              ttl=self._cache_ttl(), clock=self.clock)
         out: list[dict] = []
         for repo in repos:
             try:
                 out += self.watch(db, repo)
+            except plan_github.GithubRateLimited as exc:
+                # quota épuisé : aucun autre appel ne part avant le reset
+                when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) \
+                    if exc.reset else "unknown"
+                self.log("CI %s: GitHub quota exhausted (reset at %s): pass stopped"
+                         % (repo, when))
+                break
             except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
                 self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
         return out
@@ -609,8 +743,13 @@ class Watcher:
         Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
         journalisée et n'empêche ni les échecs, ni les verdicts.
         """
+        from . import plan_github
         try:
             self._guard_state(db, repo)
+        except plan_github.GithubRateLimited:
+            # N5 #848 : un quota épuisé arrête le passage (tick le rattrape),
+            # il n'est pas journalisé comme un échec de la garde.
+            raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
             self.log("CI %s: guard failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
 
@@ -937,15 +1076,24 @@ def main_red(db) -> list[dict]:
     l'échec d'une autre, #1110), et une exécution encore en cours dont un échec
     est déjà relevé (#846 : un main rouge ne reste pas silencieux derrière ses
     jobs agrégateurs, qui peuvent attendre un runner des heures).
+    Une exécution en cours plus ancienne que la dernière conclue de son
+    workflow est écartée : une exécution supprimée ou introuvable (l'API rend
+    `{}`) n'est jamais conclue, et son job rouge garderait l'alerte, qui bloque
+    les déploiements, sans fin (#1453).
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
-    out = []
+    out, newest = [], {}
     for row in st.ci.latest_concluded(BASE_BRANCHES):
+        key = (row["repo"], row["branch"], row.get("workflow"))
+        newest[key] = max(newest.get(key, 0), int(row["run_id"]))
         if row.get("status") != "failure":
             continue
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
     for row in st.ci.running_on(BASE_BRANCHES):
+        if int(row["run_id"]) < newest.get(
+                (row["repo"], row["branch"], row.get("workflow")), 0):
+            continue
         # hérités exclus : un échec déjà rouge à la dernière exécution conclue
         # de la base est déjà porté par l'alerte de celle-ci, de même clé
         own = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))
@@ -1021,7 +1169,44 @@ def render_status(report: dict) -> list[str]:
     return lines
 
 
+def quota_line(state_dir, *, now=None) -> str | None:
+    """Une ligne lisible sur les lectures GitHub partagées de l'hôte (#848),
+    ou None tant qu'aucune lecture n'a été comptée.
+
+    Elle dit l'économie (requêtes, 304, cache servi) et le quota restant par
+    ressource d'API (`core`, `graphql`…) : de quoi lire la CI sans ajouter
+    d'appel, et voir venir l'épuisement — sans confondre les buckets."""
+    from . import plan_github
+
+    stats = plan_github.quota_stats(state_dir)
+    counters, quotas = stats["counters"], stats["quota"]
+    if not counters and not quotas:
+        return None
+    parts = []
+    requests = int(counters.get("requests") or 0)
+    hits = int(counters.get("hits") or 0)
+    if requests or hits:
+        parts.append("%d request(s) (%d not modified), %d served from the shared cache"
+                     % (requests, int(counters.get("not_modified") or 0), hits))
+    now = time.time() if now is None else float(now)
+    for resource, quota in sorted(quotas.items()):
+        if not isinstance(quota, dict):
+            continue
+        remaining = quota.get("remaining")
+        if remaining is not None:
+            label = "quota" if resource == plan_github.DEFAULT_RESOURCE \
+                else "quota %s" % resource
+            parts.append("%s %s/%s" % (label, remaining, quota.get("limit", "?")))
+        blocked = float(quota.get("blocked_until") or 0.0)
+        if blocked > now:
+            suffix = "" if resource == plan_github.DEFAULT_RESOURCE else " (%s)" % resource
+            parts.append("exhausted until %s%s"
+                         % (time.strftime("%H:%M:%SZ", time.gmtime(blocked)), suffix))
+    return "GitHub reads (shared): " + ", ".join(parts) if parts else None
+
+
 def cmd_ci(cfg, args) -> int:
+    from . import plan_github
     from .db import open_db
     db = open_db(cfg)
     try:
@@ -1029,8 +1214,15 @@ def cmd_ci(cfg, args) -> int:
     except CiError as exc:
         print("ameesh ci: %s" % exc)
         return 1
+    # N2 #848 : la vue JSON dit les lectures GitHub partagées de l'hôte, comme
+    # la vue texte (`quota_line`) ; sans état, la projection est vide.
+    report["github_reads"] = plan_github.quota_stats(getattr(cfg, "state_dir", None))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
-    else:
-        print("\n".join(render_status(report)))
+        return 0
+    lines = render_status(report)
+    line = quota_line(getattr(cfg, "state_dir", None))
+    if line:
+        lines.append(line)
+    print("\n".join(lines))
     return 0

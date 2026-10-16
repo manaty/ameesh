@@ -11,7 +11,10 @@ sur quoi, ce qui attend, ce qui est livré.
 ameesh reconnaît un orchestrateur de trois façons : sa fiche Agent du canon
 porte `roles: [orchestrateur]`, il est déclaré dans
 `AMEESH_ALERT_ORCHESTRATORS`, ou il a confié des lots (`work assign`,
-`work delegate`) dans les 30 derniers jours. La fiche est la voie durable.
+`work delegate`) dans les 30 derniers jours. Cette dernière déduction cesse
+dès qu'une fiche de son organisation (son canon) déclare des rôles (L242c) :
+la fiche est alors la seule voie durable. Seule compte la fiche de son
+propre canon, jamais une fiche homonyme d'un autre.
 
 ## Tout travail confié passe par un lot
 
@@ -408,6 +411,27 @@ l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
 
+## Intégration par paquets §12 : contrôle d'inclusion avant le feu
+
+Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
+lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
+et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
+à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+
+```sh
+scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
+    --head origin/integration/paquet-23h-20261015 \
+    --expected-file "$TMPDIR/admissions-23h.txt"
+```
+
+Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
+composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
+ne suffit pas après un revert (#1638). Sans liste attendue, il sort `2`, sauf
+`--no-expected` qui assume le contrôle partiel. Un contenu *partiel* ou *vide*
+est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
+bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
+`docs/PAQUET-INCLUSION.md`.
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot
@@ -604,8 +628,9 @@ restée 4 h fusionnée sans être déployée :
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI, sober proofs (canon « Processus de lot » §§3, 6,
-   12) — and changes only through a reviewed commit.
+   packages, review before CI and no CI per lot between cuts, sober proofs
+   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
+   reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
    un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
    d'exécuteur du poste le lance dans une unité systemd distincte :
@@ -641,19 +666,59 @@ restée 4 h fusionnée sans être déployée :
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
    déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
-   `--release` libère. La réservation se lit dans `ameesh work show <lot>`
+   `--release` libère. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
+   branche au scan ignoré, en plus de celle du lot : à la composition d'un
+   paquet, la branche d'intégration porte déjà les fichiers renumérotés et
+   ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
+   numéro retenu par un autre lot reste refusé), et une branche de tronc
+   (`main`, `master`, `develop`, la branche par défaut d'`origin`) ne s'ignore
+   jamais. Un lot dont l'`issue_ref`
+   désigne un autre dépôt se corrige avant de réserver :
+   `ameesh work issue-ref <lot> owner/repo#N` (ou `--none` pour effacer),
+   réservé aux correcteurs comme `work set-app` et journalisé ; refusé tant
+   qu'une réservation est tenue dans l'ancien dépôt (`--release` d'abord). La réservation
+   se lit dans `ameesh work show <lot>`
    (ligne `migration`) et au journal du lot ; la description de la PR
    l'annonce.
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire
    (`tests/test_l122_numeros_de_migration.py`, sans base).
-6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
+6. **Geler le périmètre d'une release à son ouverture** (L750/L756, #561/#566).
+   Quand le lot de release est ouvert, son périmètre se fige à un commit
+   **nommé** de sa cible : `ameesh release open <lot> --base <commit>`. Les
+   fusions de `main` postérieures au gel vont à la release suivante ; seuls les
+   correctifs d'un bloquant de cette release sont cherry-pickés sur
+   `release/x.y`, chacun avec sa propre exécution impactée. La suite **complète**
+   tourne une fois sur la tête gelée — une PR de version seule ne lance rien, et
+   une PR peut n'avoir suivi que le plan impacté. Avant de fusionner la PR de
+   version, `ameesh release check <lot>` refuse une branche dont la base a
+   bougé après le gel (le merge-base avec la cible n'est plus le périmètre) et
+   l'absence d'une exécution de suite complète (poussée ou lancement manuel)
+   verte sur la **tête fraîche** exacte : un commit postérieur au gel (correctif
+   cherry-pické) est certifié lui-même, jamais par la CI de l'ancien gel. La
+   suite complète se **déclare** par ses fichiers de workflow dans
+   `radar.projects.<p>.full_suite` (une identité — le fichier —, jamais un nom
+   d'affichage libre) ; chacun doit avoir tourné sur le commit exact, vert
+   **jobs compris**. Une entrée peut nommer ses jobs requis
+   (`{"path": …, "jobs": ["plan", "psycopg *"], "tolerate": ["bilan des
+   impactés"]}`) : « nom * » couvre une famille de matrice (sinon égalité
+   stricte), un job requis doit exister et être vert, les autres doivent être
+   verts ou sautés (un job sauté par conception, `if:` sur l'événement ou les
+   chemins, ne bloque pas) et un job `tolerate` (`continue-on-error`) ne
+   certifie ni ne bloque. Une entrée réduite au chemin exige **tous** les jobs ;
+   un job illisible ne certifie rien, et le dispatch d'un workflow non déclaré
+   (docs seul) ne compte pas. Un écart
+   délibéré se justifie par `ameesh release reason <lot> --text "…"` ; le
+   périmètre et la raison vivent au journal du lot. La file de fusion applique
+   la même porte au lot de classe release qu'elle traverse
+   (`merge_queue.readiness`).
+7. **Essai à blanc avant toute étiquette de release.** Avant de poser une
    étiquette qui publie (application, installeur, image), le workflow de
    release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
    cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
    étiquette publiée : on pose la suivante.
-7. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
+8. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
    `deploy/mise-a-jour/poste.sh publier <sha>` pose l'étiquette annotée
    `v<version>` sur ce commit de `main` (le numéro est celui de son
    `pyproject.toml`), la pousse et crée la release GitHub. Les notes viennent

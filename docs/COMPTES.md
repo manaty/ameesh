@@ -23,13 +23,22 @@ compte est choisi ainsi :
    premier**. Un **relevé partiel** (#1561 : une fenêtre datée remise à zéro
    alors qu'une autre court encore, ou un relevé non daté plus vieux que sa
    plus courte fenêtre) n'est plus un instantané courant : le compte est **non
-   vérifié** et passe après tout compte à relevé courant, quel que soit son
-   rythme lu — il reste utilisable en dernier recours (L71, « essayé, pas
-   écarté »). À égalité, celui dont la capacité inutilisée expire le plus tôt,
-   puis l'ordre déclaré (amendement du 2026-10-10 à 0034, lot L117 : un compte
-   jamais utilisé ne doit pas rester inutilisé ; avant, le primaire, toujours
-   en fenêtre ouverte, gagnait toujours).
-4. Tous les comptes au seuil : pause.
+   vérifié**, sa raison le dit, et il passe après tout compte à relevé courant,
+   quel que soit son rythme lu — il reste **essayé** faute de mieux (L71,
+   « essayé, pas écarté »). #1672 **borne cet essai** : quand une fenêtre datée
+   s'est remise à zéro, un relevé plus vieux que ce qui reste de **chaque**
+   fenêtre encore ouverte est une information trop ancienne pour engager un
+   tour — prudence, pas preuve d'un quota atteint —, le compte est écarté du
+   placement et, sans compte plaçable, le choix pause ; la remise à zéro qui
+   motive la pause le rouvre (L71, 0 %). La continuité (règle 2) garde son
+   chemin : une session déjà sur le compte y reste, et c'est son tour qui
+   rapporte la jauge ; un forçage manuel (règle 1) reste souverain. À égalité,
+   celui dont la capacité inutilisée expire le plus tôt, puis l'ordre déclaré
+   (amendement du 2026-10-10 à 0034, lot L117 : un compte jamais utilisé ne
+   doit pas rester inutilisé ; avant, le primaire, toujours en fenêtre ouverte,
+   gagnait toujours).
+4. Tous les comptes au seuil, ou écartés faute d'un relevé assez récent pour
+   placer : pause — la raison dit lequel des deux cas s'applique.
 
 Un relevé dont la fenêtre est échue (`resets_at` passé) compte pour **0 %**
 (même règle que L71) : un compte resté à 93 % sur une fenêtre close n'est plus
@@ -37,12 +46,18 @@ Un relevé dont la fenêtre est échue (`resets_at` passé) compte pour **0 %**
 **partiel** — une fenêtre datée remise à zéro depuis, une autre encore ouverte —
 n'est pas dans ce cas : la fenêtre ouverte n'est qu'une **borne inférieure**
 (le compte a pu servir depuis, ici ou ailleurs), donc le relevé n'est plus
-courant et le compte devient **non vérifié** (#1561) : il ne passe plus avant
-un compte à relevé courant, sa raison le dit au lieu d'annoncer la valeur
-périmée comme courante, et il n'annonce ni perte ni échéance. Le cas réel du
-15/10/2026 : une jauge 7 j lue à 30 % alors qu'elle valait 93 %, la fenêtre de
-5 h s'étant remise à zéro entre-temps. Les jauges sont relues à chaque choix.
-Jamais au milieu d'un tour. Étude :
+courant et le compte devient **non vérifié** (#1561) : sa raison le dit au lieu
+d'annoncer la valeur périmée comme courante, il n'annonce ni perte ni échéance,
+et il passe après tout relevé courant, **essayé** faute de mieux (L71). #1672
+borne cet essai : un relevé plus vieux que ce qui reste de chaque fenêtre
+encore ouverte est trop ancien pour engager un tour, le compte est écarté du
+placement et le choix pause jusqu'à la remise à zéro qui la motive. Le cas
+réel du 15/10/2026 : une jauge 7 j lue à 30 % (relevé vieux de quatre jours)
+alors qu'elle valait 100 %, la fenêtre de 5 h s'étant remise à zéro entre-temps
+— le choix automatique y a envoyé un tour, refusé par la limite hebdomadaire ;
+désormais il pause, la remise à zéro rouvrant le compte, et la continuité comme
+le forçage restent les chemins ouverts vers un relevé périmé. Les jauges sont
+relues à chaque choix. Jamais au milieu d'un tour. Étude :
 [docs/design/etudes/comptes-multiples.md](design/etudes/comptes-multiples.md).
 
 Le respect des conditions d'utilisation de chaque fournisseur pour l'usage de
@@ -113,14 +128,17 @@ dans le canon :
 ```
 
 * L'ordre départage les égalités de retard et d'échéance (par exemple deux
-  comptes jamais utilisés, ou les clés d'API sans jauge) : le premier est le
-  primaire.
-* `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
-  dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
-  hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex
-  sont lues au même endroit, par le mécanisme commun : argument >
-  `AMEESH_CODEX_SESSIONS` > `$CODEX_HOME/sessions` > `~/.codex/sessions` ; un
-  compte déclaré lit `<son CODEX_HOME>/sessions`.
+  comptes jamais utilisés, ou les clés d'API sans jauge), et le premier sert
+  de compte actif par défaut (`account_active`) tant qu'aucun choix n'est
+  écrit.
+* `config_dir` sans `path` : le **dossier par défaut du harnais** (`~/.claude`,
+  `~/.codex`, `~/.dsh`), jamais celui que l'environnement de l'exécuteur
+  désigne (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` hérités) : un compte déclaré
+  n'hérite pas du compte ambiant (L1078). Ses jauges Codex sont lues dans
+  `<dossier>/sessions` ; le primaire des relevés Claude — le seul compte à qui
+  appartiennent les flux sans marqueur, sessions d'avant L30 — est le profil
+  dont le dossier est le dossier par défaut du harnais, jamais le premier de
+  la liste : une liste réduite au seul secondaire ne lui prend pas ses relevés.
 * Contrôles : dossier à l'utilisateur, **0700**, identifiants présents
   (`.credentials.json` pour Claude, `auth.json` pour Codex : présence
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte
@@ -583,24 +601,70 @@ re-run the command on the target and verify it with a private
 Owner requirement (2026-10-12, 09:55 and 10:00). On 2026-10-12 at 09:50 the
 orchestrator and mesh-design were paused on budget.
 
-**Who is critical.** An agent is critical when any of these holds:
+**Who is critical** (L242c). An agent is critical by a role on its canon
+Agent card (`roles:`, manaty/home#25), not by its name. The critical roles
+are set per organisation, by `critical_roles` in its `federation.yaml`:
 
-* it is declared in the host's `critical_agents` setting (list), or in
-  `AMEESH_CRITICAL_AGENTS` (comma-separated);
-* it is declared as an orchestrator (`AMEESH_ALERT_ORCHESTRATORS`), or its
-  canon Agent card has the role `orchestrateur`;
-* its canon Agent card has the role `conception` or `design`;
-* it is an auditor (the `auditeur` agent, or the `auditeur` role).
-
-A role counts only on the card in the agent's own canon. A conflicting card
-with the same name in another canon never makes an agent critical.
-
-The canon does not give these roles today, so declare the orchestrators and
-the design agent on each host:
-
-```json
-"critical_agents": ["orchestrateur", "mesh-design"]
+```yaml
+critical_roles: [orchestrateur, conception, auditeur, relecture]
 ```
+
+That list is the default when the key is absent; an empty list makes no
+role critical. A role and its usual synonym match each other both ways:
+`orchestrateur` and `orchestrator`, `conception` and `design`, `auditeur` and
+`auditor`, `relecture` and `review` or `reviewer`. The `auditeur` agent
+without a card is critical while `auditeur` is a critical role.
+
+A role counts only on the card in the agent's own canon, against that
+canon's `critical_roles`, and only as the canon validated it: a `roles:`
+value that `ameesh canon check` rejects (`agent-roles-invalid`) gives no
+role. A conflicting card with the same name in another canon never makes an
+agent critical.
+
+**Unreadable canon.** When the agent's own canon cannot be loaded or read,
+or was read only in part (a card or the manifest could not be read:
+`canon-git-error`, `frontmatter-invalid` or `federation-invalid` errors), its
+criticality is never lowered silently: the last verdict read is kept, and
+without one (never read, or absent from the cache) the agent counts as
+critical. An agent whose owner canon is configured on no canon of the host
+(every configured canon loaded) is a known, permanent state, not an outage:
+it is not critical, and the runner (or `ameesh resume`) warns once per
+process, naming it. The last verdicts are kept in the host's
+state (`critical-known/known.json`), so a restarted runner and `ameesh resume`
+read them too; `ameesh resume` refreshes them when the canon is readable,
+and the runner compares each verdict it reads with the disk (never with its
+own memory). The cache fails closed: missing (deleted or hidden), unreadable,
+corrupt, an invalid value, or a file that cannot be trusted (a symbolic
+link, not a regular file, not owned by the runner's user, readable by
+others) means "last verdict unknown", which counts as critical. Its
+directory `critical-known/` is opened without following links, relative to
+the state directory, and must be owned by the runner's user with mode 0700;
+the data is opened relative to it, so a replaced or linked parent redirects
+nothing. It is written under a lock on that directory itself (`flock` on the
+descriptor already opened: no lock path to replace; only the data file is
+renamed), read-modify-write, through
+an exclusive temporary file, fsync, rename, fsync of the directory, mode
+0600; a corrupt file is never rewritten (delete it to start again: while it
+is missing, every agent counts as critical) and invalid values are kept as
+they are. The runner trusts a verdict only once written, and tries again
+at the next poll otherwise. Two residual risks are accepted: the state
+directory itself is opened following links and without an owner check, and
+the cache directory could be replaced between its opening and the lock (the
+write then lands in the detached directory). Both need a malicious action
+under the runner's own user in its state directory, which is outside the
+threat model. `ameesh alerts` raises `critical_roles_unreadable` for each
+configured canon that cannot be read in full on the host; it stays one
+alert while the outage lasts.
+
+Two declarations still make an agent critical whatever its roles:
+
+* the host's `critical_agents` setting (list), or `AMEESH_CRITICAL_AGENTS`
+  (comma-separated): the explicit override, for an agent whose card does
+  not (yet) say it;
+* `AMEESH_ALERT_ORCHESTRATORS`.
+
+`ameesh resume`, when it plans the account of the next session, judges an
+agent the same way.
 
 **Per-agent choice.** For a critical agent, the account choice of § 2–4 is
 made for that agent alone:

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
-  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
+  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF [--assign]] [--new-lot "title"
                  [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
@@ -11,7 +11,9 @@
                                                  unassigned work item (or one held by a human)
                                                  to the recipient — an item already held by an
                                                  agent is never reassigned by mail, whoever
-                                                 holds it (#1066) — and --new-lot creates it (L118),
+                                                 holds it (#1066); --assign is the explicit
+                                                 gesture that lets any sender hand over an
+                                                 unassigned item (#964) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
                                                  #540: a recipient who already has a work item
@@ -54,7 +56,7 @@
   agent-mail hook <claude|codex|deepseek>        hook: reads the JSON on stdin, delivers the unread
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
   agent-mail migrate [--dry-run | --additive-only]  applies the versioned migrations
-  agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY; host harnesses (L106)
+  agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
                                                  (--probe: lightweight container probe)
 
 Identity of a session: $AGENT_MAIL_NAME (the runner sets it for the harness
@@ -243,9 +245,19 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
+    # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
+    # FREE lot (or one held by a human) to the recipient, even outside the
+    # orchestrator detection (L94 history included); never a lot held by an
+    # agent (#1066).
+    assign = "--assign" in args
+    args = [arg for arg in args if arg != "--assign"]
     # #506: --app may name a project nobody declares yet, on purpose
     new_project = "--new-project" in args
     args = [arg for arg in args if arg != "--new-project"]
+    # L514: a review verdict or an arbitration reaches a dsh or codex turn
+    # at its next safe point instead of waiting for the end of the turn
+    marks = [key for key in mail.MID_TURN_KEYS if "--" + key in args]
+    args = [arg for arg in args if arg not in ["--" + key for key in mail.MID_TURN_KEYS]]
     explicit_sender = "--from" in args
     estimate = None
     force = None
@@ -292,8 +304,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--ack and --urgent contradict each other: an acknowledgement does not wake",
               file=sys.stderr)
         return 2
+    if ack and marks:
+        print("--ack and --%s contradict each other: an acknowledgement does not "
+              "interrupt a turn" % marks[0], file=sys.stderr)
+        return 2
     if ack and new_lot is not None:
         print("--ack and --new-lot contradict each other: an acknowledgement does not hand over work",
+              file=sys.stderr)
+        return 2
+    if ack and assign:
+        print("--ack and --assign contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
         return 2
     sign = key_path is not None or "--sign" in args
@@ -303,11 +323,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--expires only makes sense with --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
+        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF [--assign]] "
               "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
               "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
-              "[--urgent] "
+              "[--urgent] [--verdict|--arbitration] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
               file=sys.stderr)
         return 2
@@ -316,6 +336,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if new_lot is not None and lot is not None:
         print("--lot OR --new-lot, not both", file=sys.stderr)
+        return 2
+    if assign and lot is None:
+        print("--assign requires --lot <id|ref>: say which lot to assign to the recipient",
+              file=sys.stderr)
+        return 2
+    if assign and new_lot is not None:
+        print("--assign goes with --lot (--new-lot already assigns the created lot to the "
+              "recipient)", file=sys.stderr)
         return 2
     if new_lot is not None and not new_lot.strip():
         print("--new-lot: empty title", file=sys.stderr)
@@ -442,7 +470,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # son prochain tour sans le réveiller.
     human = _sender_is_human(bk, cfg, sender, explicit_sender)
     payload: dict = {"human": True} if human else {}
-    if ack or (not urgent and not sign and not human and dest != "all"
+    payload.update((key, True) for key in marks)
+    if ack or (not urgent and not sign and not human and not marks and dest != "all"
                and lot is None and new_lot is None and kind in ("notify", "reply")
                and mail.looks_like_ack(text)):
         payload["ack"] = True
@@ -457,6 +486,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if new_lot is not None and (bk.kind != "pg" or dest == "all"):
         print("--new-lot requires the database and a single recipient", file=sys.stderr)
         return 2
+    if assign and getattr(bk, "mediated", False):
+        print("--assign is unavailable in mediated contract 1.1; assign the work item "
+              "on the server before sending mail", file=sys.stderr)
+        return 2
+    if assign and (bk.kind != "pg" or dest == "all"):
+        print("--assign requires the database and a single recipient", file=sys.stderr)
+        return 2
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
     if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
@@ -468,7 +504,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project, force=force,
+                estimate=estimate, app=app, new_project=new_project, assign=assign,
+                force=force,
                 parent_lot=parent_lot)
         except (assignments.AssignmentError, work.WorkError) as exc:
             print("message not delivered — %s" % exc, file=sys.stderr)
@@ -503,11 +540,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       kind=kind, urgent=urgent, thread_meta=thread_meta,
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
-    # #1604 : un envoi local touche la boîte des destinataires de CET hôte ;
-    # leur marqueur local repasse à « à vérifier » sans attendre la base. Un
-    # destinataire d'un autre hôte n'a pas de marqueur ici : rien à faire.
-    for nom in set(targets) | set(cc):
-        fastmail.bump(cfg, nom)
+    # #1689 (N1) : le marqueur local des destinataires est posé par le dépôt
+    # lui-même (`mail.send`, `FileBackend.send`), pour tout émetteur local et
+    # pas seulement cette commande.
     if skipped:
         print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
@@ -719,6 +754,43 @@ class _Remise:
         self.msgs = [mail.normalize(row) for row in rows]
         # une réservation pleine peut cacher des non-lus : on le dit (au pire
         # pour rien, le prochain hook reviendra par le chemin complet).
+        self.reste = 1 if len(rows) >= taille else 0
+        return self.msgs
+
+    def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
+        """L514/#885 : réserve les SEULS messages qui ne peuvent pas attendre.
+
+        Lecture préalable sans verrou (`mail.unread_mid_turn` : le filtre est
+        dans la requête, pas dans les `UNREAD_LIMIT` premiers non-lus), puis une
+        seule réservation des ids éligibles. Rien d'éligible : aucun geste
+        d'écriture — ni verrou de registre, ni libération des autres non-lus
+        (le churn d'un `PostToolUse`), et un verdict derrière plus de 200
+        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+        if not self.pg:
+            tous = self.bk.unread(self.name)
+            gardes = [m for m in tous if mail.mid_turn(m)]
+            self.msgs = gardes if limite is None else gardes[:max(0, limite)]
+            self.reste = len(gardes) - len(self.msgs)
+            return self.msgs
+        if limite is not None and limite <= 0:
+            # borne du tour épuisée : rien à montrer, et rien à écrire (même
+            # une urgence attend le tour suivant, comme `garder(..., 0)`).
+            self.msgs = []
+            self.reste = 0
+            return []
+        taille = mail.UNREAD_LIMIT if limite is None else limite
+        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille)
+        ids = [int(m["id"]) for m in voulus if m.get("id") is not None]
+        if not ids:
+            self.msgs = []
+            self.reste = 0
+            return []
+        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                            ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                            limit=taille)
+        self.ouverte = bool(rows)
+        self.msgs = [mail.normalize(row) for row in rows]
+        # comme `prendre` : une lecture pleine peut cacher d'autres éligibles
         self.reste = 1 if len(rows) >= taille else 0
         return self.msgs
 
@@ -938,6 +1010,18 @@ def hook_subagent(data: dict) -> str:
     return str(agent_id).strip()
 
 
+#: L514: harnesses whose turn gets, between two tool calls, only the mail
+#: `mail.mid_turn` accepts; Claude keeps getting all of it
+MID_TURN_HARNESSES = ("deepseek", "codex")
+
+
+def mid_turn_filtered(tool: str, binding) -> bool:
+    """L514: a PostToolUse of this harness, in a turn the runner drives,
+    delivers only verdicts, arbitrations, human and urgent mail; the rest
+    keeps the L125 batching until the end of the turn."""
+    return tool in MID_TURN_HARNESSES and bool(binding.bound_to_lease)
+
+
 def cmd_hook(cfg: Config, tool: str) -> int:
     """Hook de harnais : lit le JSON sur stdin, ne fait JAMAIS échouer l'agent."""
     try:
@@ -1001,6 +1085,22 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
     # `agent_id` : inscrite ici, elle devenait la session reprise au tour
     # suivant, que dsh refuse (« is a subagent or forked session »).
+    if binding.source == "explicit" and bk.kind == "pg":
+        # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a hérité)
+        # ne prend jamais le courrier d'un agent mené par l'exécuteur (bail
+        # vivant). La réservation le refuse aussi, sous verrou ; ce contrôle-ci
+        # le dit. #1689 (N2) : le refus précède l'inscription — sinon le
+        # tampon d'inscription de ce shell (clé sans bail) faisait dire au
+        # chemin rapide « inscription à jour », et le marqueur local taisait ce
+        # diagnostic à chaque PostToolUse.
+        try:
+            holder = sb.lease_holder(bk.db, name)
+        except Exception:
+            return 0
+        if holder:
+            print("agent-mail: %s is driven by the runner (live lease of %s) — "
+                  "mail left in place" % (name, holder), file=sys.stderr)
+            return 0
     session_id = None if binding.bound_to_lease else data.get("session_id")
     try:
         inscription = [tool, data.get("cwd"), session_id,
@@ -1016,16 +1116,6 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 if session_id:
                     registry.record_session_history(bk.db, name, str(session_id))
                 _register_done(cfg, name, inscription)
-        if binding.source == "explicit" and bk.kind == "pg":
-            # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
-            # hérité) ne prend jamais le courrier d'un agent mené par
-            # l'exécuteur (bail vivant). La réservation le refuse aussi, sous
-            # verrou ; ce contrôle-ci le dit.
-            holder = sb.lease_holder(bk.db, name)
-            if holder:
-                print("agent-mail: %s is driven by the runner (live lease of %s) — "
-                      "mail left in place" % (name, holder), file=sys.stderr)
-                return 0
         set_title(cfg, bk, name)
         if event not in ("Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"):
             return 0
@@ -1066,7 +1156,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             return 0
         remise = _Remise(bk, name, binding)
         try:
-            msgs = remise.prendre(borne - etat["remis"] if etat is not None else None)
+            limite = borne - etat["remis"] if etat is not None else None
+            if event == "PostToolUse" and mid_turn_filtered(tool, binding):
+                # L514/#885: in a dsh or codex turn, only what must not wait
+                msgs = remise.prendre_mi_tour(limite)
+            else:
+                msgs = remise.prendre(limite)
             avis = ""
             if etat is not None and msgs and etat["remis"] + len(msgs) >= borne:
                 attente = _attente(bk, name, msgs)
@@ -1680,6 +1775,13 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             else:
                 print("notify     : KO (%r)" % (got,))
                 verdict = 1
+        # L66 : le canal `desktop` tel que CET OS l'affiche (notify-send,
+        # osascript, toast WSL2) ; un envoi reel s'il est route.
+        from . import notify as notify_mod
+        ok, line = notify_mod.desktop_probe(cfg)
+        print("desktop    : %s" % line)
+        if not ok:
+            verdict = 1
     db.close()
     print("verdict    : %s" % ("OK" if verdict == 0 else "KO"))
     return verdict

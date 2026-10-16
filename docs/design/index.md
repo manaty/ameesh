@@ -10,3 +10,4 @@
 * [Studies](etudes/) - Messaging, work catalog, human authority, business domains, harness standards.
 * [ameesh-approve: three hosting options](ameesh-approve-hebergement-equipes.md) - One WebAuthn identity per team, three hosting modes, switchover without re-enrollment.
 * [Durable host handoffs](../HOST-HANDOFFS.md) - Planner, lot-boundary fence, journal, simulated adapter contract and recovery (L232a).
+* [Explorations](explorations/index.md) - Ideas off the roadmap: problems, intuitions and open questions, with no delivery commitment.

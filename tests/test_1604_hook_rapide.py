@@ -11,14 +11,15 @@ Ce que ces tests protègent :
   base, et un courrier en attente est remis même avec un marqueur frais ;
 * le marqueur lui-même : posé après un passage complet, invalidé par un envoi
   local, et un cache de barre d'état de quelques secondes ;
-* le coût : le chemin rapide n'importe pas le paquet complet et son temps CPU
-  reste très en dessous d'un import de `ameesh.cli`.
+* le coût d'import : le vrai sous-processus rapide ne charge ni `ameesh.cli`,
+  ni le backend, ni psycopg. Le CPU se mesure après installation (protocole
+  du lot #1604), sans seuil dépendant de la machine dans la CI (#1785).
 """
 from __future__ import annotations
 
+import io
 import json
 import os
-import resource
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import fastmail, registry
+from ameesh import fastmail, mail, registry, session_bindings
+from ameesh.backend import FileBackend
 
 from .support import PgTestCase
 
@@ -62,6 +64,21 @@ class LeasedFastHookTest(unittest.TestCase):
                 # A different lease must still go through the full hook.
                 os.environ["AMEESH_LEASE_EPOCH"] = "8"
                 self.assertFalse(fastmail.hook_rapide(cfg, "claude", raw))
+
+
+class EntreeRendStdinTest(unittest.TestCase):
+    """#1689 (N3) : le JSON lu par le chemin rapide est rendu au chemin
+    complet, à l'octet près, même illisible ou pas un objet."""
+
+    def test_stdin_rendu_tel_quel(self):
+        from ameesh import entry
+
+        cfg = fastmail.Config(state_dir=tempfile.mkdtemp())
+        for raw in ("{pas du json", "[1, 2]", ""):
+            with self.subTest(raw=raw):
+                with mock.patch.object(sys, "stdin", io.StringIO(raw)):
+                    self.assertIsNone(entry._rapide_statusline(cfg, fastmail, []))
+                    self.assertEqual(sys.stdin.read(), raw)
 
 
 class HookRapideTest(PgTestCase):
@@ -103,8 +120,15 @@ class HookRapideTest(PgTestCase):
     # -- décision rapide ---------------------------------------------------
     def test_posttooluse_sans_base_quand_rien_a_faire(self):
         env = self._marqueur_frais()
+        garde = (
+            "import sys\n"
+            "def refuser(event, args):\n"
+            "    if event in ('socket.connect', 'subprocess.Popen'):\n"
+            "        raise AssertionError('chemin rapide : ' + event)\n"
+            "sys.addaudithook(refuser)\n"
+        )
         proc = subprocess.run(
-            [sys.executable, "-c", SONDE], input=self._posttooluse(),
+            [sys.executable, "-c", garde + SONDE], input=self._posttooluse(),
             capture_output=True, text=True, timeout=60, env=env, cwd=self.tmp)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.splitlines(),
@@ -189,6 +213,58 @@ class HookRapideTest(PgTestCase):
         marque = fastmail.read_marker(self.cfg, "alpha")
         self.assertTrue(marque["pending"])
 
+    # -- #1689 : les quatre N de la relecture Claude -----------------------
+    def test_envoi_par_la_base_invalide_le_marqueur(self):
+        """N1 : tout dépôt local réveille le chemin rapide, pas seulement
+        `agent-mail send` (approbations, exécuteur, veille passent par là)."""
+        fastmail.note(self.cfg, "alpha", pending=False, unread=0)
+        mail.send(self.db, "beta", "alpha", "un message déposé par la base")
+        self.assertTrue(fastmail.read_marker(self.cfg, "alpha")["pending"])
+
+    def test_envoi_repli_fichier_invalide_le_marqueur(self):
+        """N1 (repli fichier) : un envoi direct et sa copie réveillent le
+        chemin rapide sans passer par la CLI."""
+        fastmail.note(self.cfg, "alpha", pending=False, unread=0)
+        fastmail.note(self.cfg, "gamma", pending=False, unread=0)
+        FileBackend(self.cfg).send("beta", "alpha", "un message", cc=["gamma"])
+        self.assertTrue(fastmail.read_marker(self.cfg, "alpha")["pending"])
+        self.assertTrue(fastmail.read_marker(self.cfg, "gamma")["pending"])
+
+    def test_identite_explicite_sous_bail_garde_le_diagnostic(self):
+        """N2 : le refus L46 précède l'inscription. Sinon le premier hook
+        tamponnait la clé de ce shell et, marqueur frais, le chemin rapide
+        taisait « driven by the runner » sur les PostToolUse suivants."""
+        registry.upsert(self.db, "alpha", harness="claude", host=self.cfg.host)
+        self.db.execute(
+            "UPDATE agent_registry SET lease_owner = 'runner-x', lease_epoch = 1, "
+            "lease_expires_at = now() + interval '1 hour' WHERE name = 'alpha'")
+        fastmail.note(self.cfg, "alpha", pending=False, unread=0)
+        env = self.env(AGENT_MAIL_NAME="alpha", AMEESH_HOOK_FAST_TTL="600")
+        for tour in (1, 2):
+            proc = self.entry("hook", "claude", env=env, stdin=self._posttooluse())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("is driven by the runner", proc.stderr, "tour %d" % tour)
+            self.assertEqual(proc.stdout, "", "tour %d" % tour)
+        # rien n'a été inscrit pour ce shell : le refus se redit à chaque hook
+        self.assertTrue(fastmail.register_due(
+            self.cfg, "alpha", ["claude", self.tmp, "sess-1", None, None]))
+
+    def test_liaison_locale_invalidee_au_bind_et_au_unbind(self):
+        """N4 : le cache local (600 s) ne garde pas l'ancien nom après une
+        liaison qui change."""
+        chemin = fastmail.liaison_path(self.cfg, "claude", "sess-1")
+        fastmail.remember_liaison(self.cfg, "alpha", "claude", "sess-1")
+        self.assertTrue(os.path.exists(chemin))
+        registry.upsert_unleased(self.db, "beta", harness="claude", host=self.cfg.host)
+        session_bindings.bind(self.cfg, self.db, "beta", session_id="sess-1",
+                              harness="claude", by="test")
+        self.assertFalse(os.path.exists(chemin), "le bind doit invalider le cache")
+        fastmail.remember_liaison(self.cfg, "beta", "claude", "sess-1")
+        self.assertTrue(os.path.exists(chemin))
+        session_bindings.unbind(self.cfg, self.db, session_id="sess-1",
+                                harness="claude", by="test")
+        self.assertFalse(os.path.exists(chemin), "le unbind doit invalider le cache")
+
     def test_entree_et_cli_rendent_le_meme_json(self):
         """Le chemin complet garde le JSON à l'octet près (compatibilité)."""
         # instant fixe : les deux rendus portent la même heure (jamais d'horloge
@@ -233,39 +309,3 @@ class HookRapideTest(PgTestCase):
                                         AMEESH_STATUSLINE_TTL="0"))
         self.assertEqual(frais.returncode, 0, frais.stderr)
         self.assertNotIn("✉", frais.stdout)
-
-    # -- coût --------------------------------------------------------------
-    def test_temoin_cout_cpu_du_chemin_rapide(self):
-        """Témoin de coût : le chemin rapide reste loin d'un import complet."""
-        env = self._marqueur_frais()
-        charge = ("import sys; sys.argv = ['agent-mail', 'hook', 'claude'];"
-                  "import ameesh.entry as e; e.main()")
-
-        def cpu_enfants() -> float:
-            usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-            return usage.ru_utime + usage.ru_stime
-
-        avant = cpu_enfants()
-        rapide = subprocess.run([sys.executable, "-c", charge],
-                                input=self._posttooluse(), capture_output=True,
-                                text=True, timeout=60, env=env, cwd=self.tmp)
-        cout_rapide = cpu_enfants() - avant
-        self.assertEqual(rapide.returncode, 0, rapide.stderr)
-
-        avant = cpu_enfants()
-        lourd = subprocess.run([sys.executable, "-c", "import ameesh.cli"],
-                               capture_output=True, text=True, timeout=120, env=env,
-                               cwd=self.tmp)
-        cout_lourd = cpu_enfants() - avant
-        self.assertEqual(lourd.returncode, 0, lourd.stderr)
-
-        self.assertLess(cout_rapide, cout_lourd,
-                        "le chemin rapide coûte %.3fs CPU, l'import complet %.3fs"
-                        % (cout_rapide, cout_lourd))
-        # borne relative, jamais en secondes : le CPU d'un démarrage Python
-        # dépend de la machine (runner lent, cache .pyc froid), pas son rapport
-        # à l'import complet mesuré dans le même processus (mesuré : 0,05 contre
-        # 0,30 s). Une régression qui réimporterait le paquet atteint ce rapport.
-        self.assertLess(cout_rapide, cout_lourd / 2,
-                        "chemin rapide : %.3fs CPU, plus de la moitié d'un import "
-                        "complet (%.3fs)" % (cout_rapide, cout_lourd))

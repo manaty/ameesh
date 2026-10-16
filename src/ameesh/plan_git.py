@@ -17,16 +17,22 @@ jalon `frozen` le plus récent de L10, avec son commit) : un gel antérieur
 déjà fusionné ne prouve rien sur le travail courant. Pour chaque lot ouvert
 qui a un tel gel, la fusion est constatée, dans cet ordre :
 
-1. **ancêtre** : le commit du dernier gel est ancêtre de la branche cible ;
+1. **ancêtre** : le commit du dernier gel est ancêtre de la branche cible —
+   sauf si un revert postérieur en a annulé le contenu (#1825 : un paquet
+   fusionné puis retiré par `git revert` laisse la tête ancêtre de la cible
+   alors que le contenu n'y est plus). Détection au mieux : un revert hors
+   de la fenêtre lue (MAX_REVERT_SCAN) ou sans `patch-id --verbatim` n'est
+   pas vu, et l'ancêtre ferme alors comme avant #1825 ;
 2. **patch-id exact** (rebase, cherry-pick) : chaque commit du gel absent
    de la cible (`cible..gel`, hors fusions) a son `git patch-id --verbatim`
    parmi ceux des commits de la cible depuis leur base commune ; ou
    (**squash**) le diff entier du gel (base..gel) a le patch-id d'un commit
-   de la cible. `--verbatim` ne normalise AUCUN espace (`--stable` ignore les
-   espaces, même dans une chaîne : `"a b"` et `"ab"` y sont égaux) ; seuls
-   les numéros de ligne des en-têtes de bloc sont ignorés. Un git sans
-   `--verbatim` (< 2.40) ne prouve que par l'ancêtre : faux négatif plutôt
-   que faux positif ;
+   de la cible. Dans les deux cas, le commit porteur ne doit pas avoir été
+   annulé depuis par un revert (#1825). `--verbatim` ne normalise AUCUN
+   espace (`--stable` ignore les espaces, même dans une chaîne : `"a b"` et
+   `"ab"` y sont égaux) ; seuls les numéros de ligne des en-têtes de bloc
+   sont ignorés. Un git sans `--verbatim` (< 2.40) ne prouve que par
+   l'ancêtre : faux négatif plutôt que faux positif ;
 3. à défaut, si `--repo` est donné, **la PR liée est fusionnée**
    (`plan_github.sync_github`, lecture seule de GitHub).
 
@@ -64,6 +70,17 @@ class _NoVerbatim(Exception):
 
 #: le patch-id exact : aucun espace normalisé (voir le docstring du module)
 PATCH_ID = ("patch-id", "--verbatim")
+
+#: #1825 : commits lus au plus après un gel, à la recherche d'un revert (borne
+#: de coût) ; plus ancien, un revert n'est pas vu et la preuve d'avant #1825
+#: (ancêtre, patch-id) ferme le lot : un faux positif reste possible
+MAX_REVERT_SCAN = 200
+#: `git revert` écrit « This reverts commit <sha>. » — et, pour une fusion,
+#: « This reverts commit <sha>, reversing changes made to <parent>. » (la
+#: parente citée est la ligne principale, `-m 1` : l'apport du lot est annulé)
+_REVERTED_COMMIT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,64})[,.]")
+#: abréviation minimale reconnue dans un message (« tête gelée <sha> »)
+_SHORT_SHA = 7
 
 
 def _patch_id_run(repo: str, data: bytes):
@@ -114,11 +131,17 @@ def _diff_patch_id(repo: str, base: str, head: str) -> str | None:
     return next(iter(ids), None)
 
 
-def probe(repo: str, sha: str, target: str) -> dict:
+def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
     """Le commit `sha` est-il entré dans `target` ? Rend `{merged, how, ref, detail}`.
 
-    `how` : ancestor | patch-id | squash ; `ref` : le commit de la cible qui
-    porte le contenu (le gel lui-même s'il est ancêtre)."""
+    `how` : ancestor | patch-id | squash | reverted ; `ref` : le commit de la
+    cible qui porte le contenu (le gel lui-même s'il est ancêtre). `lot` :
+    l'id du lot examiné, pour rattacher un revert à son porteur (#1825).
+
+    #1825 : une preuve par le contenu est annulée par un revert postérieur
+    (`reverted_content`) — une tête ancêtre de la cible dont la fusion a été
+    annulée n'est pas livrée ; de même un patch-id encore présent dans
+    l'historique quand le commit qui le porte a été annulé depuis."""
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
@@ -129,6 +152,11 @@ def probe(repo: str, sha: str, target: str) -> dict:
         return {"merged": False, "how": None, "ref": None,
                 "detail": "commit %s not in the repository" % sha[:12]}
     if _git(repo, "merge-base", "--is-ancestor", frozen, head).returncode == 0:
+        stopped = reverted_content(repo, frozen, target, lot=lot)
+        if stopped:
+            return {"merged": False, "how": "reverted", "ref": None,
+                    "detail": "%s is an ancestor of %s, but %s reverts its content"
+                              % (frozen[:12], target, stopped["ref"][:12])}
         return {"merged": True, "how": "ancestor", "ref": frozen,
                 "detail": "%s is an ancestor of %s" % (frozen[:12], target)}
     base = _out(repo, "merge-base", frozen, head)
@@ -146,6 +174,14 @@ def _by_patch_id(repo: str, frozen: str, head: str, base: str, target: str) -> d
     on_target = _patch_ids(repo, "--max-count=%d" % MAX_TARGET_COMMITS, "%s..%s" % (base, head))
     mine = _patch_ids(repo, "%s..%s" % (head, frozen))
     if mine and all(pid in on_target for pid in mine):
+        carriers = {on_target[pid] for pid in mine}
+        stopped = _effective_revert(repo, base, target,
+                                    lambda sha, _message: sha in carriers)
+        if stopped:
+            return {"merged": False, "how": "reverted", "ref": None,
+                    "detail": "%d frozen commit(s) found by patch-id in %s, but %s "
+                              "reverts their content"
+                              % (len(mine), target, stopped["ref"][:12])}
         # `git log` rend les commits du plus récent au plus ancien : le premier
         # patch-id est celui du dernier commit du gel
         last = on_target[next(iter(mine))]
@@ -154,11 +190,121 @@ def _by_patch_id(repo: str, frozen: str, head: str, base: str, target: str) -> d
                           % (len(mine), target)}
     squash = _diff_patch_id(repo, base, frozen)
     if squash and squash in on_target:
-        return {"merged": True, "how": "squash", "ref": on_target[squash],
+        carrier = on_target[squash]
+        stopped = _effective_revert(repo, base, target,
+                                    lambda sha, _message: sha == carrier)
+        if stopped:
+            return {"merged": False, "how": "reverted", "ref": None,
+                    "detail": "frozen diff found in %s (squash), but %s reverts it"
+                              % (target, stopped["ref"][:12])}
+        return {"merged": True, "how": "squash", "ref": carrier,
                 "detail": "frozen diff found as one commit of %s (squash)" % target}
     missing = sum(1 for pid in mine if pid not in on_target)
     return {"merged": False, "how": None, "ref": None,
             "detail": "%d/%d frozen commit(s) missing from %s" % (missing, len(mine), target)}
+
+
+def branch_lot(branch: str | None) -> int | None:
+    """L'id du lot d'une branche `lot/<id>` ou `lot/<id>-…`, sinon None."""
+    match = re.match(r"^lot/(?P<lot>\d+)(?:-|$)", short_branch(branch))
+    return int(match.group("lot")) if match else None
+
+
+def _commit_message(repo: str, sha: str) -> str:
+    return _out(repo, "log", "-1", "--format=%B", sha) or ""
+
+
+def _commit_parents(repo: str, sha: str) -> list[str]:
+    return (_out(repo, "rev-list", "--parents", "-n", "1", sha) or "").split()[1:]
+
+
+def _carries_frozen(repo: str, commit: str, frozen: str, *, lot: int | None = None,
+                    branch: str | None = None, hash_refs: bool | None = None,
+                    message: str | None = None) -> bool:
+    """#1825 : le commit `commit` a-t-il porté le gel `frozen` dans la cible ?
+
+    Oui s'il EST le gel (poussée directe), s'il le cite par son abréviation
+    (« tête gelée <sha> » des commits de composition), s'il désigne le lot
+    (`cited_lots`, `merge_branch`) ou si c'est la fusion dont la première
+    parente ne portait pas encore le gel (la fusion porteuse d'une PR)."""
+    if commit == frozen:
+        return True
+    if message is None:
+        message = _commit_message(repo, commit)
+    if frozen[:_SHORT_SHA] in message:
+        return True
+    if hash_refs is None:
+        hash_refs = lot_ref_hash(repo)
+    if lot is not None and int(lot) in cited_lots(message, hash_refs=hash_refs):
+        return True
+    if branch and merge_branch(message) == short_branch(branch):
+        return True
+    parents = _commit_parents(repo, commit)
+    return (len(parents) > 1 and _is_ancestor(repo, frozen, commit)
+            and not _is_ancestor(repo, frozen, parents[0]))
+
+
+def _effective_revert(repo: str, since: str, ref: str, carries) -> dict | None:
+    """#1825 : le revert EFFECTIF le plus récent d'un porteur, dans `since..ref`.
+
+    `carries(sha, message)` : ce commit a-t-il porté le contenu examiné ? Un
+    revert n'est retenu que s'il cite le commit annulé (`This reverts commit
+    <sha>`), si son diff annule exactement l'apport de ce commit (patch-id) et
+    si aucun commit postérieur ne réapplique cet apport. Rend
+    `{ref, undone, detail}`, ou None. La lecture est bornée à
+    MAX_REVERT_SCAN commits (les plus récents). None ne prouve PAS l'absence
+    de revert : au-delà de la borne, ou sans `patch-id --verbatim` (git <
+    2.40, aucun revert n'est retenu), l'appelant retombe sur sa preuve
+    d'avant #1825 (ancêtre, patch-id, citation) et peut fermer à tort un lot
+    annulé — détection au mieux, pas une garantie."""
+    out = _out(repo, "log", "--format=%H%x00%B%x1e",
+               "--max-count=%d" % MAX_REVERT_SCAN, "%s..%s" % (since, ref))
+    for record in (out or "").split("\x1e"):
+        sha, _sep, message = record.strip().partition("\x00")
+        if not sha or not (message or "").lstrip().startswith('Revert "'):
+            continue
+        match = _REVERTED_COMMIT_RE.search(message)
+        if not match:
+            continue
+        undone = _commit(repo, match.group(1))
+        if undone is None or not _is_ancestor(repo, undone, sha):
+            continue
+        if not carries(undone, _commit_message(repo, undone)):
+            continue
+        try:
+            # l'apport du commit annulé : la première parente pour une fusion
+            # (`git revert -m 1` ; `-m 2` annule l'autre côté, sans rapport)
+            applied = _diff_patch_id(repo, undone + "^", undone)
+            removed = _diff_patch_id(repo, sha, sha + "^")
+            if not applied or applied != removed:
+                continue
+            if applied in _patch_ids(repo, "--max-count=%d" % MAX_TARGET_COMMITS,
+                                     "%s..%s" % (sha, ref)):
+                continue                     # réappliqué depuis : rien d'annulé
+        except _NoVerbatim:
+            return None
+        return {"ref": sha, "undone": undone,
+                "detail": "%s reverts %s: content removed from %s"
+                          % (sha[:12], undone[:12], ref)}
+    return None
+
+
+def reverted_content(repo: str, frozen: str, ref: str, *, lot: int | None = None,
+                     branch: str | None = None, hash_refs: bool | None = None) -> dict | None:
+    """#1825 : le contenu du gel `frozen` a-t-il été annulé dans `ref` ?
+
+    L'ascendance seule ne prouve plus la livraison : un paquet peut être
+    fusionné puis annulé par un revert (`Revert "#<lot>: compose …"`), la tête
+    gelée restant ancêtre de la cible. Rend le revert effectif, ou None."""
+    return _effective_revert(
+        repo, frozen, ref,
+        lambda sha, message: _carries_frozen(repo, sha, frozen, lot=lot, branch=branch,
+                                             hash_refs=hash_refs, message=message))
+
+
+def _merge_reverted(repo: str, sha: str, ref: str) -> dict | None:
+    """#1825 : ce commit de fusion a-t-il été annulé depuis (revert effectif) ?"""
+    return _effective_revert(repo, sha, ref, lambda commit, _message: commit == sha)
 
 
 def latest_freeze(rows: list[dict]) -> dict | None:
@@ -169,6 +315,157 @@ def latest_freeze(rows: list[dict]) -> dict | None:
     if not freezes:
         return None
     return max(freezes, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
+
+
+#: un identifiant de commit exploitable : 4 à 64 hexadécimaux (git abrège
+#: jusqu'à 4). La résolution en commit complet et unique reste au lecteur qui
+#: a le dépôt (#1756).
+_COMMIT_ID = re.compile(r"[0-9a-f]{4,64}")
+
+
+def commit_id(value) -> str:
+    """L'identifiant de commit d'un jalon, en minuscules (`''` sinon)."""
+    text = str(value or "").strip().lower()
+    return text if _COMMIT_ID.fullmatch(text) else ""
+
+
+def same_commit(a, b) -> bool:
+    """Deux identifiants qui nomment le même commit (préfixe admis, #1756)."""
+    a, b = commit_id(a), commit_id(b)
+    return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _freeze_mark(row: dict | None) -> dict | None:
+    """Un jalon lu, réduit à ce que la provenance d'un gel effectif expose."""
+    if row is None:
+        return None
+    return {"id": int(row.get("id") or 0), "kind": row.get("kind") or "",
+            "sha": commit_id(row.get("sha")), "verdict": row.get("verdict") or "",
+            "actor": row.get("actor") or "", "at_ts": row.get("at_ts")}
+
+
+def freeze_candidate(rows: list[dict]) -> dict:
+    """Le gel effectif d'un lot (#1756) : le commit sur lequel un avis
+    favorable existe, même sans jalon `frozen`, ou malgré un gel périmé.
+
+    `latest_freeze` rend le dernier gel *déclaré* — la frise, la fermeture sur
+    fusion et la classification s'y tiennent ; ici on rend un **candidat de
+    lecture** pour les lecteurs qui décident si un lot est prêt (composeur du
+    paquet horaire, §11bis). Aucune écriture, aucune date inventée : `origin`
+    dit si le gel est `frozen` (déclaré) ou `verdict` (dérivé du dernier avis
+    favorable), `declared` et `verdict` portent les jalons lus, `notes` les
+    observations non bloquantes, `causes` les refus (le SHA est alors vide).
+
+    Règles (celles de `progress._verdict_applies`, resserrées du « dernier
+    avis par relecteur, blocage jamais masqué » de la porte des avis) :
+
+    * gel et avis nommant le même commit (préfixe admis) : le gel déclaré ;
+    * avis favorable postérieur à un gel qui nomme un autre commit : le SHA
+      de l'avis, le gel déclaré étant périmé (rebase) — sauf si ce commit est
+      nommé par un jalon antérieur au gel (ancienne tête) : l'avis est tardif
+      et écarté, note `late-verdict-on-older-commit` (#1767) ;
+    * gel postérieur à l'avis sur un autre commit : refus
+      `freeze-after-verdict`, un nouvel avis est dû sur la tête gelée (#1283) ;
+    * sans gel déclaré : le SHA de l'avis favorable ;
+    * avis sans commit : il ne vaut que par l'instant, le gel déclaré (s'il
+      existe) reste candidat, note `verdict-names-no-commit` ;
+    * aucun avis : le gel déclaré reste candidat (note `no-verdict` — la
+      classe légère n'exige pas d'avis) ; sans gel non plus, refus
+      `no-verdict` ;
+    * un `blocked` applicable n'est jamais masqué par le `ok` d'un autre
+      relecteur : refus `blocked-verdict`.
+
+    Le SHA rendu peut être abrégé : le lecteur qui a le dépôt le résout en un
+    commit complet **unique** et le confronte à la tête **publiée** (jamais
+    `branch_head`, une observation) ; un candidat qui n'est pas la tête
+    publiée est une exclusion nommée, jamais une omission."""
+    marks = list(rows or [])
+    freeze = latest_freeze(marks)
+    verdicts = [r for r in marks if r.get("kind") == "verdict"]
+
+    def newest(items):
+        if not items:
+            return None
+        return max(items, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
+
+    f_sha = commit_id((freeze or {}).get("sha"))
+    f_at = float((freeze or {}).get("at_ts") or 0)
+    # #1767 : un avis ok postérieur au gel sur un commit que la frise nommait
+    # déjà avant ce gel (ancienne tête) est tardif : il ne déclasse pas le gel.
+    # Un commit jamais nommé avant le gel reste lu comme un rebase relu.
+    before = [commit_id(r.get("sha")) for r in marks
+              if r.get("kind") in ("frozen", "verdict")
+              and float(r.get("at_ts") or 0) < f_at] if f_sha else []
+
+    def late(v) -> bool:
+        sha = commit_id(v.get("sha"))
+        return ((v.get("verdict") or "ok") == "ok" and bool(sha)
+                and float(v.get("at_ts") or 0) > f_at
+                and not same_commit(sha, f_sha)
+                and any(same_commit(sha, b) for b in before))
+
+    last = newest([v for v in verdicts if not late(v)])
+    out = {"sha": "", "origin": "", "declared": _freeze_mark(freeze),
+           "verdict": _freeze_mark(last), "causes": [], "notes": []}
+    if any(late(v) for v in verdicts):
+        out["notes"].append("late-verdict-on-older-commit")
+    if freeze is not None and not f_sha:
+        out["notes"].append("declared-freeze-unusable")
+    v_sha = commit_id((last or {}).get("sha"))
+    v_at = float((last or {}).get("at_ts") or 0)
+
+    if last is None:
+        if f_sha:
+            out.update(sha=f_sha, origin="frozen")
+            out["notes"].append("no-verdict")
+            return out
+        out["causes"].append("no-verdict")
+        return out
+    if (last.get("verdict") or "ok") != "ok":
+        out["causes"].append("blocked-verdict")
+        return out
+    if f_sha and v_sha:
+        if same_commit(f_sha, v_sha):
+            out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
+        elif f_at > v_at:
+            out["causes"].append("freeze-after-verdict")
+            return out
+        else:
+            out.update(sha=v_sha, origin="verdict")
+            out["notes"].append("declared-freeze-stale")
+    elif v_sha:
+        out.update(sha=v_sha, origin="verdict")
+        if freeze is not None:
+            out["notes"].append("declared-freeze-stale")
+    elif f_sha and v_at >= f_at:
+        out.update(sha=f_sha, origin="frozen")
+        out["notes"].append("verdict-names-no-commit")
+    else:
+        out["causes"].append("verdict-names-no-commit")
+        return out
+
+    # Blocage applicable : le dernier avis de chaque relecteur sur le commit
+    # candidat (mêmes règles que la porte des avis, #1374).
+    by_actor: dict = {}
+    for v in verdicts:
+        cand = commit_id(v.get("sha"))
+        applies = same_commit(cand, out["sha"]) if cand else (
+            freeze is None or float(v.get("at_ts") or 0) >= f_at)
+        if not applies:
+            continue
+        actor = (v.get("actor") or "").strip()
+        seen = by_actor.get(actor)
+        if seen is None or (v.get("at_ts") or 0, int(v.get("id") or 0)) > \
+                (seen.get("at_ts") or 0, int(seen.get("id") or 0)):
+            by_actor[actor] = v
+    blocked = sorted({(v.get("actor") or "?") for v in by_actor.values()
+                      if (v.get("verdict") or "ok") != "ok"})
+    if blocked:
+        out.update(sha="", origin="")
+        out["causes"].append("blocked-verdict")
+        out["notes"].append("blocked by %s" % ", ".join(blocked))
+        return out
+    return out
 
 
 def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
@@ -257,10 +554,11 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         off_default = None               # la cible par défaut qu'elle n'est pas
         first_ref = first_proof = None   # la ref autoritaire, pour le compte rendu
         residue = None                   # une ref qui la porte sans pouvoir fermer
+        reverted = None                  # un gel livré puis annulé (#1825)
         error = None
         for ref, off, closes in refs:
             try:
-                proof = probe(repo_dir, sha, ref)
+                proof = probe(repo_dir, sha, ref, lot=lot)
             except (MergeProbeError, GitError) as exc:
                 if off:
                     residue = residue or "%s is unreadable (%s)" % (ref, exc)
@@ -270,6 +568,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             if first_proof is None:
                 first_ref, first_proof = ref, proof
             if not proof["merged"]:
+                # #1825 : le gel a été livré sur cette ref puis annulé ; le
+                # dire, même quand la cible par défaut ne le porte pas du tout
+                if proof["how"] == "reverted" and reverted is None:
+                    reverted = (ref, proof)
                 continue
             if closes:
                 found_target, found_proof, off_default = ref, proof, (default if off else None)
@@ -285,6 +587,13 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         if found_target is None:
             entry.update(target=first_ref, sha=sha, result="open",
                          detail=first_proof["detail"] if first_proof else entry["detail"])
+            if reverted is not None and (first_proof is None
+                                         or first_proof["how"] != "reverted"):
+                # #1825 : la cible par défaut ne porte pas le gel (« missing »),
+                # mais une ref d'intégration l'a livré puis annulé : le relevé
+                # dit le revert plutôt qu'une absence trompeuse
+                entry.update(target=reverted[0], how="reverted",
+                             detail=reverted[1]["detail"])
             if residue:
                 entry.update(result="off-target", detail=residue)
             results.append(entry)
@@ -409,6 +718,10 @@ LOT_BRANCH_MERGE_RE = re.compile(
     r"|(?:remote-tracking )?branch '(?:origin/)?)"
     r"(?P<branch>lot/(?P<lot>[1-9][0-9]{0,17})(?:-[A-Za-z0-9._/-]*)?)'?"
     r"(?: into [^\s]+)?[ \t]*$")
+#: #1005 : le numéro de PR d'un commit de fusion GitHub, QUELLE QUE SOIT la
+#: branche fusionnée (« Merge pull request #N from owner/<branche> ») : la PR
+#: porteuse d'un gel, même sans citer le lot, a un corps à lire
+GITHUB_MERGE_PR_RE = re.compile(r"^Merge pull request #([1-9][0-9]{0,17}) from \S+")
 #: `#<id>` dans le titre d'un commit de fusion (« Merge #93 … », « … (#91) ») ;
 #: ni `PR#9`, ni `depot#9`, ni `##9`, ni `#9a`
 HASH_REF_RE = re.compile(r"(?<![\w/#&])#([1-9][0-9]{0,17})(?!\w)")
@@ -418,6 +731,10 @@ LOT_REF_GIT_KEY = "ameesh.lotRef"
 LOT_REF_HASH = "hash"
 #: commits de fusion lus au plus par dépôt et par relevé (les plus récents)
 MAX_MERGE_SCAN = 500
+#: #1005 B2 : fusions lues au plus sur la chaîne première-parente d'une cible
+#: pour trouver le porteur d'un gel (la ligne de trop dit la troncature) ;
+#: au-delà, le porteur reste indéterminé et le lot ouvert
+MAX_CARRIER_SCAN = 500
 #: écart d'horloge admis (s) entre la base (création du lot) et le poste qui
 #: a fait le commit de fusion (date à la seconde)
 CLOCK_SLACK_S = 120.0
@@ -562,7 +879,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     def seen() -> dict | None:
         if not seen_head:
             return None
-        found = probe(repo, seen_head, target)
+        found = probe(repo, seen_head, target, lot=branch_lot(branch))
         if found["merged"]:
             return dict(out, merged=True, how="vu-" + found["how"], ref=found["ref"],
                         detail="last commit seen ahead (%s): %s"
@@ -572,6 +889,12 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     def mention(why: str) -> dict:
         sha = merge_mentioning(repo, branch, head, since_ts)
         if sha:
+            stopped = _merge_reverted(repo, sha, target)
+            if stopped:
+                return dict(out, merged=False, how="reverted",
+                            detail="merge commit %s of %s that cites %s was reverted "
+                                   "(%s)" % (sha[:12], target, branch,
+                                             stopped["ref"][:12]))
             return dict(out, merged=True, how="message", ref=sha,
                         detail="merge commit %s of %s that cites %s" % (sha[:12], target,
                                                                           branch))
@@ -580,6 +903,13 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     if tip is None:
         return seen() or mention("branch %s not found (neither local nor origin/)" % branch)
     if _git(repo, "merge-base", "--is-ancestor", tip, head).returncode == 0:
+        lot = branch_lot(branch)
+        stopped = reverted_content(repo, tip, target, lot=lot, branch=branch)
+        if stopped:
+            return dict(out, merged=False, how="reverted",
+                        detail="%s (%s) entered %s through a merge commit, but %s "
+                               "reverts its content"
+                               % (branch, tip[:12], target, stopped["ref"][:12]))
         if not _on_first_parent(repo, tip, head):
             return dict(out, merged=True, how="ancestor", ref=tip,
                         detail="%s (%s) entered %s through a merge commit"
@@ -587,7 +917,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
         return seen() or mention("%s has no work of its own: its tip %s is on the "
                                  "line of %s" % (branch, tip[:12], target))
     out["ahead"] = True
-    found = probe(repo, tip, target)
+    found = probe(repo, tip, target, lot=branch_lot(branch))
     if found["merged"]:
         return dict(out, merged=True, how=found["how"], ref=found["ref"],
                     detail="%s: %s" % (branch, found["detail"]))
@@ -602,10 +932,16 @@ def lot_ref_hash(repo: str) -> bool:
 
 
 def merge_commits(repo: str, target: str, since_ts: float | None = None,
-                  limit: int = MAX_MERGE_SCAN) -> list[dict]:
+                  limit: int = MAX_MERGE_SCAN, first_parent: bool = False) -> list[dict]:
     """Les commits de FUSION de `target` (au plus `limit`, du plus récent au
-    plus ancien, postérieurs à `since_ts`) : `{sha, ts, message, parents}`."""
+    plus ancien, postérieurs à `since_ts`) : `{sha, ts, message, parents}`.
+    Avec `first_parent`, seulement ceux de la CHAÎNE première-parente de
+    `target` (#1005 B2 : le porteur d'un gel est une fusion de la cible,
+    jamais une fusion imbriquée dans une branche porteuse) ; les citations,
+    elles, gardent toutes les fusions."""
     args = ["log", "--merges", "--format=%H%x00%ct%x00%P%x00%B%x1e", "--max-count=%d" % int(limit)]
+    if first_parent:
+        args.append("--first-parent")
     if since_ts:
         args.append("--since=@%d" % int(since_ts))
     proc = _git(repo, *args, target)
@@ -655,6 +991,16 @@ def merge_pr_number(message: str) -> int | None:
     `lot/<id>-…` (son corps n'est pas dans le message : `partial_of_pr`)."""
     match = _lot_branch_merge(message)
     return int(match.group("pr")) if match and match.group("pr") else None
+
+
+def merge_pull_number(message: str) -> int | None:
+    """#1005 B2 : le numéro de la PR d'un commit de fusion GitHub, quelle que
+    soit la branche fusionnée (`merge_pr_number` ne voit que `lot/<id>-…`).
+    La PR PORTEUSE d'un gel — celle qui l'a fait entrer dans la cible — a un
+    corps à lire avant de retenir la preuve par le contenu."""
+    lines = (message or "").strip().splitlines()
+    match = GITHUB_MERGE_PR_RE.match(lines[0].strip() if lines else "")
+    return int(match.group(1)) if match else None
 
 
 def merge_branch(message: str) -> str | None:
@@ -888,18 +1234,88 @@ def _off_target_citations(repo: str, lot: int, row: dict, all_merges: list,
     return citing, partial
 
 
+def _is_ancestor(repo: str, sha: str, ref: str) -> bool:
+    """`git merge-base --is-ancestor` : une commande, sans lecture d'objet."""
+    return _git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0
+
+
+def _content_ancestor(repo: str, sha: str, target: str) -> bool:
+    """#1005 : le commit gelé est-il ancêtre de la cible ? C'est la preuve par
+    contenu la moins chère (une commande git), celle d'une fusion `--no-ff`
+    (ou d'une avance rapide) poussée sur la branche d'intégration sans citer
+    le lot. Le patch-id exact (rebase, cherry-pick, squash) reste au relevé de
+    contenu (`sync-merges`), dont c'est le travail et le coût assumé."""
+    head = _commit(repo, target)
+    frozen = _commit(repo, sha)
+    if head is None or frozen is None:
+        return False
+    return _is_ancestor(repo, frozen, head)
+
+
+def _content_carrier(repo: str, sha: str, target: str) -> tuple[dict | None, bool]:
+    """#1005 B2 : la fusion qui a FAIT ENTRER le gel `sha` dans la cible — la
+    plus ancienne fusion de la CHAÎNE PREMIÈRE-PARENTE de `target` dont la
+    première parente ne le porte pas encore et dont une autre parente le porte.
+    C'est la PR porteuse, celle dont le corps doit être lu avant de retenir la
+    preuve par le contenu.
+
+    La recherche est faite séparément sur la cible (`first_parent`) : la
+    fenêtre des citations, bornée par `since_all`, peut ne pas contenir la
+    fusion porteuse, et une fusion IMBRIQUÉE dans une branche porteuse (fusion
+    locale `--no-ff` puis PR GitHub) n'est jamais sur cette chaîne — la
+    retenir ferait lire le mauvais message et fermer le lot sans lire la PR.
+
+    Rend `(porteur, fenêtre_tronquée)`. `(None, False)` : le gel est entré
+    autrement (avance rapide, poussée directe), il n'y a aucun corps de PR à
+    qualifier — même tronquée, la fenêtre part de la fusion la plus récente,
+    et si elle ne porte pas le gel, aucune fusion plus ancienne ne le porte.
+    `(None, True)` : la limite de lecture est atteinte sans que le porteur
+    soit connu (il peut être plus ancien) : indéterminé, le lot reste ouvert."""
+    merges = merge_commits(repo, target, limit=MAX_CARRIER_SCAN + 1, first_parent=True)
+    truncated = len(merges) > MAX_CARRIER_SCAN
+    if not merges or not _is_ancestor(repo, sha, merges[0]["sha"]):
+        return None, False
+    # du plus récent au plus ancien ; « porte le gel » y est monotone (une
+    # fusion récente de la chaîne descend de toutes les plus anciennes) : la
+    # plus ancienne qui le porte est trouvée par dichotomie
+    lo, hi = 0, len(merges) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _is_ancestor(repo, sha, merges[mid]["sha"]):
+            lo = mid
+        else:
+            hi = mid - 1
+    carrier = merges[lo]
+    parents = carrier.get("parents") or []
+    if parents and _is_ancestor(repo, sha, parents[0]):
+        # le gel était déjà sur la chaîne avant cette fusion : il est entré
+        # par une avance rapide ou une poussée directe, sans corps de PR —
+        # sauf si la fenêtre s'arrête là, le porteur peut être plus ancien
+        return None, bool(truncated and lo == len(merges) - 1)
+    return carrier, False
+
+
 def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: str, *,
                   st, since_all: float | None, hashes: dict, merges: dict, bodies: dict,
                   sweep: dict, pr_body, dry_run: bool, implicits: dict, tips: dict,
-                  off_target: bool = False) -> dict:
+                  freeze: dict | None = None, off_target: bool = False,
+                  closing: bool = True) -> dict:
     """L'examen d'un lot contre UNE cible, extrait de `sync_branches` (#746)
     pour essayer la cible par défaut puis, si elle ne porte pas la fusion,
     les refs d'intégration du dépôt.
 
     `off_target` : la ref n'est ni la cible déclarée ni la cible par défaut ;
     seule une citation prouve alors la livraison, jamais le seul voisinage
-    de la branche. Rend `{found, branch, implicit, row}` ; lève
+    de la branche. `closing` : cette ref peut fermer le lot (une cible
+    déclarée ne ferme jamais ailleurs : la preuve n'y est qu'un résidu).
+    #1005 : à défaut de branche ou de citation, l'ancêtre du dernier gel
+    (`freeze`, id et sha) prouve la livraison, après lecture du corps de sa
+    PR porteuse quand la preuve ferme (B2, cherchée sur la chaîne
+    première-parente de la cible) ; une fenêtre de lecture tronquée sans
+    porteur connu laisse le lot ouvert. La fermeture est conditionnée à
+    ce gel (B1). Rend `{found, branch, implicit, row}` ; lève
     MergeProbeError/GitError comme l'examen d'origine."""
+    freeze_sha = ((freeze or {}).get("sha") or "").strip() or None
     found = None
     implicit = False
     if not branch:
@@ -944,6 +1360,19 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
             partial = (merge, "merge commit %s declares itself partial "
                        "(\"ameesh-work-partial: %d\"): lot kept open"
                        % (merge["sha"][:12], lot))
+    reverted_cite = None
+    if citing:
+        # #1825 : une fusion citante annulée par un revert n'a rien livré —
+        # y compris sur une ref d'intégration essayée hors cible (la citation
+        # seule n'y ferme que si elle a réellement livré, cf. `close`)
+        gardees = []
+        for merge in citing:
+            stopped = _merge_reverted(repo, merge["sha"], target)
+            if stopped is None:
+                gardees.append(merge)
+            elif reverted_cite is None:
+                reverted_cite = dict(stopped, cite=merge["sha"])
+        citing = gardees
     for merge in citing:
         number = merge_pr_number(merge["message"])
         if not number:
@@ -986,22 +1415,82 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
         # a livré la suite (L118d : pas une simple avance jusqu'à la cible)
         partial = None
     held = partial[1] if partial else unreadable
+    # #1005 : ni la branche ni une citation ne prouvent la livraison ; le
+    # dernier gel, ancêtre de la cible, la prouve par le contenu (fusion
+    # --no-ff poussée sur la branche d'intégration, comme #560/#905). B2 : le
+    # corps de la PR PORTEUSE — celle qui a fait entrer le gel — est lu AVANT
+    # de retenir la preuve quand elle ferme ; partielle pour ce lot ou
+    # illisible, le lot reste ouvert. Sur une ref qui ne ferme pas (cible
+    # déclarée), la preuve n'est qu'un résidu signalé : rien à qualifier.
+    content = None
+    reverted = None
+    if freeze_sha and cited is None and not held and not (found and found["merged"]) \
+            and _content_ancestor(repo, freeze_sha, target):
+        # #1825 : la tête gelée reste ancêtre de la cible quand sa fusion a
+        # été annulée par un revert — le contenu n'y est plus, rien n'est livré
+        reverted = reverted_content(repo, freeze_sha, target, lot=lot, branch=branch,
+                                    hash_refs=hashes[repo])
+        if reverted is None and closing:
+            # le porteur est cherché sur la chaîne première-parente de la
+            # CIBLE, séparément de la fenêtre des citations (B2, R2 cx3) :
+            # indéterminé au-delà de la limite, le lot reste ouvert
+            carrier, truncated = _content_carrier(repo, freeze_sha, target)
+            number = merge_pull_number(carrier["message"]) if carrier else None
+            if number:
+                if (repo, number) not in bodies:
+                    bodies[(repo, number)] = _read_pr_body(pr_body, repo, number, sweep)
+                body = bodies[(repo, number)]
+                if isinstance(body, GitError):
+                    unreadable = ("PR #%d carries the last freeze %s, but its body is "
+                                  "unreadable (%s): not closed until it says whether it "
+                                  "is partial" % (number, freeze_sha[:12], body))
+                elif lot in partial_lots(body):
+                    partial = (carrier, "PR #%d carries the last freeze %s and declares "
+                               "itself partial (\"ameesh-work-partial: %d\"): lot kept open"
+                               % (number, freeze_sha[:12], lot))
+            elif carrier is None and truncated:
+                unreadable = ("the last freeze %s is an ancestor of %s, but its carrier "
+                              "merge is older than the %d merges read on the first-parent "
+                              "chain: not closed until it is known"
+                              % (freeze_sha[:12], target, MAX_CARRIER_SCAN))
+        held = partial[1] if partial else unreadable
+        if reverted is None and not held:
+            content = {"merged": True, "how": "content-ancestor", "ref": freeze_sha,
+                       "tip": None, "ahead": False, "kind": "content",
+                       "detail": "the last freeze %s is an ancestor of %s (content)"
+                                 % (freeze_sha[:12], target),
+                       "note": "the last freeze %s entered %s as an ancestor (content)"
+                               % (freeze_sha[:12], target)}
+            if freeze.get("id") is not None:
+                content["frozen_id"] = int(freeze["id"])
     if held and cited is None and (partial or not proven):
         found = dict(found or {"tip": None, "ahead": False, "ref": None},
                      merged=False, how="partial", detail=held)
-    elif found is None or not found["merged"]:
-        if cited:
-            found = dict(found or {"tip": None, "ahead": False}, merged=True,
-                         how=cited["how"], ref=cited["sha"],
-                         detail=_citation(cited, lot, target),
-                         note=_citation(cited, lot, target, sha=False))
-        elif found is None:
-            found = {"merged": False, "how": None, "ref": None, "tip": None,
-                     "ahead": False,
-                     "detail": "no merge commit of %s names the lot "
-                               "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
-                               % (target, lot, lot, ", nor \"#%d\" in a title" % lot
-                                  if hashes[repo] else "")}
+    elif found is not None and found["merged"]:
+        pass
+    elif cited:
+        found = dict(found or {"tip": None, "ahead": False}, merged=True,
+                     how=cited["how"], ref=cited["sha"],
+                     detail=_citation(cited, lot, target),
+                     note=_citation(cited, lot, target, sha=False))
+    elif content is not None:
+        found = content
+    elif reverted is not None:
+        found = dict(found or {"tip": None, "ahead": False, "ref": None}, merged=False,
+                     how="reverted", ref=reverted["ref"], detail=reverted["detail"])
+    elif reverted_cite is not None:
+        found = dict(found or {"tip": None, "ahead": False, "ref": None}, merged=False,
+                     how="reverted", ref=reverted_cite["ref"],
+                     detail="merge commit %s of %s that names the lot was reverted (%s)"
+                            % (reverted_cite["cite"][:12], target,
+                               reverted_cite["ref"][:12]))
+    elif found is None:
+        found = {"merged": False, "how": None, "ref": None, "tip": None,
+                 "ahead": False,
+                 "detail": "no merge commit of %s names the lot "
+                           "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
+                           % (target, lot, lot, ", nor \"#%d\" in a title" % lot
+                              if hashes[repo] else "")}
     return {"found": found, "branch": branch, "implicit": implicit, "row": row}
 
 
@@ -1053,13 +1542,38 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     fusion, les refs d'intégration du remote (`develop`, `main`, `master`,
     `release/*`) sont essayées à leur tour : une fusion citante y ferme le
     lot, avec la ref trouvée dans la note. Aucune autre ref (branche de
-    travail, autre remote), aucun fetch."""
+    travail, autre remote), aucun fetch.
+
+    #1005 : à défaut de branche et de citation, le dernier gel du lot,
+    ancêtre de la ref examinée, prouve la livraison par le contenu (une
+    fusion `--no-ff` poussée sur la branche d'intégration, comme #560/#905,
+    sans citer le lot) : le relevé la ferme, en nommant la ref. Le patch-id
+    exact (rebase, cherry-pick, squash) reste le travail de `sync-merges`.
+    B2 : le corps de la PR PORTEUSE de ce gel (`merge_pull_number`, quelle
+    que soit sa branche) est lu comme celui d'une PR citante — partielle pour
+    le lot ou illisible, la preuve n'est pas retenue. Le porteur est cherché
+    sur la chaîne première-parente de la cible, indépendamment de la fenêtre
+    des citations (une fusion imbriquée dans une branche porteuse n'est pas
+    la fusion de la cible) ; quand la limite de lecture est atteinte sans
+    porteur connu, le lot reste ouvert. B1 : la fermeture est
+    conditionnée au jalon `frozen` examiné (`frozen_id`) : un regel
+    concurrent, vu après la lecture, laisse le lot ouvert (`refrozen`)."""
     import os
 
     from . import fil, registry
 
     st = storage.of(db)
     rows = st.work.open_for_sweep(limit)
+    # #1005 : le dernier gel de chaque lot — id ET sha (B1 : la fermeture est
+    # conditionnée à ce jalon précis) — lu une fois, comme le relevé de contenu
+    marks: dict = {}
+    for ms in st.progress.lot_milestones([int(r["id"]) for r in rows]):
+        marks.setdefault(int(ms["work_item_id"]), []).append(ms)
+    freezes: dict = {}
+    for lot, items in marks.items():
+        latest = latest_freeze(items) or {}
+        if (latest.get("sha") or "").strip():
+            freezes[lot] = latest
     # les commits de fusion lus une fois par dépôt et par cible : depuis le
     # lot ouvert le plus ancien, chaque lot ne retient que les siens
     since_all = min((float(r["created_ts"]) - CLOCK_SLACK_S for r in rows
@@ -1136,6 +1650,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             outcome = None                   # l'examen retenu (cible par défaut)
             off_outcome = None               # une citation hors cible (jamais fermée)
             partial_off = None               # une fusion partielle hors cible
+            reverted_off = None              # un contenu annulé hors cible (#1825)
             unreadable = []                  # (ref, pourquoi) : le résidu, jamais silencieux
             for target, off, close in to_try:
                 try:
@@ -1143,7 +1658,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                         repo, lot, row, branch, target, st=st, since_all=since_all,
                         hashes=hashes, merges=merges, bodies=bodies, sweep=sweep,
                         pr_body=pr_body, dry_run=dry_run, implicits=implicits,
-                        tips=tips, off_target=off)
+                        tips=tips, freeze=freezes.get(lot), off_target=off,
+                        closing=close)
                 except (MergeProbeError, GitError) as exc:
                     if off:
                         unreadable.append((target, str(exc)))
@@ -1158,6 +1674,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                     break
                 if off and probe["found"]["how"] == "partial" and partial_off is None:
                     partial_off = (target, probe["found"]["detail"])
+                if off and probe["found"]["how"] == "reverted" and reverted_off is None:
+                    reverted_off = (target, probe["found"]["detail"])
                 if outcome is None:
                     outcome = dict(probe, target=target, off=off)
         except (MergeProbeError, GitError) as exc:
@@ -1212,6 +1730,10 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 # #746 : une fusion partielle hors cible ne ferme pas, mais
                 # se dit (comme la fusion partielle de la cible)
                 entry.update(how="partial", detail=partial_off[1])
+            elif reverted_off:
+                # #1825 : un contenu annulé hors cible ne ferme pas, mais se
+                # dit (le lot reste ouvert avec la raison)
+                entry.update(how="reverted", detail=reverted_off[1])
             stale = row.get("branch_head_ts") is None or (
                 row.get("partial_merge") and (row.get("partial_seen_ts") is None
                                               or row["branch_head_ts"] <= row["partial_seen_ts"]))
@@ -1244,15 +1766,21 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                       "`git config %s %s` to make it explicit"
                       % (source, target, primary, TARGET_GIT_KEY, target))
         done = work_mod.close_merged(
-            db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target, source=source)
+            db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target,
+            source=source, frozen_id=found.get("frozen_id"))
         entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
         if done["result"] == "merged":
+            if found.get("kind") == "content":
+                delivered = "its last freeze %s is an ancestor of %s" % (
+                    (found["ref"] or "?")[:12], target)
+            elif found.get("note"):
+                delivered = "a merge commit of %s names it" % target
+            else:
+                delivered = "branch %s entered %s" % (branch, target)
             text = ("Lot #%d \"%s\" delivered: %s (%s, commit %s). Closed by the runner's "
                     "merge sweep."
-                    % (lot, row.get("title") or "",
-                       "a merge commit of %s names it" % target if found.get("note")
-                       else "branch %s entered %s" % (branch, target),
-                       found["how"], (found["ref"] or "?")[:12]))
+                    % (lot, row.get("title") or "", delivered, found["how"],
+                       (found["ref"] or "?")[:12]))
             if outcome["off"]:
                 text = ("%s Merged into %s, off the default target %s: declare "
                         "`git config %s %s` to make it explicit."

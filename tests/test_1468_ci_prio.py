@@ -235,8 +235,17 @@ class RunsOnTest(unittest.TestCase):
 
     def test_same_expression_on_every_linux_job(self):
         self.assertEqual(set(self.linux), {"plan", "psycopg", "psql", "doc-readers",
-                                           "bilan", "version", "tests"})
-        self.assertEqual(len(set(self.linux.values())), 1, self.linux)
+                                           "bilan", "version", "tests", "fs-class"})
+        # #1256 x #1468 : `bilan` (hors de la clôture du check requis,
+        # continue-on-error) porte, après le pool prioritaire, le repli vers
+        # l'hôte prêté quand un prêt est armé ; tous les autres jobs Linux
+        # gardent l'expression unique du pool.
+        others = {j: e for j, e in self.linux.items() if j != "bilan"}
+        self.assertEqual(len(set(others.values())), 1, others)
+        self.assertEqual(self.linux["bilan"], others["plan"].replace(
+            """'["self-hosted", "linux", "ameesh-ci"]'""",
+            """vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]'"""),
+            self.linux["bilan"])
         # #987 x #1468 : le job requis tourne sur l'image x64 standard
         # (`macos-26-intel`) ; `macos-latest` (macOS 26 arm64) n'obtenait pas
         # de capacité hébergée et était annulé sans qu'une étape ne tourne.

@@ -415,10 +415,22 @@ def key_owner(key: str) -> str:
     return parts[1]
 
 
+def _same_home(left: str, right: str) -> bool:
+    """True when both paths designate the same directory, symlinks resolved (L731).
+
+    A path that cannot be resolved reads as different: the caller then refuses
+    without `--allow-other-agent`, never guesses."""
+    try:
+        return os.path.realpath(left) == os.path.realpath(right)
+    except (OSError, ValueError):
+        return False
+
+
 def restore_agent(db, cfg, conf, args) -> tuple[str, str, list[str]]:
     """Lock both destination and key owner through extraction; refuse active turns."""
     owner = key_owner(args.key) if args.key else args.agent
-    if owner != args.agent and not getattr(args, "allow_other_agent", False):
+    allow_other = bool(getattr(args, "allow_other_agent", False))
+    if owner != args.agent and not allow_other:
         raise BackupError("backup belongs to %s, not %s: use --allow-other-agent "
                           "for an explicit cross-agent restore" % (owner, args.agent))
     with db.transaction() as tx:
@@ -437,7 +449,25 @@ def restore_agent(db, cfg, conf, args) -> tuple[str, str, list[str]]:
                 raise BackupError("cannot restore an active agent: stop %s first" % agent)
             locked[agent] = row
         row = locked[args.agent]
-        home = args.home or _agent_home(cfg, row, args.agent)
+        if args.home:
+            home = args.home
+            # L731: an explicit destination home must be the key owner's own
+            # home. Anything else — another agent's home, or a directory whose
+            # owner we cannot prove (N #782) — is a foreign home and needs the
+            # same explicit flag as a foreign key, before any download.
+            if not allow_other:
+                try:
+                    owner_home = _agent_home(cfg, locked[owner], owner)
+                except Exception as exc:  # fail closed: an unprovable home is refused
+                    raise BackupError("cannot identify the home of %s (%s): an explicit "
+                                      "destination home needs --allow-other-agent"
+                                      % (owner, exc)) from exc
+                if not _same_home(home, owner_home):
+                    raise BackupError("destination home %s is not the home of %s: use "
+                                      "--allow-other-agent for an explicit restore into "
+                                      "another home" % (home, owner))
+        else:
+            home = _agent_home(cfg, row, args.agent)
         session = args.session or row.get("session_id")
         key = args.key or latest(conf, agent=args.agent, session=session or "")
         if not key:
@@ -465,7 +495,8 @@ def main(argv) -> int:
     p.add_argument("--home", help="account home to use instead of the declared one")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--allow-other-agent", action="store_true",
-                   help="explicitly allow a key owned by another agent; both agents must be idle")
+                   help="explicitly allow a key owned by another agent, or a destination "
+                        "home that is not the key owner's (L731); both agents must be idle")
     args = p.parse_args(rest)
     cfg = load_config()
     try:
