@@ -154,9 +154,14 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         # L85 (#373) : `sweep` prune le journal d'événements après la moisson
         # des baux — la doublure doit fournir le point d'entrée, borné ici.
         fake.prune_events_once = lambda *args, **kwargs: None
+        # #753 : sweep also runs the stopped-agents maintenance before the stale
+        # restart guard. The maintenance still runs (its call is checked below);
+        # only the claim stops.
+        fake.release_stopped_lots_once = mock.Mock(return_value=[])
         with mock.patch.object(registry, "reap", return_value=[]), \
                 mock.patch.object(registry, "claimable") as claimable:
             runner_mod.Runner.sweep(fake)
+        fake.release_stopped_lots_once.assert_called_once_with()
         claimable.assert_not_called()
 
 
