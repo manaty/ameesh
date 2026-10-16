@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import io
 import json
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -59,7 +60,7 @@ class FleetCommandTest(unittest.TestCase):
                 self.assertEqual(mesh_cli.cmd_hosts(config_mod.Config(), args), 2)
                 opened.assert_not_called()
 
-    def run_fleet(self, readings, *, json_out=False, send=None, code=0, err=None):
+    def run_fleet(self, readings, *, json_out=False, send=None, code=0, err=None, canons=()):
         store = mock.MagicMock()
         store.hosts.current.return_value = readings
         store.hosts.since.return_value = []
@@ -69,8 +70,19 @@ class FleetCommandTest(unittest.TestCase):
                 mock.patch.object(mesh_cli.time, "time", return_value=10_000.0), \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err or io.StringIO()):
-            self.assertEqual(mesh_cli._host_fleet("db", [], args), code)
+            self.assertEqual(mesh_cli._host_fleet("db", canons, args), code)
         return out.getvalue()
+
+    def test_canon_host_without_retained_reading_stays_visible(self):
+        canon = SimpleNamespace(hosts=[SimpleNamespace(title="ci-unmeasured")])
+        text = self.run_fleet([], canons=[canon])
+        self.assertIn("fleet: 1 host(s), 1 to look at", text)
+        self.assertIn("ci-unmeasured [!] no published measurement (STALE)", text)
+        rows = [json.loads(l) for l in self.run_fleet([], canons=[canon], json_out=True)
+                .splitlines()]
+        self.assertIsNone(rows[0]["age_s"])
+        self.assertTrue(rows[0]["stale"])
+        self.assertFalse(rows[0]["ok"])
 
     def test_send_mails_the_summary_as_printed(self):
         with mock.patch.object(mesh_cli.mail, "send") as send:

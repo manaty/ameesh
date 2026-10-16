@@ -693,7 +693,7 @@ def _host_publish(cfg: Config, args) -> int:
 
 
 def _host_fleet(db, canons, args) -> int:
-    """`ameesh hosts --fleet` (#2022): one line per host that publishes —
+    """`ameesh hosts --fleet` (#2022): one line per measured or canonical host —
     age of its last reading (stale beyond 1 h), worst disk, zombies, what it
     breaches or warns about; the hosts with something to say first. Meant
     for a daily summary in the bureau's and the owner's thread."""
@@ -701,9 +701,14 @@ def _host_fleet(db, canons, args) -> int:
 
     now = time.time()
     lines = []
-    for reading in storage.of(db).hosts.current(args.host):
+    readings = {r["host"]: r for r in storage.of(db).hosts.current(args.host)}
+    names = ({args.host} if args.host else set(readings) | {
+        host.title for canon in canons for host in canon.hosts})
+    for name in sorted(names):
+        reading = readings.get(name, {"host": name})
         limits = res.host_limits(canons, reading["host"])["limits"]
-        history = storage.of(db).hosts.since(reading["host"], res.DISK_TREND_WINDOW_S)
+        history = (storage.of(db).hosts.since(reading["host"], res.DISK_TREND_WINDOW_S)
+                   if name in readings else [])
         lines.append(res.fleet_line(reading, limits, [h for h in history
                                                       if h.get("id") != reading.get("id")],
                                     now=now))
@@ -736,7 +741,8 @@ FLEET_SENDER = "ameesh"
 
 def _fleet_text(line: dict) -> str:
     """« agents-1 [!] measured 2m ago; disk / 91 % used, 9.0 GiB free; … »."""
-    parts = ["measured %s%s" % (_fmt_age(line["age_s"]), " (STALE)" if line["stale"] else "")]
+    parts = ["no published measurement (STALE)" if line["age_s"] is None else
+             "measured %s%s" % (_fmt_age(line["age_s"]), " (STALE)" if line["stale"] else "")]
     disk = line.get("disk")
     if disk is not None:
         parts.append("disk %s %s%s free" % (

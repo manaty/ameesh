@@ -1433,10 +1433,11 @@ FLEET_STALE_S = 3600.0
 
 def fleet_line(reading: dict, limits: dict, history=(), *, now: float) -> dict:
     """#2022: one host of the fleet summary (`ameesh hosts --fleet`): `host`,
-    `age_s`, `stale`, `disk` (the worst volume: path, free, used share),
+    `age_s` (None without a reading), `stale`, `disk` (the worst volume: path, free, used share),
     `disk_warnings` (`disk_warnings`), `zombies`, `procs`, `breaches` (the
     keys of the pressure verdict) and `ok` (nothing to say)."""
-    age = max(0.0, now - float(reading.get("sampled_ts") or now))
+    sampled = reading.get("sampled_ts")
+    age = None if sampled is None else max(0.0, now - float(sampled))
     vols = [v for v in reading.get("volumes") or () if isinstance(v, dict)
             and v.get("disk_free_bytes") is not None]
     low = min(vols, key=lambda v: v["disk_free_bytes"]) if vols else None
@@ -1449,8 +1450,9 @@ def fleet_line(reading: dict, limits: dict, history=(), *, now: float) -> dict:
     zombies = reading.get("procs_zombie")
     many = zombies is not None and limits.get("max_zombies") is not None \
         and zombies >= limits["max_zombies"]
-    stale = age > FLEET_STALE_S
-    return {"host": reading.get("host"), "age_s": round(age), "stale": stale,
+    stale = age is None or age > FLEET_STALE_S
+    return {"host": reading.get("host"), "age_s": None if age is None else round(age),
+            "stale": stale,
             "disk": disk, "disk_warnings": warnings, "zombies": zombies,
             "procs": reading.get("procs_total"), "breaches": breaches,
             "ok": not (stale or warnings or breaches or many)}
