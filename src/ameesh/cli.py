@@ -725,11 +725,15 @@ class _Remise:
     l'annuler si rien n'a été montré. Repli fichier : lecture et marquage v0.
     """
 
-    def __init__(self, bk, name: str, binding) -> None:
-        self.bk, self.name = bk, name
+    def __init__(self, cfg, bk, name: str, binding) -> None:
+        self.cfg, self.bk, self.name = cfg, bk, name
         self.pg = getattr(bk, "kind", None) == "pg"
         self.owner = binding.runner_id if binding.bound_to_lease else None
         self.epoch = binding.epoch if self.owner else None
+        #: #811 : projets de l'agent lus avec le bail (`None` = inconnus). Un
+        #: agent mono-projet ne peut pas retenir de lot secondaire : son hook
+        #: garde le chemin d'origine, une seule réservation (budget L61).
+        self.projects = getattr(binding, "projects", None)
         self.jeton = mail.new_token()
         self.msgs: list[dict] = []
         self.ouverte = False
@@ -740,22 +744,86 @@ class _Remise:
         self.solde = False
 
     def prendre(self, limite: int | None = None) -> list[dict]:
-        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour)."""
+        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour).
+
+        #811 B1/R3 : un message dont l'unique lot est un secondaire déclaré
+        sans dossier n'est pas réservé — l'exécuteur retient ce courrier, mais
+        son état de différé vit en mémoire et le hook ne le voit pas : sans
+        cette garde partagée il le remettrait dans la session d'un autre lot et
+        le marquerait livré. La lecture franchit en outre le préfixe retenu,
+        qui pouvait masquer un message remisable plus récent."""
         if not self.pg:
             tous = self.bk.unread(self.name)
             self.msgs = tous if limite is None else tous[:max(0, limite)]
             self.reste = len(tous) - len(self.msgs)
             return self.msgs
-        taille = 200 if limite is None else max(1, limite)
-        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=taille)
-        self.ouverte = bool(rows)
-        self.msgs = [mail.normalize(row) for row in rows]
+        borne = 200 if limite is None else max(1, limite)
+        if self.projects is not None and len(self.projects) < 2:
+            # #811 : mono-projet, aucune retenue de lot secondaire n'est
+            # possible — chemin d'origine en une seule réservation, budget du
+            # hook préservé (L61). Le filtrage par lot ne sert qu'au
+            # multi-projet déclaré.
+            return self._reserver_simple(borne)
+        besoin, lus = borne, 0
+        self.msgs = []
+        while len(self.msgs) < borne:
+            ids = self._deliverable(besoin)
+            if ids is None:
+                # #811 : la fiche du registre n'est pas servie à une session
+                # médiée (contrat 1.1, `agents.get` refusé au jeton de
+                # session) : la règle du lot retenu n'est pas décidable ici.
+                # Réservation simple, comme avant #811 — jamais moins de
+                # courrier remis.
+                return self._reserver_simple(borne)
+            if len(ids) <= lus:       # boîte épuisée ou backend à page bornée
+                break
+            lus = len(ids)
+            # Une page courte a atteint la fin de la boîte : la réservation
+            # suivante n'aurait rien de plus à voir (#811, budget du hook).
+            page_courte = len(ids) < besoin
+            # Les réservations actives (y compris celles de notre jeton) sont
+            # écartées avant la LIMIT SQL. Compléter depuis une page plus large
+            # si elles occupaient le préfixe lu, même en mono-projet (#811 R3).
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                                limit=borne - len(self.msgs))
+            self.msgs.extend(mail.normalize(row) for row in rows)
+            self.ouverte = bool(self.msgs)
+            if page_courte:
+                break
+            besoin = max(mail.UNREAD_LIMIT, besoin * 2, lus * 2)
         # une réservation pleine peut cacher des non-lus : on le dit (au pire
         # pour rien, le prochain hook reviendra par le chemin complet).
-        self.reste = 1 if len(rows) >= taille else 0
+        self.reste = 1 if len(self.msgs) >= borne else 0
         return self.msgs
+
+    def _reserver_simple(self, borne: int) -> list[dict]:
+        """#811 : réservation sans filtre de lot (mono-projet, ou règle du lot
+        retenu indécidable) — le chemin d'origine du hook, budget L61 gardé."""
+        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                            limit=borne)
+        self.ouverte = bool(rows)
+        self.msgs = [mail.normalize(row) for row in rows]
+        self.reste = 1 if len(self.msgs) >= borne else 0
+        return self.msgs
+
+    def _deliverable(self, borne: int) -> list[int] | None:
+        """#811 B1/R3 : les ids à réserver, les lots retenus laissés en place.
+
+        Même règle que l'exécuteur (`lot_workdir.deliverable_unread`), dérivée
+        du registre et du Host pour être visible du hook. Rend `None` quand
+        elle n'est pas décidable ici : une session médiée n'a pas `agents.get`
+        (contrat 1.1) et l'appelant réserve alors sans filtre, comme avant
+        #811."""
+        from . import lot_workdir, registry
+        from .mediated_executor.contract import NotSupportedRemotely
+        try:
+            agent = registry.get(self.bk.db, self.name) or {"name": self.name}
+        except NotSupportedRemotely:
+            return None
+        rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent, besoin=borne)
+        return [int(row["id"]) for row in rows if row.get("id") is not None]
 
     def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
         """L514/#885 : réserve les SEULS messages qui ne peuvent pas attendre.
@@ -1184,7 +1252,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # pour que le chemin rapide ne conclue pas « rien à faire ».
             _marque_boite(cfg, name, attente)
             return 0
-        remise = _Remise(bk, name, binding)
+        remise = _Remise(cfg, bk, name, binding)
         try:
             # #289 : la garde `and borne` date la remise a zero (une borne
             # nulle n'a rien reserve) ; la structure L514 de la chaine est
