@@ -122,11 +122,17 @@ class PartielInformateurTest(unittest.TestCase):
     def test_partiel_informateur_garde_le_rang_courant(self):
         """Fraîcheur 1 (jamais 0) : il concourt avec les relevés courants et
         peut passer devant eux par le budget — c'est la fin de l'inversion du
-        scénario de la relecture (le secondaire dont la 5 h s'est rouverte)."""
+        scénario de la relecture (le secondaire dont la 5 h s'est rouverte).
+
+        #1789 (perte par seconde d'abord) : un courant dont une fenêtre
+        s'évapore plus vite passe devant ; ici le primaire vient de rouvrir sa
+        5 h (70 % utilisés, il reste 5 h) et son 7 j est à 10 %, tandis que le
+        7 j du secondaire se remet à zéro dans 8 h avec 70 % inutilisés : la
+        perte du secondaire est la plus rapide, il garde le premier rang."""
         now = self.NOW
-        partiel = self._partial()               # 5 h remise à zéro, 7 j ouverte
+        partiel = self._partial(reset_in=8 * HOUR)  # 5 h remise à zéro, 7 j ouverte
         courant = [
-            cost.Gauge("claude", "five_hour", 0.60, now + HOUR, 5 * HOUR, now - HOUR),
+            cost.Gauge("claude", "five_hour", 0.70, now + 5 * HOUR, 5 * HOUR, now - HOUR),
             cost.Gauge("claude", "seven_day", 0.10, now + 3 * DAY, WEEK, now - HOUR),
         ]
         items = [accounts.Profile("claude", n) for n in ("primaire", "secondaire")]
