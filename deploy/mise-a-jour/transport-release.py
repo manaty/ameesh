@@ -105,6 +105,52 @@ def exchange(args, payload, seconds):
                     stream.close()
 
 
+def validate_enrollment(value, user):
+    """Endpoint and private key paths of one dedicated SSH account (any delegation)."""
+    if (not isinstance(value, dict) or set(value) != {'host', 'address',
+            'port', 'user', 'host_key_alias', 'known_hosts',
+            'known_hosts_sha256', 'identity_file', 'seconds'}):
+        raise TransportError('invalid SSH enrollment')
+    for name in ('host', 'address', 'host_key_alias'):
+        if (not isinstance(value[name], str) or not re.fullmatch(
+                r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', value[name])):
+            raise TransportError('invalid SSH endpoint')
+    if (value['user'] != user or type(value['port']) is not int
+            or not 1 <= value['port'] <= 65535
+            or type(value['seconds']) is not int or not 5 <= value['seconds'] <= 360
+            or not isinstance(value['known_hosts_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', value['known_hosts_sha256'])):
+        raise TransportError('invalid SSH transport policy')
+    for name in ('known_hosts', 'identity_file'):
+        if (not isinstance(value[name], str) or not value[name].startswith('/')
+                or not re.fullmatch(r'/[A-Za-z0-9/_.~-]+', value[name])
+                or '..' in Path(value[name]).parts):
+            raise TransportError('invalid enrolled SSH path')
+    if hashlib.sha256(protected_file(value['known_hosts'])).hexdigest() != value['known_hosts_sha256']:
+        raise TransportError('enrolled host key changed')
+    # Check permissions/size; never retain, log or forward the key bytes.
+    protected_file(value['identity_file'])
+
+
+def ssh_args(value):
+    """Pinned client options: no config, agent, forwarding, proxy or multiplexing."""
+    return ['/usr/bin/ssh', '-F', '/dev/null', '-T', '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no',
+            '-o', 'GlobalKnownHostsFile=/dev/null',
+            '-o', 'UserKnownHostsFile=' + value['known_hosts'],
+            '-o', 'HostKeyAlias=' + value['host_key_alias'],
+            '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+            '-o', 'CertificateFile=none', '-o', 'PreferredAuthentications=publickey',
+            '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
+            '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no',
+            '-o', 'ClearAllForwardings=yes', '-o', 'ControlMaster=no',
+            '-o', 'ControlPath=none', '-o', 'ProxyCommand=none',
+            '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=1',
+            '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=1',
+            '-i', value['identity_file'], '-p', str(value['port']),
+            '-l', value['user'], value['address']]
+
+
 class SSHRestartTransport:
     """Endpoint and private key paths come from independent enrollment only.
 
@@ -117,30 +163,7 @@ class SSHRestartTransport:
         self._validate()
 
     def _validate(self):
-        value = self.enrollment
-        if (not isinstance(value, dict) or set(value) != {'host', 'address',
-                'port', 'user', 'host_key_alias', 'known_hosts',
-                'known_hosts_sha256', 'identity_file', 'seconds'}):
-            raise TransportError('invalid SSH enrollment')
-        for name in ('host', 'address', 'host_key_alias'):
-            if (not isinstance(value[name], str) or not re.fullmatch(
-                    r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', value[name])):
-                raise TransportError('invalid SSH endpoint')
-        if (value['user'] != 'ameesh-release' or type(value['port']) is not int
-                or not 1 <= value['port'] <= 65535
-                or type(value['seconds']) is not int or not 5 <= value['seconds'] <= 360
-                or not isinstance(value['known_hosts_sha256'], str)
-                or not re.fullmatch(r'[0-9a-f]{64}', value['known_hosts_sha256'])):
-            raise TransportError('invalid SSH transport policy')
-        for name in ('known_hosts', 'identity_file'):
-            if (not isinstance(value[name], str) or not value[name].startswith('/')
-                    or not re.fullmatch(r'/[A-Za-z0-9/_.~-]+', value[name])
-                    or '..' in Path(value[name]).parts):
-                raise TransportError('invalid enrolled SSH path')
-        if hashlib.sha256(protected_file(value['known_hosts'])).hexdigest() != value['known_hosts_sha256']:
-            raise TransportError('enrolled host key changed')
-        # Check permissions/size; never retain, log or forward the key bytes.
-        protected_file(value['identity_file'])
+        validate_enrollment(self.enrollment, 'ameesh-release')
 
     def perform(self, step, request):
         try:
@@ -157,21 +180,7 @@ class SSHRestartTransport:
                     or request['manifest_digest'] != protocol.identity(request['manifest'])):
                 raise TransportError('SSH action scope mismatch')
             value = self.enrollment
-            args = ['/usr/bin/ssh', '-F', '/dev/null', '-T', '-o', 'BatchMode=yes',
-                    '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no',
-                    '-o', 'GlobalKnownHostsFile=/dev/null',
-                    '-o', 'UserKnownHostsFile=' + value['known_hosts'],
-                    '-o', 'HostKeyAlias=' + value['host_key_alias'],
-                    '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
-                    '-o', 'CertificateFile=none', '-o', 'PreferredAuthentications=publickey',
-                    '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
-                    '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no',
-                    '-o', 'ClearAllForwardings=yes', '-o', 'ControlMaster=no',
-                    '-o', 'ControlPath=none', '-o', 'ProxyCommand=none',
-                    '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=1',
-                    '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=1',
-                    '-i', value['identity_file'], '-p', str(value['port']),
-                    '-l', value['user'], value['address']]
+            args = ssh_args(value)
             wire = {key: request[key] for key in ('operation', 'action_id', 'step', 'manifest_digest')}
             output = exchange(args, json.dumps(wire, sort_keys=True).encode(), value['seconds'])
             receipt = json.loads(output, object_pairs_hook=unique_object)

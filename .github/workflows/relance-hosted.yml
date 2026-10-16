@@ -24,6 +24,14 @@
 # concurrence sérialise en plus les gardes d'une même exécution, pour que deux
 # événements (tentative 1 puis 2) ne se croisent pas.
 #
+# #2119 : `paquet.yml` appelle cette suite par `workflow_call` (portier §12).
+# GitHub n'émet pas d'événement `workflow_run` pour le workflow réutilisable
+# appelé : l'exécution terminée est celle de « paquet ». Sans ce nom dans la
+# liste, un job hébergé annulé faute de runner dans un paquet n'est jamais
+# relancé, et son check requis y reste rouge par capacité, pas par code
+# (discussion community 72631). La décision du script, elle, est générique sur
+# les jobs du run : aucun nom de workflow n'y est en dur.
+#
 # Ce workflow s'exécute depuis la branche par défaut (le fichier doit y être
 # pour que `workflow_run` se déclenche) ; `actions/checkout` y prend donc le
 # code de la branche par défaut, jamais celui de la PR : le jeton `actions:
@@ -34,7 +42,7 @@ name: relance hosted
 
 on:
   workflow_run:
-    workflows: ["tests"]
+    workflows: ["tests", "paquet"]
     types: [completed]
 
 permissions:

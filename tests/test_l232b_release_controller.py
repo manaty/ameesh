@@ -147,6 +147,25 @@ class ControllerTest(unittest.TestCase):
                 self.run_release(operation, manifest)
         self.assertEqual(self.host.effects, ['prepare'])
 
+    def test_changed_manifest_or_foreign_journal_leaves_no_orphan_reservation(self):
+        self.assertEqual(self.run_release(), 'accepted')
+        changed = dict(self.manifest, commit='c' * 40, release='c' * 40 + '-' + 'b' * 64)
+        with self.assertRaisesRegex(controller.ControllerError, 'manifest changed'):
+            self.run_release('release-1', changed)
+        # The refusal happened before the host reservation: the next operation
+        # is not blocked by a reservation nobody owns.
+        self.assertFalse((self.root / 'test-host.active.json').exists())
+        self.assertEqual(self.run_release('release-2'), 'accepted')
+
+    def test_reserved_readiness_operation_never_replaces_the_service_document(self):
+        readiness = self.root / 'readiness.json'
+        readiness.write_text('{"ready": true}')
+        with self.assertRaisesRegex(controller.ControllerError, 'reserved operation'):
+            self.run_release('readiness')
+        self.assertEqual(readiness.read_text(), '{"ready": true}')
+        self.assertFalse((self.root / 'test-host.active.json').exists())
+        self.assertEqual(self.run_release('release-2'), 'accepted')
+
     def test_revocation_between_actions_blocks_before_migration(self):
         self.host.before = lambda step: self.authority.denied.add('migrate') if step == 'fence' else None
         with self.assertRaisesRegex(controller.ControllerError, 'authority denied'):

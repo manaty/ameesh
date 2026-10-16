@@ -991,6 +991,8 @@ class Enforcer:
         self.freeze_unit = freeze_unit(cfg.slice)
         self.jobs_stopped = False        # the drain's deadline is past: jobs stopped
         self.guest_stopped = False       # level 4: slice killed and stopped
+        #: UIDs whose user manager a level 4 stop owes (retried while it fails)
+        self._user_uids: set[str] = set()
         #: why this slice is never touched (system slice, holds the guard)
         self.refused = refused_slice(cfg.slice, cgroup)
         #: the freeze episode: its since_ts, the boot, and its bound on the
@@ -1181,12 +1183,37 @@ class Enforcer:
     def stop_guest(self) -> bool:
         """Level 4: kills the agents' units and the jobs (`systemctl kill`,
         aimed at the units: not every systemd kills a slice), then stops the
-        slice, its units with it. Done once both succeeded (a unit pattern
-        that matches nothing is not a failure)."""
+        slice, its units with it.
+
+        Level 4 also stops the user slice of the users owning the agents
+        (`user-<uid>.slice`): the guest's user manager lives there (linger is
+        needed by rootless Podman; a job may also start a unit with
+        `systemd-run --user`), outside the guest slice, and a process a job
+        left there survives a stop of the guest slice alone (R2 N2, #1416).
+        The managers that were running are recorded, so the restart starts
+        them again with the guest. Done once the kill, the guest stop and
+        every user stop succeeded (a pattern that matches nothing is not a
+        failure)."""
         running = self.agent_units(running=True)
+        # a manager whose stop failed is kept: the retry finds the agent
+        # units already gone and would otherwise return success without it
+        uids = self._user_uids = self._user_uids | {
+            uid for uid in (self._unit_uid(u) for u in running) if uid}
         killed = self._systemctl("kill", "--signal=SIGKILL", self.cfg.agent_units,
                                  self.cfg.job_units)
         stopped = self._systemctl("stop", self.cfg.slice)
+        users, users_ok = [], True
+        for uid in sorted(uids):
+            manager = "user@%s.service" % uid
+            # Session scopes can still occupy the user slice when its manager
+            # is inactive. Always stop the slice, but only restart a manager
+            # this stop actually found running.
+            manager_active = self._unit_active(manager)
+            if self._systemctl("stop", "user-%s.slice" % uid):
+                if manager_active:
+                    users.append(manager)
+            else:
+                users_ok = False
         boot = self.boot_id()
         # a record of an earlier boot is moot (systemd started what it
         # enables): a stop in this boot starts its own, else its units
@@ -1199,8 +1226,9 @@ class Enforcer:
         # stopped never moves it (codex #267 r1)
         mono = self.monotonic()
         record["units"] = dict(record["units"], **{u: mono for u in running})
+        record["units"].update({u: mono for u in users})
         self.stopped = record
-        return killed and stopped
+        return killed and stopped and users_ok
 
     def restore_stopped(self, record: Any) -> None:
         """The units a previous guard stopped (`guard.stopped`). The format
@@ -1227,6 +1255,28 @@ class Enforcer:
         if proc.returncode != 0:
             return {}
         return dict(line.partition("=")[::2] for line in proc.stdout.splitlines() if "=" in line)
+
+    def _unit_uid(self, unit: str) -> str | None:
+        """UID of the unit's main process (`systemctl show`), None when there
+        is none (inactive unit, unreadable property, root): level 4 only
+        reaches the user slices of real guest users."""
+        try:
+            proc = self.run(["systemctl", "show", "--property=UID", "--value", unit],
+                            capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        uid = (proc.stdout or "").strip()
+        return uid if proc.returncode == 0 and uid.isdigit() and uid != "0" else None
+
+    def _unit_active(self, unit: str) -> bool:
+        """The unit is active right now (`systemctl is-active --quiet`): a
+        manager that was not running is neither stopped nor started again."""
+        try:
+            proc = self.run(["systemctl", "is-active", "--quiet", unit],
+                            capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
 
     def restart_stopped(self, now: float) -> dict:
         """Starts again, once, the agent units the guard stopped itself: not

@@ -128,6 +128,17 @@ class PauseTest(PgTestCase):
             "'ameesh_operator_pause(text,boolean,text,text,text)'::regprocedure")[0]
         self.assertEqual(row, {"prosecdef": False, "public_exec": False})
 
+    def test_sql_entrypoint_stores_the_trimmed_reason(self):
+        # N2 de la R2 qa-01 (#1533) : la validation portait sur trim(p_reason)
+        # mais la valeur brute était stockée ; un appel SQL direct écrivait une
+        # raison avec des espaces de bord. La migration 0454 normalise.
+        rows = self.db.query("SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",
+                             ("worker", True, "   maintenance   ",
+                              "human:alice", "human:alice"))
+        self.assertTrue(rows[0]["changed"])
+        self.assertEqual(registry.get(self.db, "worker")["operator_pause_reason"], "maintenance")
+        self.assertEqual(self.events()[0]["reason"], "maintenance")
+
     def test_operator_resume_wakes_the_runner_after_commit(self):
         name = self.schema
         registry.upsert(self.db, name, harness="deepseek", host=self.cfg.host)
@@ -163,6 +174,9 @@ class PauseTest(PgTestCase):
         threading.Thread.__init__(worker)
         worker.db, worker.name = self.db, "worker"
         worker.stopping = threading.Event()
+        # #1533 : la pause sert aussi le passage L232a (maybe_relocate) ; sans
+        # drainage demandé, il ne réserve rien et n'arrête pas le worker.
+        worker.runner = mock.Mock(mediated=False, relocate=False)
         with mock.patch.object(worker, "budget_ok", side_effect=AssertionError("budget called")):
             self.assertIsNone(worker._pick())
         self.assertFalse(worker.stopping.is_set())
@@ -233,6 +247,21 @@ class PauseTest(PgTestCase):
                         env=self.env(AGENT_MAIL_NAME="worker", AMEESH_RUNNER_ID="stale-runner",
                                      AMEESH_LEASE_EPOCH="99"))
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+
+    def test_cli_failure_names_the_requested_gesture_on_resume_too(self):
+        # N3 de la R2 qa-01 (#1533) : l'échec d'un « resume --operator »
+        # s'annonçait « ameesh operator pause », un préfixe trompeur.
+        for argv, expected in ((("pause", "worker"), "ameesh operator pause: "),
+                               (("resume", "worker", "--operator"),
+                                "ameesh operator resume: ")):
+            with self.subTest(argv=argv):
+                out = self.mesh(*argv, "--reason", "maintenance", "--human", "human:alice",
+                                env=self.env(AGENT_MAIL_NAME="worker",
+                                             AMEESH_RUNNER_ID="stale-runner",
+                                             AMEESH_LEASE_EPOCH="99"))
+                self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+                self.assertIn(expected, out.stderr)
         self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
 
     def test_real_runner_keeps_work_queued_then_runs_after_operator_resume(self):

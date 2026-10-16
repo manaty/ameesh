@@ -629,6 +629,49 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.sync()
         self.assertEqual(len(self._sujets("orchestre")), 1)
 
+    def test_deux_synchros_concurrentes_poussent_une_seule_fois(self):
+        # #793: two syncs of the host read the same previous state before
+        # either records the new commit; the rules go out once
+        self.sync()
+        stale = canon_sync.state(self.db, "atelier", canon.load(self.clone))
+        self._change("# Processus de lot\n\n- la règle nouvelle\n")
+        with mock.patch.object(canon_sync, "state", lambda *a, **k: dict(stale)):
+            first = self.sync()
+            second = self.sync()
+        self.assertEqual(len(self._sujets("orchestre")), 1)
+        self.assertGreater(first.processes.sent, 0)
+        self.assertEqual((second.processes.sent, second.processes.changed), (0, []))
+
+    def test_perdant_ancien_ne_rearme_pas_un_envoi_plus_recent(self):
+        # R2 #793 : A/B lisent X ; A pousse Y, C pousse Z, puis B perd
+        # son CAS mais record_state(Y) termine après record_state(Z).
+        self.sync()
+        stale = canon_sync.state(self.db, "atelier", canon.load(self.clone))
+        self._change("# Processus de lot\n\n- règle Y\n")
+        revision_y = canon.load(self.clone)
+        self.sync()
+        self._change("# Processus de lot\n\n- règle Z\n")
+        revision_z = canon.load(self.clone)
+        self.sync()
+        with mock.patch.object(canon_sync, "state", lambda *a, **k: dict(stale)):
+            loser = canon_sync.sync_processes(self.db, revision_y, "atelier", ["orchestre"])
+        self.assertEqual(loser.sent, 0)
+        canon_sync.record_state(self.db, "atelier", "ok", "", revision_y)
+        again = canon_sync.sync_processes(self.db, revision_z, "atelier", ["orchestre"])
+        self.assertEqual(again.sent, 0)
+        self.assertEqual(len(self._sujets("orchestre")), 2)
+
+    def test_un_ancien_commit_ne_repousse_pas_des_regles_perimees(self):
+        self.sync()
+        self._change("# Processus de lot\n\n- règle Y\n")
+        revision_y = canon.load(self.clone)
+        self.sync()
+        self._change("# Processus de lot\n\n- règle Z\n")
+        self.sync()
+        old = canon_sync.sync_processes(self.db, revision_y, "atelier", ["orchestre"])
+        self.assertEqual(old.sent, 0)
+        self.assertEqual(len(self._sujets("orchestre")), 2)
+
     def test_une_modification_hors_process_ne_pousse_rien(self):
         self.sync()
         write(self.clone, "agents/ouvrier.md", fiche(
