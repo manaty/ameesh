@@ -1396,7 +1396,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         holder = storage.of(db).work.migration_landed_holder(*landed)
         raise WorkError(_landed_taken(landed[0], landed[1], holder, cfg)) from exc
     if landed is not None and done["result"] == "already":
-        # A merge sweep may have closed the lot after our initial read.
+        # un balayage a pu fusionner le lot après notre lecture : le numéro
+        # déclaré est enregistré (ou corrige celui déjà tenu) après coup
         return _record_landed(db, done["item"], landed, actor=actor, cfg=cfg)
     if done["result"] == "refused":
         item = done["item"]
