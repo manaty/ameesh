@@ -36,6 +36,12 @@ class AutoGh(FakeGh):
                 return subprocess.CompletedProcess(args, 1, "", self.disable_error)
             self.auto = False
             return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["pr", "list"] and "--state" in args and "merged" in args:
+            # #1682 : le faux `gh` ne modelise que la PR ouverte ; par defaut
+            # aucune PR fusionnee — un desarmement qui echoue n'est pas une
+            # fusion (les temoins de la fenetre posent `merged` eux-memes).
+            self.calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "[]", "")
         if args[:2] == ["pr", "list"]:
             proc = super().__call__(args, timeout=timeout)
             rows = json.loads(proc.stdout or "[]")

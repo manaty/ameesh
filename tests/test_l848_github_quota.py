@@ -16,7 +16,9 @@ propriétés du correctif, sans réseau ni base :
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import gc
 import io
 import json
 import os
@@ -203,6 +205,87 @@ class SharedReadsTest(unittest.TestCase):
         self.assertEqual(reads.quota("graphql")["remaining"], 0)
         self.assertEqual(sorted(reads.quotas()), ["core", "graphql"])
 
+    # -- N1, N3, N4 de la relecture Claude (#848) --------------------------
+
+    def test_lecture_ne_cree_aucun_dossier(self):
+        """N1 : une construction ou une lecture ne crée rien ; le cache naît
+        à sa première écriture, et la vue ne fabrique aucun chemin."""
+        github = os.path.join(self.dir.name, plan_github.READS_DIR)
+        reads = self.reads()
+        self.assertFalse(os.path.exists(github))
+        self.assertIsNone(reads.cached("repos/o/r"))
+        self.assertEqual(reads.quotas(), {})
+        self.assertEqual(reads.counters(), {})
+        self.assertEqual(plan_github.quota_stats(self.dir.name),
+                         {"quota": {}, "counters": {}})
+        self.assertFalse(os.path.exists(github), "une lecture a créé un dossier")
+        reads.store("repos/o/r", {"id": 1})
+        self.assertTrue(os.path.isdir(os.path.join(github, "reads")))
+
+    def test_state_dir_vide_refuse(self):
+        """N1 : un état vide est refusé, jamais transformé en `None/github`."""
+        for empty in (None, "", "   "):
+            with self.subTest(state_dir=empty):
+                with self.assertRaises(ValueError):
+                    plan_github.SharedReads(empty)
+        self.assertEqual(plan_github.quota_stats(None),
+                         {"quota": {}, "counters": {}})
+        self.assertEqual(plan_github.quota_stats(""), {"quota": {}, "counters": {}})
+
+    def test_compteurs_agreges_puis_ecrits_une_fois(self):
+        """N3 : aucun verrou ni écriture par hit ; une écriture au passage."""
+        reads = self.reads()
+        writes: list = []
+        real = plan_github._atomic_write
+
+        def spy(path, data):
+            writes.append(path)
+            return real(path, data)
+
+        with mock.patch.object(plan_github, "_atomic_write", spy):
+            for _ in range(5):
+                reads.count("hits")
+            self.assertEqual(writes, [], "un hit de cache a écrit quota.json")
+            self.assertEqual(reads.counters()["hits"], 5)     # agrégé en mémoire
+            self.assertFalse(os.path.exists(reads._quota_path))
+            reads.flush()
+            self.assertEqual(writes, [reads._quota_path])     # une seule écriture
+            self.assertEqual(self.reads().counters()["hits"], 5)
+            reads.flush()                                     # rien de neuf
+            self.assertEqual(len(writes), 1)
+
+    def test_compteurs_du_passage_ecrits_a_la_fin(self):
+        """N3 : le passage terminé (objet libéré), les compteurs sont sur disque."""
+        reads = self.reads()
+        reads.count("hits", 2)
+        self.assertFalse(os.path.exists(reads._quota_path))
+        del reads
+        gc.collect()
+        self.assertEqual(self.reads().counters()["hits"], 2)
+
+    def test_cle_de_cache_par_base_et_jeton(self):
+        """N4 : deux jetons (ou deux bases) ne partagent pas la même entrée,
+        et le jeton n'apparaît nulle part dans le cache."""
+        one = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope(BASE, "jeton-a"))
+        two = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope(BASE, "jeton-b"))
+        one.store("repos/o/r", {"id": 1})
+        self.assertIsNotNone(one.cached("repos/o/r"))
+        self.assertIsNone(two.cached("repos/o/r"), "un autre jeton partage l'entrée")
+        other_base = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope("https://ghe.test", "jeton-a"))
+        self.assertIsNone(other_base.cached("repos/o/r"), "une autre base partage l'entrée")
+        token = "jeton-secret-n4"
+        scoped = plan_github.SharedReads(
+            self.dir.name, scope=plan_github.reads_scope(BASE, token))
+        scoped.store("repos/o/r2", {"id": 2})
+        reads_dir = os.path.join(self.dir.name, plan_github.READS_DIR, "reads")
+        for name in os.listdir(reads_dir):
+            self.assertNotIn(token, name, "le jeton est dans un nom de fichier")
+            with open(os.path.join(reads_dir, name), encoding="utf-8") as fh:
+                self.assertNotIn(token, fh.read(), "le jeton est dans le cache")
+
 
 class ApiTest(unittest.TestCase):
     def setUp(self):
@@ -235,6 +318,18 @@ class ApiTest(unittest.TestCase):
         self.assertEqual((counters["requests"], counters["not_modified"],
                           counters["hits"]), (2, 1, 1))
         self.assertEqual(api.reads.quota()["remaining"], 4999)
+
+    def test_deux_jetons_ne_partagent_pas_le_cache(self):
+        """N4 : la clé du cache porte la base et une empreinte du jeton."""
+        first = plan_github.Api(token="jeton-a", base=BASE, cache_dir=self.dir.name,
+                                ttl=60, clock=self.clock, opener=self.gh)
+        self.assertEqual(first.get("repos/o/r"), {"id": 1, "name": "r"})
+        self.assertEqual(self.gh.calls, ["repos/o/r"])
+        second = plan_github.Api(token="jeton-b", base=BASE, cache_dir=self.dir.name,
+                                 ttl=60, clock=self.clock, opener=self.gh)
+        self.assertEqual(second.get("repos/o/r"), {"id": 1, "name": "r"})
+        self.assertEqual(len(self.gh.calls), 2,
+                         "un autre jeton a été servi par le cache du premier")
 
     def test_quota_epuise_sert_le_cache_puis_attend_le_reset(self):
         api = self.api()
@@ -306,9 +401,10 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(reads.counters()["not_modified"], 1)
 
 
-class ClientIsolationTest(unittest.TestCase):
-    """#1405 : le cache isole les clients, retient la ressource du chemin et
-    la limite secondaire (N1-N3 de la R2 bureau de #848)."""
+class ResourceAndSecondaryLimitTest(unittest.TestCase):
+    """#1405 : le cache retient la ressource du chemin et la limite
+    secondaire, et repaie une entrée illisible (N2-N3 de la R2 bureau de
+    #848 ; la clé par client, N1, est celle de #1790 : `reads_scope`)."""
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -323,43 +419,17 @@ class ClientIsolationTest(unittest.TestCase):
         return plan_github.Api(token=token, base=base, reads=reads, ttl=60,
                                clock=self.clock, opener=self.gh)
 
-    def test_un_jeton_ne_sert_pas_lautre(self):
-        """N1 : la clé du cache porte le client (base, jeton), jamais le jeton."""
-        first, other = self.api(), self.api(token="other-token")
-        self.assertEqual(first.get("repos/o/r"), {"id": 1})
-        self.assertEqual(other.get("repos/o/r"), {"id": 1})
-        self.assertEqual(len(self.gh.calls), 2)          # pas servi de l'autre
-        self.assertEqual(self.api().get("repos/o/r"), {"id": 1})
-        self.assertEqual(len(self.gh.calls), 2)          # même client : partagé
-        self.assertNotEqual(first.scope, other.scope)
-        self.assertNotEqual(first.scope, self.api(base="https://ghe.test/api/v3").scope)
-        reads_dir = os.path.join(first.reads.root, "reads")
-        for name in os.listdir(reads_dir):
-            with open(os.path.join(reads_dir, name), encoding="utf-8") as fh:
-                text = fh.read()
-            self.assertNotIn("secret-token", text)
-            self.assertNotIn("other-token", text)
-
-    def test_repli_gh_isole_du_jeton(self):
-        """N1 : le repli `gh` ne lit pas l'entrée du client à jeton."""
-        reads = plan_github.SharedReads(self.dir.name, clock=self.clock, ttl=60)
-        reads.store("repos/o/r", {"id": "jeton"}, scope=self.api().scope)
-        gh = FakeGh()
-        api = plan_github.GhApi(gh, reads=reads, ttl=60, clock=self.clock)
-        self.assertEqual(api.get("repos/o/r")["visibility"], "private")
-        self.assertEqual(len(gh.calls()), 1)
-
     def test_entree_illisible_repayee(self):
         """Une date illisible dans une entrée ne fait pas échouer la lecture."""
         api = self.api()
         api.get("repos/o/r")
-        path = api.reads._entry_path("repos/o/r", api.scope)
+        path = api.reads._entry_path("repos/o/r")
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         data["read_ts"] = "abc"
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
-        self.assertIsNone(api.reads.cached("repos/o/r", scope=api.scope))
+        self.assertIsNone(api.reads.cached("repos/o/r"))
         self.assertEqual(api.get("repos/o/r"), {"id": 1})
         self.assertEqual(len(self.gh.calls), 2)
 
@@ -490,7 +560,7 @@ class ReaderStaleTest(unittest.TestCase):
             reads = plan_github.SharedReads(directory, clock=wall, ttl=60)
             api = plan_github.Api(token="t", base=BASE, reads=reads, ttl=60,
                                   clock=wall, opener=self._no_network)
-            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=1.0, scope=api.scope)
+            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=1.0)
             reads.note(quota_headers(remaining="0", reset=100000),
                        status=403, now=wall.now)
             reader, value = self._reader(directory, wall, api)
@@ -505,7 +575,7 @@ class ReaderStaleTest(unittest.TestCase):
             reads = plan_github.SharedReads(directory, clock=wall, ttl=60)
             api = plan_github.Api(token="t", base=BASE, reads=reads, ttl=60,
                                   clock=wall, opener=self._no_network)
-            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=990.0, scope=api.scope)
+            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=990.0)
             reader, value = self._reader(directory, wall, api)
             self.assertEqual(value, {"id": 1})
             self.assertEqual(reader.stamp("repos/o/r"), 990.0)
@@ -614,6 +684,68 @@ class DataclassCompatTest(unittest.TestCase):
         config = plan_github.Settings(projects={"a": "o/a"}, host="h")
         with self.assertRaises(dataclasses.FrozenInstanceError):
             config.ci_ttl = 1
+
+
+class JsonReportTest(unittest.TestCase):
+    """N2 #848 : la vue JSON de `ameesh ci status` dit les lectures partagées."""
+
+    def _run(self, cfg):
+        args = SimpleNamespace(json=True, id=7, limit=5)
+        out = io.StringIO()
+        with mock.patch.object(
+                ci, "status_of",
+                lambda db, item_id, limit=5: {"id": item_id, "runs": []}), \
+                mock.patch("ameesh.db.open_db", lambda cfg: None), \
+                contextlib.redirect_stdout(out):
+            code = ci.cmd_ci(cfg, args)
+        return code, json.loads(out.getvalue())
+
+    def test_json_porte_les_lectures_partagees(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reads = plan_github.SharedReads(directory)
+            reads.note(quota_headers(remaining="4997"), status=200)
+            reads.count("hits", 2)
+            reads.flush()
+            code, report = self._run(SimpleNamespace(state_dir=directory))
+            self.assertEqual(code, 0)
+            self.assertEqual(report["github_reads"]["counters"]["requests"], 1)
+            self.assertEqual(report["github_reads"]["counters"]["hits"], 2)
+            self.assertEqual(report["github_reads"]["quota"]["core"]["remaining"], 4997)
+
+    def test_json_sans_etat_ne_fabrique_pas_de_chemin(self):
+        code, report = self._run(SimpleNamespace(state_dir=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(report["github_reads"], {"quota": {}, "counters": {}})
+
+
+class RateLimitedPropagationTest(unittest.TestCase):
+    """N5 #848 : un quota épuisé n'est plus avalé par la découverte ni la garde."""
+
+    def setUp(self):
+        self.cfg = SimpleNamespace(host="h", state_dir="/state",
+                                   github={"projects": {"a": "o/a"}, "host": "h"})
+
+    def test_decouverte_ne_masque_pas_le_quota(self):
+        def api(path):
+            raise plan_github.GithubRateLimited(path, 1000)
+
+        watcher = ci.Watcher(self.cfg, api=api)
+        with self.assertRaises(plan_github.GithubRateLimited):
+            watcher.discovered_workflows("o/a")
+        self.assertEqual(watcher._workflows_cache, {},
+                         "un quota épuisé est gardé comme « pas de workflow »")
+
+    def test_garde_ne_masque_pas_le_quota(self):
+        logs: list = []
+        watcher = ci.Watcher(self.cfg, api=lambda path: {}, log=logs.append)
+
+        def guard_state(db, repo):
+            raise plan_github.GithubRateLimited(repo, 1000)
+
+        watcher._guard_state = guard_state
+        with self.assertRaises(plan_github.GithubRateLimited):
+            watcher._guard(None, "o/a")
+        self.assertEqual(logs, [], "le quota est journalisé comme échec de garde")
 
 
 if __name__ == "__main__":

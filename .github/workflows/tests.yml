@@ -16,7 +16,8 @@
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
-#               6 parts, sur push vers main ou release/**, sur une PR de
+#               9 parts (#1692 : 6 → 9, parts de ~30 min sous saturation), sur
+#               push vers main ou release/**, sur une PR de
 #               release (sans liste pilote), à la main (workflow_dispatch) et
 #               sur l'appel du portier de paquet (workflow_call).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
@@ -150,9 +151,23 @@ env:
 # asks for `ameesh-ci`, as before. The routing only picks the runner: no
 # `if:`, no part, no required check depends on it, and no hosted runner is
 # ever added (a fork PR keeps ubuntu-latest, as before). The job-level
-# expression is the same everywhere (tests/test_1468_ci_prio.py);
+# expression is the same everywhere (tests/test_1468_ci_prio.py), sauf
+# `bilan` qui porte en plus le repli prêté de #1256 ci-dessous ;
 # docs/EXPLOITATION.md, « Runners prioritaires », gives the activation and
 # rollback steps; scripts/ci-queue-wait.py measures the queue wait per class.
+#
+# Borrowed capacity (lot #1256, option A of the R2 B1 arbitration): a lending
+# host runs SINGLE-USE runners under the DISTINCT label `ameesh-lent`, never
+# `ameesh-ci`, so no job of the fleet — in particular the required check
+# `tests` and everything it needs — can land there. Only a job that is not
+# the required check, is not needed by it, holds no write permission and
+# feeds nothing the required path reads may target that label; the admissible
+# list and the residual risk are in deploy/guest/PILOT-ci-nexlink.md §3.
+# `vars.AMEESH_LENT_RUNS_ON` is set to `["self-hosted","linux","ameesh-lent"]`
+# only while a loan is armed (a single-use configuration deposited and the
+# slot armed); unset, the job stays on the fleet. The one job routed below
+# (`bilan`, after the priority pool of #1468) is `continue-on-error` and is
+# NOT in the `needs` of `tests`.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # lot PR only; merge commit against its target), the branch context
@@ -178,6 +193,13 @@ jobs:
       psql: ${{ steps.plan.outputs.psql }}
       psql_parts: ${{ steps.plan.outputs.psql_parts }}
       release: ${{ steps.release.outputs.release }}
+      # the digest of the uploaded plan.json, read by every required consumer
+      # before it runs a part: the run's runtime token also serves the
+      # artifact API, so a job of the borrowed label could delete and replace
+      # this artifact before a "re-run failed jobs" (R1 Claude B4, #1256).
+      # A job output is written by this job alone and cannot be rewritten by
+      # another one, so it is the reference the parts check against.
+      plan_sha256: ${{ steps.plan_digest.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -220,6 +242,9 @@ jobs:
           case "$BASE_REF" in release/*) release=true ;; esac
           case "$HEAD_REF" in release/*) release=true ;; esac
           echo "release=$release" >> "$GITHUB_OUTPUT"
+      - id: plan_digest
+        name: empreinte du plan (canal artefacts, #1256 B4)
+        run: echo "sha256=$(sha256sum plan.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: plan
@@ -341,6 +366,15 @@ jobs:
         with:
           name: plan
           path: ${{ runner.temp }}
+      - &plan_empreinte
+        name: le plan téléchargé est celui du plan (empreinte, #1256 B4)
+        run: |
+          # the run's runtime token also serves the artifact API, and a job of
+          # the borrowed label runs after `plan`: it could delete this
+          # artifact and publish a forged one before a "re-run failed jobs".
+          # The digest comes from the plan job's own output, which no other
+          # job can rewrite; a part that does not match runs nothing.
+          echo "${{ needs.plan.outputs.plan_sha256 }}  $RUNNER_TEMP/plan.json" | sha256sum -c -
       - &publier
         name: publication du flux en direct (check run)
         env:
@@ -382,8 +416,9 @@ jobs:
     # #880 : sur une PR, la part psql est une seule part « pilote » ; mesurée
     # 21,7-26,1 min au repos et 30,4-31,0 min sous saturation (8/8 runners),
     # elle était annulée par le plafond de 30 min sans échec de test (PR #640,
-    # run 38381239685). 45 min laisse la marge sous charge et reste un plafond
-    # borné (§3 du processus de lot : aucun job ne retient un runner des heures).
+    # run 38381239685). 60 min laisse la marge sous charge (#1251 : 45 → 60) et
+    # reste un plafond borné (§3 du processus de lot : aucun job ne retient un
+    # runner des heures).
     # psycopg garde 30 min : ses parts tournent en 6-8 min, même à 3× plus lent
     # elles tiennent dans le plafond.
     timeout-minutes: 60
@@ -394,8 +429,8 @@ jobs:
         # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
         # une part, deux ou trois selon l'estimation (scripts/test-plan.py,
         # lot_part_count), trois au plus (#947 : sous saturation, une part
-        # unique atteignait le plafond de 30 min) ; suite complète en 6 parts
-        # sur push et sur une PR de release (sans liste pilote).
+        # unique atteignait le plafond de 30 min) ; suite complète en 9 parts
+        # (#1692) sur push et sur une PR de release (sans liste pilote).
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
@@ -428,6 +463,7 @@ jobs:
       - *base
       - *git
       - *plan
+      - *plan_empreinte
       - *publier
       - name: part ${{ matrix.part }}
         run: >-
@@ -530,6 +566,7 @@ jobs:
       - *base
       - *git
       - *plan
+      - *plan_empreinte
       - name: racine temporaire sur l'autre classe de système de fichiers
         run: |
           set -eu
@@ -648,12 +685,28 @@ jobs:
         run: python -m unittest -v ${{ needs.plan.outputs.doc_readers }}
 
   # L161f : leaks (failures of modules the map did not select) and the
-  # provisional green, for the two-week review (L161i); never required
+  # provisional green, for the two-week review (L161i); never required.
+  # Its result gates nothing and nothing required reads what it produces, so
+  # it is the job this lot routes to the borrowed label when a loan is armed
+  # (option A, #1256; plan §3): a forged green here costs the two-week tally,
+  # never a required check.
   bilan:
     name: bilan des impactés
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # Union #1256 x #1468 : le pool prioritaire d'abord, puis l'hôte prêté
+    # quand un prêt est armé, puis la flotte ordinaire. `bilan` est hors de la
+    # clôture du check requis (tests/test_1256_ci_runners.py), seul job routé
+    # du workflow avec `ui.yml/ui` ; c'est le seul job Linux dont l'expression
+    # diffère de celle des autres (tests/test_1468_ci_prio.py).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # Cache access is closed for a job that may run on the borrowed host: the
+    # cache service scopes the run's runtime token from this declaration, and
+    # `permissions:` does not bound it (R1 Codex B3, #1256). `none` here: this
+    # job reads no cache. A write mode is forbidden on every routed job — it
+    # could otherwise publish a `carte-*` or `.venv-ci` entry that `plan` and
+    # the psycopg parts restore, poisoning required checks.
+    cache-mode: none
     timeout-minutes: 5
     continue-on-error: true
     steps:

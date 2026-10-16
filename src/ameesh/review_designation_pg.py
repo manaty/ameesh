@@ -170,14 +170,14 @@ class PgPort:
             return self._write(self.db, lot, freeze=freeze, required=required,
                                state=state, reviewers=reviewers, missing=missing,
                                why=why, authors=authors, policy_ref=policy_ref,
-                               notify=notify, messages=messages)
+                               notify=notify, messages=messages, hook=True)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads)
         with self.db.transaction() as tx:
             out = inner._write(tx, lot, freeze=freeze, required=required, state=state,
                                reviewers=reviewers, missing=missing, why=why,
                                authors=authors, policy_ref=policy_ref, notify=notify,
-                               messages=messages)
+                               messages=messages, hook=False)
         # le fil externe après le commit seulement : un envoi annulé n'y laisse rien
         for record in threads:
             record(self.db.cfg, self.db)
@@ -185,7 +185,7 @@ class PgPort:
 
     def _write(self, db, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str, authors,
-               policy_ref: str, notify: str, messages) -> dict:
+               policy_ref: str, notify: str, messages, hook: bool) -> dict:
         freeze = dict(freeze or {})
         sha = str(freeze.get("sha") or "").strip().lower()
         try:
@@ -203,13 +203,6 @@ class PgPort:
             raise StaleFreeze(
                 "freeze #%d (%s) of lot #%d is no longer the last: nothing written"
                 % (freeze_id, sha[:12] or "?", lot))
-        existing = self._recorded_in(db, lot, freeze_id)
-        # Une désignation est finale ; une attente ne se réécrit pas (une seule
-        # notification par gel) mais **cède** la place à la désignation quand la
-        # capacité revient : c'est le même gel, la marque suivante fait foi.
-        if existing is not None and (existing.get("state") == DESIGNATED
-                                     or state == WAITING):
-            return existing
         if state not in (DESIGNATED, WAITING):
             raise DesignationError("a designation is %s or %s, not %r"
                                    % (DESIGNATED, WAITING, state))
@@ -218,20 +211,52 @@ class PgPort:
             raise DesignationError("a designated review names its reviewers")
         if state == WAITING and reviewers:
             raise DesignationError("a waiting designation designates no reviewer")
-        threads = self.after_commit if self.after_commit is not None else []
-        for message in messages or ():
-            row = dict(message or {})
+        messages = [dict(message or {}) for message in messages or ()]
+        undelivered = []
+        for row in messages:
             recipient = str(row.get("to") or "").strip()
             if not recipient:
-                raise DesignationError(
-                    "no recipient for the %s of lot #%d: name the pilot (notify)"
-                    % (state, lot))
-            if registry.get(db, recipient) is None:
-                # un courrier à un nom inconnu ne réveille personne : le refus
-                # vaut mieux qu'une désignation qui ne parvient jamais
+                undelivered.append({"to": "", "reason": "no recipient"})
+            elif registry.get(db, recipient) is None:
+                undelivered.append({"to": recipient, "reason": "not in the registry"})
+        if undelivered:
+            if not hook:
+                # hors hook : le refus vaut mieux qu'une désignation qui ne
+                # parvient jamais (un courrier à un nom inconnu ne réveille
+                # personne), et rien n'est écrit
+                first = undelivered[0]
+                if not first["to"]:
+                    raise DesignationError(
+                        "no recipient for the %s of lot #%d: name the pilot (notify)"
+                        % (state, lot))
                 raise DesignationError(
                     "unknown recipient %r for the %s of lot #%d: nothing written"
-                    % (recipient, state, lot))
+                    % (first["to"], state, lot))
+            # #1634 — au gel (hook), lever annulerait le jalon `frozen` acquis.
+            # Le gel reste ; aucun courrier ne part, la marque est une attente
+            # (réessayable : une reprise hors hook désigne quand elle le peut)
+            # et le journal du lot dit quel destinataire manquait.
+            what = ", ".join("%s (%s)" % (u["to"] or "—", u["reason"]) for u in undelivered)
+            why = "%snotification undeliverable at freeze: %s" % (
+                (why + "; ") if why else "", what)
+            if state == DESIGNATED:
+                state, reviewers, missing = WAITING, [], int(required)
+            messages = []
+        existing = self._recorded_in(db, lot, freeze_id)
+        # Une désignation est finale ; une attente ne se réécrit pas (une seule
+        # notification par gel) mais **cède** la place à la désignation quand la
+        # capacité revient : c'est le même gel, la marque suivante fait foi.
+        if existing is not None and (existing.get("state") == DESIGNATED
+                                     or state == WAITING):
+            return existing
+        if undelivered:
+            ops.note(lot, str(rows[0].get("state") or ""),
+                     "désignation au gel #%d : notification non remise — %s. Gel conservé, "
+                     "aucun relecteur prévenu ; relancer la désignation hors hook avec un "
+                     "destinataire du registre." % (freeze_id, what), self.sender)
+        threads = self.after_commit if self.after_commit is not None else []
+        for row in messages:
+            recipient = str(row.get("to") or "").strip()
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
                       work_item_id=str(lot),
                       payload={"review_designation": {

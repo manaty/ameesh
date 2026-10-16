@@ -573,7 +573,7 @@ def _inside(target: str, real: str | None, is_dir: bool) -> bool:
 
 
 def holders(path: str | None, needle: str | None = None, exclude=(), *,
-            mapped: bool = False) -> list[dict]:
+            mapped: bool = False, allow=()) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
     `needle` sur la ligne de commande (hors argv[0] et hors les PID de
@@ -587,15 +587,24 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     utilisateur refuse la lecture de ses fichiers ouverts (non dumpable) sans
     être le gestionnaire de services, `NotAvailable` : une liste vide voudrait
     dire « personne ne tient la session », ce qui n'aurait pas été vérifié.
-    `path` None : `needle` seul, l'OS toujours exigé (L63b)."""
+    `path` None : `needle` seul, l'OS toujours exigé (L63b).
+
+    `allow` (L230) : noms des processus de l'utilisateur dont l'illisibilité
+    n'est PAS un doute — le choix explicite de l'owner de l'hôte, vide par
+    défaut ; le `comm` ET le nom de base d'`argv[0]` doivent s'y trouver
+    (même règle que `user_paths`), sinon le refus reste un doute. Un détenteur
+    CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste rapporté, même
+    si son nom est dans `allow` : l'allow ne lève que le doute, jamais une
+    observation."""
     real = os.path.realpath(path) if path else None
     is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
+    allow = frozenset(allow or ())
     ps = _psutil()
     if ps is not None:
-        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
+        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped, allow)
     if _proc_ok():
-        return _holders_proc(real, is_dir, needle, exclude, mapped)
+        return _holders_proc(real, is_dir, needle, exclude, mapped, allow)
     raise NotAvailable("file holders",
                        "neither psutil nor /proc to list open files")
 
@@ -678,12 +687,28 @@ def service_managers(uid: int | None = None) -> frozenset:
     return frozenset(out)
 
 
-def _doubt_proc(pid, uid: int, managers) -> str | None:
+def _allowed_proc(pid, allow) -> bool:
+    """L230 : le processus se nomme (`comm`) ET s'annonce (`argv[0]`) dans
+    `allow` — un nom emprunté ne blanchit pas un refus. Un `comm` vide ou un
+    `cmdline` illisible ne blanchit rien : le doute reste."""
+    if not allow:
+        return False
+    name = _read_text(os.path.join(PROC, str(pid), "comm")).strip()
+    try:
+        with open(os.path.join(PROC, str(pid), "cmdline"), "rb") as fh:
+            argv0 = fh.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return False
+    return bool(name) and name in allow and os.path.basename(argv0) in allow
+
+
+def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
     """L63b: why a process whose open files were denied leaves the answer
     unknown, read on /proc; None when it cannot hold anything of the user's:
     gone, a zombie (no files left), running as another user (effective uid:
-    a setuid helper such as sudo is root's), or the user's service manager
-    (`managers()`, by PID). An unreadable status is a doubt."""
+    a setuid helper such as sudo is root's), the user's service manager
+    (`managers()`, by PID), or a process named by `allow` (L230, `comm` and
+    `argv[0]`; an unreadable status is a doubt)."""
     try:
         status = _proc_status(pid)
     except OSError as exc:
@@ -695,13 +720,16 @@ def _doubt_proc(pid, uid: int, managers) -> str | None:
         return "%s (uid unreadable)" % pid
     if int(uids[1]) != uid or int(pid) in managers():
         return None
+    if _allowed_proc(pid, allow):
+        return None
     return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
 
 
-def _doubt_psutil(ps, pid: int, user) -> str | None:
+def _doubt_psutil(ps, pid: int, user, allow=()) -> str | None:
     """`_doubt_proc` off Linux, by psutil: gone or zombie, another user
-    (effective uid, or user name on Windows), or a system executable
-    (`SYSTEM_EXE_ROOTS`) is not a doubt; an unreadable answer is."""
+    (effective uid, or user name on Windows), a system executable
+    (`SYSTEM_EXE_ROOTS`), or a process named by `allow` (L230, name and
+    `argv[0]`) is not a doubt; an unreadable answer is."""
     try:
         proc = ps.Process(pid)
         if proc.status() == ps.STATUS_ZOMBIE or _owner(proc) != user:
@@ -717,6 +745,13 @@ def _doubt_psutil(ps, pid: int, user) -> str | None:
         return "%d (%s)" % (pid, type(exc).__name__)
     if exe.startswith(SYSTEM_EXE_ROOTS):
         return None
+    if allow:
+        try:
+            argv0 = proc.cmdline()[0]
+        except (ps.AccessDenied, ps.ZombieProcess, OSError, IndexError):
+            argv0 = ""
+        if name in allow and os.path.basename(str(argv0)) in allow:
+            return None
     return "%d %s" % (pid, name)
 
 
@@ -754,7 +789,7 @@ def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | Non
     return None
 
 
-def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False, allow=()) -> list[dict]:
     me = os.getpid()
     try:
         ps.Process(me).open_files()
@@ -767,10 +802,10 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
         uid, managers = os.getuid(), _once(service_managers)
 
         def doubt(pid):
-            return _doubt_proc(pid, uid, managers)
+            return _doubt_proc(pid, uid, managers, allow)
     else:
         def doubt(pid):
-            return _doubt_psutil(ps, pid, user)
+            return _doubt_psutil(ps, pid, user, allow)
     found = []
     doubts: dict = {}
     for proc in ps.process_iter():
@@ -851,7 +886,7 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
     return ""
 
 
-def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_proc(real, is_dir, needle, exclude, mapped=False, allow=()) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
@@ -905,10 +940,10 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
         if row:
             found.append(row)
         elif refused:
-            who = _doubt_proc(pid, uid, managers)
+            who = _doubt_proc(pid, uid, managers, allow)
             if who:
                 doubts[pid] = who
-    _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers))
+    _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow))
     return found
 
 
@@ -963,14 +998,44 @@ def _link(path: str) -> str:
     return target if target.startswith("/") else ""
 
 
+def _zombie(pid: int) -> bool:
+    """Le processus `pid` est-il un zombie (état `Z` de /proc/<pid>/stat) ?
+
+    Un zombie n'est plus qu'une entrée de table : il ne détient aucun fichier,
+    et ses liens `/proc` sont illisibles sans qu'il y ait un doute à avoir
+    (#1678, constat #1665 : un « timeout <defunct> » retenait tout le ménage
+    des worktrees). Un stat illisible (disparu, autre utilisateur) : False —
+    le doute ordinaire s'applique.
+
+    Le meneur d'un groupe dont un autre fil vit encore se lit aussi `Z` : il
+    n'est zombie que si tous ses fils (`/proc/<pid>/task`) le sont."""
+    try:
+        if _stat_fields(pid)[0] != "Z":
+            return False
+        tasks = os.listdir(os.path.join(PROC, str(int(pid)), "task"))
+        for tid in tasks:
+            path = os.path.join(PROC, str(int(pid)), "task", tid, "stat")
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    data = fh.read()
+            except FileNotFoundError:
+                continue   # fil disparu entre-temps
+            if data[data.rindex(")") + 2:].split()[0] != "Z":
+                return False
+        return bool(tasks)
+    except (OSError, IndexError, ValueError):
+        return False
+
+
 def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     """Where the processes of `uid` (default: this user) are, from `/proc`.
 
-    A process gone meanwhile is ignored. One that cannot be read (not
-    dumpable: setuid, file capabilities) is a doubt, unless its name (`comm`)
-    AND the base name of its `argv[0]` are both in `allow` or the service
-    manager: its `exe` link is unreadable too, its command line is not.
-    Without `/proc` (other OS), `available` is false."""
+    A process gone meanwhile is ignored, and so is a zombie (`_zombie`, #1678):
+    it holds nothing anymore. One that cannot be read (not dumpable: setuid,
+    file capabilities) is a doubt, unless its name (`comm`) AND the base name
+    of its `argv[0]` are both in `allow` or the service manager: its `exe` link
+    is unreadable too, its command line is not. Without `/proc` (other OS),
+    `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
@@ -986,6 +1051,9 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
             if os.lstat(base).st_uid != uid:
                 continue
         except OSError:
+            continue
+        if _zombie(int(pid)):
+            # plus un détenteur : ignoré comme un processus disparu (#1678)
             continue
         name = _read_text(os.path.join(base, "comm")).strip() or "?"
         who = "%s %s" % (pid, name)

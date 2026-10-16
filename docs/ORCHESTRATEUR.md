@@ -408,6 +408,27 @@ l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
 
+## Intégration par paquets §12 : contrôle d'inclusion avant le feu
+
+Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
+lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
+et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
+à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+
+```sh
+scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
+    --head origin/integration/paquet-23h-20261015 \
+    --expected-file "$TMPDIR/admissions-23h.txt"
+```
+
+Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
+composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
+ne suffit pas après un revert (#1638). Sans liste attendue, il sort `2`, sauf
+`--no-expected` qui assume le contrôle partiel. Un contenu *partiel* ou *vide*
+est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
+bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
+`docs/PAQUET-INCLUSION.md`.
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot
@@ -604,8 +625,9 @@ restée 4 h fusionnée sans être déployée :
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI, sober proofs (canon « Processus de lot » §§3, 6,
-   12) — and changes only through a reviewed commit.
+   packages, review before CI and no CI per lot between cuts, sober proofs
+   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
+   reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
    un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
    d'exécuteur du poste le lance dans une unité systemd distincte :
@@ -641,7 +663,18 @@ restée 4 h fusionnée sans être déployée :
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
    déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
-   `--release` libère. La réservation se lit dans `ameesh work show <lot>`
+   `--release` libère. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
+   branche au scan ignoré, en plus de celle du lot : à la composition d'un
+   paquet, la branche d'intégration porte déjà les fichiers renumérotés et
+   ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
+   numéro retenu par un autre lot reste refusé), et une branche de tronc
+   (`main`, `master`, `develop`, la branche par défaut d'`origin`) ne s'ignore
+   jamais. Un lot dont l'`issue_ref`
+   désigne un autre dépôt se corrige avant de réserver :
+   `ameesh work issue-ref <lot> owner/repo#N` (ou `--none` pour effacer),
+   réservé aux correcteurs comme `work set-app` et journalisé ; refusé tant
+   qu'une réservation est tenue dans l'ancien dépôt (`--release` d'abord). La réservation
+   se lit dans `ameesh work show <lot>`
    (ligne `migration`) et au journal du lot ; la description de la PR
    l'annonce.
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le

@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+from types import SimpleNamespace
 
 from . import plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -386,7 +387,9 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
     run on the exact head, green, its jobs included (`skipped`/`neutral`/unread
     jobs certify nothing). QueueError otherwise (no run, running, missing, red,
     unreadable); `full_ci` reads the runs (`radar.full_suite_ci` by default
-    when the project has a GitHub repo)."""
+    when the project has a GitHub repo). Une suite non **déclarée** est refusée
+    pour ce qu'elle est — la clé `radar.projects.<p>.full_suite` manquante —,
+    jamais comme une lecture gh impossible (#886)."""
     from . import plan_github, radar
     who = "lot #%s" % lot if lot is not None else "this lot"
     reader = full_ci
@@ -395,6 +398,14 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
             raise QueueError("%s is class release: no full-suite reader (project without a "
                              "GitHub repository) — a full run on the frozen head %s is required"
                              % (who, sha[:12]))
+        if not tuple(getattr(project, "full_suite", ()) or ()):
+            # #886 (P3, R2 mty-amh-qa-01 sur PR manaty/ameesh#633) : une
+            # déclaration manquante n'est pas une panne de lecture ; le message
+            # nomme la clé et ne renvoie pas à « once gh works ».
+            raise QueueError("%s is class release: project %s declares no full suite "
+                             "(radar.projects.%s.full_suite — the workflow files of the full "
+                             "run): a green full-suite run on the frozen head %s is required"
+                             % (who, project.name, project.name, sha[:12]))
         reader = lambda one: radar.full_suite_ci(project, one)
     try:
         runs = reader(sha)
@@ -940,6 +951,45 @@ def radar_project(cfg, repo: str):
     return matching[0] if matching else None
 
 
+def writer_project(cfg, repo: str, app: str = "", project=None):
+    """The project identity a single-lot writer shares with the train (#1703).
+
+    `land.lock_key` keys a target lease on `project.name`. A packet train holds
+    the key of the **declared** radar project of its repository, so the direct
+    merge path (`merge_pr.direct_merge`) must resolve that same identity,
+    never a parallel one: the declared project comes first, whatever the
+    admitted lot's `app` says. Without a declared project no train can run on
+    this host, and the lot's `app` is then the explicit identity already
+    carried by the queue — no repository key is invented here (#1680). An
+    empty app refuses: an anonymous writer would open a key space of its own.
+    """
+    if project is None:
+        project = radar_project(cfg, repo)
+    if project is not None:
+        return project
+    name = (app or "").strip()
+    if not name:
+        raise QueueError("cannot reserve an undeclared target project")
+    return SimpleNamespace(name=name)
+
+
+def working_clone(cfg, repo: str, project) -> tuple:
+    """Le clone où `queue add` lit les branches fraîches, et le temporaire à
+    retirer (`None` quand c'est le clone du radar).
+
+    Un passage de radar a son clone privé (`radar.clone_dir`) ; un poste agent
+    ou pilote n'en a pas, et la file doit pourtant s'ouvrir de là (§2 : le
+    pilote met un lot en file depuis son poste). On prête alors un clone
+    jetable du dépôt local (`--shared`), le temps de la commande : la lecture
+    reste fraîche (`fetch_fresh`), le dépôt des agents n'est jamais écrit, et
+    rien ne survit à la commande."""
+    from . import radar, resolutions
+    if project is not None:
+        return resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)), None
+    scratch = tempfile.mkdtemp(prefix="ameesh-queue-")
+    return resolutions.Replayer(repo, os.path.join(scratch, "clone")), scratch
+
+
 def run(cfg, db, args) -> int:
     import sys
     from . import radar, resolutions
@@ -947,10 +997,13 @@ def run(cfg, db, args) -> int:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
             project = radar_project(cfg, repo)
-            clone = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)) \
-                if project else None
-            row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
-                        clone=clone, cfg=cfg)
+            clone, scratch = working_clone(cfg, repo, project)
+            try:
+                row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
+                            clone=clone, cfg=cfg)
+            finally:
+                if scratch:
+                    shutil.rmtree(scratch, ignore_errors=True)
             print(json.dumps(row, ensure_ascii=False, indent=2, default=str) if args.json else
                   "lot #%d queued for %s at %s, class %s; the radar orders the queue at its "
                   "next pass" % (args.id, row["target"], row["frozen_sha"][:12],

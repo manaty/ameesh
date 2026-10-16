@@ -15,6 +15,7 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from unittest import mock
 
 from ameesh import db as db_mod
@@ -39,9 +40,19 @@ class PositionTest(unittest.TestCase):
                          "70001-12-6f3at00000001")
         self.assertEqual(events.parse_position(" 70001-12-6f3at00000001 "),
                          ((70001, 12), "6f3at00000001"))
+        # #928/F5: the identity carries the journal's own random identifier
+        journal = "6f3at00000001j0123456789abcdef"
+        self.assertEqual(events.format_position((70001, 12), journal),
+                         "70001-12-" + journal)
+        self.assertEqual(events.parse_position("70001-12-" + journal),
+                         ((70001, 12), journal))
         self.assertEqual(events.parse_position("1-2-none"), ((1, 2), events.UNKNOWN_CLUSTER))
         for bad in ("12", "a-1", "1-", "-1", "70001-12", "1-2-x", "1-2-3-4", "1-2-",
-                    "1-2-6f3a", "1-2-6f3at1", "1-2-%st00000001" % ("f" * 17), ""):
+                    "1-2-6f3a", "1-2-6f3at1", "1-2-%st00000001" % ("f" * 17), "",
+                    "1-2-6f3at00000001j0123",                 # journal too short
+                    "1-2-6f3at00000001j0123456789abcdeg",     # not hexadecimal
+                    "1-2-6f3at00000001x0123456789abcdef",     # wrong separator
+                    "1-2-6f3at00000001j0123456789abcdef0"):   # journal too long
             self.assertIsNone(events.parse_position(bad), bad)
 
     def test_out_of_range_is_refused(self):
@@ -120,6 +131,32 @@ class RunnerPruneTest(unittest.TestCase):
             self.assertEqual(runner.Runner.prune_events_once(fake, now=100.0 + 3600), 3)
         self.assertEqual(prune.call_count, 2)
 
+    def test_the_prune_runs_on_its_own_connection(self):
+        """#928/F6: the retention's transaction (up to PRUNE_MAX_S, with lock
+        and statement timeouts) must not hold the runner's shared connection,
+        on whose transaction lock the lease renewals wait."""
+        own, seen = mock.Mock(), []
+        fake = self.fake(cfg=object())
+        with mock.patch.object(runner.db_mod, "open_db", return_value=own) as opened, \
+                mock.patch.object(events, "prune",
+                                  side_effect=lambda db, **kw: seen.append(db) or 1), \
+                mock.patch.object(runner, "log_async"):
+            self.assertEqual(runner.Runner.prune_events_once(fake, now=1.0), 1)
+        opened.assert_called_once_with(fake.cfg)
+        self.assertEqual(seen, [own])          # never the runner's connection
+        own.close.assert_called_once()
+
+    def test_a_prune_connection_that_cannot_open_is_said_once(self):
+        fake = self.fake(cfg=object())
+        with mock.patch.object(runner.db_mod, "open_db",
+                               side_effect=db_mod.Unavailable("down")), \
+                mock.patch.object(events, "prune") as prune, \
+                mock.patch.object(runner, "log_async") as said:
+            self.assertIsNone(runner.Runner.prune_events_once(fake, now=1.0))
+            self.assertIsNone(runner.Runner.prune_events_once(fake, now=1.0 + 3600))
+        prune.assert_not_called()
+        self.assertEqual(said.call_count, 1)
+
     def test_dry_run_and_errors(self):
         with mock.patch.object(events, "prune") as prune:
             self.assertIsNone(runner.Runner.prune_events_once(self.fake(dry_run=True)))
@@ -168,7 +205,7 @@ class EventLogPgTest(PgTestCase):
         deadline = time.monotonic() + timeout
         unheld = 0
         while True:
-            rows, waiting = store.readable(position, limit)
+            rows, waiting, _pruned = store.readable(position, limit)
             got = [r["object"] for r in rows]
             if waiting is None:
                 self.assertEqual(got, expected)          # no skip, no loss
@@ -283,6 +320,20 @@ class EventLogPgTest(PgTestCase):
         with self.assertRaises(ValueError):
             events.prune(self.db, days=10)
 
+    def test_retention_follows_the_database_clock(self):
+        """#928/F6: the cutoff is the base's `now()`, the clock of the table's
+        own guard, not the host's. A host 400 days ahead used to aim the
+        whole deletion at recent events: the guard refused it and the
+        retention failed in full, on one runner out of two."""
+        self._empty()
+        self._old_event("alert:pa")
+        self._old_event("alert:pr", days=0)
+        ahead = time.time() + 400 * 86400.0
+        with mock.patch.object(events.time, "time", return_value=ahead):
+            self.assertEqual(events.prune(self.db, days=365), 1)
+        self.assertEqual(self._kept(), ["alert:pr"])
+        self.assertEqual(events.expired(self.db, days=365), 0)
+
     def test_prune_is_bounded(self):
         self._empty()
         for _ in range(5):
@@ -344,6 +395,45 @@ class EventLogPgTest(PgTestCase):
                 events.prune(self.db, days=365, max_s=1.0)
             self.assertLess(time.monotonic() - start, 5.0)
 
+    def test_two_overlapping_prunes_both_progress(self):
+        """#1711 (Codex N1 of #928): two pruners chose the same first batch;
+        the second waited on the first's rows, then found them gone and
+        deleted nothing — the runner said "expired event(s) left, none
+        deleted" while the other progressed. Locked when chosen, the batch
+        of the second skips the deleted rows and takes the next ones."""
+        self._empty()
+        for name in ("alert:pa", "alert:pb"):
+            self._old_event(name)
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        probe = db_mod.connect(self.cfg)
+        self.addCleanup(probe.close)
+        result = {}
+
+        def second():
+            try:
+                result["n"] = storage.of(self.db).events.prune(365, 1, 10.0)
+            except Exception as exc:  # noqa: BLE001 - reported below
+                result["error"] = exc
+
+        with other.transaction() as tx:
+            # the first pruner, its batch deleted and not yet committed
+            tx.execute("delete from ameesh_events where object = 'alert:pa'")
+            # the waiter is whoever this backend blocks (the psql driver
+            # opens a backend per statement: its pid is not known ahead)
+            first = int(tx.query("select pg_backend_pid() as p")[0]["p"])
+            worker = threading.Thread(target=second, daemon=True)
+            worker.start()
+            deadline = time.monotonic() + 10.0
+            while not probe.query("select 1 from pg_stat_activity"
+                                  " where %s = any(pg_blocking_pids(pid))", (first,)):
+                self.assertLess(time.monotonic(), deadline, "the second pruner never waited")
+                time.sleep(0.05)
+        worker.join(15.0)
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("n"), 1)
+        self.assertEqual(self._kept(), [])
+
     def test_prune_is_not_stopped_by_a_kept_event_and_raises_the_watermark(self):
         """Codex P2 r5: a first row (in (tx, id) order) that never expires
         stopped a prefix retention for good. By `created_at`, and the
@@ -383,7 +473,7 @@ class EventLogPgTest(PgTestCase):
         self.db.execute(
             "INSERT INTO ameesh_events (type, object, tx) VALUES ('alert.raised', 'alert:r',"
             " ((pg_current_xact_id()::text::bigint + 1000000)::text)::xid8)")
-        self.assertEqual(store.readable(position, 100), ([], "restore"))
+        self.assertEqual(store.readable(position, 100)[:2], ([], "restore"))
 
     def test_a_long_project_name_never_refuses_the_thread_write(self):
         project = "p" * 301
@@ -405,7 +495,7 @@ class EventLogPgTest(PgTestCase):
             a = storage.of(tx_a).events.record("alert.raised", "alert:a", None, {})
             b = events.record(self.db, "alert.raised", "alert:b")
             self.assertGreater(b, a)
-            rows, waiting = store.readable(position, 100)   # held back by A
+            rows, waiting, _pruned = store.readable(position, 100)   # held back by A
             # A holds its own event back; a foreign transaction of the shared
             # bench (xmin) can only shorten that prefix, never skip 11 for 12.
             self.assertNotIn("alert:b", [r["object"] for r in rows])
@@ -437,7 +527,7 @@ class EventLogPgTest(PgTestCase):
             tx_a.query("select pg_current_xact_id()")      # A: an xid, no event
             events.record(self.db, "alert.raised", "alert:b")
             with mock.patch.object(self.db, "query", wraps=self.db.query) as query:
-                self.assertEqual(store.readable(position, 100), ([], "xmin"))
+                self.assertEqual(store.readable(position, 100)[:2], ([], "xmin"))
             self.assertEqual(query.call_count, 1)
         self.delivered(store, position, ["alert:b"])         # A over, no event of its own
 
@@ -455,13 +545,13 @@ class EventLogPgTest(PgTestCase):
         store = storage.of(self.db).events
         self.assertEqual([r["object"] for r in store.readable((0, 0), 1)[0]],
                          ["alert:nine"])
-        rows, waiting = store.readable((0, 0), 10)
+        rows, waiting, _pruned = store.readable((0, 0), 10)
         self.assertEqual([r["object"] for r in rows],
                          ["alert:nine", "alert:ten", "alert:eleven"])
         self.assertIsNone(waiting)
         # the cursor follows the same numeric order, batch after batch
         first = store.readable((0, 0), 1)[0][0]
-        following, _ = store.readable((int(first["tx"]), int(first["id"])), 1)
+        following, _, _ = store.readable((int(first["tx"]), int(first["id"])), 1)
         self.assertEqual([r["object"] for r in following], ["alert:ten"])
 
     def test_notify_carries_the_id_alone(self):
@@ -567,6 +657,19 @@ class StreamPgTest(ServerMixin, PgTestCase):
             buf += resp.fp.read1(65536)
         self.fail("%d message(s) expected, got %r" % (count, found))
 
+    def assert_reset_at_head(self, frame, at_least, cluster):
+        """#928: a reset frame names THIS journal and a position at or after
+        `at_least`. The exact head at the instant of the reset cannot be
+        compared to a snapshot taken by the test: an event held back by a
+        foreign transaction of the shared bench (`xmin`) becomes readable
+        when it ends, and the head only ever advances."""
+        parsed = events.parse_position(frame["id"])
+        self.assertIsNotNone(parsed, frame["id"])
+        self.assertEqual(parsed[1], cluster)
+        self.assertGreaterEqual(parsed[0], at_least)
+        bounds = storage.of(self.db).events.bounds()
+        self.assertLessEqual(parsed[0], max(bounds["top"], bounds["pruned"]))
+
     def test_live_events_then_resume(self):
         self.serve()
         resp = self.open_stream()
@@ -640,8 +743,15 @@ class StreamPgTest(ServerMixin, PgTestCase):
         self.assertIn("TRUNCATE ameesh_events, ameesh_events_pruned", logs.output[0])
 
     def test_without_last_event_id_only_new_events(self):
-        events.record(self.db, "alert.raised", "alert:before")
+        before = events.record(self.db, "alert.raised", "alert:before")
         self.serve()
+        # #928: a foreign transaction of the shared bench (xmin) can hold the
+        # record back for a moment; opening the stream before it is readable
+        # would replay it, legitimately, as a new event (never skip).
+        deadline = time.monotonic() + 5
+        while (storage.of(self.db).events.bounds()["head"][1] != before
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
         resp = self.open_stream()
         events.record(self.db, "alert.raised", "alert:after")
         got = self.read_messages(resp, 1, kind="alert.raised")
@@ -686,7 +796,7 @@ class StreamPgTest(ServerMixin, PgTestCase):
             (top[0] + 1000, top[1]), cluster)})
         got = self.read_messages(resp, 1, kind="reset")
         self.assertEqual(json.loads(got[0]["data"])["reason"], "unknown position")
-        self.assertEqual(got[0]["id"], events.format_position(bounds["head"], cluster))
+        self.assert_reset_at_head(got[0], bounds["head"], cluster)
         # a position below the retention's watermark: events may be lost
         before = bounds["head"]
         self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
@@ -703,30 +813,94 @@ class StreamPgTest(ServerMixin, PgTestCase):
         got = self.read_messages(resp, 1, kind="alert.raised")
         self.assertEqual(json.loads(got[0]["data"])["object"], "alert:kept")
 
-    def test_reset_for_a_position_of_another_cluster(self):
+    def test_reset_after_pruning_the_whole_log_has_a_stable_cursor(self):
+        self.db.execute("TRUNCATE ameesh_events, ameesh_events_pruned")
+        self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
+                        " VALUES ('alert.resolved', 'alert:gone',"
+                        " now() - interval '400 days')")
+        events.prune(self.db, days=365)
+        bounds = storage.of(self.db).events.bounds()
+        self.serve()
+        resp = self.open_stream({"Last-Event-ID": events.format_position(
+            (0, 0), bounds["cluster"])})
+        reset = self.read_messages(resp, 1, kind="reset")[0]
+        self.assertGreaterEqual(events.parse_position(reset["id"])[0], bounds["pruned"])
+
+    def test_a_prune_during_the_stream_resets_the_open_reader(self):
+        """#928/F6: the watermark was checked at connection only. A stream
+        that was open when the retention passed its cursor kept reading,
+        silently skipping the deleted events; it now gets the same `reset`
+        frame as a resume below the watermark."""
+        self.serve()
+        resp = self.open_stream()
+        self.read_messages(resp, 1, timeout=5)              # retry:
+        before = storage.of(self.db).events.bounds()["head"]
+        # the old event and its pruning commit together: the stream is woken
+        # once, when the watermark already sits above its cursor
+        with self.db.transaction() as tx:
+            tx.execute("INSERT INTO ameesh_events (type, object, created_at)"
+                       " VALUES ('alert.resolved', 'alert:gone',"
+                       " now() - interval '400 days')")
+            self.assertGreaterEqual(events.prune(tx, days=365), 1)
+        got = self.read_messages(resp, 1, kind="reset", timeout=5)
+        self.assertEqual(json.loads(got[0]["data"])["reason"], "events lost (retention)")
+        current = storage.of(self.db).events.bounds()
+        self.assert_reset_at_head(got[0], before, current["cluster"])
+
+    def test_reset_for_a_position_of_another_cluster_or_journal(self):
         """Codex P2 r3: after a logical restore, `tx` starts again lower. A
         position 70001-12 of the old cluster passes the bounds of the new
         one, and an event at (1000, 13) sorts below it: lost for good.
-        The cluster in the position makes it a reset."""
+        The identity in the position makes it a reset.
+
+        #928/F5 (witness W5): two meshes of the SAME cluster — two schemas,
+        two bases — share the system identifier and the timeline but not
+        their log; the journal's own identifier makes the other mesh's
+        position a reset instead of a silent skip."""
         self.serve()
         events.record(self.db, "alert.raised", "alert:old")
         bounds = storage.of(self.db).events.bounds()
-        self.assertRegex(bounds["cluster"], "^[0-9a-f]{1,16}t[0-9a-f]{8}$")
-        sysid, timeline = bounds["cluster"].split("t")
+        self.assertRegex(bounds["cluster"], "^[0-9a-f]{1,16}t[0-9a-f]{8}j[0-9a-f]{16}$")
+        sysid, rest = bounds["cluster"].split("t")
+        timeline, journal = rest.split("j")
         head = bounds["head"]
-        # another cluster; then the same cluster on another timeline (codex
-        # P2 r5: a point-in-time recovery keeps the system identifier)
-        for other in ("0t" + timeline if sysid != "0" else "1t" + timeline,
-                      "%st%08x" % (sysid, int(timeline, 16) + 1)):
+        # another cluster; the same cluster on another timeline (codex P2 r5:
+        # a point-in-time recovery keeps the system identifier); and the same
+        # cluster and timeline under another journal (another mesh of the base)
+        for other in ("0t" + rest if sysid != "0" else "1t" + rest,
+                      "%st%08xj%s" % (sysid, int(timeline, 16) + 1, journal),
+                      "%st%sj%016x" % (sysid, timeline, int(journal, 16) + 1)):
             resp = self.open_stream({"Last-Event-ID": events.format_position(
                 (head[0] - 1, head[1] - 1), other)})          # within the bounds
             got = self.read_messages(resp, 1, kind="reset")
             self.assertEqual(json.loads(got[0]["data"])["reason"],
                              "another cluster or timeline", other)
-            self.assertEqual(got[0]["id"], events.format_position(head, bounds["cluster"]))
+            self.assert_reset_at_head(got[0], head, bounds["cluster"])
         events.record(self.db, "alert.raised", "alert:new")
         got = self.read_messages(resp, 1, kind="alert.raised")
         self.assertEqual(json.loads(got[0]["data"])["object"], "alert:new")
+
+    def test_the_identity_carries_the_journal_of_this_log(self):
+        """#928/F5: the identity names the journal itself (migration 0448),
+        not only the cluster and timeline."""
+        journal = self.db.query("select journal from ameesh_events_journal")[0]["journal"]
+        self.assertRegex(journal, "^[0-9a-f]{16}$")
+        self.assertTrue(storage.of(self.db).events.bounds()["cluster"].endswith(
+            "j" + journal))
+        # two journals of the same cluster draw different identifiers
+        other = "t_journal_%s" % uuid.uuid4().hex[:8]
+        self.db.execute('create schema "%s"' % other)
+        self.addCleanup(self.db.execute, 'drop schema "%s" cascade' % other)
+        self.db.execute('create table "%s".ameesh_events_journal'
+                        " (like ameesh_events_journal including all)" % other)
+        self.db.execute('insert into "%s".ameesh_events_journal (one) values (true)' % other)
+        self.assertNotEqual(
+            journal,
+            self.db.query('select journal from "%s".ameesh_events_journal' % other)[0]["journal"])
+        # and 0448 re-defines the identity function without 0396 being torn
+        # down: the journal row is a singleton, never duplicated
+        self.assertEqual(
+            self.db.query("select count(*) as n from ameesh_events_journal")[0]["n"], 1)
 
     def test_an_unknown_cluster_resets_every_resume(self):
         """The identity functions refused to the role: no resume trusted."""

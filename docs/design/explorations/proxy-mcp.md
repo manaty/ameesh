@@ -1,23 +1,23 @@
 ---
 type: Exploration
 status: exploration
-title: "Porte exposée comme proxy MCP"
+title: "Gate exposed as an MCP proxy"
 ---
 
-# Porte exposée comme proxy MCP
+# Gate exposed as an MCP proxy
 
-## Problème
+## Problem
 
-Les outils d’un agent peuvent exposer des actions qui demandent une approbation. Une façade MCP devant la porte pose la question de la conservation du contrat d’action et de la preuve signée.
+An agent's tools can expose actions that require approval. An MCP facade in front of the gate raises the question of preserving the action contract and the signed proof.
 
 ## Intuitions
 
-Un proxy pourrait présenter les outils tout en reliant chaque appel à une action durable et à sa politique. La description d’un outil et les arguments reçus pourraient rester distincts de l’autorisation d’exécuter.
+A proxy could present the tools while linking each call to a durable action and to its policy. A tool's description and the arguments received could remain distinct from the authorization to execute.
 
-## Questions ouvertes
+## Open questions
 
-- Comment lier les arguments exécutés au contenu approuvé ?
-- Comment rendre un résultat inconnu et une reprise idempotente à un client MCP ?
-- Comment exposer les capacités sans élargir les droits de l’agent ?
+- How can the executed arguments be bound to the approved content?
+- How can an unknown result and an idempotent resume be exposed to an MCP client?
+- How can the capabilities be exposed without widening the agent's rights?
 
-Contexte existant : [Spécification des actions et de la porte](../specification.md), [Étude de l’autorité humaine](../etudes/autorite-humaine.md). Ces références éclairent la question ; elles ne promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Specification of actions and the gate](../specification.md), [Study of human authority](../etudes/autorite-humaine.md). These references inform the question; they do not promote this card to a study or to decided work.

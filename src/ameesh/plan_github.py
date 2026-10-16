@@ -75,6 +75,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import weakref
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -283,16 +284,6 @@ def resource_of(path: str) -> str:
     return DEFAULT_RESOURCE
 
 
-def client_scope(kind: str, *parts) -> str:
-    """L'empreinte non réversible d'un client GitHub (#1405, N1).
-
-    Elle entre dans la clé du cache partagé : deux bases d'API (GitHub,
-    GitHub Enterprise) ou deux jetons ne se servent jamais la lecture l'un de
-    l'autre. Un condensé tronqué, jamais le jeton : le cache ne le garde pas."""
-    material = "\0".join([str(kind), *(str(part or "") for part in parts)])
-    return "%s:%s" % (kind, hashlib.sha256(material.encode("utf-8")).hexdigest()[:16])
-
-
 class GithubRateLimited(GithubError):
     """Quota GitHub épuisé (#848) : ne rien redemander avant `reset` (epoch).
 
@@ -376,6 +367,80 @@ def _atomic_write(path: str, data: dict) -> None:
         raise
 
 
+def reads_scope(base: str | None, token: str | None = None) -> str:
+    """La portée du cache partagé (#848, N4) : la base d'API et une empreinte
+    non réversible du client (le jeton). Deux bases ou deux jetons ne se
+    partagent plus les mêmes entrées, même sur un état d'hôte commun ; le
+    jeton lui-même n'entre jamais dans une clé ni dans un fichier."""
+    digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:12] \
+        if token else "anon"
+    return "%s|%s" % (str(base or API_BASE).rstrip("/"), digest)
+
+
+#: instances vivantes du processus : leurs compteurs en mémoire restent
+#: visibles (`counters`) et partent une fois à la fin du passage (N3) —
+#: jamais un verrou et une réécriture par hit de cache.
+_LIVE_READS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _merge_counters(data: dict, pending: dict, clock) -> list[str]:
+    """Fusionne `pending` dans `data["counters"]` ; rend les noms fusionnés."""
+    counters = data.setdefault("counters", {})
+    if not isinstance(counters, dict):
+        counters = data["counters"] = {}
+    merged = []
+    for name, n in pending.items():
+        counters[name] = int(counters.get(name) or 0) + int(n)
+        merged.append(name)
+    if merged:
+        counters["updated"] = float(clock())
+    return merged
+
+
+def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> None:
+    """Écrit une fois les compteurs en mémoire dans `quota.json` (N3).
+
+    Un état d'hôte disparu (dossier temporaire nettoyé, poste effacé) n'est
+    pas ressuscité pour y écrire des compteurs. Jamais bloquant : une panne
+    (droits, disque) laisse `pending` intact pour le prochain essai."""
+    if not pending:
+        return
+    if not os.path.isdir(state_dir):
+        return
+    for directory in (root, os.path.join(root, "reads")):
+        with contextlib.suppress(OSError):
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+    if not os.path.isdir(root):
+        return
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    merged = False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = {}
+        try:
+            with open(quota_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+        _merge_counters(data, pending, clock)
+        _atomic_write(quota_path, data)
+        merged = True
+    except (OSError, ValueError):
+        merged = False
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    if merged:
+        for name in list(pending):
+            pending.pop(name, None)
+
+
 class SharedReads:
     """Cache disque et quota GitHub partagés par les processus d'un hôte (#848).
 
@@ -396,18 +461,39 @@ class SharedReads:
     Le cache ne garde que des réponses JSON de l'API, jamais le jeton ;
     racine 0700, fichiers 0600, écriture atomique. Une panne du cache
     (disque plein, droits) ne fait jamais échouer une lecture : elle la
-    laisse simplement repayée."""
+    laisse simplement repayée.
+
+    N1 : une construction ou une lecture ne crée aucun dossier — le cache
+    naît à sa première écriture, et un `state_dir` vide est refusé plutôt
+    que de fabriquer un chemin relatif. N3 : les compteurs s'agrègent en
+    mémoire et s'écrivent une fois par passage (`flush`, fin de processus),
+    jamais un verrou par hit. N4 : la clé d'une entrée porte la base d'API
+    et une empreinte non réversible du jeton."""
 
     def __init__(self, state_dir, *, clock=time.time, ttl: float = READS_TTL,
-                 max_entries: int = READS_MAX):
-        self.root = os.path.join(str(state_dir), READS_DIR)
+                 max_entries: int = READS_MAX, scope: str = ""):
+        state_dir = str(state_dir or "").strip()
+        if not state_dir:
+            raise ValueError("state_dir is required for the shared reads cache")
+        self.state_dir = state_dir
+        self.root = os.path.join(state_dir, READS_DIR)
         self.clock = clock
         self.ttl = float(ttl)
         self.max_entries = int(max_entries)
+        self.scope = str(scope or "")
         self._reads_dir = os.path.join(self.root, "reads")
         self._quota_path = os.path.join(self.root, "quota.json")
         self._lock_path = os.path.join(self.root, ".lock")
         self._stores = 0
+        self._pending: dict = {}
+        _LIVE_READS.add(self)
+        # N3 : les compteurs en attente partent une fois, à la fin du passage
+        # (objet libéré ou processus terminé), sans ressusciter un état disparu.
+        weakref.finalize(self, _write_counters, self.state_dir, self.root,
+                         self._lock_path, self._quota_path, self._pending, self.clock)
+
+    def _ensure_dirs(self) -> None:
+        """La racine du cache (0700), créée avant une écriture, jamais pour lire."""
         for directory in (self.root, self._reads_dir):
             with contextlib.suppress(OSError):
                 os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -425,22 +511,23 @@ class SharedReads:
             os.close(fd)
 
     # -- entrées du cache ---------------------------------------------------
-    def _entry_path(self, path: str, scope: str = "") -> str:
-        """Le fichier d'une lecture : condensé du client (`scope`) et du chemin
-        (#1405, N1 : une base d'API ou un jeton ne sert pas l'autre)."""
-        key = "%s\0%s" % (scope, path)
-        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:40]
+    def _entry_path(self, path: str) -> str:
+        """La clé d'une entrée : la portée (base, client) puis le chemin REST.
+
+        N4 : deux bases d'API ou deux jetons ne partagent plus la même entrée
+        de cache sur un état commun ; le jeton n'apparaît que par empreinte."""
+        digest = hashlib.sha256(
+            ("%s\n%s" % (self.scope, path)).encode("utf-8")).hexdigest()[:40]
         return os.path.join(self._reads_dir, digest + ".json")
 
-    def cached(self, path: str, *, scope: str = "") -> ReadEntry | None:
-        """L'entrée gardée de ce chemin pour ce client, même périmée, sinon None."""
+    def cached(self, path: str) -> ReadEntry | None:
+        """L'entrée gardée de ce chemin, même périmée, sinon None."""
         try:
-            with open(self._entry_path(path, scope), encoding="utf-8") as fh:
+            with open(self._entry_path(path), encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, ValueError):
             return None
-        if not isinstance(data, dict) or data.get("path") != path \
-                or str(data.get("scope") or "") != scope:
+        if not isinstance(data, dict) or data.get("path") != path:
             return None
         try:
             read_ts = float(data.get("read_ts") or 0.0)
@@ -459,25 +546,25 @@ class SharedReads:
         return ttl > 0 and now - entry.read_ts < ttl
 
     def store(self, path: str, value, *, etag: str | None = None,
-              read_ts=None, scope: str = "", resource: str | None = None) -> None:
+              read_ts=None, resource: str | None = None) -> None:
         now = float(self.clock() if read_ts is None else read_ts)
+        self._ensure_dirs()
         try:
-            _atomic_write(self._entry_path(path, scope),
-                          {"path": path, "scope": scope, "value": value,
-                           "etag": etag or None, "read_ts": now,
-                           "resource": resource or None})
+            _atomic_write(self._entry_path(path),
+                          {"path": path, "value": value, "etag": etag or None,
+                           "read_ts": now, "resource": resource or None})
         except (OSError, ValueError, TypeError):
             return                 # le cache est une économie, jamais une panne
         self._stores += 1
         if self._stores % READS_PRUNE_EVERY == 0:
             self.prune()
 
-    def touch(self, path: str, *, read_ts=None, scope: str = "") -> None:
+    def touch(self, path: str, *, read_ts=None) -> None:
         """Rafraîchit l'instant d'une entrée revalidée (304, sans quota)."""
-        entry = self.cached(path, scope=scope)
+        entry = self.cached(path)
         if entry is not None:
             self.store(path, entry.value, etag=entry.etag, read_ts=read_ts,
-                       scope=scope, resource=entry.resource)
+                       resource=entry.resource)
 
     def prune(self) -> int:
         """Retire les entrées les plus anciennes au-delà de `max_entries`."""
@@ -526,20 +613,40 @@ class SharedReads:
                 if isinstance(quota, dict)}
 
     def counters(self) -> dict:
+        """Les compteurs partagés : le disque, plus ceux encore en mémoire dans
+        ce processus pour le même cache (`_LIVE_READS`)."""
         counters = self._load().get("counters")
-        return dict(counters) if isinstance(counters, dict) else {}
+        merged = dict(counters) if isinstance(counters, dict) else {}
+        for reads in list(_LIVE_READS):
+            if reads.root != self.root:
+                continue
+            for name, n in reads._pending.items():
+                merged[name] = int(merged.get(name) or 0) + int(n)
+        return merged
+
+    def _merge_pending(self, data: dict) -> list[str]:
+        """Fusionne les compteurs en mémoire dans `data` ; rend leurs noms."""
+        return _merge_counters(data, self._pending, self.clock)
 
     def count(self, name: str, n: int = 1) -> None:
-        """Un compteur partagé (hits, stale, refused…) ; jamais bloquant."""
+        """Un compteur partagé (hits, stale, refused…) ; jamais bloquant.
+
+        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (ou la fin
+        du processus) fait une seule écriture par passage, au lieu d'un verrou
+        et d'une réécriture de `quota.json` à chaque hit de cache."""
         try:
-            with self._locked():
-                data = self._load()
-                counters = data.setdefault("counters", {})
-                counters[name] = int(counters.get(name) or 0) + int(n)
-                counters["updated"] = float(self.clock())
-                _atomic_write(self._quota_path, data)
-        except (OSError, ValueError):
+            key = str(name)
+            self._pending[key] = self._pending.get(key, 0) + int(n)
+        except (TypeError, ValueError):
             return
+
+    def flush(self) -> None:
+        """Écrit une fois les compteurs agrégés depuis le dernier `flush` (N3).
+
+        Sans compteur en attente, ne touche à rien. Une panne (droits, disque)
+        laisse les compteurs en mémoire : le prochain passage réessaiera."""
+        _write_counters(self.state_dir, self.root, self._lock_path,
+                        self._quota_path, self._pending, self.clock)
 
     def note(self, headers, *, status: int, now=None, resource: str | None = None,
              body: str | None = None) -> float | None:
@@ -559,9 +666,11 @@ class SharedReads:
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
             or str(resource or "").strip().lower() or DEFAULT_RESOURCE
         secondary = status in (403, 429) and SECONDARY_LIMIT_MARK in str(body or "").lower()
+        self._ensure_dirs()
         try:
             with self._locked():
                 data = self._load()
+                merged = self._merge_pending(data)
                 quotas = data.setdefault("quota", {})
                 if not isinstance(quotas, dict):
                     quotas = data["quota"] = {}
@@ -589,6 +698,8 @@ class SharedReads:
                 quota["blocked_until"] = blocked if blocked > now else 0.0
                 quota["checked"] = now
                 _atomic_write(self._quota_path, data)
+                for name in merged:
+                    self._pending.pop(name, None)
                 return quota["blocked_until"] or None
         except (OSError, ValueError):
             return None
@@ -637,9 +748,8 @@ class Api:
         self.last_read: ReadMeta | None = None
         self.clock = clock
         self.reads = reads if reads is not None else (
-            SharedReads(cache_dir, clock=clock, ttl=ttl) if cache_dir else None)
-        #: la part du client dans la clé du cache : base et jeton (#1405, N1)
-        self.scope = client_scope("api", self.base, self.token)
+            SharedReads(cache_dir, clock=clock, ttl=ttl,
+                        scope=reads_scope(self.base, self.token)) if cache_dir else None)
         self._open = opener or urllib.request.urlopen
 
     def _request_headers(self, path: str, entry: ReadEntry | None) -> dict:
@@ -655,8 +765,7 @@ class Api:
         ttl = self.ttl if ttl is None else float(ttl)
         now = float(self.clock())
         self.last_read = None
-        scope = self.scope
-        entry = self.reads.cached(path, scope=scope) if self.reads is not None else None
+        entry = self.reads.cached(path) if self.reads is not None else None
         resource = (entry.resource if entry is not None else None) or resource_of(path)
         if self.reads is not None and self.reads.fresh(entry, now=now, ttl=ttl):
             self.reads.count("hits")
@@ -682,7 +791,7 @@ class Api:
             headers = getattr(exc, "headers", None)
             if exc.code == 304 and entry is not None:
                 if self.reads is not None:
-                    self.reads.touch(path, read_ts=now, scope=scope)
+                    self.reads.touch(path, read_ts=now)
                     self.reads.note(headers, status=304, now=now, resource=resource)
                 self.last_read = ReadMeta(now, False, "revalidated")
                 return entry.value
@@ -707,7 +816,7 @@ class Api:
         if self.reads is not None:
             etag = header_of(headers, "ETag")
             self.reads.note(headers, status=200, now=now, resource=resource)
-            self.reads.store(path, value, etag=etag, read_ts=now, scope=scope,
+            self.reads.store(path, value, etag=etag, read_ts=now,
                              resource=_resource_header(headers))
         self.last_read = ReadMeta(now, False, "network")
         return value
@@ -728,11 +837,6 @@ class GhApi:
         self.ttl = float(ttl)
         self.clock = clock
         self.last_read: ReadMeta | None = None
-        # la session `gh` vit dans son dossier de configuration, pour un hôte :
-        # c'est l'identité du client dans la clé du cache (#1405, N1)
-        env = getattr(gh, "env", None) or {}
-        self.scope = client_scope("gh", env.get("GH_HOST") or "github.com",
-                                  env.get("GH_CONFIG_DIR") or "")
 
     def get(self, path: str, *, ttl=None):
         ttl = self.ttl if ttl is None else float(ttl)
@@ -742,8 +846,7 @@ class GhApi:
             value = _json(self.gh, ["api", path])
             self.last_read = ReadMeta(now, False, "network")
             return value
-        scope = self.scope
-        entry = self.reads.cached(path, scope=scope)
+        entry = self.reads.cached(path)
         resource = (entry.resource if entry is not None else None) or resource_of(path)
         if self.reads.fresh(entry, now=now, ttl=ttl):
             self.reads.count("hits")
@@ -760,7 +863,7 @@ class GhApi:
         status, headers, body = gh_api_response(
             self.gh, path, etag=entry.etag if entry is not None else None)
         if status == 304 and entry is not None:
-            self.reads.touch(path, read_ts=now, scope=scope)
+            self.reads.touch(path, read_ts=now)
             self.reads.note(headers, status=304, now=now, resource=resource)
             self.last_read = ReadMeta(now, False, "revalidated")
             return entry.value
@@ -780,7 +883,7 @@ class GhApi:
         except ValueError as exc:
             raise GithubError("gh api %s: unreadable response" % path) from exc
         self.reads.store(path, value, etag=header_of(headers, "ETag"), read_ts=now,
-                         scope=scope, resource=_resource_header(headers))
+                         resource=_resource_header(headers))
         self.last_read = ReadMeta(now, False, "network")
         return value
 
@@ -794,8 +897,11 @@ def client(*, env=None, gh: str | None = None, timeout: float = 60.0,
     appelé et l'appelant dit le manque. `cache_dir` (l'état de l'hôte) active
     le cache et le quota partagés (#848) ; sans lui, rien n'est gardé."""
     env = os.environ if env is None else env
-    reads = SharedReads(cache_dir, clock=clock, ttl=ttl) if cache_dir else None
-    if token_of(env):
+    token = token_of(env)
+    reads = SharedReads(cache_dir, clock=clock, ttl=ttl,
+                        scope=reads_scope(env.get("GITHUB_API_URL"), token)) \
+        if cache_dir else None
+    if token:
         return Api(env=env, timeout=timeout, reads=reads, ttl=ttl, clock=clock)
     if not allow_gh:
         return None
@@ -811,7 +917,11 @@ def quota_stats(state_dir) -> dict:
     """Le quota et les compteurs partagés de l'hôte (#848), pour les vues.
 
     Rend `{"quota": {ressource: {...}}, "counters": {...}}`, vide sans cache
-    encore écrit : `core` et `graphql` ne se confondent pas."""
+    encore écrit : `core` et `graphql` ne se confondent pas. Un `state_dir`
+    vide est refusé (N1) : la vue ne fabrique pas de chemin relatif, et une
+    lecture ne crée aucun dossier."""
+    if not str(state_dir or "").strip():
+        return {"quota": {}, "counters": {}}
     reads = SharedReads(state_dir)
     return {"quota": reads.quotas(), "counters": reads.counters()}
 

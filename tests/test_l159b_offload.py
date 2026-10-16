@@ -1275,6 +1275,50 @@ class JobUserExecutorTest(unittest.TestCase):
         self.assertTrue(os.stat(tree).st_mode & 0o020)
         self.assertTrue(os.stat(os.path.join(tree, "sub")).st_mode & 0o2000)
 
+    def test_grant_tree_closes_the_descriptors_left_by_a_failing_walk(self):
+        # N3 of the #354 R2 review: a raising grant (fstat/fchmod) must not
+        # leave the directories still stacked open. The root is granted
+        # first, then its four children are opened before the first one is
+        # granted: the injected failure happens with a non-empty stack.
+        # #1413 P3: the release is proved on the file identity, not on the
+        # descriptor number alone -- a concurrent thread could reopen the same
+        # number between the close and the check, and the old check would then
+        # flag a leak on a descriptor that was released. A number that is
+        # closed or names another file counts as released; one that still
+        # names the file opened by the walk is a leak.
+        tree = os.path.join(self.tmp, "work")
+        for name in ("a", "b", "c", "d"):
+            os.makedirs(os.path.join(tree, name))
+        real_open, real_fchmod = os.open, os.fchmod
+        opened: list[tuple[int, int, int]] = []
+        grants = {"count": 0}
+
+        def tracking_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            st = os.fstat(fd)
+            opened.append((fd, st.st_dev, st.st_ino))
+            return fd
+
+        def failing_fchmod(fd, mode):
+            grants["count"] += 1
+            if grants["count"] == 2:
+                raise OSError(errno.EIO, "injected")
+            return real_fchmod(fd, mode)
+
+        with mock.patch.object(offload_shell.os, "open", tracking_open), \
+                mock.patch.object(offload_shell.os, "fchmod", failing_fchmod):
+            with self.assertRaises(OSError):
+                offload_shell._grant_tree(tree)
+        self.assertGreaterEqual(len(opened), 3)
+        for fd, dev, ino in opened:
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                continue                        # closed, not left to the caller
+            self.assertNotEqual(
+                (st.st_dev, st.st_ino), (dev, ino),
+                "fd %d still names the file opened by the walk: leaked" % fd)
+
     def test_granted_requires_the_shared_group_and_write(self):
         # B3: a ready cache is reused only when the shell already granted it
         ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)

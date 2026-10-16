@@ -77,3 +77,30 @@ class WorkDependencies(Contract):
             FROM work_item_dependencies d JOIN work_items w ON w.id = d.blocker_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
+
+    def release_unassigned(self, item_ids, *, actor):
+        """#1668 : un dépendant NON ASSIGNÉ dont la dernière attente vient de
+        tomber repasse `blocked` → `intake` dans la transaction de fermeture.
+
+        Sans ce geste, `lot_sessions.actionable` (qui ne lit que `intake` et
+        `build`) ne le voit pas : il reste invisible au self-service jusqu'à ce
+        qu'une alerte stale le fasse rouvrir à la main, jusqu'à 14 h plus tard.
+        Les lots assignés ne bougent pas : le courrier de réveil (L385) porte
+        le geste à leur agent, qui peut juger la suite. Appelé dans la
+        transaction qui ferme le bloqueur, sous son verrou de graphe : la
+        réouverture est committée avec la fermeture, ou pas du tout.
+        Rend les identifiants rouverts."""
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return []
+        rows = self.db.query(
+            "UPDATE work_items SET state = 'intake', updated_at = clock_timestamp()"
+            " WHERE id IN (" + ", ".join(["%s"] * len(ids)) + ")"
+            " AND state = 'blocked' AND assignee IS NULL RETURNING id", tuple(ids))
+        for row in rows:
+            self.db.execute(
+                "INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
+                " VALUES (%s, 'intake', %s, %s, clock_timestamp())",
+                (int(row["id"]),
+                 "Dependency released: back to intake (no assignee, #1668)", actor or ""))
+        return [int(row["id"]) for row in rows]

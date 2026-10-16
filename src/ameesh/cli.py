@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
-  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
+  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF [--assign]] [--new-lot "title"
                  [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
@@ -11,7 +11,9 @@
                                                  unassigned work item (or one held by a human)
                                                  to the recipient — an item already held by an
                                                  agent is never reassigned by mail, whoever
-                                                 holds it (#1066) — and --new-lot creates it (L118),
+                                                 holds it (#1066); --assign is the explicit
+                                                 gesture that lets any sender hand over an
+                                                 unassigned item (#964) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
                                                  #540: a recipient who already has a work item
@@ -243,6 +245,12 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
+    # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
+    # FREE lot (or one held by a human) to the recipient, even outside the
+    # orchestrator detection (L94 history included); never a lot held by an
+    # agent (#1066).
+    assign = "--assign" in args
+    args = [arg for arg in args if arg != "--assign"]
     # #506: --app may name a project nobody declares yet, on purpose
     new_project = "--new-project" in args
     args = [arg for arg in args if arg != "--new-project"]
@@ -304,6 +312,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--ack and --new-lot contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
         return 2
+    if ack and assign:
+        print("--ack and --assign contradict each other: an acknowledgement does not hand over work",
+              file=sys.stderr)
+        return 2
     sign = key_path is not None or "--sign" in args
     allow_structured = "--allow-structured" in args
     args = [arg for arg in args if arg not in ("--sign", "--allow-structured")]
@@ -311,7 +323,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--expires only makes sense with --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
+        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF [--assign]] "
               "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
               "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
@@ -324,6 +336,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if new_lot is not None and lot is not None:
         print("--lot OR --new-lot, not both", file=sys.stderr)
+        return 2
+    if assign and lot is None:
+        print("--assign requires --lot <id|ref>: say which lot to assign to the recipient",
+              file=sys.stderr)
+        return 2
+    if assign and new_lot is not None:
+        print("--assign goes with --lot (--new-lot already assigns the created lot to the "
+              "recipient)", file=sys.stderr)
         return 2
     if new_lot is not None and not new_lot.strip():
         print("--new-lot: empty title", file=sys.stderr)
@@ -466,6 +486,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if new_lot is not None and (bk.kind != "pg" or dest == "all"):
         print("--new-lot requires the database and a single recipient", file=sys.stderr)
         return 2
+    if assign and getattr(bk, "mediated", False):
+        print("--assign is unavailable in mediated contract 1.1; assign the work item "
+              "on the server before sending mail", file=sys.stderr)
+        return 2
+    if assign and (bk.kind != "pg" or dest == "all"):
+        print("--assign requires the database and a single recipient", file=sys.stderr)
+        return 2
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
     if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
@@ -477,7 +504,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project, force=force,
+                estimate=estimate, app=app, new_project=new_project, assign=assign,
+                force=force,
                 parent_lot=parent_lot)
         except (assignments.AssignmentError, work.WorkError) as exc:
             print("message not delivered — %s" % exc, file=sys.stderr)
@@ -512,11 +540,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       kind=kind, urgent=urgent, thread_meta=thread_meta,
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
-    # #1604 : un envoi local touche la boîte des destinataires de CET hôte ;
-    # leur marqueur local repasse à « à vérifier » sans attendre la base. Un
-    # destinataire d'un autre hôte n'a pas de marqueur ici : rien à faire.
-    for nom in set(targets) | set(cc):
-        fastmail.bump(cfg, nom)
+    # #1689 (N1) : le marqueur local des destinataires est posé par le dépôt
+    # lui-même (`mail.send`, `FileBackend.send`), pour tout émetteur local et
+    # pas seulement cette commande.
     if skipped:
         print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
@@ -1038,6 +1064,22 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
     # `agent_id` : inscrite ici, elle devenait la session reprise au tour
     # suivant, que dsh refuse (« is a subagent or forked session »).
+    if binding.source == "explicit" and bk.kind == "pg":
+        # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a hérité)
+        # ne prend jamais le courrier d'un agent mené par l'exécuteur (bail
+        # vivant). La réservation le refuse aussi, sous verrou ; ce contrôle-ci
+        # le dit. #1689 (N2) : le refus précède l'inscription — sinon le
+        # tampon d'inscription de ce shell (clé sans bail) faisait dire au
+        # chemin rapide « inscription à jour », et le marqueur local taisait ce
+        # diagnostic à chaque PostToolUse.
+        try:
+            holder = sb.lease_holder(bk.db, name)
+        except Exception:
+            return 0
+        if holder:
+            print("agent-mail: %s is driven by the runner (live lease of %s) — "
+                  "mail left in place" % (name, holder), file=sys.stderr)
+            return 0
     session_id = None if binding.bound_to_lease else data.get("session_id")
     try:
         inscription = [tool, data.get("cwd"), session_id,
@@ -1053,16 +1095,6 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 if session_id:
                     registry.record_session_history(bk.db, name, str(session_id))
                 _register_done(cfg, name, inscription)
-        if binding.source == "explicit" and bk.kind == "pg":
-            # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
-            # hérité) ne prend jamais le courrier d'un agent mené par
-            # l'exécuteur (bail vivant). La réservation le refuse aussi, sous
-            # verrou ; ce contrôle-ci le dit.
-            holder = sb.lease_holder(bk.db, name)
-            if holder:
-                print("agent-mail: %s is driven by the runner (live lease of %s) — "
-                      "mail left in place" % (name, holder), file=sys.stderr)
-                return 0
         set_title(cfg, bk, name)
         if event not in ("Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"):
             return 0
