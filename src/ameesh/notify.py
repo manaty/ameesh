@@ -1059,9 +1059,18 @@ class Notifier:
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
-        acknowledgements = alert_ack.reconcile(
-            db, current, observed_ts=observed_ts, dry_run=self.dry_run,
-            observation_host=getattr(self.cfg, "host", None)) if db is not None else []
+        acknowledgements = []
+        if db is not None:
+            # #1473 : un accusé se juge dans le périmètre qui l'a pris ; cette
+            # passe réobserve l'alerte dans le sien avant de la dire résolue.
+            def reobserve(own):
+                return alert_ack.current(self.cfg, db, now=now, **own)
+
+            acknowledgements = alert_ack.reconcile(
+                db, current, observed_ts=observed_ts, dry_run=self.dry_run,
+                observation_host=getattr(self.cfg, "host", None),
+                perimeter=alert_ack.canonical(thresholds or alert_ack.default_thresholds()),
+                evaluate=reobserve)
         # Reuse each subject's route for acknowledgement and group membership;
         # lot/package lookups belong to this snapshot, not to every projection.
         routes = {id(a): router.resolve(a) for a in current}

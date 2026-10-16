@@ -293,6 +293,55 @@ class AcknowledgementTest(PostMixin, PgTestCase):
         self.assertEqual(n.state["summary"], {})
         self.assertEqual(self.sent, [])
 
+    def test_another_pass_perimeter_does_not_declare_resolution(self):
+        custom = {"stale_lot_s": 3600.0}
+        self.ack(**custom)
+        domain = storage.of(self.db).alert_acknowledgements
+        self.assertEqual(json.loads(domain.live()[0]["perimeter"]), custom)
+        seen = []
+
+        def evaluate(thresholds):
+            seen.append(thresholds)
+            return [self.a]
+
+        alert_ack.reconcile(self.db, [], observed_ts=domain.clock(),
+                            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+                            evaluate=evaluate)
+        self.assertIsNone(self.history()[0]["invalidation_reason"])
+        self.assertEqual(seen, [custom])
+        # The same pass, once in the ack's own perimeter: resolved.
+        alert_ack.reconcile(self.db, [], observed_ts=domain.clock(),
+                            perimeter=alert_ack.canonical(custom), evaluate=evaluate)
+        self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
+        self.assertEqual(seen, [custom])          # one re-observation per perimeter
+
+    def test_a_severity_change_in_the_ack_perimeter_rearms_it(self):
+        custom = {"stale_lot_s": 3600.0}
+        self.ack(**custom)
+        changed = dict(self.a, critical=True, reason="critique")
+        alert_ack.reconcile(
+            self.db, [], observed_ts=storage.of(self.db).alert_acknowledgements.clock(),
+            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+            evaluate=lambda thresholds: [changed])
+        self.assertEqual(self.history()[0]["invalidation_reason"], "severity_changed")
+
+    def test_legacy_unknown_perimeter_is_judged_by_the_pass(self):
+        self.ack()
+        self.db.execute("update alert_acknowledgements set perimeter = null")
+        alert_ack.reconcile(self.db, [], observed_ts=storage.of(self.db)
+                            .alert_acknowledgements.clock(),
+                            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+                            evaluate=lambda thresholds: [self.a])
+        self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
+
+    def test_notify_does_not_resolve_an_ack_from_another_perimeter(self):
+        self.ack(stale_lot_s=3600.0)
+        n = self.notifier()
+        n.run_pass(self.db, [])                   # defaults, the ack's own: kept
+        self.assertIsNone(self.history()[0]["invalidation_reason"])
+        n.run_pass(self.db, [], thresholds={"stale_lot_s": 3600.0})
+        self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
+
     def test_ack_between_last_raise_and_resolution_silences_resolution(self):
         n = self.notifier()
         n.run_pass(self.db, [self.a])

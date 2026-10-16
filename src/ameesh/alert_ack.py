@@ -5,6 +5,9 @@ The API supplies authenticated actor/principal. The CLI acts as its local
 human. Only the routed recipient (or their authenticated deputy) can ack.
 Notify invalidates acknowledgements when its complete snapshot observes
 resolution or a severity change, retaining the row as an audit trail.
+#1473: a row also keeps the perimeter (thresholds) of its acknowledgement; a
+pass observing another perimeter re-observes the alert there before declaring
+its resolution, so a narrower pass cannot invalidate it by that sole gap.
 """
 from __future__ import annotations
 
@@ -38,11 +41,25 @@ def severity(alert: dict) -> str:
                       ensure_ascii=False, separators=(",", ":"))
 
 
-def current(cfg, db, **thresholds) -> list[dict]:
+def canonical(thresholds: dict) -> str:
+    """Canonical identity of an observation perimeter (#1473): sorted keys, so
+    the same thresholds give the same text whatever their insertion order."""
+    return json.dumps(thresholds, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def default_thresholds() -> dict:
+    """The perimeter of the API and of a CLI without options: the `alerts`
+    parser's defaults, environment included."""
+    from . import exploitation
+    return exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
+
+
+def current(cfg, db, *, now: float | None = None, **thresholds) -> list[dict]:
     from . import db as db_mod, exploitation
     if not thresholds:
-        thresholds = exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
-    return db_mod.batched(db, lambda db: exploitation.alerts(cfg, db, **thresholds))
+        thresholds = default_thresholds()
+    return db_mod.batched(db, lambda db: exploitation.alerts(
+        cfg, db, now=now, **thresholds))
 
 
 def acknowledge(cfg, db, key: str, *, actor: str, principal: str | None = None,
@@ -55,7 +72,8 @@ def acknowledge(cfg, db, key: str, *, actor: str, principal: str | None = None,
         raise AckRefused("bad_key", "alert key: 64 lowercase hexadecimal characters required")
     if storage.is_remote(db):
         raise AckRefused("native_only", "alert acknowledgement needs a native operator connection")
-    alert = next((a for a in current(cfg, db, **thresholds) if key_of(a) == key), None)
+    effective = thresholds or default_thresholds()
+    alert = next((a for a in current(cfg, db, **effective) if key_of(a) == key), None)
     if alert is None:
         raise AckRefused("not_found", "no current alert with this key")
     # The local console pass must work without the mesh database (#1179),
@@ -66,7 +84,8 @@ def acknowledge(cfg, db, key: str, *, actor: str, principal: str | None = None,
     if principal != recipient:
         raise AckRefused("forbidden", "only the alert's human recipient can acknowledge it")
     return storage.of(db).alert_acknowledgements.acknowledge(
-        key, severity(alert), actor, principal, observation_host=alert.get("observation_host"))
+        key, severity(alert), actor, principal, observation_host=alert.get("observation_host"),
+        perimeter=canonical(effective))
 
 
 def matches(rows: list[dict], alert: dict, human: str | None) -> dict | None:
@@ -96,20 +115,50 @@ def annotate(cfg, db, alerts: list[dict], *, human: str | None = None) -> list[d
 
 
 def reconcile(db, current: list[dict], *, observed_ts: float, dry_run: bool = False,
-              observation_host: str | None = None) -> list[dict]:
+              observation_host: str | None = None, perimeter: str | None = None,
+              evaluate=None) -> list[dict]:
     """Invalidate old observations; return the pre-invalidation rows too, so
-    a just-resolved acknowledged alert does not send a resolution message."""
+    a just-resolved acknowledged alert does not send a resolution message.
+
+    #1473: a row is judged in the perimeter that acknowledged it. A pass
+    observing another perimeter (`perimeter` is its canonical identity) asks
+    `evaluate(thresholds)` to re-observe the alert there before concluding a
+    resolution; an unknown perimeter (NULL, row predating the column) or an
+    absent `evaluate` falls back to the pass's own observation.
+    """
     domain = storage.of(db).alert_acknowledgements
     rows = domain.live()
     levels = {key_of(a): severity(a) for a in current}
+    others: dict = {}
+
+    def observed(own: str | None) -> dict:
+        if own is None or own == perimeter or evaluate is None:
+            return levels
+        if own not in others:
+            try:
+                thresholds = json.loads(own)
+            except ValueError:
+                thresholds = None
+            others[own] = ({key_of(a): severity(a) for a in evaluate(thresholds)}
+                           if isinstance(thresholds, dict) else levels)
+        return others[own]
+
     if not dry_run:
         for row in rows:
             if row["observation_host"] is not None and row["observation_host"] != observation_host:
                 continue
             level = levels.get(row["alert_key"])
-            if level != row["severity"]:
-                domain.invalidate(row["id"], reason="resolved" if level is None
-                                  else "severity_changed", observed_ts=observed_ts)
+            if level == row["severity"]:
+                continue
+            if level is not None:
+                domain.invalidate(row["id"], reason="severity_changed", observed_ts=observed_ts)
+                continue
+            # Absent from this pass: only its own perimeter may declare it gone.
+            own = observed(row.get("perimeter")).get(row["alert_key"])
+            if own == row["severity"]:
+                continue
+            domain.invalidate(row["id"], reason="resolved" if own is None
+                              else "severity_changed", observed_ts=observed_ts)
     return rows
 
 

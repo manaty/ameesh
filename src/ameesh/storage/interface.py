@@ -636,13 +636,17 @@ class AlertAcknowledgements(Domain):
 
     @abc.abstractmethod
     def live(self) -> list[dict]:
-        """Active rows: id, alert_key, severity, observation_host, actor, principal,
-        acknowledged_ts."""
+        """Active rows: id, alert_key, severity, observation_host, perimeter,
+        actor, principal, acknowledged_ts."""
 
     @abc.abstractmethod
     def acknowledge(self, key: str, severity: str, actor: str, principal: str, *,
-                    observation_host: str | None = None) -> dict:
-        """Atomically acknowledge once per key/principal/severity; row + changed."""
+                    observation_host: str | None = None,
+                    perimeter: str | None = None) -> dict:
+        """Atomically acknowledge once per key/principal/severity; row + changed.
+
+        `perimeter` (#1473): canonical thresholds of the observation that
+        raised the alert; NULL when unknown (row predating the column)."""
 
     @abc.abstractmethod
     def invalidate(self, id: int, *, reason: str, observed_ts: float) -> bool:
