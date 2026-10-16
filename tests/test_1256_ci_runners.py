@@ -429,10 +429,34 @@ class CiRunnersTest(unittest.TestCase):
                    "[ \"$1\" = -- ] && shift\n"
                    "exec \"$@\"\n", mode=0o755)
 
+    def _with_floor(self, args):
+        """Canon §3 : le bac ne dépend pas du disque de l'hôte. Sans plancher
+        explicite ni plancher enregistré (l'état est relu comme par le script :
+        « floor » valide, 1..1048576), le défaut de 15 GiB mesure le disque
+        réel du bac — un runner à 15315 MiB libres a fait rougir les 24 témoins
+        de `CiRunnersTest` (paquet #1346). On couvre 1 MiB ; les témoins du
+        plancher gardent la main par l'option ou par l'état."""
+        if "--disk-floor-mib" in args:
+            return args
+        etat = os.path.join(self.host, "etc/ameesh/ci-runners.state")
+        valeur = ""
+        try:
+            with open(etat, encoding="utf-8") as fh:
+                for ligne in fh:
+                    champs = ligne.split()
+                    if champs[:1] == ["floor"] and len(champs) > 1:
+                        valeur = champs[1]
+        except OSError:
+            pass
+        if valeur.isdigit() and 1 <= int(valeur) <= 1048576:
+            return args
+        return (*args, "--disk-floor-mib", "1")
+
     def real_run(self, *args, **env_extra):
         """A real run (no `--dry-run`) against the test host: non-root, the
         `runuser` shim on PATH; refuses to touch anything else (R2 cx2 #1256)."""
-        return subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+        return subprocess.run(["bash", SCRIPT, *self._with_floor(args)],
+                              capture_output=True, text=True,
                               env=self.script_env(**env_extra))
 
     def write(self, path, content, mode=None):
@@ -453,7 +477,7 @@ class CiRunnersTest(unittest.TestCase):
     def run_script(self, *args, busy=False, **env_extra):
         if busy:
             env_extra["CI_RUNNERS_TEST_BUSY"] = "1"
-        return subprocess.run(["bash", SCRIPT, "--dry-run", *args],
+        return subprocess.run(["bash", SCRIPT, "--dry-run", *self._with_floor(args)],
                               capture_output=True, text=True,
                               env=self.script_env(**env_extra))
 
@@ -461,7 +485,7 @@ class CiRunnersTest(unittest.TestCase):
         """Un check qui vit pendant le témoin : lu sur stdout (octets, sans
         tampon Python), arrêté en cleanup même si une assertion échoue avant
         sa fin."""
-        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", *args],
+        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", *self._with_floor(args)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=self.script_env(**env_extra))
         self.addCleanup(self.stop_script, proc)
