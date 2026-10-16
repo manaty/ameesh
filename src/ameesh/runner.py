@@ -1112,6 +1112,11 @@ class AgentWorker(threading.Thread):
         temps restant comme budget d'appel.
         """
         pas = (self.runner.lease_ttl / 3.0) if self.runner.lease_ttl > 0 else 3.0
+        if getattr(self, "renew_failures", 0):
+            # Un échec ne repousse pas le bail : la tranche nulle ne doit pas
+            # marteler la base. Réessayer au délai court de L72, sans jamais
+            # attendre au-delà de l'échéance connue.
+            return self.wait_timeout(max(0.0, min(float(cap), pas, Reprise.MINIMUM)))
         if self.lease_deadline > 0:
             reste = self.lease_deadline - time.time() - pas
             pas = min(pas, max(0.0, reste))
