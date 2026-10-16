@@ -2939,6 +2939,11 @@ class HostResources(Domain):
         s'il est donné), trié par nom d'hôte."""
 
     @abc.abstractmethod
+    def runners(self, host: str, since_s: float) -> list[dict]:
+        """#2022: the last reading of each runner of `host` (`runner_id`)
+        within `since_s` seconds, the most zombies first."""
+
+    @abc.abstractmethod
     def turns_in_progress(self, host: str) -> int:
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
 

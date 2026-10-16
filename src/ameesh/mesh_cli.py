@@ -490,8 +490,17 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     from . import canon as canon_mod
     from . import resources as res
 
+    if getattr(args, "send", None) and (
+            not getattr(args, "fleet", False)
+            or any(getattr(args, flag, False)
+                   for flag in ("json", "publish", "report", "hold", "release"))):
+        print("ameesh hosts: --send requires --fleet in text mode, "
+              "without --publish, --report, --hold or --release", file=sys.stderr)
+        return 2
     if args.hold or args.release:
         return _host_hold(cfg, args)
+    if getattr(args, "publish", False):
+        return _host_publish(cfg, args)
     if args.until or args.reason:
         print("ameesh hosts: --until and --reason go with --hold", file=sys.stderr)
         return 2
@@ -502,6 +511,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         canons = canon_mod.load_configured(cfg)
         if getattr(args, "report", False):
             return _host_report(cfg, db, canons, args)
+        if getattr(args, "fleet", False):
+            return _host_fleet(db, canons, args)
         parts = _host_parts(cfg, db, canons, args.host, args.history)
         if not parts:
             print("no known host: no published measurement, no Host card in the canon")
@@ -652,6 +663,102 @@ def _host_report(cfg: Config, db, canons, args: argparse.Namespace) -> int:
     return 0
 
 
+def _host_publish(cfg: Config, args) -> int:
+    """`ameesh hosts --publish` (#2022): one reading of THIS host, published
+    like a runner's, for a host that runs no agent (CI VMs, the mesh server):
+    a systemd timer runs it every few minutes. The reading carries the
+    runner id `publish@HOST`."""
+    import dataclasses
+
+    from . import resources as res
+
+    if not cfg.host:
+        print("ameesh hosts --publish: no host name in the configuration", file=sys.stderr)
+        return 2
+    if args.host and args.host != cfg.host:
+        print("ameesh hosts --publish: a host publishes its own reading only (%s)"
+              % cfg.host, file=sys.stderr)
+        return 2
+    db = _open(cfg)
+    try:
+        reading = res.collect(dataclasses.replace(cfg, runner_id="publish@%s" % cfg.host), db)
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(reading, ensure_ascii=False, sort_keys=True, default=str))
+    else:
+        print("%s: reading published (disk %s free, %s zombies)" % (
+            cfg.host, _fmt_bytes(reading.get("disk_free_bytes")),
+            "—" if reading.get("procs_zombie") is None else reading["procs_zombie"]))
+    return 0
+
+
+def _host_fleet(db, canons, args) -> int:
+    """`ameesh hosts --fleet` (#2022): one line per measured or canonical host —
+    age of its last reading (stale beyond 1 h), worst disk, zombies, what it
+    breaches or warns about; the hosts with something to say first. Meant
+    for a daily summary in the bureau's and the owner's thread."""
+    from . import resources as res
+
+    now = time.time()
+    lines = []
+    readings = {r["host"]: r for r in storage.of(db).hosts.current(args.host)}
+    names = ({args.host} if args.host else set(readings) | {
+        host.title for canon in canons for host in canon.hosts})
+    for name in sorted(names):
+        reading = readings.get(name, {"host": name})
+        limits = res.host_limits(canons, reading["host"])["limits"]
+        history = (storage.of(db).hosts.since(reading["host"], res.DISK_TREND_WINDOW_S)
+                   if name in readings else [])
+        lines.append(res.fleet_line(reading, limits, [h for h in history
+                                                      if h.get("id") != reading.get("id")],
+                                    now=now))
+    lines.sort(key=lambda line: (line["ok"], line["host"] or ""))
+    if args.json:
+        for line in lines:
+            print(json.dumps(line, ensure_ascii=False, sort_keys=True))
+        return 0
+    text = "\n".join(["fleet: %d host(s), %d to look at"
+                      % (len(lines), sum(not l["ok"] for l in lines))]
+                     + ["  " + _fleet_text(line) for line in lines])
+    print(text)
+    # #2022: the daily summary, mailed as is to each recipient's thread (the
+    # bureau's, read by the owner); any failure exits non-zero so the timer
+    # unit shows failed instead of losing the summary
+    failed = 0
+    for name in getattr(args, "send", None) or ():
+        try:
+            mail.send(db, FLEET_SENDER, name, text, kind="notify")
+        except Exception as exc:
+            failed += 1
+            print("ameesh hosts --fleet: not sent to %s (%s: %s)"
+                  % (name, type(exc).__name__, exc), file=sys.stderr)
+    return 1 if failed else 0
+
+
+#: #2022: the sender of the mailed fleet summary
+FLEET_SENDER = "ameesh"
+
+
+def _fleet_text(line: dict) -> str:
+    """« agents-1 [!] measured 2m ago; disk / 91 % used, 9.0 GiB free; … »."""
+    parts = ["no published measurement (STALE)" if line["age_s"] is None else
+             "measured %s%s" % (_fmt_age(line["age_s"]), " (STALE)" if line["stale"] else "")]
+    disk = line.get("disk")
+    if disk is not None:
+        parts.append("disk %s %s%s free" % (
+            disk["path"], "" if disk["used"] is None else "%d %% used, " % round(
+                disk["used"] * 100), _fmt_bytes(disk["free"])))
+    eta = [w["floor_eta_s"] for w in line["disk_warnings"] if w.get("floor_eta_s") is not None]
+    if eta:
+        parts.append("pause floor in %.1f h" % (min(eta) / 3600))
+    if line.get("zombies") is not None:
+        parts.append("%d zombies of %s processes" % (line["zombies"], line.get("procs")))
+    if line["breaches"]:
+        parts.append("breaches %s" % ", ".join(line["breaches"]))
+    return "%s %s %s" % (line["host"], "ok " if line["ok"] else "[!]", "; ".join(parts))
+
+
 def _host_measure_lines(latest: dict, offer: dict | None) -> list[str]:
     """`ameesh hosts` (L159d): PSI, application and guest shares, lendable
     capacity; nothing for a reading without these measures."""
@@ -672,6 +779,12 @@ def _host_measure_lines(latest: dict, offer: dict | None) -> list[str]:
         out.append("  shares     CPU application %s, guest %s of %s; guest memory %s" % (
             cpus(latest.get("app_cpu")), cpus(latest.get("guest_cpu")),
             latest.get("cpu_count") or "—", _fmt_bytes(latest.get("guest_mem_bytes"))))
+    # #2022: processes and zombies, of the host and of the publishing runner
+    if latest.get("procs_total") is not None:
+        out.append("  processes  %d, zombies %d; runner %s: %s, zombies %s" % (
+            latest["procs_total"], latest.get("procs_zombie") or 0,
+            latest.get("runner_id") or "—", latest.get("runner_procs", "—"),
+            latest.get("runner_zombies", "—")))
     # without an offer the host lends nothing: show what it could lend
     lent = res.offered(latest, offer if offer is not None else {})
     if lent is not None:
@@ -2352,6 +2465,15 @@ def build_parser() -> argparse.ArgumentParser:
                               "turns, lendable capacity, per day (L159g)")
     p_hosts.add_argument("--days", type=float, default=7.0,
                          help="window of --report, in days (default 7)")
+    p_hosts.add_argument("--publish", action="store_true",
+                         help="publish one reading of this host, for a host without a "
+                              "runner (CI VM, server; run by a timer) (#2022)")
+    p_hosts.add_argument("--fleet", action="store_true",
+                         help="fleet summary: one line per host, stale readings, disk, "
+                              "zombies, the hosts to look at first (#2022)")
+    p_hosts.add_argument("--send", action="append", default=None, metavar="NAME",
+                         help="with --fleet: also mail the summary to NAME's thread "
+                              "(repeatable); exits 1 if a send fails (#2022)")
     p_hosts.add_argument("--hold", action="store_true",
                          help="hold HOST on purpose (#254): alerts and nudges about its "
                               "agents stay quiet until --until (required, 24 h at most)")
