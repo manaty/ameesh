@@ -334,6 +334,18 @@ class AcknowledgementTest(PostMixin, PgTestCase):
                             evaluate=lambda thresholds: [self.a])
         self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
 
+    def test_a_perimeter_naming_an_unknown_threshold_is_reobserved_without_it(self):
+        self.ack(stale_lot_s=3600.0)
+        self.db.execute("update alert_acknowledgements"
+                        " set perimeter = '{\"gone_s\":1,\"stale_lot_s\":3600.0}'")
+        seen = []
+        alert_ack.reconcile(self.db, [], observed_ts=storage.of(self.db)
+                            .alert_acknowledgements.clock(),
+                            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+                            evaluate=lambda thresholds: seen.append(thresholds) or [self.a])
+        self.assertEqual(seen, [{"stale_lot_s": 3600.0}])
+        self.assertIsNone(self.history()[0]["invalidation_reason"])
+
     def test_notify_does_not_resolve_an_ack_from_another_perimeter(self):
         self.ack(stale_lot_s=3600.0)
         n = self.notifier()

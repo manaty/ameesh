@@ -1064,7 +1064,8 @@ class Notifier:
             # #1473 : un accusé se juge dans le périmètre qui l'a pris ; cette
             # passe réobserve l'alerte dans le sien avant de la dire résolue.
             def reobserve(own):
-                return alert_ack.current(self.cfg, db, now=now, **own)
+                # Sans la console locale (#1179) : ses alertes ne s'accusent pas.
+                return alert_ack.current(self.cfg, db, now=now, local_pool=False, **own)
 
             acknowledgements = alert_ack.reconcile(
                 db, current, observed_ts=observed_ts, dry_run=self.dry_run,

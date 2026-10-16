@@ -54,12 +54,13 @@ def default_thresholds() -> dict:
     return exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
 
 
-def current(cfg, db, *, now: float | None = None, **thresholds) -> list[dict]:
+def current(cfg, db, *, now: float | None = None, local_pool: bool = True,
+            **thresholds) -> list[dict]:
     from . import db as db_mod, exploitation
     if not thresholds:
         thresholds = default_thresholds()
     return db_mod.batched(db, lambda db: exploitation.alerts(
-        cfg, db, now=now, **thresholds))
+        cfg, db, now=now, local_pool=local_pool, **thresholds))
 
 
 def acknowledge(cfg, db, key: str, *, actor: str, principal: str | None = None,
@@ -139,6 +140,12 @@ def reconcile(db, current: list[dict], *, observed_ts: float, dry_run: bool = Fa
                 thresholds = json.loads(own)
             except ValueError:
                 thresholds = None
+            if isinstance(thresholds, dict):
+                # A perimeter written by another version may name a threshold
+                # that no longer exists: re-observe with the known ones rather
+                # than fail every pass on a TypeError.
+                known = default_thresholds()
+                thresholds = {k: v for k, v in thresholds.items() if k in known}
             others[own] = ({key_of(a): severity(a) for a in evaluate(thresholds)}
                            if isinstance(thresholds, dict) else levels)
         return others[own]
