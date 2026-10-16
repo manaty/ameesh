@@ -516,7 +516,11 @@ private recovery credential file, and no credential value enters a receipt, an
 argument, the child environment or an error. `dsn` must name the exact database
 of the release connection the migrations open (an enrollment pointing at
 another database is refused), and the pinned inventory carries that connection's
-schema, so the set can only be the pre-migration image of the migrated database. `backup` publishes the dump and
+schema, so the set can only be the pre-migration image of the migrated database. Reading the effective target uses libpq's own parser
+(`psycopg.conninfo`); when that parser is absent (the `psql` driver installs no
+psycopg) the recovery set refuses at construction with the named
+`LibpqParserUnavailable`, so admission stays fail-closed instead of accepting an
+unverified target. `backup` publishes the dump and
 its pinned row inventory in the private retention root, proves an isolated
 restore against that inventory, proves a configured remote copy can be
 retrieved with the recovery identity, and records the verified set in a

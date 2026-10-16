@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -20,6 +21,32 @@ SPEC = importlib.util.spec_from_file_location(
     'release_recovery', Path(__file__).resolve().parents[1] / 'deploy/mise-a-jour/sauvegarde-release.py')
 recovery = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(recovery)
+# Le pilote psql n'installe pas psycopg : le recoupement de cible libpq (K7)
+# ne peut pas s'exécuter. L'absence est un REFUS NOMMÉ, prouvé par
+# `DatabaseTargetTest.test_absent_libpq_parser_refuses_namedly` (les deux
+# passes) et par l'admission de `test_l232b_host_factory` ; les témoins qui
+# exigent le parseur réel sont donc sautés dans cette passe-là seulement.
+HAVE_PSYCOPG = importlib.util.find_spec('psycopg') is not None
+
+
+class DatabaseTargetTest(unittest.TestCase):
+    """Le recoupement de cible libpq : parseur réel, ou refus nommé."""
+
+    @unittest.skipUnless(HAVE_PSYCOPG, 'libpq DSN parser (psycopg) unavailable')
+    def test_libpq_parser_reads_the_effective_target(self):
+        target = recovery.database_target(
+            'postgresql://backup@localhost:5433/fixture-db')
+        self.assertEqual(target, ('localhost', '', '5433', 'fixture-db'))
+    def test_absent_libpq_parser_refuses_namedly(self):
+        # Pilote psql sans psycopg : aucune cible non vérifiée n'est acceptée,
+        # et le refus est nommé (fail-closed), pas une erreur d'import masquée.
+        with mock.patch.dict(sys.modules, {'psycopg.conninfo': None}):
+            with self.assertRaises(recovery.LibpqParserUnavailable) as caught:
+                recovery.database_target('postgresql://backup@localhost/fixture-db')
+        self.assertIn('libpq parser unavailable', str(caught.exception))
+        # une référence invalide reste un refus silencieux, sans parseur requis
+        self.assertIsNone(recovery.database_target(None))
+        self.assertIsNone(recovery.database_target(''))
 
 
 class Database:
@@ -30,6 +57,9 @@ class Database:
         return True
 
 
+@unittest.skipUnless(HAVE_PSYCOPG, 'libpq DSN parser (psycopg) unavailable: '
+                     'the named refusal is proven by DatabaseTargetTest and by '
+                     'the host factory admission witness')
 class RecoverySetTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ameesh-release-recovery-')
