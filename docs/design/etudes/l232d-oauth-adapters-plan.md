@@ -196,3 +196,32 @@ pas telle quelle ; voir §9.
    d'admission L232a/e existant ?
 6. **Frontière #365 tranche 2** : le canal connexion partage-t-il le dispatcher/ForceCommand
    `ameesh-secrets`, ou reste-t-il séparé ?
+
+## 11. Annexe — vérifications première main des CLI installés (16/10 ~12:05Z)
+
+Relevé sur `ameesh-agents-1` (cet hôte) et via `ameesh harness versions` :
+
+- **Versions** : `claude` 2.1.296 ici, 2.1.286 sur `pc-smichea` ; `gh` 2.102.0 ici ;
+  `codex` 0.159.3 **seulement** sur `pc-smichea` ; `dsh` 0.2.0-rc.2. Les versions
+  diffèrent d'un hôte à l'autre : le parseur doit être indexé sur la version observée et
+  refuser tout flux non reconnu (§3, §4).
+- **Claude** (`claude auth login --help`, 2.1.296) : options `--claudeai` (abonnement,
+  défaut), `--console` (facturation API), `--email`, `--sso`. Garde-fou ajouté :
+  l'adaptateur exige l'abonnement et **refuse `--console`** (règle « jamais de dépense en
+  plus ») ; `--email` peut pré-remplir le compte voulu. `claude auth status` existe (sonde
+  `sentinel.probe_claude`) ; `claude setup-token` existe et reste hors pilote par défaut
+  (type de compte `oauth_token` requis, §4).
+- **GitHub** (`gh auth login --help`, 2.102.0) : `-w/--web`, `--hostname`,
+  `-p/--git-protocol {ssh|https}`, `-c/--clipboard`, `--insecure-storage`,
+  `--with-token`, `-s/--scopes`. Deux garde-fous ajoutés : pas de `--clipboard` sur un
+  compte distant (le presse-papiers est celui de l'hôte, pas du téléphone) — le code se
+  capture dans la sortie du CLI ; `--insecure-storage` refusé sauf absence de trousseau
+  **et** foyer `0600` vérifié ; `--with-token` hors périmètre (aucun jeton en clair).
+- **Codex** : absent de cet hôte, `codex login --device-auth` n'a pas pu être vérifié
+  première main ici. Précondition de la tranche 1 : vérifier le drapeau et la forme de
+  sortie sur l'hôte du pilote (0.159.3 sur `pc-smichea`) avant d'écrire le parseur ; en
+  cas de divergence, l'adaptateur refuse le flux et le signale (pas de repli par copie).
+- **Conséquence** : §4 est confirmé pour Claude et GitHub sur les versions ci-dessus ;
+  deux garde-fous s'ajoutent ; la vérification Codex est ajoutée aux préconditions de la
+  tranche 1.
+
