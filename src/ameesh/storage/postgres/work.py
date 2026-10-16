@@ -461,7 +461,13 @@ class WorkItems(interface.WorkItems):
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
         en cours est effacée (issue `annulee` au registre). #540 :
-        `queued_note` (voir l'interface)."""
+        `queued_note` (voir l'interface). #1696 : `ready_only` (prise
+        automatique, L165) exige `current=None` — une combinaison contraire
+        est une erreur d'appel, refusée avant le verrou, jamais un None muet."""
+        if ready_only and current is not None:
+            raise ValueError(
+                "assign(ready_only=True) exige current=None : la prise"
+                " automatique (L165/#1242) ne réassigne pas un lot attribué")
         with self.db.transaction() as tx:
             if ready_only:
                 # Même verrou que les éditions du graphe : une dépendance ne
@@ -474,7 +480,7 @@ class WorkItems(interface.WorkItems):
                     "                         WHERE work_item_id = %s)"
                     " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
                 item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
-                if current is not None or item is None or item["state"] != "intake" \
+                if item is None or item["state"] != "intake" \
                         or item["assignee"] is not None:
                     return None
                 if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
