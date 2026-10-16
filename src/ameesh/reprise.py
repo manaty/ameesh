@@ -258,6 +258,20 @@ def recently_modified(path: str | None) -> bool:
         return False
 
 
+def recently_modified(path: str | None) -> bool:
+    """A recently written external journal may still have a live writer.
+
+    Some harnesses close their journal between writes. Wait a quiet minute
+    before adoption or unleased resumption, even when no open fd was found.
+    """
+    if not path:
+        return False
+    try:
+        return time.time() - os.stat(path).st_mtime < 60
+    except FileNotFoundError:
+        return False
+
+
 def session_cwd(harness: str, path: str) -> str | None:
     """Le dossier de travail noté dans le journal de session (Codex :
     `session_meta.payload.cwd` ; Claude : champ `cwd`), ou None."""

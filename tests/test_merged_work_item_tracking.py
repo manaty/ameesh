@@ -25,8 +25,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (assignments, exploitation, mail, plan_git, projects, registry,
-                    sous_utilisation, work)
+from ameesh import (assignments, exploitation, mail, migrations, plan_git, projects,
+                    registry, sous_utilisation, work)
 
 from .support import PgTestCase, hold_for_owner
 
@@ -206,11 +206,63 @@ class CorrectionTest(_Base):
         self.assertEqual(item["state"], "build")
         self.assertEqual(work.events(self.db, lot["id"])[0]["note"],
                          "correction: merged → build — PR d'étape fusionnée trop tôt (#759)")
-        # le jalon de fusion reste : la fusion a bien eu lieu
-        self.assertEqual(sum(1 for m in work.milestones(self.db, lot["id"])
-                             if m["kind"] == "merged"), 1)
+        # #1693 (N4) : le jalon de la fusion annulée est retiré de la frise —
+        # elle ne date ni l'affichage ni les délais d'un lot rouvert. Le
+        # journal, lui, garde la fusion puis la correction.
+        self.assertEqual([m for m in work.milestones(self.db, lot["id"])
+                          if m["kind"] == "merged"], [])
+        self.assertIsNone(work.timeline(self.db, lot["id"])["merged_ts"])
         # et le lot repart dans la machine à états
         self.assertEqual(work.move(self.db, lot["id"], "qa")["state"], "qa")
+        # la vraie fusion écrit SON jalon, daté et signé par elle
+        work.merged(self.db, lot["id"], sha="beef1234", actor="orch")
+        merged = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["sha"], "beef1234")
+        self.assertEqual(work.timeline(self.db, lot["id"])["merged_ts"],
+                         merged[0]["at_ts"])
+
+    def test_1693_reprise_retire_le_jalon_des_lots_corriges(self):
+        # #1693 (N4) : la reprise 0449 retire le jalon d'une fusion annulée
+        # laissé par les lots corrigés AVANT le correctif ; un lot sorti de
+        # `merged` par une transition normale (`blocked`) garde le sien, et un
+        # lot REFUSIONNÉ depuis (vue cx2) aussi — son jalon est celui de la
+        # vraie fusion, que la reprise ne doit pas emporter.
+        corrige = work.add(self.db, title="corrigé avant le correctif", actor="orch")
+        for state in ("build", "qa", "merged"):
+            work.move(self.db, corrige["id"], state, actor="orch")
+        work.move(self.db, corrige["id"], "build", actor="orch",
+                  correct="PR d'étape fusionnée trop tôt (#759)")
+        # le correctif courant a déjà retiré le jalon : on repose celui d'avant
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor, note)"
+            " VALUES (%s, 'merged', now(), %s, 'orch', 'transition')",
+            (corrige["id"], SHA))
+        suspendu = work.add(self.db, title="suspendu après fusion", actor="orch")
+        for state in ("build", "qa", "merged"):
+            work.move(self.db, suspendu["id"], state, actor="orch")
+        work.move(self.db, suspendu["id"], "blocked", actor="orch")
+        refusionne = work.add(self.db, title="refusionné puis suspendu", actor="orch")
+        for state in ("build", "qa", "merged"):
+            work.move(self.db, refusionne["id"], state, actor="orch")
+        work.move(self.db, refusionne["id"], "build", actor="orch",
+                  correct="PR d'étape fusionnée trop tôt (#759)")
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor, note)"
+            " VALUES (%s, 'merged', now(), %s, 'orch', 'transition')",
+            (refusionne["id"], SHA))
+        for state in ("qa", "merged"):        # la vraie fusion, après la correction
+            work.move(self.db, refusionne["id"], state, actor="orch")
+        work.move(self.db, refusionne["id"], "blocked", actor="orch")
+        with open(os.path.join(migrations.MIGRATIONS_DIR,
+                               "0449_work_milestones_correction.sql"),
+                  encoding="utf-8") as fh:
+            self.db.script(fh.read())
+        self.assertEqual([m for m in work.milestones(self.db, corrige["id"])
+                          if m["kind"] == "merged"], [])
+        self.assertEqual(self.merged_milestone(suspendu["id"])["kind"], "merged")
+        self.assertEqual(self.merged_milestone(refusionne["id"])["kind"], "merged")
 
     def test_role_de_conception_au_canon(self):
         class Fiche:
