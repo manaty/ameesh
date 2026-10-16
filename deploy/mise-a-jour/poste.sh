@@ -185,7 +185,7 @@ ameesh_de() {
 installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
-  local ref=${1:-HEAD} cible court
+  local ref=${1:-HEAD} cible court precedent_court=
   cible=$(instantane "$ref")
   court=${cible##*/src-}
   etape "instantané $ref ($court) dans $cible"
@@ -204,14 +204,19 @@ installer() {
   fi
   [ -L "$PARTAGE/src-current" ] && readlink "$PARTAGE/src-current" > "$TRAVAIL/precedent"
   echo "version précédente : $(cat "$TRAVAIL/precedent" 2>/dev/null || echo '?')"
+  if [ -s "$TRAVAIL/precedent" ]; then
+    precedent_court=$(basename "$(cat "$TRAVAIL/precedent")"); precedent_court=${precedent_court#src-}
+  fi
   # #1969 : jamais de pip dans le venv vivant. Le venv de $court est préparé à
   # l'écart (pip + contrôles d'imports, de point d'entrée et de shebang), puis
   # la bascule n'est qu'un rename : un appel concurrent des agents voit
-  # l'ancien ou le nouveau code entier, jamais un état incomplet.
+  # l'ancien ou le nouveau code entier, jamais un état incomplet. La première
+  # conversion adopte le venv réel comme version précédente, sans pip.
   etape "préparation isolée du venv de $court (code puis dépendances, dont psycopg)"
   python3 "$ICI/bascule.py" preparer --venv "$VENV" --src "$cible" --version "$court"
   etape "bascule atomique du venv et du code courant"
-  python3 "$ICI/bascule.py" activer --venv "$VENV" --version "$court"
+  python3 "$ICI/bascule.py" activer --venv "$VENV" --version "$court" \
+    ${precedent_court:+--precedent "$precedent_court"}
   ln -sfn "src-$court" "$PARTAGE/src-current"
   "$VENV/bin/python" -c 'import psycopg, ameesh.budget, ameesh.projects; print("psycopg", psycopg.__version__, ": modules L70 et L62 présents")'
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."

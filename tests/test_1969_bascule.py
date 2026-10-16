@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1969 : bascule atomique du venv de mise à jour.
 
-Banc isolé uniquement : des venvs factices dans un répertoire temporaire, une
-boucle d'appels concurrents, aucune installation réelle, aucun hôte, aucune
-base. On vérifie les témoins exigés par le corps du lot :
+Banc isolé uniquement : des venvs factices ou de VRAIS venvs (`--without-pip`)
+dans un répertoire temporaire, une boucle d'appels concurrents, aucune
+installation réelle, aucun hôte, aucune base. On vérifie les témoins exigés
+par le corps du lot et par la revue BLOQUÉE du 16/10 :
 
+* B1 — un processus garde un chemin IMMUTABLE : un enfant lancé avant la
+  conversion (venv réel) puis un enfant lancé après (par le lanceur) peuvent
+  importer un sous-module TARDIF après la bascule sans jamais voir le mélange
+  ancien/nouveau ; de vrais interpréteurs sont utilisés pour ce témoin ;
+* B2 — `retour` réutilise le venv réel conservé (lib liée, aucun pip), y
+  compris à la première conversion ;
 * pendant `activer` puis `retour`, un appel CLI concurrent voit toujours
   l'ancien ou le nouveau code ENTIER (jamais absent, jamais partiel) ;
 * une préparation en échec laisse la version active intacte ;
-* les shebangs/chemins restent valides après la bascule (le script console du
-  venv versionné s'exécute via `<venv>/bin/…`) ;
-* l'ancien venv reste sur disque (un processus déjà lancé garde son
-  environnement) ;
-* `retour` ramène à la version précédente complète, sans pip, et est
-  idempotent.
+* `retour` est idempotent et sans pip.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -36,32 +39,60 @@ SPEC = importlib.util.spec_from_file_location("bascule_1969", DEPLOY / "bascule.
 bascule = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bascule)
 
-TEMOIN = """#!/bin/sh
-# script console du venv versionné : nomme la version qui le porte
-cat "$(dirname "$0")/../VERSION"
+#: enfant réel : importe le paquet, attend, puis importe un sous-module TARDIF
+ENFANT = """import sys
+import pkg1969
+print("prefix=" + sys.prefix, flush=True)
+print("valeur=" + pkg1969.VALUE, flush=True)
+sys.stdin.readline()
+import importlib
+tardif = importlib.import_module("pkg1969." + sys.argv[1])
+print("tardif=" + tardif.VALUE, flush=True)
 """
 
 
 def faux_venv(base: Path, version: str, *, marque: bool = True) -> Path:
-    """Un venv factice : `bin/temoin` nomme la version, marqueur `.pret`."""
+    """Un venv factice : `bin/python` et `bin/ameesh` nomment la version."""
     path = base / ("venv-%s" % version)
     (path / "bin").mkdir(parents=True)
-    (path / "VERSION").write_text(version + "\n")
-    temoin = path / "bin" / "temoin"
-    temoin.write_text(TEMOIN)
-    temoin.chmod(0o755)
+    python = path / "bin" / "python"
+    python.write_text('#!/bin/sh\n[ "$1" = "-c" ] && exit 0\necho %s\n' % version)
+    python.chmod(0o755)
+    ameesh = path / "bin" / "ameesh"
+    ameesh.write_text("#!/bin/sh\necho %s\n" % version)
+    ameesh.chmod(0o755)
+    (path / "pyvenv.cfg").write_text("home = /usr/bin\n")
     if marque:
         (path / bascule.MARKER).write_text(json.dumps({"version": version}))
     return path
 
 
+def vrai_venv(base: Path, version: str, valeur: str, sous_module: str) -> Path:
+    """Un VRAI venv (`--without-pip`) portant un paquet distinguable."""
+    path = base / ("venv-%s" % version)
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(path)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    site = next(path.glob("lib/python3*/site-packages"))
+    paquet = site / "pkg1969"
+    paquet.mkdir()
+    (paquet / "__init__.py").write_text("VALUE = %r\n" % valeur)
+    (paquet / (sous_module + ".py")).write_text("VALUE = %r\n" % valeur)
+    ameesh = path / "bin" / "ameesh"
+    ameesh.write_text("#!%s/bin/python\nimport pkg1969\nprint(pkg1969.VALUE)\n" % path)
+    ameesh.chmod(0o755)
+    return path
+
+
 def lire(venv: Path) -> tuple[int, str]:
-    proc = subprocess.run([str(venv / "bin" / "temoin")], capture_output=True, text=True)
+    proc = subprocess.run([str(venv / "bin" / "ameesh")], capture_output=True, text=True)
     return proc.returncode, proc.stdout.strip()
 
 
-def activer(venv: Path, version: str) -> int:
-    return bascule.main(["activer", "--venv", str(venv), "--version", version])
+def activer(venv: Path, version: str, precedent: str | None = None) -> int:
+    args = ["activer", "--venv", str(venv), "--version", version]
+    if precedent:
+        args += ["--precedent", precedent]
+    return bascule.main(args)
 
 
 def retour(venv: Path) -> int:
@@ -74,8 +105,78 @@ class BasculeTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.venv = self.base / "venv"
+        self.enfants: list[subprocess.Popen] = []
+        self.addCleanup(self._fermer_enfants)
 
-    # -- première conversion : venv réel -> lien, puis bascules ------------
+    def _fermer_enfants(self):
+        for enfant in self.enfants:
+            if enfant.poll() is None:
+                enfant.kill()
+            enfant.wait(timeout=10)
+
+    def enfant(self, python, sous_module):
+        proc = subprocess.Popen([str(python), "-c", ENFANT, sous_module],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        self.enfants.append(proc)
+        prefix = proc.stdout.readline().strip()
+        valeur = proc.stdout.readline().strip()
+        return proc, prefix, valeur
+
+    @staticmethod
+    def reveiller(proc):
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        return proc.stdout.readline().strip()
+
+    # -- B1 : le chemin d'un processus ne traverse jamais une bascule -------
+
+    def test_import_tardif_ne_traverse_jamais_une_bascule(self):
+        vrai_venv(self.base, "v1", "v1", "old_only")
+        os.rename(self.base / "venv-v1", self.venv)      # venv réel d'avant #1969
+        vrai_venv(self.base, "v2", "v2", "new_only")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        # enfant hérité : lancé par le venv réel AVANT la conversion
+        herite, prefix, valeur = self.enfant(self.venv / "bin" / "python", "old_only")
+        self.assertEqual(os.path.realpath(self.venv), os.path.realpath(prefix.split("=", 1)[1]))
+        self.assertEqual("valeur=v1", valeur)
+        # bascule : adoption du venv réel (lib réutilisée) puis lien vers v2
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        self.assertFalse(self.venv.is_symlink())
+        self.assertTrue((self.venv / bascule.LAUNCHERS).is_file())
+        self.assertEqual((0, "v2"), lire(self.venv))
+        self.assertTrue((self.base / "venv-v1" / "lib").is_symlink())
+        # l'enfant hérité importe encore SON sous-module d'origine
+        self.assertEqual("tardif=v1", self.reveiller(herite))
+        # un nouvel enfant part sur le venv versionné concret
+        neuf, prefix, valeur = self.enfant(self.venv / "bin" / "python", "new_only")
+        self.assertEqual(os.path.realpath(self.base / "venv-v2"),
+                         os.path.realpath(prefix.split("=", 1)[1]))
+        self.assertEqual("valeur=v2", valeur)
+        # après retour, l'enfant neuf garde son chemin : toujours v2 entier
+        self.assertEqual(0, retour(self.venv))
+        self.assertEqual((0, "v1"), lire(self.venv))
+        self.assertEqual("tardif=v2", self.reveiller(neuf))
+
+    # -- B2 : le retour réutilise le venv réel, sans pip --------------------
+
+    def test_retour_reutilise_le_venv_reel_sans_pip(self):
+        vrai_venv(self.base, "v1", "v1", "old_only")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "new_only")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        with mock.patch.object(bascule, "_pip_install",
+                               side_effect=AssertionError("pip interdit sur ce chemin")):
+            self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+            self.assertEqual(0, retour(self.venv))
+            self.assertEqual(0, retour(self.venv))       # idempotent, toujours sans pip
+        self.assertEqual((0, "v1"), lire(self.venv))
+        # la version adoptée réutilise le venv réel : lib liée, rien de déplacé
+        self.assertTrue((self.base / "venv-v1" / "lib").is_symlink())
+        self.assertTrue(os.path.samefile(self.base / "venv-v1" / "lib", self.venv / "lib"))
+        self.assertEqual("v1", bascule.etat_de(str(self.venv))["precedente"])
+
+    # -- conversions et idempotence (venvs factices, rapides) ---------------
 
     def test_conversion_atomique_retour_et_idempotence(self):
         faux_venv(self.base, "v1")
@@ -83,11 +184,9 @@ class BasculeTest(unittest.TestCase):
         faux_venv(self.base, "v2")
         self.assertEqual((0, "v1"), lire(self.venv))
 
-        self.assertEqual(0, activer(self.venv, "v2"))
-        self.assertTrue(self.venv.is_symlink())
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
         self.assertEqual((0, "v2"), lire(self.venv))
-        # l'ancien venv entier reste sur disque (processus déjà lancé)
-        self.assertEqual((0, "v1"), lire(self.base / "venv-precedent"))
+        self.assertEqual((0, "v1"), lire(self.base / "venv-v1"))   # conservé, adopté
 
         self.assertEqual(0, retour(self.venv))
         self.assertEqual((0, "v1"), lire(self.venv))
@@ -96,6 +195,10 @@ class BasculeTest(unittest.TestCase):
 
         self.assertEqual(0, activer(self.venv, "v2"))     # lien -> lien
         self.assertEqual((0, "v2"), lire(self.venv))
+        # relance sur le même SHA : aucun pip, la cible de retour ne bouge pas
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v2"))
+        self.assertEqual((0, "v2"), lire(self.venv))
+        self.assertEqual("v1", bascule.etat_de(str(self.venv))["precedente"])
 
     def test_bascule_concurrente_voit_ancien_ou_nouveau_entier(self):
         faux_venv(self.base, "v1")
@@ -112,7 +215,7 @@ class BasculeTest(unittest.TestCase):
         fil.start()
         try:
             for _ in range(25):
-                self.assertEqual(0, activer(self.venv, "v2"))
+                self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
                 self.assertEqual(0, retour(self.venv))
         finally:
             arret.set()
@@ -170,13 +273,15 @@ class BasculeTest(unittest.TestCase):
                 activer(self.venv, "v9")
         self.assertEqual((0, "v1"), lire(self.venv))
 
-    def test_retour_sans_precedente_refuse(self):
+    def test_retour_sans_bascule_enregistree_est_un_noop(self):
         faux_venv(self.base, "v1")
         os.rename(self.base / "venv-v1", self.venv)
-        with self.assertRaises(SystemExit):
-            with redirect_stdout(io.StringIO()):
-                retour(self.venv)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(0, retour(self.venv))
         self.assertEqual((0, "v1"), lire(self.venv))
+        faux_venv(self.base, "v2")
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        self.assertEqual((0, "v2"), lire(self.venv))
 
 
 class CablageTest(unittest.TestCase):
@@ -195,6 +300,19 @@ class CablageTest(unittest.TestCase):
         texte = (DEPLOY / "poste.sh").read_text()
         self.assertLess(texte.index('bascule.py" preparer'),
                         texte.index('bascule.py" activer'))
+
+    def test_poste_adopte_la_version_quittee(self):
+        """La première conversion nomme la version quittée : retour sans pip."""
+        texte = (DEPLOY / "poste.sh").read_text()
+        self.assertIn("--precedent", texte)
+
+    def test_vm_adopte_la_version_quittee_et_retourne_sans_preparer(self):
+        texte = (DEPLOY / "vm.sh").read_text()
+        self.assertIn('reinstaller_agents "$sha" "$complet"', texte)
+        self.assertIn("--precedent", texte)
+        self.assertIn("$BASCULE_AGENTS retour", texte)
+        self.assertNotIn('reinstaller_agents "$complet"', texte,
+                         "le retour agents repasse par preparer/pip")
 
 
 if __name__ == "__main__":

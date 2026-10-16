@@ -293,6 +293,10 @@ class VmAgentsHarness(unittest.TestCase):
         (self.venv / 'bin/python').chmod(0o755)
         (self.venv / 'bin/pip').chmod(0o755)
         (self.venv / 'bin/ameesh').chmod(0o755)
+        # #1969 : un venv réel porte son pyvenv.cfg ; la première conversion
+        # l'adopte (lib réutilisée) sans pip et exige cette pièce.
+        (self.venv / 'pyvenv.cfg').write_text(
+            'home = %s\n' % os.path.dirname(sys.executable))
         self.workhome = self.root / 'home'
         self.workhome.mkdir()
         config = self.root / 'bascule.env'
@@ -392,7 +396,15 @@ class VmAgentsHarness(unittest.TestCase):
         return log.read_text().splitlines() if log.exists() else []
 
     def installed_url(self):
-        info = (self.venv / 'lib/python3.11/site-packages'
+        # #1969 : le venv stable porte les lanceurs ; le code servi est celui du
+        # venv versionné vivant (lien venv-courant), pas le lib d'origine
+        # conservé pour les processus déjà lancés.
+        vivant = self.venv
+        courant = self.parts / 'venv-courant'
+        if courant.is_symlink():
+            cible = os.readlink(courant)
+            vivant = Path(cible) if cible.startswith('/') else self.parts / cible
+        info = (vivant / 'lib/python3.11/site-packages'
                 / 'ameesh-1.9.0.dist-info/direct_url.json')
         return json.loads(info.read_text())['url']
 

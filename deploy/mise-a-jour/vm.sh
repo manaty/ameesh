@@ -338,10 +338,17 @@ else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
 # effective du compte runner et le journal de récupération sont vérifiés avant
 # toute mutation. Détail : docs/DEPLOIEMENT-HOTE-AGENTS.md.
 
-installe_agents() {  # code réellement installé (direct_url.json -> src-<sha7>)
+installe_agents() {  # code réellement installé (direct_url.json du venv VIVANT)
   utilisateur_agents bash -c 'set -euo pipefail
-    V=/home/ameesh/.local/share/ameesh/venv
-    for d in "$V"/lib/python*/site-packages/ameesh-*.dist-info; do
+    P=/home/ameesh/.local/share/ameesh; V=$P/venv; L=$V
+    # #1969 : le venv stable porte les lanceurs ; les métadonnées du code servi
+    # sont celles du venv versionné vivant (lien venv-courant), pas du lib
+    # d’origine conservé pour les processus déjà lancés.
+    if [ -L "$P/venv-courant" ]; then
+      C=$(readlink "$P/venv-courant")
+      case $C in /*) L=$C;; *) L=$P/$C;; esac
+    fi
+    for d in "$L"/lib/python*/site-packages/ameesh-*.dist-info; do
       [ -r "$d/direct_url.json" ] || continue
       python3 -c "import json,sys
 u = json.load(open(sys.argv[1])).get(\"url\", \"\")
@@ -582,14 +589,16 @@ assurer_instantane_agents() {  # $1 : sha40 ; instantané exact, créé ou véri
     return 1; }
 }
 # Réinstallation depuis l'instantané $1 : venv versionné préparé à l'écart
-# puis bascule atomique (#1969), même chemin pour installer et retour.
+# puis bascule atomique (#1969). $2 (facultatif) : version quittée, adoptée
+# sans pip à la première conversion. Le retour, lui, ne passe pas par ici : il
+# rebascule le lien vers le venv conservé (`retour_agents`).
 reinstaller_agents() {
-  local court=${1:0:7}
+  local court=${1:0:7} precedent=${2:0:7}
   envoyer_bascule_agents || return 1
   utilisateur_agents bash -c "set -euo pipefail
     P=/home/ameesh/.local/share/ameesh; V=\$P/venv
     python3 $BASCULE_AGENTS preparer --venv \"\$V\" --src \"\$P/src-$court\" --version $court
-    python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court
+    python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court ${precedent:+--precedent $precedent}
     \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
 }
 releve_agents() {  # identité et pièces du bon hôte, avant tout geste
@@ -719,7 +728,7 @@ installer_agents() {
     exit 1
   fi
   etape "installation dans le venv (depuis src-$court)"
-  if ! reinstaller_agents "$sha"; then
+  if ! reinstaller_agents "$sha" "$complet"; then
     echo "installation inachevée : « $0 agents retour » revient à ${complet:0:9} (journal conservé)" >&2
     exit 1
   fi
@@ -778,9 +787,13 @@ retour_agents() {
     echo "checkout de ${complet:0:9} inachevé : relancer « $0 agents retour »" >&2
     exit 1
   fi
-  etape "réinstallation dans le venv (depuis src-$court)"
-  if ! reinstaller_agents "$complet"; then
-    echo "réinstallation inachevée : relancer « $0 agents retour »" >&2
+  etape "retour par la bascule, sans pip (venv versionné conservé)"
+  if ! envoyer_bascule_agents \
+     || ! utilisateur_agents bash -c "set -euo pipefail
+        P=/home/ameesh/.local/share/ameesh; V=\$P/venv
+        python3 $BASCULE_AGENTS retour --venv \"\$V\"
+        \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"retour\", ameesh.__file__)'"; then
+    echo "retour par la bascule inachevé : relancer « $0 agents retour »" >&2
     exit 1
   fi
   # succès : le code installé devient la cible idempotente du retour, et le
@@ -826,7 +839,7 @@ installer() {
     git -C $SRC checkout -q --detach '$sha'
     test \"\$(git -C $SRC rev-parse HEAD)\" = '$sha'
     python3 $BASCULE_VM preparer --venv $VENV --src $SRC --version ${sha:0:7}
-    python3 $BASCULE_VM activer --venv $VENV --version ${sha:0:7}
+    python3 $BASCULE_VM activer --venv $VENV --version ${sha:0:7} --precedent \$(cut -c1-7 $PRECEDENT)
     $VENV/bin/python -c 'import psycopg, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \": modules L70 et L62 présents\")'"
   echo "installé. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
