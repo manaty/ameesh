@@ -736,7 +736,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         else:
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
-                source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]))
+                source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]),
+                repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
             entry["result"] = done["result"]
             detail = "%s — %s" % (entry["detail"], done["detail"])
             entry["detail"] = detail
@@ -1898,7 +1899,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                       % (source, target, primary, TARGET_GIT_KEY, target))
         done = work_mod.close_merged(
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target,
-            source=source, frozen_id=found.get("frozen_id"))
+            source=source, frozen_id=found.get("frozen_id"),
+            repo=repo)                          # L539 : dépôt du relevé, indice de classe
         entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
         if done["result"] == "merged":
             if found.get("kind") == "content":
@@ -1920,5 +1922,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                        text=text, project=fil.project_for(db.cfg, fil.agent_project(reg)),
                        lot=str(lot), meta={"kind": "event"})
         results.append(entry)
+    # L539 (#1104) : les relevés ne revoient jamais un lot déjà fusionné ; ce
+    # rattrapage borné rouvre les relectures dont l'ouverture avait échoué à la
+    # fusion (R1 #1104 P2-2). Jamais en dry-run, jamais bloquant.
+    review_catch_up: dict = {}
+    if not dry_run:
+        try:
+            from . import review_lot
+            review_catch_up = review_lot.catch_up(
+                db, limit=review_lot.CATCH_UP_LIMIT)
+        except Exception:  # noqa: BLE001 - un rattrapage ne casse pas le relevé
+            review_catch_up = {}
     return {"host": host, "dry_run": bool(dry_run), "results": results,
-            "merged": sum(1 for r in results if r["result"] == "merged")}
+            "merged": sum(1 for r in results if r["result"] == "merged"),
+            "review_catch_up": review_catch_up}
