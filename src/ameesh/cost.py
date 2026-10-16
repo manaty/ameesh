@@ -260,6 +260,11 @@ class Gauge:
     #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
     #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
     read_at: float | None = None
+    #: #1580 (tranche 3) : le modèle auquel ce seau est propre (le `title` du
+    #: widget omarchy, ex. « Fable Weekly » → « fable »), '' pour une fenêtre
+    #: générale. Un seau propre à un modèle ne compte que pour une session de
+    #: ce modèle (`accounts.gauges_of`) ; l'affichage les montre tous.
+    scope: str = ""
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -404,6 +409,39 @@ def stale_reading(gauges, now: float) -> bool:
     if not stamps:
         return False
     return now - min(stamps) > min(g.window_s for g in gauges)
+
+
+def reading_outdated(gauges, now: float) -> bool:
+    """#1672 : le relevé **partiel** est-il trop vieux pour engager un tour ?
+
+    `stale_reading` dit qu'un relevé partiel — une fenêtre datée remise à zéro,
+    une autre encore ouverte — n'est plus un instantané courant ; il reste
+    néanmoins informatif pour les fenêtres encore ouvertes tant que son âge
+    (`now - read_at`) ne dépasse pas ce qui leur reste (`resets_at - now`).
+    Au-delà, la remise à zéro qui rendra le relevé caduc est plus proche que le
+    trou d'observation : **prudence sur une information ancienne**, pas la
+    preuve d'un quota atteint. Le cas réel du 15/10 : relevé de 30 % vieux de
+    quatre jours, fenêtre 7 j à 9 h de sa remise à zéro — le choix automatique
+    y a envoyé un tour, refusé par la limite hebdomadaire.
+
+    Faux pour un relevé **courant** (aucune fenêtre datée remise à zéro) et
+    pour un relevé dont **toutes** les fenêtres datées sont échues (L71, la
+    suivante est vierge à 0 %). Faux sans âge connu (`read_at` absent : une
+    date manquante ne prouve aucune péremption de plus). Faux dès qu'**une**
+    fenêtre encore ouverte reste plus longue que l'âge : le relevé garde du
+    sens pour elle.
+    """
+    dated = [g for g in gauges if g.resets_at]
+    if not any(g.reset_passed(now) for g in dated):
+        return False
+    opened = [g for g in dated if not g.reset_passed(now)]
+    if not opened:
+        return False                    # L71 : toutes échues, la suivante est vierge
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
+    if not stamps:
+        return False
+    age = now - min(stamps)
+    return all(age > float(g.resets_at) - now for g in opened)
 
 
 @dataclass(frozen=True)
@@ -807,11 +845,14 @@ class CostBook:
 
         With `account` (L30), use the marker preceding each turn, including
         markers outside the read tail. Only a stream with no account marker
-        belongs to `primary`. Leading readings before any established marker
-        in a marked stream stay unknown, never primary.
+        belongs to `primary` — the harness's default account (`accounts.
+        primary_of`), and only when one is declared: `primary=None` means no
+        account claims them (L1078), never "the account itself". Leading
+        readings before any established marker in a marked stream stay
+        unknown, never primary.
         """
         if account is not None:
-            return self._claude_gauges_of(account, primary or account)
+            return self._claude_gauges_of(account, primary)
         newest = None
         for agent in self.agents():
             if not self._claude_candidate(agent):
@@ -833,11 +874,13 @@ class CostBook:
                 break
         return newest[1] if newest else []
 
-    def _claude_gauges_of(self, account: str, primary: str) -> list:
+    def _claude_gauges_of(self, account: str, primary: str | None) -> list:
         """Read the newest gauges for one Claude account (L30).
 
         Compare turn-marker timestamps across agents. Only a stream without
-        any marker uses the primary account and file modification time.
+        any marker uses the `primary` account (the harness's default one,
+        L1078) and file modification time; with `primary` None, no account
+        claims them.
         """
         best = None
         for agent in self.agents():
@@ -866,12 +909,15 @@ class CostBook:
                 self._claude_gauge_cache.pop(path, None)
                 continue
             found = readings.get(account)
-            if found is None and account == primary:
+            if found is None and primary is not None and account == primary:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
-        # A caller must not mutate the cached list seen by another CostBook.
-        return list(best[1]) if best else []
+        # A caller must not mutate the cached list seen by another CostBook;
+        # the copy keeps the reading's overage flags (L226b, #1649).
+        # No reading: an empty Gauges (overage None), the same type as a
+        # reading, so a direct `.overage` read never meets a bare list (N1 impl-04).
+        return Gauges(best[1], best[2]) if best else Gauges()
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
@@ -2137,7 +2183,11 @@ def _racy(stat, now_ns: int) -> bool:
 
 
 def _claude_account_readings(events: list, mtime: float) -> dict:
-    """Attribute all accounts in one pass; None is a verified legacy stream."""
+    """Attribute all accounts in one pass; None is a verified legacy stream.
+
+    Each reading is (stamp, gauges, overage): the overage flags stay beside
+    the gauges, so the shared cache keeps them too (L226b, #1649).
+    """
     marked = any(_is_claude_marker(e) for e in events)
     current, stamp = None, 0.0 if marked else mtime
     readings = {}
@@ -2151,7 +2201,7 @@ def _claude_account_readings(events: list, mtime: float) -> dict:
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
             gauges = _claude_windows(event, stamp)
             if gauges is not None:
-                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
+                readings[current] = (stamp, gauges, _claude_overage(event))
     return readings
 
 

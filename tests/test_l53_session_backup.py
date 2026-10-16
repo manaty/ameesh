@@ -232,7 +232,7 @@ class OwnerHomeTest(_Tmp):
                 self.assertIn("--home", message)
                 self.assertNotIn(self.home, message)
 
-    def test_explicit_home_wins_over_an_unprovable_profile(self):
+    def test_explicit_home_over_an_unprovable_profile_needs_the_flag(self):
         os.environ["DSH_HOME"] = self.home
         self.addCleanup(os.environ.pop, "DSH_HOME", None)
         conf = self.conf()
@@ -248,13 +248,19 @@ class OwnerHomeTest(_Tmp):
             sb.restore_agent(self.registry(row), cfg, conf, args)
         self.assertIn("--home", str(caught.exception))
         args.home = os.path.join(self.tmp, "explicite")
+        # L731 : sans preuve du home du propriétaire, la désignation explicite
+        # reste un home étranger — le drapeau est requis avant tout téléchargement.
+        with self.assertRaises(sb.BackupError) as caught:
+            sb.restore_agent(self.registry(row), cfg, conf, args)
+        self.assertIn("--allow-other-agent", str(caught.exception))
+        args.allow_other_agent = True
         _key, home, files = sb.restore_agent(self.registry(row), cfg, conf, args)
         self.assertEqual(home, args.home)
         self.assertTrue(files)
         self.assertTrue(os.path.exists(os.path.join(
             home, "sessions/--directory--", SESSION, "session.v4.jsonl.zstd")))
 
-    def test_restore_needs_a_proof_or_an_explicit_home(self):
+    def test_restore_needs_a_proof_or_a_flagged_explicit_home(self):
         conf = self.conf()
         sb.backup(conf, host="pc", agent="a", home=self.home, patterns=DSH, session=SESSION,
                   state_dir=self.state, now=1000.0)
@@ -267,6 +273,10 @@ class OwnerHomeTest(_Tmp):
             sb.restore_agent(self.registry(row), self.cfg(), conf, args)
         self.assertIn("--home", str(caught.exception))
         args.home = os.path.join(self.tmp, "explicite")
+        with self.assertRaises(sb.BackupError) as caught:
+            sb.restore_agent(self.registry(row), self.cfg(), conf, args)
+        self.assertIn("--allow-other-agent", str(caught.exception))
+        args.allow_other_agent = True
         _key, home, files = sb.restore_agent(self.registry(row), self.cfg(), conf, args)
         self.assertEqual(home, args.home)
         self.assertTrue(files)

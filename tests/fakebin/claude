@@ -159,7 +159,12 @@ def main() -> int:
         reponse_texte = reponse  # vide compris : un tour sans réponse
     print(json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": reponse_texte}]}}), flush=True)
-    print(json.dumps({"type": "result", "subtype": "success", "result": reponse,
+    # #1397 : AMEESH_TEST_IS_ERROR marque le `result` comme erreur du CLI —
+    # le seul canal où Claude dit un quota ; son texte est alors fournisseur.
+    erreur = os.environ.get("AMEESH_TEST_IS_ERROR") == "1"
+    print(json.dumps({"type": "result",
+                      "subtype": "error_during_execution" if erreur else "success",
+                      "result": reponse, "is_error": erreur,
                       "total_cost_usd": 0.0125, "usage": tour, "session_id": session}),
           flush=True)
     # #1270 : le stderr du fournisseur (429, trace d'erreur) — canal distinct

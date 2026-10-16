@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -17,6 +18,7 @@ from ameesh import (account_turn, accounts, auth_failure, cost, exploitation, re
                     sentinel, storage)
 
 from .support import FAKEBIN, REPO
+from .test_cost import Sandbox
 from .test_l30_accounts import _Base, _codex_rollout
 
 
@@ -204,22 +206,26 @@ class CapsAndOrderTest(_CapsBase):
         # the long window keeps the pace cap
         self.assertEqual(evs["secondaire"].limits["seven_day"][1], "pace cap")
 
-    def test_failover_order_primary_last(self):
+    def test_budget_criteria_before_the_declared_order(self):
+        """#1580 (propriétaire, 2026-10-15) : le choix ne suit plus l'ordre
+        déclaré — le compte qui a le plus de budget inutilisé passe d'abord,
+        même déclaré dernier ; l'ordre de bascule (L226b) ne départage plus que
+        des critères de budget à égalité."""
         now = 1_800_000_000.0
         items = self._items(tertiaire={"priority": 10})
-        # the primary is the least used, yet comes last
+        # the primary is the least used: it comes first, whatever its priority
         gauges = {"primaire": self._gauges(0.05, 0.05, now),
                   "secondaire": self._gauges(0.30, 0.30, now),
                   "tertiaire": self._gauges(0.60, 0.60, now)}
         evs = self._ev(items, gauges, now)
         ranked = accounts.rank(items, evs, now)
+        self.assertEqual([p.name for p in ranked], ["primaire", "secondaire", "tertiaire"])
+        # égalité de budget : l'ordre déclaré départage encore (L226b)
+        equal = {name: self._gauges(0.05, 0.05, now) for name in gauges}
+        evs = self._ev(items, equal, now)
+        ranked = accounts.rank(items, evs, now)
         self.assertEqual([p.name for p in ranked], ["tertiaire", "secondaire", "primaire"])
         self.assertIn("first in the failover order", accounts.reason_of(ranked, evs, now))
-        # without priorities, the pace decides among the others; primary still last
-        items = self._items()
-        evs = self._ev(items, gauges, now)
-        self.assertEqual([p.name for p in accounts.rank(items, evs, now)],
-                         ["secondaire", "tertiaire", "primaire"])
 
 
 class OverageReadingTest(unittest.TestCase):
@@ -256,6 +262,43 @@ class OverageReadingTest(unittest.TestCase):
                 sessions=os.path.join(tmp, "sessions"))
             self.assertEqual(len(gauges), 1)
             self.assertEqual(gauges.overage, cost.Overage(True, False))
+
+
+class ClaudeJournalOverageTest(Sandbox, unittest.TestCase):
+    """#1649: the overage flags of a Claude journal reach the L226b guard
+    through the per-account path (journal -> claude_gauges -> gauges_of)."""
+
+    def test_flags_survive_the_account_path_and_its_cache(self):
+        tmp = tempfile.mkdtemp(prefix="ameesh-1649-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        items = accounts.parse({"claude": [
+            {"name": "primaire"},
+            {"name": "secondaire", "path": tmp, "check_credentials": False}]})["claude"]
+        profile = items[1]
+        self.agent("a", "claude")
+        self.events("a", {"type": cost.ACCOUNT_MARKER, "harness": "claude",
+                          "account": "secondaire", "ts": self.now},
+                    {"type": "rate_limit_event", "rate_limit_info": {
+                        "status": "allowed", "overageStatus": "allowed",
+                        "isUsingOverage": True, "unifiedWindows": {"five_hour": {
+                            "utilization": 1.0, "resetsAt": self.now + 3600}}}})
+        for _ in range(2):              # a fresh read, then the shared cache
+            gauges = accounts.gauges_of(self.book(), profile, items)
+            self.assertAlmostEqual(gauges[0].used, 1.0)
+            self.assertEqual(gauges.overage, cost.Overage(True, True))
+            self.assertIn((profile.overage_cap, "overage cap"),
+                          accounts.fixed_caps(profile, gauges))
+            self.assertTrue(accounts.in_overage(gauges, self.now))
+            gauges.clear()              # the caller's copy, not the cached one
+
+    def test_no_reading_is_an_empty_gauges(self):
+        # N1 impl-04: without any reading the result has the same type as a
+        # reading, so a direct `.overage` read meets None, not a bare list.
+        self.agent("a", "claude")
+        gauges = self.book().claude_gauges(account="secondaire", primary="primaire")
+        self.assertIsInstance(gauges, cost.Gauges)
+        self.assertEqual([], gauges)
+        self.assertIsNone(gauges.overage)
 
 
 class _AuthBase(_Base):
@@ -411,11 +454,14 @@ class ContinuityCapTest(_AuthBase):
 
     def test_session_leaves_the_primary_above_half(self):
         secondaire = self._codex_comptes()[1]
-        home = os.path.join(self.tmp, "codex-default")
+        # L1078 : le primaire déclaré sans dossier lit `~/.codex`, pas le
+        # CODEX_HOME ambiant — le banc lui donne un HOME à lui
+        maison = os.path.join(self.tmp, "maison")
+        home = os.path.join(maison, ".codex")
         os.makedirs(home, mode=0o700, exist_ok=True)
         items = accounts.parse({"codex": [{"name": "primaire"}, secondaire]})["codex"]
         now = time.time()
-        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+        with mock.patch.dict(os.environ, {"HOME": maison}):
             book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
             _codex_rollout(home, 40, now + 1800)   # under 50 % (and its pace cap, 90 %)
             choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now,
@@ -617,7 +663,9 @@ class ForcedRaceTest(_AuthBase):
 
     def test_forced_primary_above_its_cap_is_not_launched(self):
         secondaire = self._codex_comptes()[1]
-        home = os.path.join(self.tmp, "codex-default")
+        # L1078 : le primaire déclaré sans dossier lit `~/.codex`
+        maison = os.path.join(self.tmp, "maison")
+        home = os.path.join(maison, ".codex")
         os.makedirs(home, mode=0o700, exist_ok=True)
         items = accounts.parse({"codex": [{"name": "primaire"}, secondaire]})["codex"]
         now = time.time()
@@ -630,7 +678,7 @@ class ForcedRaceTest(_AuthBase):
                      reason="forçage manuel", agent=None, forced=True)
             return False
 
-        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+        with mock.patch.dict(os.environ, {"HOME": maison}):
             book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
             _codex_rollout(home, 60, now + 1800)  # above the primary cap (50 %)
             with mock.patch.object(store_type, "switch", switch):
@@ -829,8 +877,9 @@ class LegacySessionTest(_CapsBase):
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}), \
                 mock.patch.object(accounts, "profiles", return_value=items), \
                 mock.patch.object(auth_failure, "failing", return_value=failing or {}), \
-                mock.patch.object(accounts, "gauges_of", side_effect=lambda _b, p, _i: (
-                    gauges or {}).get(p.name, quiet)), \
+                mock.patch.object(accounts, "gauges_of",
+                                  side_effect=lambda _b, p, _i, _e=None, **_kw: (
+                                      gauges or {}).get(p.name, quiet)), \
                 mock.patch.object(registry, "clear_session", return_value=False):
             account_turn.continuity(worker)
         return worker
@@ -927,7 +976,7 @@ class UnpacedChoiceTest(_AuthBase):
         try:
             worker.rotation_forcee = "test"
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i: self.overage), \
+                                   side_effect=lambda _b, _p, _i, _e=None, **_kw: self.overage), \
                     mock.patch.object(worker, "current_session", return_value="sess-1"), \
                     mock.patch.object(worker, "run_turn", return_value=False) as tour:
                 self.assertFalse(worker.budget_ok())
@@ -939,7 +988,7 @@ class UnpacedChoiceTest(_AuthBase):
             # out of overage: the guard lets it through, the pause is lifted
             worker.agent = registry.get(self.db, "ovr")  # as `pick` reloads it
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i: self.paced):
+                                   side_effect=lambda _b, _p, _i, _e=None, **_kw: self.paced):
                 self.assertTrue(worker.budget_ok())
             self.assertEqual(registry.get(self.db, "ovr")["status"], "idle")
         finally:

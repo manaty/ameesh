@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Image ameesh-approve (#953, tranche R5-IMAGE-APPROVE) : construit l'image du
+# service d'approbation d'une equipe et la publie sur le registre ghcr.io du
+# depot. Politique de tags, de digests, d'epinglage et de retour arriere :
+# docs/IMAGE-APPROVE.md.
+#
+# Aucune publication avant la fusion : le seul declencheur est
+# `workflow_dispatch`, et l'etape de tete refuse toute ref autre que main.
+# GitHub ne propose `workflow_dispatch` que si le fichier existe deja sur la
+# branche par defaut : le workflow ne devient donc declenchable qu'apres la
+# fusion, ce qui est exactement la regle (arbitrage du pilote du 13/10/2026,
+# consigne du bureau : jamais depuis une branche de lot ni une PR).
+#
+# Apres la fusion, avec le feu du pilote, un dispatch sur main publie le tag
+# immuable sha-<12> du commit de fusion puis le tag de version de
+# pyproject.toml, promu depuis le manifeste distant (jamais depuis une
+# reconstruction locale).
+#
+# Toute la publication (lecture du registre, push du tag sha, promotion du tag
+# de version) vit dans deploy/approve-image/publish.sh : une absence de tag ne
+# se conclut que sur un 404, et le tag de version recopie le manifeste distant
+# du tag sha au lieu de pousser l'image locale. Le GITHUB_TOKEN du depot porte
+# `packages: write` (permission declaree ici) ; aucun jeton personnel.
+name: image approve
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Cle fixe, volontairement pas github.ref : deux publications de la meme
+  # image ne doivent pas se croiser, sinon un tag peut etre reecrit. Une
+  # execution en attente est remplacee par la suivante.
+  group: image-approve-publish
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: image approve
+    # Une fourche n'a ni l'ecriture du paquet ni acces a nos runners
+    # auto-heberges : le job est ignore, jamais execute sur un runner heberge.
+    if: github.repository == 'manaty/ameesh'
+    runs-on: [self-hosted, linux, ameesh-ci]
+    timeout-minutes: 30
+    env:
+      IMAGE: ghcr.io/manaty/ameesh-approve
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Version, revision et ref autorisee
+        id: meta
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/main) ;;
+            *)
+              echo "::error::ref $GITHUB_REF refusee : la publication part de main apres la fusion"
+              exit 1
+              ;;
+          esac
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          test -n "$version"
+          revision="$(git rev-parse HEAD)"
+          sha12="$(printf '%s' "$revision" | cut -c1-12)"
+          {
+            echo "version=$version"
+            echo "revision=$revision"
+            echo "sha12=$sha12"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, revision $revision (tag sha-$sha12)"
+
+      - name: Build de l'image
+        # L'image locale ne sert qu'a creer le tag sha si le registre prouve
+        # son absence ; elle n'est jamais poussee sous le tag de version.
+        run: |
+          set -euo pipefail
+          docker build -f deploy/approve-image/Containerfile \
+            --build-arg VERSION="${{ steps.meta.outputs.version }}" \
+            --build-arg REVISION="${{ steps.meta.outputs.revision }}" \
+            -t "$IMAGE:sha-${{ steps.meta.outputs.sha12 }}" \
+            .
+          docker image inspect --format 'image locale {{.Id}} ({{.Size}} octets)' \
+            "$IMAGE:sha-${{ steps.meta.outputs.sha12 }}"
+
+      - name: Publication (tags immuables, digest)
+        id: publish
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA_TAG: sha-${{ steps.meta.outputs.sha12 }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          REVISION: ${{ steps.meta.outputs.revision }}
+        run: bash deploy/approve-image/publish.sh

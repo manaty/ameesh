@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import radar, resolutions, storage, work
+from ameesh import plan_git, radar, resolutions, storage, work
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, MIG, _git, _write, make_repo
@@ -287,6 +287,25 @@ class AgentFlowTest(_Base):
         self.fake.lots[4]["branch"] = None
         with self.assertRaises(resolutions.ResolveError):
             resolutions.open_resolution(None, 1, 4, repo=self.repo)
+
+    def test_null_default_target_and_named_main_are_the_same_branch(self):
+        """#1802 : `branch_target` NULL (défaut `origin/main`) et `main`
+        désignent la même branche : le couple s'ouvre, il n'est pas refusé,
+        et la cible retenue est le défaut du dépôt (forme qui existe)."""
+        self.fake.lots[1]["branch_target"] = None
+        self.fake.lots[2]["branch_target"] = "main"
+        with mock.patch.object(plan_git, "default_target", return_value="origin/main"):
+            out = resolutions.pair(None, 1, 2, repo=self.repo, fetch=False)
+            self.assertEqual(out["target"], "origin/main")
+            self.assertEqual((out["lot"]["id"], out["other"]["id"]), (1, 2))
+            # l'ordre des lots ne change ni l'acceptation ni la cible retenue
+            out = resolutions.pair(None, 2, 1, repo=self.repo, fetch=False)
+            self.assertEqual(out["target"], "origin/main")
+        # deux vraies cibles différentes restent refusées
+        self.fake.lots[3]["branch_target"] = "release/1.12"
+        self.fake.lots[1]["branch_target"] = "main"
+        with self.assertRaises(resolutions.ResolveError):
+            resolutions.pair(None, 1, 3, repo=self.repo, fetch=False)
 
     def test_finish_after_a_failed_record_is_resumed(self):
         path = resolutions.open_resolution(None, 2, 1, repo=self.repo)["path"]

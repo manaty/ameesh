@@ -21,8 +21,10 @@ Lecture seule : rien n'est écrit, ni en base ni dans systemd.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 
@@ -107,6 +109,196 @@ def harness_report(agents: list[dict] | None = None) -> list[dict]:
             out.append({"harness": harness, "agents": sorted(noms), "ok": False,
                         "detail": str(exc)})
     return out
+
+
+# --------------------------------------------------------------------------
+# L514 : les hooks de courrier des harnais
+# --------------------------------------------------------------------------
+
+def mail_hooks_of(descriptor) -> dict:
+    """L514 : la section `ameesh.hooks.mail` d'un descripteur, ou {}."""
+    hooks = getattr(descriptor, "hooks", None)
+    mail = hooks.get("mail") if isinstance(hooks, dict) else None
+    return mail if isinstance(mail, dict) else {}
+
+
+def hook_file_of(descriptor) -> str:
+    """L514 : nom du fichier de hooks du harnais (`ameesh.hooks.mail.file`) ;
+    `hooks.json` sinon."""
+    name = mail_hooks_of(descriptor).get("file")
+    return name if isinstance(name, str) and name else "hooks.json"
+
+
+def hook_events_of(descriptor) -> list[str]:
+    """L514 : les événements que le harnais doit servir (`hooks.mail.events`)."""
+    events = mail_hooks_of(descriptor).get("events")
+    return [str(e) for e in events] if isinstance(events, list) else []
+
+
+def hook_dirs(cfg, harness: str, environ=None) -> list[str]:
+    """L514 : dossiers de configuration à regarder pour ce harnais : celui de
+    l'environnement (`DSH_HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`), sinon son
+    défaut, puis les comptes déclarés (L30/L95) — jamais deux fois le même."""
+    from . import accounts
+    environ = os.environ if environ is None else environ
+    variable = accounts.config_env_of(harness)
+    primary = (environ.get(variable) if variable else "") or accounts.default_home_of(harness)
+    out: list[str] = []
+    for home in [primary, *accounts.homes(cfg, harness)]:
+        chemin = os.path.abspath(os.path.expanduser(home))
+        if chemin not in out:
+            out.append(chemin)
+    return out
+
+
+def hook_commands(document) -> list[tuple[str, str]]:
+    """L514 : les (événement, commande) d'un fichier de hooks de harnais.
+
+    Format Claude Code, repris par dsh et Codex :
+    `{"hooks": {"<événement>": [{"hooks": [{"type": "command", "command": "…"}]}]}}`.
+    Un document d'une autre forme ne rend rien (jamais une erreur)."""
+    hooks = document.get("hooks") if isinstance(document, dict) else None
+    if not isinstance(hooks, dict):
+        return []
+    out: list[tuple[str, str]] = []
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                command = entry.get("command")
+                if isinstance(command, str) and command.strip():
+                    out.append((str(event), command.strip()))
+    return out
+
+
+def _hook_binary(command: str) -> str:
+    """Le premier mot d'une commande de hook (guillemets respectés)."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    return parts[0] if parts else ""
+
+
+def _binary_missing(binary: str, *, path: str | None = None) -> bool:
+    """Le binaire d'une commande de hook est-il introuvable ? Un chemin
+    (absolu ou avec un séparateur) est contrôlé sur place ; un nom seul passe
+    par `path` s'il est fourni, sinon par le PATH ambiant — c'est le cas de
+    l'incident du 2026-10-12 (`/usr/local/bin/agent-mail` absent, tous les
+    hooks en 127)."""
+    chemin = os.path.expanduser(binary)
+    if os.sep in chemin:
+        return not (os.path.isfile(chemin) and os.access(chemin, os.X_OK))
+    return shutil.which(chemin, path=path or None) is None
+
+
+def _binary_missing_where(binary: str, manager_path: str) -> str:
+    """Où le binaire d'un hook est introuvable : la raison lisible, sinon "".
+
+    Un nom seul est cherché dans **deux** contextes : le PATH de la session
+    du doctor (le contrôle d'origine) et, quand il est lisible, le PATH du
+    gestionnaire systemd (`adapters.systemd_manager_path`). Le PATH réel du
+    service est celui de son unité (`Environment=PATH`, qu'un EnvironmentFile
+    peut encore remplacer) : aucun des deux ne le prouve à lui seul, et la
+    présence dans l'un ne doit pas masquer l'absence dans l'autre — un
+    binaire absent d'un contexte peut y sortir en 127 (#1395, avis bloquant
+    cx2 : la résolution « gestionnaire seul » rendait ok un hook introuvable
+    sous le PATH réel). Un chemin est contrôlé sur place, sans contexte."""
+    if os.sep in os.path.expanduser(binary):
+        return "not found" if _binary_missing(binary) else ""
+    missing = []
+    if _binary_missing(binary):
+        missing.append("this session's PATH")
+    if manager_path and _binary_missing(binary, path=manager_path):
+        missing.append("the systemd manager PATH")
+    return "not found under %s" % " or ".join(missing) if missing else ""
+
+
+def hook_lines(cfg, ids, environ=None) -> dict:
+    """L514 : lignes de `ameesh doctor --harness` sur les hooks de courrier
+    installés pour les harnais `ids` ; `{"lines": [...], "ok": bool}`.
+
+    `ok` est faux seulement pour un défaut certain : un fichier de hooks
+    illisible, ou une commande de hook dont le binaire est introuvable (le
+    hook sort alors en 127 : ni courrier en cours de tour, ni Stop). Un
+    fichier absent ou un événement non configuré est un avertissement, pas un
+    KO — l'agent travaille, mais sans livraison entre deux outils.
+
+    #514 N2 : un nom de binaire seul est contrôlé dans les deux contextes qui
+    # peuvent lancer le hook — la session du doctor et le PATH du gestionnaire
+    # systemd (`adapters.systemd_manager_path`) ; le PATH réel du service
+    # reste celui de son unité, donc un binaire absent de l'un des deux est
+    # signalé : le gestionnaire seul ne prouve pas que le hook tournera
+    # (#1395, avis bloquant cx2). Le doctor reste en lecture seule."""
+    environ = os.environ if environ is None else environ
+    lines: list[str] = []
+    ok = True
+    manager_path = adapters.systemd_manager_path(environ)
+    for harness in ids:
+        descriptor = harnesses.get(harness)
+        name = hook_file_of(descriptor)
+        expected = hook_events_of(descriptor)
+        directories = hook_dirs(cfg, harness, environ)
+        found = [os.path.join(directory, name) for directory in directories
+                 if os.path.isfile(os.path.join(directory, name))]
+        if not found:
+            lines.append("hooks      : %s — no %s (%s): mail read at the next turn, "
+                         "without mid-turn delivery"
+                         % (harness, name, ", ".join(directories)))
+            continue
+        for path in found:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    document = json.load(fh)
+            except (OSError, ValueError) as exc:
+                ok = False
+                lines.append("hooks      : %s KO — %s unreadable (%s)"
+                             % (harness, path, " ".join(str(exc).split())[:120]))
+                continue
+            commands = [(event, command) for event, command in hook_commands(document)
+                        if "hook" in command and ("agent-mail" in command
+                                                  or "agent-mesh" in command
+                                                  or "ameesh" in command)]
+            if not commands:
+                lines.append("hooks      : %s — no mail hook in %s: mail read at the "
+                             "next turn, without mid-turn delivery" % (harness, path))
+                continue
+            events = sorted({event for event, _command in commands})
+            binaries = []
+            for _event, command in commands:
+                binary = _hook_binary(command)
+                if binary and binary not in binaries:
+                    binaries.append(binary)
+                if not binary:
+                    continue
+                where = _binary_missing_where(binary, manager_path)
+                if where:
+                    ok = False
+                    lines.append("hooks      : %s KO — %s calls %s: %s (the hook "
+                                 "exits 127: no delivery between two tool calls, "
+                                 "no Stop)" % (harness, path, command, where))
+            if binaries and all(not _binary_missing_where(binary, manager_path)
+                                for binary in binaries):
+                lines.append("hooks      : %s → %d event(s) (%s), %s"
+                             % (harness, len(events), ", ".join(events),
+                                ", ".join(binaries)))
+            missing = [event for event in expected if event not in events]
+            if missing:
+                why = []
+                if "PostToolUse" in missing:
+                    why.append("no delivery between tool calls")
+                if "Stop" in missing:
+                    why.append("no end-of-turn delivery")
+                lines.append("warning    : hooks %s: %s not configured in %s — %s"
+                             % (harness, ", ".join(missing), path,
+                                "; ".join(why) or "events missing"))
+    return {"lines": lines, "ok": ok}
 
 
 def runner_coverage(names: list[str], run=_systemctl) -> dict | None:
@@ -287,7 +479,8 @@ def cmd_harness(cfg, db=None) -> int:
     if systemd_path and systemd_path != os.environ.get("PATH"):
         print("PATH systemd : %s" % systemd_path)
     verdict = 0
-    for item in harness_report(agents):
+    items = harness_report(agents)
+    for item in items:
         qui = " [%s]" % ", ".join(item["agents"]) if item["agents"] else ""
         if item["ok"]:
             print("harness    : %s%s → %s" % (item["harness"], qui, item["detail"]))
@@ -301,6 +494,14 @@ def cmd_harness(cfg, db=None) -> int:
         else:
             verdict = 1
             print("harness    : %s%s KO — %s" % (item["harness"], qui, item["detail"]))
+    # L514 : un hook de courrier dont le binaire est introuvable sort en 127 —
+    # aucune remise entre deux outils, aucun Stop ; le découvrir ici, pas dans
+    # une session d'agent.
+    hooks = hook_lines(cfg, [item["harness"] for item in items])
+    for line in hooks["lines"]:
+        print(line)
+    if not hooks["ok"]:
+        verdict = 1
     if db is not None and agents is not None:
         for line in missing_runner_lines(cfg, db) + memory_cap_lines(cfg, db):
             print(line)

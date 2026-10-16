@@ -170,14 +170,18 @@ RECENT_FAILURE_DAYS = 7
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
 #: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète reste en six parts.
+#: saturé) ; la suite psql complète passe à neuf parts (#1692) : sur le run
+#: 38736559499 attempt 2, les six parts ont pesé 26-45,5 min sous saturation
+#: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
+#: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
+#: mesuré, huit en laisseraient ~34.
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+PARTS = {"psycopg": (4, 4), "psql": (3, 9)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
-#: comme dans celui de 45 min de psql.
+#: comme dans celui de 60 min de psql (#1251).
 PR_TARGET_PART_S = 300
 #: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
 #: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
@@ -355,6 +359,47 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _is_exit_call(node: ast.Call, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether a call is a known import-time termination: the builtins
+    `exit()`/`quit()`, `sys.exit()`/`os._exit()` (aliases of `sys`, `os` and of
+    the imported names included)."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in exit_names
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        if func.attr == "exit":
+            return func.value.id in sys_names
+        if func.attr == "_exit":
+            return func.value.id in os_names
+    return False
+
+
+def _may_terminate(node: ast.AST, names: set[str], exit_names: set[str],
+                   sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether running this statement may end the import: a reachable `raise`,
+    a false `assert`, or an exit call (#1627).
+
+    Deliberately conservative — a `raise` caught by an enclosing `try` still
+    counts (a proof lost, never a false proof) — and the body of an
+    `if TYPE_CHECKING:` / `if False:` is dead, as in `_never_runs`. A function
+    or lambda body runs later, not at import, so it terminates nothing here."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Raise):
+        return True
+    if isinstance(node, ast.Assert):
+        return _never_runs(node.test, names)
+    if isinstance(node, ast.Call) and _is_exit_call(node, exit_names, sys_names, os_names):
+        return True
+    if isinstance(node, ast.If) and _never_runs(node.test, names):
+        children: list[ast.AST] = list(node.orelse)  # seul le `else` s'exécute
+    else:
+        children = list(ast.iter_child_nodes(node))
+    return any(_may_terminate(child, names, exit_names, sys_names, os_names)
+               for child in children)
+
+
 class _RuntimeImports(ast.NodeVisitor):
     """The import statements that may run, and those the module certainly runs
     when it is imported.
@@ -366,8 +411,13 @@ class _RuntimeImports(ast.NodeVisitor):
     import, a function body does not), outside any condition, loop, `try` or
     `with` — a `with` body may never run (its `__enter__` may fail, or an
     earlier statement may raise and be suppressed), so it is no proof.
+    An unconditional module-level `raise` or `sys.exit` also leaves every
+    later import without proof, while keeping its possible selection edge.
     A lazy or conditional import alone is a possible load, never a proof
-    (relecture Codex, B2 résiduel)."""
+    (relecture Codex, B2 résiduel). A reachable termination — a guarded
+    `raise`, an `except` that exits, `exit()`/`sys.exit()`/`os._exit()`, a
+    false `assert` — stops the proofs too: the imports after it may never run
+    (#1627)."""
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
@@ -375,10 +425,23 @@ class _RuntimeImports(ast.NodeVisitor):
         self.guaranteed: list[ast.stmt] = []
         self._deferred = 0  # inside a function or lambda body: not run at import
         self._guarded = 0   # inside a condition, a loop or a try: may not run
+        self._terminated = False  # module execution cannot reach later imports
+        # #1627 : une terminaison atteignable arrête les preuves du corps
+        # (module ou classe) : les imports suivants restent possibles seulement.
+        self._exit_names = {"exit", "quit"}  # builtins, `from sys import exit`
+        self._sys_names = {"sys"}            # `sys.exit`, alias compris
+        self._os_names = {"os"}              # `os._exit`, alias compris
 
     def _visit_function(self, node: ast.AST) -> None:
+        # Décorateurs, valeurs par défaut et annotations s'évaluent à la
+        # définition, donc à l'import : seul le corps est différé (#1474).
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for child in ast.iter_child_nodes(node):
+            if not any(child is statement for statement in body):
+                self.visit(child)
         self._deferred += 1
-        self.generic_visit(node)
+        for child in body:
+            self.visit(child)
         self._deferred -= 1
 
     visit_FunctionDef = _visit_function
@@ -399,6 +462,17 @@ class _RuntimeImports(ast.NodeVisitor):
     visit_With = _visit_guarded
     visit_AsyncWith = _visit_guarded
 
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self.generic_visit(node)
+        if not self._deferred and not self._guarded:
+            self._terminated = True
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        if not self._deferred and _is_exit_call(
+                node, self._exit_names, self._sys_names, self._os_names):
+            self._terminated = True
+
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
             # the guard never runs: only its `else` does (at module level)
@@ -407,15 +481,47 @@ class _RuntimeImports(ast.NodeVisitor):
             return
         self._visit_guarded(node)
 
+    def _visit_body(self, body: list[ast.stmt]) -> None:
+        """The body of a module or a class runs at import, in order: a
+        reachable termination cuts the proofs that follow it (#1627)."""
+        for child in body:
+            self.visit(child)
+            if not self._deferred and not self._terminated and _may_terminate(
+                    child, self.names, self._exit_names, self._sys_names, self._os_names):
+                self._terminated = True
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._visit_body(node.body)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # Ces expressions s'évaluent avant le corps : une sortie y interdit
+        # aussi de certifier les imports du corps, pas seulement ceux d'après.
+        for expression in (*node.decorator_list, *node.bases,
+                           *(keyword.value for keyword in node.keywords)):
+            self.visit(expression)
+        self._visit_body(node.body)
+
     def _record(self, node: ast.stmt) -> None:
         self.imports.append(node)
-        if not self._deferred and not self._guarded:
+        if not self._deferred and not self._guarded and not self._terminated:
             self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "sys":
+                self._sys_names.add(alias.asname or "sys")
+            elif alias.name == "os":
+                self._os_names.add(alias.asname or "os")
         self._record(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        if module == "sys":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "exit")
+        elif module == "os":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "_exit")
         self._record(node)
 
 
@@ -545,11 +651,34 @@ def _reverse_closure(reverse: dict[str, set[str]], path: str) -> set[str]:
 
 # -- the map --------------------------------------------------------------
 
+def ignored_coverages(card: dict) -> list:
+    """Couvertures que la fusion de la carte a écartées (#1257). Une carte
+    antérieure à la clé n'en porte pas : sa mesure est complète par
+    construction (l'ancien code échouait sur un fichier illisible au lieu de
+    l'ignorer)."""
+    mesure = card.get("measure") or card.get("mesure") or {}
+    if not isinstance(mesure, dict):
+        return []
+    ignorees = mesure.get("couverture_ignoree")
+    if not ignorees:
+        return []
+    return ignorees if isinstance(ignorees, list) else [ignorees]
+
+
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
                 repo: pathlib.Path = REPO) -> tuple[str, float | None]:
     """Why the map cannot be used ("" if it can), and its age in hours."""
     if card is None:
         return "no map", None
+    ignorees = ignored_coverages(card)
+    if ignorees:
+        # #1257 (R1 B3) : une couverture écartée à la fusion rend la mesure
+        # partielle — les modules que le processus perdu mesurait manquent, et
+        # les durées connues feraient passer la sélection pour sûre. La carte ne
+        # juge plus la restriction : repli suite complète, jamais une décision
+        # sur une carte partielle.
+        return (f"map measured with {len(ignorees)} ignored coverage file(s) "
+                "(partial measure)"), None
     try:
         generated = datetime.datetime.fromisoformat(card["genere"])
     except (KeyError, TypeError, ValueError):
