@@ -7,6 +7,12 @@ Une seule source de vérité, lue dans cet ordre :
    en alias, comme `agent-mail` pour la commande) ;
 3. les valeurs par défaut.
 
+Le fichier est choisi par `AMEESH_CONFIG` (alias `AGENT_MESH_CONFIG`). Un
+chemin nommé explicitement qui n'existe pas est refusé (« config file not
+found »), jamais remplacé en silence par la config historique (#1127). Sans
+variable explicite, `~/.config/ameesh/config.json` est lu, à défaut
+`~/.config/agent-mesh/config.json`.
+
 Canon (spec §4) : `AMEESH_CANON` (racine du bundle OKF), `AMEESH_CANON_REF`
 (révision canonique), `AMEESH_CANON_UNTRUSTED=1` (canon hors git, tests
 seulement) et `AMEESH_REQUIRE_RESPONSIBLE` (R14 dans `claimable` ; par défaut
@@ -33,6 +39,8 @@ import os
 import re
 import socket
 from dataclasses import dataclass, field, replace
+
+from . import dsn as dsn_mod
 
 #: DSN du banc local, **sans mot de passe** : le secret vient de PGPASSWORD ou
 #: de ~/.pgpass, ou d'un DSN complet dans AMEESH_DSN / le fichier de config.
@@ -233,7 +241,8 @@ class Config:
     critical_fallback_harnesses: tuple[str, ...] = ("codex", "deepseek")
     #: rotation de session (0018) : taille de contexte et latence des tours
     session_max_tokens: float = 150000.0
-    session_max_turn_seconds: float = 900.0
+    #: #706 : au-dessus du plafond de tour par défaut (1800 s).
+    session_max_turn_seconds: float = 3600.0
     session_min_turns: int = 3
     #: plafond de contexte (L60) : au-delà de ce nombre de jetons d'entrée
     #: relus (cache compris) au dernier tour, la session est tournée avant le
@@ -292,6 +301,8 @@ class Config:
     #: withdrawal deadline when a `draining` state gives none (seconds); 0 =
     #: the offer's `drain_seconds` on a lending host, 90 otherwise
     host_gate_drain: float = 0.0
+    #: L159i: require the Linux guard heartbeat in a mediated VM's file gate.
+    host_gate_lending: bool = False
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -308,6 +319,11 @@ class Config:
     #: défaut) : les entrées plus anciennes sont retirées par le ménage de
     #: l'exécuteur ; 0 = aucune expiration
     thread_retention_days: int = 365
+    #: rétention du courrier en souffrance, en jours (L976) : le ménage de
+    #: l'exécuteur re-livre au successeur d'un agent arrêté, et expire au-delà
+    #: de ce délai le courrier dont personne ne lit la boîte (arrêté sans
+    #: successeur, nom absent du registre) ; 0 = aucune expiration
+    mail_dead_letter_days: int = 7
     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
     #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
     project: str = ""
@@ -460,10 +476,26 @@ class Config:
 def load(env: dict | None = None) -> Config:
     env = dict(os.environ if env is None else env)
     cfg = Config()
-    legacy_cfg = _expand(env.get("AGENT_MESH_CONFIG") or LEGACY_CONFIG)
-    cfg_path = _expand(env.get("AMEESH_CONFIG") or env.get("AGENT_MESH_CONFIG") or DEFAULT_CONFIG)
-    if not os.path.exists(cfg_path) and os.path.exists(legacy_cfg):
-        cfg_path = legacy_cfg  # une config agent-mesh existante reste lue
+    # #1127 : une variable explicite nomme un fichier qui doit exister. Un
+    # chemin explicite absent ne se replie plus en silence sur la config
+    # historique : le DSN changeait alors sans le dire, et la sonde de schéma
+    # concluait à tort à un schéma absent. La variable retenue est celle qui
+    # décide du chemin (AMEESH_CONFIG, sinon son alias) : un alias périmé
+    # n'empêche pas la variable courante de faire foi.
+    explicit = next((name for name in ("AMEESH_CONFIG", "AGENT_MESH_CONFIG")
+                     if env.get(name)), "")
+    if explicit:
+        cfg_path = _expand(env[explicit])
+        if not os.path.exists(cfg_path):
+            raise SystemExit("config file not found: %s (%s)"
+                             % (cfg_path, explicit))
+    else:
+        # Repli historique : sans config explicite, une config agent-mesh
+        # existante reste lue (compatibilité du banc et des postes basculés).
+        cfg_path = _expand(DEFAULT_CONFIG)
+        legacy_cfg = _expand(LEGACY_CONFIG)
+        if not os.path.exists(cfg_path) and os.path.exists(legacy_cfg):
+            cfg_path = legacy_cfg
     raw: dict = {}
     if os.path.exists(cfg_path):
         try:
@@ -600,6 +632,8 @@ def load(env: dict | None = None) -> Config:
         threads_dir=_expand(threads_brut) if threads_brut else "",
         thread_retention_days=_as_days(pick("AMEESH_THREAD_RETENTION_DAYS"),
                                         cfg.thread_retention_days),
+        mail_dead_letter_days=_as_days(pick("AMEESH_MAIL_DEAD_LETTER_DAYS"),
+                                       cfg.mail_dead_letter_days),
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
         resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),
@@ -678,6 +712,8 @@ def load(env: dict | None = None) -> Config:
                                     default=cfg.host_gate_fallback) or "").strip().lower(),
         host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
                                     False, "AMEESH_HOST_MEDIATED")),
+        host_gate_lending=bool(_as_bool(pick("AMEESH_HOST_GATE_LENDING", default=cfg.host_gate_lending),
+                                       False, "AMEESH_HOST_GATE_LENDING")),
         host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
                                         int(cfg.host_gate_drain))),
     )
@@ -736,19 +772,26 @@ def _canons_from_file(raw: dict, where: str) -> dict:
             "extra_canons": tuple(entries[1:])}
 
 
+#: ce qu'un DSN affichable montre à la place de son mot de passe (L537)
+MASKED_PASSWORD = "password=***"
+
+
 def mask_dsn(dsn: str) -> str:
-    """DSN affichable : le mot de passe n'apparaît jamais dans un journal."""
-    if "://" in dsn:
-        head, rest = dsn.split("://", 1)
-        if "@" in rest:
-            creds, tail = rest.rsplit("@", 1)
-            user = creds.split(":", 1)[0]
-            return "%s://%s:***@%s" % (head, user, tail)
-        return dsn
-    out = []
-    for token in dsn.split():
-        if token.startswith("password="):
-            out.append("password=***")
-        else:
-            out.append(token)
-    return " ".join(out)
+    """DSN affichable : le mot de passe n'apparaît jamais dans un journal.
+
+    Le DSN sans son mot de passe est celui d'`ameesh.dsn.split_password`, qui
+    suit les règles de libpq : mot de passe de l'userinfo, paramètre
+    `password` de la requête, couples clé/valeur (blancs autour du `=`, valeurs
+    citées, échappements), dernière entrée gagnante. `MASKED_PASSWORD` marque
+    qu'il y en avait un ; un DSN que libpq refuserait s'affiche `<invalid DSN>`,
+    jamais cité. L'environnement (PGSERVICE) ne compte pas : on ne lit que le
+    DSN."""
+    try:
+        password, rest = dsn_mod.split_password(dsn, {})
+    except dsn_mod.DsnError:
+        return "<invalid DSN>"
+    if not password:
+        return rest
+    if rest.startswith(("postgresql://", "postgres://")):
+        return rest + ("&" if "?" in rest else "?") + MASKED_PASSWORD
+    return ("%s %s" % (rest, MASKED_PASSWORD)) if rest else MASKED_PASSWORD

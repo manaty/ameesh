@@ -5,6 +5,7 @@
     scripts/ci-flow.py summary F.jsonl [F.jsonl…]   >> "$GITHUB_STEP_SUMMARY"
     scripts/ci-flow.py publish F.jsonl --name "tests (flux) psql 1/6" &   (L161c)
     scripts/ci-flow.py close F.jsonl --name "tests (flux) psql 1/6"      (L161c)
+    scripts/ci-flow.py sweep [--sha TÊTE]                                (#856)
 
 Le flux est écrit par `scripts/test-parts.py run --flow F.jsonl` : une
 ligne JSON par événement, schéma `ameesh-test-event/1` (étude
@@ -43,6 +44,36 @@ s'arrête à la ligne `fin`. `close` (étape `if: always()`) le termine dans
 tous les cas, et le crée s'il n'existe pas encore. Sans jeton, ou si GitHub
 refuse (PR d'une fourche : jeton en lecture seule), rien n'est publié et
 l'étape reste verte : la publication n'est jamais une cause d'échec.
+
+#899 — le plafond du job reste borné (canon §3), mais la part qui grandit
+avec la suite doit prévenir avant de l'atteindre : `publish --plafond-min N
+--debut T` (le plafond du job, égal à son `timeout-minutes`, et son début en
+epoch, écrit par l'étape « début du job ») publie **une fois** une alerte à
+`ALERTE_SEUIL` (80 %) du plafond, en tête du titre et du résumé du check run
+et en ligne JSON `type: alerte`. L'alerte ne change jamais la conclusion de
+la part, et une valeur absente ou illisible ne publie rien. `summary` affiche
+en plus, sur chaque part, la part du plafond consommée à la fin du job
+(« Plafond du job : … sur N min (P %) »), avec un ⚠ au-delà du seuil : c'est
+la mesure qui montre la croissance de la suite d'une exécution à l'autre.
+
+#1044 — un nombre non fini (NaN, ±infini, ou un débordement de conversion)
+n'est jamais un nombre : il est refusé comme illisible, avant tout calcul et
+toute écriture. Et quand la part n'a pas de durée finale attestée (interrompue
+sans ligne `fin`), `summary` donne la durée « au moment de l'alerte » et le
+dit, au lieu de la présenter comme une durée de fin de part.
+
+#856 — un runner arrêté (saturation #747) tue le publisher *et* l'étape
+`close` : le check restait `in_progress` pour toujours, la PR ne pouvait plus
+paraître verte. `sweep` est la réconciliation, indépendante du publisher : il
+relit chaque check « tests (flux) » encore en cours et l'état terminal réel du
+job et de l'exécution qui l'ont publié, puis conclut `cancelled` — jamais
+`success`, faute de ligne `fin`. L'exécution se lit dans le `details_url`
+quand il porte `/actions/runs/<id>` ; sinon dans le `check_suite` du check
+(GitHub laisse l'URL par défaut `…/runs/<id_du_check>` sur les checks publiés
+par un jeton d'exécution). Un check dont le job tourne encore, une autre
+tentative ou une autre tête ne sont pas touchés. `publish` qui atteint son
+arrêt de sûreté sans ligne `fin` laisse le check ouvert (le publisher vit
+encore) : `close` ou `sweep` le conclura.
 """
 from __future__ import annotations
 
@@ -50,8 +81,10 @@ import argparse
 import collections
 import datetime
 import json
+import math
 import os
 import pathlib
+import re
 import sys
 import time
 import urllib.error
@@ -61,6 +94,11 @@ SCHEMA = "ameesh-test-event/1"
 FAILURES = ("echec", "erreur")
 #: tests listés au plus dans le résumé, par catégorie
 LIMIT = 20
+#: #899 : part du plafond du job où l'alerte est publiée (80 %)
+ALERTE_SEUIL = 0.80
+#: #899 : plafond du job (minutes, = timeout-minutes) et début du job (epoch)
+ENV_PLAFOND = "AMEESH_PLAFOND_MIN"
+ENV_DEBUT = "AMEESH_JOB_DEBUT"
 
 
 def read(chemin: str | pathlib.Path) -> tuple[list[dict], int]:
@@ -92,6 +130,81 @@ def _duration(s: float) -> str:
     return f"{s:.1f} s" if s < 60 else f"{int(s // 60)} min {int(s % 60):02d} s"
 
 
+def _nombre(valeur) -> float | None:
+    """Un nombre fini d'option, d'environnement ou d'état, ou None s'il est
+    absent, illisible ou non fini (#1044 : NaN, ±infini et débordement)."""
+    try:
+        nombre = float(valeur)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return nombre if math.isfinite(nombre) else None
+
+
+def _minutes(valeur) -> str:
+    return "%g" % float(valeur)
+
+
+def _horodatage(ts: float) -> str:
+    """Un epoch en `ts` de flux (UTC, millisecondes), comme `test-parts.py`."""
+    return (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+
+
+def alerte_plafond(debut, plafond_min, maintenant: float,
+                   contexte: dict | None = None) -> dict | None:
+    """#899 — l'alerte à `ALERTE_SEUIL` du plafond du job, ou None avant le seuil.
+
+    `debut` (epoch, début du job) et `plafond_min` (le `timeout-minutes` du
+    job) viennent du workflow ; absents ou illisibles, il n'y a pas d'alerte
+    (jamais d'échec pour autant)."""
+    debut, plafond = _nombre(debut), _nombre(plafond_min)
+    if not debut or not plafond or plafond <= 0:
+        return None
+    ecoule = maintenant - debut
+    if ecoule < ALERTE_SEUIL * plafond * 60.0:
+        return None
+    alerte = {"v": 1, "schema": SCHEMA, "type": "alerte", "seuil": ALERTE_SEUIL,
+              "ecoule_s": round(ecoule, 1), "plafond_min": plafond,
+              "ts": _horodatage(maintenant)}
+    alerte.update(contexte or {})
+    return alerte
+
+
+def contexte_de(events: list[dict]) -> dict:
+    """Le contexte de la part (depot, tete, execution, part), porté par l'alerte."""
+    debut = next((e for e in events if e.get("type") == "debut"), {})
+    return {cle: debut[cle] for cle in
+            ("depot", "tete", "fusion", "execution", "part", "pilote") if debut.get(cle)}
+
+
+def seuil_pourcent(alerte: dict) -> int:
+    """Le seuil de l'alerte en pourcentage entier (80 par défaut)."""
+    return round((_nombre(alerte.get("seuil")) or ALERTE_SEUIL) * 100)
+
+
+def texte_alerte(alerte: dict) -> str:
+    """Le texte lisible de l'alerte (résumé du check run, résumé du job)."""
+    return ("⚠ %d %% du plafond du job atteint : %s écoulées sur %s min."
+            % (seuil_pourcent(alerte),
+               _duration(_nombre(alerte.get("ecoule_s")) or 0.0),
+               _minutes(_nombre(alerte.get("plafond_min")) or 0)))
+
+
+def etat_publication(chemin) -> dict:
+    """L'état écrit par `publish` à côté du flux (`F.jsonl.check`), ou {}."""
+    try:
+        etat = json.loads(pathlib.Path(str(chemin) + ".check").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return etat if isinstance(etat, dict) else {}
+
+
+def alerte_de(etat: dict) -> dict | None:
+    """L'alerte de plafond portée par un état de publication, si c'en est une."""
+    alerte = (etat or {}).get("alerte")
+    return alerte if isinstance(alerte, dict) else None
+
+
 def summary(chemins: list[str]) -> str:
     """Résumé Markdown d'un ou plusieurs fichiers de flux."""
     check_output: list[str] = []
@@ -116,6 +229,33 @@ def summary(chemins: list[str]) -> str:
         if illisibles:
             check_output[-1] += f" ; {illisibles} ligne(s) illisible(s)"
         check_output.append("")
+        # #899 : la part du plafond consommée, mesure de la croissance de la suite
+        publication = etat_publication(chemin)
+        plafond = _nombre(publication.get("plafond_min"))
+        alerte = alerte_de(publication)
+        fin_ecoule = _nombre(publication.get("fin_ecoule_s"))
+        ecoule_alerte = _nombre(alerte.get("ecoule_s")) if alerte else None
+        if plafond and fin_ecoule is not None:
+            part_du_plafond = fin_ecoule / (plafond * 60.0)
+            ligne = ("%sPlafond du job : %s à la fin de la part sur %s min (%.0f %%)"
+                     % ("⚠ " if alerte or part_du_plafond >= ALERTE_SEUIL else "",
+                        _duration(fin_ecoule), _minutes(plafond), 100 * part_du_plafond))
+            if alerte:
+                ligne += " — alerte à %d %% publiée dans le check run." % seuil_pourcent(alerte)
+            elif part_du_plafond >= ALERTE_SEUIL:
+                ligne += " — seuil de %d %% atteint." % round(ALERTE_SEUIL * 100)
+            else:
+                ligne += "."
+            check_output.append(ligne + "\n")
+        elif plafond and ecoule_alerte is not None:
+            # #1044 : sans `fin_ecoule_s`, la durée de l'alerte n'atteste pas la
+            # fin de la part (interruption, annulation) : ne pas la présenter
+            # comme telle.
+            part_du_plafond = ecoule_alerte / (plafond * 60.0)
+            check_output.append(
+                "⚠ Plafond du job : %s écoulées au moment de l'alerte sur %s min (%.0f %%)"
+                " — durée finale non attestée (part sans ligne de fin).\n"
+                % (_duration(ecoule_alerte), _minutes(plafond), 100 * part_du_plafond))
         classes = debut.get("classes", {})
         touches = [m for m in debut.get("modules", []) if classes.get(m, "P3") != "P3"]
         impacted = next((e for e in events if e.get("type") == "impacted"), None)
@@ -165,6 +305,11 @@ FOLLOWING_LINES = 10
 #: annotations au plus par requête (limite de GitHub)
 MAX_ANNOTATIONS = 50
 CONCLUSIONS = {"succes": "success", "echec": "failure", "interrompu": "cancelled"}
+#: préfixe des checks tenus par `publish` (#856 : le job porte le nom sans lui)
+FLUX_PREFIX = "tests (flux) "
+#: conclusion d'un check orphelin : le publisher est mort sans lire de ligne
+#: `fin`, donc jamais `success` (#856)
+ORPHAN_CONCLUSION = "cancelled"
 
 
 def _failure_line(ev: dict, lignes: int | None) -> str:
@@ -179,8 +324,12 @@ def _failure_line(ev: dict, lignes: int | None) -> str:
     return json.dumps(ev, ensure_ascii=False)
 
 
-def check_output(events: list[dict]) -> dict:
-    """`output` du check run : titre, résumé, et le bloc des échecs."""
+def check_output(events: list[dict], alerte: dict | None = None) -> dict:
+    """`output` du check run : titre, résumé, et le bloc des échecs.
+
+    `alerte` (#899) : l'alerte de plafond, une fois publiée ; elle se voit dans
+    le titre et le résumé, et voyage en ligne JSON `type: alerte` du bloc, que
+    `ameesh.ci.events_of` ignore (seuls les échecs de test le concernent)."""
     debut = next((e for e in events if e.get("type") == "debut"), {})
     fin = next((e for e in events if e.get("type") == "fin"), None)
     tests = [e for e in events if e.get("type") == "test"]
@@ -189,7 +338,11 @@ def check_output(events: list[dict]) -> dict:
     etat = "en cours" if fin is None else {"succes": "verte", "echec": "rouge"}.get(
         fin.get("statut"), fin.get("statut") or "?")
     titre = "%d échec(s), %d test(s) passé(s), %s" % (len(echecs), len(tests), etat)
+    if alerte:
+        titre = "⚠ %d %% du plafond — %s" % (seuil_pourcent(alerte), titre)
     resume_ = ["Part %s : %s." % (debut.get("part") or "?", etat)]
+    if alerte:
+        resume_.append(texte_alerte(alerte))
     if attendus:
         resume_.append("%d module(s) dans cette part." % attendus)
     if echecs:
@@ -198,6 +351,10 @@ def check_output(events: list[dict]) -> dict:
         if len(echecs) > LIMIT:
             resume_.append("- … et %d autre(s)" % (len(echecs) - LIMIT))
     lignes, taille, omis = [MARKER, "```jsonl"], len(MARKER) + 20, 0
+    if alerte:
+        ligne = json.dumps(alerte, ensure_ascii=False)
+        lignes.append(ligne)
+        taille += len(ligne) + 1
     for i, e in enumerate(echecs):
         for garde in ((None if i < FULL_EXCERPTS else FOLLOWING_LINES), 0):
             ligne = _failure_line(e, garde)
@@ -244,16 +401,72 @@ class GitHub:
     def ready(self) -> bool:
         return bool(self.jeton and self.depot and self.tete)
 
-    def call(self, methode: str, chemin: str, corps: dict) -> dict:
+    def _request(self, methode: str, chemin: str, corps: dict | None = None) -> dict:
         req = urllib.request.Request(
             "%s/repos/%s/%s" % (self.api, self.depot, chemin), method=methode,
-            data=json.dumps(corps).encode("utf-8"),
+            data=None if corps is None else json.dumps(corps).encode("utf-8"),
             headers={"Authorization": "Bearer %s" % self.jeton,
                      "Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28",
                      "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=20) as rep:
             return json.loads(rep.read().decode("utf-8") or "{}")
+
+    def call(self, methode: str, chemin: str, corps: dict) -> dict:
+        return self._request(methode, chemin, corps)
+
+    def read(self, chemin: str) -> dict:
+        """Lecture (GET) : checks d'une tête, exécution, jobs d'une exécution."""
+        return self._request("GET", chemin)
+
+    def check_runs(self, tete: str) -> list[dict]:
+        """Tous les checks d'une tête (paginés)."""
+        checks, page = [], 1
+        while True:
+            rep = self.read("commits/%s/check-runs?per_page=100&page=%d" % (tete, page))
+            page_checks = rep.get("check_runs") or []
+            checks += page_checks
+            if not page_checks or len(checks) >= int(rep.get("total_count") or 0):
+                return checks
+            page += 1
+
+    def run(self, execution: int) -> dict:
+        """L'exécution GitHub qui a publié un check (details_url ou check_suite)."""
+        return self.read("actions/runs/%d" % execution)
+
+    def runs_of_suite(self, suite: int) -> list[dict]:
+        """Les exécutions d'une suite de checks (#856).
+
+        GitHub laisse le `details_url` par défaut `…/runs/<id_du_check>` sur
+        les checks publiés par un jeton d'exécution : il ne nomme alors pas
+        l'exécution, mais le `check_suite` du check la retrouve exactement."""
+        return self._listed("actions/runs?check_suite_id=%d" % suite,
+                            "workflow_runs", maximum=1000)
+
+    def _listed(self, path: str, key: str, *, maximum: int | None = None) -> list[dict]:
+        """Une liste complète et stable, sinon une erreur (pas une liste vide)."""
+        items, page, total = [], 1, None
+        separator = "&" if "?" in path else "?"
+        while True:
+            response = self.read("%s%sper_page=100&page=%d" % (path, separator, page))
+            page_items = response.get(key)
+            count = response.get("total_count")
+            if (not isinstance(page_items, list) or type(count) is not int
+                    or count < 0 or (maximum is not None and count > maximum)
+                    or (total is not None and count != total)
+                    or any(not isinstance(item, dict) for item in page_items)):
+                raise ValueError("liste %s incomplète" % key)
+            total = count
+            items.extend(page_items)
+            if len(items) == total:
+                return items
+            if not page_items or len(items) > total:
+                raise ValueError("page de %s manquante" % key)
+            page += 1
+
+    def jobs(self, execution: int) -> list[dict]:
+        """Les jobs d'une exécution : leur état terminal fait foi (#856)."""
+        return self._listed("actions/runs/%d/jobs" % execution, "jobs")
 
     def create(self, nom: str, output: dict) -> int:
         corps = {"name": nom, "head_sha": self.tete, "status": "in_progress", "output": output}
@@ -289,9 +502,10 @@ class Publication:
     def events(self) -> list[dict]:
         return read(self.flux)[0] if self.flux.is_file() else []
 
-    def push(self, events: list[dict], conclusion: str | None = None) -> bool:
+    def push(self, events: list[dict], conclusion: str | None = None,
+             alerte: dict | None = None) -> bool:
         """Crée ou met à jour le check run ; False si GitHub refuse."""
-        output = check_output(events)
+        output = check_output(events, alerte)
         echecs = [e for e in events if e.get("type") == "test"
                   and e.get("statut") in FAILURES]
         vus = set(self.etat.get("annotes") or ())
@@ -302,7 +516,7 @@ class Publication:
             if not self.etat.get("id"):
                 self.etat["id"] = self.gh.create(self.nom, output)
                 if conclusion:
-                    self.gh.update(self.etat["id"], check_output(events), conclusion)
+                    self.gh.update(self.etat["id"], check_output(events, alerte), conclusion)
             else:
                 self.gh.update(int(self.etat["id"]), output, conclusion)
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
@@ -310,6 +524,8 @@ class Publication:
             return False
         self.etat["annotes"] = sorted(vus | {e.get("test") for e in nouveaux})
         self.etat["echecs"] = len(echecs)
+        if alerte:
+            self.etat["alerte"] = alerte
         if conclusion:
             self.etat["conclusion"] = conclusion
         self._keep()
@@ -321,33 +537,64 @@ def conclusion_of(events: list[dict], defaut: str = "cancelled") -> str | None:
     return CONCLUSIONS.get(fin.get("statut"), "failure") if fin else defaut
 
 
-def publish(args, gh: GitHub | None = None, dormir=time.sleep, horloge=time.monotonic) -> int:
-    """Suit le flux et tient le check run jusqu'à la ligne `fin`."""
+def publish(args, gh: GitHub | None = None, dormir=time.sleep, horloge=time.monotonic,
+            maintenant=time.time) -> int:
+    """Suit le flux et tient le check run jusqu'à la ligne `fin`.
+
+    #899 : avec le plafond du job (`--plafond-min`, défaut `AMEESH_PLAFOND_MIN`)
+    et son début (`--debut`, défaut `AMEESH_JOB_DEBUT`), publie une fois
+    l'alerte à `ALERTE_SEUIL` du plafond ; sans eux, rien ne change."""
     gh = gh or GitHub()
     if not gh.ready():
         print("ci-flow : pas de jeton, de dépôt ou de tête : rien n'est publié", file=sys.stderr)
         return 0
+    plafond = _nombre(getattr(args, "plafond_min", None))
+    debut = _nombre(getattr(args, "debut", None))
+    if plafond is None:
+        plafond = _nombre(os.environ.get(ENV_PLAFOND))
+    if debut is None:
+        debut = _nombre(os.environ.get(ENV_DEBUT))
     pub = Publication(args.file, args.name, gh)
+    if plafond:
+        pub.etat.setdefault("plafond_min", plafond)
+    if debut:
+        pub.etat.setdefault("debut", debut)
+    alerte = alerte_de(pub.etat)
     limite = horloge() + args.max_duration
-    if not pub.push([]):
+    if not pub.push([], alerte=alerte):
         return 0  # refus (jeton en lecture seule) : on n'insiste pas
-    publies, dernier = (0, 0), horloge()
+    publies, dernier, alerte_publiee = (0, 0), horloge(), False
     while horloge() < limite:
         if pub.etat_chemin.with_suffix(".stop").exists():
             return 0
         events = pub.events()
         tests = [e for e in events if e.get("type") == "test"]
         echecs = sum(1 for e in tests if e.get("statut") in FAILURES)
+        if alerte is None and debut and plafond:
+            alerte = alerte_plafond(debut, plafond, maintenant(), contexte_de(events))
+            if alerte:
+                # le log est relu par l'étape `fermer` (cat) : l'annotation
+                # apparaît dans le job, en plus du résumé du check run
+                pub.log("::warning title=plafond du job à %d %%::%s"
+                        % (seuil_pourcent(alerte), texte_alerte(alerte)))
         fin = conclusion_of(events, defaut=None)
         if fin:
-            pub.push(events, fin)
+            if debut:
+                pub.etat["fin_ecoule_s"] = round(maintenant() - debut, 1)
+            pub.push(events, fin, alerte=alerte)
             return 0
-        # le check run change à chaque échec ; sinon, toutes les minutes au
-        # plus (avancement), pour ménager le quota de l'API
-        if echecs != publies[0] or (len(tests) != publies[1] and horloge() - dernier > 60):
-            if pub.push(events):
+        # le check run change à chaque échec et à la première alerte de plafond ;
+        # sinon, toutes les minutes au plus (avancement), pour ménager le quota
+        if (alerte is not None and not alerte_publiee) or echecs != publies[0] \
+                or (len(tests) != publies[1] and horloge() - dernier > 60):
+            if pub.push(events, alerte=alerte):
+                alerte_publiee = alerte_publiee or alerte is not None
                 publies, dernier = (echecs, len(tests)), horloge()
         dormir(args.interval)
+    # arrêt de sûreté sans ligne `fin` : le publisher vit encore, le check
+    # reste ouvert — `close` (job vivant) ou `sweep` (job terminal) conclura #856
+    print("ci-flow : arrêt de sûreté après %.0f s sans ligne fin — check « %s » "
+          "laissé ouvert" % (args.max_duration, args.name), file=sys.stderr)
     return 0
 
 
@@ -364,7 +611,160 @@ def close(args, gh: GitHub | None = None) -> int:
     if pub.etat.get("conclusion"):
         return 0
     events = pub.events()
-    pub.push(events, conclusion_of(events))
+    pub.push(events, conclusion_of(events), alerte=alerte_de(pub.etat))
+    return 0
+
+
+def _execution_of(check: dict) -> int | None:
+    """Le numéro d'exécution lu dans le `details_url`, quand il le nomme.
+
+    Les checks publiés par un jeton d'exécution portent l'URL par défaut
+    `…/runs/<id_du_check>`, qui ne nomme pas l'exécution : c'est alors le
+    `check_suite` qui la retrouve (`_executions_of`)."""
+    trouve = re.search(r"/actions/runs/(\d+)", check.get("details_url") or "")
+    return int(trouve.group(1)) if trouve else None
+
+
+def _suite_of(check: dict) -> int | None:
+    """Le `check_suite` du check : l'exécution s'y retrouve par l'API (#856)."""
+    ident = (check.get("check_suite") or {}).get("id")
+    try:
+        return int(ident) if ident is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _executions_of(check: dict, gh: GitHub, suites: dict[int, list[int]]) -> list[int]:
+    """Les exécutions qui ont pu publier le check (#856).
+
+    Celle du `details_url` quand il porte `/actions/runs/<id>` ; sinon celles
+    de son `check_suite`. Une liste vide veut dire « non identifiable », jamais
+    « orphelin » : sans exécution prouvée terminale, on ne conclut pas."""
+    execution = _execution_of(check)
+    if execution is not None:
+        return [execution]
+    suite = _suite_of(check)
+    if suite is None:
+        return []
+    if suite not in suites:
+        suites[suite] = [int(run["id"]) for run in gh.runs_of_suite(suite)]
+    return suites[suite]
+
+
+def orphaned(check: dict, jobs: list[dict], execution_status: str) -> bool:
+    """Le check « tests (flux) » est-il orphelin ? (#856)
+
+    Il l'est quand il est encore `in_progress` et que le job qui l'a publié est
+    terminal : le publisher est mort avec le runner (saturation #747) — ou il a
+    expiré sans lire de ligne `fin` — et l'étape `close` n'a pas tourné. Le job
+    est retrouvé par son nom (`tests (flux) X` pour le job `X`) ; s'il a
+    disparu, l'exécution terminale fait foi. Un job encore actif — y compris
+    celui de la tentative courante d'un rerun du même run, qui porte le même
+    nom — et une autre tête ne sont jamais touchés."""
+    if check.get("status") != "in_progress":
+        return False
+    nom = check.get("name") or ""
+    if not nom.startswith(FLUX_PREFIX):
+        return False
+    job = next((j for j in jobs if j.get("name") == nom[len(FLUX_PREFIX):]), None)
+    if job is not None:
+        return job.get("status") == "completed"
+    return execution_status == "completed"
+
+
+def _proved_terminal(check: dict, executions: list[int], gh: GitHub,
+                     etats: dict[int, tuple[dict, list[dict]] | None]) -> bool:
+    """Le publisher est-il mort dans *toutes* les exécutions candidates ? (#856)
+
+    Le job homonyme doit être terminal dans chaque candidate, même si d'autres
+    jobs de l'exécution tournent encore. Si ce job est absent d'une liste lue
+    complètement, seule une exécution terminale fait foi. Une réponse illisible
+    ou une liste incomplète ne permet jamais de conclure."""
+    for execution in executions:
+        if execution not in etats:
+            try:
+                run, jobs = gh.run(execution), gh.jobs(execution)
+                if (not isinstance(run, dict) or not isinstance(run.get("status"), str)
+                        or not run["status"] or not isinstance(jobs, list)
+                        or any(not isinstance(job, dict) for job in jobs)):
+                    raise ValueError("réponse d'exécution ou de jobs illisible")
+                etats[execution] = (run, jobs)
+            except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+                print("ci-flow : exécution %d illisible (%s)" % (execution, exc),
+                      file=sys.stderr)
+                etats[execution] = None
+        etat = etats[execution]
+        if etat is None or not orphaned(check, etat[1], etat[0].get("status", "")):
+            return False
+    return True
+
+
+def sweep(args, gh: GitHub | None = None) -> int:
+    """Conclut les checks « tests (flux) » laissés en cours par un job terminal.
+
+    Réconciliation indépendante du publisher (#856) : chaque check encore en
+    cours est jugé sur l'état terminal réel du job et de l'exécution qui l'ont
+    publié (retrouvée par son `details_url` ou, à défaut, par son
+    `check_suite`). Sans ligne `fin`, la conclusion est `cancelled`, jamais
+    `success`. Ne ferme aucun check dont l'exécution est encore active, ni ceux
+    d'une autre tête. Ne fait jamais échouer le job : une erreur d'API est
+    tracée et la fonction rend 0."""
+    try:
+        return _sweep(args, gh)
+    except Exception as exc:  # la réconciliation n'échoue jamais le job
+        print("ci-flow : réconciliation interrompue (%s)" % exc, file=sys.stderr)
+        return 0
+
+
+def _sweep(args, gh: GitHub | None = None) -> int:
+    gh = gh or GitHub()
+    if not gh.ready():
+        print("ci-flow : pas de jeton, de dépôt ou de tête : rien à réconcilier",
+              file=sys.stderr)
+        return 0
+    tete = getattr(args, "sha", "") or gh.tete
+    try:
+        checks = gh.check_runs(tete)
+    except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+        print("ci-flow : checks de %s illisibles (%s)" % (tete[:8], exc), file=sys.stderr)
+        return 0
+    etats: dict[int, tuple[dict, list[dict]] | None] = {}
+    suites: dict[int, list[int]] = {}
+    for check in checks:
+        nom = check.get("name") or ""
+        if check.get("status") != "in_progress" or not nom.startswith(FLUX_PREFIX):
+            continue
+        try:
+            executions = _executions_of(check, gh, suites)
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            print("ci-flow : exécution du check %s illisible (%s)"
+                  % (check.get("id"), exc), file=sys.stderr)
+            continue
+        if not executions:
+            # publié hors CI, ni details_url ni check_suite exploitables : on
+            # ne juge pas (#856)
+            print("ci-flow : check %s « %s » sans exécution identifiable : non conclu"
+                  % (check.get("id"), nom), file=sys.stderr)
+            continue
+        if not _proved_terminal(check, executions, gh, etats):
+            continue
+        sortie = check.get("output") or {}
+        resume = (sortie.get("summary") or "").rstrip()
+        sortie = {
+            "title": sortie.get("title") or "tests (flux) : check réconcilié (#856)",
+            "summary": (resume + "\n\nCheck conclu par réconciliation (#856) : le job "
+                        "d'origine est terminal et aucune ligne `fin` n'a été lue — "
+                        "conclusion `cancelled`, jamais `success`.").strip(),
+            "text": sortie.get("text") or "",
+        }
+        try:
+            gh.update(int(check["id"]), sortie, ORPHAN_CONCLUSION)
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            print("ci-flow : check %s non conclu (%s)" % (check.get("id"), exc),
+                  file=sys.stderr)
+            continue
+        print("ci-flow : check %s « %s » conclu %s — job terminal sans ligne fin"
+              % (check.get("id"), nom, ORPHAN_CONCLUSION), file=sys.stderr)
     return 0
 
 
@@ -383,11 +783,22 @@ def main(argv: list[str] | None = None) -> int:
                            help="secondes entre deux lectures du flux (défaut 5)")
             p.add_argument("--max-duration", type=float, default=3600.0,
                            help="arrêt de sûreté (secondes, défaut 3600)")
+            p.add_argument("--plafond-min", type=_nombre, default=None,
+                           help="plafond du job en minutes (= timeout-minutes ; "
+                                "défaut : %s)" % ENV_PLAFOND)
+            p.add_argument("--debut", type=_nombre, default=None,
+                           help="début du job, epoch en secondes (défaut : %s)" % ENV_DEBUT)
+    p = sous.add_parser("sweep", help="conclut les checks « tests (flux) » laissés "
+                         "en cours par un job terminal (#856)")
+    p.add_argument("--sha", default="",
+                   help="tête à réconcilier (défaut : AMEESH_CI_TETE ou GITHUB_SHA)")
     args = ap.parse_args(argv)
     if args.commande == "publish":
         return publish(args)
     if args.commande == "close":
         return close(args)
+    if args.commande == "sweep":
+        return sweep(args)
     sys.stdout.write(summary(args.files))
     return 0
 

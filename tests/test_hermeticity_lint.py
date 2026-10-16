@@ -90,6 +90,69 @@ class RulesTest(unittest.TestCase):
             "    # hermeticity: allow — le banc mesure la garde de 5 s\n"
             "    self.assertLess(time.time() - debut, 5)\n"), [])
 
+    def test_exemption_inline_comment(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    debut = time.time()\n"
+            "    self.assertLess(time.time() - debut, 5)  # hermeticity: allow — garde mesurée\n"),
+            [])
+
+    def test_exemption_without_reason_does_not_exempt(self):
+        """Un commentaire vide ne supprime pas le constat (R1 #707, N1)."""
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    # hermeticity: allow —\n"
+            "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    # hermeticity: allow\n"
+            "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
+
+    def test_marker_in_a_string_does_not_exempt(self):
+        """Le marqueur doit être un commentaire, pas une chaîne de code."""
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    note = 'hermeticity: allow — dans une chaîne'\n"
+            "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
+
+    def test_punctuation_only_reason_does_not_exempt(self):
+        for reason in ("—", "-", ".", "... !?", "_", "( )"):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.rules(
+                    "import time\n"
+                    "def test_x(self):\n"
+                    f"    # hermeticity: allow — {reason}\n"
+                    "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
+
+    def test_exemption_ascii_separator_and_unicode_reason(self):
+        for reason in ("échéance contrôlée", "(échéance contrôlée)", "... 5 s"):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.rules(
+                    "import time\n"
+                    "def test_x(self):\n"
+                    f"    # hermeticity: allow - {reason}\n"
+                    "    self.assertLess(time.time() - debut, 5)\n"), [])
+
+    def test_exemption_inside_a_multiline_assertion(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    self.assertTrue(\n"
+            "        # hermeticity: allow - le banc mesure la garde de 5 s\n"
+            "        time.time() - debut < 5)\n"), [])
+
+    def test_exemption_on_a_multiline_assertion(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    # hermeticity: allow — le banc mesure la garde de 5 s\n"
+            "    self.assertTrue(\n"
+            "        time.time() - debut < 5)\n"), [])
+
     def test_syntax_error_is_reported(self):
         self.assertEqual(self.rules("def test_x(:\n"), ["H0"])
 

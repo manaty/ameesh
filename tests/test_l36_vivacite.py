@@ -46,7 +46,9 @@ class L36CliTest(PgTestCase):
         self.register("alpha", "claude", cwd=self.tmp)
         self.register("beta", "codex", cwd=self.tmp)
         for title, who in (("un", "alpha"), ("deux", "alpha"), ("trois", "beta")):
-            proc = self.mesh("work", "add", "--title", title, "--assignee", who)
+            proc = self.mesh("work", "add", "--title", title, "--assignee", who,
+                             "--actor", "human:test",
+                             "--force", "test: two lots for alpha (#540)")
             self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -58,6 +60,25 @@ class L36CliTest(PgTestCase):
         col = header.index("ITEMS")
         self.assertEqual(lines["alpha"][col:col + 5].strip(), "2")
         self.assertEqual(lines["beta"][col:col + 5].strip(), "1")
+
+    def test_list_colonne_harnais_etoilee_ne_decale_pas_la_ligne(self):
+        # #1782 : un harnais vivant de 9 lettres étoilé (`[:9] + '*'`) occupe
+        # la colonne HARNESS entière (10) ; les colonnes suivantes gardent
+        # l'alignement de l'en-tête.
+        self.register("bascule", "claude", cwd=self.tmp)
+        self.db.execute(
+            "UPDATE agent_registry SET session_id = %s, session_origin = %s, "
+            "session_harness = 'deepseek9' WHERE name = 'bascule'",
+            ("sid-1782", "sid-1782"))
+        proc = self.mesh("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        header = proc.stdout.splitlines()[0]
+        row = next(line for line in proc.stdout.splitlines()
+                   if line.startswith("bascule"))
+        self.assertIn("deepseek9*", row)
+        host_col = header.index("HOST")
+        # la colonne HOST tronque à 10 (comme l'en-tête le suppose)
+        self.assertEqual(row[host_col:host_col + 10].rstrip(), self.cfg.host[:10])  # colonne complétée : un hôte court (« laptop ») est suivi d'espaces
 
     def test_attribution_a_un_inconnu_refusee_et_l_attente_le_dit(self):
         # L37 (0030) : l'avertissement de L36 est devenu un refus

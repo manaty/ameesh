@@ -335,13 +335,13 @@ ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--jso
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
-ameesh work merged <id> --sha SHA [--note N] [--actor A]
-ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
+ameesh work merged <id> --sha SHA [--migration-landed N] [--note N] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agent/…] [--target BRANCH]
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
-ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID)
-ameesh work sync-merges [--dry-run] [--json]          # close frozen lots whose content is merged (L29)
+ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA)
+ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
 ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)
 ameesh work measure [<id>…] [--no-ci] [--json]        # actual time per phase, merged diff size (L157c)
@@ -349,6 +349,9 @@ ameesh work project-github --app PROJECT [--repo R] [--dry-run]   # one issue pe
 ameesh work resolve <lot> --with <other> [--json]     # prepare a conflict resolution (L160d)
 ameesh work queue add <id> | remove <id> | show [--target BRANCH] [--json]   # merge queue (L160e)
 ameesh work land <id> [--project P] [--json]          # land the queue head (L160e2)
+ameesh release open <id> --base SHA                   # freeze the release perimeter (L750)
+ameesh release check <id> [--repo R] [--json]         # moved base, full suite on the head (L756)
+ameesh release reason <id> --text "…"                 # record why the release base moved after the freeze
 ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
@@ -365,11 +368,18 @@ ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 prerequisites between lots (L385). `work migration` reserves the next free
 migration number for the lot, per repository, **before** the file is written
 (L122); `--number` reserves an exact one, `--release` gives it back. It is
-idempotent and visible in `work show`. `work set-app` corrects a
+idempotent and visible in `work show`. `work merged --migration-landed N`
+records the number that actually landed when the landing renumbered the
+reservation (a packet takes the target's max+1, #1567); the option also
+corrects an already merged lot, so `work show` names the landed number (its
+file, and the reservation when it differs) instead of showing only the
+reservation. `work set-app` corrects a
 lot's project and `work backfill-app` fills the uniquely inferred ones, both
 with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 (`--none` detaches it),
-`work close` closes an abandoned or superseded lot, and `work sync-merges`
+`work close` closes an abandoned, superseded or delivered-outside-target lot
+(`--delivered --sha <reviewed head>`: the `delivered` milestone carries the
+head and counts as a delivery in `estimates`, #988), and `work sync-merges`
 closes the frozen lots whose content is already merged (L29). `work schedule`
 proposes the planned dates of open assigned lots at the p80 of the L157
 reference table (`--apply` writes), and `work measure` records the actual time
@@ -436,6 +446,14 @@ deadline: if the delegate has not worked on it by then, the lot goes back to
 the delegator (`--actor`, else the current assignee). The runner processes
 deadlines at every pass; `expire-delegations` does it by hand. See
 [Operate agents](../guides/operate-agents.md#guarded-assignment-and-delegation).
+
+`--claim` assigns only a lot that has **no assignee**: a lot already taken is
+refused (exit 1) naming its holder, and the write is conditional on the
+assignee still being empty, so two concurrent claims produce a single
+assignment and the other is refused without changing hands (#1026). The
+`stale_lot` (unassigned lot) and `idle_capacity` (lots without an agent)
+briefs carry that command; a deliberate reassignment of a lot already held
+stays `work assign` without `--claim`.
 
 **Branch of a lot (L118).** `--branch` records the lot's branch, `--target`
 its target (default: `git config ameesh.target` in the repository, else

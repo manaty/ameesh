@@ -20,13 +20,17 @@ from .test_l30_accounts import _Base as _L30Base, _codex_rollout
 
 
 class _Comptes(_AuthBase):
-    """Codex : `primaire` (compte par défaut, CODEX_HOME) et `secondaire`."""
+    """Codex : `primaire` (compte par défaut, `~/.codex`) et `secondaire`."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.home = os.path.join(self.tmp, "codex-default")
+        # L1078 : un primaire déclaré sans dossier, c'est le dossier par défaut
+        # du harnais (`~/.codex`) — le banc lui donne un HOME à lui, jamais le
+        # vrai dossier de l'utilisateur
+        self.maison = os.path.join(self.tmp, "maison")
+        self.home = os.path.join(self.maison, ".codex")
         os.makedirs(self.home, mode=0o700, exist_ok=True)
-        env = mock.patch.dict(os.environ, {"CODEX_HOME": self.home})
+        env = mock.patch.dict(os.environ, {"CODEX_HOME": self.home, "HOME": self.maison})
         env.start()
         self.addCleanup(env.stop)
         self.secondaire = self._codex_comptes()[1]
@@ -269,11 +273,15 @@ class IdentiteTest(unittest.TestCase):
         self.assertFalse(account_turn.is_critical(types.SimpleNamespace(name="x", agent={})))
 
     def test_configuration(self):
-        cfg = config.load({"AMEESH_CONFIG": "/nonexistent", "AMEESH_CRITICAL_AGENTS":
-                           "orchestrateur, mesh-design"})
-        self.assertEqual(cfg.critical_agents, ("orchestrateur", "mesh-design"))
         import json
         import tempfile
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as vide:
+            vide.write("{}\n")
+        self.addCleanup(os.unlink, vide.name)
+        cfg = config.load({"AMEESH_CONFIG": vide.name, "AMEESH_CRITICAL_AGENTS":
+                           "orchestrateur, mesh-design"})
+        self.assertEqual(cfg.critical_agents, ("orchestrateur", "mesh-design"))
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             json.dump({"critical_agents": ["auditeur", "mesh-design"]}, fh)
         self.addCleanup(os.unlink, fh.name)

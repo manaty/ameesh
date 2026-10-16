@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 from .. import interface
-from .registry import canon_governed_sql
+from .registry import NAME_LOCK_SQL, canon_governed_sql, name_lock_key
 
 #: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
 #: gouverné par le canon, sinon son chantier, désormais `workstream` (un
@@ -22,7 +22,7 @@ PROJECT_SQL = (
     " FROM agent_registry r WHERE r.name = %s")
 
 MAIL_COLUMNS = """
-    id, sender, recipient, body, kind, payload, status, host,
+    id, sender, recipient, body, kind, payload, status, host, work_item_id,
     signature, signature_key, signed_payload, nonce,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from delivered_at)::float8 as delivered_ts,
@@ -148,6 +148,29 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
+    def unread_mid_turn(self, recipient, limit) -> list[dict]:
+        """L514/#885 : le filtre de `mail.mid_turn` DANS la requête — un
+        verdict, un arbitrage, un message humain ou urgent, sans borne sur les
+        autres non-lus (les 200 premiers ne sont pas un plafond de lecture)."""
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox m
+            WHERE recipient = %%s AND delivered_at IS NULL
+              AND (payload @> '{"urgent": true}'::jsonb
+                   OR payload @> '{"human": true}'::jsonb
+                   OR payload @> '{"verdict": true}'::jsonb
+                   OR payload @> '{"arbitration": true}'::jsonb)
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_registry v
+                  WHERE v.name = m.recipient AND (%s)
+              )
+            ORDER BY id
+            LIMIT %%s
+            """ % (MAIL_COLUMNS, self.ACTIVE_SQL),
+            (recipient, int(limit)),
+        )
+
     def get(self, message_id) -> dict | None:
         rows = self.db.query("SELECT %s FROM agent_mailbox WHERE id = %%s" % MAIL_COLUMNS,
                              (int(message_id),))
@@ -161,7 +184,7 @@ class Mailbox(interface.Mailbox):
         rows = self.db.query(
             """
             UPDATE agent_mailbox
-               SET delivered_at = now(), status = 'delivered'
+               SET delivered_at = clock_timestamp(), status = 'delivered'
              WHERE delivered_at IS NULL AND id IN (%s)
             RETURNING id
             """ % ", ".join(str(i) for i in clean)
@@ -175,7 +198,7 @@ class Mailbox(interface.Mailbox):
         rows = self.db.query(
             """
             UPDATE agent_mailbox AS m
-               SET delivered_at = now(), status = 'delivered',
+               SET delivered_at = clock_timestamp(), status = 'delivered',
                    meta = m.meta || jsonb_build_object('retire', %%s::jsonb)
              WHERE m.delivered_at IS NULL AND m.id IN (%s)
                AND m.sender = 'ameesh' AND m.payload ? 'ci'
@@ -277,6 +300,11 @@ class Mailbox(interface.Mailbox):
         return sorted(rows, key=lambda row: int(row["id"]))
 
     def deliver(self, recipient, owner, epoch, token, ids) -> list[int]:
+        # #796 : `clock_timestamp()`, pas `now()` — l'horodatage de remise est
+        # celui de CHAQUE message (l'instant réel où il entre dans le contexte,
+        # ici l'injection par le hook ou le lancement du tour), pas l'instant
+        # de la transaction, identique pour tout un lot. C'est ce qui rend le
+        # délai de réaction (created_at → delivered_at) mesurable.
         clean = sorted({int(i) for i in ids})
         if not clean:
             return []
@@ -287,7 +315,7 @@ class Mailbox(interface.Mailbox):
                   FROM agent_registry WHERE name = %%s FOR UPDATE
             )
             UPDATE agent_mailbox AS m
-               SET delivered_at = now(), status = 'delivered'
+               SET delivered_at = clock_timestamp(), status = 'delivered'
               FROM v
              WHERE m.recipient = %%s AND m.delivered_at IS NULL AND m.id IN (%s)
                AND m.meta->'consigne'->>'jeton' = %%s
@@ -397,6 +425,39 @@ class Mailbox(interface.Mailbox):
         # message pris entre-temps par une remise (verrou de ligne, WHERE
         # réévalué) n'est pas renvoyé.
         with self.db.transaction() as tx:
+            # L976 (R2 delta codex3, B1 résiduel) : le verrou par nom est pris
+            # AVANT toute lecture du registre, et les chemins de création
+            # prennent le même (`registry.NAME_LOCK_CTE`). L'absence d'une
+            # ligne — qu'un `FOR UPDATE` ne verrouille pas — ne peut donc plus
+            # se glisser entre la lecture et la copie : une inscription
+            # concurrente attend notre commit, et si elle l'a gagné, la lecture
+            # ci-dessous la voit (instantané de l'instruction suivante).
+            # Deux renvois croisés prennent les verrous par ordre de clé.
+            for key in sorted({name_lock_key(old), name_lock_key(new)}):
+                tx.query(NAME_LOCK_SQL, (key,))
+            # Puis la décision sous le verrou des deux lignes du registre
+            # (`FOR UPDATE`, par ordre de nom : deux renvois croisés ne
+            # s'interbloquent pas) et le statut est relu après l'attente
+            # éventuelle. Une relance de `old` ou un arrêt de `new` committé
+            # entre la lecture et la copie bloquait jusqu'ici sans être revu :
+            # il bloque désormais sur ce verrou jusqu'à notre commit, donc
+            # jamais entre la décision et la copie.
+            locked = {row["name"]: row["status"] for row in tx.query(
+                "SELECT name, status FROM agent_registry"
+                " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))}
+            if old == new:
+                raise interface.MailboxRefused(
+                    "old and new recipient are the same (%s)" % old)
+            if old in locked and locked[old] != "stopped":
+                raise interface.MailboxRefused(
+                    "%s is not stopped (status %s): its mailbox is read, forward refused"
+                    % (old, locked[old]))
+            if new not in locked:
+                raise interface.MailboxRefused(
+                    "%s is not in the registry: forward to a live agent" % new)
+            if locked[new] == "stopped":
+                raise interface.MailboxRefused(
+                    "%s is stopped: forward to a live agent" % new)
             ids = sorted(int(row["id"]) for row in tx.query(
                 "SELECT m.id FROM agent_mailbox m"
                 " WHERE m.recipient = %%s AND m.delivered_at IS NULL"
@@ -426,7 +487,7 @@ class Mailbox(interface.Mailbox):
             rows = tx.query(
                 """
                 UPDATE agent_mailbox AS m
-                   SET delivered_at = now(), status = 'delivered',
+                   SET delivered_at = clock_timestamp(), status = 'delivered',
                        meta = (m.meta - 'consigne')
                               || jsonb_build_object('forwarded', jsonb_build_object(
                                      'to', %%s::text, 'message_id', v.new_id,
@@ -439,3 +500,55 @@ class Mailbox(interface.Mailbox):
                 """ % ", ".join("(%d, %d)" % pair for pair in pairs),
                 (new, by))
         return sorted(rows, key=lambda row: int(row["original_id"]))
+
+    def expire_dead_letters(self, recipient, note, before_ts, dry_run=False) -> list[dict]:
+        # L976 : expire le courrier en souffrance d'une boîte morte. La
+        # décision (boîte morte) est prise sous le verrou par nom
+        # (`registry.NAME_LOCK_*`, partagé avec les chemins de création), puis
+        # sous le verrou de la ligne du registre quand elle existe (`FOR
+        # SHARE`) : une relance concurrente comme une inscription d'un nom
+        # absent bloquent jusqu'à notre commit, et le statut est relu après
+        # l'attente — le courrier d'un vivant n'est jamais expiré (relectures
+        # codex3, B1 puis B1 résiduel). Mêmes exclusions que `dead_letters`
+        # (L124 : une demande de décision attend un humain) et que `forward`
+        # (réservation active : le message est peut-être montré). `before_ts` :
+        # seuls les messages reçus avant ce seuil (la rétention). `dry_run` :
+        # lecture seule, sans verrou.
+        v = ("WITH v AS (SELECT name, status FROM agent_registry"
+             " WHERE name = %%s FOR SHARE) ")
+        where = """
+             WHERE m.recipient = %%s
+               AND m.delivered_at IS NULL
+               AND m.created_at <= to_timestamp(%%s)
+               AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
+               AND NOT (%s)
+               AND (NOT EXISTS (SELECT 1 FROM v) OR (SELECT status FROM v) = 'stopped')
+            """ % _RESERVED_SQL
+        columns = ("m.id, m.sender, m.kind,"
+                   " extract(epoch from m.created_at)::float8 AS created_ts")
+        if dry_run:
+            rows = self.db.query((v + "SELECT %s FROM agent_mailbox AS m%s")
+                                 % (columns, where),
+                                 (recipient, recipient, float(before_ts)))
+        else:
+            # L976 (relecture codex3, B1 résiduel) : le verrou par nom est pris
+            # dans une instruction À PART, avant la décision : une inscription
+            # concurrente prend le même verrou (chemins de création), donc soit
+            # elle a gagné et la lecture de l'instruction suivante la voit,
+            # soit elle attend notre commit — l'absence ne se glisse plus entre
+            # la lecture et l'écriture (une seconde lecture sans verrou ne
+            # suffit pas : l'instantané d'une même instruction ne se rafraîchit
+            # pas après l'attente sur le verrou).
+            with self.db.transaction() as tx:
+                tx.query(NAME_LOCK_SQL, (name_lock_key(recipient),))
+                rows = tx.query(
+                    (v + """
+                    UPDATE agent_mailbox AS m
+                       SET delivered_at = now(), status = 'delivered',
+                           meta = m.meta || jsonb_build_object('expired', %%s::jsonb)
+                    %s
+                     RETURNING %s
+                    """) % (where, columns),
+                    (recipient, json.dumps(note or {}, ensure_ascii=False), recipient,
+                     float(before_ts)))
+        return sorted(rows, key=lambda row: int(row["id"]))

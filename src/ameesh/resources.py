@@ -73,7 +73,7 @@ CRITICAL_LOAD_FACTOR = 2.0     # charge >= le double du plafond
 #: arrêtés au point sûr, consignes remises en attente, baux rendus) ; au retour
 #: du secteur, il reprend seul.
 #:
-#: 25 % : un tour dure jusqu'à 15 min (`session_max_turn_seconds`) et une
+#: 25 % : un tour dure jusqu'à 30 min (`turn_max_seconds`, 1 800 s) et une
 #: dizaine d'agents vident une batterie de portable en moins d'une heure
 #: (2026-10-10 : débranché à 11:06, « batterie faible » à 11:56, coupure à
 #: 12:10) — les tours en cours doivent pouvoir finir avant le seuil d'arrêt.

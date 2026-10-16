@@ -566,8 +566,15 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                     if parent is None:
                         raise DecisionError("parent work item %s not found" % parent_ref)
                 project = work_projects.creation_project(cfg, db, requester, parent=parent)
-            item = work.add(db, title=title, assignee=requester, actor=requester,
-                            source="decision", app=project, cfg=cfg)
+            # #540 : le lot de sa propre question reste au demandeur, qui
+            # attend la réponse (jamais dans la file d'équipe)
+            item = work._decision_lot(db, title=title, requester=requester, app=project,
+                                      cfg=cfg)
+            # #1391 : une question de décision est une demande légitime
+            # (humaine) — pas d'avertissement de route ici, même si le titre
+            # ressemble à une suite. La route du canon §2 est rendue par les
+            # deux points d'entrée de création de travail (`work add`, `mail
+            # --new-lot`), où le flux de suites de relecture a été observé.
         except work.WorkError as exc:
             raise DecisionError("work item not created — %s" % exc) from exc
         except assignments.AssignmentError as exc:
@@ -920,8 +927,10 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
             db, human, view["requester"], answer_text(view), host=cfg.host, kind=REPLY_KIND,
             work_item_id=str(view["lot"]) if view.get("lot") is not None else None,
             # L125 : le courrier d'un humain réveille tout de suite (jamais
-            # retenu par la fenêtre de regroupement, jamais passif)
-            payload={"human": True,
+            # retenu par la fenêtre de regroupement, jamais passif). #795 : la
+            # réponse de l'owner est prioritaire (0018 §2) — elle préempte le
+            # tour du demandeur, qui repart avec elle en tête.
+            payload={"human": True, "urgent": True,
                      "decision_answer": {"decision": view["id"], "lot": view.get("lot"),
                                          "by": human, "channel": channel, "option": option,
                                          "text": text}},

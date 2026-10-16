@@ -27,12 +27,16 @@ Interface (`ResidentDriver`): `start()` opens or resumes the session;
 `send(text)` starts a turn and returns its `Turn` handle (`ResidentBusy` if
 one is running); `steer(text)` serves an input at the safe point of the
 running turn (outside a turn, it is `send`); `interrupt()` ends the running
-turn without killing the process; `probe()` checks that the harness answers;
-`close()` stops the process group. A turn steered one or more times stays
-**one** logical turn: its `TurnResult` lists every input it served, whatever
-the protocol does underneath (a second `result` for Claude, a second
-`turn/start` for Codex when the steer lost the race against the end of the
-turn, a second `session/prompt` for ACP).
+turn without killing the process; `probe(timeout)` checks, bounded, that the
+harness answers — a control round-trip (`initialize` again for Claude,
+`thread/read` for Codex, `session/list` for ACP). The Claude CLI answers
+`success` to the second `initialize` (observed, no model call), so any answer
+proves it alive, a refusal from another harness too; only silence is a failure.
+`close()` stops the process group. A turn steered one or
+more times stays **one** logical turn: its `TurnResult` lists every input it
+served, whatever the protocol does underneath (a second `result` for Claude, a
+second `turn/start` for Codex when the steer lost the race against the end of
+the turn, a second `session/prompt` for ACP).
 
 Every event read from the harness goes to `on_event(raw, parsed)`: `raw` is
 the harness's own message, `parsed` the contract of `adapters.StreamReader`
@@ -101,6 +105,13 @@ class ResidentBusy(ResidentError):
     """A turn is running: the input waits for its end (or is steered)."""
 
 
+class RequestRefused(ResidentError):
+    """The harness answered a control request, but refused it: it is alive
+    (`probe`), which is not the same as silence. The Claude CLI answers
+    `success` to the probe's `initialize`; counting a refusal as an answer
+    covers another harness, or a protocol that changes."""
+
+
 def log(message: str) -> None:
     try:
         sys.stderr.write("[resident] %s\n" % message)
@@ -122,7 +133,9 @@ class TurnResult:
     calls), plus `context_tokens` (context of its last call) and
     `context_window` when the harness gives them. `cost`: USD of the turn
     when it can be told apart from the session's cumulative cost
-    (`cost_total`)."""
+    (`cost_total`). `compact`: the native compaction the harness reported in
+    the turn (`{"pre": …, "post": …}`, tokens before and after; L81), None
+    when it reported none."""
 
     status: str
     final: str = ""
@@ -133,6 +146,7 @@ class TurnResult:
     cost: float | None = None
     cost_total: float | None = None
     duration_s: float = 0.0
+    compact: dict | None = None
 
 
 class Turn:
@@ -188,6 +202,121 @@ def _number(value: Any) -> int:
     return 0
 
 
+class LeaderPopen(subprocess.Popen):
+    """The leader of a resident harness group, never reaped outside the kill
+    path (codex r2, #417): `poll()` and `wait()` see its exit without reaping
+    it (`waitid` with WNOWAIT), so its zombie keeps its pid — the group's
+    number — from being reused; `returncode` stays None until `reap()`,
+    which kills the group first. Elsewhere (no WNOWAIT): a plain Popen."""
+
+    _exit: int | None = None
+
+    def __init__(self, *args, **kwargs):
+        #: a group signal and the reap never cross: a signal goes only while
+        #: the leader is unreaped, the reap only once the group is killed
+        self._reap_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def _peek(self) -> int | None:
+        """The exit code once the leader has exited, without reaping it."""
+        if self.returncode is not None:
+            return self.returncode
+        if self._exit is not None:
+            return self._exit
+        try:
+            info = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            # reaped behind our back: its number may be reused, never signal it
+            self.returncode = self._exit if self._exit is not None else -1
+            return self.returncode
+        if info is None:
+            return None
+        killed = info.si_code in (os.CLD_KILLED, os.CLD_DUMPED)
+        self._exit = -info.si_status if killed else info.si_status
+        return self._exit
+
+    # Popen's own internals, so that every path goes through them —
+    # `poll()`, `wait()`, `communicate()`, `__del__()` and
+    # `subprocess._cleanup()` (codex r3, #417)
+    def _internal_poll(self, _deadstate=None, **_ignored):
+        code = self._peek()
+        if code is not None and _deadstate is not None and self.returncode is None:
+            # an orphaned object (`__del__`, `_cleanup`): nobody will close it —
+            # its group is killed while its number is ours, then it is reaped.
+            # Never blocking in a finalizer (codex r4): lock taken elsewhere,
+            # `returncode` stays None and CPython keeps the object in
+            # `subprocess._active`, whose next `_cleanup()` retries — as long
+            # as None is returned: `_cleanup()` drops whatever returns an exit
+            # code, reaped or not (codex r5).
+            if self._reap_lock.acquire(blocking=False):
+                try:
+                    self._reap_locked(0.0)
+                finally:
+                    self._reap_lock.release()
+            return self.returncode
+        return code
+
+    def _wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            code = self._peek()
+            if code is not None:
+                return code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.01)
+
+    def send_signal(self, sig) -> None:
+        with self._reap_lock:
+            if self.returncode is None:     # unreaped: the pid is still ours
+                os.kill(self.pid, sig)
+
+    def signal_group(self, sig) -> bool:
+        """`sig` to the leader's group, only while its number is ours."""
+        with self._reap_lock:
+            if self.returncode is not None:
+                return False
+            try:
+                os.killpg(self.pid, sig)
+                return True
+            except OSError:
+                return False
+
+    def reap(self, timeout: float = 2.0) -> int | None:
+        """SIGKILL to the whole group, then the leader is reaped. A leader
+        still not dead after `timeout` stays unreaped (its number with it)."""
+        with self._reap_lock:
+            return self._reap_locked(timeout)
+
+    def _reap_locked(self, timeout: float) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.returncode = self._exit if self._exit is not None else -1
+                return self.returncode
+            if pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+                return self.returncode
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
+
+
+def spawn_leader(*args, **kwargs) -> subprocess.Popen:
+    """`LeaderPopen` where the system can wait without reaping, else Popen."""
+    if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+        return LeaderPopen(*args, **kwargs)
+    return subprocess.Popen(*args, **kwargs)
+
+
 def _kill_group(proc: subprocess.Popen, grace: float, *, close_input: bool = True) -> None:
     """Close standard input (unless a writer may still use it), then SIGTERM
     and SIGKILL to the harness group."""
@@ -196,21 +325,29 @@ def _kill_group(proc: subprocess.Popen, grace: float, *, close_input: bool = Tru
             proc.stdin.close()
     except (OSError, ValueError):
         pass
+    signal_group = getattr(proc, "signal_group", None)
     for sig in (None, signal.SIGTERM, signal.SIGKILL):
         if sig is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                try:
+            if signal_group is not None:
+                # under the reap lock: only while the leader is unreaped (codex r3)
+                if not signal_group(sig):
                     proc.send_signal(sig)
-                except OSError:
-                    pass
+            else:
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    try:
+                        proc.send_signal(sig)
+                    except OSError:
+                        pass
         try:
             proc.wait(timeout=max(grace, 0.1) if sig != signal.SIGKILL else 1.0)
             break
         except subprocess.TimeoutExpired:
             continue
-    if proc.poll() is not None:
+    if isinstance(proc, LeaderPopen):
+        proc.reap()     # the group killed while its number is ours, then reaped
+    elif proc.poll() is not None:
         # the leader is gone; what it left in the group goes too
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -243,7 +380,8 @@ class ResidentDriver:
                  tier: str | None = None,
                  on_event: Callable[[dict, dict], None] | None = None,
                  env: Mapping[str, str] | None = None, stderr: Any = None,
-                 init_timeout: float = INIT_TIMEOUT, cost_base: float | None = None):
+                 init_timeout: float = INIT_TIMEOUT, cost_base: float | None = None,
+                 spawn: Callable[..., subprocess.Popen] | None = None):
         self.adapter = adapter
         self.descriptor = adapter.descriptor
         self.block = dict(self.descriptor.resident)
@@ -260,6 +398,9 @@ class ResidentDriver:
         self.extra_env = dict(env or {})
         self.stderr = stderr
         self.init_timeout = max(init_timeout, 0.1)
+        #: L76: starts the harness (`subprocess.Popen` by default); the runner
+        #: passes its own, under its launch lock
+        self.spawn = spawn or spawn_leader
         #: cumulative session cost before this process (resumed session)
         self.cost_base = cost_base if cost_base is not None else (None if session else 0.0)
         self.last_activity = time.monotonic()
@@ -433,7 +574,7 @@ class ResidentDriver:
         if self.proc is None:
             raise ResidentError("resident harness not started")
         if self.proc.poll() is not None:
-            raise ResidentError("resident harness exited (code %s)" % self.proc.returncode)
+            raise ResidentError("resident harness exited (code %s)" % self.proc.poll())
 
     def _reset_turn(self) -> None:
         self._final = ""
@@ -444,6 +585,8 @@ class ResidentDriver:
         self._window: int | None = None
         self._cost: float | None = None
         self._cost_total: float | None = None
+        #: L81: native compaction reported in this turn (compact_boundary)
+        self._compact: dict | None = None
 
     def _add_usage(self, input_tokens: int = 0, cache_read: int = 0, cache_creation: int = 0,
                    output_tokens: int = 0) -> None:
@@ -481,7 +624,8 @@ class ResidentDriver:
                 session=self.session_id, usage=usage,
                 inputs=tuple(i for i in current.inputs if i not in self._unconfirmed),
                 cost=self._cost, cost_total=self._cost_total,
-                duration_s=round(time.monotonic() - current.started, 3))
+                duration_s=round(time.monotonic() - current.started, 3),
+                compact=dict(self._compact) if self._compact else None)
             self._turn = None
             self._followups.clear()
             self._unconfirmed.clear()
@@ -575,7 +719,7 @@ class ClaudeStreamJson(ResidentDriver):
     def start(self) -> str:
         argv = self.argv()
         try:
-            self._proc = subprocess.Popen(
+            self._proc = self.spawn(
                 argv, cwd=self.cwd, env=self._env(), stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=self.stderr, text=True, bufsize=1,
                 start_new_session=True)
@@ -726,8 +870,8 @@ class ClaudeStreamJson(ResidentDriver):
                 self._controls.pop(request_id, None)
         response = slot["response"] or {}
         if response.get("subtype") != "success":
-            raise ResidentError("%s refused: %s" % (request.get("subtype"),
-                                                     response.get("error") or response))
+            raise RequestRefused("%s refused: %s" % (request.get("subtype"),
+                                                      response.get("error") or response))
         return response
 
     def _user(self, text: str, wire: str, input_id: str) -> None:
@@ -768,6 +912,23 @@ class ClaudeStreamJson(ResidentDriver):
         except ResidentError as exc:
             log("interrupt: %s" % exc)
             return False
+
+    def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
+        """Does the harness answer? The `initialize` handshake of `start()`,
+        sent again outside a turn and bounded by `timeout`: it carries no turn
+        and no state the driver depends on. The CLI answers `success` to it
+        (observed, no model call): any answer proves the control channel and
+        its reader alive — a refusal from another harness too — and only
+        silence, or a process gone meanwhile, is a failure (L76 T3, #285)."""
+        if not self.alive:
+            return False
+        try:
+            self._control({"subtype": "initialize"}, timeout)
+        except RequestRefused:
+            return True                     # it answered
+        except ResidentError:
+            return False                    # silence, or gone meanwhile
+        return True
 
     # -- reading -----------------------------------------------------------
     def _read_loop(self) -> None:
@@ -829,6 +990,10 @@ class ClaudeStreamJson(ResidentDriver):
         parsed = self.adapter.parse(line)
         if parsed.get("session"):
             self.session_id = str(parsed["session"])
+        if ((kind == "system" and event.get("subtype") == "compact_boundary")
+                or kind == "compact_boundary"):
+            # L81 (étude §6.2) : la compaction native est un événement du tour
+            self._on_compact(event)
         principal = not event.get("parent_tool_use_id")
         if kind == "user" and event.get("isReplay"):
             with self._lock:
@@ -843,12 +1008,46 @@ class ClaudeStreamJson(ResidentDriver):
         if kind == "result" and principal:
             self._on_result(event)
 
+    def _on_compact(self, event: dict) -> None:
+        """L81 (étude §6.2) : la compaction native rapportée par le harnais —
+        ses jetons avant/après ; le contexte mesuré suit l'après, pour que la
+        décision d'entretien ne redemande pas une compaction sans fin."""
+        meta = event.get("compact_metadata")
+        if not isinstance(meta, dict):
+            meta = event
+
+        def token(*names) -> int | None:
+            for name in names:
+                value = meta.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return int(value)
+            return None
+
+        compact = {"pre": token("pre_tokens", "preTokens", "pre"),
+                   "post": token("post_tokens", "postTokens", "post")}
+        with self._lock:
+            self._compact = compact
+            if compact["post"] is not None:
+                self._context = compact["post"]
+
     def _on_result(self, event: dict) -> None:
         usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
         self._add_usage(_number(usage.get("input_tokens")),
                         _number(usage.get("cache_read_input_tokens")),
                         _number(usage.get("cache_creation_input_tokens")),
                         _number(usage.get("output_tokens")))
+        # L81 (étude §6.1) : la fenêtre du modèle, donnée par `modelUsage`
+        # (Claude Code) ; sans elle la décision de compaction ne peut se
+        # prendre sur la part du contexte.
+        model_usage = event.get("modelUsage")
+        if isinstance(model_usage, dict):
+            for entry in model_usage.values():
+                window = _number((entry or {}).get("contextWindow")) \
+                    if isinstance(entry, dict) else 0
+                if window:
+                    with self._lock:
+                        self._window = window
+                    break
         with self._lock:
             total = event.get("total_cost_usd")
             if isinstance(total, (int, float)) and not isinstance(total, bool):

@@ -163,7 +163,7 @@ read without limit (full log, all its actions).
 | `milestones_source` | `milestones` (lot milestones table, L10) \| `events` (deduction) |
 | `blocked_verdicts` | number of blocking verdicts (integer; null if the source does not know) |
 | `blocks` | number of holds (`blocked`, `waiting_human`) |
-| `assignee`, `reviewer` | author; author of the retained verdict (approver for a merge action) |
+| `assignee`, `reviewer` | author; the designated reviewer (`work move … qa --reviewer`, #705) while the review is open, otherwise the author of the retained verdict (approver for a merge action) |
 | `qa_loops` | `qa → build` round trips counted by `work_items` |
 | `updated_ts`, `budget_usd`, `spent_usd` | last modification, lot budget |
 | `actions` | ids of the actions linked to the lot |
@@ -202,6 +202,7 @@ freeze, otherwise `review` (a refrozen lot goes back to review); `active` otherw
 | `effort` | `ameesh set … effort=` setting; **null** = harness default or unknown (local setting of another host) |
 | `state` | `working` \| `idle` \| `paused` \| `stopped` |
 | `status`, `status_text` | raw registry status and its text (reason for a pause) |
+| `paused_on_budget` | (L242b, #1070) `true` when the pause is the budget/pace guard (`status` `blocked` and text `budget : …`, the rule of `handoff.paused`); another `blocked` cause (host not ready, authentication) keeps `false` |
 | `since_ts` | start of the current turn (`working`), end of the last turn (`idle`), last update otherwise |
 | `turn` | current turn or null: `{started_ts, duration_s, label, task}` (`task` = current prompt, truncated to 140 characters) |
 | `turns`, `unread`, `pending_prompt`, `lease_live` | turns counted, unread, pending prompt, live lease |

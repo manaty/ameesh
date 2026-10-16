@@ -25,7 +25,7 @@ from unittest import mock
 from ameesh import background, config as config_mod, mail, platform, registry, storage
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import EMPTY_CONFIG, FAKEBIN, PgTestCase
 
 
 def _p(pid, ppid, name, pgid=100, zombie=False) -> dict:
@@ -340,6 +340,20 @@ class _Base(PgTestCase):
             "SELECT status, extract(epoch from ended_at)::float8 AS ended_ts"
             " FROM turn_resources WHERE agent = %s ORDER BY id", (agent,))
 
+    def _ressource_fermee(self, agent: str, timeout: float = 10.0) -> dict:
+        """#1708 : attendre la **ligne du registre**, pas seulement la mort du
+        pid — le nettoyage peut l'écrire après. La grâce renseigne déjà
+        ended_ts : seul un statut terminal prouve la fermeture. Sous charge (deux suites
+        partageant le Postgres de banc), un `ended_ts` encore nul faisait
+        rougir un test sain sur un simple décalage d'ordonnancement."""
+        def fermee():
+            lignes = self._ressources(agent)
+            if (lignes and lignes[0]["ended_ts"] is not None
+                    and lignes[0]["status"] in ("done", "orphan")):
+                return lignes[0]
+            return None
+        return self.wait_for(fermee, timeout=timeout)
+
     def _tour(self, worker, prompt: str = "x", **env) -> str:
         self.clear_turns()
         with self._env(**env):
@@ -470,7 +484,7 @@ class GraceTest(_Base):
         runner.background.tick()
         self.wait_for(lambda: not platform.alive(pid), timeout=10)
         self.assertFalse(runner.background.has_jobs("fond-long"))
-        self.assertIn(self._ressources("fond-long")[0]["status"], ("done", "orphan"))
+        self.assertIn(self._ressource_fermee("fond-long")["status"], ("done", "orphan"))
         self.assertIn("stopped when the grace period", self._tour(worker))
 
     def test_sans_grace_nettoyage_immediat(self):
@@ -481,8 +495,9 @@ class GraceTest(_Base):
         pid = self._pid(pidfile)
         self.wait_for(lambda: not platform.alive(pid), timeout=5)
         self.assertFalse(runner.background.has_jobs("fond-zero"))
-        self.assertIsNotNone(self._ressources("fond-zero")[0]["ended_ts"])
-        self.assertNotEqual(self._ressources("fond-zero")[0]["status"], "running")
+        ligne = self._ressource_fermee("fond-zero")
+        self.assertIsNotNone(ligne["ended_ts"])
+        self.assertNotEqual(ligne["status"], "running")
 
     def test_tour_clos_au_point_sur_garde_le_travail_de_fond(self):
         runner, worker = self._worker("fond-clos", turn_max_seconds=1)
@@ -500,7 +515,7 @@ class GraceTest(_Base):
         # arrêt de l'exécuteur : le nettoyage, tout de suite
         self.assertEqual(runner.background.stop_all("test"), 1)
         self.wait_for(lambda: not platform.alive(pid), timeout=10)
-        self.assertNotEqual(self._ressources("fond-clos")[0]["status"], "running")
+        self.assertNotEqual(self._ressource_fermee("fond-clos")["status"], "running")
 
     def test_arret_d_urgence_sans_grace(self):
         _runner, worker = self._worker("fond-urgence")
@@ -586,10 +601,10 @@ class ReglagesTest(_Base):
         self.assertEqual(config_mod.Config().turn_mail_max, 20)
         self.assertEqual(config_mod.Config().turn_grace_seconds, 1200)
         cfg = config_mod.load(env={"AMEESH_TURN_GRACE_SECONDS": "60",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.turn_grace_seconds, 60.0)
         cfg = config_mod.load(env={"AMEESH_TURN_GRACE_SECONDS": "-3",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.turn_grace_seconds, 1200.0)
 
     def test_ameesh_set_turn_grace_seconds(self):

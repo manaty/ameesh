@@ -8,6 +8,7 @@ Postgres réel (les deux pilotes, AMEESH_DRIVER) ; faux harnais du banc."""
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from unittest import mock
 
@@ -44,11 +45,15 @@ class _Base(PgTestCase):
         return storage.of(self.db).lot_sessions
 
 
+#: #540 : plusieurs lots non démarrés au même agent, forcés
+_FORCE = "test: several lots for one agent (#540)"
+
+
 class StockageTest(_Base):
     def test_bascule_met_de_cote_puis_reprend(self):
         runner, lease = self.bail("a1")
-        a = work.add(self.db, title="A", assignee="a1")["id"]
-        b = work.add(self.db, title="B", assignee="a1")["id"]
+        a = work.add(self.db, title="A", assignee="a1", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a1", force=_FORCE)["id"]
         epoch = lease["lease_epoch"]
         storage.of(self.db).operations.set_session_work_item("a1", runner.runner_id, epoch,
                                                              str(a))
@@ -74,8 +79,8 @@ class StockageTest(_Base):
 
     def test_compte_harnais_ou_dossier_differents_ecartent_la_session(self):
         runner, lease = self.bail("a2")
-        a = work.add(self.db, title="A", assignee="a2")["id"]
-        b = work.add(self.db, title="B", assignee="a2")["id"]
+        a = work.add(self.db, title="A", assignee="a2", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a2", force=_FORCE)["id"]
         epoch = lease["lease_epoch"]
         for i, autre in enumerate(({"account": "autre"}, {"harness": "codex"},
                                    {"cwd": "/ailleurs"})):
@@ -100,8 +105,8 @@ class StockageTest(_Base):
         vers B met A de côté avec /old ; le retour sur A dans /new ne la
         reprend pas. Une session d'origine inconnue n'est jamais reprise."""
         runner, lease = self.bail("a6")
-        a = work.add(self.db, title="A", assignee="a6")["id"]
-        b = work.add(self.db, title="B", assignee="a6")["id"]
+        a = work.add(self.db, title="A", assignee="a6", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a6", force=_FORCE)["id"]
         epoch = lease["lease_epoch"]
         storage.of(self.db).operations.set_session_work_item("a6", runner.runner_id, epoch,
                                                              str(a))
@@ -144,8 +149,8 @@ class StockageTest(_Base):
         qui tient encore S la met de côté sans origine : jamais reprise."""
         runner, lease = self.bail("a9")
         epoch = lease["lease_epoch"]
-        a = work.add(self.db, title="A", assignee="a9")["id"]
-        b = work.add(self.db, title="B", assignee="a9")["id"]
+        a = work.add(self.db, title="A", assignee="a9", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a9", force=_FORCE)["id"]
         storage.of(self.db).operations.set_session_work_item("a9", runner.runner_id, epoch,
                                                              str(a))
         registry.set_session(self.db, "a9", "S", "X", harness="claude", cwd="/w")
@@ -170,10 +175,10 @@ class StockageTest(_Base):
         runner, lease = self.bail("a7")
         epoch = lease["lease_epoch"]
         cle = dict(harness="claude", account=None, cwd="/w")
-        b = work.add(self.db, title="B", assignee="a7")["id"]
+        b = work.add(self.db, title="B", assignee="a7", force=_FORCE)["id"]
         for fin in ("close", "assign"):
             with self.subTest(fin=fin):
-                a = work.add(self.db, title="A", assignee="a7")["id"]
+                a = work.add(self.db, title="A", assignee="a7", force=_FORCE)["id"]
                 storage.of(self.db).operations.set_session_work_item(
                     "a7", runner.runner_id, epoch, str(a))
                 registry.set_session(self.db, "a7", "sess-" + fin, None, **{
@@ -201,7 +206,7 @@ class StockageTest(_Base):
 
     def test_bascule_fencee_par_le_bail(self):
         runner, lease = self.bail("a3")
-        a = work.add(self.db, title="A", assignee="a3")["id"]
+        a = work.add(self.db, title="A", assignee="a3", force=_FORCE)["id"]
         self.assertIsNone(self.st.switch("a3", "autre", lease["lease_epoch"], to_lot=str(a),
                                          harness="claude", account=None, cwd="/w",
                                          current="s"))
@@ -212,9 +217,9 @@ class StockageTest(_Base):
 
     def test_purge_des_lots_finis_ou_reassignes(self):
         runner, lease = self.bail("a4")
-        a = work.add(self.db, title="A", assignee="a4")["id"]
-        b = work.add(self.db, title="B", assignee="a4")["id"]
-        c = work.add(self.db, title="C", assignee="a4")["id"]
+        a = work.add(self.db, title="A", assignee="a4", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a4", force=_FORCE)["id"]
+        c = work.add(self.db, title="C", assignee="a4", force=_FORCE)["id"]
         for lot in (a, b, c):
             self.st.note_wake("a4", lot, time.time())
         work.close(self.db, a, abandoned=True, actor="test")
@@ -225,7 +230,7 @@ class StockageTest(_Base):
 
     def test_reveils_comptes_jusqu_a_ce_que_le_lot_vive(self):
         self.bail("a5")
-        a = work.add(self.db, title="A", assignee="a5")["id"]
+        a = work.add(self.db, title="A", assignee="a5", force=_FORCE)["id"]
         t = time.time()
         self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 1)
         self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 2)
@@ -235,7 +240,7 @@ class StockageTest(_Base):
     def test_lots_actionnables(self):
         self.bail("a6")
         def lot(title, **kw):
-            return work.add(self.db, title=title, assignee="a6", **kw)["id"]
+            return work.add(self.db, title=title, assignee="a6", force=_FORCE, **kw)["id"]
         bas = lot("priorité basse", priority=3)
         haut = lot("priorité haute", priority=1)
         build = lot("en build")
@@ -290,13 +295,13 @@ class RoutageTest(_Base):
     def test_relecture_puis_retour_reprend_la_session_du_lot(self):
         worker = self._worker("w1")
         try:
-            a = work.add(self.db, title="A", assignee="w1")["id"]
+            a = work.add(self.db, title="A", assignee="w1", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             argv = self.tour(worker, a, "commence A", session="sess-A")
             self.assertNotIn("--resume", argv)
             self.assertEqual(registry.get(self.db, "w1")["session_id"], "sess-A")
             work.move(self.db, a, "qa")                    # A part en relecture
-            b = work.add(self.db, title="B", assignee="w1")["id"]
+            b = work.add(self.db, title="B", assignee="w1", force=_FORCE)["id"]
             argv = self.tour(worker, b, "prends B", session="sess-B")
             self.assertNotIn("--resume", argv)             # session distincte
             self.assertIn("dedicated to lot #%d" % b, " ".join(argv))
@@ -318,14 +323,14 @@ class RoutageTest(_Base):
         bascule vers B : le retour sur A ne reprend pas sa session ailleurs."""
         worker = self._worker("w3")
         try:
-            a = work.add(self.db, title="A", assignee="w3")["id"]
+            a = work.add(self.db, title="A", assignee="w3", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             self.tour(worker, a, "commence A", session="sess-A")
             self.assertEqual(self.origine("w3"), ("claude", self._cwd("w3"), "sess-A"))
             self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = %s",
                             (self._cwd("w3-new"), "w3"))
             work.move(self.db, a, "qa")
-            b = work.add(self.db, title="B", assignee="w3")["id"]
+            b = work.add(self.db, title="B", assignee="w3", force=_FORCE)["id"]
             self.tour(worker, b, "prends B", session="sess-B")
             argv = self.tour(worker, a, "retour de relecture sur A", session="sess-A2")
             self.assertNotIn("--resume", argv)
@@ -340,7 +345,7 @@ class RoutageTest(_Base):
         pas."""
         worker = self._worker("w4")
         try:
-            a = work.add(self.db, title="A", assignee="w4")["id"]
+            a = work.add(self.db, title="A", assignee="w4", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             self.tour(worker, a, "commence A", session="sess-A")
             self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = %s",
@@ -349,7 +354,7 @@ class RoutageTest(_Base):
             self.assertEqual(argv[argv.index("--resume") + 1], "sess-A")
             self.assertEqual(self.origine("w4"), ("claude", self._cwd("w4"), "sess-A"))
             work.move(self.db, a, "qa")
-            b = work.add(self.db, title="B", assignee="w4")["id"]
+            b = work.add(self.db, title="B", assignee="w4", force=_FORCE)["id"]
             self.tour(worker, b, "prends B", session="sess-B")
             argv = self.tour(worker, a, "retour sur A", session="sess-A2")
             self.assertNotIn("--resume", argv)
@@ -362,8 +367,8 @@ class RoutageTest(_Base):
         session a été mise de côté sous `parquee_sous`."""
         worker = self._worker(name)
         self.addCleanup(worker.watchdog_stop.set)
-        a = work.add(self.db, title="A", assignee=name)["id"]
-        b = work.add(self.db, title="B", assignee=name)["id"]
+        a = work.add(self.db, title="A", assignee=name, force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee=name, force=_FORCE)["id"]
         epoch = worker.epoch
         ops = storage.of(self.db).operations
         cwd = registry.get(self.db, name)["cwd"]
@@ -400,14 +405,264 @@ class RoutageTest(_Base):
     def test_le_lot_du_tour_est_l_unique_lot_actionnable(self):
         worker = self._worker("w2")
         try:
-            a = work.add(self.db, title="A", assignee="w2")["id"]
+            a = work.add(self.db, title="A", assignee="w2", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             work.move(self.db, a, "qa")
-            b = work.add(self.db, title="B", assignee="w2")["id"]
+            b = work.add(self.db, title="B", assignee="w2", force=_FORCE)["id"]
             registry.set_pending_prompt(self.db, "w2", "continue")
             self.assertEqual(worker.pick()["lot"], str(b))
         finally:
             worker.watchdog_stop.set()
+
+    def test_session_sans_lot_n_est_jamais_adoptee_par_un_lot(self):
+        """#794 : une session ouverte par un tour dont le lot est inconnu (ici
+        deux lots actifs, aucune consigne ne tranche) n'est jamais adoptée par
+        le premier lot venu ; ce lot ouvre SA session, sur le brief minimal."""
+        worker = self._worker("w7")
+        try:
+            # #540 : le second lot non démarré irait à la file d'équipe sans
+            # forçage motivé — le témoin « deux lots actifs » ne serait plus bâti.
+            a = work.add(self.db, title="A", assignee="w7", force=_FORCE)["id"]
+            work.add(self.db, title="B", assignee="w7", force=_FORCE)
+            registry.set_pending_prompt(self.db, "w7", "veille : rien de neuf")
+            with self._env("sess-veille"):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertIsNone(spec["lot"], "deux lots actifs : lot inconnu")
+                self.assertTrue(worker.run_turn(spec))
+            agent = registry.get(self.db, "w7")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-veille", None))
+            mail.send(self.db, "orch", "w7", "prends A", work_item_id=str(a))
+            with self._env("sess-A"):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertEqual(spec["lot"], str(a))
+                self.assertTrue(worker.run_turn(spec))
+            argv = self.turns()[-1]["argv"]
+            self.assertNotIn("--resume", argv, "la session sans lot n'est pas reprise")
+            self.assertIn("dedicated to lot #%d" % a, " ".join(argv))
+            agent = registry.get(self.db, "w7")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-A", str(a)))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_le_lot_fini_ferme_la_session_au_tour_suivant(self):
+        """B1 (revue Claude du 14/10) : la session active d'un lot FINI est
+        fermée par son agent, sous son bail, avant le tour suivant sur ce même
+        lot ; le tour ouvre alors une session neuve sur le brief du lot."""
+        worker = self._worker("w8")
+        try:
+            a = work.add(self.db, title="A", assignee="w8")["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            self.assertEqual(registry.get(self.db, "w8")["session_id"], "sess-A")
+            work.close(self.db, a, abandoned=True, actor="test")
+            spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
+                                          "ids": [], "lot": str(a)})
+            self.assertEqual(spec["lot"], str(a))
+            agent = registry.get(self.db, "w8")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             (None, None), "la session du lot fini est fermée")
+            self.assertIsNone(worker.read_session_file(),
+                              "le fichier local ne ressuscite pas la session")
+            self.assertIsNone(worker.current_session())
+            self.assertIn("dedicated to lot #%d" % a, worker.resume_summary or "",
+                          "le tour suivant ouvre sur le brief du lot")
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_un_fichier_local_non_retire_ne_ressuscite_pas_la_session(self):
+        """P2 bloquant (contrôle bureau + R1 Codex du 14/10) : si le fichier
+        local ne peut pas être retiré (`unlink` refuse, PermissionError),
+        l'oubli reste durable. `clear_session` pose `session_reset_at` dans la
+        même écriture fencée par le bail ; le fichier, antérieur au reset, est
+        périmé — sur ce worker comme sur un worker recréé qui relit le
+        registre. Avant le correctif, la méthode rendait True et
+        `current_session` relisait « sess-A »."""
+        worker = self._worker("w12")
+        try:
+            a = work.add(self.db, title="A", assignee="w12")["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            chemin = worker._path("session")
+            self.assertTrue(os.path.exists(chemin))
+            work.close(self.db, a, abandoned=True, actor="test")
+            with mock.patch("ameesh.runner.os.unlink",
+                            side_effect=PermissionError("read-only")):
+                self.assertTrue(worker._close_finished_lot_session(str(a)),
+                                "l'oubli est durable, il ne dépend pas de l'unlink")
+                self.assertTrue(os.path.exists(chemin),
+                                "le fichier est resté : c'est le cas PermissionError")
+                self.assertIsNone(worker.current_session(),
+                                  "le fichier périmé ne ressuscite pas la session")
+                agent = registry.get(self.db, "w12")
+                self.assertIsNotNone(agent["session_reset_ts"],
+                                     "l'oubli a posé un reset fencé par le bail")
+                # worker recréé (redémarrage du service) : le registre suffit.
+                recree = AgentWorker(Runner(self.cfg, self.db, once=True),
+                                     registry.get(self.db, "w12"),
+                                     {"lease_epoch": worker.epoch})
+                self.assertIsNone(recree.current_session(),
+                                  "même sur un worker neuf, le fichier reste périmé")
+                self.assertTrue(os.path.exists(chemin),
+                                "aucune reprise ne dépend de la disparition du fichier")
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_les_politiques_jamais_et_taille_gardent_la_session(self):
+        """B1b : hors politique `par-lot`, un lot fini ne ferme pas la session
+        longue (`jamais`, `taille`)."""
+        for i, politique in enumerate(("jamais", "taille")):
+            name = "w9%d" % i
+            with self.subTest(politique=politique):
+                worker = self._worker(name)
+                try:
+                    storage.of(self.db).operations.set_settings(
+                        name, {"session_policy": politique})
+                    worker.agent = registry.get(self.db, name)
+                    a = work.add(self.db, title="A", assignee=name)["id"]
+                    work.move(self.db, a, "build")
+                    self.tour(worker, a, "commence A", session="sess-A")
+                    work.close(self.db, a, abandoned=True, actor="test")
+                    self.assertFalse(worker._close_finished_lot_session(str(a)))
+                    worker.rotate_for_lot({"kind": "prompt", "prompt": "veille",
+                                           "ids": []})
+                    agent = registry.get(self.db, name)
+                    self.assertEqual(agent["session_id"], "sess-A")
+                    self.assertEqual(agent["session_work_item"], str(a))
+                finally:
+                    worker.watchdog_stop.set()
+
+    def test_pas_de_fermeture_pendant_un_tour(self):
+        """B1c : jamais pendant un tour — la garde `proc` laisse la session et
+        son fichier local intacts, même pour un lot fini."""
+        worker = self._worker("w10")
+        proc = subprocess.Popen(["sleep", "60"])
+        try:
+            a = work.add(self.db, title="A", assignee="w10")["id"]
+            work.move(self.db, a, "build")
+            storage.of(self.db).operations.set_session_work_item(
+                "w10", worker.runner.runner_id, worker.epoch, str(a))
+            registry.set_session(self.db, "w10", "sess-A", None, harness="claude",
+                                 cwd=self._cwd("w10"))
+            worker.agent = registry.get(self.db, "w10")
+            worker.proc = proc
+            work.close(self.db, a, abandoned=True, actor="test")
+            self.assertFalse(worker._close_finished_lot_session(str(a)))
+            spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite",
+                                          "ids": [], "lot": str(a)})
+            self.assertEqual(spec["lot"], str(a))
+            agent = registry.get(self.db, "w10")
+            self.assertEqual(agent["session_id"], "sess-A")
+        finally:
+            worker.proc = None
+            proc.kill()
+            proc.wait()
+            worker.watchdog_stop.set()
+
+    def test_rotation_de_taille_sur_le_meme_lot_garde_le_resume(self):
+        """N1 (revue Claude du 14/10) : après une rotation de taille, le tour
+        suivant sur le MÊME lot ne jette pas le résumé payé : il ouvre la
+        session neuve (complété par la fiche du lot), en mémoire et sur disque
+        (`RESUME_PENDING`), au lieu du brief de lot seul."""
+        worker = self._worker("w11")
+        try:
+            a = work.add(self.db, title="A", assignee="w11")["id"]
+            work.move(self.db, a, "build")
+            mail.send(self.db, "orch", "w11", "commence A", work_item_id=str(a))
+            with mock.patch.dict(os.environ, {
+                    "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+                    "AMEESH_SESSION_STORE_CHECK": "0",
+                    "AMEESH_TEST_NEW_SESSION": "sess-A",
+                    "AMEESH_TEST_RESULT": "RESUME-PAYE"}):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertTrue(worker.run_turn(spec))
+                worker.rotation_forcee = "banc"        # rotation de taille due
+                self.assertTrue(worker.maybe_rotate())
+            self.assertIsNone(registry.get(self.db, "w11")["session_id"])
+            self.assertEqual(worker.resume_origin, "agent")
+            self.assertIn("RESUME-PAYE", worker.resume_summary)
+            # le tour suivant porte le MÊME lot : le résumé ne doit pas être écrasé
+            mail.send(self.db, "orch", "w11", "suite de A", work_item_id=str(a))
+            spec = worker.rotate_for_lot(worker.pick())
+            self.assertEqual(spec["lot"], str(a))
+            self.assertEqual(worker.resume_origin, "agent")
+            self.assertIn("RESUME-PAYE", worker.resume_summary)
+            self.assertIn("dedicated to lot #%d" % a, worker.resume_summary,
+                          "la fiche du lot complète le résumé")
+            chemin = os.path.join(worker.state_dir, "resume-pending.json")
+            with open(chemin, encoding="utf-8") as fh:
+                self.assertIn("RESUME-PAYE", fh.read(),
+                              "le disque garde le même résumé que la mémoire")
+        finally:
+            worker.watchdog_stop.set()
+
+
+class BriefDeLotTest(_Base):
+    """#794 : le brief d'une session dédiée à un lot est MINIMAL — canon,
+    fiche du lot, diff de sa branche, fil du lot (décisions et messages non
+    lus) — jamais un transcript, jamais un autre lot, jamais un résumé."""
+
+    def test_fiche_diff_et_fil_du_lot_seulement(self):
+        import subprocess
+
+        from ameesh import reprise
+        self.bail("b1")
+        autre = work.add(self.db, title="Un autre lot", assignee="b1")["id"]
+        a = work.add(self.db, title="Le lot du brief", assignee="b1")["id"]
+        work.note(self.db, a, "une note du lot", actor="b1")
+        mail.send(self.db, "orch", "b1", "un message non lu sur le lot",
+                  work_item_id=str(a))
+        mail.send(self.db, "orch", "b1", "un message pour un autre lot",
+                  work_item_id=str(autre))
+        cwd = self._cwd("b1")
+
+        def git(*args):
+            subprocess.run(["git", "-C", cwd, *args], check=True,
+                           capture_output=True, text=True)
+
+        git("init", "-q")
+        git("config", "user.email", "banc@test")
+        git("config", "user.name", "banc")
+        with open(os.path.join(cwd, "base.txt"), "w", encoding="utf-8") as fh:
+            fh.write("base\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        git("branch", "-M", "main")
+        git("checkout", "-q", "-b", "lot/b1")
+        with open(os.path.join(cwd, "travail.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "travail du lot")
+        work.set_branch(self.db, a, "lot/b1", "main")
+
+        text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b1"), a,
+                                 consigne="go")
+        self.assertIn("Session dedicated to lot #%d" % a, text)
+        self.assertIn("## Lot #%d — Le lot du brief" % a, text)
+        self.assertIn("une note du lot", text)
+        self.assertIn("## Diff of the lot's branch", text)
+        self.assertIn("lot/b1", text)
+        self.assertIn("travail.py", text)
+        self.assertIn("1 file changed", text)
+        self.assertIn("## Lot thread — decisions and unread messages", text)
+        self.assertIn("un message non lu sur le lot", text)
+        # jamais le contenu d'un autre lot, ni l'ancienne session, ni la liste
+        # des lots assignés du brief de reprise
+        self.assertNotIn("Un autre lot", text)
+        self.assertNotIn("un message pour un autre lot", text)
+        self.assertNotIn("Previous session", text)
+        self.assertNotIn("Work items assigned to you", text)
+
+    def test_branche_qui_commence_par_un_tiret_n_est_pas_une_option_git(self):
+        """N2 (revue Claude du 14/10) : `branch`/`branch_target` viennent de la
+        base (`work.set_branch` les valide, mais la colonne peut être écrite
+        autrement) : jamais passés à git comme des options."""
+        from ameesh import reprise
+        lignes = reprise._lot_diff(
+            {"branch": "--output=/tmp/prise", "branch_target": "--output=/tmp/autre"},
+            self.tmp)
+        self.assertIn("refused", "\n".join(lignes))
 
 
 class ReveilTest(_Base):
@@ -437,11 +692,11 @@ class ReveilTest(_Base):
 
     def test_reveil_sur_le_lot_actionnable(self):
         worker = self._worker("r1")
-        qa = work.add(self.db, title="en relecture", assignee="r1")["id"]
+        qa = work.add(self.db, title="en relecture", assignee="r1", force=_FORCE)["id"]
         work.move(self.db, qa, "build")
         work.move(self.db, qa, "qa")
         self.assertIsNone(self.pick(worker), "un lot en qa ne réveille pas")
-        b = work.add(self.db, title="à faire", assignee="r1")["id"]
+        b = work.add(self.db, title="à faire", assignee="r1", force=_FORCE)["id"]
         spec = self.pick(worker)
         self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(b)))
         self.assertIn("Resuming lot #%d" % b, spec["prompt"])
@@ -450,7 +705,7 @@ class ReveilTest(_Base):
 
     def test_backoff_en_base_survit_au_redemarrage(self):
         worker = self._worker("r2")
-        b = work.add(self.db, title="à faire", assignee="r2")["id"]
+        b = work.add(self.db, title="à faire", assignee="r2", force=_FORCE)["id"]
         self.assertIsNotNone(self.pick(worker))
         relance = self._worker("r2")    # nouvel exécuteur, même agent
         relance.runner.idle_nudge = 100_000.0    # plafond du délai doublé
@@ -472,18 +727,18 @@ class ReveilTest(_Base):
 
     def test_desactivable_par_agent_et_par_hote(self):
         worker = self._worker("r3", lot_wake=False)
-        work.add(self.db, title="à faire", assignee="r3")
+        work.add(self.db, title="à faire", assignee="r3", force=_FORCE)
         self.assertIsNone(self.pick(worker))
         storage.of(self.db).operations.set_settings("r3", {"lot_wake": "on"})
         self.assertIsNotNone(self.pick(worker), "l'agent l'emporte sur l'hôte")
         autre = self._worker("r4")
-        work.add(self.db, title="à faire", assignee="r4")
+        work.add(self.db, title="à faire", assignee="r4", force=_FORCE)
         storage.of(self.db).operations.set_settings("r4", {"lot_wake": "off"})
         self.assertIsNone(self.pick(autre))
 
     def test_pas_de_reveil_sans_repos_ni_pendant_le_courrier(self):
         worker = self._worker("r5")
-        work.add(self.db, title="à faire", assignee="r5")
+        work.add(self.db, title="à faire", assignee="r5", force=_FORCE)
         worker.last_activity = time.monotonic()
         self.assertIsNone(self.pick(worker), "pas encore au repos")
         worker.last_activity = time.monotonic() - 10_000
@@ -493,7 +748,7 @@ class ReveilTest(_Base):
 
     def test_lot_tenu_ne_reveille_pas(self):
         worker = self._worker("r6")
-        b = work.add(self.db, title="à faire", assignee="r6")["id"]
+        b = work.add(self.db, title="à faire", assignee="r6", force=_FORCE)["id"]
         work.note(self.db, b, "hold: attend l'hôte de test", actor="r6")
         self.assertIsNone(self.pick(worker))
 
@@ -501,14 +756,72 @@ class ReveilTest(_Base):
 class PurgeTest(_Base):
     def test_le_releve_des_branches_purge_les_lots_finis(self):
         runner, lease = self.bail("p1")
-        a = work.add(self.db, title="A", assignee="p1")["id"]
-        b = work.add(self.db, title="B", assignee="p1")["id"]
+        a = work.add(self.db, title="A", assignee="p1", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="p1", force=_FORCE)["id"]
         for lot in (a, b):
             self.st.note_wake("p1", lot, time.time())
         work.close(self.db, a, abandoned=True, actor="test")
         purges = runner.lot_sessions_purge(self.db)
         self.assertEqual([r["work_item_id"] for r in purges], [a])
         self.assertEqual([r["work_item_id"] for r in self.st.listing("p1")], [b])
+
+    def test_la_purge_ne_ferme_jamais_la_session_active(self):
+        """B1 (revue Claude du 14/10) : le relevé des branches n'a pas le bail
+        de l'agent et peut tomber en plein tour : il ne touche plus au registre.
+        La session ACTIVE d'un lot fini est laissée à l'agent, qui la ferme à
+        son tour suivant."""
+        runner, lease = self.bail("p2")
+        a = work.add(self.db, title="A", assignee="p2")["id"]
+        storage.of(self.db).operations.set_session_work_item(
+            "p2", runner.runner_id, lease["lease_epoch"], str(a))
+        registry.set_session(self.db, "p2", "sess-A", None, harness="claude",
+                             cwd=self._cwd("p2"))
+        self.st.note_wake("p2", a, time.time())
+        work.close(self.db, a, abandoned=True, actor="test")
+        purges = runner.lot_sessions_purge(self.db)
+        self.assertEqual([r["work_item_id"] for r in purges], [a])
+        agent = registry.get(self.db, "p2")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                         ("sess-A", str(a)), "le balayage ne ferme aucune session")
+
+    def test_un_lot_non_assigne_ne_ferme_pas_la_session(self):
+        """B1a : un relecteur, le pilote ou l'auditeur qui travaille sur un lot
+        dont il n'est pas l'assigné garde sa session, même sans changer de lot
+        (elle n'est fermée que par un lot FINI, jamais par une réassignation)."""
+        runner, lease = self.bail("p3")
+        worker = AgentWorker(runner, registry.get(self.db, "p3"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        a = work.add(self.db, title="A", assignee="p3")["id"]
+        work.assign(self.db, a, "human:quelqu-un")        # relecture par un autre
+        storage.of(self.db).operations.set_session_work_item(
+            "p3", runner.runner_id, lease["lease_epoch"], str(a))
+        registry.set_session(self.db, "p3", "sess-relecture", None, harness="claude",
+                             cwd=self._cwd("p3"))
+        worker.agent = registry.get(self.db, "p3")
+        self.assertEqual(runner.lot_sessions_purge(self.db), [])
+        self.assertFalse(worker._close_finished_lot_session(str(a)))
+        spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "relecture",
+                                      "ids": [], "lot": str(a)})
+        self.assertEqual(spec["lot"], str(a))
+        agent = registry.get(self.db, "p3")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                         ("sess-relecture", str(a)))
+
+    def test_la_purge_ne_touche_pas_un_agent_passe_a_un_autre_lot(self):
+        runner, lease = self.bail("p4")
+        a = work.add(self.db, title="A", assignee="p4")["id"]
+        b = work.add(self.db, title="B", assignee="p4")["id"]
+        storage.of(self.db).operations.set_session_work_item(
+            "p4", runner.runner_id, lease["lease_epoch"], str(b))
+        registry.set_session(self.db, "p4", "sess-B", None, harness="claude",
+                             cwd=self._cwd("p4"))
+        self.st.note_wake("p4", a, time.time())
+        work.close(self.db, a, abandoned=True, actor="test")
+        purges = runner.lot_sessions_purge(self.db)
+        self.assertEqual([r["work_item_id"] for r in purges], [a])
+        agent = registry.get(self.db, "p4")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                         ("sess-B", str(b)))
 
 
 class AlerteTest(_Base):
@@ -522,7 +835,7 @@ class AlerteTest(_Base):
     def test_seulement_apres_un_reveil_sans_effet(self):
         from ameesh import alert_briefs
         self.bail("x1")
-        a = work.add(self.db, title="A", assignee="x1")["id"]
+        a = work.add(self.db, title="A", assignee="x1", force=_FORCE)["id"]
         self.assertEqual(self.alertes(), [], "sans réveil, la règle 1 agit encore")
         activite = self.st.actionable("x1")[0]["activity_ts"]
         self.st.note_wake("x1", a, activite)

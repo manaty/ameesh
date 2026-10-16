@@ -20,7 +20,7 @@ from ameesh import adapters, cli, mail, registry, storage
 from ameesh.mesh_cli import parse_duration
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import EMPTY_CONFIG, FAKEBIN, PgTestCase
 
 
 class LectureDuFluxTest(unittest.TestCase):
@@ -200,10 +200,10 @@ class DureeMaximaleTest(_Base):
         self.assertEqual(config_mod.Config().turn_mail_max, 20)  # 5 avant le 2026-10-11
         cfg = config_mod.load(env={"AMEESH_TURN_MAX_SECONDS": "600",
                                    "AMEESH_TURN_MAIL_MAX": "2",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual((cfg.turn_max_seconds, cfg.turn_mail_max), (600.0, 2))
         cfg = config_mod.load(env={"AMEESH_TURN_MAIL_MAX": "nan",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.turn_mail_max, 20)
 
 
@@ -268,6 +268,44 @@ class CourrierBorneTest(_Base):
         sortie = self._hook(worker, "tour-1", borne=0)
         self.assertIn("message n°6", sortie)
         self.assertEqual(self._livres(ids), 7)
+
+    def test_l_instant_du_dernier_message_humain_remis_est_date(self):
+        """L81 §6.3 (#289) : le message humain remis par le hook pendant un
+        tour n'est plus non-lu quand l'exécuteur décide de l'entretien
+        résident — l'instant de sa remise est gardé dans l'état du tour."""
+        _runner, worker = self._worker("orch-humain")
+        mail.send(self.db, "pair", "orch-humain", "message d'agent")
+        self.assertFalse(cli.tour_lu(worker.cfg, worker.name).get("humain"))
+        self._hook(worker, "tour-1")
+        etat = cli.tour_lu(worker.cfg, worker.name)
+        self.assertEqual(etat.get("remis"), 1)
+        self.assertFalse(etat.get("humain"))       # un agent ne tient pas la fenêtre
+        # un humain, marqué à l'envoi : sa remise est datée
+        mail.send(self.db, "proprio", "orch-humain", "fais le point",
+                  payload={"human": True})
+        avant = time.time()
+        self._hook(worker, "tour-1")
+        etat = cli.tour_lu(worker.cfg, worker.name)
+        self.assertEqual(etat.get("remis"), 2)
+        self.assertGreaterEqual(float(etat.get("humain") or 0), avant)
+        self.assertLessEqual(float(etat.get("humain") or 0), time.time())
+
+
+    def test_l_instant_humain_survit_aux_hooks_suivants_meme_sans_borne(self):
+        for borne in (5, 0):
+            with self.subTest(borne=borne):
+                _runner, worker = self._worker("orch-humain-suite-%d" % borne)
+                mail.send(self.db, "proprio", worker.name, "fais le point",
+                          payload={"human": True})
+                self._hook(worker, "tour-1", borne=borne)
+                instant = cli.tour_lu(worker.cfg, worker.name).get("humain")
+                self.assertTrue(instant)
+                mail.send(self.db, "pair", worker.name, "suite d'agent")
+                self._hook(worker, "tour-1", borne=borne)
+                self.assertEqual(cli.tour_lu(worker.cfg, worker.name).get("humain"),
+                                 instant)
+                worker._humain_observe()
+                self.assertTrue(worker._humain_recent())
 
 
 class ReglagesTest(_Base):
