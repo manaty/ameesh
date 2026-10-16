@@ -186,12 +186,15 @@ def hook_commands(document) -> list[tuple[str, str]]:
 
 
 def _hook_binary(command: str) -> str:
-    """Le premier mot d'une commande de hook (guillemets respectés)."""
+    """Le premier mot brut : conserver les quotes qui protègent un `$`."""
     try:
-        parts = shlex.split(command)
+        shlex.split(command)
     except ValueError:
         parts = command.split()
-    return parts[0] if parts else ""
+        return parts[0] if parts else ""
+    word = re.match(r'''(?:[^\s'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+''',
+                    command.lstrip(), re.DOTALL)
+    return word.group(0) if word else ""
 
 
 #: variables d'environnement d'un chemin de hook : `$HOME` et `${HOME}`.
@@ -206,13 +209,35 @@ def _hook_path(binary: str, environ=None) -> str:
     seul laisse `$HOME` littéral, le binaire passait donc pour absent (faux KO
     du doctor, incident staging b9a2 du 16/10). Une variable non définie reste
     littérale : le chemin est contrôlé tel quel et reste signalé absent — un
-    vrai binaire manquant n'est jamais masqué."""
+    vrai binaire manquant n'est jamais masqué. Les quotes simples et les
+    échappements protègent les dollars littéraux ; les quotes doubles
+    permettent le développement, sans réinterpréter la valeur obtenue."""
     environ = os.environ if environ is None else environ
-    chemin = os.path.expanduser(binary)
-    if "$" not in chemin:
-        return chemin
-    return _HOOK_VARIABLE.sub(
-        lambda m: environ.get(m.group("accolade") or m.group("nu"), m.group(0)), chemin)
+    binary = os.path.expanduser(binary)
+    chemin, quote, i = [], "", 0
+    while i < len(binary):
+        char = binary[i]
+        if char in "\"'" and quote in ("", char):
+            quote = "" if quote else char
+            i += 1
+            continue
+        if char == "\\" and quote != "'" and i + 1 < len(binary):
+            suivant = binary[i + 1]
+            if quote != '"' or suivant in '\\$"`\n':
+                if suivant != "\n":
+                    chemin.append(suivant)
+                i += 2
+                continue
+        if char == "$" and quote != "'":
+            variable = _HOOK_VARIABLE.match(binary, i)
+            if variable:
+                chemin.append(environ.get(variable.group("accolade")
+                                          or variable.group("nu"), variable.group(0)))
+                i = variable.end()
+                continue
+        chemin.append(char)
+        i += 1
+    return "".join(chemin)
 
 
 def _binary_missing(binary: str, *, path: str | None = None, environ=None) -> bool:

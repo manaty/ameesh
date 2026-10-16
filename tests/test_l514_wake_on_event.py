@@ -355,6 +355,33 @@ class DoctorHooksTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("127", "\n".join(out["lines"]))
 
+    def test_dollar_litteral_absent_ne_devient_pas_un_hook_present(self):
+        home = self._home(binary=True, rel=".local/bin/agent-mail")
+        for word in ("'$HOME/.local/bin/agent-mail'",
+                     r"\$HOME/.local/bin/agent-mail",
+                     r'"\$HOME/.local/bin/agent-mail"'):
+            with self.subTest(word=word):
+                self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
+                out = self._lines(home, environ={"HOME": home})
+                self.assertFalse(out["ok"], out["lines"])
+                self.assertIn("127", "\n".join(out["lines"]))
+
+    def test_home_entre_guillemets_doubles_reste_developpe(self):
+        home = self._home(binary=True, rel=".local/bin/agent-mail")
+        for word in ('"$HOME/.local/bin/agent-mail"',
+                     '"${HOME}"/.local/bin/agent-mail'):
+            with self.subTest(word=word):
+                self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
+                self.assertTrue(self._lines(home, environ={"HOME": home})["ok"])
+
+    def test_chemin_existant_avec_dollar_litteral_reste_trouve(self):
+        home = self._home(binary=True, rel="$HOME/agent-mail")
+        path = os.path.join(home, "$HOME", "agent-mail")
+        for word in ("'%s'" % path, path.replace("$", r"\$")):
+            with self.subTest(word=word):
+                self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
+                self.assertTrue(self._lines(home, environ={"HOME": home})["ok"])
+
     def test_hook_variable_non_definie_reste_litterale_et_ko(self):
         """Une variable non définie n'est pas remplacée en silence : le chemin
         littéral `$VAR/...` reste contrôlé et signalé absent."""
