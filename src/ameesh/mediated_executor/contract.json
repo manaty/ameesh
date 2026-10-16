@@ -4264,6 +4264,7 @@
    "progress": [
     "actions",
     "agents",
+    "ci_suite",
     "costs",
     "lot_actions",
     "lot_events",
