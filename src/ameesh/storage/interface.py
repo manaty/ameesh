@@ -187,7 +187,12 @@ RETURNED_NOTE = "returned to the queue"
 DELEGATED_NOTE = "delegated to "
 LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
 AUTO_TAKE_NOTE = "prise automatique"
-HANDOFF_NOTE = "repris pendant la pause budget"
+#: Reprise sur pause budget : les deux notes du handoff (lot `build` repris,
+#: lot `intake` rendu à la file d'équipe, L165/main #757) partagent ce préfixe ;
+#: le plafond horaire les compte ensemble (`handoff.NOTE_PREFIX`).
+HANDOFF_PREFIX = "pause budget (reprise) : "
+HANDOFF_NOTE = HANDOFF_PREFIX + "lot repris"
+HANDOFF_RETURN_NOTE = HANDOFF_PREFIX + "lot rendu à la file d'équipe"
 ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
                         DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
 
