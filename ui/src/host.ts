@@ -90,11 +90,23 @@ function firstConfig(root: ParentNode): AmeeshConfig | null {
     .querySelector?.("ameesh-config") as AmeeshConfig | null ?? null;
 }
 
+/** The mesh of `base` in the host's list; trailing slashes are ignored. */
+function meshForBase(list: AmeeshMesh[], base: string): AmeeshMesh | null {
+  const wanted = base.replace(/\/+$/, "");
+  return list.find((item) => (item.apiBase ?? "").replace(/\/+$/, "") === wanted) ?? null;
+}
+
 /**
  * Binds a host object to a page: sets the token provider of the
  * <ameesh-config> around (or creates one) and routes the components' events
  * to `host.open`, `host.openApproval` and `host.notify`. Returns the
  * unbinding function (a page that unmounts the components calls it).
+ *
+ * One binding, one <ameesh-config>: the events are listened to on that
+ * element, so a page that shows two meshes never hands one mesh's event to
+ * the other's host. The config's `apiBase` (or `options.apiBase`) selects
+ * the mesh in `meshes()`, and therefore the token: no mesh's token is sent
+ * to another origin.
  */
 export function connectHost(host: AmeeshHost, options: ConnectHostOptions = {}): () => void {
   const root: ParentNode = options.root ?? document;
@@ -106,28 +118,45 @@ export function connectHost(host: AmeeshHost, options: ConnectHostOptions = {}):
   }
   const target = config;
   let mesh = options.mesh;
+  let disposed = false;
   const tokenProvider = () => host.getToken(mesh);
   target.tokenProvider = tokenProvider;
   if (options.apiBase) target.apiBase = options.apiBase;
   if (host.theme) target.theme = host.theme;
   if (host.language) target.setAttribute("lang", host.language);
   if (host.meshes) {
+    // a discovery that lands after the unbinding (or after a rebinding, or a
+    // new selection) must touch nothing: the config is not ours any more
     void Promise.resolve(host.meshes()).then((list) => {
-      const first = list[0];
-      if (!first) return;
-      mesh = mesh ?? first.id ?? first.apiBase;
-      if (!target.apiBase) target.apiBase = first.apiBase;
-      if (host.theme && !target.hasAttribute("theme")) target.theme = host.theme;
+      if (disposed || target.tokenProvider !== tokenProvider) return;
+      const known = Array.isArray(list) ? list : [];
+      if (!known.length) return;
+      if (!mesh) {
+        // the API base chooses the mesh; without one, the first mesh is the
+        // default. An unknown base keeps its host's `getToken(undefined)`
+        // rather than borrowing another origin's token.
+        const match = target.apiBase ? meshForBase(known, target.apiBase) : known[0];
+        if (match) {
+          mesh = match.id ?? match.apiBase;
+          if (!target.apiBase) target.apiBase = match.apiBase;
+        }
+      } else if (!target.apiBase) {
+        const match = known.find((item) => (item.id ?? item.apiBase) === mesh);
+        if (match) target.apiBase = match.apiBase;
+      }
     }).catch(() => undefined);
   }
 
-  const on = (type: string, fn: (event: Event) => void) => root.addEventListener(type, fn);
-  const off = (type: string, fn: (event: Event) => void) => root.removeEventListener(type, fn);
+  const on = (type: string, fn: (event: Event) => void) => target.addEventListener(type, fn);
+  const off = (type: string, fn: (event: Event) => void) => target.removeEventListener(type, fn);
 
   const opened = (kind: string) => (event: Event) => {
     const row = (event as CustomEvent).detail as HostRow | undefined;
-    const id = row?.id ?? row?.lot ?? row?.name;
-    host.open?.({ kind, id: id === undefined || id === null ? "" : String(id), mesh, row });
+    // the views carry the identifier under the kind's own field
+    // (`detail.project`, `detail.agent`, `detail.lot`); id and name stay
+    // accepted for other emitters
+    const value = row?.[kind] ?? row?.id ?? row?.lot ?? row?.name;
+    host.open?.({ kind, id: value === undefined || value === null ? "" : String(value), mesh, row });
   };
   const openFns = HOST_EVENTS.open.map((type) => [type, opened(type.slice("ameesh:open-".length))] as const);
   const approval = (event: Event) => {
@@ -145,6 +174,7 @@ export function connectHost(host: AmeeshHost, options: ConnectHostOptions = {}):
   on(HOST_EVENTS.alert, alert);
 
   return () => {
+    disposed = true;
     for (const [type, fn] of openFns) off(type, fn);
     off(HOST_EVENTS.approval, approval);
     off(HOST_EVENTS.alert, alert);

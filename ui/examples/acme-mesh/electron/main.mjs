@@ -41,7 +41,8 @@ function createWindow(mesh) {
   win = new BrowserWindow({
     width: 1180, height: 820,
     webPreferences: {
-      preload: path.join(HERE, "preload.mjs"),
+      // self-contained CommonJS: a sandboxed preload cannot use ESM
+      preload: path.join(HERE, "preload.cjs"),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,

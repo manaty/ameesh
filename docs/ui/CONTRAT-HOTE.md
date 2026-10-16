@@ -111,14 +111,23 @@ const unbind = connectHost(host, {
 * feeds the `<ameesh-config>` (sets `tokenProvider`, `apiBase`, `theme`,
   `lang`);
 * routes `ameesh:open-project|agent|lot`, `ameesh:approval-requested` and
-  `ameesh:alert` to `open`, `openApproval` and `notify`;
+  `ameesh:alert` to `open`, `openApproval` and `notify` — listening on **that
+  `<ameesh-config>`**, so a page that binds two meshes can never hand one
+  mesh's event (approval and alert included) to the other's host;
+* chooses the mesh and therefore the token: an explicit `mesh` wins, else the
+  config's `apiBase` selects the entry of `meshes()` with the same base (a
+  host with a single mesh may ignore the argument). A base that matches no
+  mesh gets `getToken(undefined)`: no mesh's token is sent to another origin;
+* ignores a `meshes()` discovery that lands after the unbinding, after a
+  rebinding, or after a new selection — a stale answer never overwrites what
+  the host chose;
 * returns an unbind function — a page that unmounts the components calls it.
 
 ### Events
 
 | Event (bubbling, composed) | `detail` | Host member |
 |---|---|---|
-| `ameesh:open-project`, `ameesh:open-agent`, `ameesh:open-lot` | the row | `open(target)` |
+| `ameesh:open-project`, `ameesh:open-agent`, `ameesh:open-lot` | the row (`detail.project`, `detail.agent` or `detail.lot` carries the identifier) | `open(target)` |
 | `ameesh:approval-requested` | `{ url }` or the URL string | `openApproval(url)` |
 | `ameesh:alert` | `AmeeshHostAlert` or the text | `notify(alert)` |
 | `ameesh:unauthorized` | — | listener: renew the token, ask the human |

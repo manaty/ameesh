@@ -39,11 +39,16 @@ window.addEventListener("ameesh:navigate", (event) => router.go(event.detail));
 window.addEventListener("beforeunload", off);
 ```
 
-The preload is the only crossing:
+The preload is the only crossing. A **sandboxed** preload cannot use ESM
+(`import`): Electron loads it before any bundler, so it is a self-contained
+CommonJS file, `require("electron")` only — `.cjs`, never `.mjs`
+([sandbox](https://www.electronjs.org/docs/latest/tutorial/sandbox),
+[ESM](https://www.electronjs.org/docs/latest/tutorial/esm)). The renderer
+stays ESM; the main process may be ESM on Electron ≥ 28.
 
 ```js
-// preload.mjs
-import { contextBridge, ipcRenderer } from "electron";
+// preload.cjs — self-contained CommonJS, no import/export
+const { contextBridge, ipcRenderer } = require("electron");
 const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
 contextBridge.exposeInMainWorld("ameeshHost", {
   getToken: (mesh) => invoke("ameesh:get-token", mesh),
@@ -56,15 +61,16 @@ contextBridge.exposeInMainWorld("ameeshHost", {
 });
 ```
 
-Nothing else crosses: no `ipcRenderer`, no `require`, no module. Validate
-every value that comes back from the renderer (URLs especially).
+Nothing else crosses: the page never sees `ipcRenderer`, no module, no
+bundler at preload time. Validate every value that comes back from the
+renderer (URLs especially).
 
 ## Window and partitions
 
 ```js
 const win = new BrowserWindow({
   webPreferences: {
-    preload: path.join(__dirname, "preload.mjs"),
+    preload: path.join(__dirname, "preload.cjs"),
     contextIsolation: true,
     sandbox: true,
     nodeIntegration: false,
@@ -132,7 +138,8 @@ or a custom protocol):
 
 - [ ] `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`,
       no `webview`, `webSecurity` left on (`true`);
-- [ ] the preload exposes the host contract and nothing else;
+- [ ] the preload is a self-contained CommonJS `.cjs` (`require("electron")`
+      only; no `import`), and exposes the host contract and nothing else;
 - [ ] `openApproval` checks the origin and opens in the foreground;
 - [ ] tokens sealed by `safeStorage`, `0600`, one per mesh;
 - [ ] one partition per mesh; no storage shared between meshes;

@@ -77,9 +77,10 @@ to the host page's navigation (study §2.2).
 | `theme` | no | `auto` (default), `light`, `dark` |
 | `language` | no | `fr`, `en` |
 
-In Electron, expose exactly this object through `contextBridge` from a preload
-with `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false` — see
-`docs/ui/GUIDE-ELECTRON.md`.
+In Electron, expose exactly this object through `contextBridge` from a
+self-contained CommonJS preload (`preload.cjs`: a sandboxed preload cannot use
+ESM) with `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`
+— see `docs/ui/GUIDE-ELECTRON.md`.
 
 ## Screens
 
