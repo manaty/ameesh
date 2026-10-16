@@ -44,7 +44,7 @@ import os
 import time
 
 from . import db as db_mod
-from . import fil, registry, storage
+from . import fastmail, fil, registry, storage
 
 #: `mail_undeliverable` : courrier en attente depuis 15 min
 DEFAULT_THRESHOLD_S = 900.0
@@ -584,6 +584,11 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
         # concurrent gagne ici, jamais entre la lecture et la copie.
         raise Refused(str(exc)) from None
     if moved:
+        # #1689 (N1) : les copies sont déposées dans la boîte du nouveau
+        # destinataire sans passer par `mail.send` ; son chemin rapide doit les
+        # voir sans attendre le TTL. Un destinataire d'un autre hôte n'a pas de
+        # marqueur ici : `bump` ne crée rien.
+        fastmail.bump(cfg, new)
         project = fil.project_for(cfg, team_of(new_row), team_of(old_row))
         fil.record(
             cfg, db, sender=actor, recipients=[new],
