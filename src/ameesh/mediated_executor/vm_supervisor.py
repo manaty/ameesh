@@ -129,8 +129,11 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
         state_path = str(Path(recipe["state_dir"]) / "state.json")
         ack_path = str(Path(recipe["ack_dir"]) / "ack.json")
         while not stop.is_set():
-            # Never start during withdrawal or with a missing/stale guard.
-            if gate_state(state_path, now()) != "available":
+            # A dead guard ends supervision, including between two windows.
+            gate = gate_state(state_path, now())
+            if gate == "stale":
+                return 0
+            if gate != "available":
                 stop.wait(1)
                 continue
             # The first ack must be produced by this launch. The guest has

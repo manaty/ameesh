@@ -92,8 +92,9 @@ courant** après enrôlement, au plus tard à sa fin, y compris sur erreur.
 Seule exception : le `SIGKILL` du garde au niveau 4 tue le superviseur sans
 lui laisser ce nettoyage (#1402). Le code reste alors dans `enroll_dir` (lisible
 par l'invité et le propriétaire seulement), mais seulement si l'unité est tuée
-avant le premier acquittement : après celui-ci, le superviseur l'a effacé dans
-la seconde. Le lancement suivant l'utilise et l'efface comme d'habitude. Le
+avant que le superviseur observe le premier acquittement : le code est
+retiré à cette observation, à la prochaine lecture (chaque seconde).
+Le lancement suivant l'utilise et l'efface comme d'habitude. Le
 propriétaire qui ne veut pas d'un code en attente le retire lui-même
 (`rm <enroll_dir>/code`) avant de relancer l'unité.
 Avant chaque lancement, l'ancien `ack.json` est retiré. Le répertoire

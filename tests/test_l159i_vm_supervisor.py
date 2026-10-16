@@ -314,6 +314,28 @@ class VMSupervisor(unittest.TestCase):
         self.assertEqual(stop.waits, 3)
         self.assertEqual(calls, [['podman', 'stop', '--ignore', '--time=100', V.NAME]])
 
+    def test_guard_expiry_while_waiting_for_next_window_exits(self):
+        """A stopped container must not leave its supervisor waiting on a dead guard."""
+        launches = []
+        def launch(_):
+            launches.append(1)
+            raw = json.loads(self.state.read_text())
+            raw['state'] = 'stopped'
+            self.state.write_text(json.dumps(raw))
+            return Process(0, running=True)
+        class Stop:
+            waits = 0
+            def is_set(inner):
+                return inner.waits >= 3
+            def wait(inner, _):
+                inner.waits += 1
+                self.state.unlink(missing_ok=True)
+                return inner.is_set()
+        stop = Stop()
+        self.assertEqual(self.supervise(launch, stop, run=lambda *_, **__: Process(0)), 0)
+        self.assertEqual(stop.waits, 1, 'stale gate must end the supervisor before another wait')
+        self.assertEqual(len(launches), 1)
+
     def test_signal_exit_is_logged_with_its_name(self):
         """#1402 N3 : un rc négatif (signal) reste 2, et le journal garde le rc
         brut et le nom du signal."""
