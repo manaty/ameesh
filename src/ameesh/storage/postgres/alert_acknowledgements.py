@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .. import interface
 
-_FIELDS = ("id, alert_key, severity, observation_host, actor, principal, "
+_FIELDS = ("id, alert_key, severity, observation_host, perimeter, actor, principal, "
            "extract(epoch from acknowledged_at)::float8 as acknowledged_ts")
 
 
@@ -13,7 +13,8 @@ class AlertAcknowledgements(interface.AlertAcknowledgements):
         return self.db.query("select " + _FIELDS + " from alert_acknowledgements"
                              " where invalidated_at is null order by id")
 
-    def acknowledge(self, key, severity, actor, principal, *, observation_host=None) -> dict:
+    def acknowledge(self, key, severity, actor, principal, *, observation_host=None,
+                    perimeter=None) -> dict:
         with self.db.transaction() as tx:
             # Serializes creation as well as replacement: SELECT FOR UPDATE
             # alone would not lock an absent acknowledgement.
@@ -25,11 +26,12 @@ class AlertAcknowledgements(interface.AlertAcknowledgements):
                        " and invalidated_at is null and severity <> %s",
                        (key, principal, severity))
             rows = tx.query("insert into alert_acknowledgements"
-                            " (alert_key, severity, actor, principal, observation_host)"
-                            " values (%s, %s, %s, %s, %s)"
+                            " (alert_key, severity, actor, principal, observation_host,"
+                            "  perimeter)"
+                            " values (%s, %s, %s, %s, %s, %s)"
                             " on conflict (alert_key, principal) where invalidated_at is null"
                             " do nothing returning " + _FIELDS,
-                            (key, severity, actor, principal, observation_host))
+                            (key, severity, actor, principal, observation_host, perimeter))
             changed = bool(rows)
             if not rows:
                 rows = tx.query("update alert_acknowledgements"
