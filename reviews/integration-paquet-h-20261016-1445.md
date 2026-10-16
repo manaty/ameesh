@@ -63,3 +63,37 @@ rejouée) et **#1994** / **#1270**, relevés en union sur cette base.
   `interface_total`) : 64 opérations / 363 refusées / 427 au total,
   `tests/test_l107_executor_contract.py` vert.
 - Une seule CI complète, sur cette tête gelée (§12) ; aucune CI de lot.
+
+## Tête finale après la CI rouge du 16/10 — correctifs groupés (pilote 14:05)
+
+La CI du run `38904431472` (tête `c8871afea`) a relevé quatre causes distinctes.
+La tête finale les corrige **sans élargir le périmètre des 33 unités** :
+
+- **raccord composeur `b9aaf6f2a`** (branche `prep/paquet-h-20261016-1445-raccord-ci`,
+  poussée inerte) : `tests.test_l161c_failures_realtime` lit le `run_attempt` réel,
+  `tests.test_l56_role_executor` emploie `attendu()`, `ci_parts.py` résout `PROC`
+  via `platform` (+ réexport `platform/__init__.py`), témoin SandboxTest recalculé.
+- **#2025 K7 `89a24fa80`** (GO dev7/Claude 13:58, jalon 9106, couplage #927+#2025
+  conservé) : `LibpqParserUnavailable` — refus nommé et fail-closed du recoupement
+  de cible quand `psycopg.conninfo` manque sous le pilote psql.
+- **#498 `c2d1cfa50b`** (cause prouvée du rouge psql 9/9 — dev7 13:57, avis Codex
+  pilote 0B/0N consigné) : `turn_cgroup_root` journalise en `log_async` ; le
+  démarrage de `run()` ne bloque plus sur un puits plein et traite le SIGTERM.
+  La réécriture de quelques lignes ajoutées par #498, #2025, #927, #1666, #365
+  et #2021 (témoins CI recalculés par le raccord et le correctif K7) est le seul
+  écart de contenu signalé par `scripts/paquet-inclusion.py` — 6 avertissements
+  « contenu partiel à la tête », aucun défaut, aucune unité manquante.
+
+Tête de composition : `b3f1e28bc` (b9aaf6f2a + les deux correctifs) ; la tête
+poussée du paquet est le commit de ce manifeste. Aucune CI intermédiaire (§3) :
+une seule CI groupée sur cette tête, puis auto-fusion armée sur le SHA exact.
+Les admissions du paquet suivant (#2061, #1898, #2008, #2022, #1683, #1777…)
+restent hors de cette correction (pilote 14:05).
+
+Tests ciblés des trois correctifs (huit modules, deux pilotes, logs
+`tests-final-1445-psql.log` / `tests-final-1445-psycopg.log`) : **299 OK par
+pilote**, 2 sautés. Seule erreur, `tests.test_l56_role_executor.RoleExecutorTest`
+en `setUpClass` (« fe_sendauth: no password supplied » sur la base neuve du banc
+— `.pgpass` local sans entrée générique pour `agent_mesh`) : **reproduite à
+l'identique sur `c8871afea` nu**, artefact du banc local et non du delta ; la
+classe rejouée avec `PGPASSWORD` rend **23 OK psql et 23 OK psycopg**.
