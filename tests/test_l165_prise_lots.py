@@ -308,6 +308,21 @@ class PriseDeLotTest(_Lots):
         self.assertIsNone(work.get(self.db, par_app["id"])["assignee"])
         self.assertIsNone(work.get(self.db, sans_equipe["id"])["assignee"])
 
+    def test_prise_sans_app_par_l_equipe_du_lot(self):
+        """#811 : sans `app`, le projet du lot retombe sur son équipe
+        (`backlog._lot_project`), et c'est l'agent de cette équipe qui le
+        prend — le repli d'équipe ne disparaît pas avec l'arbitrage projet."""
+        self.agent("web1", team="web")
+        self.agent("api1", team="api")
+        sans_app = self.lot("sans app, équipe web", app="")
+        self.db.execute("UPDATE work_items SET team = 'web' WHERE id = %s",
+                        (sans_app["id"],))
+        rows = {i["id"]: i for i in storage.of(self.db).work.unassigned_lots(10)}
+        self.assertEqual(rows[sans_app["id"]]["lot_team"], "web")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("web1", sans_app["id"])])
+
     def test_capacites_et_harnais(self):
         self.agent("claude1", team="nexlink", capabilities=["read"])
         self.agent("codex1", "codex", team="nexlink", capabilities=["read"],
