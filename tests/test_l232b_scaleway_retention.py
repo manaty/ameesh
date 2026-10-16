@@ -227,9 +227,31 @@ class ScalewayRetentionTest(unittest.TestCase):
         self.credentials.write_text(json.dumps(dict(self.settings, purpose='upload')))
         with self.assertRaisesRegex(backend.StorageError, 'separate'):
             backend.VersionRetention(self.credentials, self.staging, max_bytes=4096)
-        with mock.patch.object(backend.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='curl 8.3.0')):
-            with self.assertRaisesRegex(backend.StorageError, '8.4'):
+        with mock.patch.object(backend.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='curl 7.74.0')):
+            with self.assertRaisesRegex(backend.StorageError, '7.75'):
                 backend.VersionRetention(self.credentials, self.staging, max_bytes=4096)
+        # Debian 12's curl: signed transfers are accepted and the response size
+        # is bounded by the child's own RLIMIT_FSIZE, not by a curl version.
+        self.credentials.write_text(json.dumps(self.settings))
+        self.credentials.chmod(0o600)
+        with mock.patch.object(backend.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='curl 7.88.1')):
+            self.assertIsInstance(backend.VersionRetention(self.credentials, self.staging, max_bytes=4096),
+                                  backend.VersionRetention)
+
+    def test_curl_child_carries_a_kernel_file_size_bound(self):
+        limits = []
+        def capture(what, values):
+            limits.append((what, values))
+        def with_child(args, **kw):
+            if args != ['/usr/bin/curl', '--version']:
+                kw['preexec_fn']()
+            return self.transport(args, **kw)
+        with mock.patch.object(backend.resource, 'setrlimit', side_effect=capture), \
+                mock.patch.object(backend.subprocess, 'run', side_effect=with_child):
+            self.adapter.inspect('test-host/old.dump', version_id='old/+?version')
+        self.assertTrue(limits)
+        self.assertEqual(limits[0][0], backend.resource.RLIMIT_FSIZE)
+        self.assertLessEqual(limits[0][1][0], 4096 + 65537)
 
     def test_catalog_rejects_null_duplicate_and_mixed_version_references(self):
         self.register()
