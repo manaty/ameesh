@@ -7605,7 +7605,8 @@ class Runner:
         (`critical_roles` de l'organisation, défaut orchestrateur, conception,
         auditeur, relecture). Canon propriétaire illisible (#424 r1) : le
         dernier verdict lu, sinon critique (#424 r6). Canon propriétaire
-        configuré sur aucun canon de l'hôte (#424 r7) : non critique."""
+        configuré sur aucun canon de l'hôte (#424 r7) : non critique, et
+        jamais gravé au cache (#921 : rien ne doit déclasser un agent)."""
         if name in (getattr(self.cfg, "critical_agents", None) or ()):
             return True
         if name in getattr(self, "_orchestrators_declared", ()):
@@ -7635,22 +7636,32 @@ class Runner:
                 log_async("[%s] owner canon %s is configured on no canon of this host:"
                           " not critical" % (name, foreign))
             return False
+        configured = bool(canon_mod.configured(self.cfg))
         verdict, unknown = su.critical_verdict(
-            dict(row or {}, name=name), canons,
-            configured=bool(canon_mod.configured(self.cfg)), known=last)
-        if not unknown:
+            dict(row or {}, name=name), canons, configured=configured, known=last)
+        if unknown:
+            if self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
+                self._critical_held[name] = verdict
+                log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
+                          % (name, "critical" if verdict else "not critical",
+                             "last known" if isinstance(last, bool) else
+                             "unknown: fail-closed"))
+        elif configured or canons:
+            # #921 : ne rien graver du verdict de repli « hôte sans canon » —
+            # ni sur le disque, ni dans la mémoire du processus (elle nourrit
+            # `known` au passage suivant) : ce « non critique » serait tenu
+            # quand un canon devient configuré mais illisible, et déclasserait
+            # l'agent au lieu du repli critique (#424 r6). Un verdict n'est un
+            # fait sur l'agent que si un canon est en jeu (`configured or
+            # canons`, l'exact inverse du repli de `critical_verdict`) ; en
+            # service, des canons chargés impliquent `configured`, comme la
+            # garde `and configured` d'`auditor.is_critical`.
             # #424 r3 : la mémoire ne suit qu'une écriture réussie (sinon
             # nouvel essai au sondage suivant) ; #424 r4 : comparé au disque
             # à chaque verdict, jamais à la mémoire (`resume` a pu l'écrire)
             if (su.remember_critical(self.cfg, name, verdict)
                     or su._memory_path(self.cfg) is None):
                 known[name] = verdict     # sans dossier d'état : la mémoire seule
-        elif self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
-            self._critical_held[name] = verdict
-            log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
-                      % (name, "critical" if verdict else "not critical",
-                         "last known" if isinstance(last, bool) else
-                         "unknown: fail-closed"))
         return verdict
 
     def audit_command(self, name: str, argv: list, agent=None, *,
