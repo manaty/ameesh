@@ -25,6 +25,7 @@ lot**.
 | Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 2h` |
 | Demande d'un humain (L130) | `ameesh work add --title "RÉF : titre" --source "… « phrase exacte »" --priority N --estimate 2h`, puis le message `--lot <id>` |
 | Lot existant, sans agent | `ameesh mail send <agent> "…" --lot <id\|RÉF>` |
+| Prendre un lot sans agent (brief `stale_lot`/`idle_capacity`) | `ameesh work assign <id> <agent> --claim` : refusé si un autre l'a pris entre-temps, jamais de changement de main silencieux (#1026) |
 | Reprendre un lot à un autre agent | `ameesh work assign <id> <agent>`, puis le message `--lot <id>` |
 | Message sur un lot (relance, question) | `ameesh mail send <agent> "…" --lot <id>` |
 
@@ -650,8 +651,9 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI, sober proofs (canon « Processus de lot » §§3, 6,
-   12) — and changes only through a reviewed commit.
+   packages, review before CI and no CI per lot between cuts, sober proofs
+   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
+   reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
    exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
    Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance

@@ -224,7 +224,7 @@ D-Bus).
 
 ```bash
 ameesh work add --title T --assignee AGENT [--externe] …
-ameesh work assign <id> <agent> [--externe] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--claim]
 ameesh work delegate <id> <agent> --within 30m [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
 ```
@@ -245,7 +245,12 @@ human. Details:
 - a canon that is momentarily invalid does not block an assignment (warning);
   claiming stays closed until the next valid sync;
 - `work assign` reassigns an open lot, logs "assigned to X (before: Y)" in the
-  lot's events, and clears any delegation in progress.
+  lot's events, and clears any delegation in progress;
+- `--claim` (#1026) assigns only a lot that has no assignee: an already taken
+  lot is refused (exit 1) naming its holder, and the write is conditional on
+  the assignee still being empty, so two concurrent claims on the same lot
+  produce one assignment and one readable refusal, never a silent hand
+  change. The `stale_lot` and `idle_capacity` briefs carry that command.
 
 **Delegation with a deadline**. `work delegate` hands a lot to a wakeable
 agent (same guard; a human is refused, use `work assign`) and drops an event

@@ -1430,7 +1430,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
-                              branch_target=args.target, force=args.force)
+                              branch_target=args.target, force=args.force,
+                              claim=args.claim)
             if out.get("queue_warning"):
                 print("lot #%d not assigned to %s (before: %s)" % (
                     out["item"]["id"], args.agent, out["previous"] or "nobody"))
@@ -2576,6 +2577,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_assign.add_argument("--externe", action="store_true",
                            help="force assignment to an external agent that has a "
                                 "human responsible")
+    pw_assign.add_argument("--claim", action="store_true",
+                           help="assign only if the work item has no assignee (atomic "
+                                "claim); refused, naming its holder, if it is already taken")
     pw_assign.add_argument("--branch", default=None,
                            help="work item branch (L118); allowed on a work item already assigned "
                                 "to this agent")
