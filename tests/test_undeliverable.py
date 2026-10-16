@@ -719,12 +719,13 @@ class SweepTest(_Base):
     def test_essaye_les_successeurs_dans_l_ordre(self):
         """#1396/N3 : le premier successeur arrêté ne fait plus expirer le
         courrier quand un suivant est vivant (les deux sont essayés dans
-        l'ordre)."""
+        l'ordre). #1615/N3 : l'ordre est celui des liaisons, la plus récente
+        d'abord — le successeur arrêté est donc lié en dernier."""
         self.agent("a-mort")
         self.stop("a-mort")
         registry.set_session(self.db, "claude3", "s-claude3")
         binds = storage.of(self.db).session_bindings
-        for harness, agent in (("claude", "a-mort"), ("codex", "mesh-design")):
+        for harness, agent in (("claude", "mesh-design"), ("codex", "a-mort")):
             binds.bind(host=self.cfg.host, harness=harness, session_id="s-claude3",
                        agent=agent, pid=None, created_by="human:proprio")
         self.stop("claude3")
@@ -766,6 +767,78 @@ class SweepTest(_Base):
         payload = json.loads(out.stdout)
         self.assertEqual((payload["forwarded"], payload["expired"]), ([], []))
         self.assertEqual(payload["refused"][0]["new"], "mesh-design")
+
+    def test_successeur_rend_la_liste_recente_d_abord(self):
+        """#1615/N3 : `successor` rend la liste des repreneurs, liaison la plus
+        récente d'abord — pas une chaîne triée alphabétiquement puis
+        redécoupée ; un agent lié deux fois ne figure qu'une fois."""
+        self.agent("a-mort")
+        registry.set_session(self.db, "claude3", "s-claude3")
+        binds = storage.of(self.db).session_bindings
+        for harness, agent in (("claude", "mesh-design"), ("codex", "a-mort"),
+                               ("deepseek", "a-mort")):
+            binds.bind(host=self.cfg.host, harness=harness, session_id="s-claude3",
+                       agent=agent, pid=None, created_by="human:proprio")
+        row = registry.get(self.db, "claude3")
+        self.assertEqual(undeliverable.successor(self.db, row),
+                         ["a-mort", "mesh-design"])
+
+    def test_le_balayage_quitte_la_boucle_quand_l_ancien_est_relance(self):
+        """#1615/N2 : un refus qui porte sur l'ancien (relancé sous le verrou)
+        n'est pas réessayé sur chaque successeur : une seule entrée refused, et
+        son courrier n'est pas expiré — sa boîte est de nouveau lue."""
+        self.agent("a-mort")
+        self.stop("a-mort")
+        self.stop("claude3")
+        registry.set_session(self.db, "claude3", "s-claude3")
+        binds = storage.of(self.db).session_bindings
+        for harness, agent in (("claude", "mesh-design"), ("codex", "a-mort")):
+            binds.bind(host=self.cfg.host, harness=harness, session_id="s-claude3",
+                       agent=agent, pid=None, created_by="human:proprio")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        self.age(8)                        # assez vieux pour expirer sans le renvoi
+        essais = []
+
+        def relance_entre_temps(cfg, db, old, new, **kw):
+            essais.append(new)
+            raise undeliverable.RefusedOld("claude3 is not stopped (status running)")
+
+        vrai_forward = undeliverable.forward
+        undeliverable.forward = relance_entre_temps
+        try:
+            report = undeliverable.sweep(self.cfg, self.db)
+        finally:
+            undeliverable.forward = vrai_forward
+        self.assertEqual(essais, ["a-mort"])       # un seul essai, pas un par successeur
+        self.assertEqual([(r["old"], r["new"]) for r in report["refused"]],
+                         [("claude3", "a-mort")])
+        self.assertEqual(report["expired"], [])
+        self.assertEqual(self.pending("claude3"), ["Rapport."])
+
+    def test_cli_sweep_ne_rend_pas_1_quand_un_successeur_a_repris(self):
+        """#1615/N1 : un refus réparé par un successeur suivant (courrier remis)
+        n'est plus un échec — code 0, le refus restant imprimé ; un refus sans
+        reprise rend toujours 1 (témoin voisin)."""
+        self.agent("a-mort")
+        self.stop("a-mort")
+        self.stop("claude3")
+        registry.set_session(self.db, "claude3", "s-claude3")
+        binds = storage.of(self.db).session_bindings
+        for harness, agent in (("claude", "mesh-design"), ("codex", "a-mort")):
+            binds.bind(host=self.cfg.host, harness=harness, session_id="s-claude3",
+                       agent=agent, pid=None, created_by="human:proprio")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        out = self.mesh("mail", "sweep", "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("re-delivery to a-mort refused", out.stderr)
+        self.assertIn("would be re-delivered to mesh-design", out.stdout)
+        self.assertEqual(self.pending("claude3"), ["Rapport."])    # dry-run : rien bougé
+        out = self.mesh("mail", "sweep", "--dry-run", "--json")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        payload = json.loads(out.stdout)
+        self.assertEqual([(r["old"], r["new"]) for r in payload["refused"]],
+                         [("claude3", "a-mort")])
+        self.assertEqual(payload["forwarded"][0]["new"], "mesh-design")
 
     def test_expire_un_nom_absent_du_registre(self):
         """Nom absent : rien à verrouiller, l'absence est constatée dans
@@ -924,6 +997,43 @@ class SweepTest(_Base):
         self.assertFalse(holder.is_alive() or worker.is_alive())
         self.assertEqual(errors, [])
         self.assertIsInstance(out.get("error"), storage.MailboxRefused, out)
+        self.assertEqual(self.pending("claude3"), ["Rapport."])
+        self.assertEqual(self.pending("mesh-design"), [])
+
+    def test_forward_distingue_un_refus_du_stockage_venu_de_l_ancien(self):
+        """#1615/N2 : quand le stockage refuse sous verrou parce que l'ancien a
+        été relancé, `undeliverable.forward` le classe `RefusedOld` (et non un
+        refus du successeur) : le balayage ne réessaiera pas les suivants."""
+        self.stop("claude3")
+        mid = mail.send(self.db, "claude1", "claude3", "Rapport.")
+        started, release = threading.Event(), threading.Event()
+        errors = []
+
+        def hold():
+            try:
+                with ScopedDb(self.cfg).transaction() as tx:
+                    tx.execute("UPDATE agent_registry SET status = 'running'"
+                               " WHERE name = 'claude3'")
+                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
+                    started.set()
+                    release.wait(15)
+            except BaseException as exc:
+                errors.append(exc)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
+        worker, out = self._travail_concurrent(
+            lambda db: undeliverable.forward(self.cfg, db, "claude3", "mesh-design",
+                                             actor="test"))
+        self._attend_verrou("ORDER BY name FOR UPDATE", "ORDER BY m.id FOR UPDATE",
+                            out=out)
+        release.set()
+        holder.join(20)
+        worker.join(20)
+        self.assertFalse(holder.is_alive() or worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsInstance(out.get("error"), undeliverable.RefusedOld, out)
         self.assertEqual(self.pending("claude3"), ["Rapport."])
         self.assertEqual(self.pending("mesh-design"), [])
 
