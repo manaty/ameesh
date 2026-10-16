@@ -1013,6 +1013,9 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     row = registry.get(db, name)
     if row is None:
         raise RepriseError("unknown agent: %s" % name)
+    if row.get("operator_paused"):
+        raise RepriseError("%s is operator paused: use ameesh resume %s --operator --reason <reason>"
+                           % (name, name))
     if (row.get("mode") or "execute") == "externe":
         raise RepriseError("%s is an external agent (human session): ameesh does not restart "
                            "it; use \"ameesh adopt %s --session <id> --harness <h>\" "
@@ -1150,6 +1153,13 @@ def cmd_adopt(cfg: Config, args) -> int:
 
 
 def cmd_resume(cfg: Config, args) -> int:
+    if getattr(args, "operator", False):
+        from . import agent_pause
+        if args.brief is not None or args.fresh:
+            print("ameesh resume --operator does not replace the session or instruction",
+                  file=sys.stderr)
+            return 1
+        return agent_pause.cmd_cli(cfg, args, paused=False)
     try:
         brief = _read_brief(args.brief)
     except OSError as exc:
@@ -1181,6 +1191,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ameesh", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
+    p_pause = sub.add_parser("pause", help="operator pause: finish the turn, start no new one")
+    p_pause.add_argument("agent")
+    p_pause.add_argument("--reason", required=True)
+    p_pause.add_argument("--human", default=None, help="local human (same as ameesh serve)")
+    p_pause.add_argument("--json", action="store_true")
+    from . import agent_pause
+    p_pause.set_defaults(func=lambda cfg, args: agent_pause.cmd_cli(cfg, args, paused=True))
     p_ad = sub.add_parser("adopt", help="existing interactive session → runner (L39)")
     p_ad.add_argument("agent")
     p_ad.add_argument("--session", required=True, help="harness session id")
@@ -1206,11 +1223,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_re.add_argument("--fresh", action="store_true",
                       help="forget the session: new session on a deterministic brief")
     p_re.add_argument("--json", action="store_true")
+    p_re.add_argument("--operator", action="store_true", help="lift only an operator pause")
+    p_re.add_argument("--reason", default="", help="required with --operator")
+    p_re.add_argument("--human", default=None, help="local human for --operator")
     p_re.set_defaults(func=cmd_resume)
     return parser
 
 
-COMMANDS = ("adopt", "resume")
+COMMANDS = ("adopt", "resume", "pause")
 
 
 def main(argv: list[str] | None = None) -> int:
