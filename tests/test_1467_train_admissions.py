@@ -100,7 +100,7 @@ class TrainAdmissionsTest(PgTestCase):
         with self.assertRaisesRegex(train.TrainError, "unknown historical author"):
             self.qualify()
 
-    def test_real_git_history_and_sql_freezes_cover_correction_then_refuse_new_freeze(self):
+    def recorded_admission(self, *, light=False, reviewed=True):
         env = dict(os.environ, GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
                    GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
         def git(*args):
@@ -115,9 +115,11 @@ class TrainAdmissionsTest(PgTestCase):
             return git("rev-parse", "HEAD")
         with open(os.path.join(self.tmp, "federation.yaml"), "w") as fh:
             json.dump(dict(review_policies=dict(
-                risk_classes=dict(projects={self.project.name: dict(default="sensitive", rules=[])}),
+                risk_classes=dict(projects={self.project.name: dict(
+                    default="light" if light else "sensitive", rules=[])}),
                 train_reviews=dict(schema="ameesh-train-reviews-policy/1", projects={
-                    self.project.name: dict(rules=[dict(paths=["content"], reviews=2)])}))), fh)
+                    self.project.name: dict(rules=[] if light else [
+                        dict(paths=["content"], reviews=2)])}))), fh)
         git("add", "federation.yaml")
         base, first, head = commit("base"), commit("author"), commit("correction")
         self.admissions.policy = train_policy.Versioned(self.tmp, base, self.project.name)
@@ -126,7 +128,7 @@ class TrainAdmissionsTest(PgTestCase):
         entry = self.ops.queue_add(item, target="main", frozen_sha=head, note="", actor="fixture",
                                   source=self.admissions.source, frozen_id=freeze["id"])
         receipts = {"commit:" + sha: dataclasses.asdict(author(sha)) for sha in (first, head)}
-        for reader, family in (("r1", "claude"), ("r2", "deepseek")):
+        for reader, family in ((("r1", "claude"), ("r2", "deepseek")) if reviewed else ()):
             mark = self.ops.add_milestone(item, "verdict", sha=head, actor=reader, verdict="ok", note="")
             _, receipt = verdict(mark["id"], reader, family, commit=head)
             receipt = dataclasses.replace(receipt, milestone={
@@ -136,13 +138,40 @@ class TrainAdmissionsTest(PgTestCase):
             receipt_for_commit=lambda db, sha: receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: receipts.get("milestone:%d" % mid))
         self.admissions.history = train_history.Recorded(self.db, self.tmp, provider=provider)
+        return base, first, head, entry
+
+    def test_real_git_history_and_sql_freezes_cover_correction_then_refuse_new_freeze(self):
+        base, first, head, entry = self.recorded_admission()
         proof = self.admissions.qualify([entry], base, "packet")
         self.assertEqual(proof["members"][0]["policy"]["policy_commit"], base)
         coverage = proof["members"][0]["history"]["reviews"]["coverage"]
         self.assertEqual(set(coverage), {first, head})
         self.assertTrue(all(len(readers) == 2 for readers in coverage.values()))
-        self.ops.add_milestone(item, "frozen", sha=head, actor="fixture", verdict=None, note="new gel")
+        self.ops.add_milestone(entry["work_item_id"], "frozen", sha=head,
+                               actor="fixture", verdict=None, note="new gel")
         with self.assertRaisesRegex(train.TrainError, "latest exact freeze"):
+            self.admissions.qualify([entry], base, "packet")
+
+    def test_light_admission_with_no_verdict_uses_versioned_zero_review_policy(self):
+        # #1734: a LIGHT lot must not disappear behind a positive-vote filter.
+        base, first, head, entry = self.recorded_admission(light=True, reviewed=False)
+        self.admissions.targeted_ci = mock.Mock(side_effect=AssertionError("unexpected lot CI"))
+        self.assertIn(entry, self.admissions.entries())
+        proof = self.admissions.qualify([entry], base, "packet")["members"][0]
+        self.assertEqual((proof["policy"]["risk"], proof["policy"]["reviews"]), ("light", 0))
+        self.assertEqual(proof["history"]["reviews"]["coverage"], {first: [], head: []})
+        self.assertEqual(proof["history"]["reviews"]["reviews"], [])
+
+    def test_sensitive_admission_with_no_verdict_still_refuses(self):
+        base, _, _, entry = self.recorded_admission(reviewed=False)
+        with self.assertRaisesRegex(train.TrainError, "missing independent final-head reviews"):
+            self.admissions.qualify([entry], base, "packet")
+
+    def test_light_admission_still_preserves_an_explicit_blockage(self):
+        base, _, head, entry = self.recorded_admission(light=True, reviewed=False)
+        self.ops.add_milestone(entry["work_item_id"], "verdict", sha=head,
+                               actor="blocked-reader", verdict="blocked", note="")
+        with self.assertRaisesRegex(train.TrainError, "unresolved blocking.*blocked-reader"):
             self.admissions.qualify([entry], base, "packet")
 
     def test_dependency_read_keeps_open_prerequisite_outside_packet(self):

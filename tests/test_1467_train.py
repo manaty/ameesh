@@ -398,6 +398,35 @@ class TrainGitTest(_Land):
         self.assertEqual(_git(self.origin, "rev-parse", "main"), plan["head"])
         self.assertEqual(_git(self.origin, "rev-parse", "main^{tree}"), plan["tree"])
 
+    def test_stale_freeze_names_every_moved_lot_and_both_exact_heads(self):
+        # #753: a favorable verdict on a later head must not make the
+        # published branch silently eligible on an obsolete declared freeze.
+        members = [self.queued(1), self.queued(4)]
+        stale = members[0]["frozen_sha"]
+        published = members[1]["frozen_sha"]
+        _git(self.repo, "push", "-q", "origin", "+lot/4-d:lot/1-a")
+        _git(self.repo, "push", "-q", "origin", "+lot/1-a:lot/4-d")
+        with self.assertRaisesRegex(train.TrainError, "member moved beyond its exact freeze") as caught:
+            self.repository.check_members("main", members)
+        for expected in ("#1", "#4", "lot/1-a", "lot/4-d",
+                         "frozen=" + stale, "published=" + published):
+            self.assertIn(expected, str(caught.exception))
+        self.assertEqual(_git(self.origin, "for-each-ref", "--format=%(refname)",
+                              "refs/heads/integration/", self.project.lease_ref), "")
+
+    def test_unqualified_conflict_names_exact_lot_and_composition_context(self):
+        # #1651: a raw conflict must name the context requiring a qualified
+        # transport, rather than invite another attempt at the same raw head.
+        members = [self.queued(1), self.queued(2)]
+        base = self.repository.target("main")
+        with self.assertRaisesRegex(train.TrainError, "train conflict needs a reviewed delta") as caught:
+            self.repository.compose("main", base, members)
+        for expected in ("#2", "base=", "frozen=" + members[1]["frozen_sha"], "shared.py"):
+            self.assertIn(expected, str(caught.exception))
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), base)
+        self.assertEqual(_git(self.origin, "for-each-ref", "--format=%(refname)",
+                              "refs/heads/integration/", self.project.lease_ref), "")
+
     def test_moved_train_ref_and_older_epoch_never_promote(self):
         plan = self.plan()
         self.repository.publish(plan, key="p:main", epoch=2, owner="two", workflows=self.workflows)

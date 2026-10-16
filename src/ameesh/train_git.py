@@ -45,8 +45,12 @@ class Repository:
             raise TrainError("train members belong to another source or target")
         tips, _ = merge_queue.fetch_fresh(self.project.repo, [r["branch"] for r in rows],
                                          self.clone)
-        if any(tips.get(r["branch"]) != r["frozen_sha"] for r in rows):
-            raise TrainError("member moved beyond its exact freeze")
+        moved = ["#%s branch=%s frozen=%s published=%s" % (
+                    r["work_item_id"], r["branch"], r["frozen_sha"],
+                    tips.get(r["branch"]) or "missing")
+                 for r in rows if tips.get(r["branch"]) != r["frozen_sha"]]
+        if moved:
+            raise TrainError("member moved beyond its exact freeze: " + "; ".join(moved))
 
     def compose(self, target, base, rows, nonce=""):
         branch = self._guard(target)
@@ -60,7 +64,10 @@ class Repository:
             if merged["state"] != "clean":
                 # A resolution needs exact-delta qualification before the
                 # adapter can accept it; never inherit a pair's old approval.
-                raise TrainError("train conflict needs a reviewed delta")
+                raise TrainError("train conflict needs a reviewed delta: "
+                                 "#%s base=%s frozen=%s state=%s files=%s" % (
+                                     row["work_item_id"], head, row["frozen_sha"],
+                                     merged["state"], ", ".join(merged.get("files", ()))))
             head = merged["sha"]
         checked = land.gates(self.project, self.clone.path,
                              files=land.changed(self.clone.path, base, head))

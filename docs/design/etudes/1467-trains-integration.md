@@ -90,6 +90,14 @@ refuse le geste. Les cibles protégées et les branches de release restent
 refusées. Le premier raccord n'utilise aucune résolution automatique : un
 conflit attend sa qualification de delta.
 
+Les cas de candidature #753/#1734 et de transport #1651 sont décrits dans
+[`reviews/1467-selection-contract`](../../../reviews/1467-selection-contract/README.md).
+Le lecteur de candidature #1756 distingue le gel effectif du gel déclaré ;
+il ne remplace pas une génération admise. Les refus Git nomment désormais
+le lot et les têtes exactes, et le parcours léger sans avis préalable est
+éprouvé jusqu'à la lecture historique. Le transport qualifié reste un port
+distinct à raccorder, avec les preuves conservées sur son contexte exact.
+
 Les phases persistées précèdent les effets externes : `publishing`,
 `ci-intent`, `ci`, `ready`, `promoting`, puis `landed`. Une réponse de dispatch
 perdue ne provoque pas un deuxième dispatch. Une promotion incertaine conserve
