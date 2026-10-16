@@ -77,6 +77,27 @@ class StockageTest(_Base):
         lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a1")}
         self.assertEqual(lignes, {a: None, b: "sess-b"})
 
+    def test_mise_de_cote_sans_lot_actif(self):
+        """#2055 : `to_lot=None` met la session active de côté pour son lot et
+        ne rend active aucune session (`session_work_item` NULL) — le tour
+        suivant part dans une session sans lot."""
+        runner, lease = self.bail("a10")
+        a = work.add(self.db, title="A", assignee="a10", force=_FORCE)["id"]
+        epoch = lease["lease_epoch"]
+        storage.of(self.db).operations.set_session_work_item("a10", runner.runner_id, epoch,
+                                                             str(a))
+        registry.set_session(self.db, "a10", "sess-a", "compte", harness="claude", cwd="/w")
+        out = self.st.switch("a10", runner.runner_id, epoch, to_lot=None,
+                             harness="claude", account="compte", cwd="/w",
+                             current="sess-a")
+        self.assertEqual(out, {"resumed": None, "parked": "sess-a", "discarded": None,
+                               "discard_reason": None})
+        agent = registry.get(self.db, "a10")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, None))
+        self.assertEqual(self.origine("a10"), (None, None, None))
+        lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a10")}
+        self.assertEqual(lignes, {a: "sess-a"})
+
     def test_compte_harnais_ou_dossier_differents_ecartent_la_session(self):
         runner, lease = self.bail("a2")
         a = work.add(self.db, title="A", assignee="a2", force=_FORCE)["id"]
@@ -522,6 +543,55 @@ class RoutageTest(_Base):
             b = work.add(self.db, title="B", assignee="w8")["id"]
             self.tour(worker, b, "prends B", session="sess-B")
             agent = registry.get(self.db, "w8")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-B", str(b)))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_le_tour_d_un_lot_fini_ne_partage_pas_la_session_d_un_autre_lot(self):
+        """#2055 (P3 de la relecture de #1898) : quand le tour porte sur un lot
+        FINI A alors que la session active est celle d'un AUTRE lot B encore
+        ouvert, la session de B est mise de côté pour lui (reprise au prochain
+        tour sur B) et le tour de A part dans une session sans lot : une session
+        n'est jamais partagée entre lots (#794), même fini."""
+        worker = self._worker("w14")
+        try:
+            b = work.add(self.db, title="B", assignee="w14", force=_FORCE)["id"]
+            work.move(self.db, b, "build")
+            self.tour(worker, b, "commence B", session="sess-B")
+            a = work.add(self.db, title="A", assignee="w14", force=_FORCE)["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            argv = self.tour(worker, b, "retour sur B", session="sess-B2")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
+            self.assertEqual(registry.get(self.db, "w14")["session_id"], "sess-B")
+            work.close(self.db, a, abandoned=True, actor="test")
+            spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
+                                          "ids": [], "lot": str(a)})
+            self.assertEqual(spec["lot"], str(a))
+            self.assertTrue(spec.get("lot_finished"))
+            agent = registry.get(self.db, "w14")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, None),
+                             "la session de B est mise de côté, aucune n'est active")
+            self.assertIsNone(worker.read_session_file(),
+                              "le fichier de B ne sert pas le tour du lot fini")
+            self.assertIsNone(worker.current_session())
+            lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("w14")}
+            self.assertEqual(lignes.get(b), "sess-B", "la session de B est gardée pour B")
+            self.assertNotIn("dedicated to lot", worker.resume_summary or "",
+                             "aucune session dédiée au lot fini n'est rouverte")
+            # le tour du lot fini part sans lot, jamais dans la session de B.
+            with self._env("sess-A2"):
+                self.assertTrue(worker.run_turn(spec))
+            argv = self.turns()[-1]["argv"]
+            self.assertNotIn("--resume", argv, "la session de B n'est pas partagée")
+            agent = registry.get(self.db, "w14")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-A2", None))
+            # le tour suivant sur B reprend SA session, mise de côté.
+            argv = self.tour(worker, b, "suite de B")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
+            agent = registry.get(self.db, "w14")
             self.assertEqual((agent["session_id"], agent["session_work_item"]),
                              ("sess-B", str(b)))
         finally:

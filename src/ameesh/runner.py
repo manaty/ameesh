@@ -1890,8 +1890,11 @@ class AgentWorker(threading.Thread):
         puis ses tours partagent la session courante ou une session sans lot :
         jamais de session dédiée rouverte ni de fermeture à chaque tour (#1898
         N1 ; c'est ici que vit l'ancien prédicat `lot_rotation_due`, #1898 N3).
-        Bail perdu ou base injoignable : le tour part dans la session courante,
-        le nouveau lot y est noté (pas de nouvel essai à chaque tour).
+        Si la session courante appartient à un AUTRE lot encore ouvert, elle
+        est mise de côté avant ce tour (#2055) : la session d'un lot ne sert
+        jamais un autre lot (#794), même fini. Bail perdu ou base injoignable :
+        le tour part dans la session courante, le nouveau lot y est noté (pas
+        de nouvel essai à chaque tour).
         """
         if not spec:
             return spec
@@ -1916,6 +1919,11 @@ class AgentWorker(threading.Thread):
             # session n'est donc ni fermée ni rouverte à chaque tour.
             fini = self._lot_is_finished(lot)
         if fini:
+            if courant and courant != str(lot):
+                # #2055 : la session courante est celle d'un autre lot, encore
+                # ouvert : elle est mise de côté pour lui, jamais partagée avec
+                # le tour du lot fini (#794). Le tour part sans lot.
+                self._park_lot_session(courant, str(lot))
             spec["lot_finished"] = True
             return spec
         if courant:
@@ -1938,6 +1946,12 @@ class AgentWorker(threading.Thread):
                     self.agent["session_work_item"] = str(lot)
             except db_mod.DbError as exc:
                 log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
+            return spec
+        # #2055 : la session sans lot vient d'être écartée ; si une session
+        # attend pour le lot du tour (mise de côté par une bascule, ou avant le
+        # tour d'un lot fini), elle est reprise, comme toute bascule (#408) —
+        # jamais une session neuve quand la sienne est de côté.
+        if self._has_parked_session(str(lot)) and self._switch_lot("", str(lot)):
             return spec
         self._open_lot_session(lot)
         return spec
@@ -2032,6 +2046,85 @@ class AgentWorker(threading.Thread):
             "session opens on the next turn's brief." % (session or "?", lot),
             meta={"action": "session-lot-fin", "session": session or "", "lot": lot})
         return True
+
+    def _park_lot_session(self, courant: str, fini: str) -> bool:
+        """#2055 (P3 de la relecture de #1898) : met de côté la session du lot
+        `courant` (encore ouvert) avant le tour d'un lot FINI `fini`.
+
+        La session d'un lot n'est jamais partagée avec un autre (#794) ; le
+        tour du lot fini part donc dans une session SANS lot, ouverte sur le
+        brief déterministe (comme la fermeture d'un lot fini). La session mise
+        de côté pour `courant` sera reprise par la bascule au prochain tour sur
+        ce lot. Fencé par le bail, sans reprise : bail perdu ou base
+        injoignable rend False, et le tour suit le chemin courant (session
+        partagée), comme une bascule refusée.
+        """
+        compte = account_turn.for_turn(self)
+        nom = None if compte is None or compte is account_turn.INVALID else compte.name
+        session = self.current_session()
+        # le harnais que le tour lancera (L242b), comme `_switch_lot` : une
+        # session n'est reprise que sous le harnais qui l'a ouverte
+        harnais = self.turn_harness()
+        try:
+            out = storage.of(self.db).lot_sessions.switch(
+                self.name, self.runner.runner_id, self.epoch, to_lot=None,
+                harness=harnais, account=nom, cwd=self.agent.get("cwd"),
+                current=session)
+        except db_mod.DbError as exc:
+            log_async("[%s] session of lot %s not put aside (%s)"
+                      % (self.name, courant, exc))
+            return False
+        if out is None:
+            log_async("[%s] session of lot %s not put aside: lease lost"
+                      % (self.name, courant))
+            return False
+        try:
+            os.unlink(self._path("session"))  # sinon `current_session` le relirait
+        except OSError:
+            pass
+        self.agent = registry.get(self.db, self.name) or self.agent
+        self._reset_session_counts()
+        self._state_note("session_harness", "")
+        if not self.resume_summary:
+            try:
+                from . import reprise
+                brief = reprise.deterministic_brief(
+                    self.cfg, self.db, self.agent, session=session,
+                    reason="the session of lot #%s, still open, is put aside for "
+                           "its lot: this turn is on lot #%s, which is finished"
+                           % (courant, fini),
+                    consigne="This turn's instruction follows this brief: resume your "
+                             "work from there.")
+            except Exception as exc:  # un brief manquant n'empêche pas la mise de côté
+                log_async("[%s] deterministic brief unavailable (%s)" % (self.name, exc))
+            else:
+                if not self._resume_keep(brief, "ameesh"):
+                    self.resume_summary, self.resume_origin = brief, "ameesh"
+        log_async("[%s] session %s of lot %s put aside: lot %s is finished, no "
+                  "session is dedicated to it" % (self.name, session or "?", courant, fini))
+        self._fil_note(
+            "Session %s of lot %s put aside before the turn of finished lot %s: "
+            "a session is never shared between lots (#794)." % (
+                session or "?", courant, fini),
+            meta={"action": "session-lot-mise-de-cote", "session": session or "",
+                  "lot": courant, "fini": fini})
+        return True
+
+    def _has_parked_session(self, lot: str) -> bool:
+        """#2055 : une session est-elle mise de côté pour le lot `lot` ?
+
+        Lecture seule : la bascule (`_switch_lot`) décide ensuite de la
+        reprendre (même harnais, compte et dossier) ou de l'écarter."""
+        lot = str(lot or "").strip()
+        if not lot.isdigit():
+            return False
+        try:
+            rows = storage.of(self.db).lot_sessions.listing(self.name)
+        except db_mod.DbError as exc:
+            log_async("[%s] parked sessions unreadable (%s)" % (self.name, exc))
+            return False
+        return any(str(r.get("work_item_id")) == lot and r.get("session_id")
+                   for r in rows)
 
     def _forget_lotless_session(self) -> bool:
         """#794 : oublie la session active qui n'a aucun lot noté.
@@ -2149,13 +2242,16 @@ class AgentWorker(threading.Thread):
         if not repris:
             self.resume_summary = self._lot_brief(lot, courant, out)
             self.resume_origin = "ameesh"
+        # #2055 : une reprise sans bascule (aucune session active) n'a pas de
+        # lot courant à nommer.
+        de = courant or "aucun"
         log_async("[%s] session of lot %s %s, lot %s: %s"
-                  % (self.name, courant, "put aside" if out.get("parked") else "none",
+                  % (self.name, de, "put aside" if out.get("parked") else "none",
                      lot, "resumed (%s)" % repris if repris else "new session"))
         self._fil_note(
             "Lot change %s → %s: %s; %s.%s" % (
-                courant, lot,
-                "session %s put aside for lot %s" % (out["parked"], courant)
+                de, lot,
+                "session %s put aside for lot %s" % (out["parked"], de)
                 if out.get("parked") else "no session to put aside",
                 "session %s of lot %s resumed" % (repris, lot) if repris
                 else "new session for lot %s, opened on the lot brief" % lot,
@@ -2177,16 +2273,19 @@ class AgentWorker(threading.Thread):
             from . import reprise, work as work_mod
             item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
             branche = (item or {}).get("branch")
+            # #2055 : sans lot courant (reprise d'une session mise de côté hors
+            # bascule), il n'y a pas d'autre lot à citer.
+            autres = (" Your other lots keep their own sessions (the one of lot #%s is "
+                      "put aside and will be resumed when feedback arrives on it): work "
+                      "only on lot #%s here, in its own worktree and branch." % (courant, lot)
+                      if courant else
+                      " Work only on lot #%s here, in its own worktree and branch." % lot)
             return reprise.lot_brief(
                 self.cfg, self.db, self.agent, lot,
                 reason="new session dedicated to lot #%s" % lot,
-                consigne="This session is dedicated to lot #%s%s. Your other lots keep "
-                         "their own sessions (the one of lot #%s is put aside and will "
-                         "be resumed when feedback arrives on it): work only on lot #%s "
-                         "here, in its own worktree and branch. This turn's instruction "
-                         "follows this brief." % (
-                             lot, " (branch %s)" % branche if branche else "",
-                             courant, lot))
+                consigne="This session is dedicated to lot #%s%s.%s This turn's "
+                         "instruction follows this brief." % (
+                             lot, " (branch %s)" % branche if branche else "", autres))
         except Exception as exc:  # un brief manquant n'empêche pas la bascule
             log_async("[%s] lot brief unavailable (%s)" % (self.name, exc))
             return None

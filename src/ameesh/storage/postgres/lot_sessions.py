@@ -21,6 +21,7 @@ _COLUMNS = """
 class LotSessions(interface.LotSessions):
 
     def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None):
+        """`to_lot=None` : mise de côté de la session active seulement (#2055)."""
         with self.db.transaction() as tx:
             reg = tx.query(
                 "SELECT session_work_item,"
@@ -40,9 +41,12 @@ class LotSessions(interface.LotSessions):
                            r.get("session_cwd"))
             else:
                 origine = (None, None, None)
+            # `to_lot=None` (ou vide) : aucune session active au sortir, la
+            # session courante est seulement mise de côté pour son lot.
+            cible = str(to_lot).strip() if to_lot is not None else ""
             parked = None
             courant = str(r.get("session_work_item") or "").strip()
-            if current and courant.isdigit() and courant != str(to_lot):
+            if current and courant.isdigit() and courant != cible:
                 # la session active est gardée pour son lot s'il est encore
                 # ouvert et assigné à l'agent (sinon la purge l'effacerait)
                 rows = tx.query(
@@ -60,13 +64,13 @@ class LotSessions(interface.LotSessions):
                     (name, current, *origine, int(courant), name))
                 parked = rows[0]["session_id"] if rows else None
             resumed = discarded = raison = None
-            if str(to_lot).isdigit():
+            if cible.isdigit():
                 rows = tx.query(
                     "SELECT l.session_id, l.harness, l.account, l.cwd,"
                     "       (w.assignee = l.agent AND w.state NOT IN " + _CLOSED + ") AS ouvert"
                     "  FROM agent_lot_sessions l JOIN work_items w ON w.id = l.work_item_id"
                     " WHERE l.agent = %s AND l.work_item_id = %s FOR UPDATE OF l",
-                    (name, int(to_lot)))
+                    (name, int(cible)))
                 row = rows[0] if rows else None
                 if row and row.get("session_id"):
                     if not row.get("ouvert"):
@@ -79,14 +83,14 @@ class LotSessions(interface.LotSessions):
                         discarded, raison = row["session_id"], "origin"
                     tx.execute(
                         "UPDATE agent_lot_sessions SET session_id = NULL, parked_at = NULL"
-                        " WHERE agent = %s AND work_item_id = %s", (name, int(to_lot)))
+                        " WHERE agent = %s AND work_item_id = %s", (name, int(cible)))
             tx.execute(
                 "UPDATE agent_registry SET session_id = %s, session_account = %s,"
                 "       session_harness = %s, session_cwd = %s, session_origin = %s,"
                 "       session_work_item = %s, updated_at = now()"
                 " WHERE name = %s",
                 (resumed, account if resumed else None, harness if resumed else None,
-                 cwd if resumed else None, resumed, str(to_lot), name))
+                 cwd if resumed else None, resumed, cible or None, name))
             return {"resumed": resumed, "parked": parked, "discarded": discarded,
                     "discard_reason": raison}
 

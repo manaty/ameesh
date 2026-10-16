@@ -3250,7 +3250,7 @@ class LotSessions(Domain):
     HOLD_PREFIX = "hold:"
 
     @abc.abstractmethod
-    def switch(self, name: str, owner: str, epoch: int, *, to_lot: str,
+    def switch(self, name: str, owner: str, epoch: int, *, to_lot: str | None,
                harness: str | None, account: str | None, cwd: str | None,
                current: str | None = None) -> dict | None:
         """Change le lot de la session active, **fencé par le bail**, en une
@@ -3263,6 +3263,9 @@ class LotSessions(Domain):
         l'agent et qu'elle a été ouverte sous les harnais `harness`, compte
         `account` (celui du prochain tour) et dossier `cwd` (sinon elle est
         écartée et la session active est vide : une session neuve s'ouvrira).
+        `to_lot=None` : la session active est mise de côté pour son lot et
+        AUCUNE ne devient active (`session_work_item` remis à NULL) — le tour
+        part dans une session sans lot (#2055).
         Rend `{resumed, parked, discarded, discard_reason}` (identifiants ou
         None ; raison `origin` ou `lot`), ou None si le bail n'est plus le
         nôtre (rien n'est écrit)."""
