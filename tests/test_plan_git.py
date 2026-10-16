@@ -1,13 +1,33 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1756 : gel effectif dérivé du dernier avis favorable (`plan_git.freeze_candidate`)."""
+"""#1756 : gel effectif dérivé du dernier avis favorable (`plan_git.freeze_candidate`).
+#1905 : report de l'avis sur un gel republié quand le delta du lot est
+mécaniquement constant (`plan_git.rebase_identity`)."""
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 from ameesh import plan_git
 
 A = "a" * 40
 B = "b" * 40
+
+#: config git neutralisée : le dépôt jetable ne dépend pas du poste.
+GIT_ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+
+def _git(depot: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(["git", "-C", depot, *args], capture_output=True, text=True,
+                          env=GIT_ENV)
+    if check and proc.returncode:
+        raise AssertionError("git %s : %s" % (" ".join(args), proc.stderr or proc.stdout))
+    return proc
+
 
 
 def frozen(sha, at, id=1):
@@ -172,6 +192,118 @@ class FreezeCandidateTest(unittest.TestCase):
             verdict(A, 12, id=4, actor="dev1", kind="blocked")])
         self.assertEqual(out["sha"], "")
         self.assertEqual(out["causes"], ["blocked-verdict"])
+
+
+class RebaseIdentityTest(unittest.TestCase):
+    """#1905 : la tête relue et le gel republié portent-ils le même delta ?"""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="ameesh-1905-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.depot = os.path.join(self.base, "depot")
+        os.makedirs(self.depot)
+        _git(self.depot, "init", "-q", "-b", "main")
+        _git(self.depot, "config", "user.name", "t")
+        _git(self.depot, "config", "user.email", "t@t")
+        self._ecrire("a.txt", "base\n")
+        _git(self.depot, "add", "a.txt")
+        _git(self.depot, "commit", "-qm", "base")
+        _git(self.depot, "checkout", "-qb", "lot")
+        self._ecrire("a.txt", "lot 1\n")
+        _git(self.depot, "commit", "-qam", "#1905 lot 1")
+        self._ecrire("b.txt", "lot 2\n")
+        _git(self.depot, "add", "b.txt")
+        _git(self.depot, "commit", "-qm", "#1905 lot 2")
+        self.reviewed = self._rev("HEAD")
+        _git(self.depot, "checkout", "-q", "main")
+        self._ecrire("c.txt", "main\n")
+        _git(self.depot, "add", "c.txt")
+        _git(self.depot, "commit", "-qm", "main avance")
+        _git(self.depot, "checkout", "-q", "lot")
+        _git(self.depot, "rebase", "-q", "main")
+        self.frozen = self._rev("HEAD")
+
+    def _ecrire(self, nom: str, contenu: str) -> None:
+        with open(os.path.join(self.depot, nom), "w") as fh:
+            fh.write(contenu)
+
+    def _rev(self, rev: str) -> str:
+        return _git(self.depot, "rev-parse", rev).stdout.strip()
+
+    def test_rebase_mecanique_est_reconnu(self) -> None:
+        self.assertNotEqual(self.reviewed, self.frozen)
+        out = plan_git.rebase_identity(self.depot, self.reviewed, self.frozen, "main")
+        self.assertTrue(out["mechanical"], out)
+
+    def test_union_de_main_est_mecanique(self) -> None:
+        # gel republié par une fusion à deux parents (#508) : la base du lot
+        # est celle de la nouvelle main, les commits du lot sont inchangés.
+        _git(self.depot, "checkout", "-q", "-b", "union", self.reviewed)
+        _git(self.depot, "merge", "-q", "--no-ff", "-m", "union", "main")
+        union = self._rev("HEAD")
+        out = plan_git.rebase_identity(self.depot, self.reviewed, union, "main")
+        self.assertTrue(out["mechanical"], out)
+
+    def test_contenu_introduit_dans_un_merge_refuse(self) -> None:
+        _git(self.depot, "checkout", "-q", "-b", "union", self.reviewed)
+        _git(self.depot, "merge", "-q", "--no-commit", "main")
+        self._ecrire("a.txt", "contenu jamais relu dans le merge\n")
+        _git(self.depot, "commit", "-qam", "union modifiee")
+        union = self._rev("HEAD")
+        out = plan_git.rebase_identity(self.depot, self.reviewed, union, "main")
+        self.assertFalse(out["mechanical"], out)
+        out = plan_git.freeze_candidate(
+            [verdict(self.reviewed, 10), frozen(union, 20)],
+            repo=self.depot, target="main")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("freeze-after-verdict", out["causes"])
+
+    def test_avis_ancien_ne_leve_pas_un_blocage_de_la_tete_gelee(self) -> None:
+        rows = [verdict(self.frozen, 11, id=1, actor="cx1", kind="blocked"),
+                verdict(self.reviewed, 12, id=2, actor="cx1", kind="ok"),
+                frozen(self.frozen, 20, id=3)]
+        out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("blocked-verdict", out["causes"])
+
+    def test_contenu_change_n_est_pas_mecanique(self) -> None:
+        self._ecrire("a.txt", "lot 1 corrige\n")
+        _git(self.depot, "commit", "-qam", "#1905 correction")
+        corrige = self._rev("HEAD")
+        out = plan_git.rebase_identity(self.depot, self.reviewed, corrige, "main")
+        self.assertFalse(out["mechanical"], out)
+        rows = [verdict(self.reviewed, 10), frozen(corrige, 20)]
+        refus = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(refus["sha"], "")
+        self.assertIn("freeze-after-verdict", refus["causes"])
+
+    def test_meme_commit_et_shas_illisibles(self) -> None:
+        self.assertTrue(plan_git.rebase_identity(
+            self.depot, self.reviewed, self.reviewed, "main")["mechanical"])
+        self.assertFalse(plan_git.rebase_identity(
+            self.depot, self.reviewed, "0" * 40, "main")["mechanical"])
+
+    def test_avis_porte_sur_le_gel_mecanique(self) -> None:
+        rows = [verdict(self.reviewed, 10), frozen(self.frozen, 20)]
+        out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(out["sha"], self.frozen)
+        self.assertEqual(out["origin"], "frozen")
+        self.assertEqual(out["causes"], [])
+        self.assertTrue(any(n.startswith("mechanical-rebase") for n in out["notes"]), out)
+
+    def test_sans_repo_le_refus_demeure(self) -> None:
+        rows = [verdict(self.reviewed, 10), frozen(self.frozen, 20)]
+        out = plan_git.freeze_candidate(rows)
+        self.assertEqual(out["sha"], "")
+        self.assertIn("freeze-after-verdict", out["causes"])
+
+    def test_blocked_sur_la_tete_relue_n_est_pas_masque(self) -> None:
+        rows = [verdict(self.reviewed, 10, id=2, actor="cx1", kind="blocked"),
+                verdict(self.reviewed, 11, id=3, actor="dev4"),
+                frozen(self.frozen, 20, id=4)]
+        out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("blocked-verdict", out["causes"])
 
 
 if __name__ == "__main__":

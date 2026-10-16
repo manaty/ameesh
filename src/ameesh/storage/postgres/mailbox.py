@@ -21,8 +21,12 @@ PROJECT_SQL = (
     + " AND coalesce(btrim(r.team), '') <> '' THEN btrim(r.team) ELSE r.workstream END"
     " FROM agent_registry r WHERE r.name = %s")
 
+#: colonnes d'un message rendues aux appelants. `work_item_id` (#811 R3) porte
+#: le lot du message : la règle du dossier de lot (`lot_workdir.deliverable`)
+#: s'applique alors sans une requête par ligne.
 MAIL_COLUMNS = """
-    id, sender, recipient, body, kind, payload, status, host, work_item_id,
+    id, sender, recipient, body, kind, payload, status, host,
+    coalesce(btrim(work_item_id), '') as work_item_id,
     signature, signature_key, signed_payload, nonce,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from delivered_at)::float8 as delivered_ts,
