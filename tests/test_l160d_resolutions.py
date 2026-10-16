@@ -33,6 +33,15 @@ def _commit_on(repo, branch, path, text, message):
     _git(repo, "checkout", "-q", "main")
 
 
+def _add_on(repo, branch, path, text, message):
+    """`_commit_on` for a path the branch does not have yet."""
+    _git(repo, "checkout", "-q", branch)
+    _write(repo, path, text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", message)
+    _git(repo, "checkout", "-q", "main")
+
+
 def _identity(repo):
     _git(repo, "config", "user.name", "t")
     _git(repo, "config", "user.email", "t@example.invalid")
@@ -181,6 +190,40 @@ class ReplayTest(_Base):
 
     def test_primed_by_python_port(self):
         self.check(None)
+
+    def asymmetric_pair(self):
+        """#2136: `.gitattributes` arrives with lot/1-a and drives the merge it
+        is part of — `tests/parts/*.txt merge=union` applies only when lot/1-a
+        is the first parent, so lot/2-b ← lot/1-a conflicts on the parts list
+        where lot/1-a ← lot/2-b unions it. The resolution commit is made in the
+        union direction, as the author's `work resolve` did on #2110/#753."""
+        path = "tests/parts/pilote-psql.txt"
+        _add_on(self.repo, "lot/1-a", ".gitattributes",
+                "tests/parts/*.txt merge=union\n", "union driver")
+        _add_on(self.repo, "lot/1-a", path, "l1\nfrom-a\n", "a adds a part")
+        _add_on(self.repo, "lot/2-b", path, "l1\nfrom-b\n", "b adds a part")
+        return _manual_resolution(self.repo)
+
+    def check_asymmetric(self, script):
+        sha = self.asymmetric_pair()
+        rp = self.replayer(script)
+        rp.ensure()
+        self.assertEqual(rp.prime([sha]), [])
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        # the direction the resolution was prepared in: the union driver applies
+        self.assertEqual(rp.replay(a, b, sha)["state"], "prepared")
+        # the landing direction (the queue merges the late lot into the earlier
+        # ones): no `.gitattributes` when the merge starts, so the parts list
+        # conflicts and only a resolution learnt in this direction covers it
+        got = rp.replay(b, a, sha)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+
+    @unittest.skipUnless(resolutions.rerere_train_script(), "rerere-train.sh not installed")
+    def test_asymmetric_pair_primed_by_rerere_train_sh(self):
+        self.check_asymmetric("auto")
+
+    def test_asymmetric_pair_primed_by_python_port(self):
+        self.check_asymmetric(None)
 
     def test_resolution_from_another_host_is_fetched(self):
         bare = self.origin()

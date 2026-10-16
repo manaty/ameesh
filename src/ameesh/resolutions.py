@@ -188,12 +188,57 @@ def rerere_train_script() -> str | None:
     return None
 
 
+def _parents(cwd: str, commit: str) -> list[str]:
+    return _text(_run(cwd, "rev-parse", commit + "^@")).split()
+
+
+def _learn(cwd: str, commit: str, first: str, others) -> bool:
+    """Plays the merge of `others` into `first` and records, in `rr-cache`, the
+    resolution the tree of `commit` carries when that merge conflicts. Returns
+    whether it learnt from a conflict (a clean merge has none to record).
+    Leaves `cwd` clean on a detached `first`; a failure is cleaned up by the
+    caller, which also restores the commit `cwd` was on."""
+    _check(_run(cwd, "checkout", "-q", "-f", "--detach", first), "checkout")
+    merge = _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+                 "merge", "-q", "--no-ff", "--no-commit", *others)
+    if merge.returncode == 0:
+        _run(cwd, "reset", "-q", "--hard")
+        return False
+    conflicted = unmerged(cwd)
+    # `forget` exits 0 even when it did nothing (rerere off): check it
+    _run(cwd, "-c", "rerere.enabled=true", "rerere", "forget", ".")
+    still = sorted(set(conflicted) - set(rerere_remaining(cwd)))
+    if still:
+        raise GitError("git rerere forget left %s resolved (%s)"
+                       % (", ".join(still), commit[:12]))
+    both = _both_sides(cwd)
+    if both:
+        # forget leaves the old resolution in the files: back to the conflict,
+        # else the next `rerere` records the old resolution again (only paths
+        # with both sides: a modify/delete conflict has nothing to restore)
+        _check(_run(cwd, "checkout", "-m", "--", *both), "checkout -m")
+    if conflicted:
+        _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
+        _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
+        _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
+    _run(cwd, "reset", "-q", "--hard")
+    return bool(conflicted)
+
+
 def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
     """Primes the `rr-cache` of the repository of worktree `cwd` from the
     merge commits `commits` (`--overwrite`: a replaced resolution wins),
     with `rerere-train.sh`, or the same loop in Python when the script is
     not installed (`script=None` forces the port). Leaves `cwd` clean, on
-    the commit it was on. Returns the commits it learnt from."""
+    the commit it was on. Returns the commits it learnt from.
+
+    #2136 : a merge is not symmetric — a `.gitattributes` a merge brings in
+    only drives that merge once it is checked out (so `merge=union` applies
+    on one side only), and rerere keys a conflict by its preimage, where ours
+    and theirs are ordered. The script and the loop only learn the
+    first-parent direction; the other is learnt here from the same commit, so
+    a resolution prepared in one direction replays in the landing direction
+    of the queue."""
     commits = [c for c in commits if c]
     if not commits:
         return []
@@ -201,49 +246,32 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
                             "rr-cache"), "rev-parse"), exist_ok=True)
     if script == "auto":
         script = rerere_train_script()
-    if script:
-        head = _check(_run(cwd, "rev-parse", "HEAD"), "rev-parse")
-        proc = subprocess.run(["sh", script, "--overwrite", "--no-walk", *commits], cwd=cwd,
-                              capture_output=True, env=_git_env(),
-                              timeout=FETCH_TIMEOUT, check=False)
-        out = proc.stdout.decode("utf-8", "replace")
-        # the script returns to the branch it started on; make sure of it
-        _run(cwd, "checkout", "-q", "-f", "--detach", head)
-        learnt = re.findall(r"^Learning from ([0-9a-f]+)", out, re.M)
-        return [c for c in commits if any(c.startswith(short) for short in learnt)]
     head = _check(_run(cwd, "rev-parse", "HEAD"), "rev-parse")
     learnt = []
     try:
-        for commit in commits:
-            parents = _text(_run(cwd, "rev-parse", commit + "^@")).split()
-            if len(parents) < 2:
-                continue
-            _check(_run(cwd, "checkout", "-q", "-f", "--detach", parents[0]), "checkout")
-            if _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
-                    "merge", "-q", "--no-ff", "--no-commit", *parents[1:]).returncode != 0:
-                conflicted = unmerged(cwd)
-                # `forget` exits 0 even when it did nothing (rerere off): check it
-                _run(cwd, "-c", "rerere.enabled=true", "rerere", "forget", ".")
-                still = sorted(set(conflicted) - set(rerere_remaining(cwd)))
-                if still:
-                    raise GitError("git rerere forget left %s resolved (%s)"
-                                   % (", ".join(still), commit[:12]))
-                both = _both_sides(cwd)
-                if both:
-                    # forget leaves the old resolution in the files: back to the conflict,
-                    # else the next `rerere` records the old resolution again (only paths
-                    # with both sides: a modify/delete conflict has nothing to restore)
-                    _check(_run(cwd, "checkout", "-m", "--", *both), "checkout -m")
-                if conflicted:
-                    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
-                    _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
-                    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
+        if script:
+            proc = subprocess.run(["sh", script, "--overwrite", "--no-walk", *commits],
+                                  cwd=cwd, capture_output=True, env=_git_env(),
+                                  timeout=FETCH_TIMEOUT, check=False)
+            out = proc.stdout.decode("utf-8", "replace")
+            found = re.findall(r"^Learning from ([0-9a-f]+)", out, re.M)
+            learnt = [c for c in commits if any(c.startswith(short) for short in found)]
+        else:
+            for commit in commits:
+                parents = _parents(cwd, commit)
+                if len(parents) < 2:
+                    continue
+                if _learn(cwd, commit, parents[0], parents[1:]):
                     learnt.append(commit)
-            _run(cwd, "reset", "-q", "--hard")
+        for commit in commits:
+            parents = _parents(cwd, commit)
+            if len(parents) == 2 and _learn(cwd, commit, parents[1], [parents[0]]):
+                learnt.append(commit)
     finally:
         _run(cwd, "reset", "-q", "--hard")
         _run(cwd, "checkout", "-q", "-f", "--detach", head)
-    return learnt
+    seen = set(learnt)
+    return [c for c in commits if c in seen]
 
 
 # --------------------------------------------------------------------------
