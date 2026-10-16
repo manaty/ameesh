@@ -8183,10 +8183,10 @@ class Runner:
             # probing concurrently: a pending probe is not a PID/PGID fallback.
             self._turn_cgroup_probed = True
             if root is None:
-                log("per-turn cgroup unavailable (%s): keeping PID/PGID ownership"
+                log_async("per-turn cgroup unavailable (%s): keeping PID/PGID ownership"
                     % reason)
             else:
-                log("per-turn cgroup: delegated root %s" % root)
+                log_async("per-turn cgroup: delegated root %s" % root)
         return self._turn_cgroup_root
 
     def _live_turn_ids(self) -> set | None:
