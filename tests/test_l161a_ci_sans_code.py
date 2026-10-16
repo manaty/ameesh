@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import re
+import tempfile
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -68,6 +69,21 @@ class ReadersTest(unittest.TestCase):
         self.assertTrue(found)
         self.assertEqual(found - declared, set(),
                          "à déclarer dans tests/parts/lecteurs-doc.txt")
+
+    def test_ligne_dupliquee_par_union_passee_une_fois(self):
+        """#1609 : `tests/parts/*.txt` est fusionné en `union` ; une ligne
+        dupliquée (deux lots ajoutant le même lecteur au même endroit) ne doit
+        pas faire rejouer le module par `python -m unittest`, et l'ordre du
+        fichier est gardé."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "lecteurs-doc.txt"
+            path.write_text("# lecteurs\n"
+                            "test_b  # dupliqué par l'union\n"
+                            "test_a\n"
+                            "test_b\n"
+                            "test_c # autre raison\n", encoding="utf-8")
+            self.assertEqual(version_only.doc_readers(path),
+                             ["tests.test_b", "tests.test_a", "tests.test_c"])
 
 
 class WorkflowTest(unittest.TestCase):
