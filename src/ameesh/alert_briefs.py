@@ -67,7 +67,12 @@ def _workstream(row: dict) -> str:
 
 def _of_teams(orchestras, by_name: dict, teams: set) -> list:
     """Les orchestrateurs d'un des projets (ou sans projet) ; sans projet
-    connu, tous."""
+    connu, tous.
+
+    `orchestras` vient de `sous_utilisation.alert_orchestrators` (#1114) :
+    l'historique d'attribution ne confère pas le rôle, donc un agent sans
+    projet n'est ici qu'un hub explicitement déclaré (rôle au canon ou
+    `AMEESH_ALERT_ORCHESTRATORS`), jamais un assigneur récent."""
     if not teams:
         return list(orchestras)
     return [o for o in orchestras if not _projects(by_name, o)
