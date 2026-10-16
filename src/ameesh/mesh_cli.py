@@ -2967,6 +2967,14 @@ def _cost_report_reads(cfg: Config, db) -> None:
     _real_spend_24h(db)
 
 
+def _config_origin(cfg: Config) -> dict:
+    """#1466 : provenance de la configuration lue — fichier, base héritée et
+    clés qu'un profil écrase (les comptes, notamment)."""
+    return {"path": cfg.config_path, "base": cfg.config_base,
+            "shadowed": list(cfg.config_shadowed or ()),
+            "source": cfg.config_source}
+
+
 def cmd_accounts(cfg: Config, args) -> int:
     """`ameesh accounts list|use <harnais> <compte>|auto [harnais]|healthy
     <harnais> [<compte>]` (L30, 0027 ; L226b).
@@ -3058,10 +3066,22 @@ def cmd_accounts(cfg: Config, args) -> int:
             except db_mod.DbError:
                 sante = []  # base sans la migration 0060
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
+                              "config": _config_origin(cfg),
                               "accounts": rows, "switches": bascules,
                               "credentials": sante},
                              ensure_ascii=False, indent=2, default=str))
             return 0
+        if cfg.config_base:
+            # #1466 : d'où viennent ces comptes — un profil peut diverger de
+            # la configuration de l'hôte sans que personne ne le voie
+            note = ("config     : %s (profile; host config %s)"
+                    % (cfg.config_path, cfg.config_base))
+            if cfg.config_shadowed:
+                note += "; overrides: %s" % ", ".join(cfg.config_shadowed)
+            if "accounts" in (cfg.config_shadowed or ()):
+                note += ("\n             WARNING: this profile's `accounts` override the "
+                         "host's; a stale profile diverges silently from other runners")
+            print(note)
         print(accounts_mod.format_rows(rows))
         if bascules:
             print()

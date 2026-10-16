@@ -29,7 +29,11 @@ from . import sous_utilisation
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
-                 "critical_budget_pause", "idle_actionable_lot", "slo_breach")
+                 "critical_budget_pause", "idle_actionable_lot", "slo_breach",
+                 # #1466 : une pause qui dure est un plafond périmé, un compte
+                 # retiré ou une configuration que l'exécuteur ne lit pas ; les
+                 # orchestrateurs peuvent vérifier, l'auditeur suit
+                 "budget_pause_long")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -271,6 +275,17 @@ def _critical_budget_pause(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _budget_pause_long(alert: dict) -> str:
+    """#1466 : une pause budget qui dure n'est plus ordinaire. Aux
+    orchestrateurs de l'équipe et aux auditeurs."""
+    return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
+            "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
+            "the runner reads (ameesh doctor; a profile can diverge from the host's "
+            "config.json); free an account, fix the profile, or have the runner restart, "
+            "then `ameesh resume` the agent if its runner is not live."
+            % (alert.get("detail") or "?"))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
     des lots démarrables ouverts sans agent, l'écart est le sien (L165b,
@@ -368,6 +383,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind == "budget_pause_long":
+            # #1466 : meme routage que `critical_budget_pause` ; L243 : les
+            # projets de l'agent (`_projects`), pas l'ancien `_team`.
+            text = _budget_pause_long(alert)
+            teams = _projects(by_name, alert.get("agent"))
         else:
             text = _plan_underused(alert)
             teams = {p for n in alert.get("idle_agents") or ()
@@ -402,7 +422,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     if kind != "stale_lot":
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
-    if kind == "critical_budget_pause":
+    if kind in ("critical_budget_pause", "budget_pause_long"):
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     return out
 
