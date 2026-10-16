@@ -219,6 +219,35 @@ class PolitiqueVolumesTest(unittest.TestCase):
 # récolte : déclaration explicite, absence continue, jamais le reste
 # ==========================================================================
 
+class ReapVolumesObservationTest(unittest.TestCase):
+    def test_reference_closes_episode_even_when_creation_inspection_fails(self):
+        """A known reference ends absence even when CreatedAt is unreadable."""
+        now = 1_800_000_000.0
+        created = now - 72 * 3600
+        previous = [{"path": "bench", "action": "waiting",
+                     "data": {"created": created,
+                              "episode_since": now - 48 * 3600}}]
+        journal = mock.Mock()
+        journal.latest_by_path.side_effect = lambda *args: previous
+        store = mock.Mock(housekeeping=journal)
+        runtime = _FauxVolumes([_v("bench", JETABLE)],
+                               created={"bench": created},
+                               created_unreadable=True, refs={"bench"})
+        with mock.patch.object(menage.storage, "of", return_value=store):
+            referenced = menage.reap_volumes(
+                runtime, object(), "pc", menage.Policy(), now=now)
+            # Persist just like run_pass before the next observation.
+            previous[:] = referenced["entries"] or previous
+            runtime.refs.clear()
+            runtime.created_unreadable = False
+            detached = menage.reap_volumes(
+                runtime, object(), "pc", menage.Policy(), now=now + 60)
+        self.assertEqual(runtime.removed, [])
+        self.assertEqual([e["action"] for e in referenced["entries"]], ["referenced"])
+        self.assertEqual([e["action"] for e in detached["entries"]], ["waiting"])
+        self.assertEqual(detached["entries"][0]["data"]["episode_since"], now + 60)
+
+
 class ReapVolumesTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()

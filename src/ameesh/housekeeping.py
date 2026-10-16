@@ -3169,8 +3169,9 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
         base = {"kind": "volume", "path": name}
         stamp = stamps.get(name)
         if name not in free:
-            # repris par un conteneur : l'épisode d'absence est refermé
-            if _volume_episode(previous.get(name), stamp) is not None:
+            # Une référence suffit à fermer l'absence, même si l'inspection
+            # de CreatedAt échoue : elle ne doit pas préserver l'ancien délai.
+            if (previous.get(name) or {}).get("action") in _VOLUME_EPISODE_ACTIONS:
                 out["entries"].append(dict(
                     base, action="referenced",
                     detail="volume %s is referenced again: the absence episode is closed" % name,
