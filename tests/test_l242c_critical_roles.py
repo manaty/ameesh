@@ -656,5 +656,56 @@ class RepliSansExecuteurTest(unittest.TestCase):
             self.assertTrue(self.juger("dev7", lambda cfg, strict=False: [_Canon("A", CARTES)]))
 
 
+class Relecture921Test(_Cache):
+    """#921 (N de la R8 #414) : sur un hôte sans canon configuré,
+    `Runner.is_critical` rend « non critique » (persona auditeur seule) mais
+    ne grave rien — le verdict n'est un fait que si un canon est en jeu
+    (`configured or canons`), comme la garde `and configured` de
+    `auditor.is_critical`. Sans elle, ce verdict était tenu quand un canon
+    devenait configuré puis illisible : l'agent était déclassé au lieu du
+    repli critique (#424 r6)."""
+
+    def unconfigured(self, **cfg):
+        """Un exécuteur dont l'hôte ne configure aucun canon."""
+        base = dict(critical_agents=(), canon="")
+        base.update(cfg)
+        return types.SimpleNamespace(
+            cfg=types.SimpleNamespace(**base), db=None, _audit_canons=(),
+            _orchestrators_declared=frozenset(), _canon_complete=True)
+
+    def test_sans_canon_rien_grave_puis_repli_critique(self):
+        from ameesh import auditor
+        fake = self.unconfigured(state_dir=self.tmp)
+        # hôte sans canon : la persona auditeur seule, pas un fait sur l'agent
+        self.assertFalse(self.critical(fake, "dev7"))
+        self.assertTrue(self.critical(fake, "auditeur"))
+        # rien de gravé, ni sur le disque ni dans la mémoire du processus
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(fake._critical_known, {})
+        # le second appelant, même critère : l'auditeur ne grave rien non plus
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
+            self.assertFalse(auditor.is_critical(fake.cfg, None, "dev7", (),
+                                                 declared=(), agent=self.rows["dev7"]))
+            self.assertTrue(auditor.is_critical(fake.cfg, None, "auditeur", (),
+                                                declared=(), agent=self.rows["auditeur"]))
+        self.assertFalse(os.path.exists(self.path))
+        # le canon devient configuré puis illisible, dans le même processus :
+        # `known` n'a rien retenu du passage sans canon, le repli est critique
+        fake.cfg.canon = "home"
+        fake._audit_canons = (_Canon("A", {}, readable=False),)
+        self.assertTrue(self.critical(fake, "dev7"))
+        # et pour un exécuteur neuf, sur le même hôte
+        panne = self.fake([_Canon("A", {}, readable=False)])
+        for name in ("dev7", "codex1", "orchestrateur", "auditeur"):
+            self.assertTrue(self.critical(panne, name), name)
+
+    def test_sans_dossier_d_etat_la_memoire_ne_grave_rien_non_plus(self):
+        # `known` en processus nourrit `last` au passage suivant : la garde
+        # vaut aussi sans dossier d'état (mémoire seule, sans disque)
+        fake = self.unconfigured()
+        self.assertFalse(self.critical(fake, "dev7"))
+        self.assertEqual(fake._critical_known, {})
+
+
 if __name__ == "__main__":
     unittest.main()
