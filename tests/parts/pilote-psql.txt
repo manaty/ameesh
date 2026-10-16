@@ -30,6 +30,7 @@ test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, le
 test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes planifiées et livraison Notifier (#789 t2)
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)
 test_810_multi_project_consumers  # stockage : `projects` lu par la vue par projet et le filtre progress, prise au projet primaire (L243-3)
+test_753_stop_returns_lots  # stockage : retour transactionnel des lots, journal et réattribution des promus (#753)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit

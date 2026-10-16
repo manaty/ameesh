@@ -342,16 +342,15 @@ class Operations(interface.Operations):
             "  FROM work_items WHERE assignee = %s AND state NOT IN " + _CLOSED +
             " ORDER BY updated_at DESC, id DESC", (name,))
 
-    def open_lots_activity(self, limit) -> list[dict]:
-        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
-        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
-        reviewer = ("w.reviewer" if has_reviewer(self.db)
-                    else "''::text AS reviewer")
-        # #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
-        # `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
-        # migration. `released_by` en écarte les dépendants pinnés, dont la
-        # retenue ne tombe que par une commande `release` du registre.
-        sql = ("""
+    #: corps commun de `open_lots_activity` / `state_lots_activity` : la
+    #: dernière activité d'un lot (ligne, transitions, jalons, actions,
+    #: messages). `%%s` du LIMIT est échappé : `_lots_activity` injecte le
+    #: WHERE, qui peut lui-même porter un `%s`.
+    # #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
+    # `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
+    # migration. `released_by` en écarte les dépendants pinnés, dont la
+    # retenue ne tombe que par une commande `release` du registre.
+    _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, __REVIEWER__,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
@@ -368,12 +367,29 @@ class Operations(interface.Operations):
                                   WHERE a.work_item = w.id) ac ON true
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM agent_mailbox b
                                   WHERE b.work_item_id = w.id::text) mb ON true
-             WHERE w.state NOT IN """ + _CLOSED + """
+             WHERE %s
              ORDER BY last_activity_ts ASC, w.id
-             LIMIT %s
-            """).replace("__REVIEWER__", reviewer)
+             LIMIT %%s
+            """
+
+    def _lots_activity(self, where, params) -> list[dict]:
+        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
+        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
+        reviewer = ("w.reviewer" if has_reviewer(self.db)
+                    else "''::text AS reviewer")
         return self.db.query(
-            sql, (int(limit) if limit is not None else None,))
+            self._LOTS_ACTIVITY.replace("__REVIEWER__", reviewer) % where,
+            params)
+
+    def open_lots_activity(self, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state NOT IN " + _CLOSED,
+            (int(limit) if limit is not None else None,))
+
+    def state_lots_activity(self, state, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state = %s",
+            (state, int(limit) if limit is not None else None))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
