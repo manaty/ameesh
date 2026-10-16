@@ -162,6 +162,11 @@ from .work_dependencies import WorkDependencies
 import abc
 from typing import Any, Callable, Protocol, Sequence, TypedDict
 
+#: #1654 : observation NON fournie au CAS `set_issue_ref` — le contrôle de la
+#: réservation (`migration_repo`) n'est alors pas appliqué, les appelants qui
+#: ne lisent pas la réservation gardent le CAS d'origine.
+UNCHECKED = object()
+
 
 class Domain(abc.ABC):
     """Opérations d'un domaine, liées à une connexion ou une transaction."""
@@ -1668,11 +1673,17 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def set_issue_ref(self, item_id: int, issue_ref: str | None, *,
-                      current: str | None) -> bool:
+                      current: str | None,
+                      migration_repo: object = UNCHECKED) -> bool:
         """Pose `issue_ref` si le lot porte encore `current` (NULL et chaîne
         vide confondus) : faux si la valeur a changé entre-temps (un autre
         projecteur l'a posée). Ni journal ni `updated_at` : une projection
-        n'est pas une activité du lot."""
+        n'est pas une activité du lot.
+
+        #1654 : `migration_repo` est l'observation de l'appelant ; fournie,
+        elle resserre le CAS sur la réservation (`IS NOT DISTINCT FROM`, NULL
+        compris), pour qu'une réservation prise entre la lecture et l'écriture
+        ne passe pas en silence. `UNCHECKED` (défaut) garde le CAS d'origine."""
 
     @abc.abstractmethod
     def recent_or_cited(self, *, since_ts: float, ids: Sequence[int]) -> list[dict]:
