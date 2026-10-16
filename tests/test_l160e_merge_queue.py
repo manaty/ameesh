@@ -1000,7 +1000,7 @@ class QueueWithoutRadarTest(PgTestCase):
         self.assertEqual(_git(agents, "rev-parse", "refs/remotes/origin/lot/1-a"), stale)
         self.assertNotEqual(subprocess.run(
             ["git", "-C", agents, "cat-file", "-e", fresh + "^{commit}"],
-            capture_output=True).returncode, 0)
+            capture_output=True, env=git_env()).returncode, 0)
 
     def test_the_declared_project_keeps_the_radar_clone(self):
         clone, scratch = merge_queue.working_clone(
