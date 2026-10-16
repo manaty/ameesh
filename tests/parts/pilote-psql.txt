@@ -31,6 +31,7 @@ test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes pl
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)
 test_810_multi_project_consumers  # stockage : `projects` lu par la vue par projet et le filtre progress, prise au projet primaire (L243-3)
 test_831_packages_lock_scope  # storage : un verrou de sync par schéma (tous canons), attente hors statement_timeout (#831)
+test_811_lot_workdirs  # stockage : dossiers de projets par lot, reprise de session et prise secondaire (L243-4)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
