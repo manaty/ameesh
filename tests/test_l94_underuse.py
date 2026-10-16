@@ -207,13 +207,21 @@ class IdleCapacityTest(_Base):
                         (jour, lot["id"]))
         debut = plan.day_start_ts(jour)
         listing = self.listing()
-        # L'horloge du passage franchit la date, celle du poste reste avant.
+        # L'horloge du passage franchit la date, celle du poste reste avant :
+        # le lot est retenu par son début prévu (#1625), donc pas démarrable ;
+        # #1608 : l'alerte le dit et nomme l'attente au lieu de se taire.
         with mock.patch("ameesh.planned_waits.time.time", return_value=debut - JOUR):
-            self.assertEqual(sous_utilisation.idle_capacity(
-                self.db, listing, debut - JOUR, [], paid=("deepseek",)), [])
+            avant = sous_utilisation.idle_capacity(
+                self.db, listing, debut - JOUR, [], paid=("deepseek",))
+            self.assertEqual([a["lots"] for a in avant], [[lot["id"]]])
+            self.assertEqual(avant[0]["startable_lots"], [])
+            self.assertEqual(avant[0]["blocked_lots"],
+                             {str(lot["id"]): {"what": "scheduled", "start": jour}})
             out = sous_utilisation.idle_capacity(
                 self.db, listing, debut, [], paid=("deepseek",))
         self.assertEqual([a["lots"] for a in out], [[lot["id"]]])
+        self.assertEqual(out[0]["startable_lots"], [lot["id"]])
+        self.assertEqual(out[0]["blocked_lots"], {})
 
     def test_lots_sans_assigne(self):
         self.agent("claude1")
