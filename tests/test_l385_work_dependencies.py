@@ -472,6 +472,8 @@ class LandingTest(PgTestCase):
         self.db.execute("TRUNCATE work_items CASCADE")
         self.waiting = work.add(self.db, title="waiting", app="acme")["id"]
         self.vehicle = work.add(self.db, title="vehicle", app="acme")["id"]
+        self.sha = "a" * 40
+        work.milestone(self.db, self.vehicle, "frozen", sha=self.sha, actor="test")
 
     def cli(self, *args, ok=True):
         proc = self.mesh("work", "landing", *args, "--actor", "test")
@@ -485,18 +487,23 @@ class LandingTest(PgTestCase):
         self.assertTrue(payload["changed"])
         self.assertEqual(payload["landing"]["vehicle_id"], self.vehicle)
         self.assertEqual(payload["landing"]["until_on"], until)
+        self.assertEqual(payload["landing"]["pinned_sha"], self.sha)
         self.assertTrue(payload["landing"]["open"])
         self.assertEqual(payload["landing"]["created_by"], "test")
         # rejouer remplace la déclaration : une seule ligne, un second journal
         other = work.add(self.db, title="other vehicle", app="acme")["id"]
+        other_sha = "b" * 40
+        work.milestone(self.db, other, "frozen", sha=other_sha, actor="test")
         payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(other),
                                       "--until", "2026-10-20", "--json").stdout)
         self.assertEqual(payload["landing"]["vehicle_id"], other)
+        self.assertEqual(payload["landing"]["pinned_sha"], other_sha)
         self.assertEqual(len(storage.of(self.db).work_dependencies.landings_for([self.waiting])), 1)
         notes = [e["note"] for e in work.events(self.db, self.waiting)
                  if e["note"].startswith("Landing")]
-        self.assertEqual(notes, ["Landing declared: vehicle #%d until 2026-10-20" % other,
-                                 "Landing declared: vehicle #%d until %s" % (self.vehicle, until)])
+        self.assertEqual(notes, [
+            "Landing declared: vehicle #%d until 2026-10-20 (frozen %s)" % (other, other_sha[:12]),
+            "Landing declared: vehicle #%d until %s (frozen %s)" % (self.vehicle, until, self.sha[:12])])
         text = self.mesh("work", "show", str(self.waiting))
         self.assertEqual(text.returncode, 0, text.stderr)
         self.assertIn("landing on vehicle #%d" % other, text.stdout)
@@ -518,6 +525,16 @@ class LandingTest(PgTestCase):
                                             "--until", until, ok=False).stderr)
         self.assertIn("ISO day", self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
                                           "--until", "someday", ok=False).stderr)
+        # un véhicule sans gel ne peut pas être épinglé
+        unfrozen = work.add(self.db, title="unfrozen", app="acme")["id"]
+        self.assertIn("frozen head", self.cli(str(self.waiting), "--vehicle", str(unfrozen),
+                                              "--until", until, ok=False).stderr)
+        # un véhicule bloqué est refusé avant écriture
+        blocked = work.add(self.db, title="blocked vehicle", app="acme")["id"]
+        work.milestone(self.db, blocked, "frozen", sha="c" * 40, actor="test")
+        work.move(self.db, blocked, "blocked", actor="test")
+        self.assertIn("blocked", self.cli(str(self.waiting), "--vehicle", str(blocked),
+                                          "--until", until, ok=False).stderr)
         work.close(self.db, self.vehicle, abandoned=True)
         self.assertIn("must still be open", self.cli(str(self.waiting), "--vehicle",
                                                      str(self.vehicle), "--until", until,

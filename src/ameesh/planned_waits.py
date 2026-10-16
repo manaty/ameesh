@@ -56,10 +56,13 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     it, and the date is what makes the hold end by itself.
 
     #1945: a declared landing (`landings`, rows of `work_landings` enriched
-    with the vehicle's state and last freeze) waits only while the vehicle is
-    open and the finite day `until_on` is not past (its day counts in full,
-    like a hold). A scheduled start, a dependency or a gate stays ahead: the
-    more explicit wait wins. Nothing is inferred from prose or from git.
+    with the vehicle's state and last freeze) is an admission PINNED to one
+    freeze. It waits only while the vehicle is open, not `blocked`, its last
+    freeze is exactly `pinned_sha`, and the finite day `until_on` is not past
+    (its day counts in full, like a hold). A new freeze, a missing freeze or a
+    blocked vehicle gives the signal back until the pilot renews the
+    declaration explicitly. A scheduled start, a dependency or a gate stays
+    ahead: the more explicit wait wins. Nothing is inferred from prose or git.
     """
     open_ids = {int(r["id"]) for r in open_items
                 if r.get("state") not in ("merged", "promoted", "closed")}
@@ -142,10 +145,12 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         if held:
             waits[ident] = dict(held, what="hold")
             continue
-        # #1945 : l'atterrissage déclaré n'éteint que tant que le véhicule est
-        # ouvert et que l'échéance (journée finie, comptée en entier) n'est pas
-        # passée ; le retrait, la fermeture du véhicule ou l'échéance rendent
-        # le signal stale.
+        # #1945 (revue B) : l'admission est épinglée au gel du véhicule. Elle
+        # n'éteint que si le véhicule est ouvert, non bloqué, et si son dernier
+        # gel est EXACTEMENT la tête épinglée ; l'échéance (journée finie,
+        # comptée en entier) doit être future. Nouveau gel, gel absent, véhicule
+        # bloqué, retrait ou échéance dépassée : le signal stale revient, et le
+        # pilote renouvelle explicitement la déclaration sur la nouvelle tête.
         landing = landing_by_item.get(ident)
         if not landing:
             continue
@@ -153,15 +158,18 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         open_vehicle = landing.get("open")
         if open_vehicle is None:
             open_vehicle = vehicle in open_ids
+        etat = landing.get("vehicle_state")
+        pinned = (landing.get("pinned_sha") or "").strip()
+        tete = (landing.get("head") or "").strip()
         end = hold_end(landing.get("until_on"))
-        if vehicle == ident or not open_vehicle or end is None or now >= end:
+        if (vehicle == ident or not open_vehicle or etat == "blocked"
+                or not pinned or not tete or pinned != tete
+                or end is None or now >= end):
             continue
         wait = {"what": "landing", "vehicle": vehicle,
-                "until": str(landing.get("until_on"))[:10]}
-        if landing.get("vehicle_state"):
-            wait["step"] = landing["vehicle_state"]
-        if landing.get("head"):
-            wait["head"] = landing["head"]
+                "until": str(landing.get("until_on"))[:10], "head": pinned}
+        if etat:
+            wait["step"] = etat
         waits[ident] = wait
     return waits
 
@@ -169,9 +177,10 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
 def _with_heads(st, landings):
     """#1945 : la tête exacte du véhicule est son dernier gel, lu en base.
 
-    Une lecture groupée pour tous les véhicules déclarés ; la tête n'est
-    jamais recopiée dans `work_landings`, un nouveau gel la remplace donc
-    sans geste. Les jalons non `frozen` ou sans sha ne comptent pas."""
+    Une lecture groupée pour tous les véhicules déclarés, comparée à chaque
+    passe à la tête épinglée dans `work_landings` (`pinned_sha`) : un nouveau
+    gel ne prolonge donc rien sans renouvellement explicite. Les jalons non
+    `frozen` ou sans sha ne comptent pas."""
     rows = list(landings)
     vehicles = sorted({int(l["vehicle_id"]) for l in rows})
     heads: dict[int, tuple[float, str]] = {}

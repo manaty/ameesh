@@ -54,8 +54,10 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
     """Déclare (ou renouvelle) l'atterrissage planifié du lot sur un véhicule.
 
     Le lot et le véhicule doivent être ouverts et distincts ; l'échéance est
-    une journée ISO, fin de journée incluse. Un simple geste, aucun texte
-    libre : la tête et l'étape sont relues à chaque passe chez le véhicule."""
+    une journée ISO, fin de journée incluse. L'admission est ÉPINGLÉE au gel
+    du véhicule : il doit porter une tête gelée et ne pas être `blocked`. Un
+    simple geste, aucun texte libre ; l'étape et la tête épinglée sont relues
+    à chaque passe, un nouveau gel exige un renouvellement explicite."""
     _id(item_id)
     _id(vehicle_id)
     if not isinstance(actor, str) or not actor.strip():
@@ -69,7 +71,11 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
     errors = {"self_landing": "a lot cannot land on itself",
               "unknown_lot": "landing endpoints must be existing lots",
               "finished_lot": "the landing lot must still be open",
-              "finished_vehicle": "the vehicle must still be open"}
+              "finished_vehicle": "the vehicle must still be open",
+              "no_freeze": "the vehicle has no frozen head: freeze it before "
+                           "declaring the landing",
+              "blocked_vehicle": "the vehicle is blocked: unblock it or wait for "
+                                 "its next freeze"}
     if result.get("error"):
         raise work.WorkError(errors[result["error"]])
     return result["landed"]
@@ -312,7 +318,10 @@ def run_landing(db, args):
     if row:
         wait = {"what": "landing", "vehicle": int(row["vehicle_id"]),
                 "step": row.get("vehicle_state"), "until": row.get("until_on")}
-        print("#%d: %s" % (args.id, landing_label(wait, landing_head(db, int(row["vehicle_id"])))))
+        # la tête affichée est celle de l'admission (épinglée), pas la courante
+        print("#%d: %s" % (args.id,
+                           landing_label(wait, row.get("pinned_sha")
+                                         or landing_head(db, int(row["vehicle_id"])))))
     else:
         print("lot #%d: no planned landing" % args.id)
     return 0

@@ -127,7 +127,8 @@ class UnitTest(unittest.TestCase):
 
     def landing(self, **kw):
         row = {"work_item_id": 1, "vehicle_id": 2, "until_on": "2026-10-13",
-               "open": True, "vehicle_state": "qa", "head": "b" * 40}
+               "open": True, "vehicle_state": "qa",
+               "pinned_sha": "b" * 40, "head": "b" * 40}
         row.update(kw)
         return row
 
@@ -149,6 +150,28 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(self.resolve(landings=[fallback]), {})
         self.assertEqual(self.resolve(landings=[fallback], items=[{"id": 2, "state": "qa"}]),
                          expected)
+
+    def test_landing_is_pinned_to_the_freeze_and_gives_the_signal_back(self):
+        """#1945 revue B : sans gel, sur un autre gel ou véhicule bloqué, rien
+        n'est éteint ; le renouvellement explicite ré-épingle la nouvelle tête."""
+        for broken in ({"pinned_sha": None}, {"pinned_sha": ""},
+                       {"head": None}, {"head": ""},
+                       {"head": "c" * 40},                      # nouveau gel B
+                       {"vehicle_state": "blocked"}):
+            with self.subTest(broken=broken):
+                self.assertEqual(self.resolve(landings=[self.landing(**broken)]), {})
+        # renouvellement sur la nouvelle tête : l'attente revient, épinglée à B
+        renewed = self.landing(pinned_sha="c" * 40, head="c" * 40)
+        self.assertEqual(self.resolve(landings=[renewed]),
+                         {1: {"what": "landing", "vehicle": 2, "step": "qa",
+                              "head": "c" * 40, "until": "2026-10-13"}})
+        # sans drapeau `open` (résolveur pur), le véhicule doit être un lot ouvert connu
+        fallback = self.landing()
+        fallback.pop("open")
+        self.assertEqual(self.resolve(landings=[fallback]), {})
+        self.assertEqual(self.resolve(landings=[fallback], items=[{"id": 2, "state": "qa"}]),
+                         {1: {"what": "landing", "vehicle": 2, "step": "qa",
+                              "head": "b" * 40, "until": "2026-10-13"}})
 
     def test_explicit_waits_and_gates_stay_ahead_of_a_landing(self):
         landing = self.landing()
@@ -303,13 +326,31 @@ class PgTest(PgTestCase):
         self.assertEqual(row["waiting_for"]["label"], label)
         snap = progress.snapshot(self.db, self.cfg, project="acme", now=self.now, gantt=False)
         self.assertIsNone(next(r for r in snap["lots"] if r["id"] == waiting["id"])["stale"])
-        # un nouveau gel du véhicule remplace la tête affichée, sans geste
+        # revue B : un nouveau gel rend le signal, sans renouvellement explicite
         newer = "f" * 40
         work.milestone(self.db, vehicle["id"], "frozen", sha=newer, actor="test")
+        self.old(waiting)
+        row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
+        self.assertIsNone(row["planned_wait"])
+        self.assertEqual(row["waiting_for"]["label"], "merge (executor not designated)")
+        self.assertIn(waiting["id"], [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # le renouvellement explicite ré-épingle la tête courante
+        work_dependencies.land(self.db, waiting["id"], vehicle["id"], until_on=until, actor="pilot")
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
         row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
         self.assertEqual(row["planned_wait"]["head"], newer)
         self.assertIn(newer[:12], row["waiting_for"]["label"])
+        # véhicule bloqué après coup : le signal revient aussi
+        work.move(self.db, vehicle["id"], "blocked", actor="test")
+        self.old(waiting)
+        self.assertIn(waiting["id"], [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        with self.assertRaises(work.WorkError) as blocked:
+            work_dependencies.land(self.db, waiting["id"], vehicle["id"], until_on=until, actor="pilot")
+        self.assertIn("blocked", str(blocked.exception))
         # le retrait rend le signal stale immédiatement
+        work.move(self.db, vehicle["id"], "qa", actor="test")
+        work_dependencies.land(self.db, waiting["id"], vehicle["id"], until_on=until, actor="pilot")
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
         self.assertTrue(work_dependencies.clear_landing(self.db, waiting["id"], actor="pilot"))
         row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
         self.assertIsNone(row["planned_wait"])
@@ -322,8 +363,16 @@ class PgTest(PgTestCase):
         work.close(self.db, vehicle["id"], abandoned=True)
         self.old(waiting)
         self.assertIn(waiting["id"], [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # véhicule sans gel : la déclaration est refusée avant toute écriture
+        unfrozen = work.add(self.db, title="unfrozen vehicle", app="acme")
+        with self.assertRaises(work.WorkError) as no_freeze:
+            work_dependencies.land(self.db, waiting["id"], unfrozen["id"], until_on=until, actor="pilot")
+        self.assertIn("frozen head", str(no_freeze.exception))
+        self.assertIsNone(plan.annotate(self.db, [work.get(self.db, waiting["id"])],
+                                        now=self.now)[0]["planned_wait"])
         # échéance dépassée : la journée compte en entier, puis le signal revient
         vehicle2 = work.add(self.db, title="second vehicle", app="acme")
+        work.milestone(self.db, vehicle2["id"], "frozen", sha="a" * 40, actor="test")
         work_dependencies.land(self.db, waiting["id"], vehicle2["id"], until_on=until, actor="pilot")
         end_until = plan.day_start_ts(
             (datetime.date.fromisoformat(until) + datetime.timedelta(days=1)).isoformat())

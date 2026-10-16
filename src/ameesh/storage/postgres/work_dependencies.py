@@ -99,17 +99,33 @@ class WorkDependencies(Contract):
                 return {"error": "finished_lot"}
             if states[vehicle_id] in _DONE:
                 return {"error": "finished_vehicle"}
+            if states[vehicle_id] == "blocked":
+                return {"error": "blocked_vehicle"}
+            # #1945, revue B : l'admission est ÉPINGLÉE au gel du véhicule. La
+            # tête est lue dans la même transaction que l'écriture ; sans gel,
+            # rien ne peut être épinglé et la déclaration est refusée.
+            freezes = tx.query("""
+                SELECT sha FROM work_item_milestones
+                 WHERE work_item_id = %s AND kind = 'frozen'
+                   AND btrim(coalesce(sha, '')) <> ''
+                 ORDER BY at DESC, id DESC LIMIT 1""", (vehicle_id,))
+            if not freezes:
+                return {"error": "no_freeze"}
+            pinned = freezes[0]["sha"].strip()
             tx.execute("""
-                INSERT INTO work_landings(work_item_id, vehicle_id, until_on, created_by)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO work_landings(work_item_id, vehicle_id, pinned_sha, until_on, created_by)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (work_item_id) DO UPDATE
                     SET vehicle_id = EXCLUDED.vehicle_id,
+                        pinned_sha = EXCLUDED.pinned_sha,
                         until_on = EXCLUDED.until_on,
                         created_by = EXCLUDED.created_by,
                         created_at = clock_timestamp()
-                """, (item_id, vehicle_id, until_on, actor))
+                """, (item_id, vehicle_id, pinned, until_on, actor))
             self._landing_journal(
-                tx, item_id, "Landing declared: vehicle #%d until %s" % (vehicle_id, until_on), actor)
+                tx, item_id,
+                "Landing declared: vehicle #%d until %s (frozen %s)"
+                % (vehicle_id, until_on, pinned[:12]), actor)
             return {"landed": True}
 
     def clear_landing(self, item_id, *, actor):
@@ -128,7 +144,8 @@ class WorkDependencies(Contract):
         if not ids:
             return []
         return self.db.query("""
-            SELECT l.work_item_id, l.vehicle_id, l.until_on::text AS until_on,
+            SELECT l.work_item_id, l.vehicle_id, l.pinned_sha,
+                   l.until_on::text AS until_on,
                    l.created_by,
                    extract(epoch FROM l.created_at)::float8 AS created_ts,
                    w.state AS vehicle_state,

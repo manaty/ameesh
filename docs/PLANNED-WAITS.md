@@ -39,25 +39,31 @@ A lot is stale when it is open and inactive beyond the configured threshold
 - A **declared landing**, `ameesh work landing <id> --vehicle <lot> --until <day>`
   (#1945), parks a lot whose
   work is done on a package vehicle: an open lot that carries the composition.
-  While the vehicle is open **and** the day is not past (its day counts in
-  full, like a hold), the lot is not stale. The head and step are not copied:
-  they are read at each pass from the vehicle's last `frozen` milestone and its
-  state, so a new freeze replaces the displayed head without any gesture.
-  `ameesh work landing <id> --clear`, a closed or merged vehicle, or a past
-  deadline let the ordinary inactivity rule apply again. A self, unknown or
-  finished vehicle does not suppress the alert; nor does prose, a bare
-  admission to a packet or an old transport chain.
+  The declaration is an admission **pinned to the vehicle's freeze**: the
+  vehicle must carry a `frozen` head (refused otherwise, and refused while it
+  is `blocked`), and the pin is read in the same transaction as the write.
+  While the vehicle is open, not `blocked`, its last freeze is exactly that
+  pinned head **and** the day is not past (its day counts in full, like a
+  hold), the lot is not stale. A new freeze, a vehicle left without a freeze,
+  a vehicle moved to `blocked`, `ameesh work landing <id> --clear`, a closed
+  or merged vehicle, or a past deadline all give the signal back: the pilot
+  renews the declaration explicitly on the new head. A
+  self, unknown or finished vehicle does not suppress the alert; nor does
+  prose, a bare admission to a packet or an old transport chain.
 
   ```sh
-  ameesh work landing 1427 --vehicle 1675 --until 2026-10-18
+  ameesh work landing 1427 --vehicle 1675 --until 2026-10-18   # pin the current freeze
+  ameesh work landing 1427 --clear
   ```
 
-  The gesture is journalled ("Landing declared: vehicle #1675 until …") and
-  counts as activity, like a prerequisite edit. A planned start, a declared
+  The step is read at each pass from `work_items.state`, but the displayed
+  head is the pinned one (the admission), never a later freeze. The gesture is
+  journalled (`Landing declared: vehicle #1675 until … (frozen …)`) and counts
+  as activity, like a prerequisite edit. A planned start, a declared
   prerequisite or a gate stays ahead in the displayed wait: the more explicit
-  wait wins. When a landing is declared on a frozen lot whose verdict is
-  acquired, the registry label names the vehicle, its step, its head and the
-  deadline instead of `merge (executor not designated)`.
+  wait wins. When a landing is active on a frozen lot whose verdict is
+  acquired, the registry label names the vehicle, its step, its pinned head
+  and the deadline instead of `merge (executor not designated)`.
 
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
