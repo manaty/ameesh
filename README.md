@@ -136,10 +136,10 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 
 ```
 agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind request|reply|notify|event] [--urgent]
-               [--ack] [--cc NOM[,NOM…]]       # dest = nom ou "all" ; L125 : courrier regroupé
-                                               # (90 s), --urgent sans délai, --ack et --cc sans réveil
-                                               # --lot : étiquette de fil ; confie un lot libre (historique
-                                               # L94, ou --assign #964), jamais un lot tenu par un agent (#1066)
+               [--ack] [--cc NOM[,NOM…]]       # dest = name or "all"; L125: batched mail
+                                               # (90 s), --urgent without delay, --ack and --cc without waking
+                                               # --lot: thread label; hands over a free lot (L94
+                                               # history, or --assign #964), never one held by an agent (#1066)
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
