@@ -1567,7 +1567,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
-            if item.get("reviewer"):
+            if item.get("reviewer") == work.REVIEWER_NONE:
+                print("reviewer : — (verdict not required, #1979)")
+            elif item.get("reviewer"):
                 print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
@@ -1687,10 +1689,31 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
             # sans aller-retour build/qa ; c'est la commande que l'alerte
             # `stale_lot` recommande à l'orchestrateur du projet.
-            item = work.designate_reviewer(cfg, db, args.id, args.agent, actor=args.actor)
-            print("lot #%d: reviewer %s (state %s, designated by %s)" % (
-                item["id"], item["reviewer"], item["state"],
-                args.actor or "the bound identity"))
+            # #1979 : `--remove` retire la désignation, `--no-verdict` marque
+            # « verdict non requis » (résolution de composition mécanique,
+            # canon §11 bis/#87) : l'attente passe à la fusion, sans rappel.
+            if args.agent and (args.remove or args.no_verdict):
+                print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
+                      "mutually exclusive", file=sys.stderr)
+                return 2
+            if not args.agent and not (args.remove or args.no_verdict):
+                print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
+                      file=sys.stderr)
+                return 2
+            if args.remove:
+                item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
+                print("lot #%d: reviewer designation removed (state %s, by %s)" % (
+                    item["id"], item["state"], args.actor or "the bound identity"))
+            elif args.no_verdict:
+                item = work.waive_review(cfg, db, args.id, actor=args.actor)
+                print("lot #%d: verdict not required (state %s, by %s)" % (
+                    item["id"], item["state"], args.actor or "the bound identity"))
+            else:
+                item = work.designate_reviewer(cfg, db, args.id, args.agent,
+                                               actor=args.actor)
+                print("lot #%d: reviewer %s (state %s, designated by %s)" % (
+                    item["id"], item["reviewer"], item["state"],
+                    args.actor or "the bound identity"))
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
@@ -2595,8 +2618,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="#705: designate (or change) the reviewer of a lot already in qa, "
              "without a build/qa round trip")
     pw_reviewer.add_argument("id", type=int)
-    pw_reviewer.add_argument("agent", metavar="AGENT",
+    pw_reviewer.add_argument("agent", nargs="?", metavar="AGENT",
                              help="a registry agent, or human:<id>; never the lot's assignee")
+    pw_reviewer.add_argument("--remove", action="store_true",
+                             help="#1979: remove the designation (the review goes back to "
+                                  "« verdict from a reviewer (none designated) »)")
+    pw_reviewer.add_argument("--no-verdict", dest="no_verdict", action="store_true",
+                             help="#1979: mark « verdict not required » (mechanical composition "
+                                  "resolution, canon §11 bis/#87): the lot waits for its merge "
+                                  "and no reminder goes to a reviewer")
     pw_reviewer.add_argument("--actor", default="",
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
