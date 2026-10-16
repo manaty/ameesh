@@ -732,6 +732,10 @@ class _Remise:
         self.pg = getattr(bk, "kind", None) == "pg"
         self.owner = binding.runner_id if binding.bound_to_lease else None
         self.epoch = binding.epoch if self.owner else None
+        #: #811 : projets de l'agent lus avec le bail (`None` = inconnus). Un
+        #: agent mono-projet ne peut pas retenir de lot secondaire : son hook
+        #: garde le chemin d'origine, une seule réservation (budget L61).
+        self.projects = getattr(binding, "projects", None)
         self.jeton = mail.new_token()
         self.msgs: list[dict] = []
         self.ouverte = False
@@ -756,6 +760,18 @@ class _Remise:
             self.reste = len(tous) - len(self.msgs)
             return self.msgs
         borne = 200 if limite is None else max(1, limite)
+        if self.projects is not None and len(self.projects) < 2:
+            # #811 : mono-projet, aucune retenue de lot secondaire n'est
+            # possible — chemin d'origine en une seule réservation, budget du
+            # hook préservé (L61). Le filtrage par lot ne sert qu'au
+            # multi-projet déclaré.
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                                limit=borne)
+            self.ouverte = bool(rows)
+            self.msgs = [mail.normalize(row) for row in rows]
+            self.reste = 1 if len(self.msgs) >= borne else 0
+            return self.msgs
         besoin, lus = borne, 0
         self.msgs = []
         while len(self.msgs) < borne:
@@ -763,6 +779,9 @@ class _Remise:
             if len(ids) <= lus:       # boîte épuisée ou backend à page bornée
                 break
             lus = len(ids)
+            # Une page courte a atteint la fin de la boîte : la réservation
+            # suivante n'aurait rien de plus à voir (#811, budget du hook).
+            page_courte = len(ids) < besoin
             # Les réservations actives (y compris celles de notre jeton) sont
             # écartées avant la LIMIT SQL. Compléter depuis une page plus large
             # si elles occupaient le préfixe lu, même en mono-projet (#811 R3).
@@ -771,11 +790,12 @@ class _Remise:
                                 limit=borne - len(self.msgs))
             self.msgs.extend(mail.normalize(row) for row in rows)
             self.ouverte = bool(self.msgs)
+            if page_courte:
+                break
             besoin = max(mail.UNREAD_LIMIT, besoin * 2, lus * 2)
         # une réservation pleine peut cacher des non-lus : on le dit (au pire
         # pour rien, le prochain hook reviendra par le chemin complet).
         self.reste = 1 if len(self.msgs) >= borne else 0
-        return self.msgs
         return self.msgs
 
     def _deliverable(self, borne: int) -> list[int]:
