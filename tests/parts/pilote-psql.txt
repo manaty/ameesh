@@ -26,6 +26,7 @@ test_420_qa_role  # SQL: QA role, runner binding and TEMP registry spoofing (#42
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
+test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)
 test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes planifiées et livraison Notifier (#789 t2)
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)
 test_810_multi_project_consumers  # stockage : `projects` lu par la vue par projet et le filtre progress, prise au projet primaire (L243-3)
