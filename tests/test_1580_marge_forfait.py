@@ -284,3 +284,82 @@ class GardesMargeTest(unittest.TestCase):
                  ("external", "idle", "externe"))]
         with mock.patch.object(registry, "overview", return_value=rows):
             self.assertEqual(rebalance.live_fleet(object(), 100), {"live": "deepseek"})
+
+    # -- #1600 : une jauge illisible ne fait pas tomber l'affichage ---------
+
+    def test_offer_note_les_comptes_illisibles_sans_lever(self):
+        """#1600 : une lecture en erreur est comptée, la marge des autres reste."""
+        now = 1_000_000.0
+        bon = accounts.Profile("codex", "bon", hourly_usd=1)
+        mauvais = accounts.Profile("codex", "mauvais", hourly_usd=1)
+        gauge = cost.Gauge("codex", "long", 0.03, now + 6 * JOUR, 7 * JOUR)
+        book = mock.Mock(db=object())
+        book.codex_gauges.return_value = [gauge]
+        book.spent.return_value = 0
+        vrai = accounts.evaluate
+
+        def evaluate_ou_illisible(book_, profile, items, now_, **kw):
+            if profile.name == "mauvais":
+                raise RuntimeError("jauge illisible")
+            return vrai(book_, profile, items, now_, **kw)
+
+        illisibles: list = []
+        with (mock.patch.object(accounts, "check", return_value=[]),
+              mock.patch.object(accounts, "evaluate", side_effect=evaluate_ou_illisible)):
+            offer = rebalance._offer([bon, mauvais], ["cx"], now, book,
+                                     unreadable=illisibles)
+        self.assertGreater(offer.free, 0)          # la marge du compte lisible reste
+        self.assertEqual(offer.accounts, ("bon",))
+        self.assertEqual(illisibles, ["mauvais"])
+
+    def test_proposal_rend_une_raison_si_les_jauges_sont_illisibles(self):
+        """#1600 : `ameesh accounts list` dit pourquoi, au lieu de lever."""
+        from ameesh import auditor, sous_utilisation
+        cfg = SimpleNamespace(accounts={"codex": [{"name": "test", "hourly_usd": 1}]},
+                              critical_agents=(), host="test")
+        with (mock.patch.object(cost, "paid_harnesses_of", return_value=("deepseek",)),
+              mock.patch.object(auditor, "load_all", return_value=[]),
+              mock.patch.object(sous_utilisation, "declared_orchestrators", return_value=set()),
+              mock.patch.object(auditor, "is_critical", return_value=False),
+              mock.patch.object(accounts, "evaluate",
+                                side_effect=RuntimeError("jauge illisible"))):
+            prop = rebalance.proposal(cfg, object(), object(), now=1_000_000,
+                                      fleet={"dev1": "deepseek", "cx1": "codex"})
+        self.assertEqual((prop.movable, prop.moves), (0, ()))
+        self.assertIn("gauge readings unreadable for test", prop.text())
+
+    def test_report_garde_le_compte_illisible_sans_lever(self):
+        """#1600 : `accounts list` liste le compte en erreur au lieu de lever.
+
+        Le chemin d'affichage (`mesh_cli.cmd_accounts` -> `report`) tourne AVANT
+        `rebalance.proposal` : sans garde ici, une jauge illisible fait tomber la
+        commande avant même d'atteindre `_offer`.
+        """
+        cfg = SimpleNamespace(accounts={"codex": [{"name": "bon", "hourly_usd": 1},
+                                                  {"name": "mauvais", "hourly_usd": 1}]},
+                              host="test")
+        gauge = cost.Gauge("codex", "long", 0.03, 1_000_000.0 + 6 * JOUR, 7 * JOUR)
+        book = mock.Mock(db=object())
+        book.codex_gauges.return_value = [gauge]
+        book.spent.return_value = 0
+        vrai = accounts.evaluate
+
+        def evaluate_ou_illisible(book_, profile, items, now_, **kw):
+            if profile.name == "mauvais":
+                raise RuntimeError("jauge illisible")
+            return vrai(book_, profile, items, now_, **kw)
+
+        with (mock.patch.object(accounts, "check", return_value=[]),
+              mock.patch.object(accounts, "evaluate", side_effect=evaluate_ou_illisible)):
+            rows = accounts.report(cfg, None, book, now=1_000_000.0, record=False)
+        par_nom = {row["account"]: row for row in rows}
+        self.assertEqual(sorted(par_nom), ["bon", "mauvais"])
+        self.assertTrue(par_nom["bon"]["ok"])
+        self.assertFalse(par_nom["mauvais"]["ok"])
+        self.assertIn("gauge readings unreadable", par_nom["mauvais"]["reason"])
+        self.assertIn("jauge illisible", par_nom["mauvais"]["reason"])
+        self.assertEqual(par_nom["mauvais"]["gauges"], [])
+        # l'affichage texte garde la ligne du compte, avec sa raison
+        texte = accounts.format_rows(rows)
+        self.assertIn("mauvais", texte)
+        self.assertIn("gauge readings unreadable", texte)
