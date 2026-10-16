@@ -572,6 +572,32 @@ class ClaudeStreamJsonTest(DriverCase):
             driver.send("after")
         self.assertFalse(driver.probe())
 
+    def test_probe_is_a_bounded_round_trip_not_only_liveness(self):
+        # T3 (#285): the Claude probe is the `initialize` handshake sent again
+        # outside a turn; a process that lives but no longer answers its
+        # protocol fails it (DEAF: the fake never reads its input again)
+        driver = self.driver()
+        driver.start()
+        self.assertTrue(driver.probe(2.0))
+        self.assertEqual([e["control"] for e in self.trace() if "control" in e].count(
+            "initialize"), 2)                       # the start handshake, then the probe
+        self.assertEqual(self.wait(driver.send("DEAF")).status, resident.COMPLETED)
+        self.assertTrue(driver.alive)               # the process lives…
+        self.assertFalse(driver.probe(0.5))         # …but does not answer any more
+
+    def test_a_refused_probe_still_proves_the_harness_alive(self):
+        # T3 (#285): an answer, a refusal too, is a proof of life; only
+        # silence (or a process gone) is a failure
+        driver = self.driver()
+        driver.start()
+        with mock.patch.object(resident.ClaudeStreamJson, "_control",
+                               side_effect=resident.RequestRefused("initialize refused")):
+            self.assertTrue(driver.probe(0.1))
+        with mock.patch.object(resident.ClaudeStreamJson, "_control",
+                               side_effect=resident.ResidentError("no answer")):
+            self.assertFalse(driver.probe(0.1))
+        self.assertTrue(driver.probe(0.1))          # the mock is gone: it answers again
+
     def test_close_stops_the_group(self):
         driver = self.driver()
         driver.start()
