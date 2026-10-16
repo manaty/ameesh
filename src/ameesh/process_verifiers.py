@@ -38,7 +38,10 @@ Regles de decision :
 * la completion d'un type qui exige une revue (tous les types installes)
   **relie la livraison a la tete relue** qui a ete fusionnee/livree
   (`reviewed_head_for`) : une livraison acceptee sans verdict ok applicable ne
-  complete pas (`completion-review-missing`).
+  complete pas (`completion-review-missing`). Pour un type non-code, le
+  `outcome` est un **libelle client** non interpretable (aucune collection de
+  resultats cote B) : il est exige non vide, et la completion reste reliee a la
+  revue de la tete relue (N2 de la revue #1924).
 
 Registre fini (contrat #1379, commentaire 6207021753) : `GUARD_NAMES`. Types
 installes opt-in : `INSTALLED_TYPES` ; les types de code (`CODE_TYPES`)
@@ -425,30 +428,32 @@ def _milestone(snapshot: Snapshot, kind: str, sha: str = "") -> Mapping | None:
     return None
 
 
-def _verdict(snapshot: Snapshot, verdict: str, sha: str = "") -> Mapping | None:
-    for row in snapshot.milestones:
-        if _text(row.get("kind")) != "verdict":
-            continue
-        if _text(row.get("verdict")) != verdict:
-            continue
-        if sha and _text(row.get("sha")) != sha:
-            continue
-        return row
-    return None
+def _current_verdict(snapshot: Snapshot, sha: str) -> str:
+    """Le **dernier** verdict de chaque acteur sur cette revision.
 
-
-def _current_verdict(milestones, sha: str) -> str:
-    """Le **dernier** verdict enregistre sur cette revision (`""` si aucun).
-
-    Un verdict ok suivi d'un verdict bloque sur la meme revision ne vaut pas
-    ok : l'historique des verdicts est borne au verdict courant.
+    Un verdict n'est une revue que s'il porte un acteur reel, distinct de
+    l'assigne : l'auto-verdict de l'auteur (ok comme bloque) ne vaut pas
+    revue, et un verdict sans acteur n'est pas attribuable. Le blocage d'un
+    relecteur n'est leve que par un ok plus recent du meme relecteur ; le ok
+    d'un autre ne le masque pas (N1 de la revue #1924, regle du registre
+    #1756). Rend `"blocked"` si un blocage tient, sinon `"ok"` si une revue
+    est ok, sinon `""`.
     """
-    verdict = ""
-    for row in milestones or ():
-        if (_text(row.get("kind")) == "verdict"
-                and _text(row.get("sha")) == sha):
-            verdict = _text(row.get("verdict"))
-    return verdict
+    assignee = _text(snapshot.item.get("assignee"))
+    latest: dict[str, str] = {}
+    for row in snapshot.milestones or ():
+        if (_text(row.get("kind")) != "verdict"
+                or _text(row.get("sha")) != sha):
+            continue
+        actor = _text(row.get("actor"))
+        if not actor or actor == assignee:
+            continue
+        latest[actor] = _text(row.get("verdict"))
+    if "blocked" in latest.values():
+        return "blocked"
+    if "ok" in latest.values():
+        return "ok"
+    return ""
 
 
 def _observation(snapshot: Snapshot, ident: str) -> Mapping | None:
@@ -458,18 +463,37 @@ def _observation(snapshot: Snapshot, ident: str) -> Mapping | None:
     return None
 
 
-def _witness(snapshot: Snapshot, observation_id: str) -> Mapping | None:
-    """Le recu B accepte qui reference cette observation, s'il existe.
+def _receipt_facts(receipt: Mapping) -> Mapping:
+    """Les faits structures d'un recu B (#1922).
 
-    Un recu explicitement non accepte ne prouve rien ; l'absence du drapeau
-    vaut accepte (la collection ne porte que des recus acceptes).
+    B projette `facts` (les faits du client) a cote du blob
+    `process-receipt/1` garde sous `evidence` ; un recu brut non projete porte
+    les memes faits dans `evidence.facts`. Rend un mapping vide si rien n'est
+    lisible : aucun fait simule.
+    """
+    facts = receipt.get("facts")
+    if isinstance(facts, Mapping):
+        return facts
+    evidence = receipt.get("evidence")
+    if isinstance(evidence, Mapping):
+        nested = evidence.get("facts")
+        if isinstance(nested, Mapping):
+            return nested
+    return {}
+
+
+def _witness(snapshot: Snapshot, observation_id: str) -> Mapping | None:
+    """Le recu B accepte dont les faits referencent cette observation.
+
+    Un recu explicitement non accepte ne prouve rien ; B ne projette que des
+    recus acceptes (`command_id` non nul). Les faits sont lus dans la
+    projection `facts` de B, jamais dans un `evidence.observation` direct
+    (N7 de la revue #1924).
     """
     for receipt in snapshot.receipts:
         if receipt.get("accepted") is False:
             continue
-        evidence = receipt.get("evidence") or {}
-        if isinstance(evidence, Mapping) and _text(
-                evidence.get("observation")) == observation_id:
+        if _text(_receipt_facts(receipt).get("observation")) == observation_id:
             return receipt
     return None
 
@@ -492,9 +516,10 @@ def _failed_observation(snapshot: Snapshot, ident: str = "") -> Mapping | None:
 
 
 def _closed(snapshot: Snapshot) -> bool:
+    """Lot terminal : `closed` comme `promoted` (N5 de la revue #1924)."""
     if snapshot.item.get("closed_at"):
         return True
-    return _text(snapshot.item.get("state")) == "closed"
+    return _text(snapshot.item.get("state")) in ("closed", "promoted")
 
 
 #: Jalons qui portent une revision reelle.
@@ -630,11 +655,16 @@ def _check_qa_repair(command: Command, snapshot: Snapshot) -> Decision:
     if not sha:
         return _refuse("revision-missing",
                        "snapshot sans revision de travail", snapshot)
+    # R2 de la revue #1924 : sans gel, la tete de la commande n'est comparable
+    # a rien ; fail-closed comme qa_started.
+    if _milestone(snapshot, "frozen", sha) is None:
+        return _refuse("freeze-missing",
+                       "aucun gel de la revision %s" % sha, snapshot)
     if current and sha != current:
         return _refuse("revision-mismatch",
                        "verdict de %s : la tete relue est %s"
                        % (sha, current), snapshot)
-    if _current_verdict(snapshot.milestones, sha) != "blocked":
+    if _current_verdict(snapshot, sha) != "blocked":
         return _refuse("verdict-missing",
                        "aucun verdict bloque sur la revision %s" % sha, snapshot)
     if _loops(snapshot) >= MAX_REPAIRS:
@@ -653,9 +683,12 @@ def _observation_proof(command: Command, snapshot: Snapshot, env: str,
     ident = _ref(command, ref_key)
     observation = _observation(snapshot, ident)
     if observation is None:
-        return _refuse("source-unavailable",
-                       "observation %s non installee" % (ident or "(absente)"),
-                       snapshot)
+        # N4 de la revue #1924 : la collection est collectee (exigee par la
+        # matrice), une observation absente est une preuve manquante, pas une
+        # source indisponible.
+        return _refuse("evidence-missing",
+                       "observation %s inconnue de la collection collectee"
+                       % (ident or "(absente)"), snapshot)
     if _text(observation.get("env")) != env:
         return _refuse("observation-result-mismatch",
                        "observation %s hors de l'environnement %s"
@@ -747,18 +780,47 @@ def _check_repair_started(command: Command, snapshot: Snapshot) -> Decision:
 
 
 def _check_stop_work(command: Command, snapshot: Snapshot) -> Decision:
+    """Arret explicite : abandon, ou supersession par un lot distinct.
+
+    N6 de la revue #1924 : C ne dispose d'aucune collection de lots, donc
+    l'**existence** du lot remplacant n'est pas prouvable ici. Ce qui est
+    lisible dans le snapshot est verifie : le remplacant est un identifiant de
+    lot (entier positif, ou sa chaine) et ne peut pas etre le lot lui-meme
+    (meme regle que `work.close` cote natif). Une collection
+    `items` cote B permettra d'exiger l'existence reelle sans nouveau pouvoir
+    de gouvernance.
+    """
     reason = _ref(command, "reason")
     if reason not in ("abandoned", "superseded"):
         return _refuse("evidence-invalid",
                        "raison d'arret attendue: abandoned ou superseded", snapshot)
-    if reason == "superseded" and not _present(
-            (command.references or {}).get("superseded_by")):
-        return _refuse("evidence-missing",
-                       "supersession sans lot remplacant", snapshot)
+    if reason == "superseded":
+        replaced_by = (command.references or {}).get("superseded_by")
+        if not _present(replaced_by):
+            return _refuse("evidence-missing",
+                           "supersession sans lot remplacant", snapshot)
+        replacement = _as_int(replaced_by)
+        if replacement <= 0:
+            return _refuse("evidence-invalid",
+                           "lot remplacant %r : identifiant de lot attendu"
+                           % (replaced_by,), snapshot)
+        if replacement == _as_int(snapshot.item.get("id")):
+            return _refuse("evidence-invalid",
+                           "supersession du lot par lui-meme", snapshot)
     return _accept(command, ("reason",))
 
 
 def _check_work_completed(command: Command, snapshot: Snapshot) -> Decision:
+    """Completion par type, sur preuves reelles.
+
+    N2 de la revue #1924 : pour un type non-code, `outcome` est un **libelle
+    client** — B ne publie aucune collection de resultats, C n'en interprete
+    donc pas le contenu. Le rattachement exigible est celui de la tete relue :
+    tous les types installes exigent la revue, et la completion n'est acceptee
+    que sur une revision dont la tete relue applicable porte un verdict
+    courant `ok` (`completion-review-missing` sinon). Un libelle seul, sans
+    revue applicable, ne complete pas.
+    """
     revision = _revision(snapshot)
     if not revision:
         return _refuse("revision-missing",
@@ -788,7 +850,7 @@ def _check_work_completed(command: Command, snapshot: Snapshot) -> Decision:
                        "resultat propre du type non-code requis", snapshot)
     if policy.requires_review:
         head = reviewed_head_for(snapshot.milestones, revision)
-        if _current_verdict(snapshot.milestones, head) != "ok":
+        if _current_verdict(snapshot, head) != "ok":
             return _refuse("completion-review-missing",
                            "revue applicable absente ou non ok sur la tete "
                            "relue %s" % (head or "(absente)"), snapshot)
@@ -816,22 +878,22 @@ _SPECS = (
               ("milestones", "receipts", "observations"),
               ("merge", "staging"), (), _check_merged_and_staging_deployed),
     GuardSpec("staging_pass", "observation staging pass de la revision",
-              ("receipts", "observations"), ("staging",), (),
+              ("milestones", "receipts", "observations"), ("staging",), (),
               _check_staging_pass),
     GuardSpec("staging_failure", "observation staging fail et reparation permise",
-              ("receipts", "observations"), ("staging",), (),
+              ("milestones", "receipts", "observations"), ("staging",), (),
               _check_staging_failure),
     GuardSpec("preprod_deployed", "observation preprod deployee de la revision",
-              ("receipts", "observations"), ("preprod",), (),
+              ("milestones", "receipts", "observations"), ("preprod",), (),
               _check_preprod_deployed),
     GuardSpec("preprod_pass", "observation preprod pass de la revision",
-              ("receipts", "observations"), ("preprod",), (),
+              ("milestones", "receipts", "observations"), ("preprod",), (),
               _check_preprod_pass),
     GuardSpec("preprod_failure", "observation preprod fail et reparation permise",
-              ("receipts", "observations"), ("preprod",), (),
+              ("milestones", "receipts", "observations"), ("preprod",), (),
               _check_preprod_failure),
     GuardSpec("repair_started", "reparation engagee sur un echec observe",
-              ("receipts", "observations"), ("failure",), (),
+              ("milestones", "receipts", "observations"), ("failure",), (),
               _check_repair_started),
     GuardSpec("stop_work", "arret explicite (abandon/supersession)",
               (), ("reason",), ("superseded_by",), _check_stop_work),
@@ -1122,7 +1184,9 @@ def completion_policy(kind: str) -> CompletionPolicy:
 
     Les types de code exigent une livraison/acceptation reelle et la revue
     applicable ; les autres leur propre resultat et la revue applicable. Aucun
-    type ne complete sur une PR de promotion seule.
+    type ne complete sur une PR de promotion seule. Pour un type non-code, le
+    resultat est le libelle client `outcome` (aucune collection de resultats
+    cote B) : sa verification est le rattachement a la tete relue (N2).
     """
     if kind in CODE_TYPES:
         return CompletionPolicy(kind, True, True, True,
