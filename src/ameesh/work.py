@@ -432,6 +432,69 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
     return row
 
 
+#: #2102 : le début de la ligne de journal d'un détachement, suivi du nom
+#: court de la branche et d'une espace ; le relevé des fusions n'associe plus
+#: implicitement (L118b) une branche ainsi détachée
+DETACH_NOTE = "branch detached: "
+
+
+def _detach_prefix(branch: str) -> str:
+    from . import plan_git
+
+    return "%s%s " % (DETACH_NOTE, plan_git.short_branch(branch))
+
+
+def is_detached(st, item_id: int, branch: str) -> bool:
+    """#2102 : la branche `branch` a été détachée du lot par `detach_branch`
+    (une ligne de journal la nomme). `st` : le stockage (`storage.of`)."""
+    prefix = _detach_prefix(branch)
+    return any((e.get("note") or "").startswith(prefix)
+               for e in st.work.assignment_events(int(item_id), [prefix]))
+
+
+def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: str,
+                  actor: str = "") -> dict:
+    """#2102 : retire la branche d'un lot ouvert (PR fermée ou supplantée),
+    sans toucher à son état, son titulaire ni son relecteur ; journalisé avec
+    la raison et le dernier commit vu. Git n'est pas touché : la branche et
+    ses commits restent là où ils sont. Le relevé des fusions ne réassocie
+    plus implicitement ce nom ; une réassociation se fait explicitement
+    (`set_branch`, `ameesh work branch <id> <branche>`).
+
+    `branch` : la branche à détacher, par défaut celle du lot ; un lot sans
+    branche peut nommer celle à ne plus associer (détachement fait hors CLI).
+    Un nom déjà détaché d'un lot sans branche ne réécrit rien. Rend le lot."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise WorkError("a detachment needs a reason (--reason)")
+    named, _ = _branch_args(branch, None)
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    from . import plan_git
+
+    current = item.get("branch") or None
+    name = named or current
+    if not name:
+        raise WorkError("lot %s has no branch: name the branch to detach" % item_id)
+    if current and plan_git.short_branch(name) != plan_git.short_branch(current):
+        raise WorkError("lot %s carries the branch %s, not %s" % (item_id, current, name))
+    st = storage.of(db)
+    if not current and is_detached(st, item_id, name):
+        return item
+    head = (item.get("branch_head") or "").strip()
+    note = "%s(%s%s) — %s; the merge sweep no longer associates it implicitly " \
+           "(to associate it again: ameesh work branch %d %s)" % (
+               _detach_prefix(name),
+               "last seen %s" % head[:12] if head else "no commit seen",
+               ", target %s" % item["branch_target"] if item.get("branch_target") else "",
+               reason, int(item_id), plan_git.short_branch(name))
+    row = st.work.set_branch(item_id, None, None, note=note, actor=actor)
+    if row is None:
+        raise WorkError("lot %s already %s: branch not detached" % (item_id, item["state"]))
+    return row
+
+
 # --------------------------------------------------------------------------
 # numéro de migration réservé (L122)
 # --------------------------------------------------------------------------

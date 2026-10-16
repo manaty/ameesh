@@ -1451,6 +1451,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     if not branch:
         if lot not in implicits:
             implicits[lot] = implicit_branch(repo, lot)
+            # #2102 : une branche détachée explicitement n'est plus devinée
+            if implicits[lot] and work_mod.is_detached(st, lot, implicits[lot]):
+                implicits[lot] = None
         branch = implicits[lot]
         implicit = bool(branch)
     if off_target:
