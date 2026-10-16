@@ -38,10 +38,11 @@ import datetime as dt
 import json
 import os
 import shutil
+import types
 import unittest
 from unittest import mock
 
-from ameesh import canon, canon_sync, config as config_mod, mail, registry, reprise
+from ameesh import canon, canon_sync, config as config_mod, mail, registry, reprise, storage
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -670,7 +671,61 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.sync()
         old = canon_sync.sync_processes(self.db, revision_y, "atelier", ["orchestre"])
         self.assertEqual(old.sent, 0)
+        # #1464 : un sync en retard (repère plus récent) n'est PAS une
+        # divergence : il ne doit rien signaler.
+        self.assertEqual(old.error, "")
         self.assertEqual(len(self._sujets("orchestre")), 2)
+
+    def test_un_repere_fige_par_reecriture_est_signale(self):
+        # #1464 (N1 #793) : le canon est réécrit (le commit du repère n'est plus
+        # dans l'histoire) : le diff est impossible, les envois s'arrêteraient
+        # en silence — le sync le dit, garde le repère et ne pousse rien.
+        self.sync()
+        self._change("# Processus de lot\n\n- règle Y\n")
+        self.sync()
+        fige = canon_sync.state(self.db, "atelier")["process_commit"]
+        self.assertTrue(fige)
+        # réécriture forcée : C1 (le repère) disparaît de la référence, C2 le
+        # remplace sur la même base
+        git(self.clone, "reset", "--hard", "HEAD~1")
+        write(self.clone, RACINE, carte(body="# Processus de lot\n\n- règle Z\n"))
+        commit_all(self.clone, "règle Z (histoire réécrite)", push=False)
+        git(self.clone, "push", "-q", "--force", "origin", "HEAD")
+        git(self.clone, "fetch", "-q", "origin")
+        rapport = self.sync()
+        self.assertEqual((rapport.processes.sent, rapport.processes.changed), (0, []))
+        self.assertIn("is not in the history", rapport.processes.error)
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"], fige)
+        # la règle Y était passée, Z (dans l'histoire réécrite) ne passe pas
+        self.assertEqual(len(self._sujets("orchestre")), 1)
+        # le constat est durable : le sync suivant ne redevient pas muet
+        encore = self.sync()
+        self.assertIn("is not in the history", encore.processes.error)
+        # l'exécuteur (le chemin de production) le dit aussi, une fois posé
+        fake = types.SimpleNamespace(
+            cfg=dataclasses.replace(self.cfg, canon=self.clone, canon_ref="",
+                                    canon_untrusted=False),
+            host="atelier")
+        with mock.patch("ameesh.runner.log_async") as journal:
+            self.assertTrue(Runner.canon_sync_once(fake))
+            lignes = [appel.args[0] for appel in journal.call_args_list]
+        self.assertTrue(any("is not in the history" in ligne for ligne in lignes), lignes)
+
+    def test_la_copie_d_etat_emporte_le_repere_d_envoi(self):
+        # #1464 (N2 #793) : quand le canon par défaut change, l'état est
+        # recopié sous la clé de l'ancien canon ; le repère d'envoi
+        # (`process_commit`) doit voyager avec lui, sinon le repli sur
+        # `last_good_commit`, plus ancien, repousse des règles déjà passées.
+        self.sync()
+        self._change("# Processus de lot\n\n- règle Y\n")
+        self.sync()
+        etat = canon_sync.state(self.db, "atelier")
+        self.assertTrue(etat["process_commit"])
+        with self.db.transaction() as tx:
+            storage.of(tx).canon.rebase_default("atelier", "ancien-canon")
+        copie = canon_sync.state(self.db, "atelier", "ancien-canon")
+        self.assertEqual(copie["process_commit"], etat["process_commit"])
+        self.assertEqual(copie["last_good_commit"], etat["last_good_commit"])
 
     def test_une_modification_hors_process_ne_pousse_rien(self):
         self.sync()

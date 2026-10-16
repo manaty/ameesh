@@ -2047,7 +2047,10 @@ class Canon(Domain):
         l'hôte (et les paquets sans canon) reçoivent l'identifiant `previous`.
         L44 : les actions aussi ('' → `previous`, puis `new_default` → '').
         L46 : les lignes (agents, éphémères compris, et paquets) du nouveau
-        canon par défaut `new_default` repassent à NULL."""
+        canon par défaut `new_default` repassent à NULL.
+        #1464 (N2 #793) : l'état recopié sous la clé `previous` emporte le
+        repère d'envoi `process_commit` — sans lui, les règles déjà poussées
+        repartent une fois (repli sur `last_good_commit`)."""
 
     @abc.abstractmethod
     def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:

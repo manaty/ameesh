@@ -7092,6 +7092,17 @@ class Runner:
                         log_async("canon sync%s: %s (%s)" % (
                             " %s" % canon.id if len(loaded) > 1 else "", status,
                             getattr(report, "diagnostic", None) or "no detail"))
+                    # #1464 (N1 #793) : un repère d'envoi figé (canon réécrit)
+                    # arrête les poussées de règles pour toujours ; on le dit
+                    # une fois par incident, pas à chaque passe.
+                    processes = getattr(report, "processes", None)
+                    push_error = getattr(processes, "error", "") if processes else ""
+                    if push_error != getattr(self, "_process_push_error", ""):
+                        self._process_push_error = push_error
+                        if push_error:
+                            log_async("canon process rules%s: %s" % (
+                                " %s" % canon.id if len(loaded) > 1 else "",
+                                push_error))
                 except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
                     ok = False
                     log_async("canon sync failed%s: %s" % (
