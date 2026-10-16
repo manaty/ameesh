@@ -81,6 +81,37 @@ manifeste qui couvre ce membre, reste due avant promotion ; l'absence de CI
 individuelle n'est jamais exposée comme un statut vert. Le paquet 26 et la
 demande d'admission manuelle de codex3 à impl-02 restent hors de ce raccord.
 
+### Qualification préalable sans génération
+
+`Preparation` relie maintenant le candidat déclaré à la tête publiée, à la
+politique versionnée et à la lecture historique complète. Il relit le lot
+`qa` et ses bornes projet/branche/cible, puis fetch la base et la branche dans
+le clone privé. Un SHA abrégé est résolu dans ces objets ; une branche déplacée
+ou supprimée reste refusée même si le clone possède encore l'ancien commit.
+
+```python
+prepared = train_candidates.Preparation(
+    db, project, repository=repository, history=recorded_history,
+    policy=qualified_review_policy,
+).prepare(candidate, current_base)
+```
+
+Le sujet rendu ne porte aucune génération. `Recorded.qualify_subject` partage
+les contrôles historiques de `Recorded.qualify`, dont le dernier gel exact,
+les auteurs et les avis indépendants ; le second conserve sa preuve d'admission
+existante avec génération. Un candidat dérivé d'un verdict reste visible dans
+l'inventaire, sans pouvoir devenir un gel déclaré par ce lecteur.
+
+Huit cas Git réel/stockage simulé couvrent succès, SHA abrégé, branche distante
+déplacée/supprimée, sujet modifié, base différente, gel renouvelé, preuves
+manquantes, léger sans avis, blocage et release. Le probe fournisseur exact
+ajoute le parcours inventaire → préparation. Un cas Git/SQL réel prouve que
+la préparation laisse la file vide et les jalons inchangés, puis alloue
+explicitement une génération dans le stockage de test et la qualifie en mode
+`packet`, sans CI individuelle. Cet appel de fixture ne branche aucun écrivain
+dans le produit. L'inscription automatique et ses courses de réadmission restent
+à raccorder après qualification du geste par le pilote.
+
 ## Port de transport qualifié
 
 Source de ce raccord : cadrage mesh-design **#69852 du 16 octobre à 03:12**,

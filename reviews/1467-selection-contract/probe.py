@@ -6,12 +6,13 @@ Only consumer scenarios below run, not the supplier's suite.
 """
 import argparse
 import copy
+import os
 import re
 import subprocess
 import types
 import unittest
 
-from ameesh import train, train_candidates
+from ameesh import resolutions, train, train_admissions, train_candidates, train_git
 from tests.test_1467_train_history import RecordedHistoryTest
 
 
@@ -38,6 +39,26 @@ class SelectionBoundary(RecordedHistoryTest):
         self.assertEqual((candidate["origin"], candidate["sha"]), ("verdict", self.head))
         with self.assertRaisesRegex(train.TrainError, "current freeze missing"):
             self.qualify()
+
+    def test_supplier_candidate_reaches_preparation_without_queue_identity(self):
+        candidate = self.inventory()["candidates"][0]
+        self.git("branch", "develop", self.base)
+        self.git("branch", "agent/member", self.head)
+        project = types.SimpleNamespace(name="nexlink", repo=self.path, target="develop")
+        self.ops.get.return_value = dict(id=1, app="nexlink", state="qa", branch="agent/member",
+                                        branch_target="develop", type="improvement")
+        clone = resolutions.Replayer(self.path, os.path.join(self.path, "private.clone"))
+        repository = train_git.Repository(project, clone)
+        self.history.path = clone.path
+        policy = lambda item, row, base, path: train_admissions.Requirement(
+            row["work_item_id"], base, row["frozen_sha"], "sensitive", 2, self.base)
+        proof = train_candidates.Preparation(None, project, repository=repository,
+            history=self.history, policy=policy).prepare(candidate, self.base)
+        self.assertEqual(proof["subject"]["frozen_sha"], self.head)
+        self.assertNotIn("generation", proof["subject"])
+        self.assertEqual(set(proof["history"]["reviews"]["coverage"]), {self.first, self.head})
+        self.assertEqual([call[0] for call in self.ops.mock_calls],
+                         ["items", "milestones", "get", "milestones"])
 
     def test_stale_declared_freeze_is_diagnostic_not_queue_rewrite(self):
         self.marks[0]["sha"] = self.first
@@ -103,6 +124,7 @@ def main():
     names = (
         "test_inventory_reads_the_supplier_without_manufacturing_a_queue_entry",
         "test_inventory_preserves_a_derived_candidate_without_promoting_it_to_a_freeze",
+        "test_supplier_candidate_reaches_preparation_without_queue_identity",
         "test_stale_declared_freeze_is_diagnostic_not_queue_rewrite",
         "test_missing_declared_freeze_is_visible_without_inventing_a_generation",
         "test_light_candidate_needs_no_verdict_but_preserves_exact_author_history",

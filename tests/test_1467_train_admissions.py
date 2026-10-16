@@ -7,7 +7,8 @@ import subprocess
 import types
 from unittest import mock
 
-from ameesh import storage, train, train_admissions, train_history, train_policy, work
+from ameesh import (resolutions, storage, train, train_admissions, train_candidates,
+                    train_git, train_history, train_policy, work)
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
 
@@ -151,6 +152,38 @@ class TrainAdmissionsTest(PgTestCase):
                                actor="fixture", verdict=None, note="new gel")
         with self.assertRaisesRegex(train.TrainError, "latest exact freeze"):
             self.admissions.qualify([entry], base, "packet")
+
+    def test_qa_preparation_precedes_real_generation_and_keeps_packet_ci_pending(self):
+        base, first, head, old_entry = self.recorded_admission()
+        item = old_entry["work_item_id"]
+        self.db.execute("DELETE FROM merge_queue WHERE work_item_id = %s", (item,))
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (item,))
+        for name, sha in (("main", base), ("lot/admission", head)):
+            subprocess.run(["git", "-C", self.tmp, "branch", name, sha],
+                           check=True, capture_output=True)
+        clone = resolutions.Replayer(self.tmp, os.path.join(self.tmp, "private.clone"))
+        repository = train_git.Repository(self.project, clone)
+        history = train_history.Recorded(self.db, clone.path, provider=self.admissions.history.provider)
+        self.admissions.history = history
+        preparation = train_candidates.Preparation(self.db, self.project,
+            repository=repository, history=history, policy=self.admissions.policy)
+        freeze = next(mark for mark in self.ops.milestones(item, None)
+                      if mark["id"] == old_entry["frozen_id"])
+        candidate = dict(work_item_id=item, branch="lot/admission", target="main", causes=[],
+                         candidate=dict(sha=head[:12], origin="frozen", declared=freeze))
+        marks_before = self.ops.milestones(item, None)
+        subject = preparation.prepare(candidate, base)["subject"]
+        self.assertEqual(self.ops.queue(None), [])
+        self.assertNotIn("generation", subject)
+        # This explicit fixture call, outside Preparation, is the only
+        # allocation. No individual CI or production runtime is involved.
+        entry = self.ops.queue_add(item, target=subject["target"], frozen_sha=subject["frozen_sha"],
+            frozen_id=subject["frozen_id"], source=subject["source"], actor="fixture", note="fixture")
+        self.assertGreater(entry["generation"], old_entry["generation"])
+        proof = self.admissions.qualify([entry], base, "packet")["members"][0]
+        self.assertEqual(set(proof["history"]["reviews"]["coverage"]), {first, head})
+        self.assertNotIn("targeted_ci", proof)
+        self.assertEqual(self.ops.milestones(item, None), marks_before)
 
     def test_light_admission_with_no_verdict_uses_versioned_zero_review_policy(self):
         # #1734: a LIGHT lot must not disappear behind a positive-vote filter.

@@ -234,6 +234,16 @@ avant l'inscription que le train consomme. L'inscription explicite, après
 qualification historique/politique/branche publiée et par le stockage réel,
 reste à raccorder ; la preuve complète du paquet reste due avant promotion.
 
+`train_candidates.Preparation` réalise cette qualification préalable en
+lecture seule. Il relit le sujet `qa`, refuse releases et candidatures dérivées
+d'un avis, résout le SHA éventuellement abrégé contre les objets de la branche
+fraîchement lue et exige la base courante exacte. La politique versionnée et
+`Recorded.qualify_subject` vérifient ensuite le gel déclaré actuel, chaque
+auteur et les avis requis. Le résultat conserve un sujet sans génération ;
+ce n'est pas une admission. L'allocation reste un geste distinct du stockage
+réel, suivi de la qualification de sa génération par `Admissions`. Ni ce
+résultat ni une ancienne préparation ne peuvent remplacer cette revalidation.
+
 Le fournisseur de politique reste obligatoire : il reçoit le lot courant,
 l'admission, la base exacte et le dépôt d'historique. Il doit rendre un
 `Requirement` sur ce lot/base/tête, avec classe et nombre d'avis connus,

@@ -25,6 +25,16 @@ class Recorded:
         return resolutions._text(proc)
 
     def qualify(self, row, base, *, required):
+        proof = self.qualify_subject(row, base, required=required)
+        return dict(schema="ameesh-train-history/1", base=base,
+                    admission=identity(row), reviews=proof["reviews"])
+
+    def qualify_subject(self, row, base, *, required):
+        """Qualify a real freeze before queue allocation, without a generation.
+
+        This is historical evidence only. Admission still needs an actual
+        queue insertion and a fresh qualification of that persisted identity.
+        """
         head = row["frozen_sha"]
         if not isinstance(base, str) or not train_review.SHA.fullmatch(base) \
                 or not isinstance(head, str) or not train_review.SHA.fullmatch(head):
@@ -53,5 +63,6 @@ class Recorded:
             distinct_families=self.review_rules.distinct_families)
         proof = train_review.qualify_recorded(self.db, head, commits, marks,
             required=required, provider=self.provider, **independence)
-        return dict(schema="ameesh-train-history/1", base=base,
-                    admission=identity(row), reviews=proof)
+        return dict(schema="ameesh-train-subject-history/1", base=base,
+                    subject={key: row[key] for key in
+                             ("work_item_id", "frozen_id", "frozen_sha")}, reviews=proof)
