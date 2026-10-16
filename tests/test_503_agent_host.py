@@ -68,12 +68,41 @@ elif sys.argv[1] == 'show':
     if scenario == 'db-ahead': row['lease_expires_ts'] = time.time()+30
     if scenario == 'moved-before': row['host'] = 'elsewhere'
     if scenario == 'always-busy': row['status'] = 'running'
+    # #2152 : un agent qui enchaîne les tours ne rend la main qu'une fois
+    # drainé ; « chaines-toujours » ne la rend jamais.
+    if name == 'dev9' and scenario in ('chaines', 'chaines-pause-error',
+                                       'chaines-resume-error', 'pause-concurrente') \
+            and not (state / 'pause-dev9').exists():
+        row['status'] = 'running'
+    if name == 'dev9' and scenario == 'chaines-toujours':
+        row['status'] = 'running'
+    if (state / ('pause-' + name)).exists():
+        row['operator_paused'] = True
     if (state / ('restart-' + name)).exists():
         row['lease_epoch'] = 9 if scenario != 'stale-lease' else 7
         if scenario == 'moved': row['host'] = 'elsewhere'
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
+elif sys.argv[1] in ('pause', 'resume'):
+    # #2152 : les gestes du drain, avec le « changed » que lit le script.
+    name = sys.argv[2]
+    args = sys.argv[3:]
+    with (state / 'operateur.log').open('a') as f:
+        f.write('%s %s %s\n' % (sys.argv[1], name, ' '.join(args)))
+    if '--reason' not in args: sys.exit(2)
+    if sys.argv[1] == 'pause':
+        if scenario == 'chaines-pause-error': sys.exit(1)
+        (state / ('pause-' + name)).touch()
+        change = scenario != 'pause-concurrente'
+        print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': True,
+                          'changed': change, 'event_id': 1}))
+    else:
+        if '--operator' not in args: sys.exit(2)
+        if scenario == 'chaines-resume-error': sys.exit(1)
+        (state / ('pause-' + name)).unlink(missing_ok=True)
+        print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': False,
+                          'changed': True, 'event_id': 2}))
 elif sys.argv[1] == 'doctor':
     print('doctor ok')
 else: sys.exit(2)
@@ -137,6 +166,12 @@ scenario = (Path(os.environ['FAKE_STATE']) / 'scenario').read_text()
 print(time.time() + (60 if scenario == 'db-ahead' else 0))
 '''
 
+#: #2152 : le drain se décide sur l'horloge réelle (SECONDS de bash). Seule
+#: l'attente de la boucle de redémarrage (15 s) fait avancer le banc d'une
+#: demi-seconde ; les attentes de bail (5 s) restent instantanées.
+SLEEP = '#!/bin/sh\n[ "$1" = 15 ] && exec %s 0.5\nexit 0\n' % (
+    shutil.which('sleep') or '/bin/sleep')
+
 
 class AgentHostTest(unittest.TestCase):
     def setUp(self):
@@ -152,7 +187,7 @@ class AgentHostTest(unittest.TestCase):
         self.config = self.root / 'bascule.env'
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
-                             ('systemctl', SYSTEMCTL), ('systemd-run', SYSTEMD_RUN), ('db-python', DB_PYTHON), ('sleep', '#!/bin/sh\nexit 0\n'),
+                             ('systemctl', SYSTEMCTL), ('systemd-run', SYSTEMD_RUN), ('db-python', DB_PYTHON), ('sleep', SLEEP),
                              ('id', '#!/bin/sh\necho 1001\n'),
                              ('journalctl', '#!/bin/sh\nexit 0\n')]:
             path = self.bin / name; path.write_text(source); path.chmod(0o755)
@@ -175,6 +210,11 @@ class AgentHostTest(unittest.TestCase):
 
     def units(self):
         path = self.state / 'units.log'
+        return path.read_text() if path.exists() else ''
+
+    def operateur(self):
+        """#2152 : les gestes de pause/reprise réellement demandés au CLI."""
+        path = self.state / 'operateur.log'
         return path.read_text() if path.exists() else ''
 
     def test_missing_runner_env_fails_before_any_execution(self):
@@ -229,6 +269,86 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm(scenario='busy-once')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertTrue((self.state / 'busy-seen').exists())
+        # Un tour qui finit tout seul ne déclenche aucun drain.
+        self.assertEqual(self.operateur(), '')
+
+    def test_drain_poses_and_lifts_a_short_operator_pause(self):
+        """#2152 : un agent qui enchaîne les tours est drainé (pause opérateur
+        courte), redémarré hors tour, puis la pause est levée et prouvée."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='chaines')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        journal = self.operateur()
+        self.assertIn('pause dev9', journal)
+        self.assertIn('resume dev9', journal)
+        # Le motif de la pause nomme le drain (journalisé par le mesh).
+        self.assertIn('drain de déploiement #2152', journal)
+        self.assertIn('--reason', journal)
+        # Posé avant le redémarrage, et redémarré seulement hors tour.
+        self.assertLess(p.stdout.index('drain posé'), p.stdout.index('dev9 : redémarré'))
+        self.assertIn('dev9 : redémarré (était idle)', p.stdout)
+        self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
+        self.assertIn('reprise prouvée (operator_paused=false)', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_drain_refused_stops_without_restarting_the_agent(self):
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='chaines-pause-error')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('pose du drain refusée', p.stderr)
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertNotIn('resume dev9', self.operateur())
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_drain_lifts_the_pause_when_the_timeout_is_reached(self):
+        """Le drain ne doit pas survivre à un échec : le trap de sortie le lève."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        # 5 s : le drain (1 s) est posé avant l'échéance globale, même si la
+        # première passe (redémarrage des autres agents) consomme 1 à 2 s.
+        self.env['ATTENTE_MAX'] = '5'
+        p = self.run_vm(scenario='chaines-toujours')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('toujours en tour', p.stderr)
+        self.assertIn('pause dev9', self.operateur())
+        self.assertIn('resume dev9', self.operateur())
+        self.assertIn('drain levé (sortie du script)', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_resume_failure_is_named_and_the_hold_stays_visible(self):
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='chaines-resume-error')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('drain NON levé', p.stderr)
+        self.assertIn('ameesh resume dev9 --operator', p.stderr)
+        self.assertTrue((self.state / 'pause-dev9').exists())
+
+    def test_foreign_pause_is_neither_doubled_nor_lifted(self):
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'pause-dev9').touch()
+        p = self.run_vm(scenario='chaines')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('pause dev9', self.operateur())
+        self.assertNotIn('resume dev9', self.operateur())
+        self.assertTrue((self.state / 'pause-dev9').exists())
+        self.assertIn('restart ameesh-runner-agent@dev9.service', self.units())
+
+    def test_concurrent_pause_is_left_in_place(self):
+        """Posée entre notre lecture et notre pause : elle n'est pas de nous."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='pause-concurrente')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('pause dev9', self.operateur())
+        self.assertNotIn('resume dev9', self.operateur())
+        self.assertIn('déjà posée par un autre acteur', p.stdout)
+        self.assertTrue((self.state / 'pause-dev9').exists())
+
+    def test_drain_disabled_by_zero(self):
+        self.env['DRAIN_ATTENTE'] = '0'
+        self.env['ATTENTE_MAX'] = '0'
+        p = self.run_vm(scenario='chaines-toujours')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('toujours en tour', p.stderr)
+        self.assertEqual(self.operateur(), '')
 
     def test_restart_rejects_unchanged_lease(self):
         for scenario in ['stale-lease']:
@@ -328,6 +448,8 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('toujours en tour', p.stderr)
         self.assertEqual(self.units(), '')
+        # Le délai global tombe avant DRAIN_ATTENTE (300 s) : aucun drain.
+        self.assertEqual(self.operateur(), '')
 
     def test_registry_errors_fail_before_restart(self):
         for scenario in ['list-error', 'bad-json']:

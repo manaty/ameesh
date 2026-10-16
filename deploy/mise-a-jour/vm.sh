@@ -16,7 +16,10 @@
 #   installer    code REF dans /opt/ameesh/src (détaché), installé dans
 #                /opt/ameesh/venv (dépendance psycopg comprise) ; refuse tant
 #                que la base du mesh n'a pas toutes les migrations de REF
-#   redemarrer   ameesh-runner@<persona>, une par une, chacune hors tour ;
+#   redemarrer   ameesh-runner@<persona>, une par une, chacune hors tour,
+#                en attendant la fin du tour au plus ATTENTE_MAX ; après
+#                DRAIN_ATTENTE (300 s) une pause opérateur courte (drain) est
+#                posée, puis levée dès l'agent redémarré hors tour (#2152) ;
 #                refuse tant que les migrations du code installé manquent
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
 #   retour       réinstalle le commit d'avant et redémarre
@@ -39,7 +42,8 @@
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57) : VM (adresse WireGuard), PERSONAS_VM (personas servies
 # par le serveur ; liste vide admise, un hôte sans exécutant). Aucun secret
-# n'est lu ni affiché.
+# n'est lu ni affiché. ATTENTE_MAX (7200 s) et DRAIN_ATTENTE (300 s, 0 =
+# jamais) se règlent par l'environnement (#2152).
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -77,6 +81,15 @@ VENV=/opt/ameesh/venv
 PRECEDENT=/opt/ameesh/precedent
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 ATTENTE_MAX=${ATTENTE_MAX:-7200}
+# #2152 : au-delà de cette attente d'un agent en tour, le redémarrage pose
+# lui-même une pause opérateur courte (drain) au lieu d'attendre sans fin un
+# agent qui enchaîne les tours de continuation (57 min constatées les 16-17/10).
+# La pause prend effet à la fin du tour — aucun tour interrompu —, l'unité est
+# redémarrée dès que l'agent est hors tour, puis la pause est levée. 0 = jamais
+# (comportement d'avant).
+DRAIN_ATTENTE=${DRAIN_ATTENTE:-300}
+[[ $DRAIN_ATTENTE =~ ^[0-9]+$ ]] \
+  || { echo "DRAIN_ATTENTE invalide : « $DRAIN_ATTENTE » (secondes attendues)" >&2; exit 2; }
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
@@ -250,8 +263,110 @@ unite_agents() { printf 'ameesh-runner-agent@%s.service' "$1"; }
 echec_agent() {
   echo "$1 : $2 — journalctl --user -u $(unite_agents "$1") -n 50 (utilisateur ameesh sur $AGENTS_SSH)" >&2
 }
+
+# --- #2152 : drain d'un agent qui enchaîne les tours -------------------------
+# Attendre qu'un agent enchaînant les tours de continuation rende la main ne
+# finit jamais (16-17/10 : 57 min, puis de nouveau). Après DRAIN_ATTENTE
+# secondes, le redémarrage pose donc lui-même une pause opérateur courte
+# (drain) : le runner finit son tour et n'en commence plus. Dès qu'il est hors
+# tour, l'unité est redémarrée, puis la pause est levée — jamais un tour
+# interrompu. Le mesh journalise la pose et la levée (operator_pause_events) ;
+# seules les pauses posées par ce script sont levées par lui, et aucune ne
+# survit à sa sortie (trap EXIT).
+DRAINS=()
+drain_motif() {  # $1 : pose (défaut) ou reprise ; journalisé avec la pause
+  local ou
+  if [ "$MODE" = agents ]; then ou="agents $ACTION sur $HOTE_AGENTS"
+  else ou="$ACTION sur $VM"; fi
+  if [ "${1:-pose}" = reprise ]; then
+    printf 'reprise après drain de déploiement #2152 (vm.sh %s) : redémarrage hors tour effectué' "$ou"
+  else
+    printf 'drain de déploiement #2152 (vm.sh %s) : pause opérateur courte, levée après redémarrage hors tour' "$ou"
+  fi
+}
+pause_operateur() {  # $1 persona ; --json : le « changed » dit si la pause est nôtre
+  if [ "$MODE" = agents ]; then
+    ameesh_agents pause "$1" --reason "$(drain_motif pose)" --json
+  else
+    "$AMEESH" pause "$1" --reason "$(drain_motif pose)" --json
+  fi
+}
+reprise_operateur() {  # $1 persona
+  if [ "$MODE" = agents ]; then
+    ameesh_agents resume "$1" --operator --reason "$(drain_motif reprise)"
+  else
+    "$AMEESH" resume "$1" --operator --reason "$(drain_motif reprise)"
+  fi
+}
+pause_etat() {  # stdin : `show --json` → « 1 » si pause opérateur, « 0 » sinon
+  python3 -c 'import json,sys
+print(1 if json.loads(sys.stdin.read() or "{}").get("operator_paused") else 0)'
+}
+etat_agent() {  # $1 persona → « statut|pause » (une seule lecture)
+  if [ "$MODE" = agents ]; then
+    ameesh_agents show "$1" --json | python3 -c 'import json,sys
+r = json.load(sys.stdin)
+if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
+    print("skip|0")
+else:
+    print("%s|%d" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' "$HOTE_AGENTS"
+  else
+    "$AMEESH" show "$1" --json | python3 -c 'import json,sys
+r = json.load(sys.stdin)
+print("%s|%d" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))'
+  fi
+}
+drain_est_notre() {
+  local p
+  for p in ${DRAINS[@]+"${DRAINS[@]}"}; do [ "$p" = "$1" ] && return 0; done
+  return 1
+}
+poser_drain() {  # $1 persona, $2 secondes déjà attendues
+  local sortie change
+  echo "$1 : en tour depuis ${2}s — pose d'une pause opérateur (drain #2152)"
+  sortie=$(pause_operateur "$1") \
+    || { echo "$1 : pose du drain refusée (voir ci-dessus) ; aucun redémarrage de cet agent" >&2; return 1; }
+  change=$(python3 -c 'import json,sys
+print(1 if json.load(sys.stdin).get("changed") else 0)' <<<"$sortie") \
+    || { echo "$1 : réponse de pause illisible ; aucun redémarrage de cet agent" >&2; return 1; }
+  if [ "$change" != 1 ]; then
+    # Posée entre notre lecture et la nôtre : elle n'est pas de ce script, il
+    # ne la lèvera pas (§2 : on ne lève que ce qu'on a posé).
+    echo "$1 : pause opérateur déjà posée par un autre acteur — laissée en place"
+    return 0
+  fi
+  DRAINS+=("$1")
+  echo "$1 : drain posé — le tour en cours se termine, aucun tour interrompu ; redémarrage dès qu'il est hors tour"
+}
+lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
+  local p reste=() etat
+  drain_est_notre "$1" || return 0
+  reprise_operateur "$1" || {
+    echo "$1 : drain NON levé (reprise refusée) — l'agent reste en pause opérateur ; le lever à la main : « ameesh resume $1 --operator --reason … »" >&2
+    return 1; }
+  etat=$(lire_bail "$1" | pause_etat) || {
+    echo "$1 : drain levé, mais relecture de la pause impossible — vérifier « ameesh show $1 »" >&2
+    return 1; }
+  [ "$etat" = 0 ] || {
+    echo "$1 : pause toujours posée après reprise — le lever à la main : « ameesh resume $1 --operator --reason … »" >&2
+    return 1; }
+  for p in ${DRAINS[@]+"${DRAINS[@]}"}; do [ "$p" = "$1" ] || reste+=("$p"); done
+  DRAINS=(${reste[@]+"${reste[@]}"})
+  echo "$1 : drain levé ($2) — reprise prouvée (operator_paused=false)"
+}
+lever_drains() {  # sortie du script : aucun drain ne survit à la commande
+  local p code=0
+  for p in ${DRAINS[@]+"${DRAINS[@]}"}; do
+    lever_drain "$p" "sortie du script" || code=1
+  done
+  return "$code"
+}
+trap 'lever_drains || true' EXIT
+
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes suivantes debut=$SECONDS
+  local etat deja_pause ecoule
+  local -A debut_tour=()
   local non_verifiees=()
   # #1633 : inclure les personas arrêtées pour recharger leur unité active.
   noms=$(agents_du_registre avec-arretes) || return 1
@@ -262,18 +377,32 @@ redemarrer_agents() {
     for p in "${restantes[@]}"; do
       # Le placement peut changer pendant l'attente d'un tour : relire avant
       # de toucher une unité que cet hôte ne doit plus mener.
-      st=$(ameesh_agents show "$p" --json | python3 -c 'import json,sys
-r=json.load(sys.stdin)
-if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
-    print("skip")
-else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
-      if [ "$st" = skip ]; then echo "$p : placement modifié, ignoré"; continue; fi
-      if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
+      etat=$(etat_agent "$p") || return 1
+      IFS='|' read -r st deja_pause <<<"$etat"
+      if [ "$st" = skip ]; then
+        lever_drain "$p" "placement modifié" || return 1
+        echo "$p : placement modifié, ignoré"; continue
+      fi
+      if [ "$st" = running ]; then
+        # #2152 : un agent qui enchaîne les tours de continuation ne rend
+        # jamais la main ; après DRAIN_ATTENTE, le redémarrage pose lui-même
+        # une pause opérateur courte (drain), qui prend effet à la fin du tour.
+        # Une pause déjà posée par un autre acteur n'est ni doublée ni levée.
+        if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
+          if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$SECONDS; fi
+          ecoule=$((SECONDS - debut_tour[$p]))
+          if [ "$ecoule" -ge "$DRAIN_ATTENTE" ]; then
+            poser_drain "$p" "$ecoule" || return 1
+          fi
+        fi
+        suivantes+=("$p"); continue
+      fi
       # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
       # réactive pas. #1633 : son unité encore active est seulement rechargée
       # sur le nouveau code, sans bail ni tour ; une unité déjà arrêtée n'est
-      # pas relancée.
+      # pas relancée. #2152 : un drain posé par ce script est levé.
       if [ "$st" = stopped ]; then
+        lever_drain "$p" "persona arrêtée" || return 1
         if utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")"; then
           utilisateur_agents systemctl --user restart "$(unite_agents "$p")" \
             && utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
@@ -292,6 +421,9 @@ else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
       utilisateur_agents systemctl --user restart "$(unite_agents "$p")" \
         && utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
         || { echec_agent "$p" "ne redémarre pas"; return 1; }
+      # #2152 : l'agent est hors tour et l'unité tourne sur le nouveau code —
+      # la pause du drain est levée ici, avant la preuve de reprise du bail.
+      lever_drain "$p" "redémarrage hors tour" || return 1
       if [ "$tenu" = 0 ]; then
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
@@ -816,6 +948,8 @@ redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
   local restantes suivantes debut=$SECONDS st avant ligne heure tenu attendu
+  local etat deja_pause ecoule
+  local -A debut_tour=()
   non_verifiees=()
   # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
   # elles, l'exécuteur redémarré échouerait
@@ -826,12 +960,16 @@ redemarrer() {
   while [ ${#restantes[@]} -gt 0 ]; do
     suivantes=()
     for p in "${restantes[@]}"; do
-      st=$(statut "$p")
+      etat=$(etat_agent "$p") \
+        || { echo "$p: registry unreadable — nothing restarted" >&2; exit 1; }
+      IFS='|' read -r st deja_pause <<<"$etat"
       # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
       # réactive pas.
       # #1633 : son unité encore active est seulement rechargée sur le nouveau
       # code, sans bail ni tour ; une unité déjà arrêtée n'est pas relancée.
+      # #2152 : un drain posé par ce script est levé.
       if [ "$st" = stopped ]; then
+        lever_drain "$p" "persona arrêtée" || exit 1
         if ssh_vm "systemctl is-active --quiet ameesh-runner@$p"; then
           ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
             || { echo "$p : unité d'une persona arrêtée, ne redémarre pas — journalctl -u ameesh-runner@$p -n 50" >&2; exit 1; }
@@ -841,7 +979,19 @@ redemarrer() {
         fi
         continue
       fi
-      if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
+      if [ "$st" = running ]; then
+        # #2152 : après DRAIN_ATTENTE, pause opérateur courte (drain) au lieu
+        # d'attendre sans fin un agent qui enchaîne les tours ; une pause déjà
+        # posée par un autre acteur n'est ni doublée ni levée.
+        if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
+          if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$SECONDS; fi
+          ecoule=$((SECONDS - debut_tour[$p]))
+          if [ "$ecoule" -ge "$DRAIN_ATTENTE" ]; then
+            poser_drain "$p" "$ecoule" || exit 1
+          fi
+        fi
+        suivantes+=("$p"); continue
+      fi
       # #502: only a runner that held its lease must take it again (bail.sh)
       ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
         || { echo "$p: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
@@ -850,6 +1000,8 @@ redemarrer() {
       bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
       ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
         || { echo "$p : ne redémarre pas — journalctl -u ameesh-runner@$p -n 50 ; puis « $0 retour »" >&2; exit 1; }
+      # #2152 : hors tour et unité relancée — la pause du drain est levée ici.
+      lever_drain "$p" "redémarrage hors tour" || exit 1
       if [ "$tenu" = 0 ]; then
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")

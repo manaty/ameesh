@@ -32,7 +32,15 @@ deploy/mise-a-jour/vm.sh agents controler
 ```
 
 Le redémarrage attend la fin des tours, pendant au plus `ATTENTE_MAX`
-secondes (7200 par défaut). Il relit le placement avant chaque redémarrage :
+secondes (7200 par défaut). Après `DRAIN_ATTENTE` secondes (300 par défaut,
+0 pour désactiver) d'attente d'un même tour, il pose lui-même une pause
+opérateur courte et nommée (drain, #2152) : le tour en cours se termine —
+aucun tour n'est interrompu —, plus aucun ne commence, l'unité est
+redémarrée dès que l'agent est hors tour, puis la pause est levée et la
+reprise du bail prouvée. Le mesh journalise la pose et la levée
+(`operator_pause_events`) ; une pause déjà posée par un autre acteur n'est
+ni doublée ni levée, et aucune pause posée par le script ne survit à sa
+sortie. Il relit le placement avant chaque redémarrage :
 un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
 pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
 est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
