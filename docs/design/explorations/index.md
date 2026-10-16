@@ -31,6 +31,7 @@ after [home#52](https://github.com/manaty/home/pull/52) merges.
 - [SQLite driver for a personal profile](sqlite.md)
 - [One Unix user per agent](uid-par-agent.md)
 - [Installer driven by the user's harness](installeur.md)
+- [Versionnement pour agents : dépendances explicites et attestation par changement](versionnement-agents.md)
 
 The `tests.test_l1124_explorations` guard checks the cards and the local
 references from plans, roadmaps and lots. It is part of the documentation

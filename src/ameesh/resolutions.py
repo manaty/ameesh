@@ -340,16 +340,19 @@ def pair(db, lot: int, other: int, repo: str, *, fetch: bool = True) -> dict:
         if not row.get("branch_target") and default is None:
             default = plan_git.default_target(repo)
         targets[n] = row.get("branch_target") or default
-    if targets[lot] != targets[other]:
+    # #1802 : `main` et `origin/main` (le défaut du dépôt) désignent la même
+    # branche : comparer les formes courtes, pas les libellés enregistrés.
+    if plan_git.short_branch(targets[lot]) != plan_git.short_branch(targets[other]):
         raise ResolveError("lots #%d and #%d do not share a target (%s, %s): their branches "
                            "never merge together" % (lot, other, targets[lot], targets[other]))
+    target = default or targets[lot]
     tips = {}
     for n, row in rows.items():
         tips[n] = _branch_tip(repo, row["branch"], fetch=fetch and n == other)
         if not tips[n]:
             raise ResolveError("branch %s of lot #%d is neither local nor on origin"
                                % (row["branch"], n))
-    return {"lot": rows[lot], "other": rows[other], "target": targets[lot],
+    return {"lot": rows[lot], "other": rows[other], "target": target,
             "lot_tip": tips[lot], "other_tip": tips[other]}
 
 

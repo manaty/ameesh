@@ -202,6 +202,7 @@ freeze, otherwise `review` (a refrozen lot goes back to review); `active` otherw
 | `effort` | `ameesh set … effort=` setting; **null** = harness default or unknown (local setting of another host) |
 | `state` | `working` \| `idle` \| `paused` \| `stopped` |
 | `status`, `status_text` | raw registry status and its text (reason for a pause) |
+| `paused_on_budget` | (L242b, #1070) `true` when the pause is the budget/pace guard (`status` `blocked` and text `budget : …`, the rule of `handoff.paused`); another `blocked` cause (host not ready, authentication) keeps `false` |
 | `since_ts` | start of the current turn (`working`), end of the last turn (`idle`), last update otherwise |
 | `turn` | current turn or null: `{started_ts, duration_s, label, task}` (`task` = current prompt, truncated to 140 characters) |
 | `turns`, `unread`, `pending_prompt`, `lease_live` | turns counted, unread, pending prompt, live lease |

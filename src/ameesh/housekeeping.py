@@ -2308,13 +2308,15 @@ def lot_of_worktree(db, agent: str, path: str, branch: str = "") -> str | None:
     return None
 
 
-def worktree_in_use(path: str) -> bool:
+def worktree_in_use(path: str, allow=()) -> bool:
     """Un processus de l'hôte travaille-t-il dans ce worktree (dossier courant
     ou fichier ouvert dedans) ? Lu par la couche plateforme (L63). Si l'OS ne
     permet pas de le savoir, la réponse est OUI (fail-closed) : le worktree
-    attend plutôt que d'être retiré sous les pieds d'un agent."""
+    attend plutôt que d'être retiré sous les pieds d'un agent. `allow` (L230) :
+    noms des processus dont l'illisibilité n'est pas un doute — le choix de
+    l'hôte, vide par défaut ; un détenteur CONSTATÉ reste rapporté."""
     try:
-        return bool(platform.holders(_real(path)))
+        return bool(platform.holders(_real(path), allow=allow))
     except platform.NotAvailable:
         return True
 
@@ -2682,7 +2684,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if st["locked"]:
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
-        if worktree_in_use(path):
+        if worktree_in_use(path, allow=allow):
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))
             continue
