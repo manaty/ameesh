@@ -4338,6 +4338,7 @@
     "add_milestone",
     "assign",
     "assignment_events",
+    "attach_implicit_branch",
     "auto_takes_since",
     "backlog",
     "backlog_add",

@@ -1601,6 +1601,28 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     "; branch %s" % out["item"]["branch"] if args.branch else ""))
             _print_assignment(out["check"])
             return 0
+        if args.work_command == "branch":
+            # #2102 : détachement explicite, ou (ré)association explicite
+            if args.detach:
+                if args.target:
+                    raise work.WorkError("--target goes with a branch to set, not --detach")
+                before = work.get(db, args.id) or {}
+                item = work.detach_branch(db, args.id, args.branch, reason=args.reason,
+                                          actor=args.actor)
+                name = args.branch or before.get("branch")
+                print("lot #%d: branch %s detached (state %s, assignee %s kept); the "
+                      "merge sweep no longer associates it" % (
+                          item["id"], name, item["state"], item.get("assignee") or "nobody"))
+                return 0
+            if not args.branch:
+                raise work.WorkError("name the branch to set, or pass --detach")
+            again = work.is_detached(storage.of(db), args.id, args.branch)
+            item = work.set_branch(db, args.id, args.branch, args.target, actor=args.actor,
+                                   source="explicit association%s" % (
+                                       " after its detachment" if again else ""))
+            print("lot #%d: branch %s%s" % (item["id"], item.get("branch"), " to %s" % (
+                item["branch_target"]) if item.get("branch_target") else ""))
+            return 0
         if args.work_command == "delegate":
             # L40 (0030, point 5) : délégation à échéance, gardée comme `assign`
             out = work.delegate(db, args.id, args.agent, within=args.within,
@@ -2810,6 +2832,21 @@ def build_parser() -> argparse.ArgumentParser:
     pw_assign.add_argument("--target", default=None, help="target branch (see work add)")
     pw_assign.add_argument("--actor", default="")
     pw_assign.set_defaults(func=cmd_work)
+    pw_branch = work_sub.add_parser(
+        "branch", help="set a work item's branch explicitly (L118), or detach an obsolete one "
+                       "(#2102: closed or superseded PR); journaled, state and assignee kept")
+    pw_branch.add_argument("id", type=int)
+    pw_branch.add_argument("branch", nargs="?", default=None,
+                           help="the branch to set; with --detach, the branch to detach "
+                                "(default: the work item's)")
+    pw_branch.add_argument("--target", default=None, help="target branch (see work add)")
+    pw_branch.add_argument("--detach", action="store_true",
+                           help="remove the branch from the work item; the merge sweep no longer "
+                                "associates it implicitly (lot/<id>-…); Git is not touched")
+    pw_branch.add_argument("--reason", default="", help="why the branch is detached (required "
+                                                         "with --detach, goes to the journal)")
+    pw_branch.add_argument("--actor", default="")
+    pw_branch.set_defaults(func=cmd_work)
     pw_delegate = work_sub.add_parser(
         "delegate", help="delegate a work item to a wakeable agent, with a deadline (L40, 0030): "
                          "without a turn by the delegate by the deadline, it returns to the delegator")
