@@ -383,6 +383,76 @@ class Test1617FrozenHook(PgTestCase):
             record(self.db.cfg, self.db)
         self.assertEqual(drained, [self.schema])
 
+    # -- #1634 : une notification impossible n'annule pas le gel ---------
+    def waiting_freeze(self, notify):
+        """Gel par le hook sans relecteur désignable, notifiant `notify`."""
+        def hook(tx, milestone, threads):
+            seen["out"] = rd.apply(
+                dict(self.item, state="build"), policy=RULES,
+                paths=["src/ameesh/db.py"], port=pg.PgPort(tx, after_commit=threads),
+                freeze_sha=milestone["sha"],
+                authors=[{"name": "author", "family": "deepseek"}], candidates=[],
+                risk="sensitive", base="c" * 40, policy_ref="canon@deadbeef",
+                notify=notify)
+
+        seen: dict = {}
+        threads: list = []
+        row = work.milestone(self.db, self.lot, "frozen", sha=SHA_A, actor="me",
+                             on_frozen=hook, after_commit=threads)
+        for record in threads:
+            record(self.db.cfg, self.db)
+        return row, seen["out"]
+
+    def notes(self):
+        return [row["note"] for row in self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s ORDER BY id",
+            (self.lot,))]
+
+    def assert_freeze_kept_without_mail(self, row, out, recipient):
+        self.assertEqual([int(m["id"]) for m in self.milestones()], [int(row["id"])])
+        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(out["state"], rd.WAITING)
+        mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["state"], rd.WAITING)
+        self.assertEqual(mark["freeze"], {"id": int(row["id"]), "sha": SHA_A})
+        self.assertIn("notification undeliverable at freeze", mark["why"])
+        lisible = [n for n in self.notes() if n.startswith("désignation au gel")]
+        self.assertEqual(len(lisible), 1)
+        self.assertIn(recipient, lisible[0])
+        self.assertIn("Gel conservé", lisible[0])
+
+    def test_an_empty_notify_keeps_the_freeze(self):
+        row, out = self.waiting_freeze("")
+        self.assert_freeze_kept_without_mail(row, out, "— (no recipient)")
+
+    def test_an_unknown_notify_keeps_the_freeze(self):
+        row, out = self.waiting_freeze("ghost")
+        self.assert_freeze_kept_without_mail(row, out, "ghost (not in the registry)")
+
+    def test_a_normal_notify_is_mailed_at_freeze(self):
+        row, out = self.waiting_freeze("pilot")
+        self.assertEqual(len(self.milestones()), 1)
+        self.assertEqual(out["state"], rd.WAITING)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        self.assertNotIn("undeliverable", pg.designation_of(self.marks()[0])["why"])
+        self.assertFalse([n for n in self.notes() if n.startswith("désignation au gel")])
+
+    def test_an_unknown_reviewer_keeps_the_freeze_and_waits(self):
+        def hook(tx, milestone, threads):
+            seen["out"] = pg.PgPort(tx, after_commit=threads).commit(
+                self.lot, freeze={"id": int(milestone["id"]), "sha": SHA_A},
+                required=1, state=rd.DESIGNATED,
+                reviewers=[{"name": "ghost", "family": "claude"}], missing=0, why="",
+                messages=[{"to": "ghost", "body": "à relire"}])
+
+        seen: dict = {}
+        row = work.milestone(self.db, self.lot, "frozen", sha=SHA_A, actor="me",
+                             on_frozen=hook, after_commit=[])
+        self.assert_freeze_kept_without_mail(row, seen["out"],
+                                             "ghost (not in the registry)")
+        self.assertEqual(seen["out"]["reviewers"], [])
+        self.assertEqual(seen["out"]["missing"], 1)
+
     def test_a_raising_callback_rolls_the_freeze_back(self):
         def hook(tx, milestone, threads):
             pg.PgPort(tx, after_commit=threads).commit(
