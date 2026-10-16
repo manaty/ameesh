@@ -46,6 +46,14 @@ Les reparations sont bornees par `MAX_REPAIRS` ; aucune reouverture terminale.
 
 Collections d'un snapshot (noms des sources lues par B) : `milestones`,
 `receipts`, `observations`, `decisions`, `deliveries`.
+
+Matrice de capacite : `capabilities()` distingue une garde **connue** du
+contrat de son **installation** reelle dans le registre de B
+(`installed_verifiers()`), des **sources reellement disponibles** et des
+**types supportes** ; `capability_report()` publie le sous-ensemble executable
+et le refus explicite de chaque autre (`verifier-uninstalled`,
+`source-unavailable`, `type-unsupported`, `guard-unsupported`). Rien n'est
+declare executable sans preuve : ni source simulee, ni installation supposee.
 """
 from __future__ import annotations
 
@@ -101,6 +109,23 @@ HOLD_VERIFIER = "hold"
 
 #: Verificateurs reserves installes par C en plus des 14 gardes.
 RESERVED_VERIFIERS = (HOLD_VERIFIER,)
+
+#: Le registre de B (#1922) refuse lui-meme une garde sans verificateur avec ce
+#: code : la matrice de capacite le publie, mais C ne le rend jamais dans un
+#: verdict (B refuse avant de l'appeler).
+HOST_REFUSAL_CODES = ("verifier-uninstalled",)
+
+#: Matrice des noms reserves : but, sources exigees, sources conditionnelles.
+#: `decisions` n'est exige que pour `waiting_human` (d'ou la distinction avec
+#: les sources exigees, qui valent pour toute entree du verificateur).
+_RESERVED_SPECS = {
+    HOLD_VERIFIER: (
+        "retenues et reprises (hold/release) ; waiting_human exige une "
+        "decision native reellement en attente",
+        (),
+        ("decisions",),
+    ),
+}
 
 #: Environnements de deploiement observes.
 ENVIRONMENTS = ("staging", "preprod")
@@ -219,12 +244,91 @@ class Decision:
 
 @dataclass(frozen=True)
 class Capability:
-    """Une garde du registre fini, ses sources et ses references exigees."""
+    """Une garde du registre fini : connue, sondee, executable ou refusee.
+
+    Quatre etats distincts, jamais confondus :
+
+    * `known` : la garde appartient au contrat fini (les 14 gardes de A) ;
+      `reserved` : nom reserve installe par C hors de ces 14 (`hold`) ;
+    * `installed` : etat reel du registre serveur de B si sonde (`None` = non
+      sonde) ;
+    * `available` / `missing` : sources exigees **reellement** disponibles ou
+      absentes, si un jeu de sources a ete fourni (`()` = non sonde) ;
+    * `conditional_sources` : sources exigees seulement pour certaines entrees
+      (ex. `decisions` pour `waiting_human`), jamais comptees dans `missing`.
+
+    Fail-closed : `executable` n'est vrai que si l'installation est **prouvee**
+    et les sources exigees disponibles ; sinon `refusal` nomme le refus exact.
+    """
 
     guard: str
     purpose: str
     sources: tuple[str, ...]
     references: tuple[str, ...]
+    known: bool = True
+    reserved: bool = False
+    installed: bool | None = None
+    available: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
+    conditional_sources: tuple[str, ...] = ()
+
+    @property
+    def executable(self) -> bool:
+        """Vrai seulement si l'installation est prouvee et les sources exigees
+        disponibles (non sonde = non executable, jamais un accord par
+        defaut)."""
+        return self.installed is True and not self.missing
+
+    @property
+    def refusal(self) -> str:
+        """Le refus explicite de cette garde (`""` si elle est executable)."""
+        if not self.known:
+            return "guard-unsupported"
+        if self.installed is not True:
+            return HOST_REFUSAL_CODES[0]
+        if self.missing:
+            return "source-unavailable"
+        return ""
+
+
+@dataclass(frozen=True)
+class TypeCapability:
+    """Un type installe et sa politique de completion ; `supported=False` est
+    un refus explicite (`type-unsupported`), jamais une absence de reponse."""
+
+    type: str
+    supported: bool
+    code: bool
+    requires_delivery: bool
+    requires_review: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class CapabilityReport:
+    """La matrice complete : gardes connues (sondees), noms reserves, types."""
+
+    guards: tuple[Capability, ...]
+    reserved: tuple[Capability, ...]
+    types: tuple[TypeCapability, ...]
+
+    def capability(self, name: str) -> Capability | None:
+        """L'entree d'un nom connu (garde du contrat ou nom reserve)."""
+        for cap in self.guards + self.reserved:
+            if cap.guard == name:
+                return cap
+        return None
+
+    def refusal(self, name: str) -> str:
+        """`guard-unsupported` hors contrat, sinon le refus de la garde."""
+        cap = self.capability(name)
+        return "guard-unsupported" if cap is None else cap.refusal
+
+    @property
+    def executable_guards(self) -> tuple[str, ...]:
+        """Le sous-ensemble executable : installe et sources presentes."""
+        return tuple(cap.guard for cap in self.guards + self.reserved
+                     if cap.executable)
 
 
 @dataclass(frozen=True)
@@ -790,10 +894,116 @@ def verify_hold(hold: str, snapshot: Snapshot) -> Decision:
     return Decision(True, "accepted", "", snapshot.workflow_stage)
 
 
-def capabilities() -> tuple[Capability, ...]:
-    """La matrice de capacite : garde, sources exigees, references."""
-    return tuple(Capability(spec.name, spec.purpose, spec.sources,
-                            spec.required + spec.optional) for spec in _SPECS)
+def _installed_names(registry: Any) -> set[str] | None:
+    """Les noms installes dans le registre serveur de B, ou `None` si non
+    sondable (registre absent, ou sans introspection publiee)."""
+    if registry is None:
+        return None
+    probe = getattr(registry, "installed_verifiers", None)
+    mapping = probe() if callable(probe) else getattr(
+        registry, "INSTALLED_VERIFIERS", None)
+    if not isinstance(mapping, Mapping):
+        return None
+    return {_text(name) for name in mapping}
+
+
+def _available_names(sources: Any) -> set[str] | None:
+    """Les collections reellement disponibles, ou `None` si non sonde."""
+    if sources is None:
+        return None
+    return set(available_sources(sources))
+
+
+def _capability(name: str, purpose: str, required: tuple,
+                references: tuple, *, installed: set[str] | None = None,
+                available: set[str] | None = None, reserved: bool = False,
+                conditional_sources: tuple = ()) -> Capability:
+    """Une entree de la matrice, avec ses deux sondes : installation,
+    sources."""
+    if available is None:
+        seen, missing = (), ()
+    else:
+        seen = tuple(src for src in required if src in available)
+        missing = tuple(src for src in required if src not in available)
+    return Capability(
+        guard=name, purpose=purpose, sources=tuple(required),
+        references=tuple(references), known=True, reserved=reserved,
+        installed=None if installed is None else name in installed,
+        available=seen, missing=missing,
+        conditional_sources=tuple(conditional_sources))
+
+
+def capabilities(*, registry: Any = None, sources: Any = None,
+                 include_reserved: bool = False) -> tuple[Capability, ...]:
+    """La matrice de capacite : gardes connues, installation sondee, sources
+    reellement disponibles.
+
+    Sans argument : le contrat pur (les 14 gardes connues), installation et
+    sources **non sondees** (`installed=None`, `available=missing=()`), donc
+    rien n'est declare executable. `registry` (le module `process_registry` de
+    B, ou tout objet publiant `installed_verifiers()`) marque chaque garde
+    installee ou non. `sources` (noms de collections, mapping, `Snapshot` ou
+    contexte de B) marque les sources exigees disponibles et manquantes, telles
+    quelles, jamais simulees. `include_reserved` ajoute les noms reserves
+    installes par C (`hold`), marques `reserved=True`.
+    """
+    installed = _installed_names(registry)
+    available = _available_names(sources)
+    caps = [_capability(spec.name, spec.purpose, spec.sources,
+                        spec.required + spec.optional,
+                        installed=installed, available=available)
+            for spec in _SPECS]
+    if include_reserved:
+        for name in RESERVED_VERIFIERS:
+            purpose, required, conditional = _RESERVED_SPECS[name]
+            caps.append(_capability(name, purpose, required, (),
+                                    installed=installed, available=available,
+                                    reserved=True,
+                                    conditional_sources=conditional))
+    return tuple(caps)
+
+
+def type_capability(kind: str) -> TypeCapability:
+    """La politique de completion d'un type ; un type hors `INSTALLED_TYPES`
+    rend un refus explicite `type-unsupported`, jamais une exception."""
+    if kind in INSTALLED_TYPES:
+        policy = completion_policy(kind)
+        return TypeCapability(policy.type, True, policy.code,
+                              policy.requires_delivery, policy.requires_review,
+                              policy.reason)
+    return TypeCapability(str(kind), False, False, False, False,
+                          "type-unsupported: %r hors des types installes"
+                          % (kind,))
+
+
+def type_capabilities() -> tuple[TypeCapability, ...]:
+    """Les types supportes et leur politique, dans l'ordre d'installation."""
+    return tuple(type_capability(kind) for kind in INSTALLED_TYPES)
+
+
+def capability_report(*, registry: Any = None, sources: Any = None
+                      ) -> CapabilityReport:
+    """La matrice complete : 14 gardes connues sondees, nom reserve `hold`,
+    types supportes. `executable_guards` est le sous-ensemble declare
+    executable ; `refusal(name)` nomme le refus explicite des autres."""
+    caps = capabilities(registry=registry, sources=sources,
+                        include_reserved=True)
+    return CapabilityReport(
+        guards=tuple(cap for cap in caps if not cap.reserved),
+        reserved=tuple(cap for cap in caps if cap.reserved),
+        types=type_capabilities())
+
+
+def host_capabilities(*, sources: Any = None) -> CapabilityReport:
+    """La matrice du serveur courant : sonde le registre de B installe
+    (`ameesh.process_registry`). Sans B, l'installation n'est pas sondee, donc
+    rien n'est executable (fail-closed)."""
+    registry = None
+    try:
+        from . import process_registry as registry  # noqa: F811
+    except ImportError:  # pragma: no cover - B pas encore fusionne
+        registry = None
+    return capability_report(registry=registry, sources=sources)
 
 
 def completion_policy(kind: str) -> CompletionPolicy:
@@ -857,6 +1067,37 @@ def _context_sources(context: Any) -> Mapping:
     if callable(reader):
         return dict(reader(context) or {})
     return {}
+
+
+def available_sources(source: Any) -> tuple[str, ...]:
+    """Les collections reellement disponibles, sans lire la base ici.
+
+    Accepte un `Snapshot`, un contexte de B (via `context.sources`,
+    `context.read_sources()` ou `process_registry.read_sources(context)` : la
+    lecture reste chez B, dans sa transaction), un mapping de collections
+    (`{nom: lignes}`), ou un iterable de noms. Rend `()` quand rien n'est
+    disponible : aucune source simulee n'est jamais declaree.
+    """
+    if source is None:
+        return ()
+    if isinstance(source, Snapshot):
+        return tuple(source.sources)
+    if isinstance(source, Mapping):
+        return tuple(_text(name) for name in source)
+    declared = getattr(source, "sources", None)
+    if isinstance(declared, Mapping):
+        return tuple(_text(name) for name in declared)
+    if isinstance(declared, (list, tuple, set, frozenset)):
+        return tuple(_text(name) for name in declared)
+    if hasattr(source, "work_item") or callable(
+            getattr(source, "read_sources", None)):
+        return tuple(_context_sources(source) or {})
+    if isinstance(source, str):
+        return (_text(source),) if _text(source) else ()
+    try:
+        return tuple(_text(name) for name in source)
+    except TypeError:
+        return ()
 
 
 def context_snapshot(context: Any) -> Snapshot:

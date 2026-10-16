@@ -13,8 +13,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh.process_verifiers import (GUARD_NAMES, RESERVED_VERIFIERS,
-                                      context_command, context_snapshot,
+from ameesh.process_verifiers import (GUARD_NAMES, INSTALLED_TYPES,
+                                      RESERVED_VERIFIERS, available_sources,
+                                      capability_report, context_command,
+                                      context_snapshot, host_capabilities,
                                       install_verifiers, server_verifier)
 
 REV = "a" * 40
@@ -53,6 +55,10 @@ class Registry:
         if current is not None and current is not verifier and not replace:
             raise AssertionError("verificateur deja installe : %s" % name)
         self.installed[name] = verifier
+
+    def installed_verifiers(self):
+        """L'introspection publiee par B (`INSTALLED_VERIFIERS`)."""
+        return dict(self.installed)
 
 
 def item(**overrides) -> dict:
@@ -93,6 +99,35 @@ class SeamTest(unittest.TestCase):
         first = dict(registry.installed)
         install_verifiers(registry)          # memes objets : aucun ecrasement
         self.assertEqual(registry.installed, first)
+
+    def test_capabilities_sondent_le_registre_installe(self):
+        registry = Registry()
+        names = install_verifiers(registry)
+        report = capability_report(registry=registry, sources=SOURCES)
+        self.assertEqual(report.executable_guards, names)
+        self.assertEqual(tuple(cap.guard for cap in report.reserved),
+                         RESERVED_VERIFIERS)
+        self.assertTrue(report.capability("hold").reserved)
+        without = capability_report(registry=registry, sources={})
+        self.assertFalse(without.capability("staging_pass").executable)
+        self.assertEqual(without.refusal("staging_pass"), "source-unavailable")
+        self.assertEqual(without.refusal("ghost"), "guard-unsupported")
+
+    def test_available_sources_du_contexte(self):
+        self.assertEqual(available_sources(context()),
+                         ("milestones", "receipts", "observations",
+                          "decisions", "deliveries"))
+        self.assertEqual(
+            available_sources(SimpleNamespace(sources=["milestones"])),
+            ("milestones",))
+
+    def test_host_capabilities_garde_la_forme(self):
+        report = host_capabilities(sources=SOURCES)
+        self.assertEqual(tuple(cap.guard for cap in report.guards),
+                         GUARD_NAMES)
+        self.assertEqual(tuple(cap.guard for cap in report.reserved),
+                         RESERVED_VERIFIERS)
+        self.assertEqual(tuple(t.type for t in report.types), INSTALLED_TYPES)
 
     def test_appelable_reserve_des_retenues(self):
         registry = Registry()
@@ -204,14 +239,19 @@ class SeamTest(unittest.TestCase):
         without = SimpleNamespace(db=object(), work_item=item(),
                                   command=command(), spec=object(),
                                   from_stage="work", to_stage="next")
+        # `sys.modules` ET l'attribut du paquet : sans le second, un
+        # `process_registry` reel deja importe l'emporterait selon l'ordre des
+        # tests (dependance d'environnement).
         with mock.patch.dict(sys.modules,
                              {"ameesh.process_registry": module}):
-            snapshot = context_snapshot(without)
-        if getattr(ameesh, "process_registry", None) is module:
-            delattr(ameesh, "process_registry")
-        self.assertEqual(calls, [without])
+            with mock.patch.object(ameesh, "process_registry", module,
+                                   create=True):
+                snapshot = context_snapshot(without)
+                names = available_sources(without)
+        self.assertEqual(calls, [without, without])
         self.assertEqual(snapshot.revision, REV)
         self.assertIn("milestones", snapshot.sources)
+        self.assertEqual(names, ("milestones",))
 
     def test_seam_avec_le_vrai_process_registry(self):
         """Le jour ou B est fusionne, l'appelable rend son Verification reel."""

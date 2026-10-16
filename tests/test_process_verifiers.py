@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 
 from ameesh.process_verifiers import (CODE_TYPES, GUARD_NAMES, HOLDS,
-                                      INSTALLED_TYPES, MAX_REPAIRS,
-                                      OBSERVATION_KINDS, REFUSAL_CODES,
-                                      SOURCE_COLLECTIONS, Command, Snapshot,
-                                      capabilities, completion_policy, verify,
-                                      verify_hold)
+                                      HOST_REFUSAL_CODES, INSTALLED_TYPES,
+                                      MAX_REPAIRS, OBSERVATION_KINDS,
+                                      REFUSAL_CODES, RESERVED_VERIFIERS,
+                                      SOURCE_COLLECTIONS, Capability, Command,
+                                      Snapshot, available_sources,
+                                      capabilities, capability_report,
+                                      completion_policy, type_capability,
+                                      type_capabilities, verify, verify_hold)
 
 REV = "a" * 40
 OTHER = "b" * 40
@@ -511,6 +515,148 @@ class VerificateursTest(unittest.TestCase):
 
     def test_kinds_observations_stables(self):
         self.assertEqual(OBSERVATION_KINDS, ("deployed", "pass", "fail"))
+
+
+class FakeRegistry:
+    """L'introspection publiee par B (#1922) : `installed_verifiers()`."""
+
+    def __init__(self, *names):
+        self.installed = {name: object() for name in names}
+
+    def installed_verifiers(self):
+        return dict(self.installed)
+
+
+class CapacitesTest(unittest.TestCase):
+    """La matrice distingue connu, installe, sources disponibles et types.
+
+    Aucune sonde implicite : sans registre ni sources fournis, rien n'est
+    declare executable ; une source non fournie n'est jamais supposee.
+    """
+
+    def test_contrat_statique_non_sonde_et_fail_closed(self):
+        caps = capabilities()
+        self.assertEqual(tuple(cap.guard for cap in caps), GUARD_NAMES)
+        for cap in caps:
+            with self.subTest(guard=cap.guard):
+                self.assertTrue(cap.known)
+                self.assertFalse(cap.reserved)
+                self.assertIsNone(cap.installed)
+                self.assertEqual(cap.available, ())
+                self.assertEqual(cap.missing, ())
+                self.assertFalse(cap.executable)
+                self.assertEqual(cap.refusal, HOST_REFUSAL_CODES[0])
+        reserved = capabilities(include_reserved=True)
+        self.assertEqual(tuple(cap.guard for cap in reserved),
+                         GUARD_NAMES + RESERVED_VERIFIERS)
+        self.assertTrue(reserved[-1].reserved)
+        self.assertTrue(reserved[-1].known)
+
+    def test_installation_sondee_par_le_registre(self):
+        partly = FakeRegistry("planning", "start_work")
+        caps = {cap.guard: cap for cap in capabilities(registry=partly)}
+        self.assertTrue(caps["planning"].installed)
+        self.assertFalse(caps["review_requested"].installed)
+        self.assertIs(caps["planning"].executable, True)
+        self.assertEqual(caps["review_requested"].refusal,
+                         HOST_REFUSAL_CODES[0])
+        full = FakeRegistry(*(GUARD_NAMES + RESERVED_VERIFIERS))
+        report = capability_report(registry=full, sources=ALL_SOURCES)
+        self.assertEqual(tuple(cap.guard for cap in report.guards),
+                         GUARD_NAMES)
+        self.assertEqual(report.executable_guards,
+                         GUARD_NAMES + RESERVED_VERIFIERS)
+
+    def test_sources_sondees_disponibles_et_manquantes(self):
+        caps = {cap.guard: cap for cap in capabilities(
+            registry=FakeRegistry(*GUARD_NAMES),
+            sources=("milestones", "decisions", "ghost"))}
+        self.assertEqual(caps["review_requested"].available, ("milestones",))
+        self.assertEqual(caps["review_requested"].missing, ())
+        self.assertTrue(caps["review_requested"].executable)
+        self.assertEqual(caps["staging_pass"].available, ())
+        self.assertEqual(caps["staging_pass"].missing,
+                         ("receipts", "observations"))
+        self.assertFalse(caps["staging_pass"].executable)
+        self.assertEqual(caps["staging_pass"].refusal, "source-unavailable")
+        self.assertEqual(caps["planning"].refusal, "")
+
+    def test_installation_avant_sources_dans_le_refus(self):
+        report = capability_report(registry=FakeRegistry("planning",
+                                                         "staging_pass"),
+                                   sources=())
+        self.assertEqual(report.refusal("ghost"), "guard-unsupported")
+        self.assertEqual(report.refusal("planning"), "")
+        # l'installation se prouve avant les sources : B refuse
+        # `verifier-uninstalled` sans meme appeler C.
+        self.assertEqual(report.refusal("review_requested"),
+                         HOST_REFUSAL_CODES[0])
+        self.assertEqual(report.refusal("staging_pass"), "source-unavailable")
+
+    def test_nom_reserve_et_sources_conditionnelles(self):
+        report = capability_report(
+            registry=FakeRegistry(*(GUARD_NAMES + RESERVED_VERIFIERS)),
+            sources=ALL_SOURCES)
+        hold = report.capability("hold")
+        self.assertIsInstance(hold, Capability)
+        self.assertTrue(hold.reserved)
+        self.assertTrue(hold.known)
+        self.assertEqual(hold.sources, ())
+        self.assertEqual(hold.conditional_sources, ("decisions",))
+        self.assertTrue(hold.executable)
+
+    def test_types_supportes_et_refus_explicite(self):
+        types = type_capabilities()
+        self.assertEqual(tuple(t.type for t in types), INSTALLED_TYPES)
+        for kind in types:
+            with self.subTest(type=kind.type):
+                self.assertTrue(kind.supported)
+                policy = completion_policy(kind.type)
+                self.assertEqual(
+                    (kind.code, kind.requires_delivery, kind.requires_review),
+                    (policy.code, policy.requires_delivery,
+                     policy.requires_review))
+        unknown = type_capability("epic")
+        self.assertFalse(unknown.supported)
+        self.assertIn("type-unsupported", unknown.reason)
+
+    def test_available_sources_formes_acceptees(self):
+        self.assertEqual(available_sources(None), ())
+        self.assertEqual(available_sources({}), ())
+        self.assertEqual(
+            available_sources({"milestones": (), "decisions": ()}),
+            ("milestones", "decisions"))
+        self.assertEqual(available_sources(["milestones", "ghost"]),
+                         ("milestones", "ghost"))
+        self.assertEqual(available_sources("milestones"), ("milestones",))
+        self.assertEqual(available_sources(full_snapshot()), ALL_SOURCES)
+        self.assertEqual(
+            available_sources(SimpleNamespace(sources={"milestones": ()})),
+            ("milestones",))
+        # aucun attribut de contexte : rien n'est declare, rien n'est lu
+        self.assertEqual(available_sources(SimpleNamespace()), ())
+
+    def test_sous_ensemble_declare_du_premier_pilote(self):
+        # installation complete, observations pas encore collectees : le
+        # sous-ensemble executable est explicite, le reste est refuse.
+        report = capability_report(
+            registry=FakeRegistry(*(GUARD_NAMES + RESERVED_VERIFIERS)),
+            sources=("milestones", "receipts", "decisions", "deliveries"))
+        self.assertIn("planning", report.executable_guards)
+        self.assertIn("work_completed", report.executable_guards)
+        self.assertIn("hold", report.executable_guards)
+        self.assertNotIn("staging_pass", report.executable_guards)
+        self.assertNotIn("preprod_deployed", report.executable_guards)
+        self.assertEqual(report.refusal("staging_pass"), "source-unavailable")
+        self.assertEqual(report.refusal("preprod_deployed"),
+                         "source-unavailable")
+        for cap in report.guards + report.reserved:
+            with self.subTest(guard=cap.guard):
+                if cap.executable:
+                    self.assertEqual(cap.refusal, "")
+                else:
+                    self.assertIn(cap.refusal,
+                                  REFUSAL_CODES + HOST_REFUSAL_CODES)
 
 
 if __name__ == "__main__":  # pragma: no cover
