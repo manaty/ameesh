@@ -822,6 +822,21 @@ class Accounts(Domain):
         """Retire la retenue d'un compte (il redevient éligible)."""
 
     @abc.abstractmethod
+    def identities(self, host: str, harness: str, since: float) -> dict[str, list[dict]]:
+        """#1883 : les empreintes de dossier publiées pour ce couple (hôte,
+        harnais), encore vivantes depuis `since` (epoch) :
+        {account: [{identity, last_ts}]}. Deux empreintes sous le même nom
+        sont deux dossiers résolus : le compte est refusé au placement. Jamais
+        un chemin, seulement une empreinte (secret d'hôte)."""
+
+    @abc.abstractmethod
+    def publish_identity(self, host: str, harness: str, account: str,
+                         identity: str) -> None:
+        """#1883 : publie (ou rafraîchit) l'empreinte du dossier résolu
+        `identity` du compte, pour que les autres processus de l'hôte
+        détectent un même nom déclaré vers deux dossiers différents."""
+
+    @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
         """Les dernières bascules de l'hôte (toutes ou d'un harnais), récentes d'abord."""
 

@@ -157,6 +157,24 @@ class Accounts(interface.Accounts):
             "delete from account_holds where host = %s and harness = %s and account = %s",
             (host, harness, account))
 
+    def identities(self, host, harness, since) -> dict:
+        rows = self.db.query(
+            "select account, identity, extract(epoch from last_seen)::float8 as last_ts"
+            " from account_identities where host = %s and harness = %s"
+            " and extract(epoch from last_seen) >= %s", (host, harness, since))
+        vues: dict = {}
+        for r in rows:
+            vues.setdefault(r["account"], []).append(
+                {"identity": r["identity"], "last_ts": r["last_ts"]})
+        return vues
+
+    def publish_identity(self, host, harness, account, identity) -> None:
+        self.db.execute(
+            "insert into account_identities (host, harness, account, identity)"
+            " values (%s, %s, %s, %s)"
+            " on conflict (host, harness, account, identity) do update"
+            " set last_seen = now()", (host, harness, account, identity))
+
     def switches(self, host, harness, limit) -> list:
         clauses = ["host = %s"]
         params: list = [host]
