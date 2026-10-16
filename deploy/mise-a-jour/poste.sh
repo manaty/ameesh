@@ -12,7 +12,8 @@
 #                migrations de REF (défaut HEAD, comme installer), lancées
 #                depuis son instantané AVANT de l'installer : base du mesh
 #                (UNE fois), puis ancienne
-#                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#                base ; refusé si l'une n'est pas additive — garde inconditionnelle,
+#                MIGRER_APRES ne la désactive jamais (docs/BASCULE.md, L232b) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
@@ -191,7 +192,6 @@ ameesh_de() {
   local cible=$1; shift
   PYTHONPATH="$cible/src" "$VENV/bin/python" -m ameesh "$@"
 }
-installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
   local ref=${1:-HEAD} cible court

@@ -308,6 +308,16 @@ def prune(root, *, now, remote_adapter=None, remote_provider=None):
     `remote_provider` is a zero-argument factory resolved only when a candidate
     still has an undeleted remote member, so an enrolled backend is not built,
     contacted or required when nothing remote has to be expired.
+
+    The whole eligible batch is preflighted before any deletion, and a
+    divergence there refuses the entire batch: a recovery set whose pinned
+    remote member changed or disappeared can no longer be proven complete, so
+    expiring the other candidates on top of that uncertainty is refused too.
+    The refusal names the artifact (and the local file or remote object) to
+    reconcile; nothing is deleted and a later run retries. Once a durable
+    deletion intent exists, a remote failure keeps that set's local files and
+    stops the remaining candidates, which the next run resumes from the
+    persisted intent.
     """
     timestamp(now)
     with locked(root) as (root, records):
@@ -316,13 +326,13 @@ def prune(root, *, now, remote_adapter=None, remote_provider=None):
                       and now >= max(record["expires_at"], record["rollback_until"])}
         # Preflight every candidate before any deletion. A changed file blocks
         # the batch; a missing file is valid only while replaying a durable intent.
-        for record in candidates.values():
+        for artifact, record in candidates.items():
             for name, sha in record["files"].items():
                 path = root / name
                 if not os.path.lexists(path) and record["state"] == "deleting":
                     continue
                 if private_digest(path) != sha:
-                    raise RetentionError("recovery artifact changed")
+                    raise RetentionError("recovery artifact changed: %s (%s)" % (artifact, name))
             for item in record.get("remote", []):
                 if item["deleted"]:
                     continue
@@ -333,7 +343,8 @@ def prune(root, *, now, remote_adapter=None, remote_provider=None):
                 actual = remote_adapter.inspect(item["object_id"], **(
                     {"version_id": item["version_id"]} if "version_id" in item else {}))
                 if actual != item["sha256"] and not (actual is None and record["state"] == "deleting"):
-                    raise RetentionError("remote recovery artifact changed or missing")
+                    raise RetentionError("remote recovery artifact changed or missing: %s (%s)"
+                                         % (artifact, item["object_id"]))
         for artifact, record in candidates.items():
             record.setdefault("deletion_started_at", now)
             record["state"] = "deleting"
@@ -371,7 +382,10 @@ def expire_unregistered(root, *, now, max_age):
     The server's daily dump keeps its own declared window; an artifact named by
     any catalog record belongs to a recovery set and is never touched here,
     whatever its age or state. Candidates must be private owned regular files
-    with a single link: any other candidate is left in place and reported.
+    with a single link: any other candidate is left in place and reported in
+    `refused`. Entries outside the daily pattern and dotted entries are not ours
+    and are ignored by design. The `expire-unregistered` command exits non-zero
+    when a candidate was refused, so the daily run cannot stay silently green.
     """
     timestamp(now)
     timestamp(max_age)
@@ -434,7 +448,14 @@ def main():
         elif args.command == "hold":
             protect(args.root, args.artifact, hold=not args.release)
         elif args.command == "expire-unregistered":
-            print(json.dumps(expire_unregistered(args.root, now=args.now, max_age=args.max_age)))
+            result = expire_unregistered(args.root, now=args.now, max_age=args.max_age)
+            print(json.dumps(result))
+            if result["refused"]:
+                # A refused candidate never expires: without a non-zero status
+                # the timer's daily run would stay green while the file stays.
+                print("private retention refused %d candidate(s); nothing was deleted for them"
+                      % len(result["refused"]), file=sys.stderr)
+                return 3
         else:
             provider = (lambda: provider_adapter(args.provider_enrollment)) if args.provider_enrollment else None
             print(json.dumps({"deleted": prune(args.root, now=args.now, remote_provider=provider)}))
