@@ -3954,6 +3954,65 @@
    "rules": [
     "proposer seulement : execute reste au serveur (0012)"
    ]
+  },
+  {
+   "name": "operations.publish_peek",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forced": {
+    "owner": "envelope_owner",
+    "epoch": "envelope_epoch"
+   },
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "owner",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "epoch",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "payload",
+     "kind": "positional",
+     "schema": {
+      "type": "object"
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "boolean"
+   },
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
+   },
+   "rules": [
+    "Bounded sanitised snapshot of this agent only; no raw thoughts, prompts, arguments or tool output."
+   ]
   }
  ],
  "refused": {
@@ -4236,6 +4295,7 @@
     "latest_gauges",
     "listing",
     "open_lots_activity",
+    "read_peek",
     "recent_balance",
     "record_balance",
     "request_restart",

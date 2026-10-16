@@ -127,6 +127,7 @@
         same output and exit code, local fallback;
   ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
+  ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
   ameesh device enroll|challenge|show   device-side enrollment, in the VM (L110);
@@ -238,6 +239,9 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command == "agent" and rest and rest[0] == "peek":
+        from . import agent_peek
+        return agent_peek.main(rest[1:])
     if command == "module":
         from . import modules
         return modules.main(rest)
