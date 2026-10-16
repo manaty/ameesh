@@ -12,3 +12,4 @@
 * [Durable host handoffs](../HOST-HANDOFFS.md) - Planner, lot-boundary fence, journal, simulated adapter contract and recovery (L232a).
 * [Native Process workflow registry](process-workflow-registry.md) - Revision/stage registry, idempotent transactional receipts and the verifier seam (tranche B of #1915).
 * [Explorations](explorations/index.md) - Ideas off the roadmap: problems, intuitions and open questions, with no delivery commitment.
+* [Pilot: the resident agent](../PILOT-RESIDENT-AGENT.md) - Measurement plan of L76: memory, cost over a day, cache on spaced turns, bounded liveness probe, rollback (T3, #285).
