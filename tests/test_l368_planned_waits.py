@@ -18,9 +18,9 @@ class UnitTest(unittest.TestCase):
                 "epic": {"id": "epic", "present": True},
                 "prerequisite": {"id": "prerequisite", "present": True}}
 
-    def resolve(self, *, dates=None, commitments=(), items=(), rows=None, now=None):
+    def resolve(self, *, dates=None, commitments=(), items=(), rows=None, now=None, landings=()):
         return W.resolve(rows or self.rows, dates or {}, commitments, self.packages,
-                         items, now=self.now if now is None else now)
+                         items, now=self.now if now is None else now, landings=landings)
 
     def test_future_start_ends_at_local_midnight_without_changing_activity(self):
         dates = {1: {"planned_start": "2026-10-13"}}
@@ -123,6 +123,54 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(self.resolve(commitments=[both], items=[{"id": 2, "state": "build"}]),
                          {1: {"what": "dependency", "lots": [2]}})
 
+    # -- #1945 : atterrissage planifié sur un véhicule de paquet -------------
+
+    def landing(self, **kw):
+        row = {"work_item_id": 1, "vehicle_id": 2, "until_on": "2026-10-13",
+               "open": True, "vehicle_state": "qa", "head": "b" * 40}
+        row.update(kw)
+        return row
+
+    def test_landing_waits_while_vehicle_open_until_the_end_of_its_day(self):
+        expected = {1: {"what": "landing", "vehicle": 2, "step": "qa",
+                        "head": "b" * 40, "until": "2026-10-13"}}
+        self.assertEqual(self.resolve(landings=[self.landing()]), expected)
+        end = plan.day_start_ts("2026-10-14")
+        self.assertEqual(self.resolve(landings=[self.landing()], now=end - 1), expected)
+        # la journée compte en entier : le lendemain, le signal stale revient
+        self.assertEqual(self.resolve(landings=[self.landing()], now=end), {})
+        for broken in ({"open": False}, {"until_on": None}, {"until_on": ""},
+                       {"until_on": "someday"}, {"until_on": "2026-10-11"}, {"vehicle_id": 1}):
+            with self.subTest(broken=broken):
+                self.assertEqual(self.resolve(landings=[self.landing(**broken)]), {})
+        # sans drapeau `open` (résolveur pur), le véhicule doit être un lot ouvert connu
+        fallback = self.landing()
+        fallback.pop("open")
+        self.assertEqual(self.resolve(landings=[fallback]), {})
+        self.assertEqual(self.resolve(landings=[fallback], items=[{"id": 2, "state": "qa"}]),
+                         expected)
+
+    def test_explicit_waits_and_gates_stay_ahead_of_a_landing(self):
+        landing = self.landing()
+        self.assertEqual(self.resolve(dates={1: {"planned_start": "2026-10-13"}},
+                                      landings=[landing]),
+                         {1: {"what": "scheduled", "start": "2026-10-13"}})
+        self.assertEqual(self.resolve(commitments=[{"status": "open", "work_item_id": 1,
+                                                    "depends_on": ["#2"]}],
+                                      items=[{"id": 2, "state": "build"}], landings=[landing]),
+                         {1: {"what": "dependency", "lots": [2]}})
+        self.assertEqual(self.resolve(commitments=[{"status": "open", "work_item_id": 1,
+                                                    "due_on": "2026-10-13",
+                                                    "depends_on": ["gate:x"]}],
+                                      landings=[landing]),
+                         {1: {"what": "hold", "gate": "x", "until": "2026-10-13"}})
+
+    def test_landing_label_names_vehicle_step_head_and_deadline(self):
+        wait = {"what": "landing", "vehicle": 42, "step": "qa",
+                "head": "b" * 40, "until": "2026-10-18"}
+        self.assertEqual(work_dependencies.wait_label(wait),
+                         "landing on vehicle #42 (qa, head %s) until 2026-10-18" % ("b" * 12))
+
 
 class PgTest(PgTestCase):
     def setUp(self):
@@ -223,3 +271,63 @@ class PgTest(PgTestCase):
             commitment["id"], values={"status": "cancelled"}, current=["open"])
         self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)],
                          [waiting["id"]])
+
+    def test_declared_landing_defers_stagnation_until_cleared_closed_or_expired(self):
+        waiting = work.add(self.db, title="frozen, carried by a package vehicle", app="acme")
+        work.move(self.db, waiting["id"], "build", actor="test")
+        work.move(self.db, waiting["id"], "qa", actor="test")
+        head = "c" * 40
+        work.milestone(self.db, waiting["id"], "frozen", sha=head, actor="test")
+        work.milestone(self.db, waiting["id"], "verdict", verdict="ok", sha=head, actor="reviewer")
+        self.old(waiting)
+        # sans déclaration, c'est bien le faux stale générique qui tire
+        stale_row = next(r for r in stagnation.stagnant_lots(self.db, now=self.now)
+                         if r["id"] == waiting["id"])
+        self.assertEqual(stale_row["waiting_for"], "fusion")
+        self.assertEqual(stale_row["waiting"]["label"], "merge (executor not designated)")
+        vehicle = work.add(self.db, title="package vehicle", app="acme")
+        vehicle_head = "e" * 40
+        work.milestone(self.db, vehicle["id"], "frozen", sha=vehicle_head, actor="test")
+        today = datetime.date.fromtimestamp(self.now)
+        until = (today + datetime.timedelta(days=2)).isoformat()
+        work_dependencies.land(self.db, waiting["id"], vehicle["id"], until_on=until,
+                               actor="mesh-design")
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
+        label = "landing on vehicle #%d (intake, head %s) until %s" % (
+            vehicle["id"], vehicle_head[:12], until)
+        self.assertEqual(row["planned_wait"],
+                         {"what": "landing", "vehicle": vehicle["id"], "step": "intake",
+                          "head": vehicle_head, "until": until})
+        self.assertIsNone(row["stale"])
+        self.assertEqual(row["waiting_for"]["label"], label)
+        snap = progress.snapshot(self.db, self.cfg, project="acme", now=self.now, gantt=False)
+        self.assertIsNone(next(r for r in snap["lots"] if r["id"] == waiting["id"])["stale"])
+        # un nouveau gel du véhicule remplace la tête affichée, sans geste
+        newer = "f" * 40
+        work.milestone(self.db, vehicle["id"], "frozen", sha=newer, actor="test")
+        row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
+        self.assertEqual(row["planned_wait"]["head"], newer)
+        self.assertIn(newer[:12], row["waiting_for"]["label"])
+        # le retrait rend le signal stale immédiatement
+        self.assertTrue(work_dependencies.clear_landing(self.db, waiting["id"], actor="pilot"))
+        row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
+        self.assertIsNone(row["planned_wait"])
+        self.assertEqual(row["waiting_for"]["label"], "merge (executor not designated)")
+        self.old(waiting)   # le geste lui-même est une activité ; on repart de l'âge d'avant
+        self.assertIn(waiting["id"], [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # véhicule fermé : le signal revient
+        work_dependencies.land(self.db, waiting["id"], vehicle["id"], until_on=until, actor="pilot")
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        work.close(self.db, vehicle["id"], abandoned=True)
+        self.old(waiting)
+        self.assertIn(waiting["id"], [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # échéance dépassée : la journée compte en entier, puis le signal revient
+        vehicle2 = work.add(self.db, title="second vehicle", app="acme")
+        work_dependencies.land(self.db, waiting["id"], vehicle2["id"], until_on=until, actor="pilot")
+        end_until = plan.day_start_ts(
+            (datetime.date.fromisoformat(until) + datetime.timedelta(days=1)).isoformat())
+        self.assertNotIn(waiting["id"],
+                         [r["id"] for r in stagnation.stagnant_lots(self.db, now=end_until - 1)])
+        self.assertIn(waiting["id"],
+                      [r["id"] for r in stagnation.stagnant_lots(self.db, now=end_until)])

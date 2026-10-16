@@ -36,6 +36,28 @@ A lot is stale when it is open and inactive beyond the configured threshold
   the lot at once; renewing it means cancelling and adding a new dated
   commitment (a later due day pushes the hold). A hold whose date cannot be
   read does not suppress the alert: a hold always ends.
+- A **declared landing**, `ameesh work landing <id> --vehicle <lot> --until <day>`
+  (#1945), parks a lot whose
+  work is done on a package vehicle: an open lot that carries the composition.
+  While the vehicle is open **and** the day is not past (its day counts in
+  full, like a hold), the lot is not stale. The head and step are not copied:
+  they are read at each pass from the vehicle's last `frozen` milestone and its
+  state, so a new freeze replaces the displayed head without any gesture.
+  `ameesh work landing <id> --clear`, a closed or merged vehicle, or a past
+  deadline let the ordinary inactivity rule apply again. A self, unknown or
+  finished vehicle does not suppress the alert; nor does prose, a bare
+  admission to a packet or an old transport chain.
+
+  ```sh
+  ameesh work landing 1427 --vehicle 1675 --until 2026-10-18
+  ```
+
+  The gesture is journalled ("Landing declared: vehicle #1675 until …") and
+  counts as activity, like a prerequisite edit. A planned start, a declared
+  prerequisite or a gate stays ahead in the displayed wait: the more explicit
+  wait wins. When a landing is declared on a frozen lot whose verdict is
+  acquired, the registry label names the vehicle, its step, its head and the
+  deadline instead of `merge (executor not designated)`.
 
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
@@ -64,6 +86,12 @@ or, for a dated external hold:
 {"what": "hold", "gate": "liquichain-window", "until": "2026-10-15", "commitment": 42}
 ```
 
+or, for a declared landing on a vehicle:
+
+```json
+{"what": "landing", "vehicle": 1675, "step": "qa", "head": "04965e6ca1b2…", "until": "2026-10-18"}
+```
+
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its
 six-hour reminder for that episode. The output limit is applied **after**
@@ -73,5 +101,6 @@ blockers outside the current project or progress window.
 
 Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
-by a planned date, commitment/plan dependency, direct prerequisite link or
-dated external hold. This preserves alerts for unexplained waits.
+by a planned date, commitment/plan dependency, direct prerequisite link,
+dated external hold or declared landing. This preserves alerts for
+unexplained waits.

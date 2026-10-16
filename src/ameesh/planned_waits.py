@@ -41,7 +41,8 @@ def ancestors(package_id, packages):
         package_id = package.get("parent")
 
 
-def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=()):
+def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=(),
+            landings=()):
     """Pure resolver. Only an open execution lot can block another lot.
 
     Commitments apply to their explicit work item or to their plan package
@@ -53,9 +54,16 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     (`gate:<name>` or `external:<name>`) *holds* its lot until the end of the
     commitment's due day: the gate is not a lot, so nothing else can release
     it, and the date is what makes the hold end by itself.
+
+    #1945: a declared landing (`landings`, rows of `work_landings` enriched
+    with the vehicle's state and last freeze) waits only while the vehicle is
+    open and the finite day `until_on` is not past (its day counts in full,
+    like a hold). A scheduled start, a dependency or a gate stays ahead: the
+    more explicit wait wins. Nothing is inferred from prose or from git.
     """
     open_ids = {int(r["id"]) for r in open_items
                 if r.get("state") not in ("merged", "promoted", "closed")}
+    landing_by_item = {int(l["work_item_id"]): l for l in landings}
     package_lots = {}
     for row in open_items:
         if int(row["id"]) not in open_ids:
@@ -133,7 +141,54 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
                     break
         if held:
             waits[ident] = dict(held, what="hold")
+            continue
+        # #1945 : l'atterrissage déclaré n'éteint que tant que le véhicule est
+        # ouvert et que l'échéance (journée finie, comptée en entier) n'est pas
+        # passée ; le retrait, la fermeture du véhicule ou l'échéance rendent
+        # le signal stale.
+        landing = landing_by_item.get(ident)
+        if not landing:
+            continue
+        vehicle = int(landing["vehicle_id"])
+        open_vehicle = landing.get("open")
+        if open_vehicle is None:
+            open_vehicle = vehicle in open_ids
+        end = hold_end(landing.get("until_on"))
+        if vehicle == ident or not open_vehicle or end is None or now >= end:
+            continue
+        wait = {"what": "landing", "vehicle": vehicle,
+                "until": str(landing.get("until_on"))[:10]}
+        if landing.get("vehicle_state"):
+            wait["step"] = landing["vehicle_state"]
+        if landing.get("head"):
+            wait["head"] = landing["head"]
+        waits[ident] = wait
     return waits
+
+
+def _with_heads(st, landings):
+    """#1945 : la tête exacte du véhicule est son dernier gel, lu en base.
+
+    Une lecture groupée pour tous les véhicules déclarés ; la tête n'est
+    jamais recopiée dans `work_landings`, un nouveau gel la remplace donc
+    sans geste. Les jalons non `frozen` ou sans sha ne comptent pas."""
+    rows = list(landings)
+    vehicles = sorted({int(l["vehicle_id"]) for l in rows})
+    heads: dict[int, tuple[float, str]] = {}
+    if vehicles:
+        for mark in st.progress.lot_milestones(vehicles):
+            sha = (mark.get("sha") or "").strip()
+            if mark.get("kind") != "frozen" or not sha:
+                continue
+            vid = int(mark["work_item_id"])
+            at = float(mark.get("at_ts") or 0)
+            if vid not in heads or at >= heads[vid][0]:
+                heads[vid] = (at, sha)
+    out = []
+    for landing in rows:
+        head = heads.get(int(landing["vehicle_id"]))
+        out.append(dict(landing, head=head[1]) if head else landing)
+    return out
 
 
 def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=None):
@@ -151,5 +206,6 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     if open_items is None:
         open_items = st.operations.open_lots_activity(None) if any(
             c.get("depends_on") for c in commitments) else []
+    landings = _with_heads(st, st.work_dependencies.landings_for([int(r["id"]) for r in rows]))
     return resolve(rows, dates, commitments, packages, open_items, now=now,
-                   dependencies=dependencies)
+                   dependencies=dependencies, landings=landings)

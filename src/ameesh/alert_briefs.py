@@ -122,7 +122,9 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
     if alert.get("lot_state") == "qa" and alert.get("waiting_for") == "fusion":
         return ("this lot is frozen with its verdict acquired: it is a candidate for its "
                 "merge packet/queue — no author action, do not nudge its assignee or "
-                "reassign it; the composer/pilot carries the merge")
+                "reassign it; the composer/pilot carries the merge and can declare the "
+                "planned landing that stops the reminders: ameesh work landing %d "
+                "--vehicle <vehicle lot> --until <YYYY-MM-DD>" % lot)
     if who:
         return ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
                 "ameesh work assign %d <agent>" % (who, who, lot, lot))
@@ -145,7 +147,9 @@ def _stale_lot(alert: dict) -> str:
     # #1261 le disait déjà « the alert stops while the wait is planned ».
     hold = ("if the lot is parked on another open lot, declare the dependency that stops "
             "the reminders (the alert stops while the wait is planned): "
-            "ameesh work dependencies %d --add <blocker>" % lot)
+            "ameesh work dependencies %d --add <blocker>; if a package vehicle is to "
+            "carry it, declare the landing: ameesh work landing %d --vehicle "
+            "<vehicle lot> --until <YYYY-MM-DD>" % (lot, lot))
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "

@@ -332,6 +332,12 @@ def describe(db, rows: list[dict], *, now: float | None = None,
             waiting(row, jalons, acts,
                     responsible=package.get("responsible")),
             states, externals)
+        hold = holds.get(rid)
+        if hold and hold.get("what") == "landing" and detail and detail.get("what") == "merge":
+            # #1945 : un atterrissage déclaré est plus précis que le libellé
+            # générique « merge (executor not designated) » ; le registre
+            # nomme le véhicule, son étape, sa tête et l'échéance.
+            detail = dict(detail, who=None, label=work_dependencies.wait_label(hold))
         last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                              messages.get(rid), events_ts=last_events.get(rid))
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),

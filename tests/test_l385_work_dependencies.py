@@ -2,6 +2,7 @@
 """L385 storage: explicit edges, atomic cycle checks and durable audit."""
 from __future__ import annotations
 
+import datetime
 import json
 import threading
 import time
@@ -464,7 +465,81 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(self.mail_lot(row), str(self.a))
 
 
+class LandingTest(PgTestCase):
+    """#1945 : geste `ameesh work landing`, refus et journal, avant toute écriture."""
+
+    def setUp(self):
+        self.db.execute("TRUNCATE work_items CASCADE")
+        self.waiting = work.add(self.db, title="waiting", app="acme")["id"]
+        self.vehicle = work.add(self.db, title="vehicle", app="acme")["id"]
+
+    def cli(self, *args, ok=True):
+        proc = self.mesh("work", "landing", *args, "--actor", "test")
+        self.assertEqual(proc.returncode, 0 if ok else 1, proc.stdout + proc.stderr)
+        return proc
+
+    def test_declare_renew_clear_and_read_back(self):
+        until = "2026-10-18"
+        payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                      "--until", until, "--json").stdout)
+        self.assertTrue(payload["changed"])
+        self.assertEqual(payload["landing"]["vehicle_id"], self.vehicle)
+        self.assertEqual(payload["landing"]["until_on"], until)
+        self.assertTrue(payload["landing"]["open"])
+        self.assertEqual(payload["landing"]["created_by"], "test")
+        # rejouer remplace la déclaration : une seule ligne, un second journal
+        other = work.add(self.db, title="other vehicle", app="acme")["id"]
+        payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(other),
+                                      "--until", "2026-10-20", "--json").stdout)
+        self.assertEqual(payload["landing"]["vehicle_id"], other)
+        self.assertEqual(len(storage.of(self.db).work_dependencies.landings_for([self.waiting])), 1)
+        notes = [e["note"] for e in work.events(self.db, self.waiting)
+                 if e["note"].startswith("Landing")]
+        self.assertEqual(notes, ["Landing declared: vehicle #%d until 2026-10-20" % other,
+                                 "Landing declared: vehicle #%d until %s" % (self.vehicle, until)])
+        text = self.mesh("work", "show", str(self.waiting))
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("landing on vehicle #%d" % other, text.stdout)
+        # le retrait est idempotent et journalisé une fois
+        self.assertTrue(json.loads(self.cli(str(self.waiting), "--clear", "--json").stdout)["changed"])
+        self.assertFalse(json.loads(self.cli(str(self.waiting), "--clear", "--json").stdout)["changed"])
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertIn("Landing cleared: vehicle #%d" % other,
+                      [e["note"] for e in work.events(self.db, self.waiting)])
+
+    def test_refusals_leave_no_row_and_no_journal(self):
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        self.assertIn("needs --vehicle and --until", self.cli(str(self.waiting), ok=False).stderr)
+        self.assertIn("itself", self.cli(str(self.waiting), "--vehicle", str(self.waiting),
+                                         "--until", until, ok=False).stderr)
+        self.assertIn("existing lots", self.cli(str(self.waiting), "--vehicle", "999999",
+                                                "--until", until, ok=False).stderr)
+        self.assertIn("not found", self.cli("999999", "--vehicle", str(self.vehicle),
+                                            "--until", until, ok=False).stderr)
+        self.assertIn("ISO day", self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                          "--until", "someday", ok=False).stderr)
+        work.close(self.db, self.vehicle, abandoned=True)
+        self.assertIn("must still be open", self.cli(str(self.waiting), "--vehicle",
+                                                     str(self.vehicle), "--until", until,
+                                                     ok=False).stderr)
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertEqual([e["note"] for e in work.events(self.db, self.waiting)
+                          if e["note"].startswith("Landing")], [])
+
+
 class ResolverTest(unittest.TestCase):
+    def test_invalid_landing_ids_days_and_empty_actor_are_refused_before_storage(self):
+        for item in (-1, 0, True, "1"):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, item, 2, until_on="2026-10-18", actor="test")
+        with self.assertRaises(work.WorkError):
+            dependencies.land(None, 1, 2, until_on="2026-10-18", actor="")
+        with self.assertRaises(work.WorkError):
+            dependencies.clear_landing(None, 1, actor="")
+        for day in (None, "", "someday", "2026-13-45"):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, 1, 2, until_on=day, actor="test")
+
     def test_direct_links_union_with_commitments_and_ignore_satisfied_edges(self):
         rows = [{"id": 1, "state": "build"}]
         edges = [{"work_item_id": 1, "blocker_id": 2, "blocking": True},

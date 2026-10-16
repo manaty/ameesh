@@ -78,6 +78,8 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
 def clear_landing(db, item_id, *, actor):
     """Retire la déclaration d'atterrissage (rend le signal stale)."""
     _id(item_id)
+    if not isinstance(actor, str) or not actor.strip():
+        raise work.WorkError("a landing declaration needs an identified actor")
     return storage.of(db).work_dependencies.clear_landing(item_id, actor=actor)
 
 
