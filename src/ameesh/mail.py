@@ -23,7 +23,7 @@ import unicodedata
 import uuid
 from typing import Any, Sequence
 
-from . import fil, storage
+from . import fastmail, fil, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import mailbox as _pg
@@ -82,6 +82,14 @@ def send(
         signed_payload=signed_payload, nonce=nonce, created_us=created_us,
         expires_us=expires_us)
     message_id = int(row["id"])
+    # #1689 (N1) : tout dépôt local réveille le chemin rapide du destinataire
+    # (#1604), pas seulement `mail send` : approbations, exécuteur, veille,
+    # notifications système passent aussi par ici. Le marqueur ne se crée
+    # jamais : un destinataire d'un autre hôte, ou jamais vu sur celui-ci, n'a
+    # pas de chemin rapide à invalider et reste lu par les événements complets.
+    cfg = getattr(db, "cfg", None)
+    if cfg is not None:
+        fastmail.bump(cfg, recipient)
     if thread:
         # Le message est déposé : à partir d'ici, rien ne doit le faire perdre
         # (fil.record ne lève jamais).
