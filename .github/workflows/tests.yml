@@ -97,6 +97,14 @@
 # lue à l'exécution) : un test qui ne tient que sur la classe ordinaire
 # (horodatages, renommage entre périphériques, inodes, blocs) se révèle là. Le
 # job « autre système de fichiers » est alors exigé par le check agrégé.
+#
+# #856 — un runner arrêté (saturation #747) tue le publisher et l'étape
+# `close` : le check restait `in_progress` pour toujours. Le job `tests`
+# (indépendant des publishers) conclut les orphelins en relisant l'état
+# terminal réel du job et de l'exécution (`ci-flow.py sweep`, par le
+# `details_url` ou, à défaut, par le `check_suite`) : `cancelled`, jamais
+# `success` sans ligne `fin`, et aucun check actif n'est touché. D'où
+# `actions: read` et `checks: write` sur le job `tests`.
 name: tests
 
 on:
@@ -327,12 +335,14 @@ jobs:
       - id: deps
         name: dépendances (pilote psycopg)
         run: |
-          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, coverage' >/dev/null 2>&1; then
+          # Les deux besoins du venv : `coverage` pour les témoins de
+          # scripts/map.py (#1257), `yaml` pour la CI pyyaml (#1511).
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, coverage, yaml' >/dev/null 2>&1; then
             echo "venv restauré du cache : valide"
           else
             rm -rf .venv-ci
             python -m venv .venv-ci
-            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10'
+            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10' 'pyyaml>=6'
             echo "reconstruit=1" >> "$GITHUB_OUTPUT"
           fi
       # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
@@ -460,6 +470,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # ManifestesTest (test_cluster, liste « toujours ») lit deploy/k8s avec
+      # PyYAML : sans lui il est sauté, donc jamais vérifié en CI (#1511).
+      - name: pyyaml (manifestes k8s)
+        run: python -m pip install -q 'pyyaml>=6'
       - *base
       - *git
       - *plan
@@ -520,7 +534,7 @@ jobs:
       checks: write  # L161c : check run « tests (flux) »
     env:
       AMEESH_DRIVER: psycopg
-      FLUX_NOM: tests (flux) autre-FS ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+      FLUX_NOM: tests (flux) autre système de fichiers ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
       AMEESH_PLAFOND_MIN: "45"
     steps:
       - *debut
@@ -759,6 +773,10 @@ jobs:
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # #856 : relire l'état terminal des jobs d'une exécution
+      checks: write   # #856 : conclure les checks « tests (flux) » orphelins
     steps:
       - name: bilan des parts
         run: |
@@ -794,3 +812,24 @@ jobs:
           # #748 : la part sur l'autre système de fichiers n'existe que pour une
           # release (ou à la main) ; quand elle a tourné, elle compte
           test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped
+      # #856 : réconciliation indépendante du publisher — un runner arrêté
+      # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
+      # restait in_progress pour toujours. On relit l'état terminal réel du job
+      # et de l'exécution qui l'ont publié (par le `details_url`, sinon par le
+      # `check_suite` : GitHub laisse l'URL par défaut sur ces checks) ; jamais
+      # `success` sans ligne `fin`, aucun check dont l'exécution est encore
+      # active, ni d'une autre tête, n'est touché.
+      # `continue-on-error` : cette réconciliation ne change jamais le verdict
+      # requis « tests » (comme la publication, elle n'est pas une cause d'échec).
+      # `if: always()` : un bilan rouge (une part requise tombée) ne doit pas
+      # sauter le checkout — sinon `sweep`, lancé en `always()`, n'a plus son
+      # script et aucun check orphelin n'est conclu.
+      - uses: actions/checkout@v4
+        if: always()
+        continue-on-error: true
+      - name: conclusion des checks de flux orphelins
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-flow.py sweep

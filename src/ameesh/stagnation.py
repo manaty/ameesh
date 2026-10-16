@@ -368,7 +368,12 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     l'attente serait un verdict : un lot léger attend la fusion, pas un verdict
     (§2). `review_class` porte les classes déjà résolues par l'appelant
     (`{id: classe ou None}`) ; une classe absente ou douteuse garde l'attente
-    prudente d'un verdict, sans deviner."""
+    prudente d'un verdict, sans deviner.
+
+    `unreadable` (#1107) : un lot dont la ligne ne se lit pas (horodatage
+    textuel…) est isolé — l'erreur y est rendue, ses autres champs restent
+    vides (aucun instant ni attente inventés) et les autres lots sont décrits
+    normalement."""
     from . import progress  # import tardif : progress importe ce module
     from . import projects
 
@@ -392,30 +397,47 @@ def describe(db, rows: list[dict], *, now: float | None = None,
         rid = int(row["id"])
         acts = actions.get(rid, [])
         package = packages.get(row.get("package_id")) or {}
-        jalons = progress._jalons_de_lot(row, events.get(rid, []), acts, milestones.get(rid))
-        detail = waiting(row, jalons, acts,
-                         responsible=package.get("responsible"))
-        # #1822 : la classe n'est lue que pour un lot qui attendrait un
-        # verdict ; déjà résolue par l'appelant, elle ne l'est pas relue.
-        if detail is not None and detail.get("what") == "verdict":
-            cls = known[rid] if rid in known else review_class_of(
-                db, row, cfg=cfg, memo=classes, milestones=milestones.get(rid, []))
-            if cls:
-                detail = waiting(row, jalons, acts,
-                                 responsible=package.get("responsible"),
-                                 review_class=cls)
-        detail = with_availability(detail, states, externals)
-        last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
-                             messages.get(rid), events_ts=last_events.get(rid))
+        try:
+            jalons = progress._jalons_de_lot(row, events.get(rid, []), acts,
+                                             milestones.get(rid))
+            detail = waiting(row, jalons, acts,
+                             responsible=package.get("responsible"))
+            # #1822 : la classe n'est lue que pour un lot qui attendrait un
+            # verdict ; déjà résolue par l'appelant, elle ne l'est pas relue.
+            if detail is not None and detail.get("what") == "verdict":
+                cls = known[rid] if rid in known else review_class_of(
+                    db, row, cfg=cfg, memo=classes, milestones=milestones.get(rid, []))
+                if cls:
+                    detail = waiting(row, jalons, acts,
+                                     responsible=package.get("responsible"),
+                                     review_class=cls)
+            detail = with_availability(detail, states, externals)
+            last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
+                                 messages.get(rid), events_ts=last_events.get(rid))
+            project = projects.lot_project(row, agent_projects,
+                                           package_team=package.get("team"))
+        except Exception as exc:  # noqa: BLE001 — un lot ne fait pas tomber la lecture
+            # #1107 : une ligne illisible (horodatage textuel…) est isolée ;
+            # aucun instant ni attente inventés, le consommateur la signale
+            out[rid] = {"waiting": None, "waiting_for": None, "last_activity_ts": None,
+                        "project": None, "planned_wait": holds.get(rid),
+                        "dependencies": dependencies.get(rid, []), "stale": None,
+                        "unreadable": unreadable(exc)}
+            continue
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
-                    "project": projects.lot_project(row, agent_projects,
-                                                    package_team=package.get("team")),
+                    "project": project,
                     "planned_wait": holds.get(rid),
                     "dependencies": dependencies.get(rid, []),
                     "stale": None if rid in holds else
-                             stale(row.get("state") or "", last, now, threshold)}
+                             stale(row.get("state") or "", last, now, threshold),
+                    "unreadable": None}
     return out
+
+
+def unreadable(exc: BaseException) -> str:
+    """L'erreur d'un lot illisible, telle que l'alerte `lot_unreadable` la cite."""
+    return "%s: %s" % (type(exc).__name__, exc)
 
 
 def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
@@ -428,7 +450,10 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     (`{what, who, label}`, L29) et `project` (#705 : le projet du lot, dont
     l'orchestrateur est prévenu quand aucun relecteur n'est désigné).
     `cfg`/`review_class` : le contexte de classe de revue (#1822), transmis à
-    `describe`."""
+    `describe`.
+
+    `unreadable` (#1107) : l'erreur d'un lot illisible, rendu sans instant
+    ni inactivité (`last_activity_ts`, `idle_s` à None) ; None sinon."""
     from . import sous_utilisation
     now = time.time() if now is None else float(now)
     st = storage.of(db)
@@ -437,16 +462,27 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     # Read all open lots before filtering: deferred lots must not occupy the
     # render limit and hide an actionable stale lot or a dependency beyond it.
     open_items = st.operations.open_lots_activity(None)
-    rows = [r for r in open_items
-            if r.get("last_activity_ts") is not None
-            and now - float(r["last_activity_ts"]) >= float(threshold_s)
-            and not sous_utilisation.is_backlog_item(r)]
+    rows = []
+    out = []
+    for r in open_items:
+        if r.get("last_activity_ts") is None or sous_utilisation.is_backlog_item(r):
+            continue
+        try:
+            idle = now - float(r["last_activity_ts"])
+        except (TypeError, ValueError) as exc:
+            # #1107 : instant illisible, le lot est signalé sans durée inventée
+            out.append(_unreadable_line(r, unreadable(exc)))
+            continue
+        if idle >= float(threshold_s):
+            rows.append(r)
     described = describe(db, rows, now=now, threshold=threshold_s, open_items=open_items,
                          cfg=cfg, review_class=review_class)
-    out = []
     for row in rows:
         lot = int(row["id"])
         info = described[lot]
+        if info["unreadable"]:
+            out.append(_unreadable_line(row, info["unreadable"]))
+            continue
         if info["stale"] is None:
             continue
         out.append({
@@ -459,5 +495,15 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "waiting_for": info["waiting_for"],
             "waiting": info["waiting"],
             "project": info.get("project"),
+            "unreadable": None,
         })
     return out[:max(0, int(limit))]
+
+
+def _unreadable_line(row: dict, error: str) -> dict:
+    """Une ligne de `stagnant_lots` pour un lot illisible (#1107) : signalée,
+    sans instant ni inactivité inventés."""
+    return {"id": int(row["id"]), "title": row.get("title"), "state": row.get("state"),
+            "assignee": row.get("assignee") or None, "last_activity_ts": None,
+            "idle_s": None, "waiting_for": None, "waiting": None, "project": None,
+            "unreadable": error}
