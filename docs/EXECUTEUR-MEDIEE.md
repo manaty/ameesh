@@ -16,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 65 opérations et la liste des 361 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 65 opérations et la liste des 362 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -64,7 +64,7 @@ Comptes : 65 opérations, dont 25 lectures et 40 écritures. 55 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
 sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (426
+signature et les mêmes types. Il vérifie aussi que l'interface entière (427
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -81,7 +81,9 @@ l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
 `roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
 `spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
 (sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.
-`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même. Un
+`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même, et
+`operations.gauge_latest` (#1132 : provenance des relevés, instant de
+production et source) avec lui. Un
 exécuteur médié ne fait ni ménage local ni passage périodique de ménage : son
 dossier de travail est effacé en fin de bail.
 
