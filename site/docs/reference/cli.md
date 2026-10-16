@@ -336,7 +336,7 @@ ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
 ameesh work merged <id> --sha SHA [--migration-landed N] [--note N] [--actor A]
-ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agent/…] [--target BRANCH]
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
@@ -446,6 +446,14 @@ deadline: if the delegate has not worked on it by then, the lot goes back to
 the delegator (`--actor`, else the current assignee). The runner processes
 deadlines at every pass; `expire-delegations` does it by hand. See
 [Operate agents](../guides/operate-agents.md#guarded-assignment-and-delegation).
+
+`--claim` assigns only a lot that has **no assignee**: a lot already taken is
+refused (exit 1) naming its holder, and the write is conditional on the
+assignee still being empty, so two concurrent claims produce a single
+assignment and the other is refused without changing hands (#1026). The
+`stale_lot` (unassigned lot) and `idle_capacity` (lots without an agent)
+briefs carry that command; a deliberate reassignment of a lot already held
+stays `work assign` without `--claim`.
 
 **Branch of a lot (L118).** `--branch` records the lot's branch, `--target`
 its target (default: `git config ameesh.target` in the repository, else
