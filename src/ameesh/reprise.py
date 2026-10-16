@@ -125,7 +125,8 @@ def find_session(harness: str, home: str, session_id: str,
 
     * Codex : `<CODEX_HOME>/sessions/AAAA/MM/JJ/rollout-<date>-<id>.jsonl` ;
     * Claude Code : `<CLAUDE_CONFIG_DIR>/projects/<dossier encodé>/<id>.jsonl` ;
-    * DeepSeek Harness : `<DSH_HOME>/sessions/<dossier encodé>/session-<id>/`.
+    * DeepSeek Harness : `<DSH_HOME>/sessions/<dossier encodé>/session-<id>/`
+      (l'identifiant dsh porte déjà le préfixe `session-`).
 
     `strict` (L224, verdict codex #183) : une recherche incomplète (dossier
     illisible) lève `SessionSearchIncomplete` au lieu de répondre None.
@@ -177,7 +178,11 @@ def find_session(harness: str, home: str, session_id: str,
             if _present(candidate, False, strict):
                 return candidate
         elif harness == "deepseek":
-            candidate = os.path.join(root, entry, "session-" + session_id)
+            # dsh ids already carry the prefix (`session-b126155c-…`): adding it
+            # again looked for `session-session-…`, so no DeepSeek session was
+            # ever found and every turn opened a new one on the resume brief
+            name = session_id if session_id.startswith("session-") else "session-" + session_id
+            candidate = os.path.join(root, entry, name)
             if _present(candidate, True, strict):
                 return candidate
     return None
@@ -217,7 +222,7 @@ def locate(cfg: Config, harness: str, session_id: str,
     return None, None, searched
 
 
-def holders(path: str, session_id: str) -> list[dict]:
+def holders(path: str | None, session_id: str) -> list[dict]:
     """Les processus qui tiennent la session : fichier ouvert (ou dossier
     ouvert ou courant), ou id de session sur la ligne de commande (`codex
     resume <id>`, `claude --resume <id>`) — hors ce processus et ses
@@ -306,9 +311,46 @@ def _rules_unreadable(charge) -> bool:
                for f in (getattr(charge, "load_findings", ()) or ()))
 
 
+def _process_fragment(process) -> tuple[str, str]:
+    """#1372 : le texte d'une fiche Process pour le brief, et son diagnostic.
+
+    La projection courte de la carte, quand elle est lue, REMPLACE le texte
+    entier : la fin du canon (§12, §14…) n'est plus mangée par le début. Sinon
+    le texte entier est gardé (borné plus loin par le budget du bloc) et un
+    diagnostic DIT ce qui manque — jamais de coupe silencieuse."""
+    from . import canon as canon_mod
+    entete = ["### %s" % process.title,
+              "- responsible: %s" % process.responsible,
+              "- updated: %s" % process.updated]
+    if process.expire:
+        entete.append("- expire: %s" % process.expire)
+    proj = (getattr(process, "projection", "") or "").strip()
+    erreur = getattr(process, "projection_error", "") or ""
+    corps = (process.body or "").strip()
+    diag = ""
+    if erreur:
+        diag = ('the card "%s" carries an unusable short projection (%s): its '
+                "whole text is used instead" % (process.title, erreur))
+    elif proj:
+        if _octets(proj) > canon_mod.PROCESS_PROJECTION_MAX:
+            # #1372 : une projection au-delà de son budget est COUPÉE à ce
+            # budget (pas au budget du bloc) : le texte priorisé reste, sa fin
+            # est dite, et `canon check` demande de la raccourcir.
+            diag = ('the short projection of "%s" is too long (%d > %d bytes): '
+                    "cut to its budget" % (process.title, _octets(proj),
+                                           canon_mod.PROCESS_PROJECTION_MAX))
+            proj = _clip(proj, canon_mod.PROCESS_PROJECTION_MAX)
+        corps = proj
+    elif _octets(corps) > canon_mod.PROCESS_BODY_MAX:
+        diag = ('the card "%s" has no short projection (%d bytes of rules): '
+                "the brief keeps what fits" % (process.title, _octets(corps)))
+    return "\n".join(entete) + ("\n\n" + corps if corps else ""), diag
+
+
 def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
-                   host: str = "") -> str:
-    """#538 : le texte des fiches Process du canon DE L'AGENT, prêt pour un brief.
+                   host: str = "") -> tuple[str, list[str]]:
+    """#538 : le texte des fiches Process du canon DE L'AGENT, prêt pour un brief,
+    et les diagnostics de ce qui n'a pas pu être injecté (#1372).
 
     Le canon est celui qui **possède la ligne du registre** de l'agent
     (`canon_id`, la colonne `canon` ; NULL = canon par défaut), comme le rôle
@@ -319,7 +361,7 @@ def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
     Host) ; une fiche invalide n'est jamais injectée. Un canon illisible, ou
     dont la lecture des fiches a échoué, est dit, pas tu."""
     if not getattr(cfg, "canon", None):
-        return ""
+        return "", []
     try:
         from . import canon as canon_mod
         canons = canon_mod.load_configured(cfg)
@@ -328,28 +370,27 @@ def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
         owns = [c for c in canons if c.owns(canon_id)]
         charge = next((c for c in owns if agent and c.agent(agent) is not None), None)
         if charge is None:
-            return PROCESS_RULES_UNAVAILABLE if any(_rules_unreadable(c) for c in owns) else ""
+            return ((PROCESS_RULES_UNAVAILABLE, [])
+                    if any(_rules_unreadable(c) for c in owns) else ("", []))
         if _rules_unreadable(charge):
-            return PROCESS_RULES_UNAVAILABLE
+            return PROCESS_RULES_UNAVAILABLE, []
         if charge.untrusted:
-            return ""
+            return "", []
         from . import canon_sync
         if canon_sync.assess(charge, host)[0] != canon_sync.CANON_OK:
-            return ""
+            return "", []
     except Exception:
-        return ""
-    blocs = []
+        return "", []
+    blocs, diagnostics = [], []
     for process in getattr(charge, "processes", ()) or ():
         if not process.valid:
             continue
-        entete = ["### %s" % process.title,
-                  "- responsible: %s" % process.responsible,
-                  "- updated: %s" % process.updated]
-        if process.expire:
-            entete.append("- expire: %s" % process.expire)
-        corps = (process.body or "").strip()
-        blocs.append("\n".join(entete) + ("\n\n" + corps if corps else ""))
-    return "\n\n".join(blocs).strip()
+        texte, diag = _process_fragment(process)
+        if diag:
+            diagnostics.append(diag)
+        if texte:
+            blocs.append(texte)
+    return "\n\n".join(blocs).strip(), diagnostics
 
 
 def _clip_rules(rules: str, place: int) -> str:
@@ -357,30 +398,92 @@ def _clip_rules(rules: str, place: int) -> str:
     return _clip(rules, place) if _octets(rules) > place else rules
 
 
-def _rules_bloc(rules: str, limit: int) -> str:
-    """#538 : le bloc de règles (en-tête, règles, pied) borné à `limit` octets,
-    ou "" quand l'en-tête et le pied n'y tiennent déjà pas."""
-    entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
-    place = limit - _octets(entete) - _octets(pied)
-    if place <= 6:
+#: #1372 : préfixe des diagnostics de règles posés dans le bloc. Ils viennent
+#: APRÈS l'en-tête du bloc, donc ils survivent à la coupe qui emporte la fin du
+#: texte : la perte de règles est dite, jamais silencieuse.
+RULES_DIAG_PREFIX = "> rules: "
+#: #1372 : plafond des diagnostics dans le bloc (octets). Des constats nombreux
+#: (une carte fautive par ligne) ne doivent jamais chasser le texte des règles
+#: ni rendre le bloc vide : au-delà, les lignes sont agrégées (R1 #1372, B2).
+RULES_DIAG_MAX = 1200
+
+
+def _diag_block(diagnostics, cap: int) -> str:
+    """Les diagnostics prêts à poser dans le bloc, bornés à `cap` octets.
+
+    Les premières lignes qui tiennent sont gardées ; l'excédent est résumé par
+    une dernière ligne `… N more rule diagnostics`. Rend "" si même le résumé
+    ne tient pas : l'appelant garde alors le texte des règles."""
+    lignes = [RULES_DIAG_PREFIX + str(d).strip()
+              for d in (diagnostics or ()) if str(d).strip()]
+    if not lignes or cap <= 0:
         return ""
-    return entete + _clip_rules(rules, place) + pied
+    gardees: list[str] = []
+    for i, ligne in enumerate(lignes):
+        reste = len(lignes) - i - 1
+        suite = ["%s… %d more rule diagnostics (`canon check`)"
+                 % (RULES_DIAG_PREFIX, reste)] if reste else []
+        if _octets("\n".join(gardees + [ligne] + suite) + "\n") > cap:
+            break
+        gardees.append(ligne)
+    reste = len(lignes) - len(gardees)
+    if not reste:
+        return "\n".join(gardees) + "\n"
+    agregat = ("%s… %d more rule diagnostics (`canon check`)"
+               % (RULES_DIAG_PREFIX, reste))
+    while gardees:
+        texte = "\n".join(gardees + [agregat]) + "\n"
+        if _octets(texte) <= cap:
+            return texte
+        gardees.pop()
+    # une seule ligne, plus longue que le plafond : la couper sans casser l'UTF-8
+    return _clip(lignes[0], cap).rstrip() + "\n"
+
+
+def _rules_bloc(rules: str, limit: int, diagnostics=()) -> str:
+    """#538/#1372 : le bloc de règles (en-tête, diagnostics, règles, pied) borné
+    à `limit` octets, ou "" quand l'en-tête et le pied n'y tiennent déjà pas.
+
+    Les diagnostics (#1372) sont posés avant les règles, sous un plafond
+    (`RULES_DIAG_MAX`, au plus le quart de la place) : leur nombre ne peut ni
+    chasser les règles ni vider le bloc (R1 #1372, B2). Si les règles doivent
+    être coupées, une ligne le DIT, et ce constat passe avant les diagnostics
+    de cartes."""
+    entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
+    place_total = limit - _octets(entete) - _octets(pied)
+    if place_total <= 6:
+        return ""
+    diags = list(diagnostics or ())
+    cap = max(0, min(RULES_DIAG_MAX, place_total // 4))
+    diag = _diag_block(diags, cap)
+    place = place_total - _octets(diag)
+    if _octets(rules) > place:
+        coupe = ("the rules block is cut: %d bytes of rules, the end is not "
+                 "injected" % _octets(rules))
+        diag_coupe = _diag_block([coupe], cap)
+        diag = _diag_block(diags, max(0, cap - _octets(diag_coupe))) + diag_coupe
+        place = place_total - _octets(diag)
+        if place <= 6:
+            # même sans diagnostics, le texte des règles prime
+            diag, place = "", place_total
+    return entete + diag + _clip_rules(rules, place) + pied
 
 
 def process_rules_block(cfg: Config, *, agent: str = "", canon_id: str | None = None,
                         host: str = "", limit: int = BRIEF_MAX_BYTES) -> str:
     """#538 : le bloc de règles prêt à ouvrir une session neuve, ou "".
 
-    Le bloc entier (en-tête, règles, pied) tient dans `limit` octets : une
-    première session ne part jamais avec un préfixe non borné (verdict codex
-    #510 r2, P2). Ne lève jamais : une erreur de mise en forme laisse l'appelant
-    sans règles plutôt que d'interrompre l'ouverture de session (revue codex
-    #510 r1, P1)."""
+    Le bloc entier (en-tête, diagnostics, règles, pied) tient dans `limit`
+    octets : une première session ne part jamais avec un préfixe non borné
+    (verdict codex #510 r2, P2). Ne lève jamais : une erreur de mise en forme
+    laisse l'appelant sans règles plutôt que d'interrompre l'ouverture de
+    session (revue codex #510 r1, P1)."""
     try:
-        rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
+        rules, diagnostics = _process_rules(cfg, agent=agent, canon_id=canon_id,
+                                            host=host)
     except Exception:
         return ""
-    return _rules_bloc(rules, limit) if rules else ""
+    return _rules_bloc(rules, limit, diagnostics) if rules else ""
 
 
 def _join_without_rules(avant: str, apres: str) -> str:
@@ -424,14 +527,19 @@ def with_process_rules(cfg: Config, text: str, *, agent: str = "",
     #510 r3, P2). Le texte garde au plus `BRIEF_TEXT_MIN_BYTES` : les règles ne
     l'effacent pas, la consigne d'un brief court reste entière.
 
+    #1372 : la carte peut porter une projection courte, injectée à la place du
+    texte entier ; ce qui n'a pas pu être injecté (projection absente, illisible
+    ou trop longue, bloc coupé) est DIT en tête du bloc.
+
     Ne lève jamais (revue codex #510 r1, P1)."""
     try:
         corps = _strip_process_rules(text)
-        rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
+        rules, diagnostics = _process_rules(cfg, agent=agent, canon_id=canon_id,
+                                            host=host)
         if not rules:
             return corps
         garde = min(_octets(corps), BRIEF_TEXT_MIN_BYTES)
-        bloc = _rules_bloc(rules, BRIEF_MAX_BYTES - 2 - garde)
+        bloc = _rules_bloc(rules, BRIEF_MAX_BYTES - 2 - garde, diagnostics)
         if not bloc:
             return corps
         reste = BRIEF_MAX_BYTES - _octets(bloc) - 2
@@ -617,6 +725,21 @@ def _forget_local(cfg: Config, name: str) -> None:
         pass
 
 
+#: #1037 : réglages locaux qui n'ont de sens que sous le harnais déclaré
+_HARNESS_SETTINGS = ("model", "effort", "tier")
+
+
+def _drop_harness_settings(cfg: Config, name: str) -> None:
+    """Efface les réglages locaux du harnais quitté (l'exécuteur les relit
+    avant les colonnes du registre : les garder ferait lancer le nouveau
+    harnais avec le modèle, l'effort ou le tier de l'ancien)."""
+    for cle in _HARNESS_SETTINGS:
+        try:
+            os.unlink(os.path.join(cfg.agent_dir(name), cle))
+        except OSError:
+            pass
+
+
 def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
           account: str | None = None, cwd: str | None = None, brief: str = "",
           chantier: str | None = None, force: bool = False, actor: str = "",
@@ -625,7 +748,8 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
 
     Refus (`RepriseError`) : nom, harnais ou id invalide ; agent épinglé à un
     autre hôte ; bail vivant ; session introuvable sous les comptes de l'hôte ;
-    session encore ouverte (sauf `force`, journalisé).
+    session encore ouverte (sauf `force`, journalisé) ; session dont cet hôte
+    ne peut pas vérifier qu'elle est fermée (L63b : même avec `force`).
     """
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
@@ -678,22 +802,18 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                    "in the host configuration, or set its CODEX_HOME / "
                    "CLAUDE_CONFIG_DIR / DSH_HOME variable)"))
     # L63 : si l'OS ne permet pas de vérifier que la session est fermée,
-    # refus (fail-closed), sauf --force — journalisé comme un forçage
-    unverified = ""
+    # refus (fail-closed). L63b (owner, decision #9413 b): no bypass, not even
+    # --force — the open session is one of the guarantees without one
     try:
-        tenants = holders(path, session_id) if path else []
+        # no session file (dsh without its directory): the command lines are
+        # still read, and the host must still be able to read them
+        tenants = holders(path, session_id)
     except platform.NotAvailable as exc:
-        tenants, unverified = [], str(exc)
-    if unverified and not force:
         raise RepriseError(
-            "cannot check that session %s is closed on this host (%s): "
-            "adoption refused (or --force, at your own risk: if it is still open, "
-            "two harnesses would write the same session)" % (session_id, unverified))
-    if unverified:
-        avert = ("--force: session %s adopted without checking that it is closed (%s)"
-                 % (session_id, unverified))
-        warn(avert)
-        constats.append(avert)
+            "cannot check that session %s is closed on this host (%s): adoption "
+            "refused, with or without --force (if it is still open, two harnesses "
+            "would write the same session); close the session, then adopt it from "
+            "a host that can check it" % (session_id, exc)) from None
     if tenants and not force:
         raise RepriseError(
             "session %s is still open (%s): close the interactive session first "
@@ -735,6 +855,15 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
         session_account=compte, prompt=prompt, status_text=status_text)
     if result is None:
         raise RepriseError("%s: a lease was taken in the meantime; try again" % name)
+    # #1037 : le harnais déclaré a changé — les réglages du précédent
+    # (modèle, effort, tier ; base et état local) ne s'appliquent plus. Le
+    # registre les a effacés dans la même écriture que le harnais ; l'état
+    # local est effacé ici (même hôte seulement : ailleurs, il n'existe pas).
+    quitte = str(result.get("previous_harness") or "")
+    if quitte and quitte != harness:
+        _drop_harness_settings(cfg, name)
+        constats.append("harness %s → %s: model, effort and tier of the former harness "
+                        "dropped (they do not apply to %s)" % (quitte, harness, harness))
     _forget_local(cfg, name)
     # L46 : l'agent adopté est mené par l'exécuteur — ses liaisons de session
     # externes (L41) sont révoquées, sinon une session externe lui volerait
@@ -771,10 +900,10 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                        "".join("\n- %s" % c for c in constats)),
                project=_project(cfg, after),
                meta={"audit": "adopt", "session": session_id, "account": compte or "",
-                     "harness": harness, "forced": bool(tenants or unverified),
+                     "harness": harness, "forced": bool(tenants),
                      "previous_session": result.get("previous_session") or ""})
     return {"agent": name, "session": session_id, "harness": harness, "account": compte,
-            "path": path, "cwd": effectif, "forced": bool(tenants or unverified),
+            "path": path, "cwd": effectif, "forced": bool(tenants),
             "wakeable": ok,
             "previous_session": result.get("previous_session"),
             "previous_mode": result.get("previous_mode"), "notes": constats}
@@ -1065,8 +1194,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="first instruction under the runner (default: standard resume)")
     p_ad.add_argument("--chantier", default=None, help="workspace (new agent)")
     p_ad.add_argument("--force", action="store_true",
-                      help="adopt even if a process still holds the session, or if "
-                           "this host cannot check it (logged)")
+                      help="adopt even if a process still holds the session (logged); "
+                           "never when this host cannot check it (L63b)")
     p_ad.add_argument("--json", action="store_true")
     p_ad.set_defaults(func=cmd_adopt)
 

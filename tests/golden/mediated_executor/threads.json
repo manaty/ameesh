@@ -152,6 +152,94 @@
      "server_ts": 1791640000.12
     }
    }
+  },
+  {
+   "name": "threads.recount/ok",
+   "op": "threads.recount",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0d3fd8ed-1856-5f42-8a3b-6be703164d5d"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "threads.recount",
+     "args": [],
+     "kwargs": {
+      "project": "site",
+      "lot": "812",
+      "transport": "github",
+      "host": "anna-portable",
+      "location": "owner/repo#812",
+      "kept": 7,
+      "last": {
+       "entry_id": "site/812#3800",
+       "mailbox_id": 812,
+       "author": "agent:inge-front",
+       "excerpt": "PR relue.",
+       "ts": 1791640000.12
+      },
+      "end": 4096
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": 4096,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "threads.recount/session",
+   "op": "threads.recount",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "70fb76dd-52ca-52d9-9829-c1f0bb17df72"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "threads.recount",
+     "args": [],
+     "kwargs": {
+      "project": "site",
+      "lot": "812",
+      "transport": "github",
+      "host": "anna-portable",
+      "location": "owner/repo#812",
+      "kept": 7,
+      "last": {
+       "entry_id": "site/812#3800",
+       "mailbox_id": 812,
+       "author": "agent:inge-front",
+       "excerpt": "PR relue.",
+       "ts": 1791640000.12
+      },
+      "end": 4096
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": 4096,
+     "server_ts": 1791640000.12
+    }
+   }
   }
  ]
 }

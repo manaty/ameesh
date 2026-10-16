@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L132 : `stale_lot`, `plan_underused` et `idle_capacity` partent aussi, par
 courrier `event`, aux orchestrateurs et à l'auditeur, avec l'action attendue ;
-une fois par alerte, une relance après 6 h."""
+une fois par alerte, une relance après 6 h. L713 : `stale_lot` ne réveille plus
+l'auditeur, qui le lit à sa passe (`ameesh alerts --json`)."""
 from __future__ import annotations
 
 import time
@@ -35,13 +36,44 @@ class BriefsTest(unittest.TestCase):
 
     def test_stale_lot(self):
         briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
-        self.assertEqual(sorted(briefs), ["auditeur", "orch"])   # équipe de l'assigné
+        self.assertEqual(sorted(briefs), ["orch"])   # équipe de l'assigné
         text = briefs["orch"]
         self.assertIn('#42 "export"', text)
         self.assertIn('ameesh mail send dev1 "…" --lot 42', text)
         self.assertIn("ameesh work merged 42 --sha", text)
+        self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
-        self.assertEqual(briefs["auditeur"], text)
+        self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+
+    def test_stale_lot_offre_le_hold_de_dependance(self):
+        """#1642 : le brief doit offrir la dépendance déclarée (planned_wait),
+        qui supprime déjà l'alerte et sa relance quand la porte réelle est un
+        parent ouvert — sinon un lot empilé est trié en vain toutes les 6 h."""
+        text = alert_briefs.briefs(STALE, self.listing)["orch"]
+        self.assertIn("declare the dependency that stops the reminders", text)
+        self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        sans_assigne = alert_briefs.briefs(dict(STALE, agent=None), self.listing)
+        self.assertTrue(sans_assigne)
+        for body in sans_assigne.values():
+            self.assertIn("ameesh work dependencies 42 --add <blocker>", body)
+
+    def test_stale_lot_parque_sur_un_lot_ouvert(self):
+        """#1261 : un lot parqué se débloque par une dépendance déclarée
+        (planned_wait, L368), pas par une relance de son auteur."""
+        text = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])["orch"]
+        self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        self.assertIn("the alert stops while the wait is planned", text)
+        self.assertLess(text.index("ameesh work dependencies 42"),
+                        text.index("ameesh mail send dev1"))
+
+    def test_stale_lot_ne_reveille_pas_l_auditeur(self):
+        """L713 : lu à la passe de l'auditeur, pas poussé ; les autres alertes si."""
+        briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
+        self.assertNotIn("auditeur", briefs)
+        idle = {"type": "idle_capacity", "agents": ["dev1"], "lots": [],
+                "orchestrators": ["orch"], "detail": "1 agent au repos"}
+        self.assertIn("auditeur", alert_briefs.briefs(idle, self.listing,
+                                                      auditor_names=["auditeur"]))
 
     def test_stale_lot_sans_assigne(self):
         alert = dict(STALE, agent=None)
@@ -64,6 +96,17 @@ class BriefsTest(unittest.TestCase):
         briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
         self.assertIn("ameesh work assign", briefs["orch"])
         self.assertIn("Action : répartir", briefs["auditeur"])
+        # #1608 : bloqué -> l'auditeur ne reçoit pas l'ordre d'assigner ;
+        # démarrable -> il le reçoit
+        bloque = dict(alert, lots=[12], startable_lots=[],
+                      blocked_lots={"12": {"what": "dependency", "lots": [7]}})
+        auditeur = alert_briefs.briefs(bloque, self.listing, auditor_names=["auditeur"])["auditeur"]
+        self.assertIn("Action : répartir", auditeur)
+        self.assertNotIn("Lots are waiting", auditeur)
+        demarrable = dict(alert, lots=[12], startable_lots=[12])
+        auditeur = alert_briefs.briefs(demarrable, self.listing,
+                                       auditor_names=["auditeur"])["auditeur"]
+        self.assertIn("Lots are waiting", auditeur)
         self.assertEqual(alert_briefs.briefs({"type": "long_turn"}, self.listing), {})
 
     def test_orchestrateur_et_auditeur(self):
@@ -108,7 +151,7 @@ class NotifierBriefsTest(PgTestCase):
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["kind"], "event")
         self.assertIn("ameesh mail send dev1", rows[0]["body"])
-        self.assertEqual(len(self.mails("auditeur")), 1)
+        self.assertEqual(len(self.mails("auditeur")), 0)   # L713 : pas de réveil
         clock[0] += 6 * HEURE
         notifier.run_pass(self.db, current=[alert])
         rows = self.mails("orch")

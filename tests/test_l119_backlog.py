@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 
 from ameesh import backlog, exploitation, notify, registry, storage, sous_utilisation, work
 
@@ -95,6 +96,95 @@ class FileTest(_Base):
 
 
 class PriseTest(_Base):
+    def test_lot_du_projet_bloque_laisse_prendre_l_amelioration(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        lot = work.add(self.db, title="projet bloque")
+        item = self.element("amelioration prete", 50)
+        storage.of(self.db).work_dependencies.add(lot["id"], amont["id"], actor="test")
+
+        self.assertEqual([t["item"]["id"] for t in self.take(dry_run=True)], [item["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+        # Un projet dont l'amont est satisfait reprend la priorite sur la file.
+        work.close(self.db, amont["id"], abandoned=True)
+        self.agent("claude2")
+        self.element("autre amelioration", 50)
+        self.assertEqual(self.take(), [])
+
+    def test_capacite_idle_ne_propose_pas_un_lot_du_projet_bloque(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        lot = work.add(self.db, title="projet bloque")
+        storage.of(self.db).work_dependencies.add(lot["id"], amont["id"], actor="test")
+        listing = storage.of(self.db).operations.listing()
+
+        def alertes(**kw):
+            return sous_utilisation.idle_capacity(
+                self.db, listing, self.now, [], idle_s=30, paid=("deepseek",), **kw)
+
+        # #1608 : l'alerte ne se tait plus devant un lot de projet bloqué — elle
+        # le garde dans `lots`, le classe dans `blocked_lots` et écarte le
+        # dispatch ; la prise automatique (0037) garde, elle, le filtre `db=db`
+        # de #1021 (test suivant).
+        self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
+        self.assertEqual(alertes()[0]["lots"], [lot["id"]])
+        self.assertEqual(alertes()[0]["startable_lots"], [])
+        self.assertEqual(alertes()[0]["blocked_lots"][str(lot["id"])]["what"], "dependency")
+        self.assertNotIn("ameesh work assign", alertes()[0]["detail"])
+        self.assertEqual(
+            [a["type"] for a in alertes(
+                lots=storage.of(self.db).operations.open_lots_activity(500))],
+            ["idle_capacity"])
+        work.close(self.db, amont["id"], abandoned=True)
+        self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
+        self.assertEqual(alertes()[0]["startable_lots"], [lot["id"]])
+        self.assertIn("#%d" % lot["id"], alertes()[0]["detail"])
+
+    def test_dependance_ouverte_laisse_prendre_l_amelioration_prete(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        bloque = self.element("prioritaire mais bloque", 90)
+        pret = self.element("pret", 50)
+        storage.of(self.db).work_dependencies.add(bloque["id"], amont["id"], actor="test")
+
+        self.assertEqual([i["id"] for i in storage.of(self.db).work.backlog(
+            open_only=True, limit=1, ready_only=True)], [pret["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [pret["id"]])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+        # La liste de la file continue d'afficher les éléments bloqués.
+        self.assertIn(bloque["id"], [i["id"] for i in backlog.items(self.db)])
+
+        work.close(self.db, amont["id"], abandoned=True)
+        self.agent("claude2")
+        self.assertEqual([t["item"]["id"] for t in self.take()], [bloque["id"]])
+
+    def test_dependance_ajoutee_apres_selection_refuse_l_amelioration(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        bloque = self.element("devient bloque", 90)
+        pret = self.element("reste pret", 50)
+        check = work.check_assignee
+        added = False
+
+        def add_dependency(*args, **kwargs):
+            nonlocal added
+            if not added:
+                storage.of(self.db).work_dependencies.add(
+                    bloque["id"], amont["id"], actor="test")
+                added = True
+            return check(*args, **kwargs)
+
+        with patch.object(work, "check_assignee", side_effect=add_dependency):
+            out = self.take()
+        self.assertEqual([t["item"]["id"] for t in out], [pret["id"]])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+        self.assertFalse(self.db.query("SELECT id FROM agent_mailbox WHERE work_item_id = %s",
+                                       (str(bloque["id"]),)))
+        self.assertFalse(any(e["note"].startswith(backlog.AUTO_TAKE_NOTE)
+                             for e in work.events(self.db, bloque["id"])))
+
     def test_prise_de_plus_forte_valeur_et_courrier(self):
         self.agent("claude1")
         bas = self.element("doc", 20)

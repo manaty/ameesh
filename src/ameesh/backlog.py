@@ -40,6 +40,10 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
   tout le mesh (plusieurs `ameesh notify` ne se cumulent pas) ;
 * l'attribution est conditionnelle (assigné encore vide) : deux preneurs
   concurrents ne prennent pas le même élément.
+* une dépendance explicite encore ouverte exclut l'élément avant la borne
+  de sélection ; le graphe est revérifié dans la transaction de prise. Un
+  interblocage de cette transaction avec une autre (#1496) vaut une prise
+  perdue entre-temps : l'élément reste libre, le passage continue.
 
 **Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
 sans lot en cours depuis `lot_idle_s` (15 min par défaut) prend lui-même le
@@ -59,6 +63,8 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   `harness:<nom>` désigne son harnais ;
 * un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
   sa date ;
+* un lot avec une dépendance explicite encore ouverte attend son amont ;
+  les dépendances sont revérifiées dans la transaction de prise ;
 * ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
   (il le confie sans doute dans la foulée) ;
@@ -84,7 +90,7 @@ import re
 import time
 
 from . import storage
-from .db import Db
+from .db import Db, DbError, is_deadlock
 
 ITEM_TYPE = "improvement"
 PRIORITIES = (1, 2, 3)
@@ -103,6 +109,10 @@ LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
 LOT_MIN_AGE_S = 300.0
 #: capacités exigées qui réservent un lot à une attribution explicite
 RESERVED_CAPABILITIES = ("decision", "production")
+#: capacités déclarées qui marquent la classe d'un lot (canon §1/#803) : un lot
+#: qui en exige une n'est tiré que si une autre famille de harnais est au
+#: registre (canon §2). `sensitive` est la variante anglaise de `sensible`.
+CLASS_CAPABILITIES = ("sensible", "sensitive", "production", "decision")
 #: capacité exigée qui désigne un harnais (`harness:codex`)
 HARNESS_PREFIX = "harness:"
 TAKE_WINDOW_S = 3600.0
@@ -113,6 +123,128 @@ SENDER = "ameesh"
 
 class BacklogError(ValueError):
     """Élément refusé — message toujours actionnable."""
+
+
+# --------------------------------------------------------------------------
+# the route of a non-blocking defect (canon §2, owner 15/10/2026)
+# --------------------------------------------------------------------------
+
+#: what marks a review follow-up: N1/N2, P2, P3, "non bloquant", a lot
+#: "suite", a "suivi"/"follow-up" of a review. The bare `N` is matched in
+#: uppercase (`STANDALONE_N`): the French `n'` is not an N. #1622 N3: the
+#: number marker is uppercase-only too — "Nexlink n2" is not an N2.
+FOLLOWUP_MARKERS = re.compile(
+    r"(?:^|[\s\[(\"«])("
+    r"(?-i:N[0-9]+\b)"                 # N1, N2…
+    r"|p[23]\b"                        # P2, P3
+    r"|non[ -]?bloquant\w*|pas bloquant"
+    # "Suite #956", "L242c suite (N #414)", "suite de la R1", "suite du lot":
+    # the suite must point at a reference. "suite à la demande de l'owner",
+    # "suite au courrier" are ordinary French, not a review follow-up — a
+    # human request keeps its lot without a warning.
+    r"|suites?\s*(?:#|\(|(?-i:N[0-9]+)|N\b(?!\s*[°º])|de la r[0-9]|du lot|r[0-9]\b)"
+    # "suivi de la R1", "suivi du lot #956", "follow-up on the review": the
+    # follow-up must aim at a review or a reference. "suivi des coûts
+    # mensuels", "follow-up commercial" are ordinary work, not a review
+    # follow-up (R1 cx2, P2 2). #1622 N2: "avis" and "lot(s)" only count with
+    # a reference — "Suivi des avis clients" and "Suivi des lots en retard"
+    # stay silent.
+    r"|suivis?\s+(?:(?:de|des|du|la|le|un|une)\s+|d'|l')*"
+    r"(?:r[0-9]\b|#[0-9]|relectures?|verdicts?|d[eé]fauts?|correctifs?"
+    r"|avis\s+(?:de\s+la\s+)?(?:relecture|r[0-9]\b|#[0-9]|(?-i:N[0-9]+))"
+    r"|lots?\s+(?:#|(?-i:N[0-9]+)|r[0-9]\b|de\s+la\s+relecture)"
+    r"|(?-i:N[0-9]+)|p[23]\b)"
+    r"|follow[ -]?ups?\s*(?:(?:of|on|for|to|the)\s+)*"
+    r"(?:r[0-9]\b|#[0-9]|reviews?|defects?|findings?)"
+    r")", re.I)
+#: the bare "N" (uppercase), the canon's marker for a non-blocking defect.
+#: #1622 N1: "N° 5" / "Nº 5" is a number, not an N — the degree sign after
+#: the N (even spaced) disqualifies the match.
+STANDALONE_N = re.compile(r"(?:^|[\s\[(\"«])N\b(?!\s*[°º])")
+
+#: a suite of **tests** is not a review follow-up: the phrase is neutralised
+#: before the examination, without hiding an explicit N/P2/P3 (R1 cx2, P2 3)
+TEST_SUITE = re.compile(
+    r"suites? (?:de |des |du )?tests?\b|tests?[ -]?suites?\b|suites? compl[eè]?tes?\b"
+    r"|suites? ci\b", re.I)
+#: a blocking defect (B/P1), a real incident, an outage, a regression: the lot
+#: is legitimate — except an explicitly minor regression (N/P2/P3), see
+#: `followup_hint`
+BLOCKING_DEFECT = re.compile(
+    r"(?:^|[\s\[(\"«])(?:b[0-9]+\b|bloquant\w*)|(?:^|[\s\[(\"«])p1\b"
+    r"|\bincidents?\b|\bpannes?\b|\bindisponib\w*|\br[eé]gressions?\b", re.I)
+#: the canon's bare "B", uppercase ("B : suite #956 — perte de messages",
+#: R1 cx2, P2 1): a lone lowercase b is not a verdict
+BLOCKING_B = re.compile(r"(?:^|[\s\[(\"«])B[0-9]*\b")
+#: "P2 sensible": on ameesh only, it keeps its blocking nature
+SENSITIVE_P2 = re.compile(r"p2[^.;\n]{0,30}sensible|sensible[^.;\n]{0,30}p2", re.I)
+#: a review-after-merge lot is the rule, not a review follow-up
+REVIEW_LOT_TITLE = re.compile(r"^\s*revue\s*#", re.I)
+REVIEW_REF = "review-after-merge:"
+
+
+def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
+                  app: str = "") -> str:
+    """The route warning, or "": does this lot look like a review follow-up
+    (N, P2, P3) that must **not** be a lot?
+
+    Canon §2 (owner, 15/10/2026): "a non-blocking defect (N, P2, P3) never
+    blocks. It does not create a lot: it goes to the backlog (`ameesh work
+    backlog add`, with its value and its workstream), grouped with the other
+    minor defects of the same workstream". On ameesh, a P2 of the sensitive
+    class still blocks: "P2 sensible" is not reported there (`app="ameesh"`),
+    but is on the other projects, where the general rule applies.
+
+    The warning is **advisory**: nothing is refused, a human request and a real
+    incident pass. Only an explicit follow-up marker is reported (N1/N2,
+    P2/P3, "suite #lot", "suivi d'une relecture", "non bloquant"). A named
+    blocking defect (B/B1, P1, incident, outage) keeps its lot even when the
+    title or the source quotes a historical N reference: the non-blocking
+    marker does not downgrade a blocking one (R1 cx2, P2 1). "non bloquant"/
+    "pas bloquant" negates the blocking word, it is not a positive occurrence;
+    a regression announced as explicitly minor (N/P2/P3) stays a minor
+    follow-up, "régression" alone not being a blocking defect (R2 cx2, P2). A
+    suite-of-**tests** phrase is neutralised before the examination: it is not
+    a marker, but does not hide an explicit N/P2/P3 (R1 cx2, P2 3). "Suivi"/
+    "follow-up" is a marker only when aiming at a review or a reference;
+    "suivi des coûts mensuels" stays ordinary work, without a warning (R1 cx2,
+    P2 2). #1622: the N marker is uppercase-only ("Nexlink n2" is not an N2),
+    "N° 5" is a number, and "suivi des avis clients" / "suivi des lots en
+    retard" stay silent because "avis" and "lot(s)" need a reference."""
+    text = " ".join([str(title or ""), str(source or "")]).strip()
+    if not text:
+        return ""
+    if str(issue_ref or "").startswith(REVIEW_REF) \
+            or REVIEW_LOT_TITLE.search(str(title or "")):
+        return ""                       # the review-after-merge lot is the rule
+    # A suite-of-**tests** phrase must not serve as a marker: it is neutralised,
+    # without hiding an explicit N/P2/P3 (R1 cx2, P2 3).
+    text = TEST_SUITE.sub(" ", text)
+    if SENSITIVE_P2.search(text) and str(app or "").strip().lower() == "ameesh":
+        return ""                       # ameesh: a sensitive P2 still blocks
+    if not (FOLLOWUP_MARKERS.search(text) or STANDALONE_N.search(text)):
+        return ""
+    # An explicit blocking defect (B/B1, P1, incident, outage) wins: it keeps
+    # its lot even with a historical N reference (R1 cx2, P2 1).
+    # "non bloquant" / "pas bloquant" qualifies the defect: it is not a
+    # positive occurrence of "bloquant". A regression can be explicitly minor
+    # (N/P2/P3), without cancelling B/P1/incident/outage.
+    blocking_text = re.sub(r"\b(?:non[ -]?bloquant\w*|pas bloquant\w*)", " ",
+                           text, flags=re.I)
+    explicit_minor = bool(re.search(
+        r"(?:^|[\s\[(\"«])(?:(?-i:N[0-9]+\b)|p[23]\b|non[ -]?bloquant\w*|pas bloquant)",
+        text, re.I) or STANDALONE_N.search(text))
+    if explicit_minor:
+        blocking_text = re.sub(r"\br[eé]gressions?\b", " ", blocking_text, flags=re.I)
+    if BLOCKING_DEFECT.search(blocking_text) or BLOCKING_B.search(text):
+        return ""
+    where = " --app %s" % app if app else ""
+    short = " ".join(str(title or "").split())[:60]
+    return ("this looks like a non-blocking follow-up (N, P2, P3): canon §2 does not "
+            "create a lot for it — record it in the backlog "
+            "(`ameesh work backlog add --title \"%s\" --value \"<valeur attendue>\" "
+            "--score <1-100>`%s), grouped with the other minor defects of the same "
+            "workstream" % (short, where))
 
 
 # --------------------------------------------------------------------------
@@ -211,15 +343,59 @@ def auditor_may_take(item: dict, name: str, card=None) -> bool:
                          + r"|(?:sa|ses|own)\s+(?:fiche|card)", text)
 
 
-def fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bool:
-    """L'élément correspond-il à l'équipe et aux capacités de l'agent ?"""
+def declared_class(item: dict) -> bool:
+    """Le lot déclare-t-il une capacité de classe (sensible/production/decision) ?
+
+    #803 : la classe d'un lot n'est lisible sur le diff gelé qu'à la porte de
+    fusion ; à la prise, c'est le marqueur déclaré qui fait foi (le doute du
+    canon §8 se tranche au gel, pas ici, sinon tout lot `intake` serait
+    sensible). `sensitive` est accepté comme variante de `sensible`.
+    """
+    return bool(set(item.get("required_capabilities") or ())
+                & set(CLASS_CAPABILITIES))
+
+
+def other_family_available(agent: dict, others) -> bool:
+    """Une famille de harnais autre que celle du preneur est-elle au registre ?
+
+    Garde **structurelle** de la classe (#803, canon §2) : elle ne regarde pas
+    la disponibilité d'un relecteur — un relecteur peut revenir, et la
+    relecture croisée joue au moment voulu — mais seulement l'impossibilité de
+    principe d'une relecture par une autre famille (mesh mono-famille). Elle ne
+    mord donc que sur un lot marqué. Sans registre lisible, ou sans harnais
+    connu pour le preneur, on refuse (doute -> sensible).
+    """
+    mine = str((agent or {}).get("harness") or "").strip().lower()
+    if not mine:
+        return False
+    name = (agent or {}).get("name") or ""
+    for row in others or ():
+        if (row.get("name") or "") == name:
+            continue
+        harness = str(row.get("harness") or "").strip().lower()
+        if harness and harness != mine:
+            return True
+    return False
+
+
+def fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
+         others=None) -> bool:
+    """L'élément correspond-il aux projets et aux capacités de l'agent ?
+
+    `others` : les lignes du registre, pour la garde structurelle de classe
+    (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
+    """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
     team = (item.get("team") or "").strip()
-    if team and team != (agent.get("team") or "").strip():
-        return False
+    if team:
+        from . import projects as projects_mod
+        if team not in projects_mod.agent_projects(agent):   # L243: membre, pas égal
+            return False
     required = set(item.get("required_capabilities") or ())
-    return required <= set(agent.get("capabilities") or ())
+    if not required <= set(agent.get("capabilities") or ()):
+        return False
+    return not declared_class(item) or other_family_available(agent, others)
 
 
 # --------------------------------------------------------------------------
@@ -312,29 +488,64 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     return bool((item.get("lot_team") or "").strip())
 
 
-def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bool:
-    """Le lot est-il de l'équipe de l'agent, et l'agent sait-il le faire ?
-    Une capacité exigée `harness:<nom>` désigne le harnais de l'agent."""
+def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
+             others=None) -> bool:
+    """Le lot vise-t-il un des projets de l'agent, et l'agent sait-il le faire ?
+    Une capacité exigée `harness:<nom>` désigne le harnais de l'agent.
+
+    `others` : les lignes du registre, pour la garde structurelle de classe
+    (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
+    """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
-    team = (agent.get("team") or "").strip()
-    if not team or (item.get("lot_team") or "").strip() != team:
+    team = (item.get("lot_team") or "").strip()
+    from . import projects as projects_mod
+    if not team or team not in projects_mod.agent_projects(agent):   # L243: membre
         return False
     have = set(agent.get("capabilities") or ())
     if agent.get("harness"):
         have.add("%s%s" % (HARNESS_PREFIX, agent["harness"]))
-    return set(item.get("required_capabilities") or ()) <= have
+    if not set(item.get("required_capabilities") or ()) <= have:
+        return False
+    return not declared_class(item) or other_family_available(agent, others)
+
+
+def _primary_project(agent: dict) -> str:
+    """Le premier projet de l'agent ; '' s'il n'en déclare aucun (L243)."""
+    from . import projects as projects_mod
+    names = projects_mod.agent_projects(agent)
+    return names[0] if names else ""
 
 
 def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
-    """Les orchestrateurs du registre à prévenir d'une prise : ceux de
-    l'équipe, sinon tous."""
+    """Les orchestrateurs du registre à prévenir d'une prise : ceux d'un des
+    projets du lot, sinon tous."""
+    from . import projects as projects_mod
     from . import sous_utilisation
     if orchestras is None:
         orchestras = sous_utilisation.orchestrators(cfg, db, listing)
-    teams = {row["name"]: (row.get("team") or "").strip() for row in listing}
+    teams = {row["name"]: set(projects_mod.agent_projects(row)) for row in listing}
     known = [name for name in orchestras if name in teams]
-    return sorted([name for name in known if teams[name] == team] or known)
+    return sorted([name for name in known if team in teams[name]] or known)
+
+
+def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None:
+    """La prise conditionnelle d'un élément prêt (`assign`, `ready_only`), ou
+    None s'il a été pris, ou bloqué, entre-temps.
+
+    #1496 : la prise verrouille l'élément et ses amonts ; une transaction
+    hors du graphe qui les verrouille dans l'autre ordre peut l'interbloquer.
+    Le serveur annule alors la prise entière (rien d'écrit) : c'est une prise
+    perdue entre-temps, comme une course perdue, et non une panne du passage.
+    L'élément reste libre et le prochain passage le revérifie en entier ;
+    toute autre erreur remonte."""
+    try:
+        return st.work.assign(int(item["id"]), assignee, current=None, note=note,
+                              actor=SENDER, take=take, ready_only=True)
+    except DbError as exc:
+        if not is_deadlock(exc):
+            raise
+        return None
 
 
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
@@ -371,7 +582,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     room = 0
     if idle_s > 0 and max_per_hour > 0:
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
-    queue = items(db, open_only=True, limit=200) if room > 0 else []
+    queue = st.work.backlog(open_only=True, limit=200, ready_only=True) if room > 0 else []
     if not lots and not queue:
         return []
     listing = st.operations.listing() if listing is None else listing
@@ -449,9 +660,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
+            # L243 : tant que le dossier de travail par lot n'existe pas
+            # (#811), la prise automatique reste sur le projet primaire — un
+            # lot d'un autre projet ne s'attribue qu'explicitement.
+            primary = _primary_project(agent)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
-                                card=auditors.get(row["name"])):
+                                card=auditors.get(row["name"]), others=listing):
+                    continue
+                if (item.get("lot_team") or "").strip() != primary:
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -464,10 +681,17 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     check = work.check_assignee(db, row["name"], cfg=cfg)
                 except work.WorkError:
                     break                   # agent non réveillable : au suivant
-                done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                      note="%s par %s, au repos" % (LOT_TAKE_NOTE,
-                                                                    check["assignee"]),
-                                      actor=SENDER)
+                try:
+                    # #540 : sous le verrou de l'agent, pas de second lot
+                    # non démarré (il en a reçu un depuis sa sélection).
+                    # #1242 (L165) : la prise ne vise qu'un lot intake dont
+                    # toutes les dépendances sont satisfaites.
+                    done = _assign_ready(st, item, check["assignee"],
+                                         "%s par %s, au repos" % (LOT_TAKE_NOTE,
+                                                                  check["assignee"]),
+                                         work.takes_rule(check))
+                except storage.PendingLot:
+                    break                   # le lot reste à l'agent suivant
                 lots.remove(item)
                 if done is None:
                     continue                # pris entre-temps : lot suivant
@@ -488,7 +712,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe
     # avant toute amélioration
-    if taken or sous_utilisation.waiting_project_lots(st.operations.open_lots_activity(500)):
+    if taken or sous_utilisation.waiting_project_lots(
+            st.operations.open_lots_activity(500), db=db):
         return taken
     pool = candidates(idle_s)
     for row in pool:
@@ -503,9 +728,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not auditor_mod.may_take(agent, canons):
             continue
         auditors = auditor_mod.cards([agent], canons)
+        primary = _primary_project(agent)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
-                        card=auditors.get(row["name"])):
+                        card=auditors.get(row["name"]), others=listing):
+                continue
+            # L243 : même règle que les lots — un élément d'un autre projet
+            # attend une attribution explicite (#811).
+            team = (item.get("team") or "").strip()
+            if team and team != primary:
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
@@ -519,8 +750,11 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             note = "%s par %s (valeur %s) : %s" % (
                 AUTO_TAKE_NOTE, check["assignee"], item.get("value_score"),
                 item.get("expected_value") or "")
-            done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                  note=note, actor=SENDER)
+            try:
+                done = _assign_ready(st, item, check["assignee"], note,
+                                     work.takes_rule(check))
+            except storage.PendingLot:
+                break                       # #540 : l'élément reste au suivant
             queue.remove(item)
             if done is None:
                 continue                    # pris entre-temps : élément suivant

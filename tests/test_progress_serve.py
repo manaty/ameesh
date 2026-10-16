@@ -20,7 +20,7 @@ from unittest import mock
 
 from ameesh import config as config_mod
 from ameesh import db as db_mod
-from ameesh import progress, progress_serve, registry, work
+from ameesh import progress, progress_serve, registry, serve, work
 
 from .support import PgTestCase
 from .test_progress import NOW, _snap
@@ -347,6 +347,194 @@ class ServePgTest(PgTestCase):
                      ("--port", "9000"), ("--serve", "--port", "70000")):
             out = self.mesh("progress", *argv, env=env)
             self.assertEqual(out.returncode, 2, argv)
+
+
+class ConversationPgTest(PgTestCase):
+    """L83 : la fiche 0024 lit la conversation et envoie un message — le
+    parcours visible de la page servie, du GET au courrier déposé."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE api_idempotency, agent_mailbox, conversation_log,"
+                        " conversation_heads CASCADE")
+        registry.upsert(self.db, "a1", chantier="demo", harness="codex", host=self.cfg.host)
+        snapshots = progress_serve.Snapshots(lambda project: _projects_snap(project))
+        self.server = progress_serve.make_server(
+            snapshots, port=0, chat=progress_serve.db_chat(self.cfg))
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop)
+
+    def _stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+    def request(self, method, path, *, auth=None, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        head = dict(headers or {}, Host="127.0.0.1:%d" % self.port)
+        if auth:
+            head["Authorization"] = auth
+        try:
+            conn.request(method, path, body=body, headers=head)
+            resp = conn.getresponse()
+            return resp, resp.read()
+        finally:
+            conn.close()
+
+    def auth(self):
+        return "Bearer %s" % self.server.token
+
+    def conversation(self, agent="a1"):
+        resp, body = self.request("GET", "/api/conversation.json?agent=" + agent, auth=self.auth())
+        self.assertEqual(resp.status, 200, body)
+        return json.loads(body)
+
+    def post(self, payload, *, key="web-0000000001", auth=None, path="/api/conversation.json"):
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Idempotency-Key": key}
+        resp, out = self.request("POST", path, auth=auth if auth is not None else self.auth(),
+                                 body=body, headers=headers)
+        try:
+            data = json.loads(out) if out else {}
+        except ValueError:
+            data = {}
+        return resp, data
+
+    def test_la_fiche_lit_et_envoie(self):
+        # la page servie porte le branchement : section, rendu et saisie
+        resp, html = self.request("GET", "/")
+        self.assertEqual(resp.status, 200)
+        page = html.decode("utf-8")
+        self.assertIn('section(box, "Conversation")', page)
+        self.assertIn("agentConversation(name)", page)
+        self.assertIn("/api/conversation.json", page)
+        self.assertIn("Idempotency-Key", page)
+        # lecture : vide au départ, au schéma de L78
+        page = self.conversation()
+        self.assertEqual((page["schema"], page["entries"]), ("ameesh-conversation/1", []))
+        # envoi : une entrée, un courrier, la copie R12 une seule fois
+        resp, out = self.post({"agent": "a1", "text": "bonjour depuis la fiche"})
+        self.assertEqual(resp.status, 200, out)
+        self.assertEqual((out["schema"], out["action"]), ("ameesh-action/1", "chat"))
+        self.assertEqual(resp.getheader("Idempotent-Replayed"), None)
+        rows = self.db.query("select sender, recipient, body, payload::text as payload"
+                             " from agent_mailbox order by id")
+        self.assertEqual(len(rows), 1)
+        sender = serve.owner(self.cfg, None).split(":", 1)[1]
+        self.assertEqual((rows[0]["sender"], rows[0]["recipient"]), (sender, "a1"))
+        self.assertTrue(json.loads(rows[0]["payload"])["human"])
+        entries = self.conversation()["entries"]
+        self.assertEqual([e["text"] for e in entries], ["bonjour depuis la fiche"])
+        self.assertEqual(entries[0]["kind"], "human_message")
+        # rejeu de la même clé : la première réponse, rien de nouveau
+        resp, again = self.post({"agent": "a1", "text": "bonjour depuis la fiche"})
+        self.assertEqual((resp.status, again, resp.getheader("Idempotent-Replayed")),
+                         (200, out, "true"))
+        self.assertEqual(len(self.db.query("select 1 from agent_mailbox")), 1)
+        self.assertEqual(len(self.conversation()["entries"]), 1)
+
+    def test_les_gardes(self):
+        # jeton requis, des deux côtés
+        resp, _ = self.request("GET", "/api/conversation.json?agent=a1")
+        self.assertEqual(resp.status, 401)
+        resp, _ = self.post({"agent": "a1", "text": "x"}, auth="")
+        self.assertEqual(resp.status, 401)
+        # une seule écriture : le reste du serveur reste en lecture seule
+        resp, _ = self.request("POST", "/api/progress.json", auth=self.auth(),
+                               body=b"{}", headers={"Content-Type": "application/json"})
+        self.assertEqual((resp.status, resp.getheader("Allow")), (405, "GET, HEAD"))
+        # clé d'idempotence, corps et champs
+        body = json.dumps({"agent": "a1", "text": "x"}).encode("utf-8")
+        resp, _ = self.request("POST", "/api/conversation.json", auth=self.auth(), body=body,
+                               headers={"Content-Type": "application/json"})
+        self.assertEqual(resp.status, 400)
+        resp, _ = self.post({"agent": "a1", "text": "x", "surprise": 1})
+        self.assertEqual(resp.status, 400)
+        resp, _ = self.post({"agent": "a1", "text": "x", "author": "human:autre"})
+        self.assertEqual(resp.status, 400)
+        resp, out = self.post({"agent": "ghost", "text": "x"}, key="web-0000000009")
+        self.assertEqual((resp.status, out["error"]), (404, "not_found"))
+        self.assertEqual(self.db.query("select 1 from agent_mailbox"), [])
+
+
+class ConversationGuardTest(unittest.TestCase):
+    """#1673 : sans base, la saisie de la fiche suit le parseur de L87 et
+    répond toujours, même sur une erreur imprévue de l'écriture."""
+
+    def setUp(self):
+        self.calls = []
+        self.fail_with = None
+
+        def read(query):
+            if self.fail_with is not None:
+                raise self.fail_with
+            return {"entries": []}
+
+        def write(key, body):
+            self.calls.append(body)
+            if self.fail_with is not None:
+                raise self.fail_with
+            return 200, {"ok": True}, False
+        snapshots = progress_serve.Snapshots(lambda project: _projects_snap(project))
+        self.server = progress_serve.make_server(snapshots, port=0, chat=(read, write))
+        self.port = self.server.server_address[1]
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            self.server.shutdown()
+            self.server.server_close()
+            thread.join(5)
+        self.addCleanup(stop)
+
+    def request(self, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Host": "127.0.0.1:%d" % self.port,
+                   "Authorization": "Bearer %s" % self.server.token,
+                   "Content-Type": "application/json", "Idempotency-Key": "web-0000000001"}
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            return resp, resp.read().decode("utf-8")
+        finally:
+            conn.close()
+
+    def test_cle_dupliquee_refusee_comme_l87(self):
+        resp, _ = self.request("POST", progress_serve.CHAT,
+                               b'{"agent": "a1", "text": "x", "text": "y"}')
+        self.assertEqual(resp.status, 400)
+        resp, _ = self.request("POST", progress_serve.CHAT,
+                               b'{"agent": "a1", "text": NaN}')
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.calls, [])
+
+    def test_erreur_imprevue_de_l_ecriture_repond_500(self):
+        self.fail_with = KeyError("secret-detail")
+        with mock.patch("sys.stderr"):
+            resp, body = self.request("POST", progress_serve.CHAT,
+                                      b'{"agent": "a1", "text": "x"}')
+        self.assertEqual(resp.status, 500)
+        self.assertIn("may have been delivered", body)
+        self.assertNotIn("secret-detail", body)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_erreur_imprevue_de_la_lecture_repond_500(self):
+        self.fail_with = KeyError("secret-detail")
+        with mock.patch("sys.stderr"):
+            resp, body = self.request("GET", progress_serve.CHAT + "?agent=a1")
+        self.assertEqual(resp.status, 500)
+        self.assertNotIn("secret-detail", body)
+
+    def test_405_dit_ce_que_dit_allow(self):
+        resp, body = self.request("PUT", progress_serve.CHAT, b"{}")
+        self.assertEqual((resp.status, resp.getheader("Allow")), (405, "GET, HEAD, POST"))
+        self.assertIn("GET, HEAD and POST", body)
+        resp, body = self.request("POST", progress_serve.API, b"{}")
+        self.assertEqual((resp.status, resp.getheader("Allow")), (405, "GET, HEAD"))
+        self.assertIn("GET and HEAD only", body)
+        self.assertNotIn("POST %s" % progress_serve.API, body)
 
 
 class ConfigTest(unittest.TestCase):

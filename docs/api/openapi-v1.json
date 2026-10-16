@@ -1,6 +1,34 @@
 {
   "components": {
     "schemas": {
+      "ameesh-action-1": {
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "for": {
+            "type": "string"
+          },
+          "result": {
+            "type": "object"
+          },
+          "schema": {
+            "const": "ameesh-action/1",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema",
+          "action",
+          "by",
+          "for",
+          "result"
+        ],
+        "type": "object"
+      },
       "ameesh-agent-detail-1": {
         "properties": {
           "agent": {
@@ -101,6 +129,109 @@
         "required": [
           "schema",
           "limits"
+        ],
+        "type": "object"
+      },
+      "ameesh-conversation-1": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "entries": {
+            "items": {
+              "properties": {
+                "author": {
+                  "type": "string"
+                },
+                "event_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "lot": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "meta": {
+                  "type": "object"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "seq": {
+                  "type": "integer"
+                },
+                "session": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "ts": {
+                  "type": "number"
+                },
+                "turn": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "seq",
+                "kind",
+                "author",
+                "text",
+                "ts"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "gap": {
+            "type": "boolean"
+          },
+          "last_seq": {
+            "type": "integer"
+          },
+          "more": {
+            "type": "boolean"
+          },
+          "next_seq": {
+            "type": "integer"
+          },
+          "oldest_seq": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "schema": {
+            "const": "ameesh-conversation/1",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema",
+          "agent",
+          "entries",
+          "last_seq",
+          "oldest_seq",
+          "next_seq",
+          "more",
+          "gap"
         ],
         "type": "object"
       },
@@ -217,6 +348,54 @@
           "schema",
           "error",
           "message"
+        ],
+        "type": "object"
+      },
+      "ameesh-event-1": {
+        "properties": {
+          "data": {
+            "type": "object"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "object": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ts": {
+            "type": "number"
+          },
+          "type": {
+            "enum": [
+              "lot.updated",
+              "turn.started",
+              "turn.ended",
+              "agent.updated",
+              "cost.recorded",
+              "thread.entry",
+              "decision.created",
+              "decision.closed",
+              "action.updated",
+              "receipt.attached",
+              "approval.recorded",
+              "alert.raised",
+              "alert.resolved"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "object",
+          "project",
+          "ts",
+          "data"
         ],
         "type": "object"
       },
@@ -537,7 +716,7 @@
     }
   },
   "info": {
-    "description": "Read API of an ameesh mesh, local mode (L84). Each response is the serialisation of the matching `--json` output of the CLI; `schema` names it.",
+    "description": "API of an ameesh mesh, local mode: reads (L84), each the serialisation of the matching `--json` output of the CLI (`schema` names it); `/events` streams the event log (L85); and the human actions (L87), POST with a required `Idempotency-Key`. No route approves, produces or attaches a receipt.",
     "license": {
       "identifier": "AGPL-3.0-only",
       "name": "AGPL-3.0-only"
@@ -564,6 +743,147 @@
         },
         "security": [],
         "summary": "Discovery of this mesh's API"
+      }
+    },
+    "/api/v1/actions/{action}/approval-request": {
+      "post": {
+        "operationId": "post_actions_action_approval_request",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {},
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "File the approval request of an action with ameesh-approve; returns the link (approval stays a passkey on ameesh-approve's origin)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "File the approval request of an action with ameesh-approve; returns the link (approval stays a passkey on ameesh-approve's origin)"
       }
     },
     "/api/v1/agents": {
@@ -682,6 +1002,706 @@
         "summary": "One agent (`ameesh show --json`)"
       }
     },
+    "/api/v1/agents/{agent}/chat": {
+      "get": {
+        "operationId": "agents_agent_chat",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "entries after this sequence number (default 0)",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "entries at most (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-conversation-1"
+                }
+              }
+            },
+            "description": "An agent's shared conversation (`ameesh chat <agent>`, L78/L83)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "An agent's shared conversation (`ameesh chat <agent>`, L78/L83)"
+      },
+      "post": {
+        "operationId": "post_agents_agent_chat",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "lot": {
+                    "minimum": 1,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "text": {
+                    "maxLength": 8000,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "A message to an agent's shared conversation (L83: the server writes the entry and wakes the agent by mail)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "A message to an agent's shared conversation (L83: the server writes the entry and wakes the agent by mail)"
+      }
+    },
+    "/api/v1/agents/{agent}/interrupt": {
+      "post": {
+        "operationId": "post_agents_agent_interrupt",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "text": {
+                    "maxLength": 8000,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Interrupt an agent's turn (`ameesh interrupt`; the human must be in AMEESH_INTERRUPT_SENDERS)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Interrupt an agent's turn (`ameesh interrupt`; the human must be in AMEESH_INTERRUPT_SENDERS)"
+      }
+    },
+    "/api/v1/agents/{agent}/messages": {
+      "post": {
+        "operationId": "post_agents_agent_messages",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "lot": {
+                    "minimum": 1,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "text": {
+                    "maxLength": 8000,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "urgent": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Message to an agent: its mailbox and its thread (`agent-mail send`)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Message to an agent: its mailbox and its thread (`agent-mail send`)"
+      }
+    },
+    "/api/v1/agents/{agent}/stop": {
+      "post": {
+        "operationId": "post_agents_agent_stop",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "maxLength": 500,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "reason"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Stop an agent by hand, with a reason (0030 §4: `manuel`)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Stop an agent by hand, with a reason (0030 §4: `manuel`)"
+      }
+    },
     "/api/v1/alerts": {
       "get": {
         "operationId": "alerts",
@@ -778,6 +1798,159 @@
         "summary": "Budget (`ameesh budget --json`)"
       }
     },
+    "/api/v1/budget/caps": {
+      "post": {
+        "operationId": "post_budget_caps",
+        "parameters": [
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "agent": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "usd": {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  "window": {
+                    "enum": [
+                      "hour",
+                      "day"
+                    ]
+                  }
+                },
+                "required": [
+                  "window",
+                  "usd"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Lower a cap of the mesh or of an agent (never raise one)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Lower a cap of the mesh or of an agent (never raise one)"
+      }
+    },
     "/api/v1/decisions": {
       "get": {
         "operationId": "decisions",
@@ -839,6 +2012,69 @@
           }
         },
         "summary": "Decisions waiting for the human (`ameesh decisions --for --json`)"
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "events",
+        "parameters": [
+          {
+            "description": "resume strictly after this position (the last `id:` received, \"tx-id-cluster\"); without it, the new events only",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "pattern": "^[0-9]{1,20}-[0-9]{1,19}-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "x-ameesh-data": {
+                  "$ref": "#/components/schemas/ameesh-event-1"
+                }
+              }
+            },
+            "description": "text/event-stream: `id: <tx-id-cluster>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended), `event: delayed` (events wait for an open transaction); a comment every 20 s"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable, or too many streams (Retry-After)"
+          }
+        },
+        "summary": "Event stream (Server-Sent Events): lots, turns, costs, threads, decisions, alerts"
       }
     },
     "/api/v1/hosts": {
@@ -955,6 +2191,156 @@
           }
         },
         "summary": "One host (`ameesh hosts --json HOST`)"
+      }
+    },
+    "/api/v1/hosts/{host}/drain": {
+      "post": {
+        "operationId": "post_hosts_host_drain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "duration_s": {
+                    "maximum": 604800,
+                    "minimum": 30,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Stop placing sessions on a host (`ameesh host drain`)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Stop placing sessions on a host (`ameesh host drain`)"
       }
     },
     "/api/v1/lots": {
@@ -1102,6 +2488,153 @@
           }
         },
         "summary": "One lot (`ameesh work show --json`)"
+      }
+    },
+    "/api/v1/lots/{id}/assign": {
+      "post": {
+        "operationId": "post_lots_id_assign",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "assignee": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "assignee"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent)"
       }
     },
     "/api/v1/me": {
@@ -1382,6 +2915,153 @@
           }
         },
         "summary": "Project thread (`ameesh fil show PROJECT`)"
+      },
+      "post": {
+        "operationId": "post_threads_project",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "text": {
+                    "maxLength": 8000,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Publish in a project's thread"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Publish in a project's thread"
       }
     },
     "/api/v1/threads/{project}/{lot}": {
@@ -1467,6 +3147,161 @@
           }
         },
         "summary": "Lot thread (`ameesh fil show PROJECT LOT`)"
+      },
+      "post": {
+        "operationId": "post_threads_project_lot",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "lot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "text": {
+                    "maxLength": 8000,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Publish in a lot's thread"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Publish in a lot's thread"
       }
     }
   },

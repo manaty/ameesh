@@ -4,11 +4,13 @@
 `ameesh notify` et leurs seuils réglables."""
 from __future__ import annotations
 
+import dataclasses
 import time
 import unittest
 from unittest import mock
 
-from ameesh import exploitation, mail, notify, registry, storage, sous_utilisation, work
+from ameesh import (exploitation, mail, notify, plan, registry, roadmap, storage, sous_utilisation,
+                    work, work_dependencies)
 
 from .support import PgTestCase
 
@@ -85,6 +87,21 @@ class PlanUnderusedTest(_Base):
         # seuil réglable, et 0 désactive
         self.assertEqual(self.alertes(plan_pace_gap_pct=40), [])
         self.assertEqual(self.alertes(plan_pace_gap_pct=0), [])
+
+    def test_le_rythme_percu_suit_le_multiplicateur_du_profil(self):
+        # #1028 P3 : 30 % utilisés à 3/7 écoulés — écart 23 points au rythme
+        # nominal (sous le seuil de 25, pas d'alerte), 60 points au rythme du
+        # compte primaire Codex (2 × 3/7 + 10, plafonné à 90 %) → alerte.
+        self.jauge("codex", "codex-10080min", 0.30, 4 * JOUR, 7 * JOUR, account="primaire")
+        self.assertEqual(self.alertes(), [])
+        cfg = dataclasses.replace(self.cfg, accounts={"codex": [
+            {"name": "primaire", "pace_multiplier": 2.0}, {"name": "secondaire"}]})
+        out = _types(exploitation.alerts(cfg, self.db, now=self.now, **_seuils()),
+                     "plan_underused")
+        self.assertEqual([(a["account"], a["reason"]) for a in out],
+                         [("primaire", "sous_rythme")])
+        self.assertAlmostEqual(out[0]["pace_cap"], 0.90, places=4)
+        self.assertIn("allowed pace of 90 %", out[0]["detail"])
 
     def test_debut_de_fenetre_et_fenetre_courte_hors_rythme(self):
         # 10 % écoulés seulement : l'écart ne dit encore rien
@@ -199,6 +216,81 @@ class IdleCapacityTest(_Base):
         work.assign(self.db, lot["id"], "claude1")
         self.assertEqual(self.alertes(), [])
         self.assertEqual(self.alertes(idle_capacity_s=0), [])
+
+    def test_lot_bloque_n_est_pas_propose_au_dispatch(self):
+        """#1608 : un lot sans assigné qui attend une dépendance n'est pas
+        proposé ; le brief nomme le bloqueur et ne propose que le démarrable."""
+        self.agent("claude1")
+        self.agent("claude2")
+        self.agent("orch")
+        bloqueur = work.add(self.db, title="bloqueur")
+        work.assign(self.db, bloqueur["id"], "claude2")      # hors des lots à confier
+        attente = work.add(self.db, title="à prendre")
+        work_dependencies.add(self.db, attente["id"], bloqueur["id"], actor="test")
+        libre = work.add(self.db, title="libre")
+        alerte = _types(self.alertes(), "idle_capacity")[0]
+        self.assertEqual(sorted(alerte["lots"]), sorted([attente["id"], libre["id"]]))
+        self.assertEqual(alerte["startable_lots"], [libre["id"]])
+        self.assertEqual(alerte["blocked_lots"][str(attente["id"])],
+                         {"what": "dependency", "lots": [bloqueur["id"]]})
+        self.assertIn("#%d waits on #%d" % (attente["id"], bloqueur["id"]), alerte["detail"])
+        self.assertIn("1 startable now: #%d" % libre["id"], alerte["detail"])
+
+        briefs = sous_utilisation.orchestrator_briefs(
+            {**alerte, "orchestrators": ["orch"]}, self.listing(),
+            {attente["id"]: "à prendre", libre["id"]: "libre"})
+        texte = briefs["orch"]
+        self.assertIn('Open lots without an agent: #%d "libre"' % libre["id"], texte)
+        self.assertNotIn('#%d "à prendre"' % attente["id"], texte)
+        self.assertIn("Waiting for a prerequisite: #%d waits on #%d"
+                      % (attente["id"], bloqueur["id"]), texte)
+        self.assertIn("Give them work tied to a lot", texte)
+
+    def test_aucun_lot_demarrable_le_dit(self):
+        """#1608 : sans lot démarrable, le brief le dit et écarte le dispatch."""
+        self.agent("claude1")
+        self.agent("claude2")
+        self.agent("orch")
+        bloqueur = work.add(self.db, title="bloqueur")
+        work.assign(self.db, bloqueur["id"], "claude2")
+        attente = work.add(self.db, title="à prendre")
+        work_dependencies.add(self.db, attente["id"], bloqueur["id"], actor="test")
+        alerte = _types(self.alertes(), "idle_capacity")[0]
+        self.assertEqual(alerte["lots"], [attente["id"]])
+        self.assertEqual(alerte["startable_lots"], [])
+        self.assertNotIn("ameesh work assign", alerte["detail"])
+        briefs = sous_utilisation.orchestrator_briefs(
+            {**alerte, "orchestrators": ["orch"]}, self.listing(),
+            {attente["id"]: "à prendre"})
+        texte = briefs["orch"]
+        self.assertIn("No startable open lot without an agent: #%d waits on #%d"
+                      % (attente["id"], bloqueur["id"]), texte)
+        self.assertIn("Do not assign a lot that waits", texte)
+        self.assertNotIn("Give them work tied to a lot", texte)
+
+    def test_bloqueur_de_feuille_de_route_hors_liste_affichee(self):
+        """La liste bornée des candidats ne borne pas la vérité des dépendances."""
+        self.agent("claude1")
+        attente = work.add(self.db, title="à prendre")
+        bloqueur = work.add(self.db, title="hors de la liste affichée")
+        roadmap.add_commitment(self.db, "release", due="2999-01-01", lot=attente["id"],
+                               depends_on=["#%d" % bloqueur["id"]])
+        alerte = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], lots=[attente])[0]
+        self.assertEqual(alerte["startable_lots"], [])
+        self.assertEqual(alerte["blocked_lots"][str(attente["id"])]["lots"], [bloqueur["id"]])
+        self.assertNotIn("ameesh work assign", alerte["detail"])
+
+    def test_demarrage_planifie_suit_l_instant_evalue(self):
+        self.agent("claude1")
+        attente = work.add(self.db, title="planifié")
+        storage.of(self.db).roadmap.plan_item(
+            attente["id"], {"start": "2999-01-01"}, source="test", actor="test")
+        debut = plan.day_start_ts("2999-01-01")
+        with mock.patch("ameesh.planned_waits.time.time", return_value=debut - 1):
+            alerte = sous_utilisation.idle_capacity(
+                self.db, self.listing(), debut, [], lots=[attente])[0]
+        self.assertEqual(alerte["startable_lots"], [attente["id"]])
 
     def test_forfait_au_repos_pendant_que_le_token_travaille(self):
         self.agent("claude1")

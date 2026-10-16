@@ -281,7 +281,7 @@ def target_message(item: dict, source: str) -> str:
     branch = item.get("branch")
     return (
         "Work item #%d \"%s\" is now yours: %s is paused on budget. State: %s.%s "
-        "The codex review stays required before any merge. When %s's pause ends, "
+        "A review by another family stays required before any merge. When %s's pause ends, "
         "nothing comes back on its own: the orchestrator decides. Never take an "
         "irreversible or production action without the usual approval." % (
             int(item["id"]), item.get("title") or "", source, item["state"],
@@ -437,7 +437,8 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 if not backlog.lot_fits(dict(item, lot_team=project),
                                         dict(agent, team=project),
                                         auditor=row["name"] in auditors,
-                                        card=auditors.get(row["name"])):
+                                        card=auditors.get(row["name"]),
+                                        others=listing):
                     continue
                 target = row
                 break
