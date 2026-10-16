@@ -815,14 +815,19 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, items, now=now, packages=packages,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    # #1664 : le flux ciblé du stockage (transitions + notes hold/levée) ;
+    # jamais le journal entier ni le texte des notes ordinaires.
+    waits = planned_waits.read(
+        db, items, now=now, packages=packages,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(
+            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])),
                       events_ts=last_events.get(int(item["id"])), agent_states=states,
-                      planned_wait=holds.get(int(item["id"])),
+                      planned_wait=waits.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]

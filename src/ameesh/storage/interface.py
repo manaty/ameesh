@@ -88,9 +88,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    grants          register reserve release live_reservations candidates
                    revoke get
    placements      recorded
-   progress        lots lot_events lot_transitions lot_event_last lot_milestones
-                   lot_actions actions agents costs packages package_items
-                   lot_messages
+   progress        lots lot_events lot_transitions lot_event_last lot_hold_events
+                   lot_milestones lot_actions actions agents costs packages
+                   package_items lot_messages
    projects        board
    decisions       create get pending history pending_for_lot close register_chat
    roadmap         plan_item item_plans plan_package items commitments
@@ -160,6 +160,7 @@ from .conversations import Conversations
 from .work_dependencies import WorkDependencies
 
 import abc
+import re
 from typing import Any, Callable, Protocol, Sequence, TypedDict
 
 #: #1654 : observation NON fournie au CAS `set_issue_ref` — le contrôle de la
@@ -2256,6 +2257,28 @@ class Placements(Domain):
 # vue d'avancement (`ameesh progress`, L24) : lectures seules
 # --------------------------------------------------------------------------
 
+# Blancs de `str.strip`/`re` Unicode, explicites pour le lecteur ARE : sa
+# classe `\s` dépend de la locale et omet notamment l'espace insécable.
+HOLD_NOTE_WHITESPACE = ("\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+                        "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+                        "\u2028\u2029\u202f\u205f\u3000")
+
+
+def _transitions(events) -> list[dict]:
+    """Lignes où l'état d'un lot change (la première de chaque lot en fait
+    partie), texte des notes écarté : la règle de `lot_transitions`, partagée
+    avec le repli de `lot_hold_events` (#1647, #1664)."""
+    out: list[dict] = []
+    previous: dict[int, str] = {}
+    for ev in events or ():
+        lot = int(ev["work_item_id"])
+        state = ev.get("state")
+        if lot not in previous or previous[lot] != state:
+            out.append({key: value for key, value in ev.items() if key != "note"})
+        previous[lot] = state
+    return out
+
+
 class Progress(Domain):
     """Lectures de la vue d'avancement (décision 0024) : lots et leur
     journal, actions, état des agents et grand livre des coûts. Aucune
@@ -2288,15 +2311,7 @@ class Progress(Domain):
         Lecture DÉRIVÉE (pas une opération du contrat médié) : le stockage
         peut l'optimiser — agrégation SQL — sans changer ce que reçoit
         l'appelant ; le repli ci-dessous lit `lot_events`."""
-        out: list[dict] = []
-        previous: dict[int, str] = {}
-        for ev in self.lot_events(item_ids):
-            lot = int(ev["work_item_id"])
-            state = ev.get("state")
-            if lot not in previous or previous[lot] != state:
-                out.append({key: value for key, value in ev.items() if key != "note"})
-            previous[lot] = state
-        return out
+        return _transitions(self.lot_events(item_ids))
 
     def lot_event_last(self, item_ids: Sequence[int]) -> list[dict]:
         """Dernier instant d'événement de chacun de ces lots (work_item_id,
@@ -2310,6 +2325,43 @@ class Progress(Domain):
             if ts is not None:
                 last[lot] = max(last.get(lot, float("-inf")), float(ts))
         return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
+
+    def lot_hold_events(self, item_ids: Sequence[int],
+                        patterns: Sequence[str]) -> list[dict]:
+        """Événements utiles à la lecture des retenues (#1664) : les
+        transitions d'état (une retenue tombe au changement d'état) et les
+        lignes dont la note correspond à l'un des motifs `patterns` (notes
+        hold/levée ; mêmes motifs que `planned_waits`), fusionnées par
+        identifiant — la ligne à note l'emporte, elle seule porte le texte —
+        et rendues dans l'ordre d'écriture (`id`), comme `lot_transitions`.
+        Une note portée par une transition est donc rendue avec elle, et le
+        texte des notes ordinaires n'est jamais lu ni transmis. Un motif vide
+        est refusé (`ValueError`) : il ferait sortir toutes les notes.
+
+        Les motifs suivent la syntaxe des deux lecteurs (repli Python `re`,
+        pilote PostgreSQL ARE : `^`, `\\s`, `(?:…)`) et s'appliquent à la note
+        débarrassée de ses blancs de bord. Lecture DÉRIVÉE (pas une opération
+        du contrat médié) : le pilote PostgreSQL ne transfère que ces lignes ;
+        le repli ci-dessous lit `lot_events` une fois. Un appelant qui a déjà
+        lu `lot_transitions` paie une seconde lecture bornée des transitions
+        (`max_lots`) — le contrat reste inchangé."""
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        wanted = tuple(str(pattern) for pattern in patterns)
+        if any(not pattern for pattern in wanted):
+            raise ValueError("empty hold pattern")
+        compiled = tuple(re.compile(pattern, re.I) for pattern in wanted)
+        events = list(self.lot_events(ids))
+        merged: dict[tuple[int, int], dict] = {}
+        for ev in _transitions(events):
+            merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+        if compiled:
+            for ev in events:
+                note = str(ev.get("note") or "").strip()
+                if note and any(rx.match(note) for rx in compiled):
+                    merged[(int(ev["work_item_id"]), int(ev["id"]))] = dict(ev)
+        return sorted(merged.values(), key=lambda e: int(e["id"]))
 
     @abc.abstractmethod
     def lot_milestones(self, item_ids: Sequence[int]) -> list[dict]:

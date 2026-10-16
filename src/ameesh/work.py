@@ -187,6 +187,46 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
     raise WorkError(refus % text)
 
 
+def claims_pilot(cfg, db, who: str) -> bool:
+    """#1664 : `who` se présente comme pilote — un humain (`human:<id>`) ou un
+    agent orchestrateur/conception, la même autorité que `corrector`
+    (`history=False` : seul un rôle déclaré compte, pas l'historique des lots
+    confiés)."""
+    from . import assignments
+
+    who = (who or "").strip()
+    if not who:
+        return False
+    if who.startswith(HUMAN_PREFIX):
+        return True
+    return assignments.is_orchestrator(cfg, db, who, roles=CORRECTOR_ROLES,
+                                       history=False)
+
+
+def check_wait_note(cfg, db, actor: str, text: str) -> str:
+    """#1664 r2 (B1) : un hold de pilote s'authentifie au chemin d'écriture.
+
+    `hold: <raison>` sert deux conventions : la retenue du réveil (règle 1),
+    que tout assigné pose, et le hold de pilote (#1664), qui éteint la
+    stagnation. Le journal ne garde que le texte et l'acteur : sans cette
+    garde, une session ordinaire écrivait `--actor human:<pilote>` (ou le nom
+    d'un pilote) et la relecture la croyait pilote. Un acteur qui se dit
+    pilote doit donc le prouver ici (`corrector`, `history=False`) ; une levée
+    (`unhold:`…) est toujours un geste de pilote. La note `hold:` d'un acteur
+    ordinaire reste permise : c'est la règle 1, et elle ne compte pas pour la
+    stagnation (`planned_waits.pilot_holds`)."""
+    text = (text or "").strip()
+    if not text:
+        return actor
+    from . import planned_waits
+
+    if planned_waits.is_lift_note(text):
+        return corrector(cfg, db, actor, what="hold lift", history=False)
+    if planned_waits.is_hold_note(text) and claims_pilot(cfg, db, actor):
+        return corrector(cfg, db, actor, what="hold", history=False)
+    return actor
+
+
 def forcer(cfg, db, explicit: str | None = None) -> str:
     """#540 : l'auteur d'un `--force "<raison>"`, écrit au journal du lot ;
     WorkError si la session ne peut pas le prouver. Une session qui porte une
@@ -1686,6 +1726,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (MAX_QA_LOOPS, item_id))
 
     held = state == "waiting_human"
+    # #1664 r2 (B1) : la note de transition peut poser ou lever une retenue ;
+    # elle s'authentifie au même titre que `work note`. Elle se stocke nette,
+    # comme `work note` : la lecture groupée ciblée (`lot_hold_events`) lit le
+    # motif des retenues sans dépendre des blancs Unicode du texte écrit.
+    note = (note or "").strip()
+    actor = check_wait_note(getattr(db, "cfg", None), db, actor, note)
     text = note or ("%s → %s" % (current, state))
     if reviewer:
         text = "%s — reviewer %s" % (text, reviewer)
@@ -1720,7 +1766,9 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "") -> bool:
         raise WorkError("lot %s not found" % item_id)
     if not (text or "").strip():
         raise WorkError("empty note")
-    storage.of(db).work.note(item_id, item["state"], text.strip(), actor)
+    text = text.strip()
+    actor = check_wait_note(getattr(db, "cfg", None), db, actor, text)
+    storage.of(db).work.note(item_id, item["state"], text, actor)
     return True
 
 
