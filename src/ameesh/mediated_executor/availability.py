@@ -118,6 +118,11 @@ class MemoryRegistry(AvailabilityRegistry):
         return [dict(self._rows[h]) for h in sorted(self._rows)]
 
 
+class RegistryUnreadable(RuntimeError):
+    """#2128 : le registre existe mais ne se lit pas ; `put` refuse d'écrire
+    plutôt que de réécrire le fichier sans les lignes des autres hôtes."""
+
+
 class FileRegistry(AvailabilityRegistry):
     """Dans un fichier JSON (verrou `flock`, écriture atomique)."""
 
@@ -133,6 +138,11 @@ class FileRegistry(AvailabilityRegistry):
         try:
             with open(self.path, encoding="utf-8") as fh:
                 data = json.load(fh)
+        except FileNotFoundError:
+            # #2128 : un fichier absent n'est pas une lecture en échec — la
+            # première écriture doit pouvoir le créer (le commentaire de
+            # `error` le disait déjà, l'implémentation le traitait en erreur).
+            return {}
         except (OSError, ValueError) as exc:
             self.error = "%s: %s" % (self.path, exc)
             return {}
@@ -151,6 +161,10 @@ class FileRegistry(AvailabilityRegistry):
         with open(self.path + ".lock", "a") as verrou:
             fcntl.flock(verrou, fcntl.LOCK_EX)
             hosts = self._load()
+            if self.error is not None:
+                # #2128 : ne jamais réécrire un registre illisible avec le seul
+                # hôte écrit — les lignes des autres hôtes seraient perdues.
+                raise RegistryUnreadable(self.error)
             row = _merge(hosts.get(host), host, body, executor_id, gate, ack,
                          time.time() if now is None else float(now))
             hosts[host] = row
@@ -240,13 +254,16 @@ def alerts(rows: Iterable[Mapping], *, now: float | None = None,
 
 
 def local_alerts(cfg, listing: list[dict], now: float | None = None,
-                 unreadable: list | None = None) -> list[dict]:
+                 unreadable: list | None = None, errors: list | None = None) -> list[dict]:
     """Alertes du registre local de ce poste (`default_path`), baux tirés du
     listing de la base ; rien si le registre n'existe pas.
 
     #1901 : un registre présent mais illisible ne rend pas « aucune alerte »
     pour autant — c'est une famille non observée, et `GATE_FAMILY` est ajouté
-    à `unreadable` quand une liste est fournie."""
+    à `unreadable` quand une liste est fournie.
+
+    #2127 : `errors` reçoit le message de la lecture en échec, pour que
+    `exploitation._gate_alerts` dise la porte non lue (`host_gate_unreadable`)."""
     path = default_path(cfg)
     try:
         os.stat(path)
@@ -254,8 +271,11 @@ def local_alerts(cfg, listing: list[dict], now: float | None = None,
         return []
     registre = FileRegistry(path)
     rows = registre.rows()
-    if registre.error is not None and unreadable is not None:
-        unreadable.append(GATE_FAMILY)
+    if registre.error is not None:
+        if unreadable is not None:
+            unreadable.append(GATE_FAMILY)
+        if errors is not None:
+            errors.append(registre.error)
     held: dict[str, list[str]] = {}
     for row in listing:
         if row.get("lease_live") and row.get("host"):
