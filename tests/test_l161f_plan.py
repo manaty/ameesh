@@ -965,6 +965,153 @@ class ImportGraphTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
                                                       guaranteed=True), known)
+    def test_guaranteed_edges_stop_at_a_module_level_termination(self):
+        # #1627 : une terminaison atteignable à l'import (`raise` gardé, garde
+        # d'exception, exit, assert faux) laisse les imports suivants possibles,
+        # jamais garantis — sinon le plan certifie un chargement qui peut ne pas
+        # avoir eu lieu. Sens conservateur : une preuve en moins, jamais une
+        # fausse preuve.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "raise gardé": "import os\n"
+                           "if not os.environ.get('PG'):\n"
+                           "    raise RuntimeError\n"
+                           "import ameesh.db\n",
+            "raise dans un except": "try:\n"
+                                    "    import psycopg\n"
+                                    "except ImportError:\n"
+                                    "    raise SystemExit\n"
+                                    "import ameesh.db\n",
+            "exit": "exit()\nimport ameesh.db\n",
+            "quit": "quit()\nimport ameesh.db\n",
+            "os._exit": "import os\nos._exit(1)\nimport ameesh.db\n",
+            "os._exit aliasé": "from os import _exit as bye\nbye(1)\nimport ameesh.db\n",
+            "sys.exit": "import sys\nsys.exit(1)\nimport ameesh.db\n",
+            "sys.exit aliasé": "import sys as s\ns.exit(1)\nimport ameesh.db\n",
+            "exit importé": "from sys import exit as bye\nbye(1)\nimport ameesh.db\n",
+            "assert faux": "assert False\nimport ameesh.db\n",
+            "raise avant, import dans le même corps de classe":
+                "class C:\n    raise RuntimeError\n    import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # un garde mort ne termine rien : `if TYPE_CHECKING:` ne s'exécute pas
+        dead = ("from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    raise RuntimeError\n"
+                "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(dead, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        # le corps d'une fonction ne tourne pas à l'import : son raise ne coupe
+        # pas la preuve du corps du module
+        deferred = ("def broken():\n    raise RuntimeError\n"
+                    "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(deferred, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        nested = ("def factory():\n"
+                  "    class C:\n        raise RuntimeError\n"
+                  "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(nested, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+
+    def test_exit_expressions_stop_proofs_before_class_body_and_after_assert(self):
+        # #1474 : les bases et décorateurs s'évaluent avant le corps de classe ;
+        # une sortie dans un assert s'exécute aussi, même sans assert faux.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import sys\nclass C(sys.exit(1)):\n    import ameesh.db\n",
+            "@exit()\nclass C:\n    import ameesh.db\n",
+            "import os as o\nclass C(metaclass=o._exit(1)):\n    import ameesh.db\n",
+            "from sys import exit as bye\nassert bye(1)\nimport ameesh.db\n",
+            "import os\nassert os._exit(1)\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+
+    def test_exit_expressions_stop_proofs_in_function_definitions(self):
+        # #1474 : décorateurs, valeurs par défaut et annotations d'une fonction
+        # ou d'un lambda s'évaluent à la définition ; seul le corps est différé.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "@exit()\ndef f():\n    pass\nimport ameesh.db\n",
+            "@exit()\nasync def f():\n    pass\nimport ameesh.db\n",
+            "import sys\ndef f(x=sys.exit(1)):\n    pass\nimport ameesh.db\n",
+            "import os as o\ndef f(*, x=o._exit(1)):\n    pass\nimport ameesh.db\n",
+            "def f(x: quit()):\n    pass\nimport ameesh.db\n",
+            "g = lambda a=quit(): 0\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        for source in ("def f():\n    exit()\nimport ameesh.db\n",
+                       "f = lambda: exit()\nimport ameesh.db\n",
+                       "@staticmethod\ndef f(x=1):\n    import os\nimport ameesh.db\n"):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_exit_expressions_keep_prior_dead_and_deferred_proofs(self):
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import ameesh.db\nclass C(exit()):\n    pass\n",
+            "if False:\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def factory():\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def unused():\n    assert quit()\nimport ameesh.db\n",
+            "class C:\n    import ameesh.db\n    quit()\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_reassigned_exit_symbols_stay_conservative(self):
+        # #1474 : un symbole de terminaison réaffecté (`sys = ...`, puis un
+        # `bye = ...` sur un nom importé de sys/os) n'est pas suivi — la
+        # réaffectation peut être conditionnelle, donc la preuve reste coupée :
+        # une preuve perdue, jamais une preuve fausse. L'arête de sélection
+        # possible est conservée.
+        known = {"src/ameesh/db.py"}
+        reassigned = {
+            "sys rebindé": "import sys\n"
+                           "sys = None\n"
+                           "sys.exit(1)\n"
+                           "import ameesh.db\n",
+            "sys rebindé sans sortie": "import sys\n"
+                                       "class Fake:\n"
+                                       "    @staticmethod\n"
+                                       "    def exit(code):\n"
+                                       "        return None\n"
+                                       "sys = Fake\n"
+                                       "sys.exit(0)\n"
+                                       "import ameesh.db\n",
+            "exit importé puis rebindé": "from sys import exit as bye\n"
+                                         "bye = print\n"
+                                         "bye('x')\n"
+                                         "import ameesh.db\n",
+            "exit builtin rebindé": "exit = print\n"
+                                    "exit('x')\n"
+                                    "import ameesh.db\n",
+            "os._exit aliasé puis rebindé": "from os import _exit as bye\n"
+                                            "bye = print\n"
+                                            "bye('x')\n"
+                                            "import ameesh.db\n",
+        }
+        for why, source in reassigned.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
