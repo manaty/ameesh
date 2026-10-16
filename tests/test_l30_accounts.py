@@ -128,7 +128,8 @@ class ProfilsTest(unittest.TestCase):
         self.assertEqual(env["DEEPSEEK_API_KEY"], "cle-factice-b")
 
     def test_environnement_du_dossier(self):
-        # compte par défaut : le dossier hérité de l'exécuteur pour CE harnais,
+        # profil synthétique (hors configuration : session d'avant L30, hôte
+        # sans comptes) : le dossier hérité de l'exécuteur pour CE harnais,
         # jamais celui d'un autre harnais
         declare = {"claude": [accounts.Profile("claude", "p")]}
         env = {"CLAUDE_CONFIG_DIR": "/herite", "CODEX_HOME": "/autre"}
@@ -144,6 +145,33 @@ class ProfilsTest(unittest.TestCase):
         dossier = _dossier(os.path.join(self.tmp, "codex-2"), creds="auth.json")
         accounts.apply_env(env, accounts.Profile("codex", "s", path=dossier))
         self.assertEqual(env["CODEX_HOME"], dossier)
+
+    def test_profil_declare_sans_dossier_ignore_le_dossier_ambiant(self):
+        """L1078 : un compte déclaré sans `path` désigne le dossier par défaut
+        du harnais (`~/.claude`, `~/.codex`), jamais la variable du compte
+        ambiant ; le profil synthétique, lui, garde le dossier hérité."""
+        herite = {"CLAUDE_CONFIG_DIR": "/herite", "CODEX_HOME": "/autre",
+                  "HOME": self.tmp}
+        declare = accounts.parse({"claude": [{"name": "primaire"}],
+                                  "codex": [{"name": "primaire"}]})
+        claude, codex = declare["claude"][0], declare["codex"][0]
+        self.assertEqual(claude.home(herite), os.path.join(self.tmp, ".claude"))
+        self.assertEqual(codex.home(herite), os.path.join(self.tmp, ".codex"))
+        # le tour d'un compte déclaré sans dossier ne reçoit AUCUNE variable de
+        # dossier : le harnais prend son dossier par défaut, jamais le compte
+        # ambiant de l'exécuteur
+        env = dict(herite, PATH="/bin")
+        accounts.launch_env(env, declare, claude, environ=herite)
+        self.assertEqual(env, {"HOME": self.tmp, "PATH": "/bin"})
+        env = dict(herite, PATH="/bin")
+        accounts.launch_env(env, declare, codex, environ=herite)
+        self.assertEqual(env, {"HOME": self.tmp, "PATH": "/bin"})
+        # profil synthétique : la variable héritée est conservée
+        synthetique = accounts.Profile("claude", "p")
+        self.assertEqual(synthetique.home(herite), "/herite")
+        env = {"CLAUDE_CONFIG_DIR": "/herite", "PATH": "/bin"}
+        accounts.launch_env(env, {"claude": [synthetique]}, synthetique, environ=herite)
+        self.assertEqual(env, {"CLAUDE_CONFIG_DIR": "/herite", "PATH": "/bin"})
 
     def test_continuite_selon_le_harnais(self):
         a = _dossier(os.path.join(self.tmp, "a"))
@@ -201,12 +229,88 @@ class ProfilsTest(unittest.TestCase):
         self.assertAlmostEqual(accounts.gauges_of(book, items[0], items)[0].used, 0.95)
         self.assertAlmostEqual(accounts.gauges_of(book, items[1], items)[0].used, 0.10)
 
+    def test_primaire_est_le_dossier_par_defaut_pas_l_ordre_de_la_liste(self):
+        """L1078 : le primaire des relevés Claude est le compte du dossier par
+        défaut du harnais, jamais `items[0]`."""
+        maison = {"HOME": self.tmp}
+        secondaire = os.path.join(self.tmp, "claude-2")
+        liste = accounts.parse({"claude": [{"name": "secondaire", "path": secondaire},
+                                           {"name": "primaire"}]})["claude"]
+        self.assertEqual(accounts.primary_of("claude", liste, maison).name, "primaire")
+        # liste réduite au seul secondaire : aucun primaire déclaré
+        reduite = accounts.parse({"claude": [{"name": "secondaire",
+                                              "path": secondaire}]})["claude"]
+        self.assertIsNone(accounts.primary_of("claude", reduite, maison))
+
+    def test_jauges_claude_sans_marqueur_au_seul_primaire(self):
+        """L1078 : un flux sans marqueur appartient au compte du dossier par
+        défaut ; jamais au premier profil de la liste, et jamais au secondaire
+        d'une liste réduite (qui affichait sa jauge, 67 % au lieu de 86 %)."""
+        etat = os.path.join(self.tmp, "etat-sans-marqueur")
+        os.makedirs(os.path.join(etat, "ag"))
+        with open(os.path.join(etat, "ag", "tool"), "w", encoding="utf-8") as fh:
+            fh.write("claude\n")
+        now = time.time()
+        with open(os.path.join(etat, "ag", "events.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_claude_rate_limit(0.86, now + 3600)) + "\n")
+        book = cost.CostBook(state_dir=etat, db=None)
+        maison = {"HOME": self.tmp}
+        secondaire = os.path.join(self.tmp, "claude-2")
+        # liste réduite au seul secondaire : le flux sans marqueur ne lui va pas
+        reduite = accounts.parse({"claude": [{"name": "secondaire",
+                                              "path": secondaire}]})["claude"]
+        self.assertEqual(accounts.gauges_of(book, reduite[0], reduite, maison), [])
+        # liste complète, secondaire en premier : le primaire seul le réclame
+        complete = accounts.parse({"claude": [
+            {"name": "secondaire", "path": secondaire},
+            {"name": "primaire"}]})["claude"]
+        self.assertEqual(accounts.gauges_of(book, complete[0], complete, maison), [])
+        self.assertAlmostEqual(
+            accounts.gauges_of(book, complete[1], complete, maison)[0].used, 0.86)
+        # un flux marqué reste au compte de son marqueur (autre agent)
+        os.makedirs(os.path.join(etat, "ag2"))
+        with open(os.path.join(etat, "ag2", "tool"), "w", encoding="utf-8") as fh:
+            fh.write("claude\n")
+        with open(os.path.join(etat, "ag2", "events.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": cost.ACCOUNT_MARKER, "harness": "claude",
+                                 "account": "secondaire", "ts": now - 5}) + "\n")
+            fh.write(json.dumps(_claude_rate_limit(0.42, now + 3600)) + "\n")
+        self.assertAlmostEqual(
+            accounts.gauges_of(book, complete[0], complete, maison)[0].used, 0.42)
+        self.assertAlmostEqual(
+            accounts.gauges_of(book, complete[1], complete, maison)[0].used, 0.86)
+
+    def test_jauges_codex_primaire_sans_dossier_ignore_le_codex_home_ambiant(self):
+        """L1078 : un primaire déclaré sans dossier lit `~/.codex`, pas le
+        `CODEX_HOME` de l'exécuteur — sinon les deux comptes affichaient la
+        même jauge."""
+        now = time.time()
+        maison = os.path.join(self.tmp, "maison")
+        defaut = _dossier(os.path.join(maison, ".codex"), creds="auth.json")
+        ambiant = _dossier(os.path.join(self.tmp, "codex-ambiant"), creds="auth.json")
+        secondaire = _dossier(os.path.join(self.tmp, "codex-2"), creds="auth.json")
+        _codex_rollout(defaut, 95, now + 3600)
+        _codex_rollout(ambiant, 10, now + 3600)
+        _codex_rollout(secondaire, 42, now + 3600)
+        items = accounts.parse({"codex": [{"name": "primaire"},
+                                          {"name": "secondaire",
+                                           "path": secondaire}]})["codex"]
+        book = cost.CostBook(state_dir=self.tmp, db=None, codex_sessions="/nulle-part")
+        environ = {"HOME": maison, "CODEX_HOME": ambiant}
+        self.assertAlmostEqual(accounts.gauges_of(book, items[0], items, environ)[0].used,
+                               0.95)
+        self.assertAlmostEqual(accounts.gauges_of(book, items[1], items, environ)[0].used,
+                               0.42)
+
 
 class _Base(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         for table in ("account_active", "account_holds", "account_switches", "turn_costs",
-                      "spend_pending", "quota_gauge_readings", "provider_balances"):
+                      "spend_pending", "quota_gauge_readings", "provider_balances",
+                      # #1883 : les empreintes de dossier publiées par les tests
+                      # précédents ne doivent pas créer de faux conflits
+                      "account_identities"):
             self.db.execute("DELETE FROM %s" % table)
 
     def _claude_comptes(self, partage: bool = True) -> list:
@@ -486,20 +590,27 @@ class ExecuteurTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
-    def test_codex_compte_par_defaut_un_seul_mecanisme(self):
-        """Compte primaire sans dossier : jauges ET harnais sur le CODEX_HOME de
-        l'exécuteur (mécanisme de cost.CostBook) ; compte déclaré : le sien."""
-        herite = _dossier(os.path.join(self.tmp, "codex-herite"), creds="auth.json")
+    def test_codex_compte_par_defaut_sans_dossier_joue_et_lit_son_dossier(self):
+        """L1078 : un compte primaire déclaré sans dossier, c'est le dossier par
+        défaut du harnais (`~/.codex`) : ni le `CODEX_HOME` ambiant de
+        l'exécuteur (celui d'un autre compte), ni ses jauges."""
+        maison = os.path.join(self.tmp, "maison")
+        defaut = _dossier(os.path.join(maison, ".codex"), creds="auth.json")
+        ambiant = _dossier(os.path.join(self.tmp, "codex-ambiant"), creds="auth.json")
         secondaire = self._codex_comptes()[1]
+        # la jauge du dossier ambiant (10 %) ne doit jamais être lue pour le
+        # primaire ; elle ne doit pas non plus le faire passer pour le secondaire
+        _codex_rollout(ambiant, 10, time.time() + 3600)
         # L226b: the primary comes last by default; here it is put first to
         # test the gauges mechanism
         comptes = {"codex": [{"name": "primaire", "priority": 0}, secondaire]}
         runner, worker = self._worker("cxd", "codex", comptes)
         try:
-            with mock.patch.dict(os.environ, {"CODEX_HOME": herite}):
+            with mock.patch.dict(os.environ, {"CODEX_HOME": ambiant, "HOME": maison}):
                 self._tour(worker)
-                self.assertEqual(self.turns()[-1]["compte"]["CODEX_HOME"], herite)
-                _codex_rollout(herite, 95, time.time() + 3600)  # lu par le mécanisme
+                # le tour du primaire ne reçoit pas le dossier ambiant
+                self.assertIsNone(self.turns()[-1]["compte"]["CODEX_HOME"])
+                _codex_rollout(defaut, 95, time.time() + 3600)  # son dossier, lu
                 n = len(self.turns())
                 self._tour(worker, "suite")
             dernier = self.turns()[-1]

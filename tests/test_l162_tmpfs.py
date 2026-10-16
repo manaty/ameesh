@@ -22,7 +22,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import adapters, exploitation, mail, menage, registry, storage
+from ameesh import adapters, exploitation, mail, menage, platform, registry, storage
 from ameesh import runner as runner_mod
 
 from .support import PgTestCase
@@ -313,6 +313,19 @@ class AbandonDbTest(_Systeme, PgTestCase):
         return menage.run_pass(self.cfgl, self.db, kw.pop("policy", self.pol), host="pc",
                                actor="t", now=time.time() + decalage, **kw)
 
+    def _sans_doute_d_un_tiers(self) -> None:
+        """L63b : quand un processus du même utilisateur cache ses fichiers
+        ouverts (gpg-agent non dumpable, #1749), la sonde ne peut pas prouver
+        qu'aucun détenteur ne reste et le ménage garde toute entrée (« holders
+        unreadable », fail-closed) — garde-fou témoigné par test_l63_platform.
+        Ici, ce sont les décisions du ménage qu'on observe : le doute d'un tiers
+        de l'hôte, étranger au test, est neutralisé pour qu'elles ne dépendent
+        pas de l'hôte ; la détection réelle (fichier ouvert, dossier courant)
+        reste en jeu."""
+        patch = mock.patch.object(platform.process, "_settle", lambda *a, **k: None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def _en_tour(self, agent: str) -> None:
         """`agent` en tour sur l'hôte « pc » : statut running, bail vivant."""
         registry.upsert(self.db, agent, harness="claude", host="pc")
@@ -437,6 +450,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertEqual(recents, {heures, jours})
 
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
+        self._sans_doute_d_un_tiers()
         abandon = os.path.join(self.sys, "preuve-images")
         self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwx", abandon],
                         capture_output=True)
@@ -478,6 +492,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertNotIn("tmp_orphan", types)
 
     def test_garde_fous(self):
+        self._sans_doute_d_un_tiers()
         ouvert = os.path.join(self.sys, "ouvert")
         sale = os.path.join(self.sys, "clone-sale")
         homonyme = os.path.join(self.sys, "recree")
@@ -531,7 +546,57 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertTrue(all("deleted by cleanup once unchanged" in a["detail"]
                             for a in alertes))
 
+    def test_allow_des_processus_illisibles_debloque_la_suppression(self):
+        """L230/L162 : sur un poste à processus non dumpable (gpg-agent,
+        ssh-agent), `platform.holders` lève NotAvailable et l'entrée restait
+        gardée ; nommer le processus dans `unreadable_ok` lève le doute, la
+        suppression part. Liste vide : le refus garde l'entrée (fail-closed)."""
+        entree = os.path.join(self.sys, "clone-relecture")
+
+        def creer():
+            _write(os.path.join(entree, "f"), 5000)
+
+        self._tour(creer, impute="a1")
+        refus = menage.platform.NotAvailable(
+            "file holders", "open files of process(es) of this user unreadable: "
+            "4242 gpg-agent")
+
+        def holders(path, needle=None, allow=()):
+            if "gpg-agent" in allow:
+                return []
+            raise refus
+
+        with mock.patch.object(menage.platform, "holders", side_effect=holders):
+            garde = self._passage(3 * HEURE)
+            self.assertTrue(os.path.exists(entree))
+            self.assertEqual(garde["orphans"][0]["status"], "attend")
+            self.assertIn("holders unreadable", garde["orphans"][0]["detail"])
+            permis = menage.Policy(orphan_min_size=1, unreadable_ok=("gpg-agent",))
+            fait = self._passage(3 * HEURE, policy=permis)
+        self.assertFalse(os.path.exists(entree))
+        self.assertEqual(fait["orphans"], [])
+        journal = storage.of(self.db).housekeeping.recent("pc", 3600, kind="orphan")
+        self.assertEqual([r["path"] for r in journal if r["action"] == "deleted"],
+                         [entree])
+
+    def test_le_temoin_du_detenteur_a_un_argument_reste_lu(self):
+        """#1357 : le témoin d'herméticité de #1523 fixe la réponse du
+        détenteur par un lambda à UN argument (l'hôte n'a pas d'allow) ; sans
+        allow, la question posée doit rester celle-là. Sinon le TypeError est
+        avalé par le passage (« jamais fatal ») et la liste des orphelins se
+        vide en silence."""
+        entree = os.path.join(self.sys, "clone-temoin")
+        self._tour(lambda: _write(os.path.join(entree, "f"), 5000), impute="a1")
+        with mock.patch.object(menage, "tmp_holder",
+                               side_effect=lambda p: "held by process 4242 (test)"):
+            rapport = self._passage(3 * HEURE)
+        self.assertTrue(os.path.exists(entree))
+        sorts = {o["path"]: (o["status"], o["detail"]) for o in rapport["orphans"]}
+        self.assertEqual(sorts[entree][0], "attend")
+        self.assertIn("held by process 4242", sorts[entree][1])
+
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
+        self._sans_doute_d_un_tiers()
         main = _repo(self.tmp)
         relecture = os.path.join(self.sys, "relecture")
         self._tour(lambda: _git("worktree", "add", "-q", "--detach", relecture, cwd=main),

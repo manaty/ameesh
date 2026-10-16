@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ameesh"
-version = "1.11.1"
+version = "1.11.3"
 description = "Coordination d'équipes mixtes humains et agents IA : exécuteur multi-harnais, canon OKF, fil lisible, actions sous porte et approbations signées."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -37,8 +37,10 @@ crypto = ["cryptography>=41"]
 
 [project.scripts]
 ameesh = "ameesh.main:main"
-#: alias conservés : les hooks des trois harnais appellent agent-mail
-agent-mail = "ameesh.cli:main"
+#: alias conservés : les hooks des trois harnais appellent agent-mail.
+#: #1604 : l'entrée passe par `ameesh.entry`, qui sert `hook` et `statusline`
+#: sans importer le paquet complet (`ameesh.cli` reste la porte de tout le reste).
+agent-mail = "ameesh.entry:main"
 agent-runner = "ameesh.runner:main"
 #: service d'approbation humaine (spec §9), lancé sous son propre utilisateur
 ameesh-approve = "ameesh.approve.cli:main"

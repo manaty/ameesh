@@ -149,20 +149,30 @@ class ProtectedQueueTest(_Land):
 
 
 class _Gh:
-    """`gh run list` answering `rows` (or failing)."""
+    """`gh run list` answering `rows` (or failing); `workflows` for
+    `repos/<slug>/actions/workflows`, `jobs` for `gh run view --json jobs`
+    (keyed by run id, as text)."""
 
-    def __init__(self, rows=None, code=0, checks=None, statuses=None):
+    def __init__(self, rows=None, code=0, checks=None, statuses=None, workflows=None, jobs=None):
         self.rows, self.code, self.calls = rows or [], code, []
         self.checks = checks or []
         self.statuses = statuses or []
+        self.workflows = workflows or []
+        self.jobs = jobs or {}
 
     def run(self, argv, stdin=None):
         self.calls.append(argv)
         data = self.rows
-        if argv[0] == "api":
-            data = ({"total_count": len(self.checks), "check_runs": self.checks}
-                    if "check-runs" in argv[1] else
-                    {"sha": "a" * 40, "total_count": len(self.statuses), "statuses": self.statuses})
+        if argv[0] == "run" and len(argv) > 2 and argv[1] == "view":
+            data = {"jobs": self.jobs.get(argv[2], [])}
+        elif argv[0] == "api":
+            if "check-runs" in argv[1]:
+                data = {"total_count": len(self.checks), "check_runs": self.checks}
+            elif "/actions/workflows" in argv[1]:
+                data = {"total_count": len(self.workflows), "workflows": self.workflows}
+            else:
+                data = {"sha": "a" * 40, "total_count": len(self.statuses),
+                        "statuses": self.statuses}
         return self.code, json.dumps(data), "boom" if self.code else ""
 
 

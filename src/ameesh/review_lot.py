@@ -18,6 +18,15 @@ transaction** que la création (revue #544 r1) : le lot de relecture lui-même
 ligne de journal sur le lot fusionné, qui reste un confort. Deux appels
 **concurrents** sont sérialisés par le verrou de la ligne marquée, qui est
 posé avant l'insertion : le perdant rend le lot du gagnant (revue #544 r2).
+
+#1053 (suite #1037 N1) : la famille de l'auteur est celle du **gel**, pas
+celle de la session courante à la fusion. Le gel est le geste de livraison :
+son acteur est l'auteur du lot produit, et les tours comptés de cet acteur
+(`turn_costs`, 0014) jusqu'à l'instant du gel sont la trace du harnais qui a
+réellement tourné. Entre le gel et la fusion, une session peut être remplacée
+ou changer de harnais (rotation, `adopt`, L242b) : le registre courant ne
+prouve rien du passé, et quand aucun tour n'est tracé la famille reste
+inconnue (`codex ou claude`) — elle n'est jamais devinée du registre.
 """
 from __future__ import annotations
 
@@ -114,6 +123,67 @@ def _marked(ops, lot: int, ref: str) -> bool:
     return any(ref in str(e.get("note") or "") for e in events)
 
 
+#: ce qu'écrit le corps quand le harnais de l'auteur n'est pas tracé (#1053)
+UNTRACED = "non tracé au gel"
+
+
+def _freeze(db, lot: int) -> Optional[dict]:
+    """Le dernier gel du lot (jalon `frozen` le plus récent), ou None.
+
+    Même règle que `plan_git.latest_freeze` : c'est le gel le plus récent qui
+    fait autorité. Une lecture impossible rend None (famille inconnue), jamais
+    une exception : la fusion est un fait, l'attribution reste descriptive."""
+    try:
+        rows = work.milestones(db, int(lot)) or []
+        freezes = [r for r in rows if r.get("kind") == "frozen"]
+        if not freezes:
+            return None
+        return max(freezes, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
+    except Exception:  # noqa: BLE001 - jalons illisibles : pas de trace
+        return None
+
+
+def _turns_harness(db, agent: str, at_ts: float) -> str:
+    """Le harnais du dernier tour écrit de `agent` jusqu'à `at_ts` (epoch).
+
+    `turn_costs` (0014) est la seule trace du harnais qui a réellement tourné :
+    une ligne par tour fini, écrite avec le harnais du flux. Le registre, lui,
+    ne dit que l'état courant. Les lignes écartées (0043) sont gardées : le
+    tour a eu lieu, seule sa comptabilisation a été corrigée."""
+    rows = db.query(
+        "SELECT harness FROM turn_costs"
+        " WHERE agent = %s AND recorded_at <= to_timestamp(%s)"
+        " ORDER BY recorded_at DESC, id DESC LIMIT 1",
+        (agent, float(at_ts)))
+    return str((rows[0].get("harness") if rows else "") or "")
+
+
+def _author_at_freeze(db, lot: int, item: dict) -> dict:
+    """L'auteur du lot produit, et le harnais sous lequel il tournait au gel.
+
+    #1053 : le gel est le geste de livraison — son acteur est l'auteur du lot
+    produit, et le registre de ses tours est relu **jusqu'à l'instant du gel**
+    (`_turns_harness`). L'assigné courant ne le remplace pas : la relecture
+    réassigne le lot après le gel. Sans gel, sans acteur ou sans tour tracé, la
+    famille reste inconnue : le registre courant n'est jamais consulté pour la
+    deviner, il ne prouve rien d'historique (L242b, rotation, `adopt`)."""
+    assignee = str(item.get("assignee") or "").strip()
+    out = {"name": assignee, "harness": ""}
+    try:
+        freeze = _freeze(db, lot)
+        if freeze is None:
+            return out
+        name = str(freeze.get("actor") or "").strip() or assignee
+        out["name"] = name
+        at_ts = freeze.get("at_ts")
+        if not name or at_ts is None:
+            return out
+        out["harness"] = _turns_harness(db, name, at_ts)
+    except Exception:  # noqa: BLE001 - toute trace illisible : famille inconnue
+        pass
+    return out
+
+
 def title_of(item: dict, lot: int) -> str:
     """Le titre du lot de relecture."""
     return "REVUE #%d : relecture après fusion — %s" % (
@@ -125,7 +195,7 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     """Le corps du lot de relecture : quoi relire, par qui, avant quand."""
     author = author or {}
     who = author.get("name") or "inconnu"
-    harness = author.get("harness") or "inconnu"
+    harness = author.get("harness") or UNTRACED
     where = "PR #%s" % pr if pr else (merged_sha[:12] if merged_sha else "?")
     why = " ".join(str((klass or {}).get("why") or "").split())
     lines = [
@@ -192,7 +262,7 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     if _marked(ops, lot, ref):
         out["why"] = "lot de relecture déjà marqué au journal de #%d" % lot
         return out
-    author = _author(db, str(item.get("assignee") or ""))
+    author = _author_at_freeze(db, lot, item)
     family = reviewer_family(author.get("harness"))
     try:
         created = work.add(

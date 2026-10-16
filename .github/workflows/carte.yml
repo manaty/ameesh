@@ -15,6 +15,33 @@
 #
 # Sur une PR qui touche la mesure elle-même, la carte est produite pour
 # contrôle (artefact seulement, pas de cache).
+#
+# #1341 — répartition et complétude de la mesure :
+#   - A : le découpage des parts sous mesure est pondéré par les durées de la
+#     carte précédente (`--map`), pas par la table statique mesurée sans
+#     couverture : le surcoût de la mesure varie de 1,2× à 9,3× selon les
+#     modules, et la table statique ne couvre que 76 modules sur 250 ;
+#   - B : les modules « pilote » psql sont mesurés en 2 parts (une seule part
+#     de 45 modules pesait 38 min de mur pour un plafond de 40, annulée deux
+#     fois) ;
+#   - D : la fusion refuse de publier une carte si une part attendue manque ou
+#     n'a pas écrit ses `durees.json` (part annulée), ou si la matrice de
+#     mesure n'est pas verte ; elle vérifie aussi la couverture *effective*
+#     (`--plan`) : chaque module du plan mesuré une seule fois, dans la part
+#     que le plan lui assigne, aucun omis ni doublé. Une carte incomplète ne
+#     remplace pas la précédente : elle en perdrait les durées (la fusion
+#     n'hérite que des échecs), et le découpage des runs suivants retomberait
+#     sur la table statique. `PARTS_MESURE` est le miroir de la matrice
+#     `mesure`, tenu par tests/test_carte_parts_completes.py.
+#   - R1 (#1341, relecture Codex indépendante) : la carte est lue et le
+#     découpage calculé UNE seule fois par run, par le job `plan-mesure` ; le
+#     plan obtenu est publié en artefact et toutes les parts le lisent
+#     (`test-parts.py run --plan`). Avant, chaque part restaurait la carte du
+#     cache et recalculait son découpage : deux jobs pouvaient lire deux cartes
+#     différentes (cache écrit entre-temps par une PR ou main), produire des
+#     parts disjointes — un module omis, un autre doublé — toutes avec des
+#     `durees.json` non vides, et D publiait une carte incomplète avec une
+#     matrice verte (témoin K1/K2 de la R1).
 name: carte
 
 on:
@@ -58,6 +85,14 @@ env:
   AMEESH_REQUIRE_DB: "1"
   AMEESH_BALANCE_INTERVAL: "0"
   PYTHONPATH: src
+  # #1341 D — miroir de jobs.mesure.strategy.matrix.include : toute part
+  # ajoutée, retirée ou renumérotée là-bas doit l'être ici, et
+  # tests/test_carte_parts_completes.py refuse la divergence. Le plan unique
+  # du run (job `plan-mesure`) et la fusion (job `carte`) lisent la même
+  # liste : une seule source pour les parts attendues.
+  PARTS_MESURE: >-
+    mesure-psycopg-1 mesure-psycopg-2 mesure-psycopg-3 mesure-psycopg-4
+    mesure-psql-1 mesure-psql-2
 
 # Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
 # four runners): GitHub's free tier caps hosted jobs at 20 for the whole
@@ -65,8 +100,44 @@ env:
 # repository is public: its code would run on a shared, persistent machine);
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
+  # #1341 R1 — le plan de la mesure, calculé une seule fois par run : toutes
+  # les parts lisent le même découpage (`--plan`). Le découpage ne dépend donc
+  # plus de la carte présente sur chaque runner au moment où le job démarre.
+  plan-mesure:
+    name: plan de mesure
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # une seule lecture de la carte par run ; la table statique est le repli
+      - uses: actions/cache/restore@v4
+        with:
+          path: carte/carte.json.gz
+          key: carte-${{ github.sha }}
+          restore-keys: carte-
+      - name: plan unique du run
+        run: |
+          mkdir -p plan
+          CARTE=carte/carte.json.gz
+          [ -f "$CARTE" ] || CARTE=""
+          python3 scripts/test-parts.py plan --out plan/plan.json \
+            --parts "$PARTS_MESURE" --list-psql tests/parts/pilote-psql.txt \
+            ${CARTE:+--map "$CARTE"} --summary "$GITHUB_STEP_SUMMARY"
+          # la fusion réutilise la carte qui a servi au plan (historique des
+          # échecs) : le plan et la carte publiée décrivent le même run.
+          if [ -f "$CARTE" ]; then cp "$CARTE" plan/carte-source.json.gz; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan-mesure
+          path: plan
+          retention-days: 3
+
   mesure:
     name: mesure ${{ matrix.pilote }} ${{ matrix.part }}/${{ matrix.parts }}
+    needs: plan-mesure
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 40
     strategy:
@@ -77,7 +148,8 @@ jobs:
           - { pilote: psycopg, part: 2, parts: 4 }
           - { pilote: psycopg, part: 3, parts: 4 }
           - { pilote: psycopg, part: 4, parts: 4 }
-          - { pilote: psql, part: 1, parts: 1, liste: tests/parts/pilote-psql.txt }
+          - { pilote: psql, part: 1, parts: 2 }
+          - { pilote: psql, part: 2, parts: 2 }
     services:
       postgres:
         image: postgres:17
@@ -92,9 +164,14 @@ jobs:
           --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       AMEESH_DRIVER: ${{ matrix.pilote }}
-      LISTE: ${{ matrix.liste }}
     steps:
       - uses: actions/checkout@v4
+      # #1341 R1 : le plan unique du run, calculé par `plan-mesure` — chaque
+      # part lit le même découpage et ne restaure plus la carte elle-même.
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan-mesure
+          path: ${{ runner.temp }}
       - name: port de la base jetable
         run: echo "AMEESH_TEST_DSN=postgresql://ameesh@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/ameesh" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
@@ -104,9 +181,9 @@ jobs:
         run: |
           python -m venv .venv-carte
           if [ "$AMEESH_DRIVER" = psycopg ]; then
-            .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'pyyaml>=6'
           else
-            .venv-carte/bin/pip install -q 'coverage>=7.10'
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'pyyaml>=6'
           fi
           .venv-carte/bin/python scripts/map.py install
       - name: base jetable (sans fsync) et client psql
@@ -128,9 +205,12 @@ jobs:
           M="$RUNNER_TEMP/mesure"
           mkdir -p "$M"
           debut=$(date +%s)
+          # #1341 R1 : plan unique du run (job `plan-mesure`), le même pour
+          # toutes les parts ; plus de carte restaurée ni de découpage
+          # recalculé ici.
           # jamais bloquant : un échec sous mesure est noté dans la carte
-          .venv-carte/bin/python scripts/test-parts.py run --parts ${{ matrix.parts }} \
-            --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" ${LISTE:+--list "$LISTE"} \
+          .venv-carte/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json" \
+            --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" \
             --measure "$M" --output-durations "$M/durees.json" --flow "$M/flux.jsonl" \
             || echo "::warning::tests en échec sous mesure (notés dans la carte)"
           echo "durée sous mesure : $(( $(date +%s) - debut )) s" >> "$GITHUB_STEP_SUMMARY"
@@ -146,7 +226,13 @@ jobs:
   carte:
     name: carte
     needs: mesure
-    if: always()
+    # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
+    # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
+    if: always() && !cancelled()
+    # supprimer les mesures du run (étape finale) ; le reste du workflow reste en lecture
+    permissions:
+      contents: read
+      actions: write
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
@@ -159,18 +245,33 @@ jobs:
         with:
           pattern: mesure-*
           path: mesures
-      # carte précédente : historique des échecs sous mesure (14 jours)
-      - uses: actions/cache/restore@v4
+      # #1341 R1 : le plan unique du run, et la carte qui l'a produit (même
+      # historique d'échecs que le plan, pas une carte relue plus tard).
+      - uses: actions/download-artifact@v4
         with:
-          path: carte/carte.json.gz
-          key: carte-${{ github.sha }}
-          restore-keys: carte-
+          name: plan-mesure
+          path: plan
       - name: fusion des mesures
+        env:
+          RESULTAT_MESURE: ${{ needs.mesure.result }}
         run: |
-          if [ -f carte/carte.json.gz ]; then mv carte/carte.json.gz carte/precedente.json.gz; fi
+          # #1341 D : aucune carte n'est publiée à partir d'une mesure
+          # incomplète. Le résultat de la matrice attrape la part annulée
+          # (plafond, runner perdu) ; --attendu attrape l'artefact publié sans
+          # durées et la part absente du disque ; --plan vérifie la couverture
+          # effective : aucun module du plan omis, doublé ou hors de sa part.
+          if [ "$RESULTAT_MESURE" != "success" ]; then
+            echo "::error::mesure $RESULTAT_MESURE : carte non publiée (part en échec ou annulée)"
+            exit 1
+          fi
           mkdir -p carte
+          if [ -f plan/carte-source.json.gz ]; then
+            cp plan/carte-source.json.gz carte/precedente.json.gz
+          fi
           python scripts/map.py merge --output carte/carte.json.gz \
-            --previous carte/precedente.json.gz --summary "$GITHUB_STEP_SUMMARY" mesures/*
+            --previous carte/precedente.json.gz --plan plan/plan.json \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --attendu "$PARTS_MESURE" mesures/*
           rm -f carte/precedente.json.gz
       - uses: actions/upload-artifact@v4
         with:
@@ -182,3 +283,19 @@ jobs:
         with:
           path: carte/carte.json.gz
           key: carte-${{ github.sha }}
+      # Quota d'artefacts de l'organisation, plein le 15/10 (2,4 Go de mesures
+      # gardées un jour) : les mesures ne servent qu'à ce job, on les supprime
+      # dès la carte faite. Seule la carte (30 jours) reste. Jamais bloquant ;
+      # pas de condition « toujours » (#1341 : rien ne tourne sur échec de la fusion,
+      # les mesures d'un échec expirent seules en un jour).
+      - name: supprimer les mesures intermédiaires
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
+        run: |
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" "$API/runs/${{ github.run_id }}/artifacts?per_page=100" |
+            python3 -c 'import json,sys; [print(a["id"]) for a in json.load(sys.stdin).get("artifacts", []) if a["name"].startswith("mesure-")]' |
+            while read -r id; do
+              curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer $GH_TOKEN" "$API/artifacts/$id" && echo "mesure $id supprimée"
+            done

@@ -61,8 +61,9 @@ version number never takes the lane: L157 is a pull-request rule.
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
-missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
+missing, unreadable, older than 48 h, not an ancestor of HEAD, or built on
+unreadable measure artefacts (`measure.artefacts_incomplets`, #1690/#1716):
+the order falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
 default) and the plan is marked unsure. A file the map cannot judge (Python
 outside `src/ameesh`, a non-documentation file no test reads, a syntax
 error) uses the textual heuristic for that file and marks the plan unsure;
@@ -170,14 +171,18 @@ RECENT_FAILURE_DAYS = 7
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
 #: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète reste en six parts.
+#: saturé) ; la suite psql complète passe à neuf parts (#1692) : sur le run
+#: 38736559499 attempt 2, les six parts ont pesé 26-45,5 min sous saturation
+#: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
+#: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
+#: mesuré, huit en laisseraient ~34.
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+PARTS = {"psycopg": (4, 4), "psql": (3, 9)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
-#: comme dans celui de 45 min de psql.
+#: comme dans celui de 60 min de psql (#1251).
 PR_TARGET_PART_S = 300
 #: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
 #: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
@@ -355,6 +360,57 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _is_exit_func(node: ast.expr, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether an expression designates a known import-time termination: a
+    bound name, or `sys.exit`/`os._exit` (aliases of `sys`, `os` and of the
+    imported names included)."""
+    if isinstance(node, ast.NamedExpr):
+        # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
+        return _is_exit_func(node.value, exit_names, sys_names, os_names)
+    if isinstance(node, ast.Name):
+        return node.id in exit_names
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.attr == "exit":
+            return node.value.id in sys_names
+        if node.attr == "_exit":
+            return node.value.id in os_names
+    return False
+
+
+def _is_exit_call(node: ast.Call, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether a call is a known import-time termination: the builtins
+    `exit()`/`quit()`, `sys.exit()`/`os._exit()` (aliases of `sys`, `os` and of
+    the imported names included)."""
+    return _is_exit_func(node.func, exit_names, sys_names, os_names)
+
+
+def _may_terminate(node: ast.AST, names: set[str], exit_names: set[str],
+                   sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether running this statement may end the import: a reachable `raise`,
+    a false `assert`, or an exit call (#1627).
+
+    Deliberately conservative — a `raise` caught by an enclosing `try` still
+    counts (a proof lost, never a false proof) — and the body of an
+    `if TYPE_CHECKING:` / `if False:` is dead, as in `_never_runs`. A function
+    or lambda body runs later, not at import, so it terminates nothing here."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Raise):
+        return True
+    if isinstance(node, ast.Assert):
+        return _never_runs(node.test, names)
+    if isinstance(node, ast.Call) and _is_exit_call(node, exit_names, sys_names, os_names):
+        return True
+    if isinstance(node, ast.If) and _never_runs(node.test, names):
+        children: list[ast.AST] = list(node.orelse)  # seul le `else` s'exécute
+    else:
+        children = list(ast.iter_child_nodes(node))
+    return any(_may_terminate(child, names, exit_names, sys_names, os_names)
+               for child in children)
+
+
 class _RuntimeImports(ast.NodeVisitor):
     """The import statements that may run, and those the module certainly runs
     when it is imported.
@@ -366,8 +422,15 @@ class _RuntimeImports(ast.NodeVisitor):
     import, a function body does not), outside any condition, loop, `try` or
     `with` — a `with` body may never run (its `__enter__` may fail, or an
     earlier statement may raise and be suppressed), so it is no proof.
+    An unconditional module-level `raise` or `sys.exit` also leaves every
+    later import without proof, while keeping its possible selection edge.
     A lazy or conditional import alone is a possible load, never a proof
-    (relecture Codex, B2 résiduel)."""
+    (relecture Codex, B2 résiduel). A reachable termination — a guarded
+    `raise`, an `except` that exits, `exit()`/`sys.exit()`/`os._exit()`, a
+    false `assert` — stops the proofs too: the imports after it may never run
+    (#1627). A name bound to such a callable by assignment or by a star import
+    (`e = sys.exit`, `from os import *` then `_exit()`) terminates as well, the
+    binding being followed conservatively (#1860)."""
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
@@ -375,10 +438,23 @@ class _RuntimeImports(ast.NodeVisitor):
         self.guaranteed: list[ast.stmt] = []
         self._deferred = 0  # inside a function or lambda body: not run at import
         self._guarded = 0   # inside a condition, a loop or a try: may not run
+        self._terminated = False  # module execution cannot reach later imports
+        # #1627 : une terminaison atteignable arrête les preuves du corps
+        # (module ou classe) : les imports suivants restent possibles seulement.
+        self._exit_names = {"exit", "quit"}  # builtins, `from sys import exit`
+        self._sys_names = {"sys"}            # `sys.exit`, alias compris
+        self._os_names = {"os"}              # `os._exit`, alias compris
 
     def _visit_function(self, node: ast.AST) -> None:
+        # Décorateurs, valeurs par défaut et annotations s'évaluent à la
+        # définition, donc à l'import : seul le corps est différé (#1474).
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for child in ast.iter_child_nodes(node):
+            if not any(child is statement for statement in body):
+                self.visit(child)
         self._deferred += 1
-        self.generic_visit(node)
+        for child in body:
+            self.visit(child)
         self._deferred -= 1
 
     visit_FunctionDef = _visit_function
@@ -399,6 +475,64 @@ class _RuntimeImports(ast.NodeVisitor):
     visit_With = _visit_guarded
     visit_AsyncWith = _visit_guarded
 
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self.generic_visit(node)
+        if not self._deferred and not self._guarded:
+            self._terminated = True
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        if not self._deferred and _is_exit_call(
+                node, self._exit_names, self._sys_names, self._os_names):
+            self._terminated = True
+
+    def _target_names(self, target: ast.expr) -> list[str]:
+        """Les noms qu'une cible d'affectation lie vraiment : `e`, `e, f`,
+        `(e, *f)`. Un abonnement ou un attribut (`d[k]`, `obj.handler`) ne
+        rebaptise aucun nom et n'en lie aucun."""
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Starred):
+            return self._target_names(target.value)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [name for element in target.elts
+                    for name in self._target_names(element)]
+        return []
+
+    def _learn_exit_names(self, target: ast.expr, value: ast.expr | None) -> None:
+        """Un nom affecté d'une sortie connue en devient une (#1860) :
+        `e = sys.exit` puis `e()`. L'ensemble ne rétrécit jamais — une
+        réaffectation peut être conditionnelle (#1474) : une preuve perdue
+        n'est jamais une fausse preuve. Une cible multiple lisible est suivie
+        élément par élément ; toute autre forme est gardée entière dès que la
+        valeur mentionne une sortie (conservateur)."""
+        if value is None:
+            return
+        if (isinstance(target, (ast.Tuple, ast.List))
+                and isinstance(value, (ast.Tuple, ast.List))
+                and len(target.elts) == len(value.elts)):
+            for sub_target, sub_value in zip(target.elts, value.elts):
+                self._learn_exit_names(sub_target, sub_value)
+            return
+        names = self._target_names(target)
+        if names and any(_is_exit_func(node, self._exit_names, self._sys_names,
+                                       self._os_names)
+                         for node in ast.walk(value)):
+            self._exit_names.update(names)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        for target in node.targets:
+            self._learn_exit_names(target, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
+
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
             # the guard never runs: only its `else` does (at module level)
@@ -407,15 +541,54 @@ class _RuntimeImports(ast.NodeVisitor):
             return
         self._visit_guarded(node)
 
+    def _visit_body(self, body: list[ast.stmt]) -> None:
+        """The body of a module or a class runs at import, in order: a
+        reachable termination cuts the proofs that follow it (#1627)."""
+        for child in body:
+            self.visit(child)
+            if not self._deferred and not self._terminated and _may_terminate(
+                    child, self.names, self._exit_names, self._sys_names, self._os_names):
+                self._terminated = True
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._visit_body(node.body)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # Ces expressions s'évaluent avant le corps : une sortie y interdit
+        # aussi de certifier les imports du corps, pas seulement ceux d'après.
+        for expression in (*node.decorator_list, *node.bases,
+                           *(keyword.value for keyword in node.keywords)):
+            self.visit(expression)
+        self._visit_body(node.body)
+
     def _record(self, node: ast.stmt) -> None:
         self.imports.append(node)
-        if not self._deferred and not self._guarded:
+        if not self._deferred and not self._guarded and not self._terminated:
             self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "sys":
+                self._sys_names.add(alias.asname or "sys")
+            elif alias.name == "os":
+                self._os_names.add(alias.asname or "os")
         self._record(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        if module == "sys":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "exit")
+        elif module == "os":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "_exit")
+        if any(alias.name == "*" for alias in node.names):
+            # #1860 : `from os import *` lie `_exit` au corps du module (les
+            # builtins `exit`/`quit` et `from sys import *` sont déjà couverts).
+            if module == "os":
+                self._exit_names.add("_exit")
+            elif module == "sys":
+                self._exit_names.add("exit")
         self._record(node)
 
 
@@ -545,11 +718,34 @@ def _reverse_closure(reverse: dict[str, set[str]], path: str) -> set[str]:
 
 # -- the map --------------------------------------------------------------
 
+def ignored_coverages(card: dict) -> list:
+    """Couvertures que la fusion de la carte a écartées (#1257). Une carte
+    antérieure à la clé n'en porte pas : sa mesure est complète par
+    construction (l'ancien code échouait sur un fichier illisible au lieu de
+    l'ignorer)."""
+    mesure = card.get("measure") or card.get("mesure") or {}
+    if not isinstance(mesure, dict):
+        return []
+    ignorees = mesure.get("couverture_ignoree")
+    if not ignorees:
+        return []
+    return ignorees if isinstance(ignorees, list) else [ignorees]
+
+
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
                 repo: pathlib.Path = REPO) -> tuple[str, float | None]:
     """Why the map cannot be used ("" if it can), and its age in hours."""
     if card is None:
         return "no map", None
+    ignorees = ignored_coverages(card)
+    if ignorees:
+        # #1257 (R1 B3) : une couverture écartée à la fusion rend la mesure
+        # partielle — les modules que le processus perdu mesurait manquent, et
+        # les durées connues feraient passer la sélection pour sûre. La carte ne
+        # juge plus la restriction : repli suite complète, jamais une décision
+        # sur une carte partielle.
+        return (f"map measured with {len(ignorees)} ignored coverage file(s) "
+                "(partial measure)"), None
     try:
         generated = datetime.datetime.fromisoformat(card["genere"])
     except (KeyError, TypeError, ValueError):
@@ -559,6 +755,19 @@ def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
         return f"map older than {MAX_AGE_H} h ({age:.0f} h)", age
     if not card.get("commit") or not is_ancestor(card["commit"], head, repo):
         return f"map commit {str(card.get('commit'))[:12]} is not an ancestor of {head}", age
+    # #1716 : #1690 écarte un artefact de mesure illisible et le nomme dans
+    # `artefacts_incomplets`, mais la carte reste amputée des tests que cet
+    # artefact portait : un bloc peut ressortir couvert par le seul artefact
+    # lisible, et la sélection se réduire à l'insu du plan. La carte entière
+    # est suspecte — on ne sait pas quels blocs l'artefact perdu couvrait —
+    # donc ordre complet, comme pour toute carte inutilisable.
+    incomplets = (card.get("measure") or card.get("mesure") or {}).get(
+        "artefacts_incomplets") or []
+    if incomplets:
+        fichiers = ", ".join(str(i.get("fichier", "?")) for i in incomplets[:3]
+                             if isinstance(i, dict))
+        return (f"map with {len(incomplets)} unreadable measure artefact(s)"
+                + (f" ({fichiers})" if fichiers else "")), age
     return "", age
 
 
@@ -571,7 +780,7 @@ def is_foundation(path: str) -> bool:
 
 
 def read_list(path: pathlib.Path, known: list[str], required: bool = False) -> list[str]:
-    """`parts.read_list`, whose SystemExit (stale or unsorted entry) becomes a
+    """`parts.read_list`, whose SystemExit (stale entry) becomes a
     ValueError: `main` catches it and falls back to the full suite."""
     if not path.exists() and not required:
         return []

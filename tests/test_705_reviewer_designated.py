@@ -18,7 +18,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, exploitation, notify, plan, progress, storage, work
+from ameesh import alert_briefs, db as db_mod, exploitation, notify, plan, progress, storage, work
 
 from .support import REPO, PgTestCase
 
@@ -224,7 +224,7 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "second")
         rows = work.list_items(self.db, limit=10)
         plan.annotate(self.db, rows)
-        self.assertEqual(rows[0]["waiting_for"]["label"], "verdict by second")
+        self.assertEqual(rows[0]["waiting_for"]["label"], "verdict by premier, second")
         # le journal garde la désignation
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("reviewer second" in n for n in notes), notes)
@@ -263,6 +263,34 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertEqual(sorted(briefs), ["orchestrateur"])
         self.assertIn("ameesh work reviewer %d <agent>" % lot["id"],
                       briefs["orchestrateur"])
+
+    def test_stale_lot_ne_reveille_pas_un_assigneur_historique(self):
+        """#1862 : un agent qui a réassigné un lot dans les 30 jours n'est pas
+        un orchestrateur pour `stale_lot` — la clause historique mettait
+        presque toute l'équipe dans les destinataires (32 noms mesurés le
+        15/10) et chaque lot stagnant réveillait une vingtaine d'agents sans
+        mandat. Les orchestrateurs DÉCLARÉS restent prévenus."""
+        self.register("orchestrateur", "claude", cwd=self.tmp)
+        self.register("preneur", "claude", cwd=self.tmp)
+        self.register("receveur", "claude", cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
+                        " WHERE name IN ('orchestrateur', 'preneur')")
+        lot = self._lot(app="ameesh")
+        autre = work.add(self.db, title="à confier", assignee="chef")
+        work.assign(self.db, int(autre["id"]), "receveur", actor="preneur")
+        # l'historique (L94) compte bien ce preneur comme assigneur…
+        self.assertIn("preneur", storage.of(self.db).operations.assigners(since_s=3600.0))
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._stale(lot["id"])
+
+        # …mais il ne reçoit pas l'alerte d'un lot stagnant qui n'est pas le sien
+        alert = self._stale_alert(lot["id"])
+        self.assertIn("orchestrateur", alert["orchestrators"])
+        self.assertNotIn("preneur", alert["orchestrators"])
+        briefs = self._briefs(alert)
+        self.assertIn("orchestrateur", briefs)
+        self.assertNotIn("preneur", briefs)
 
     def test_le_courrier_de_l_alerte_part_au_relecteur(self):
         self.register("relecteur", "codex", cwd=self.tmp)
@@ -325,13 +353,13 @@ class ReviewerDesignationTest(PgTestCase):
         rows = work.list_items(self.db, limit=10)
         plan.annotate(self.db, rows)
         self.assertEqual(rows[0]["waiting_for"]["what"], "verdict")
-        self.assertEqual(rows[0]["waiting_for"]["who"], "second")
+        self.assertEqual(rows[0]["waiting_for"]["who"], "premier, second")
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("reviewer second" in n for n in notes), notes)
 
         self._stale(lot["id"])
         alert = self._stale_alert(lot["id"])
-        self.assertEqual(alert["waiting"]["who"], "second")
+        self.assertEqual(alert["waiting"]["who"], "premier, second")
         briefs = self._briefs(alert)
         self.assertIn("ameesh work milestone %d verdict" % lot["id"], briefs["second"])
 
@@ -388,6 +416,51 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertTrue(any("reviewer relecteur cleared (they now hold the lot)" in n
                             for n in notes), notes)
 
+    def test_assign_ne_bloque_pas_une_ecriture_au_journal_du_lot(self):
+        """#813 point 2 : `_reassign` tient la ligne en NO KEY UPDATE — pendant
+        qu'il la tient, une insertion au journal du lot (contrôle de clé
+        étrangère, FOR KEY SHARE) écrit sans attendre. FOR UPDATE la bloquait
+        jusqu'au commit.
+
+        #1946 : le témoin ne parie plus sur une horloge. Il pose la demande
+        de verrou du contrôle de clé étrangère elle-même, en NOWAIT : elle
+        n'échoue que si un verrou incompatible la précède (FOR UPDATE), et
+        jamais parce que la machine est chargée. L'ancien `lock_timeout` de
+        200 ms lisait « bloqué » toute attente de verrou plus longue que lui,
+        fût-elle étrangère au verrou testé : faux rouge sous charge du
+        16/10 (refonte #1425), vert en isolation."""
+        from ameesh.storage.postgres.work import WorkItems
+        lot = self._lot()
+        other = self.connect()
+        self.addCleanup(other.close)
+        seen = []
+        real = WorkItems._event
+
+        def event(items, item_id, state, note, actor):
+            try:
+                with other.transaction() as tx:
+                    # Garde-fou seulement (un verrou de table régresserait en
+                    # attente) : 30 s, très au-delà de toute attente légitime.
+                    tx.execute("SET LOCAL lock_timeout = '30s'")
+                    # Le verrou exact de RI_FKey_check_ins, sans attente.
+                    tx.execute("SELECT 1 FROM work_items WHERE id = %s"
+                               " FOR KEY SHARE NOWAIT", (int(item_id),))
+                    tx.execute("INSERT INTO work_item_events"
+                               " (work_item_id, state, note, actor)"
+                               " VALUES (%s, 'build', 'concurrent', 'test')",
+                               (int(item_id),))
+                seen.append("inserted")
+            except db_mod.DbError as exc:
+                seen.append("blocked: %s" % exc)
+            return real(items, item_id, state, note, actor)
+
+        with mock.patch.object(WorkItems, "_event", new=event):
+            item = storage.of(self.db).work.assign(lot["id"], "autre",
+                                                   current="auteur", note="reassign",
+                                                   actor="chef")
+        self.assertIsNotNone(item)
+        self.assertEqual(seen, ["inserted"], seen)
+
     def test_delegate_au_relecteur_retire_la_designation(self):
         """#705 r2 (B1) : déléguer le lot à son relecteur retire la
         désignation dans la même écriture ; le journal le dit."""
@@ -435,6 +508,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot()
         proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
         self.db.__dict__.pop("_has_reviewer", None)
@@ -476,6 +550,11 @@ class ReviewerDesignationTest(PgTestCase):
         self.db.execute("ALTER TABLE work_items ADD COLUMN IF NOT EXISTS"
                         " reviewer text NOT NULL DEFAULT ''")
         self.db.__dict__.pop("_has_reviewer", None)
+        # DROP COLUMN also drops its UPDATE OF trigger. Restore the schema
+        # used by subsequent tests, including compatibility for old writers.
+        with open(os.path.join(REPO, "src/ameesh/migrations/0456_work_item_reviewers.sql"),
+                  encoding="utf-8") as fh:
+            self.db.execute(fh.read())
 
     def test_lectures_avant_la_migration_0421(self):
         """#705 (revue r1, P2-3) : la prod peut être en 0373 ; sans la colonne,
@@ -483,6 +562,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
         self.db.__dict__.pop("_has_reviewer", None)
@@ -508,6 +588,31 @@ class ReviewerDesignationTest(PgTestCase):
         alerte = next(a for a in alertes
                       if a["type"] == "stale_lot" and a["lot"] == lot["id"])
         self.assertIsNone(alerte["waiting"]["who"])
+
+    def test_la_reponse_negative_de_has_reviewer_ne_se_cache_pas(self):
+        """#813 (ex-#798) : la réponse négative n'est pas mise en cache — une
+        connexion vivante (démon runner, serve) qui a lu « pas de colonne »
+        désigne dès que 0421 est appliquée, sans redémarrage ni purge."""
+        lot = self._lot()
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
+        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
+        self.addCleanup(self._restore_reviewer_column)
+        daemon = self.connect()                 # née avant 0421, aucun cache
+        self.addCleanup(daemon.close)
+
+        with self.assertRaises(db_mod.DbError) as caught:   # la colonne manque
+            storage.of(daemon).work.designate_reviewer(lot["id"], "chef", actor="chef")
+        self.assertIn("0421", str(caught.exception))
+
+        # `ameesh migrate` applique 0421 : la MÊME connexion désigne, sans
+        # redémarrage et sans purge du cache.
+        self._restore_reviewer_column()
+        row = storage.of(daemon).work.designate_reviewer(lot["id"], "chef", actor="chef")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["reviewer"], "chef")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "chef")
 
 
 class ReviewerGrantTest(unittest.TestCase):

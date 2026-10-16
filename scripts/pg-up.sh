@@ -137,7 +137,11 @@ else
     garde_sources -a "$source_voulue"
   fi
   echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT, volume $VOLUME)"
-  docker run -d --name "$NAME" \
+  # #1411 : le banc est partagé par tous les agents de l'hôte ; l'étiquette
+  # d'un tour (posée par le shim docker depuis AMEESH_CONTAINER_LABELS) en
+  # ferait la ressource d'un tour et d'un lot, gardée jusqu'à la fin du lot
+  # (L73) puis récoltée à tort. `env -u` : le shim ne voit plus l'étiquette.
+  env -u AMEESH_CONTAINER_LABELS docker run -d --name "$NAME" \
     -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$PASSWORD" -e POSTGRES_DB="$DB" \
     -p "127.0.0.1:$PORT:5432" \
     -v "$VOLUME":/var/lib/postgresql/data \

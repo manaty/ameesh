@@ -189,7 +189,7 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_merging_the_blocker_wakes_the_assignee_once(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        done = work.merged(self.db, self.b, sha="a" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         [row] = self.inbox()
         self.assertEqual((row["kind"], self.mail_lot(row)), ("event", str(self.a)))
@@ -198,7 +198,7 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration de fusion ne réveille pas une seconde fois.
-        self.assertEqual(work.merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -243,6 +243,91 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual([r["id"] for r in dependencies.released_by(self.db, self.b)], [self.a])
         self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
 
+    def test_an_unassigned_blocked_dependent_returns_to_intake(self):
+        """#1668 : sans destinataire, le lot que plus rien ne retient repasse
+        `intake` — `actionable()` ne lit que `intake`/`build`, sinon il reste
+        invisible au self-service jusqu'à l'alerte stale (jusqu'à 14 h)."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "intake")
+        notes = [e["note"] for e in work.events(self.db, self.a)]
+        self.assertIn("Dependency released: back to intake (no assignee, #1668)", notes)
+        self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
+
+    def test_a_pinned_blocked_dependent_is_not_released_by_a_legacy_closure(self):
+        """#1922/B4 (relecture Claude) : la réouverture historique ne lève pas
+        une retenue du registre Process. Un lot pinné, non assigné, retenu
+        `blocked` par le registre (vérifié par C) et dont le dernier
+        prérequis tombe restait rouvert `intake` : la retenue tombait sans
+        commande `release` ni vérificateur C, et l'étape restait (ex. review
+        avec state intake). Filtre `workflow_ref` dans le SQL."""
+        self.assign(self.a, None)
+        self.db.execute(
+            "UPDATE work_items SET state = 'blocked', workflow_ref = %s,"
+            " workflow_stage = 'review', workflow_version = 1 WHERE id = %s",
+            ("acme/process-workflow@0f1e2d3c", self.a))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        row = self.db.query(
+            "SELECT state, workflow_stage FROM work_items WHERE id = %s", (self.a,))[0]
+        self.assertEqual(row["state"], "blocked")
+        self.assertEqual(row["workflow_stage"], "review")
+        notes = [e["note"] for e in work.events(self.db, self.a)]
+        self.assertNotIn("Dependency released: back to intake (no assignee, #1668)", notes)
+        self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
+
+    def test_a_pinned_assigned_dependent_is_not_woken_by_a_legacy_closure(self):
+        """#1922/N13 (relecture Claude) : la fermeture d'un prérequis ne lève
+        pas la retenue d'un lot pinné — seul un `release` du registre, vérifié
+        par C, le débloque. Le dépendant ASSIGNÉ recevait pourtant le courrier
+        « resume it when you are ready », qui promet une reprise que le
+        registre seul peut autoriser ; il n'est plus candidat à la
+        libération."""
+        self.db.execute(
+            "UPDATE work_items SET state = 'blocked', workflow_ref = %s,"
+            " workflow_stage = 'review', workflow_version = 1 WHERE id = %s",
+            ("acme/process-workflow@0f1e2d3c", self.a))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(dependencies.released_by(self.db, self.b), [])
+        self.assertEqual(self.inbox(), [])
+        row = self.db.query(
+            "SELECT state, workflow_stage FROM work_items WHERE id = %s", (self.a,))[0]
+        self.assertEqual((row["state"], row["workflow_stage"]), ("blocked", "review"))
+
+    def test_an_assigned_blocked_dependent_keeps_its_state(self):
+        """#1668 : un lot assigné garde son état — le courrier de réveil porte
+        le geste à son agent, qui juge la suite (pas de réouverture forcée)."""
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "blocked")
+        [row] = self.inbox()
+        self.assertIn("lot #%d was closed" % self.b, row["body"])
+
+    def test_a_dependent_that_another_blocker_holds_stays_blocked(self):
+        """#1668 : la réouverture ne part qu'à la DERNIÈRE attente tombée."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        dependencies.add(self.db, self.a, self.c, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "blocked")
+        work.close(self.db, self.c, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "intake")
+
+    def test_an_unassigned_dependent_outside_blocked_is_untouched(self):
+        """#1668 : seule la retenue `blocked` se rouvre — une porte humaine
+        (`waiting_human`) ou un lot en cours ne sont pas des attentes de lot."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id = %s",
+                        (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "waiting_human")
+
     def test_the_wake_is_written_with_the_closure_in_one_transaction(self):
         """Le courrier part dans la transaction de fermeture : quand il est
         écrit, la transition est déjà visible (et elle n'est pas committée
@@ -259,7 +344,7 @@ class ReleasedWakeTest(PgTestCase):
             return real(db, sender, recipient, body, **kw)
 
         with mock.patch("ameesh.mail.send", side_effect=spy):
-            work.merged(self.db, self.b, sha="b" * 40, actor="git:main")
+            work.close_merged(self.db, self.b, sha="b" * 40, actor="git:main")
         self.assertEqual(seen, [("merged", "dev-a", "event", True)])
 
     def test_a_failed_wake_rolls_back_the_closure_and_a_retry_wakes_once(self):
@@ -273,17 +358,17 @@ class ReleasedWakeTest(PgTestCase):
         dependencies.add(self.db, self.a, self.b, actor="test")
         with mock.patch("ameesh.mail.send", side_effect=RuntimeError("mailbox down")):
             with self.assertRaises(RuntimeError):
-                work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+                work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(work.get(self.db, self.b)["state"], "intake")
         self.assertEqual(self.inbox(), [])
-        done = work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         self.assertEqual(work.get(self.db, self.b)["state"], "merged")
         [row] = self.inbox()
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration, une fois la fusion commise, ne double pas.
-        self.assertEqual(work.merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -320,7 +405,7 @@ class ReleasedWakeTest(PgTestCase):
                 db = D.connect(self.cfg)
                 try:
                     start.wait(timeout=5)
-                    results.append(work.merged(db, blocker, sha="e" * 40,
+                    results.append(work.close_merged(db, blocker, sha="e" * 40,
                                                actor="git:main")["result"])
                 except Exception as exc:  # noqa: BLE001 - remonté par le test
                     errors.append(exc)
@@ -375,7 +460,7 @@ class ReleasedWakeTest(PgTestCase):
         def closer():
             db = D.connect(self.cfg)
             try:
-                results.append(work.merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
+                results.append(work.close_merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
@@ -414,7 +499,18 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_the_cli_declaration_wakes_too(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        proc = self.mesh("work", "merged", str(self.b), "--sha", "d" * 40, "--actor", "test")
+        import os
+        from .test_merged_work_item_tracking import _git
+        repo = os.path.join(self.tmp, "declared-blocker")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "remote", "add", "origin", "git@github.com:manaty/ameesh.git")
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("manaty/ameesh#1", self.b))
+        _git(repo, "commit", "--allow-empty", "-qm", "ameesh-work: %d" % self.b)
+        sha = _git(repo, "rev-parse", "HEAD")
+        proc = self.mesh("work", "merged", str(self.b), "--sha", sha,
+                         "--repo", repo, "--actor", "test")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         [row] = self.inbox()
         self.assertEqual(self.mail_lot(row), str(self.a))

@@ -94,6 +94,16 @@ reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
 designate one.
 
+Several reviewers can be designated for the same lot (#2076): repeat
+`ameesh work reviewer <id> <agent>` to add a name. `work show` and the JSON
+`reviewers` list retain them all. The wait and alerts name each reviewer
+whose verdict on the frozen head is still due; one GO does not complete the
+other reviews. Withdraw a designation explicitly with
+`ameesh work reviewer <id> <agent> --remove` (the same authority is required).
+Assigning or delegating the lot to a reviewer removes that person's
+designation and preserves the others. Migration 0456 keeps the legacy
+`reviewer` field for older runners during an upgrade.
+
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
 `AMEESH_STALE_AFTER`, default 6 h) is **stale**: it is reported with the
@@ -293,18 +303,26 @@ When agents are idle and the queue is empty (and no lot of the
 project is waiting), the `backlog_empty` alert invites the human lead to
 fill it.
 
-### Handoff on a budget pause (L233b)
+### Handoff on a budget pause (L233b, L165)
 
-On each pass, before any pick-up, `ameesh notify` hands the `intake` and
-`build` lots of a **non-critical Claude agent paused on budget** (status
-`blocked`, `budget : …`) to a **free DeepSeek agent of the same project**,
-within its budget and able to do the lot (team, capabilities): one lot per
-taker, longest idle first, at most `--handoff-max-per-hour` (4) per sliding
-hour for the whole mesh (`0` turns it off; `--handoff-idle`, 5 min, is the
-taker's minimum rest). Critical agents are those of L242b (declared,
-orchestrators, design, auditors). The assignment stays guarded and
-conditional on the assignee and the state; a note goes on the lot and an
-`event` mail to both agents. Never handed:
+On each pass, before any pick-up, `ameesh notify` handles the lots of a
+**non-critical Claude agent paused on budget** (status `blocked`,
+`budget : …`):
+
+* its **non-started lots (`intake`) are returned to the team queue**:
+  assignee cleared, a journal note says why; the automatic take (L165) then
+  gives them to any free capable agent of the team, DeepSeek or Codex, within
+  its budget and review class — no taker needs to be free at that moment;
+* its **started lots (`build`) are handed** to a **free DeepSeek or Codex
+  agent of the same project**, within its budget and able to do the lot
+  (team, capabilities): one lot per taker, longest idle first,
+  `--handoff-idle` (5 min) is the taker's minimum rest.
+
+At most `--handoff-max-per-hour` (4) returns and handoffs per sliding hour
+for the whole mesh (`0` turns it off). Critical agents are those of L242b
+(declared, orchestrators, design, auditors). A returned lot gets its journal
+note only (the automatic take warns the taker); a handed `build` lot also
+gets an `event` mail to both agents. Never handled:
 
 * a lot under review or frozen (`qa`, or a freeze milestone);
 * a sensitive lot: reserved capability (`decision`, `production`), or a
@@ -319,4 +337,4 @@ conditional on the assignee and the state; a note goes on the lot and an
   host.
 
 When the pause ends, nothing comes back on its own: the note says so, and
-the orchestrator decides. The codex review stays required.
+the orchestrator decides. A review by another family stays required.

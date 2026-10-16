@@ -17,9 +17,12 @@
         (default 15 min) takes the highest-priority unassigned lot of its
         team and the orchestrator is told; `--take-lot-idle 0` turns it
         off.
-        L233b: before any take, the intake and build lots of a non-critical
-        Claude agent paused on budget go to a free DeepSeek agent of the
-        same project (`ameesh.handoff.budget_handoff`);
+        L233b/L165: before any take, the non-started (`intake`) lots of a
+        non-critical Claude agent paused on budget are returned to the team
+        queue (no assignee, a journal note), where the automatic take gives
+        them to any free capable agent (DeepSeek or Codex); its started
+        (`build`) lots go to a free DeepSeek or Codex agent of the same
+        project (`ameesh.handoff.budget_handoff`);
         `--handoff-max-per-hour 0` turns it off.
         L126: on the host named by the `github` config key, each pass also
         maintains the GitHub issues of the lots
@@ -49,6 +52,12 @@ lasting alert is not resent after a restart; an alert resolved while
 stopped is sent on restart); rate limited per human (beyond that, a
 summary); a failing channel does not block the others and is retried on
 later passes, a bounded number of times.
+
+Channels: `desktop`, `ntfy`, `slack`. L66 — the `desktop` channel follows
+the OS through `ameesh.platform.notify`: `notify-send` on Linux, `osascript`
+on macOS, a Windows toast through `powershell.exe` under WSL2; native
+Windows comes with L67. `ameesh doctor --notify-test` says which backend
+this OS uses (and sends a test if a `desktop` route is configured).
 """
 from __future__ import annotations
 
@@ -59,7 +68,6 @@ import http.client
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -72,6 +80,7 @@ from . import config as config_mod
 from . import db as db_mod
 from . import alert_briefs, exploitation, fil, sous_utilisation, storage
 from .config import Config
+from .platform import notify as platform_notify
 
 NOTIFY_SCHEMA = "ameesh-notify/1"
 STATE_SCHEMA = "ameesh-notify-state/1"
@@ -84,6 +93,12 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 # L226b/#1883 : un compte de forfait facturé au-delà du plan —
+                 # l'owner le sait tout de suite, la règle est « jamais de dépassement »
+                 "account_overage",
+                 # #1883 : deux configurations de l'hôte déclarent le même nom de
+                 # compte vers deux dossiers — lecture ambiguë, compte refusé
+                 "account_identity",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
@@ -110,6 +125,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "critical_budget_pause",
                  # #1268 : un agent critique enchaîne les échecs de tour réels
                  "critical_turn_failures",
+                 # L242c : canon illisible, rôles critiques tenus
+                 "critical_roles_unreadable",
                  # #330: an owner key registered or replaced lately
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
@@ -145,6 +162,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
+    "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -157,6 +175,8 @@ TYPE_LABELS = {
     # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
     # humains si le type est dans `notify.types`
     "slo_breach": "internal deadline (SLO) overdue",
+    # #1107 (n2 P3 de #1035) : un lot que les passes d'alerte ne savent pas lire
+    "lot_unreadable": "work item unreadable by the alert passes",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
@@ -209,6 +229,7 @@ TYPE_LABELS = {
     "critical_budget_pause": "critical agent paused on budget",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
+    "critical_roles_unreadable": "canon unreadable: critical roles held",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
     "budget_drift": "counted spend strays from the provider balance",
@@ -225,8 +246,10 @@ URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_ex
 QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 #: types qu'un passage observe depuis la configuration de l'hôte seule, sans
 #: la base du mesh : la console du pool PgBouncer local (#532). Une panne de
-#: base ne les résout jamais, et ne les cache pas non plus.
-LOCAL_TYPES = ("pgbouncer_pool_waiting",)
+#: base ne les résout jamais, et ne les cache pas non plus. #1179 : la passe
+#: ordinaire ne lit pas cette console (`local_pool=False`) et ne résout donc
+#: jamais ces types ; `run_local_pass` en est seul propriétaire.
+LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -718,17 +741,9 @@ def _header(value: str) -> str:
 
 
 def notify_send_bin(env: dict) -> str | None:
-    """`AMEESH_NOTIFY_SEND_BIN` (explicite : sans repli), puis
-    `AMEESH_BIN_DIR/notify-send`, puis le PATH — comme `gh` et les harnais."""
-    explicit = env.get("AMEESH_NOTIFY_SEND_BIN")
-    if explicit:
-        return explicit if os.access(explicit, os.X_OK) else None
-    bin_dir = env.get("AMEESH_BIN_DIR") or env.get("AGENT_MESH_BIN_DIR")
-    if bin_dir:
-        candidate = os.path.join(bin_dir, "notify-send")
-        if os.access(candidate, os.X_OK):
-            return candidate
-    return shutil.which("notify-send", path=env.get("PATH") or os.defpath)
+    """L66 : le binaire `notify-send` de cet environnement (compatibilite) ;
+    la couche plateforme choisit le backend selon l'OS."""
+    return platform_notify.notify_send_bin(env)
 
 
 class Sender:
@@ -743,25 +758,13 @@ class Sender:
         getattr(self, "_" + channel.kind)(channel, message, timeout)
 
     def _desktop(self, channel: Channel, message: Message, timeout: float) -> None:
-        binary = notify_send_bin(self.env)
-        if not binary:
-            raise ChannelError(
-                "notify-send not found on this host (libnotify package): the `desktop` "
-                "channel cannot show anything; install it or remove `desktop` from the "
-                "routes", permanent=True)
+        # L66 : le backend dépend de l'OS (notify-send, osascript, toast WSL2)
         urgency = "critical" if message.urgent else ("low" if message.low else "normal")
         try:
-            proc = subprocess.run(
-                [binary, "--app-name=ameesh", "--urgency=%s" % urgency,
-                 message.title, message.body],
-                capture_output=True, text=True, timeout=timeout, env=self.env)
-        except subprocess.TimeoutExpired:
-            raise ChannelError("notify-send did not answer within %ds" % timeout) from None
-        except OSError as exc:
-            raise ChannelError("notify-send: %s" % exc.strerror) from None
-        if proc.returncode != 0:
-            raise ChannelError("notify-send failed (code %d): %s" % (
-                proc.returncode, _clean(proc.stderr, 160) or "no message"))
+            platform_notify.send(message.title, message.body, urgency=urgency,
+                                 env=self.env, timeout=timeout)
+        except platform_notify.NotifyError as exc:
+            raise ChannelError(str(exc), permanent=exc.permanent) from None
 
     def _ntfy(self, channel: Channel, message: Message, timeout: float) -> None:
         url = "%s/%s" % (str(channel.options["url"]).rstrip("/"), channel.options["topic"])
@@ -1046,7 +1049,11 @@ class Notifier:
                  ) -> list:
         now = float(self.clock())
         if current is None:
-            current = exploitation.alerts(self.cfg, db, now=now, **(thresholds or {}))
+            # #1179 : la console du pool local n'est pas lue par la passe
+            # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
+            # seul juge de ses alertes. Une console illisible n'y échoue plus.
+            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
+                                          **(thresholds or {}))
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
@@ -1073,13 +1080,20 @@ class Notifier:
         for key in list(active):
             if key in wanted:
                 continue
-            entry = active.pop(key)
+            entry = active[key]
+            if entry["alert"].get("type") in LOCAL_TYPES:
+                # #1179 : ces alertes appartiennent à `run_local_pass`, seul à
+                # pouvoir les résoudre ; ne pas les voir ici n'est pas une
+                # preuve de résolution.
+                continue
+            del active[key]
             if entry["alert"].get("type") not in self.ncfg.types \
                     and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
             self._resolved(key, entry, now)
+            self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
             if entry is None:
@@ -1090,6 +1104,7 @@ class Notifier:
                 if alert.get("type") in exploitation.ESCALATING:
                     entry["escalated"] = bool(alert.get("critical"))
                 self._raise(entry, router, now)
+                self._event(db, "alert.raised", key, alert)
                 if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
                     self._brief_orchestrators(db, alert, router)
             elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
@@ -1297,12 +1312,29 @@ class Notifier:
             return
         for move in moved:
             item = move["item"]
+            queued = bool(move.get("queued"))
             entry = {"alert": {"type": "budget_handoff", "agent": move["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
                      "human": None, "source": "pause budget de %s" % move["previous"]}
-            self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
+            self._record("budget_handoff", entry,
+                         "a_blanc" if self.dry_run else ("rendu" if queued else "prise"), {})
 
     # -- levée ----------------------------------------------------------------
+    def _event(self, db, kind: str, key: str, alert: dict) -> None:
+        """L85: the alert in the event log (`GET /api/v1/events`); a base
+        error is said, never fatal to the pass."""
+        if self.dry_run or db is None:
+            return
+        from . import events
+        data = {name: alert.get(name) for name in ("agent", "lot", "host")
+                if alert.get(name) is not None}
+        try:
+            events.record(db, kind, ("alert:%s" % alert.get("type"))[:300],
+                          project=alert.get("project"), alert=alert.get("type"), key=key,
+                          **data)
+        except Exception as exc:  # noqa: BLE001 — the notification goes on
+            self.log("event %s not recorded: %s" % (kind, type(exc).__name__))
+
     def _raise(self, entry: dict, router: Router, now: float) -> None:
         alert = entry["alert"]
         first = entry["status"] == "nouvelle"
@@ -1435,6 +1467,14 @@ class Notifier:
             if not briefs:
                 continue        # personne à prévenir : on réessaie au passage suivant
             if entry is not None:
+                # #1787 N1 : la relance repart aux destinataires de la levée,
+                # pas à ceux que l'état vivant désignerait maintenant (le brief
+                # d'un lot sans assigné est atomique, #1026) ; si aucun n'est
+                # plus joignable, rien ne part et `reminded` reste à poser.
+                keep = {str(n) for n in entry.get("to") or ()}
+                briefs = {n: t for n, t in briefs.items() if n in keep}
+                if not briefs:
+                    continue
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
@@ -1654,11 +1694,17 @@ class Notifier:
         self.emit(record)
 
 
-def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None) -> list:
-    """`--test human:<id>` : un message par canal ; [(canal, None | erreur)]."""
+def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None,
+              kinds: tuple | None = None) -> list:
+    """`--test human:<id>` : un message par canal ; [(canal, None | erreur)].
+
+    `kinds` restreint aux types de canal demandes (L66 : `doctor
+    --notify-test` n'essaie que `desktop`, jamais ntfy ni Slack)."""
     sender = sender or Sender(timeout=ncfg.timeout)
     out = []
     for channel in ncfg.channels_for(human):
+        if kinds and channel.kind not in kinds:
+            continue
         try:
             sender.send(channel, render_test(human, channel, host))
             out.append((channel.name, None))
@@ -1670,6 +1716,55 @@ def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None) -> list:
     return out
 
 
+def desktop_human(ncfg: NotifyConfig) -> str | None:
+    """L66 : le premier humain dont une route porte un canal `desktop`."""
+    def porte(human: str) -> bool:
+        return any(c.kind == "desktop" for c in ncfg.channels_for(human))
+
+    if ncfg.default_human and porte(ncfg.default_human):
+        return ncfg.default_human
+    for human in sorted(ncfg.routes):
+        if porte(human):
+            return human
+    return None
+
+
+def desktop_probe(cfg, env: dict | None = None) -> tuple[bool, str]:
+    """L66 : `doctor --notify-test` — le canal `desktop` de cet OS.
+
+    Rend `(ok, ligne)`. N'envoie rien si aucune route ne porte de canal
+    `desktop` : la ligne dit alors ce que cet OS utiliserait, et ce qui
+    manque le cas échéant — sans KO, car personne n'a demandé d'affichage
+    sur cet hôte (un binaire absent n'y est pas un défaut). Le KO est
+    réservé à une route `desktop` qui existe et dont le backend manque ou
+    échoue."""
+    env = dict(os.environ if env is None else env)
+    backend, binary, problem = platform_notify.describe(env=env)
+    ou = "WSL2" if platform_notify.is_wsl(env) else platform_notify.SYSTEM
+    try:
+        ncfg = parse_config(getattr(cfg, "notify", None))
+    except NotifyConfigError as exc:
+        return False, "config refused: %s" % exc
+    human = desktop_human(ncfg)
+    if human is None:
+        if problem:
+            return True, "%s (%s) — unavailable: %s; no `desktop` route configured, nothing sent" % (
+                backend or "desktop", ou, problem)
+        return True, "%s (%s) — available; no `desktop` route configured, nothing sent" % (
+            backend, ou)
+    if problem:
+        return False, "KO — %s" % problem
+    results = send_test(ncfg, human, cfg.host,
+                        sender=Sender(env=env, timeout=ncfg.timeout), kinds=("desktop",))
+    errors = [detail for _name, detail in results if detail]
+    if errors:
+        return False, "%s (%s) — test to %s failed: %s" % (backend, ou, human, errors[0])
+    if not results:
+        return True, "%s (%s) — available; no `desktop` channel on %s's route" % (
+            backend, ou, human)
+    return True, "%s (%s) — test displayed to %s" % (backend, ou, human)
+
+
 # --------------------------------------------------------------------------
 # entrée
 # --------------------------------------------------------------------------
@@ -1679,7 +1774,7 @@ _DELIVERY_LABELS = {"a_blanc": "dry run", "envoyee": "sent", "echec": "failed",
                     "sans_destinataire": "no recipient", "sans_canal": "no channel",
                     "resumee": "summarized", "abandonnee": "abandoned",
                     "sans_envoi": "not sent", "prise": "taken", "nouvelle": "new",
-                    "envoi": "sending"}
+                    "rendu": "returned to the queue", "envoi": "sending"}
 
 
 def _format(record: dict) -> str:
@@ -1770,14 +1865,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--handoff-max-per-hour", type=int,
                         default=int(exploitation._env_float(
                             "AMEESH_HANDOFF_MAX_PER_HOUR", handoff.DEFAULT_MAX_PER_HOUR)),
-                        help="maximum lots handed per rolling hour from non-critical Claude "
-                             "agents paused on budget to free DeepSeek agents of the same "
-                             "project (default 4; 0 turns this off)")
+                        help="maximum lots returned to the queue or handed per rolling hour "
+                             "from non-critical Claude agents paused on budget, the handed "
+                             "ones to free DeepSeek or Codex agents of the same project "
+                             "(default 4; 0 turns this off)")
     parser.add_argument("--handoff-idle", type=float,
                         default=exploitation._env_float("AMEESH_HANDOFF_IDLE",
                                                         handoff.DEFAULT_IDLE_S),
-                        help="a DeepSeek agent takes a handed lot once idle for S seconds "
-                             "(default 300)")
+                        help="a DeepSeek or Codex agent takes a handed lot once idle for S "
+                             "seconds (default 300)")
     return parser
 
 
