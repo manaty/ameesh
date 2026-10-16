@@ -1067,6 +1067,20 @@ class ContentDeliveryTest(_Base):
         _git(self.repo, "update-ref", "refs/remotes/origin/develop",
              _git(self.repo, "rev-parse", "develop"))
 
+    def gel_vide(self, branch, message="composition"):
+        """#1776 : une branche dont le gel est un commit vide
+        (`--allow-empty`) — son diff propre ne porte rien, le contenu du lot
+        est dans ses ancêtres. Le gel est fusionné en `--no-ff` sur la cible
+        (develop), publiée."""
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit(branch.replace("/", "-"))
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "gel vide")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", message, branch)
+        self.publish_develop()
+        return sha
+
     def lot(self, sha):
         """Un lot gelé en qa, sans branche ni cible déclarée (#905)."""
         item = work.add(self.db, title="lot sans branche", assignee="claude1", actor="orch")
@@ -1440,6 +1454,50 @@ class ContentDeliveryTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("closed by content", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    # --- #1776 : le gel vide et le paquet imbriqué, jugés par le contenu ---
+
+    def test_1776_gel_vide_reverte_ne_ferme_pas(self):
+        """Un gel vide (`commit --allow-empty`) dont la fusion est annulée par
+        un revert : la tête reste ancêtre de la cible, mais le contenu n'y est
+        plus — le lot reste ouvert (probe et sync-merges)."""
+        sha = self.gel_vide("agent/1776")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        self.publish_develop()
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertFalse(found["merged"])
+        self.assertEqual(found["how"], "reverted")
+        self.assertIn("revert", found["detail"])
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1776_gel_vide_conserve_reste_fusionne(self):
+        """Le contenu du lot est toujours là, l'arbre a évolué depuis : pas de
+        retrait — l'ascendance reste la preuve."""
+        sha = self.gel_vide("agent/1776")
+        with open(os.path.join(self.repo, "agent-1776"), "a") as fh:
+            fh.write("suite\n")
+        _git(self.repo, "commit", "-q", "-am", "suite sur le meme fichier")
+        self.publish_develop()
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertTrue(found["merged"])
+        self.assertEqual(found["how"], "ancestor")
+
+    def test_1776_gel_vide_dans_paquet_reverte(self):
+        """Le lot entre dans une branche de paquet, elle-même fusionnée, puis
+        la fusion du paquet est annulée : le gel vide reste ancêtre, le
+        contenu a disparu — la livraison n'est pas constatée."""
+        sha = self.gel_vide("agent/1776-nested")
+        _git(self.repo, "branch", "-m", "develop", "packet1776")
+        _git(self.repo, "checkout", "-q", "-b", "develop", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "packet1776")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
+        _git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        self.publish_develop()
+        self.assertFalse(plan_git.probe(self.repo, sha, "origin/develop")["merged"])
 
 
 class CurrentLotTest(_Base):
