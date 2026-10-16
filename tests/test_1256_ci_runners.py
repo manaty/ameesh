@@ -1536,7 +1536,15 @@ class WorkflowRoutingTest(unittest.TestCase):
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]
-        self.assertEqual(jobs[self.REQUIRED].get("name"), self.REQUIRED)
+        # #1635 : hors lancement à la main, le check requis garde le nom
+        # « tests » ; une exécution `workflow_dispatch` publie
+        # « tests (dispatch) », jamais le contexte requis d'une PR (nom
+        # dynamique admis par le pilote).
+        name = str(jobs[self.REQUIRED].get("name"))
+        if name.startswith("${{"):
+            self.assertIn("|| 'tests'", name)
+        else:
+            self.assertEqual(name, self.REQUIRED)
         closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
         self.assertEqual(closure, {"plan", "version", "psycopg", "psql",
                                    "platform-macos", "doc-readers", "fs-class", "tests"})
