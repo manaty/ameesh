@@ -1016,14 +1016,6 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
                 "it has no team: it waits for the orchestrator (%s)" % later))
 
 
-def takes_rule(check: dict) -> bool:
-    """#540 : l'assigné normalisé par `check_assignee` est soumis à la règle
-    « au plus un lot non démarré » (ni humain ni agent externe). Porté de #555
-    tant qu'elle n'est pas fusionnée ; `backlog.auto_take` la passe en `take=`
-    à `storage.…work.assign`."""
-    return not (check["externe"] or check["assignee"].startswith(HUMAN_PREFIX))
-
-
 # --------------------------------------------------------------------------
 # délégation à échéance (L40, point 5 de la décision 0030)
 # --------------------------------------------------------------------------
