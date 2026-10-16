@@ -74,6 +74,18 @@ par un jeton d'exécution). Un check dont le job tourne encore, une autre
 tentative ou une autre tête ne sont pas touchés. `publish` qui atteint son
 arrêt de sûreté sans ligne `fin` laisse le check ouvert (le publisher vit
 encore) : `close` ou `sweep` le conclura.
+
+#1393 — `publish` pose à la création du check l'identité exacte de son job
+(`external_id` = `ameesh-ci-flow/<exécution>/<tentative>`, lu dans les
+variables GitHub) : le sweep la préfère au `details_url` et au `check_suite`,
+dont le repli peut nommer *une autre* exécution de `tests.yml` sur la même
+tête et faire conclure un check encore vivant. Une tentative nommée est relue
+sur elle-même (`…/attempts/<n>`) : le check d'une tentative passée se conclut
+sur l'état de *cette* tentative, pas sur celui de la tentative courante d'un
+rerun. Le balayage est borné (`--max-duration`, défaut 100 s) et l'étape CI
+l'entoure de `timeout 120` : sous le plafond de 5 min du job, un balayage lent
+ne peut pas faire rougir le check requis « tests » (il ne change jamais son
+verdict, et ne conclut jamais `success`).
 """
 from __future__ import annotations
 
@@ -138,6 +150,16 @@ def _nombre(valeur) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return nombre if math.isfinite(nombre) else None
+
+
+def _entier(valeur) -> int | None:
+    """Un entier d'option ou d'environnement, ou None s'il est absent,
+    illisible ou négatif (#1393 : numéro d'exécution, tentative)."""
+    try:
+        nombre = int(str(valeur).strip())
+    except (TypeError, ValueError):
+        return None
+    return nombre if nombre > 0 else None
 
 
 def _minutes(valeur) -> str:
@@ -310,6 +332,15 @@ FLUX_PREFIX = "tests (flux) "
 #: conclusion d'un check orphelin : le publisher est mort sans lire de ligne
 #: `fin`, donc jamais `success` (#856)
 ORPHAN_CONCLUSION = "cancelled"
+#: #1393 : préfixe de l'`external_id` posé par `publish` à la création du
+#: check — `ameesh-ci-flow/<exécution>/<tentative>`. Le sweep y lit l'identité
+#: exacte du job publiant, sans se fier au repli `check_suite` (qui peut
+#: nommer une autre exécution de `tests.yml` sur la même tête).
+EXTERNAL_PREFIX = "ameesh-ci-flow/"
+#: #1393 : durée maximale du balayage, en secondes. L'étape CI l'entoure de
+#: `timeout 120` : sous le plafond de 5 min du job, un balayage lent (appels
+#: HTTP de 20 s) ne peut pas faire expirer le job et rougir le check requis.
+SWEEP_MAX_DURATION = 100.0
 
 
 def _failure_line(ev: dict, lignes: int | None) -> str:
@@ -397,6 +428,18 @@ class GitHub:
         run = env.get("GITHUB_RUN_ID", "")
         self.lien = ("%s/%s/actions/runs/%s" % (env.get("GITHUB_SERVER_URL", "https://github.com"),
                                                 self.depot, run) if run else None)
+        #: #1393 : l'exécution et la tentative du job qui publie — posées dans
+        #: l'`external_id` du check pour que le sweep les retrouve exactement.
+        self.execution = _entier(env.get("GITHUB_RUN_ID"))
+        self.tentative = _entier(env.get("GITHUB_RUN_ATTEMPT"))
+
+    @property
+    def external_id(self) -> str:
+        """L'identité du job publiant (`ameesh-ci-flow/<exécution>/<tentative>`),
+        ou "" quand le numéro d'exécution manque (#1393)."""
+        if self.execution is None:
+            return ""
+        return "%s%d/%d" % (EXTERNAL_PREFIX, self.execution, self.tentative or 1)
 
     def ready(self) -> bool:
         return bool(self.jeton and self.depot and self.tete)
@@ -468,10 +511,24 @@ class GitHub:
         """Les jobs d'une exécution : leur état terminal fait foi (#856)."""
         return self._listed("actions/runs/%d/jobs" % execution, "jobs")
 
+    def run_attempt(self, execution: int, tentative: int) -> dict:
+        """L'état d'une tentative d'exécution (#1393) : c'est *cette* tentative
+        qui fait foi quand le check la nomme, pas la tentative courante du run."""
+        return self.read("actions/runs/%d/attempts/%d" % (execution, tentative))
+
+    def jobs_attempt(self, execution: int, tentative: int) -> list[dict]:
+        """Les jobs d'une tentative d'exécution (#1393) : le job homonyme d'une
+        tentative passée ne dépend pas de l'état de la tentative courante."""
+        return self._listed("actions/runs/%d/attempts/%d/jobs" % (execution, tentative),
+                            "jobs")
+
     def create(self, nom: str, output: dict) -> int:
         corps = {"name": nom, "head_sha": self.tete, "status": "in_progress", "output": output}
         if self.lien:
             corps["details_url"] = self.lien
+        if self.external_id:
+            # #1393 : l'identité exacte du job publiant, relue par le sweep.
+            corps["external_id"] = self.external_id
         return int(self.call("POST", "check-runs", corps)["id"])
 
     def update(self, ident: int, output: dict, conclusion: str | None = None) -> None:
@@ -634,21 +691,47 @@ def _suite_of(check: dict) -> int | None:
         return None
 
 
-def _executions_of(check: dict, gh: GitHub, suites: dict[int, list[int]]) -> list[int]:
-    """Les exécutions qui ont pu publier le check (#856).
+def _external_of(check: dict) -> tuple[int, int | None] | None:
+    """L'exécution et la tentative lues dans l'`external_id` du check (#1393),
+    ou None quand il est absent ou d'une autre forme : le sweep retombe alors
+    sur le `details_url` puis le `check_suite`, sans jamais exiger cette
+    identité des checks publiés avant #1393."""
+    texte = str(check.get("external_id") or "")
+    if not texte.startswith(EXTERNAL_PREFIX):
+        return None
+    morceaux = texte[len(EXTERNAL_PREFIX):].split("/")
+    if len(morceaux) != 2:
+        return None
+    execution, tentative = _entier(morceaux[0]), _entier(morceaux[1])
+    if execution is None or tentative is None:
+        return None
+    return (execution, tentative)
 
-    Celle du `details_url` quand il porte `/actions/runs/<id>` ; sinon celles
-    de son `check_suite`. Une liste vide veut dire « non identifiable », jamais
-    « orphelin » : sans exécution prouvée terminale, on ne conclut pas."""
+
+def _executions_of(check: dict, gh: GitHub,
+                   suites: dict[int, list[int]]) -> list[tuple[int, int | None]]:
+    """Les exécutions (et tentatives) qui ont pu publier le check (#856).
+
+    #1393 : d'abord l'`external_id` du check — l'exécution et la tentative
+    exactes, sans ambiguïté ; c'est lui qui empêche le repli `check_suite` de
+    nommer une autre exécution de `tests.yml` sur la même tête et de conclure
+    un check vivant. Sinon celle du `details_url` quand il porte
+    `/actions/runs/<id>` ; sinon celles de son `check_suite`, dont la
+    terminalité reste exigée de toutes les candidates. Une liste vide veut dire
+    « non identifiable », jamais « orphelin » : sans exécution prouvée
+    terminale, on ne conclut pas."""
+    identite = _external_of(check)
+    if identite is not None:
+        return [identite]
     execution = _execution_of(check)
     if execution is not None:
-        return [execution]
+        return [(execution, None)]
     suite = _suite_of(check)
     if suite is None:
         return []
     if suite not in suites:
         suites[suite] = [int(run["id"]) for run in gh.runs_of_suite(suite)]
-    return suites[suite]
+    return [(run_id, None) for run_id in suites[suite]]
 
 
 def orphaned(check: dict, jobs: list[dict], execution_status: str) -> bool:
@@ -672,65 +755,86 @@ def orphaned(check: dict, jobs: list[dict], execution_status: str) -> bool:
     return execution_status == "completed"
 
 
-def _proved_terminal(check: dict, executions: list[int], gh: GitHub,
-                     etats: dict[int, tuple[dict, list[dict]] | None]) -> bool:
+def _proved_terminal(check: dict, executions: list[tuple[int, int | None]], gh: GitHub,
+                     etats: dict[tuple[int, int | None],
+                                 tuple[dict, list[dict]] | None]) -> bool:
     """Le publisher est-il mort dans *toutes* les exécutions candidates ? (#856)
 
     Le job homonyme doit être terminal dans chaque candidate, même si d'autres
     jobs de l'exécution tournent encore. Si ce job est absent d'une liste lue
     complètement, seule une exécution terminale fait foi. Une réponse illisible
-    ou une liste incomplète ne permet jamais de conclure."""
-    for execution in executions:
-        if execution not in etats:
+    ou une liste incomplète ne permet jamais de conclure.
+
+    #1393 : une candidate qui nomme une tentative est relue sur *elle*
+    (`…/attempts/<n>`) — l'état de la tentative courante d'un rerun ne décide
+    pas du check d'une tentative passée, et réciproquement."""
+    for identite in executions:
+        if identite not in etats:
+            execution, tentative = identite
             try:
-                run, jobs = gh.run(execution), gh.jobs(execution)
+                if tentative is None:
+                    run, jobs = gh.run(execution), gh.jobs(execution)
+                else:
+                    run, jobs = (gh.run_attempt(execution, tentative),
+                                 gh.jobs_attempt(execution, tentative))
                 if (not isinstance(run, dict) or not isinstance(run.get("status"), str)
                         or not run["status"] or not isinstance(jobs, list)
                         or any(not isinstance(job, dict) for job in jobs)):
                     raise ValueError("réponse d'exécution ou de jobs illisible")
-                etats[execution] = (run, jobs)
+                etats[identite] = (run, jobs)
             except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
-                print("ci-flow : exécution %d illisible (%s)" % (execution, exc),
+                print("ci-flow : exécution %d%s illisible (%s)"
+                      % (execution, " tentative %d" % tentative if tentative else "", exc),
                       file=sys.stderr)
-                etats[execution] = None
-        etat = etats[execution]
+                etats[identite] = None
+        etat = etats[identite]
         if etat is None or not orphaned(check, etat[1], etat[0].get("status", "")):
             return False
     return True
 
 
-def sweep(args, gh: GitHub | None = None) -> int:
+def sweep(args, gh: GitHub | None = None, horloge=time.monotonic) -> int:
     """Conclut les checks « tests (flux) » laissés en cours par un job terminal.
 
     Réconciliation indépendante du publisher (#856) : chaque check encore en
     cours est jugé sur l'état terminal réel du job et de l'exécution qui l'ont
-    publié (retrouvée par son `details_url` ou, à défaut, par son
-    `check_suite`). Sans ligne `fin`, la conclusion est `cancelled`, jamais
-    `success`. Ne ferme aucun check dont l'exécution est encore active, ni ceux
-    d'une autre tête. Ne fait jamais échouer le job : une erreur d'API est
-    tracée et la fonction rend 0."""
+    publié (retrouvée par son `external_id` #1393, sinon par son `details_url`
+    ou, à défaut, par son `check_suite`). Sans ligne `fin`, la conclusion est
+    `cancelled`, jamais `success`. Ne ferme aucun check dont l'exécution est
+    encore active, ni ceux d'une autre tête. Ne fait jamais échouer le job : une
+    erreur d'API est tracée et la fonction rend 0.
+
+    #1393 : le balayage est borné (`--max-duration`) — un check non atteint
+    reste en cours et sera vu au prochain passage, jamais conclu à l'aveugle."""
     try:
-        return _sweep(args, gh)
+        return _sweep(args, gh, horloge)
     except Exception as exc:  # la réconciliation n'échoue jamais le job
         print("ci-flow : réconciliation interrompue (%s)" % exc, file=sys.stderr)
         return 0
 
 
-def _sweep(args, gh: GitHub | None = None) -> int:
+def _sweep(args, gh: GitHub | None = None, horloge=time.monotonic) -> int:
     gh = gh or GitHub()
     if not gh.ready():
         print("ci-flow : pas de jeton, de dépôt ou de tête : rien à réconcilier",
               file=sys.stderr)
         return 0
+    budget = _nombre(getattr(args, "max_duration", None))
+    budget = SWEEP_MAX_DURATION if budget is None else budget
+    limite = horloge() + budget if budget > 0 else horloge()
     tete = getattr(args, "sha", "") or gh.tete
     try:
         checks = gh.check_runs(tete)
     except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         print("ci-flow : checks de %s illisibles (%s)" % (tete[:8], exc), file=sys.stderr)
         return 0
-    etats: dict[int, tuple[dict, list[dict]] | None] = {}
+    etats: dict[tuple[int, int | None], tuple[dict, list[dict]] | None] = {}
     suites: dict[int, list[int]] = {}
     for check in checks:
+        if horloge() >= limite:
+            print("ci-flow : balayage arrêté au budget de %.0f s ; les checks restants "
+                  "seront vus au prochain passage" % budget, file=sys.stderr)
+            break
         nom = check.get("name") or ""
         if check.get("status") != "in_progress" or not nom.startswith(FLUX_PREFIX):
             continue
@@ -792,6 +896,9 @@ def main(argv: list[str] | None = None) -> int:
                          "en cours par un job terminal (#856)")
     p.add_argument("--sha", default="",
                    help="tête à réconcilier (défaut : AMEESH_CI_TETE ou GITHUB_SHA)")
+    p.add_argument("--max-duration", type=_nombre, default=SWEEP_MAX_DURATION,
+                   help="durée maximale du balayage en secondes (défaut %g) ; "
+                        "l'étape CI l'entoure de `timeout 120`" % SWEEP_MAX_DURATION)
     args = ap.parse_args(argv)
     if args.commande == "publish":
         return publish(args)
