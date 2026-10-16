@@ -389,14 +389,17 @@ def stale_reading(gauges, now: float) -> bool:
     * **absent** (aucune jauge) : rien ne dit l'état du compte ;
     * **partiel** : une fenêtre datée s'est remise à zéro alors qu'une autre
       court encore — la fenêtre ouverte n'est plus qu'une borne inférieure
-      (le compte a pu servir depuis, ici ou ailleurs) ;
+      (le compte a pu servir depuis, ici ou ailleurs) ; une fenêtre **non
+      datée** ne prouve pas sa remise à zéro, elle compte donc comme encore
+      ouverte (#1566 N2) ;
     * **non daté** : l'âge du relevé (`read_at`) dépasse sa plus courte
       fenêtre.
 
-    Un relevé dont **toutes** les fenêtres datées sont remises à zéro n'est
-    pas périmé : la suivante est vierge, 0 % (L71). Un relevé sans âge connu
-    n'est pas présumé périmé : une source qui ne date pas garde son sens, et
-    le choix la traite comme avant.
+    Un relevé dont **toutes** les fenêtres sont remises à zéro n'est pas
+    périmé : la suivante est vierge, 0 % (L71) — ce qui exige que toutes les
+    fenêtres soient datées, une fenêtre non datée interdisant de conclure.
+    Un relevé sans âge connu n'est pas présumé périmé : une source qui ne
+    date pas garde son sens, et le choix la traite comme avant.
     """
     gauges = list(gauges)
     if not gauges:
@@ -404,7 +407,12 @@ def stale_reading(gauges, now: float) -> bool:
     dated = [g for g in gauges if g.resets_at]
     if dated:
         passed = [g.reset_passed(now) for g in dated]
-        return any(passed) and not all(passed)
+        if not any(passed):
+            return False
+        # #1566 N2 : `all(passed)` ne portait que sur les fenêtres datées ; une
+        # fenêtre non datée encore là rendait le mélange « datée échue + non
+        # datée » faussement courant. Elle ne prouve pas sa remise à zéro.
+        return not all(passed) or any(not g.resets_at for g in gauges)
     stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
     if not stamps:
         return False
