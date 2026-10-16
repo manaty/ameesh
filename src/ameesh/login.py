@@ -255,13 +255,16 @@ class Request:
     category: str = ""
     pid: int | None = None
     login_id: str = ""
+    scope: str = ""
+    #: échéance SIGNÉE, portée par le service : lie le reçu à cette demande
+    service_exp: int = 0
     link: str = field(default="", repr=False)
     #: une décision est en cours : la fin du processus ne doit plus rien clore
     closing: bool = field(default=False, repr=False, compare=False)
 
     def describe(self) -> dict:
         return {"id": self.id, "host": self.host, "harness": self.harness,
-                "account": self.account, "version": self.version,
+                "account": self.account, "version": self.version, "scope": self.scope,
                 "state": self.state, "category": self.category,
                 "expires": self.expires, "pid": self.pid, "login_id": self.login_id}
 
@@ -339,7 +342,7 @@ class Registry:
 
     def touch(self, request: Request, **fields) -> Request:
         """Met à jour des champs autorisés (`state`, `login_id`, `link`, `pid`)."""
-        allowed = {"state", "category", "pid", "login_id", "link"}
+        allowed = {"state", "category", "pid", "login_id", "link", "scope", "service_exp"}
         unknown = sorted(set(fields) - allowed)
         if unknown:
             raise LoginError("format", "unknown field(s): %s" % ", ".join(unknown))
@@ -459,6 +462,18 @@ class Supervisor:
             self._terminate(request)
         return due
 
+    def expire(self, request_id: str) -> Request:
+        """Clôt une demande sur l'échéance du service (sans attendre l'horloge
+        locale) : tue le groupe, catégorie `expired`."""
+        request = self.registry.get(request_id)
+        if request is None:
+            raise LoginError("unknown", "unknown login request")
+        if request.state in TERMINAL:
+            return request
+        request.closing = True
+        self._terminate(request)
+        return self.registry.finish(request, EXPIRED, "expired")
+
     def forget(self, request_id: str) -> None:
         """Oublie les références à une demande close (processus, fil)."""
         with self._lock:
@@ -542,9 +557,12 @@ class Supervisor:
         if not re.fullmatch(r"lgn_[0-9a-z]{26}", login_id):
             self._fail(request, adapter, "failed", "challenge service answered an unreadable id")
             return
-        self.registry.touch(request, state=VIEWING, login_id=login_id)
+        self.registry.touch(request, state=VIEWING, login_id=login_id, scope=scope)
         if link:
             self.registry.touch(request, link=link)
+        exp = answer.get("exp")
+        if isinstance(exp, int) and not isinstance(exp, bool) and exp > 0:
+            self.registry.touch(request, service_exp=exp)
 
     def _fail(self, request: Request, adapter: Adapter, category: str,
               message: str) -> None:
@@ -583,3 +601,79 @@ class Supervisor:
             pass
         with self._lock:
             self._procs.pop(request.id, None)
+
+
+# --------------------------------------------------------------------------
+# acceptation du reçu (côté ameesh) et branchement du service de défi
+# --------------------------------------------------------------------------
+
+def expected_login(request: Request) -> dict:
+    """Le lien attendu du reçu, recalculé depuis NOTRE demande — jamais lu du
+    reçu (login_id, host, provider, account, scope, exp : `LOGIN_BINDING_FIELDS`)."""
+    return {"login_id": request.login_id, "host": request.host,
+            "provider": request.harness, "account": request.account,
+            "scope": request.scope, "exp": int(request.service_exp)}
+
+
+def receipt_decision(db, request: Request, receipt, *, policy=None, consume_by: str) -> str:
+    """Vérifie et CONSOMME le reçu du défi (une fois), rend `done` | `cancel`.
+
+    Le nonce est consommé par l'acceptation : deux acceptations du même reçu
+    ne peuvent pas réussir, et un reçu d'un autre défi est refusé
+    (`LOGIN_MISMATCH`). Lève `LoginError` sur tout refus.
+    """
+    from . import receipts
+    verdict = receipts.verify_receipt(db, receipt, policy, kind="login",
+                                      expected_login=expected_login(request),
+                                      expect_decision=None, consume_by=consume_by)
+    if not verdict.ok:
+        raise LoginError(verdict.code, verdict.reason)
+    if verdict.decision not in DECISIONS:
+        raise LoginError("failed", "receipt: done or cancel expected")
+    return verdict.decision
+
+
+def wait_for_decision(supervisor: Supervisor, request: Request, *, fetch, verify,
+                      timeout: float = TTL_S, interval: float = 2.0,
+                      sleep=time.sleep, monotonic=time.monotonic) -> Request:
+    """Attend le reçu du défi (borné) et clôt la demande.
+
+    `fetch(login_id)` rend `("pending", infos)` | `("signed", reçu)` |
+    `("expired", infos)` (la forme d'`approve_client.fetch_login_receipt`) ;
+    `verify(reçu)` rend la décision après vérification, ou lève `LoginError`.
+    À l'échéance locale comme à celle du service, la demande est close
+    `expired` et le processus tué.
+    """
+    if request.state not in LIVE:
+        return request
+    deadline = monotonic() + max(0.0, float(timeout))
+    while True:
+        status, payload = fetch(request.login_id)
+        if status == "signed":
+            decision = verify(payload)
+            if decision not in DECISIONS:
+                raise LoginError("failed", "receipt: done or cancel expected")
+            return supervisor.finish(request.id, decision)
+        if status == "expired":
+            return supervisor.expire(request.id)
+        if status != "pending":
+            raise LoginError("failed", "receipt: pending, signed or expired expected")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return supervisor.expire(request.id)
+        sleep(min(interval, remaining))
+
+
+def publisher(client, cfg, *, approver: str, requested_by: str, scope: str = ""):
+    """Rappel `publish` branché sur le service de défi (`ameesh-approve`).
+
+    Les valeurs (URL, code) traversent l'appel HTTP sans être journalisées ;
+    `scope` du défi vient de la demande, celui du payload la complète.
+    """
+    def publish(payload: dict) -> dict:
+        return client.create_login_request(
+            cfg, host=payload["host"], provider=payload["provider"],
+            account=payload["account"], approver=approver, requested_by=requested_by,
+            url=payload["url"], code=payload["code"],
+            scope=payload.get("scope") or scope, provider_exp=payload.get("provider_exp"))
+    return publish

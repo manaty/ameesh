@@ -353,6 +353,158 @@ class SupervisorTest(FakeCliTest):
         with self.assertRaises(login.LoginError):
             sup.finish(request.id, "cancel")
 
+    def test_attente_du_recu_puis_decision(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        sup = self.supervisor()
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        seen = []
+
+        def fetch(login_id):
+            seen.append(login_id)
+            if len(seen) < 3:
+                return "pending", {"login_id": login_id}
+            return "signed", {"v": 1}
+
+        done = login.wait_for_decision(sup, request, fetch=fetch, verify=lambda receipt: "done",
+                                       timeout=5.0, interval=0.01)
+        self.assertEqual((done.state, done.category), (login.DONE, "healthy"))
+        self.assertEqual(seen, [request.login_id] * 3)
+        self.assertTrue(wait_for(lambda: self.dead(self.spawned[0])))
+
+    def test_attente_du_recu_expire_au_service(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        sup = self.supervisor()
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        done = login.wait_for_decision(sup, request, fetch=lambda login_id: ("expired", {}),
+                                       verify=lambda receipt: "done", timeout=5.0)
+        self.assertEqual((done.state, done.category), (login.EXPIRED, "expired"))
+        self.assertTrue(wait_for(lambda: self.dead(self.spawned[0])))
+
+    def test_attente_du_recu_echue_localement(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        sup = self.supervisor()
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        moments = [100.0]
+
+        def monotonic():
+            moments[0] += 10.0
+            return moments[0]
+
+        done = login.wait_for_decision(sup, request, fetch=lambda login_id: ("pending", {}),
+                                       verify=lambda receipt: "done", timeout=5.0,
+                                       monotonic=monotonic, sleep=lambda seconds: None)
+        self.assertEqual((done.state, done.category), (login.EXPIRED, "expired"))
+        self.assertTrue(wait_for(lambda: self.dead(self.spawned[0])))
+
+    def test_attente_du_recu_refus_de_verification(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        sup = self.supervisor()
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+
+        def verify(receipt):
+            raise login.LoginError("LOGIN_MISMATCH", "the challenge is for another host")
+
+        with self.assertRaises(login.LoginError):
+            login.wait_for_decision(sup, request, fetch=lambda login_id: ("signed", {}),
+                                    verify=verify, timeout=5.0)
+        # un reçu non vérifié ne clôt pas la demande : l'appelant décide
+        self.assertEqual(request.state, login.VIEWING)
+        sup.finish(request.id, "cancel")
+
+
+class ReceiptTest(unittest.TestCase):
+    @staticmethod
+    def request(**overrides):
+        fields = {"id": "lgn_" + "c" * 26, "host": "ameesh-agents-1", "harness": "gh",
+                  "account": "default", "home": "/home/x", "version": "2.102.0",
+                  "created": 1.0, "expires": 2.0, "state": login.VIEWING,
+                  "login_id": "lgn_" + "d" * 26, "scope": "git", "service_exp": 1234}
+        fields.update(overrides)
+        return login.Request(**fields)
+
+    def test_expected_login_recalcule_depuis_notre_demande(self):
+        request = self.request()
+        self.assertEqual(login.expected_login(request),
+                         {"login_id": request.login_id, "host": "ameesh-agents-1",
+                          "provider": "gh", "account": "default", "scope": "git",
+                          "exp": 1234})
+
+    def test_receipt_decision_lie_et_consomme(self):
+        from ameesh import receipts
+        seen = {}
+
+        class Verdict:
+            ok = True
+            code = "OK"
+            reason = ""
+            decision = "cancel"
+
+        def fake(db, receipt, policy=None, **kwargs):
+            seen.update(kwargs)
+            seen["db"] = db
+            seen["policy"] = policy
+            return Verdict()
+
+        original = receipts.verify_receipt
+        receipts.verify_receipt = fake
+        try:
+            decision = login.receipt_decision(object(), self.request(), {"v": 1},
+                                              policy="policy", consume_by="agent:impl-04")
+        finally:
+            receipts.verify_receipt = original
+        self.assertEqual(decision, "cancel")
+        self.assertEqual(seen["kind"], "login")
+        self.assertEqual(seen["consume_by"], "agent:impl-04")
+        self.assertEqual(seen["expect_decision"], None)
+        self.assertEqual(seen["expected_login"]["login_id"], "lgn_" + "d" * 26)
+        self.assertEqual(seen["expected_login"]["exp"], 1234)
+        self.assertEqual(seen["policy"], "policy")
+
+    def test_receipt_decision_refuse(self):
+        from ameesh import receipts
+
+        class Verdict:
+            ok = False
+            code = "LOGIN_MISMATCH"
+            reason = "the challenge is for another host"
+            decision = ""
+
+        original = receipts.verify_receipt
+        receipts.verify_receipt = lambda *args, **kwargs: Verdict()
+        try:
+            with self.assertRaises(login.LoginError) as caught:
+                login.receipt_decision(object(), self.request(), {"v": 1},
+                                       consume_by="agent:impl-04")
+        finally:
+            receipts.verify_receipt = original
+        self.assertEqual(caught.exception.category, "LOGIN_MISMATCH")
+
+    def test_publisher_transmet_scope_et_echeance(self):
+        calls = []
+
+        class Client:
+            @staticmethod
+            def create_login_request(cfg, **kwargs):
+                calls.append((cfg, kwargs))
+                return {"login_id": "lgn_" + "e" * 26, "link": "https://approve.example/l"}
+
+        publish = login.publisher(Client, "cfg", approver="human:alice",
+                                  requested_by="agent:impl-04", scope="defaut")
+        answer = publish({"host": "h", "provider": "gh", "account": "default",
+                          "url": "https://github.com/login/device", "code": "WXYZ-9876",
+                          "scope": "", "provider_exp": 1234})
+        self.assertEqual(answer["login_id"], "lgn_" + "e" * 26)
+        cfg, kwargs = calls[0]
+        self.assertEqual(cfg, "cfg")
+        self.assertEqual(kwargs["scope"], "defaut")
+        self.assertEqual(kwargs["provider_exp"], 1234)
+        self.assertEqual(kwargs["approver"], "human:alice")
+        self.assertEqual(kwargs["requested_by"], "agent:impl-04")
+
 
 class RegistryTest(unittest.TestCase):
     def test_describe_ne_porte_que_des_champs_publics(self):
@@ -362,7 +514,7 @@ class RegistryTest(unittest.TestCase):
                                 login_id="lgn_" + "b" * 26, link="https://approve.example/t")
         self.assertEqual(sorted(request.describe()),
                          ["account", "category", "expires", "harness", "host", "id",
-                          "login_id", "pid", "state", "version"])
+                          "login_id", "pid", "scope", "state", "version"])
         self.assertNotIn("link", request.describe())
 
 
