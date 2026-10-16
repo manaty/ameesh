@@ -413,7 +413,8 @@ class ReservationTest(PgTestCase):
         reprendre (le fichier, lui, le protège toujours)."""
         a, b = self._lot("a"), self._lot("b", n=2)
         number = self._am(a, 9101)["migration"]
-        got = work.merged(self.db, a["id"], sha="deadbeef", actor="dev1")
+        got = work.close_merged(self.db, a["id"], sha="deadbeef", actor="dev1",
+                                source="test")
         self.assertEqual(got["result"], "merged")
         self.assertIsNone(got["item"]["migration"])
         item = work.get(self.db, a["id"])
@@ -1049,6 +1050,7 @@ class NumeroAtterriTest(PgTestCase):
         super().setUp()
         self.nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                               NEXLINK.directory, ["375_a.sql", "376_b.sql"])
+        _git(self.nexlink, "config", "ameesh.target", "develop")
         self.ameesh = _depot(os.path.join(self.tmp, "ameesh"), "manaty/ameesh",
                              AMEESH.directory, ["0005_e.sql"])
 
@@ -1059,11 +1061,18 @@ class NumeroAtterriTest(PgTestCase):
     def _nx(self, lot, number=None, **kw):
         return work.reserve_migration(self.db, lot["id"], number, repo=self.nexlink, **kw)
 
+    def _merged(self, lot, **kwargs):
+        # #1286 × #1567: keep real Git evidence while testing landed numbers.
+        _git(self.nexlink, "commit", "--allow-empty", "-qm",
+             "Deliver\n\nameesh-work: %d" % lot["id"])
+        sha = subprocess.check_output(
+            ["git", "-C", self.nexlink, "rev-parse", "HEAD"], text=True).strip()
+        return work.merged(self.db, lot["id"], sha=sha, repo=self.nexlink, **kwargs)
+
     def test_la_fusion_nomme_le_numero_atterri(self):
         lot = self._lot()
         self.assertEqual(self._nx(lot)["migration"], 377)
-        done = work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1",
-                           migration_landed=452)
+        done = self._merged(lot, actor="dev1", migration_landed=452)
         self.assertEqual(done["result"], "merged")
         item = work.get(self.db, lot["id"])
         # #956 (main) : la fusion libère la réservation dans la transaction de
@@ -1091,7 +1100,7 @@ class NumeroAtterriTest(PgTestCase):
     def test_sans_enregistrement_la_vue_ne_donne_pas_la_reservation_pour_atterrie(self):
         lot = self._lot()
         self._nx(lot)
-        work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1")
+        self._merged(lot, actor="dev1")
         item = work.get(self.db, lot["id"])
         self.assertIsNone(item["migration_landed"])
         # #956 (main) : la fusion a libéré la réservation ; sans numéro atterri
@@ -1121,18 +1130,18 @@ class NumeroAtterriTest(PgTestCase):
         lot = self._lot()
         self._nx(lot)
         sha = "b" * 40
-        work.merged(self.db, lot["id"], sha=sha, actor="dev1")
-        done = work.merged(self.db, lot["id"], sha=sha, actor="dev2", migration_landed=452)
+        self._merged(lot, actor="dev1")
+        done = self._merged(lot, actor="dev2", migration_landed=452)
         self.assertEqual(done["result"], "landed")
         self.assertIn("landed migration 452 recorded (manaty/nexlink)", done["detail"])
         self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 452)
         # idempotent : le même numéro ne réécrit rien
-        again = work.merged(self.db, lot["id"], sha=sha, actor="dev2", migration_landed=452)
+        again = self._merged(lot, actor="dev2", migration_landed=452)
         self.assertEqual(again["result"], "already")
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertEqual(sum("landed migration" in n for n in notes), 1, notes)
         # correction : l'ancien numéro est rendu, le nouveau est tenu
-        fixed = work.merged(self.db, lot["id"], sha=sha, actor="dev2", migration_landed=453)
+        fixed = self._merged(lot, actor="dev2", migration_landed=453)
         self.assertEqual(fixed["result"], "landed")
         self.assertIn("landed migration 452 → 453 corrected (manaty/nexlink)",
                       fixed["detail"])
@@ -1158,8 +1167,7 @@ class NumeroAtterriTest(PgTestCase):
             return close_merged(db, item_id, **kwargs)
 
         with mock.patch.object(work, "close_merged", side_effect=sweep_then_close):
-            done = work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1",
-                               migration_landed=452)
+            done = self._merged(lot, actor="dev1", migration_landed=452)
         self.assertEqual(done["result"], "landed")
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["state"], item["migration_landed"],
@@ -1196,19 +1204,17 @@ class NumeroAtterriTest(PgTestCase):
     def test_deux_lots_ne_nomment_pas_le_meme_numero_atterri(self):
         first = self._lot(n=1)
         self._nx(first)
-        work.merged(self.db, first["id"], sha="c" * 40, actor="dev1", migration_landed=452)
+        self._merged(first, actor="dev1", migration_landed=452)
         second = self._lot(n=2)
         self._nx(second)
         with self.assertRaises(work.WorkError) as ctx:
-            work.merged(self.db, second["id"], sha="d" * 40, actor="dev2",
-                        migration_landed=452)
+            self._merged(second, actor="dev2", migration_landed=452)
         self.assertIn("lot #%d" % first["id"], str(ctx.exception))
         self.assertIn("manaty/nexlink", str(ctx.exception))
         # la déclaration refusée n'a rien fermé ni écrit
         item = work.get(self.db, second["id"])
         self.assertEqual((item["state"], item["migration_landed"]), ("intake", None))
-        done = work.merged(self.db, second["id"], sha="d" * 40, actor="dev2",
-                           migration_landed=453)
+        done = self._merged(second, actor="dev2", migration_landed=453)
         self.assertEqual(done["result"], "merged")
 
     def test_numero_hors_bornes_et_lot_ferme(self):
@@ -1216,14 +1222,12 @@ class NumeroAtterriTest(PgTestCase):
         self._nx(lot)
         for number in (0, 10000):
             with self.assertRaises(work.WorkError) as ctx:
-                work.merged(self.db, lot["id"], sha="e" * 40, actor="dev1",
-                            migration_landed=number)
+                self._merged(lot, actor="dev1", migration_landed=number)
             self.assertIn("outside 0001-9999", str(ctx.exception))
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
         work.close(self.db, lot["id"], abandoned=True, actor="dev1")
         with self.assertRaises(work.WorkError) as ctx:
-            work.merged(self.db, lot["id"], sha="e" * 40, actor="dev1",
-                        migration_landed=452)
+            self._merged(lot, actor="dev1", migration_landed=452)
         self.assertIn("not reopened", str(ctx.exception))
 
     def test_le_numero_atterri_survit_a_la_liberation_de_la_reservation(self):
@@ -1231,7 +1235,7 @@ class NumeroAtterriTest(PgTestCase):
         numéro atterri, lui, ne doit pas disparaître avec la réservation."""
         lot = self._lot()
         self._nx(lot)
-        work.merged(self.db, lot["id"], sha="f" * 40, actor="dev1", migration_landed=452)
+        self._merged(lot, actor="dev1", migration_landed=452)
         self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
                         " WHERE id = %d" % lot["id"])
         item = work.get(self.db, lot["id"])

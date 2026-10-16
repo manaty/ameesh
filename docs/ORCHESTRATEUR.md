@@ -369,13 +369,23 @@ le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
 commit de fusion et une note qui dit comment la fusion a été constatée.
 
 À la main, quand le relevé ne peut pas la voir (lot sans assigné, autre
-hôte, commit qui ne le désigne pas) :
+hôte), depuis un clone du dépôt du lot :
 
 ```
-ameesh work merged <id> --sha <commit de fusion> [--note "…"]
+ameesh work merged <id> --sha <commit de fusion> [--repo <clone local>] [--note "…"]
 ```
 
 depuis tout état ouvert, en une fois ; l'acteur est votre identité liée.
+La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
+(ou le dépôt configuré pour son projet), puis le commit dans sa cible.
+Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
+de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
+Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
+pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
+n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
+dossier courant. La lecture reste locale : récupérer la cible au préalable
+si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
