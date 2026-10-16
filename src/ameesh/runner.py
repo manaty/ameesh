@@ -1733,10 +1733,13 @@ class AgentWorker(threading.Thread):
             return False
         if len(self.summary_display) >= SUMMARY_DISPLAY_MAX_FRAGMENTS:
             return False
-        if self._summary_chars >= SUMMARY_DISPLAY_MAX_CHARS:
+        separator = 1 if self.summary_display else 0
+        remaining = SUMMARY_DISPLAY_MAX_CHARS - self._summary_chars - separator
+        if remaining <= 0:
             return False
+        text = text[:remaining]
         self.summary_display.append(text)
-        self._summary_chars += len(text) + 1  # + le "\n" du join
+        self._summary_chars += len(text) + separator
         return True
 
     def _rotate(self, raison: str) -> bool:

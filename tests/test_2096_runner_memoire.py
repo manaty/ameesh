@@ -122,11 +122,26 @@ class SummaryDisplayBoundTest(unittest.TestCase):
         worker = bare_worker()
         fragment = "x" * 30_000
         gardes = [worker._keep_summary_display(fragment) for _ in range(5)]
-        # la borne est souple : un fragment entier est gardé ou refusé, jamais
-        # coupé ; le premier refus vient dès que le budget est consommé.
+        # Le dernier fragment est coupé au budget restant, séparateurs inclus.
         self.assertEqual(gardes, [True, True, True, False, False])
-        self.assertLessEqual(len(worker.summary_display), 3)
-        self.assertGreater(worker._summary_chars, SUMMARY_DISPLAY_MAX_CHARS)
+        self.assertEqual(worker._summary_chars, SUMMARY_DISPLAY_MAX_CHARS)
+        self.assertEqual(len("\n".join(worker.summary_display)), SUMMARY_DISPLAY_MAX_CHARS)
+
+    def test_one_huge_fragment_cannot_exceed_the_bound(self):
+        worker = bare_worker()
+        fragment = "x" * 2_000_000
+        self.assertTrue(worker._keep_summary_display(fragment))
+        self.assertEqual(worker.summary_display, [fragment[:SUMMARY_DISPLAY_MAX_CHARS]])
+        self.assertEqual(worker._summary_chars, SUMMARY_DISPLAY_MAX_CHARS)
+        self.assertFalse(worker._keep_summary_display("suite"))
+
+    def test_last_fragment_uses_only_the_remaining_budget(self):
+        worker = bare_worker()
+        prefix = "x" * (SUMMARY_DISPLAY_MAX_CHARS - 2)
+        self.assertTrue(worker._keep_summary_display(prefix))
+        self.assertTrue(worker._keep_summary_display("suite"))
+        self.assertEqual("\n".join(worker.summary_display), prefix + "\ns")
+        self.assertEqual(worker._summary_chars, SUMMARY_DISPLAY_MAX_CHARS)
 
     def test_end_of_turn_markers_are_not_kept(self):
         # `turn_summary` les ôte à la lecture : les garder consommerait le
