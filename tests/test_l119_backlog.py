@@ -411,6 +411,10 @@ class AlerteEtNotifyTest(_Base):
         # Amont satisfait : l'élément devient prenable, l'alerte se tait.
         work.close(self.db, amont["id"], abandoned=True)
         self.assertEqual(alertes(), [])
+        # #1696 x #1625 (composition) : le temoin #1696 laisse un element
+        # DEBLOQUE, prenable ; le temoin #1625 (file vide) doit repartir d'une
+        # file reellement vide. On ferme l'element avant son bloc.
+        work.close(self.db, bloque["id"], abandoned=True)
         # #1625 : un lot que sa date retient n'attend pas un agent — la file
         # vide se signale quand même
         plus_tard = work.add(self.db, title="demande planifiee")
