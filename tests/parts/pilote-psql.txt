@@ -16,9 +16,10 @@
 # pilote (connexion persistante, notifications, nombre d'allers-retours).
 #
 # Liste additive (L160a) : un module par ligne, sa raison en commentaire sur la
-# même ligne, ordre alphabétique, sans doublon (scripts/test-parts.py refuse
-# une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
-# deux endroits différents du fichier, sans conflit.
+# même ligne, ordre alphabétique, sans doublon ; la lecture range et
+# dédoublonne ce qu'une fusion `union` produit (un nom inconnu reste refusé).
+# Deux lots qui ajoutent chacun un module touchent ainsi deux endroits
+# différents du fichier, sans conflit.
 
 test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
