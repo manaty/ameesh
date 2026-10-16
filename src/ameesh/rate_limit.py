@@ -32,10 +32,12 @@ avec jitter). TIMEOUT est émis par le watchdog d'inactivité du flux, local
 (`MESSAGES_IDLE`, « DeepSeek Messages stream idle timeout ») ou mappé d'un
 message fournisseur `/timeout/i` : un flux qui ne produit plus, jamais un
 plafond déterministe du harnais. TRANSPORT est un échec réseau/transport
-(Messages transport failed, socket/fetch). ameesh classe passagère toute
-ligne `dsh: <CODE>:` — TIMEOUT et TRANSPORT compris, déjà retentés par dsh
-(#1270) : une remontée après ses cinq essais reprend à délais cadencés au
-lieu d'arrêter l'agent, et un `TIMEOUT`/`TRANSPORT` nu (sans la signature
+(Messages transport failed, socket/fetch). ameesh classe passagère la ligne
+`dsh: <CODE>:` des sept codes de `TRANSIENT_PATTERNS` (RATE_LIMIT, SERVER,
+MALFORMED_RESPONSE, STREAM_CLOSED, EMPTY_RESPONSE, TIMEOUT, TRANSPORT ; #1270),
+pas tout code dsh — `dsh: QUOTA:` est un quota, un autre code n'est pas
+classé : une remontée après ses cinq essais reprend à délais cadencés au lieu
+d'arrêter l'agent, et un `TIMEOUT`/`TRANSPORT` nu (sans la signature
 `dsh: <CODE>:`) n'est pas classé. MALFORMED_RESPONSE et STREAM_CLOSED,
 absents du jeu par défaut de dsh (échec immédiat), n'en sont pas moins
 passagers pour l'incident #1270. Borne de cette reprise : `DELAYS` est atteint

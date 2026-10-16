@@ -277,6 +277,13 @@ class CodesDshTest(unittest.TestCase):
                 self.assertIsNone(rate_limit.classify(error=texte))
                 self.assertIsNone(rate_limit.classify(stderr_tail=texte))
 
+    def test_signature_dsh_seule_ne_suffit_pas(self):
+        # seuls les codes passagers listés sont repris : la signature
+        # `dsh: <CODE>:` d'un autre code ne vaut pas panne passagère
+        self.assertEqual(rate_limit.classify(error="dsh: QUOTA: solde épuisé"),
+                         rate_limit.QUOTA)
+        self.assertIsNone(rate_limit.classify(error="dsh: AUTH: invalid key"))
+
 
 class EtatTest(unittest.TestCase):
     def test_aller_retour(self):
