@@ -91,7 +91,7 @@ def machine() -> str:
     return stdlib_platform.machine() or ""
 
 
-from .process import (alive, ancestry, become_subreaper, boot_time, children,  # noqa: E402
+from .process import (PROC, alive, ancestry, become_subreaper, boot_time, children,  # noqa: E402
                       command_argv, command_line, environ, env_values, fd_path, holders,
                       open_fd_count, parent_pid, process_table, process_group_exists,
                       reap, exited_child, self_cgroup_paths, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)

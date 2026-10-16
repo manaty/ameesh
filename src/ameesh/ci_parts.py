@@ -75,6 +75,7 @@ import time
 
 from . import plan_git
 from .canon import GIT_TIMEOUT, GitError, _git, _git_env
+from .platform import PROC
 
 #: plafond d'exécution du sélecteur : un sélecteur bloqué ne retient pas la
 #: passe du radar des heures (canon §3, plafonds de la CI)
@@ -239,7 +240,7 @@ def sandbox_prefix(bwrap: str) -> list:
     seuls les `--setenv` du contrat entrent), racine vide (`bwrap` n'expose que
     ce qui est monté), `/proc`, `/dev` et `/tmp` neufs."""
     return [bwrap, "--die-with-parent", "--unshare-all", "--unshare-net",
-            "--clearenv", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+            "--clearenv", "--proc", PROC, "--dev", "/dev", "--tmpfs", "/tmp"]
 
 
 def _readonly_binds(paths) -> list:

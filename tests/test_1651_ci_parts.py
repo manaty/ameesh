@@ -805,8 +805,20 @@ class SandboxTest(_Contract):
         #: preuve peut lui-même vivre sous un chemin personnel : ce sont ses
         #: **parents** qui ne sont jamais montés)
         self.assertNotIn("/", readonly)
-        expected = {path for path in list(ci_parts.SANDBOX_RUNTIME)
-                    + list(ci_parts.SANDBOX_LINKER) if os.path.exists(path)}
+        #: N3 de #1666 : hors du runtime système, le binaire du sélecteur et
+        #: les `lib`/`lib64` de son préfixe sont montés en lecture seule (le
+        #: préfixe entier exposerait le HOME). Sur un runner CI, l'interpréteur
+        #: qui exécute le sélecteur vit dans le toolcache : ces montages
+        #: dépendent de l'hôte et se recalculent depuis la ligne de commande.
+        real = run[run.index("--") + 1]
+        extra = os.path.dirname(real) or "/"
+        if os.path.basename(extra) == "bin":
+            extra = os.path.dirname(extra) or "/"
+        mounted = list(ci_parts.SANDBOX_RUNTIME) + list(ci_parts.SANDBOX_LINKER)
+        if not any(extra == path or extra.startswith(path.rstrip("/") + "/")
+                   for path in ci_parts.SANDBOX_RUNTIME):
+            mounted += [real] + [os.path.join(extra, name) for name in ("lib", "lib64")]
+        expected = {path for path in mounted if os.path.exists(path)}
         self.assertEqual(set(readonly), expected | {tree[0], changed[0]})
         self.assertEqual(len(writable), 2)   # travail et sortie, rien d'autre
         self.assertEqual(setenv["GITHUB_WORKSPACE"], tree[0])

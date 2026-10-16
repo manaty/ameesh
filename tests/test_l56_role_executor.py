@@ -501,7 +501,7 @@ class RoleExecutorTest(PgTestCase):
             result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
                 '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
             self.assertNotEqual(result.returncode,0)
-            self.assertIn('unrelated write privilege',result.stderr)
+            self.assertIn('unrelated write privilege',result.stderr,attendu(result.stderr))
         finally:
             self.db.execute('DROP VIEW IF EXISTS %s' % q(view))
             if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):

@@ -1646,7 +1646,7 @@ class WatcherTest(PgTestCase):
         st.ci.open_run(repo, 1202, head_sha="b2" * 20, branch="develop", event="push",
                        base="develop", work_item_id=None, url=None,
                        workflow="backend-suite.yml")
-        st.ci.add_failure(repo, 1202, part="psql 1/1", test="tests.test_a.T.test_1",
+        st.ci.add_failure(repo, 1202, run_attempt=1, part="psql 1/1", test="tests.test_a.T.test_1",
                           module="tests.test_a", status="echec", inherited=False,
                           excerpt="", replay="", duration_s=None, failed_at=None)
         st.ci.conclude(repo, 1202, "failure")
