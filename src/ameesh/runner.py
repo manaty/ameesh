@@ -66,6 +66,15 @@ def _duree(secondes: float) -> str:
     return "%d h %02d min" % (secondes // 3600, secondes % 3600 // 60)
 
 
+#: Marge de dérive tolérée entre l'horloge de la base (`session_reset_at`,
+#: `clock_timestamp()`) et celle de l'hôte (mtime du fichier de session local).
+#: Dans la fenêtre, on tranche pour l'oubli : une session oubliée ne ressuscite
+#: jamais ; un fichier frais de moins que la marge est seulement écarté (il
+#: n'est qu'un repli, le registre qui porte l'id est consulté en premier).
+#: Même règle dans `reprise._local_session` (#1481, #1898 N4).
+SESSION_RESET_SKEW_S = 5.0
+
+
 class _AsyncLog:
     """Journal non bloquant pour le fil du battement (sondes codex3 B5a-N).
 
@@ -577,6 +586,10 @@ class AgentWorker(threading.Thread):
         réussite, sinon un `unlink` refusé (PermissionError) ferait
         ressusciter l'ancienne session — sur ce worker comme sur un worker
         recréé, qui relit `session_reset_ts` au registre.
+
+        #1898 N4 : la comparaison porte sur deux horloges (mtime de l'hôte,
+        `session_reset_at` de la base) ; `SESSION_RESET_SKEW_S` couvre leur
+        dérive, et dans la fenêtre on tranche pour l'oubli (voir la constante).
         """
         session = (self.agent or {}).get("session_id")
         if session:
@@ -585,7 +598,8 @@ class AgentWorker(threading.Thread):
         reset = (self.agent or {}).get("session_reset_ts")
         if fichier and reset:
             try:
-                perime = os.stat(self._path("session")).st_mtime <= float(reset)
+                perime = os.stat(self._path("session")).st_mtime \
+                    <= float(reset) + SESSION_RESET_SKEW_S
             except OSError:
                 return None
             if perime:
@@ -1644,23 +1658,6 @@ class AgentWorker(threading.Thread):
             log_async("[%s] start measured: %s"
                       % (self.name, ", ".join("#%d" % i for i in debuts)))
 
-    def lot_rotation_due(self, lot: str | None) -> bool:
-        """Changement de session au changement de lot dû ? (politique `par-lot`)
-
-        Seulement si le lot du tour est connu. La session courante est celle
-        d'un AUTRE lot (bascule), ou n'a AUCUN lot noté alors qu'elle a déjà
-        tourné : elle n'est jamais partagée entre lots, pas même adoptée par le
-        premier lot venu (#794, décision du bureau du 2026-10-13). Jamais
-        pendant un tour. #408 : même sans session courante, celle mise de côté
-        pour le lot du tour est reprise.
-        """
-        if not lot or self.proc is not None or self.session_policy() != "par-lot":
-            return False
-        courant = (self.agent or {}).get("session_work_item")
-        if courant:
-            return str(courant) != str(lot)
-        return bool(self.current_session())
-
     def rotate_for_lot(self, spec: dict | None) -> dict | None:
         """Avant un tour : passe à la session du lot du tour s'il change
         (0025 ; #408, une session par lot).
@@ -1672,9 +1669,12 @@ class AgentWorker(threading.Thread):
         sinon une session neuve s'ouvre sur le brief MINIMAL du lot (#794 :
         canon, fiche, diff, fil du lot). Une session sans lot noté qui a déjà
         tourné n'est jamais adoptée par un lot : elle est oubliée avant
-        d'ouvrir celle du lot (#794). Bail perdu ou base injoignable : le tour
-        part dans la session courante, le nouveau lot y est noté (pas de
-        nouvel essai à chaque tour).
+        d'ouvrir celle du lot (#794). Un lot FINI ferme sa session une fois,
+        puis ses tours partagent la session courante ou une session sans lot :
+        jamais de session dédiée rouverte ni de fermeture à chaque tour (#1898
+        N1 ; c'est ici que vit l'ancien prédicat `lot_rotation_due`, #1898 N3).
+        Bail perdu ou base injoignable : le tour part dans la session courante,
+        le nouveau lot y est noté (pas de nouvel essai à chaque tour).
         """
         if not spec:
             return spec
@@ -1682,13 +1682,24 @@ class AgentWorker(threading.Thread):
         if self.proc is not None or self.session_policy() != "par-lot":
             return spec
         courant = str((self.agent or {}).get("session_work_item") or "").strip()
-        if courant and (not lot or str(lot) == courant) \
-                and self._close_finished_lot_session(courant):
-            # le lot de la session active est fini : elle est fermée ici,
-            # avant le tour (même lot, ou tour sans lot) ; un tour sur un
-            # AUTRE lot passe par la bascule, qui la ferme aussi.
-            courant = ""
+        fini = False
+        if courant and (not lot or str(lot) == courant):
+            if self._close_finished_lot_session(courant):
+                # le lot de la session active est fini : elle est fermée ici,
+                # avant le tour (même lot, ou tour sans lot) ; un tour sur un
+                # AUTRE lot passe par la bascule, qui la ferme aussi.
+                courant = ""
+                fini = True
         if not lot:
+            return spec
+        if not fini and courant != str(lot):
+            # #1898 N1 : un lot fini ne rouvre jamais de session dédiée. Le
+            # tour partage la session courante (ou une session sans lot,
+            # ouverte sur le brief déterministe posé par la fermeture) ; la
+            # session n'est donc ni fermée ni rouverte à chaque tour.
+            fini = self._lot_is_finished(lot)
+        if fini:
+            spec["lot_finished"] = True
             return spec
         if courant:
             if courant == str(lot):
@@ -1718,6 +1729,23 @@ class AgentWorker(threading.Thread):
     #: faisait — fusionné, livré (`promoted`) ou fermé.
     LOT_FINISHED_STATES = ("merged", "promoted", "closed")
 
+    def _lot_is_finished(self, lot: str | None) -> bool:
+        """Le lot est-il FINI (fusionné, livré, fermé) ? (lecture du registre)
+
+        #1898 N1 : un lot fini ne reçoit plus de session dédiée ; identifiant
+        illisible ou base injoignable rend faux (le tour suit le chemin
+        ordinaire), comme `_close_finished_lot_session`."""
+        lot = str(lot or "").strip()
+        if not lot.isdigit():
+            return False
+        try:
+            from . import work as work_mod
+            item = work_mod.get(self.db, int(lot))
+        except db_mod.DbError as exc:
+            log_async("[%s] lot #%s not checked (%s)" % (self.name, lot, exc))
+            return False
+        return bool(item and item.get("state") in self.LOT_FINISHED_STATES)
+
     def _close_finished_lot_session(self, lot: str) -> bool:
         """#794 B1 (revue Claude du 2026-10-14) : ferme la session active d'un
         lot FINI avant le tour suivant — « la session se ferme à la fusion ».
@@ -1735,15 +1763,7 @@ class AgentWorker(threading.Thread):
         if self.proc is not None or self.session_policy() != "par-lot":
             return False
         lot = str(lot or "").strip()
-        if not lot.isdigit():
-            return False
-        try:
-            from . import work as work_mod
-            item = work_mod.get(self.db, int(lot))
-        except db_mod.DbError as exc:
-            log_async("[%s] finished lot #%s not checked (%s)" % (self.name, lot, exc))
-            return False
-        if not item or item.get("state") not in self.LOT_FINISHED_STATES:
+        if not lot.isdigit() or not self._lot_is_finished(lot):
             return False
         session = self.current_session()
         try:
@@ -1829,7 +1849,11 @@ class AgentWorker(threading.Thread):
         self.agent = registry.get(self.db, self.name) or self.agent
         self._reset_session_counts()
         self._state_note("session_harness", "")
-        self.resume_summary = None
+        # #1898 N2 : le résumé de reprise en attente sur disque
+        # (`RESUME_PENDING`) décrivait la session qu'on vient d'oublier ; sans
+        # ce retrait, un worker recréé le relisait (`_resume_load`, aucune
+        # session courante) et ressuscitait un résumé périmé au redémarrage.
+        self._resume_drop()
         log_async("[%s] session %s had no lot: forgotten, never shared with a lot"
                   % (self.name, session or "?"))
         self._fil_note("Session %s had no lot (opened by a turn whose lot was "
@@ -4233,9 +4257,13 @@ class AgentWorker(threading.Thread):
             log("[%s] lease lost, agent stopped or operator paused before the turn" % self.name)
             return False
         lot = spec.get("lot")
-        if lot and str(lot) != str(self.agent.get("session_work_item") or ""):
+        if lot and not spec.get("lot_finished") \
+                and str(lot) != str(self.agent.get("session_work_item") or ""):
             # Le lot de la session courante (0025, L26) : noté au premier tour
             # d'une session neuve, ou après une rotation refusée ; fencé.
+            # #1898 N1 : jamais pour un lot fini — la session qui sert ce tour
+            # n'est pas la sienne, elle ne doit ni être close à chaque tour ni
+            # lui être rattachée.
             if storage.of(self.db).operations.set_session_work_item(
                     self.name, self.runner.runner_id, self.epoch, str(lot)):
                 self.agent["session_work_item"] = str(lot)
@@ -4625,6 +4653,12 @@ class AgentWorker(threading.Thread):
                                       "after the turn" % (self.name, session_new,
                                                          db_mod.explain(exc)))
                         if self.agent is not None:
+                            # #1898 N4 : le registre porte la session qui vient
+                            # d'être ouverte ; la mémoire du worker suit, sinon
+                            # `current_session` retombait sur le fichier local et
+                            # sa comparaison d'horloges (marge de dérive) pour
+                            # chaque tour de la même session.
+                            self.agent["session_id"] = session_new
                             self.agent["session_account"] = (
                                 compte.name if compte is not None else None)
                     if parsed.get("model") and parsed["model"] != modele_annonce:

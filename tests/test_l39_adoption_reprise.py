@@ -355,6 +355,24 @@ class ResumeTest(_Base):
         self.assertIn("--fresh", row["pending_prompt"])
         self.assertFalse(os.path.exists(os.path.join(self.cfg.agent_dir("fr"), "session")))
 
+    def test_marge_de_derive_sur_le_fichier_local(self):
+        """N4 (#1898) : la reprise par fichier local lit le mtime avec la même
+        marge de dérive d'horloges que l'exécuteur (#1481)."""
+        self.register("ml", "codex", cwd=self.travail)
+        os.makedirs(self.cfg.agent_dir("ml"), exist_ok=True)
+        chemin = os.path.join(self.cfg.agent_dir("ml"), "session")
+        reset = time.time()
+        row = {"name": "ml", "host": self.cfg.host, "session_id": None,
+               "session_reset_ts": reset}
+        with open(chemin, "w") as fh:
+            fh.write("sess\n")
+        os.utime(chemin, (reset + 2, reset + 2))    # dans la marge : oubliée
+        self.assertIsNone(reprise._local_session(self.cfg, row))
+        with open(chemin, "w") as fh:
+            fh.write("sess\n")
+        os.utime(chemin, (reset + 30, reset + 30))  # au-delà : reprise
+        self.assertEqual(reprise._local_session(self.cfg, row), "sess")
+
     def test_agent_externe_refuse(self):
         self._externe("ext")
         with self.assertRaises(reprise.RepriseError) as ctx:

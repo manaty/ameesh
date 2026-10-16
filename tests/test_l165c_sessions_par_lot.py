@@ -446,10 +446,36 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_l_oubli_d_une_session_sans_lot_retire_le_resume_en_attente(self):
+        """N2 (#1898) : oublier une session sans lot retire aussi le
+        `RESUME_PENDING` du disque ; sinon un worker recréé le relit (aucune
+        session courante) et ressuscite un résumé périmé."""
+        worker = self._worker("w13")
+        try:
+            registry.set_session(self.db, "w13", "sess-veille", None,
+                                 harness="claude", cwd=self._cwd("w13"))
+            worker.write_session_file("sess-veille")
+            worker.agent = registry.get(self.db, "w13")
+            self.assertTrue(worker._resume_keep("RESUME-PERIME", "agent"))
+            self.assertTrue(os.path.exists(worker._path(worker.RESUME_PENDING)))
+            self.assertTrue(worker._forget_lotless_session())
+            self.assertFalse(os.path.exists(worker._path(worker.RESUME_PENDING)),
+                             "le résumé périmé ne reste pas sur disque")
+            # worker recréé : rien ne ressuscite le résumé périmé.
+            recree = AgentWorker(Runner(self.cfg, self.db, once=True),
+                                 registry.get(self.db, "w13"),
+                                 {"lease_epoch": worker.epoch})
+            recree._resume_load()
+            self.assertEqual(recree.resume_summary, "")
+        finally:
+            worker.watchdog_stop.set()
+
     def test_le_lot_fini_ferme_la_session_au_tour_suivant(self):
-        """B1 (revue Claude du 14/10) : la session active d'un lot FINI est
-        fermée par son agent, sous son bail, avant le tour suivant sur ce même
-        lot ; le tour ouvre alors une session neuve sur le brief du lot."""
+        """B1 (revue Claude du 14/10) + N1 (#1898) : la session active d'un lot
+        FINI est fermée par son agent, sous son bail, avant le tour suivant sur
+        ce même lot ; ce tour et les suivants ne rouvrent PAS de session
+        dédiée au lot fini — fini le cycle ferme/rouvre à chaque tour — ils
+        partagent une session sans lot, que le prochain lot ouvert oubliera."""
         worker = self._worker("w8")
         try:
             a = work.add(self.db, title="A", assignee="w8")["id"]
@@ -460,14 +486,44 @@ class RoutageTest(_Base):
             spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
                                           "ids": [], "lot": str(a)})
             self.assertEqual(spec["lot"], str(a))
+            self.assertTrue(spec.get("lot_finished"),
+                            "le tour d'un lot fini est marqué : pas de session dédiée")
             agent = registry.get(self.db, "w8")
             self.assertEqual((agent["session_id"], agent["session_work_item"]),
                              (None, None), "la session du lot fini est fermée")
             self.assertIsNone(worker.read_session_file(),
                               "le fichier local ne ressuscite pas la session")
             self.assertIsNone(worker.current_session())
-            self.assertIn("dedicated to lot #%d" % a, worker.resume_summary or "",
-                          "le tour suivant ouvre sur le brief du lot")
+            self.assertNotIn("dedicated to lot", worker.resume_summary or "",
+                             "aucune session dédiée au lot fini n'est rouverte")
+            # le tour part sur le brief déterministe ; sa session n'est pas
+            # rattachée au lot fini.
+            with self._env("sess-A2"):
+                self.assertTrue(worker.run_turn(spec))
+            agent = registry.get(self.db, "w8")
+            self.assertEqual(agent["session_id"], "sess-A2")
+            self.assertIsNone(agent["session_work_item"],
+                              "le lot fini n'est pas noté sur la session du tour")
+            self.assertNotIn("--resume", self.turns()[-1]["argv"])
+            # tour suivant sur le même lot fini : ni fermeture ni session neuve.
+            spec2 = worker.rotate_for_lot({"kind": "prompt", "prompt": "encore A",
+                                           "ids": [], "lot": str(a)})
+            self.assertTrue(spec2.get("lot_finished"))
+            self.assertEqual(registry.get(self.db, "w8")["session_id"], "sess-A2",
+                             "la session n'est ni fermée ni rouverte")
+            with self._env("sess-jamais"):
+                self.assertTrue(worker.run_turn(spec2))
+            self.assertEqual(registry.get(self.db, "w8")["session_id"], "sess-A2",
+                             "la session du lot fini n'est pas rouverte")
+            self.assertIn("--resume", self.turns()[-1]["argv"])
+            self.assertIsNone(registry.get(self.db, "w8")["session_work_item"])
+            # lot ouvert suivant : la session sans lot est oubliée, la sienne
+            # s'ouvre normalement.
+            b = work.add(self.db, title="B", assignee="w8")["id"]
+            self.tour(worker, b, "prends B", session="sess-B")
+            agent = registry.get(self.db, "w8")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-B", str(b)))
         finally:
             worker.watchdog_stop.set()
 
