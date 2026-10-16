@@ -148,6 +148,84 @@ class PlatformTest(unittest.TestCase):
                     else:
                         self.assertEqual(vides, [])
 
+    def test_une_session_citee_n_est_pas_un_detenteur(self):
+        """#1283 : un argv qui CITE l'id (brief JSON, message) n'est pas une
+        reprise en cours ; seuls les sélecteurs de session le nomment."""
+        with tempfile.TemporaryDirectory() as tmp:
+            chemin = os.path.join(tmp, "session.jsonl")
+            open(chemin, "w").close()
+            sid = "sid-l63-cite-xyz"
+            pret = {nom: os.path.join(tmp, "pret-" + nom)
+                    for nom in ("citant", "repris", "lie", "options")}
+            code = "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)"
+            citant = self._child(code, pret["citant"], "--json",
+                                 '{"brief": "reprends la session %s"}' % sid)
+            repris = self._child(code, pret["repris"], "--resume", sid)
+            lie = self._child(code, pret["lie"], "--resume=%s" % sid)
+            # #1283 R1 cx2 : les options intercalees avant l'id ne perdent pas
+            # la reprise (`codex exec resume --json <id>`).
+            options = self._child(code, pret["options"], "exec", "resume",
+                                  "--json", sid)
+            self._wait(lambda: all(os.path.exists(p) for p in pret.values()))
+            for nom, ctx in self.variants:
+                with self.subTest(nom), ctx():
+                    found = {h["pid"]: h for h in
+                             platform.holders(chemin, sid, session=True)}
+                    self.assertNotIn(citant.pid, found)
+                    self.assertIn(repris.pid, found)
+                    self.assertIn(lie.pid, found)
+                    self.assertIn(options.pid, found)
+
+    def test_reconnaissance_du_positional_de_reprise(self):
+        """#1283 R1 cx2 : options intercalees positives, citations negatives.
+
+        `--all` elargit la recherche (il ne designe pas la derniere session) ;
+        les flags sans valeur ne mangent pas l'id ; `-p`/`--profile` de Codex
+        porte une valeur (contrairement au `-p` de Claude)."""
+        from ameesh.platform import process as platform_process
+        sid, autre = "sid-r1-xyz", "sid-autre-xyz"
+        cas = [
+            (["codex", "exec", "resume", "--json", sid], True),
+            (["codex", "resume", "--no-alt-screen", sid], True),
+            (["codex", "resume", "--no-daemon", sid], True),
+            (["codex", "exec", "resume", "--worktree", sid], True),
+            (["codex", "exec", "resume", "--ephemeral", sid], True),
+            (["codex", "exec", "resume", "--ignore-user-config", sid], True),
+            (["codex", "exec", "resume", "--ignore-rules", sid], True),
+            (["codex", "exec", "resume", "--strict-config", sid], True),
+            # --approve-for-me (interactif seulement) ne prend pas de valeur :
+            # l'id qui suit reste le positional (liste cx2, 14/10 09:42).
+            (["codex", "resume", "--approve-for-me", sid], True),
+            (["codex", "resume", "--dangerously-bypass-hook-trust", sid], True),
+            # --all : Show all sessions, l'id qui suit est le positional
+            (["codex", "resume", "--all", sid], True),
+            (["codex", "resume", "-m", "gpt-5.1-codex", sid], True),
+            (["codex", "resume", "-c", 'model_reasoning_effort="high"', sid], True),
+            (["codex", "resume", "--model=gpt-5.1-codex", sid], True),
+            (["codex", "resume", "--", sid], True),
+            (["claude", "--resume", sid], True),
+            (["claude", "-r", sid], True),
+            (["claude", "--resume", sid, "-p", "prompt qui cite " + sid], True),
+            (["claude", "-p", "prompt qui cite " + sid, "--resume", sid], True),
+            (["dsh", "--session-id", sid], True),
+            (["dsh", "--session-id=%s" % sid], True),
+            (["dsh", "tui", "--resume", sid], True),
+            # un mot `resume` du texte ne masque pas le selecteur reel
+            (["claude", "-p", "resume", "--resume", sid], True),
+            (["codex", "resume", "--json", "prompt qui cite " + sid], False),
+            (["codex", "resume", "--last", "prompt qui cite " + sid], False),
+            (["codex", "resume", "--last", sid], False),
+            (["codex", "resume", autre, "prompt qui cite " + sid], False),
+            (["codex", "resume", "--model", sid, autre], False),
+            (["codex", "resume", "--model=" + sid, autre], False),
+            (["codex", "resume", "-p", sid, autre], False),
+            (["codex", "resume", "--profile", sid, autre], False),
+            (["dsh", "--json", '{"brief": "session %s"}' % sid], False),
+        ]
+        for argv, attendu in cas:
+            with self.subTest(argv=argv):
+                self.assertIs(platform_process._session_argument(argv, sid), attendu)
+
     def test_detenteurs_d_un_dossier(self):
         with tempfile.TemporaryDirectory() as tmp:
             dossier = os.path.join(tmp, "session")
