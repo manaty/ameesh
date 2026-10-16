@@ -374,8 +374,17 @@ class WorkItems(interface.WorkItems):
         # une base d'avant la migration. Les commandes historiques le lisent
         # par cette interface : un SELECT brut serait refusé sur une connexion
         # d'exécuteur médié (`work move`/`note`/`close` d'une VM).
+        # #2130/D : `workflow_stage` et `workflow_version` sont portés par la
+        # même lecture — `project_lots` y passe pour les lots anciens/orphelins
+        # retrouvés par leur marqueur, et la projection a besoin des trois
+        # champs (sinon `projection-stage-missing` sur un lot sain). Une base
+        # pré-0452 rend '', NULL, 0 : aucune sonde de colonne.
         rows = self.db.query(
-            "SELECT %s, coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref"
+            "SELECT %s,"
+            "       coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref,"
+            "       to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
+            "       coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
+            "         AS workflow_version"
             " FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
         return rows[0] if rows else None
 
@@ -1594,9 +1603,16 @@ class WorkItems(interface.WorkItems):
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def issue_feed(self, limit) -> list[dict]:
-        """Lots ouverts ou porteurs d'une `issue_ref` (les plus récents d'abord
-        pour la borne), rendus par id croissant, avec l'équipe de leur fiche et
-        l'équipe, le chantier et l'hôte de leur assigné."""
+        """Lots ouverts, porteurs d'une `issue_ref`, ou pinnés sur une révision
+        Process (#2130/D : un cœur `merged` reste projeté ouvert, il doit donc
+        être dans le flux), les plus récents d'abord pour la borne, rendus par
+        id croissant avec l'équipe de leur fiche et l'équipe, le chantier et
+        l'hôte de leur assigné.
+
+        #2130/D : `workflow_ref`, `workflow_stage` et `workflow_version` sont
+        portés par la lecture comme B5 les porte dans `work.get` (`to_jsonb`,
+        sans sonde de colonne) ; base pré-0452 : `''`, NULL, 0.
+        """
         return self.db.query(
             "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
             "       r.chantier AS assignee_chantier, r.host AS assignee_host,"
@@ -1604,11 +1620,17 @@ class WorkItems(interface.WorkItems):
             "       (SELECT extract(epoch from min(m.at))::float8 FROM work_item_milestones m"
             "         WHERE m.work_item_id = w.id AND m.kind = 'merged') AS merged_ts"
             "  FROM (SELECT %s,"
+            "               coalesce(to_jsonb(work_items)->>'workflow_ref', '')"
+            "                 AS workflow_ref,"
+            "               to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
+            "               coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
+            "                 AS workflow_version,"
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
             "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
             "          FROM work_items"
             "         WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
+            "            OR coalesce(to_jsonb(work_items)->>'workflow_ref', '') <> ''"
             "         ORDER BY id DESC LIMIT %%s) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN agent_registry r ON r.name = w.assignee"
