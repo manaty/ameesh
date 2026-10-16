@@ -8,11 +8,85 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import plan_git, resolutions, storage, train, train_git, train_incidents, train_transports
+from ameesh import (plan_git, resolutions, storage, train, train_git, train_incidents,
+                    train_transports, train_transport_journal)
 from ameesh.canon import GitError
 from .test_1467_train import MemoryPorts, row
 from .test_l160b_radar import _git, _write
 from .test_l160e2_land import _Land
+
+
+class NormalizedQualificationTest(unittest.TestCase):
+    def setUp(self):
+        self.facts = dict(source="github.com/o/r", target="main", lot=2, source_head="a" * 40,
+                          base="b" * 40, head="c" * 40, tree="d" * 40, delta="e" * 64,
+                          ref="refs/ameesh/resolutions/2/fixture")
+        self.reference = dict(kind="work-event", id=7)
+        self.qualification = dict(kind="mechanical", references=[self.reference])
+        self.originals = [dict(reference=self.reference, author="pilot", record=dict(
+            id=7, work_item_id=2, actor="pilot", note="original qualification", created_ts=1))]
+        self.resolver = train_transport_journal.Normalized()
+
+    def event(self, number=8, *, state="maintained", actor="pilot", **change):
+        value = dict(schema=train_transport_journal.QUALIFICATION_SCHEMA, work_item_id=2,
+            frozen_sha=self.facts["source_head"], base=self.facts["base"], head=self.facts["head"],
+            kind="mechanical", state=state, source_reference=self.reference)
+        value.update(change)
+        return dict(id=number, work_item_id=2, actor=actor, created_ts=2, note=json.dumps(value))
+
+    def resolve(self, events, *, facts=None):
+        return self.resolver(None, facts=facts or self.facts, qualification=self.qualification,
+                             originals=self.originals, history=dict(events=events, milestones=[]))
+
+    def test_exact_original_author_normalization_preserves_existing_references(self):
+        answer = self.resolve([self.event()])
+        self.assertEqual(answer, dict(facts=self.facts, qualification=self.qualification, active=True))
+
+    def test_latest_state_uses_database_time_and_id_even_when_input_is_unordered(self):
+        self.assertIsNone(self.resolve([self.event(9, state="withdrawn"), self.event(8)]))
+        self.assertTrue(self.resolve([self.event(10), self.event(9, state="withdrawn"),
+                                      self.event(8)])["active"])
+
+    def test_payload_cannot_supply_author_or_lot(self):
+        for change in (dict(actor="another"), dict(work_item_id=99), dict(author="pilot")):
+            with self.subTest(change=change), self.assertRaises(train.TrainError):
+                self.resolve([self.event(**change)])
+        event = self.event()
+        event["work_item_id"] = 99
+        with self.assertRaisesRegex(train.TrainError, "another lot"):
+            self.resolve([event])
+
+    def test_closed_bounds_do_not_rebind_a_historical_freeze_or_another_base(self):
+        for change in (dict(source_head="f" * 40), dict(base="f" * 40), dict(head="f" * 40)):
+            with self.subTest(change=change):
+                self.assertIsNone(self.resolve([self.event()], facts=dict(self.facts, **change)))
+        self.assertTrue(self.resolve([self.event(9, state="withdrawn", base="f" * 40),
+                                      self.event(8)])["active"])
+
+    def test_prose_and_unknown_json_do_not_qualify(self):
+        event = self.event()
+        for text in ("mechanical GO " + self.facts["head"], '{"unrelated":true}',
+                     "The format is " + train_transport_journal.QUALIFICATION_SCHEMA):
+            event["note"] = text
+            self.assertIsNone(self.resolve([event]))
+            self.assertTrue(self.resolve([self.event(), event])["active"])
+        for change in (dict(schema="unknown/1"), dict(frozen_sha="a" * 7), dict(state="ok")):
+            with self.subTest(change=change), self.assertRaises(train.TrainError):
+                self.resolve([self.event(**change)])
+
+    def test_duplicate_json_keys_are_ambiguous_even_after_an_earlier_maintained_state(self):
+        event = self.event(9)
+        event["note"] = event["note"][:-1] + ',"state":"withdrawn"}'
+        with self.assertRaisesRegex(train.TrainError, "unreadable"):
+            self.resolve([self.event(), event])
+
+    def test_reference_requires_an_exact_integer_id_and_closed_shape(self):
+        self.reference["id"] = 1
+        self.originals[0]["record"]["id"] = 1
+        for reference in (dict(kind="work-event", id=True), dict(self.reference, extra="unknown")):
+            event = self.event(source_reference=reference)
+            with self.subTest(reference=reference), self.assertRaises(train.TrainError):
+                self.resolve([self.event(), event])
 
 
 class TransportGitTest(_Land):

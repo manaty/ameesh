@@ -120,7 +120,9 @@ train_transport_journal.import_ref(
     qualification={"kind": "mechanical", "references": original_references},
     actor=importer,
 )
-reader = train_transport_journal.Recorded(project, resolve=qualified_resolver)
+reader = train_transport_journal.Recorded(
+    project, resolve=train_transport_journal.Normalized()
+)
 passage = Passage(..., transports=reader)
 ```
 
@@ -144,10 +146,26 @@ preserved without new votes or freezes.
 
 Missing/changed originals, missing resolvers, ambiguous index entries and
 stale contexts produce named member deferrals. During CI, withdrawal refuses
-promotion and preserves the existing plan and single CI attempt. This source
-adapter remains inactive until its qualification resolver is supplied.
+promotion and preserves the existing plan and single CI attempt.
+
+The pilot supplied `ameesh-transport-qualification/1` on **16 October 2026,
+05:10 Paris** (lot events 30879/30881/30884). `Normalized` recognizes only
+that exact mechanical format: `schema`, `work_item_id`, `frozen_sha`, `base`,
+`head`, `kind`, `state`, `source_reference`. The original qualification and
+its normalization must belong to the same lot and database author. The last
+applicable structured state, ordered by database time and event ID, maintains
+or withdraws the exact frozen SHA/base/head. A historical freeze cannot be
+rebound to the current one. Unknown fields, duplicate JSON keys and foreign
+authors or scopes supply no authority. Adapted qualifications still require
+their separate explicit resolver. No live Passage or profile is installed.
 
 ## Validation du port
+
+Seven normalization boundary checks cover the original database author and
+lot, exact bounds, latest maintained/withdrawn state, historical freezes,
+unrecognized prose/JSON, duplicate keys and strict reference IDs. A dedicated
+Passage check uses this resolver through import, persisted plan, lost clone
+and a fresh SQL connection; CI and provenance remain explicit fixtures.
 
 The source adapter adds nine targeted checks, green with both PostgreSQL
 drivers, plus the 19 executor contract checks. They cover import to persisted

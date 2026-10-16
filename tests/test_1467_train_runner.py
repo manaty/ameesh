@@ -406,7 +406,7 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(rows[0]["files"], ["adapted-test", "content"])
         self.assertEqual(rows[0]["sha"], self.head)
 
-    def indexed_transport(self):
+    def indexed_transport(self, *, kind="adapted"):
         self.automatic_passage()
         member = self.ops.queue(None)[0]
         self.git(self.publisher, "checkout", "main")
@@ -420,7 +420,7 @@ class TrainRunnerTest(PgTestCase):
         work.note(self.db, member["work_item_id"], "existing qualification fixture " + head,
                   actor="fixture-pilot")
         original = self.ops.events(member["work_item_id"], 1)[0]
-        qualification = dict(kind="adapted", references=[dict(kind="work-event", id=original["id"])])
+        qualification = dict(kind=kind, references=[dict(kind="work-event", id=original["id"])])
         self.import_transport = lambda db=self.db: train_transport_journal.import_ref(
             db, self.project, self.publisher, ref, lot=member["work_item_id"],
             source_head=self.head, qualification=qualification, actor="fixture-importer")
@@ -457,6 +457,30 @@ class TrainRunnerTest(PgTestCase):
         result = resumed.step(other, self.now + 1)
         self.assertEqual(result["result"], "landed", result)
         self.assertIs(self.transport_connections[-1], other)
+        state = self.ops.train_read(self.key)
+        self.assertEqual(state["plan"], json.loads(json.dumps(plan)))
+        self.assertEqual(len(state["attempts"]), 1)
+        self.assertEqual(list(train.identity(self.ops.queue(None)[0])), list(train.identity(member)))
+
+    def test_normalized_original_author_qualification_to_plan_then_lost_clone_on_fresh_connection(self):
+        member, document, _ = self.indexed_transport(kind="mechanical")
+        facts = document["facts"]
+        normalization = dict(schema=train_transport_journal.QUALIFICATION_SCHEMA,
+            work_item_id=member["work_item_id"], frozen_sha=facts["source_head"],
+            base=facts["base"], head=facts["head"], kind="mechanical", state="maintained",
+            source_reference=document["qualification"]["references"][0])
+        work.note(self.db, member["work_item_id"], json.dumps(normalization), actor="fixture-pilot")
+        reader = train_transport_journal.Recorded(self.project, resolve=train_transport_journal.Normalized())
+        passage = self.passage(transports=reader)
+        result = passage.step(self.db, self.now)
+        self.assertEqual(result["result"], "ci", result)
+        plan = result["plan"]
+        self.assertEqual(plan["transports"][0]["qualification"], document["qualification"])
+        shutil.rmtree(passage.repository_path())
+        other = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other.close)
+        result = self.passage(transports=reader).step(other, self.now + 1)
+        self.assertEqual(result["result"], "landed", result)
         state = self.ops.train_read(self.key)
         self.assertEqual(state["plan"], json.loads(json.dumps(plan)))
         self.assertEqual(len(state["attempts"]), 1)

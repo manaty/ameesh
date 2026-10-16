@@ -20,6 +20,9 @@ from .train_review import SHA
 SCHEMA = "ameesh-train-transport-index/1"
 PREFIX = SCHEMA + " "
 FACTS = {"source", "target", "lot", "source_head", "base", "head", "tree", "delta", "ref"}
+QUALIFICATION_SCHEMA = "ameesh-transport-qualification/1"
+QUALIFICATION_FIELDS = {"schema", "work_item_id", "frozen_sha", "base", "head", "kind",
+                        "state", "source_reference"}
 
 
 def _prefix(lot):
@@ -151,6 +154,67 @@ def import_ref(db, project, path, ref, *, lot, source_head, qualification, actor
     text = _prefix(lot) + json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     work.note(db, lot, text, actor=actor, once=True)
     return document
+
+
+class Normalized:
+    """Read an original author's structured normalization, not free prose.
+
+    #1467 pilot format, 16 October 2026 05:10 Paris: the database row supplies
+    the author and lot. The last applicable structured state preserves or
+    withdraws the existing qualification; it does not create another vote.
+    Only the supplied mechanical format is supported. Adapted qualifications
+    keep their separate explicit resolver until their format is qualified.
+    """
+    @staticmethod
+    def _object(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError("duplicate JSON keys")
+        return value
+
+    def __call__(self, db, *, facts, qualification, originals, history):
+        if qualification["kind"] != "mechanical" or not originals \
+                or [original["reference"] for original in originals] != qualification["references"]:
+            return None
+        for original in originals:
+            reference, record = original["reference"], original["record"]
+            if reference["kind"] != "work-event" or record["work_item_id"] != facts["lot"] \
+                    or record["id"] != reference["id"]:
+                return None
+            applicable = []
+            for event in history["events"]:
+                try:
+                    value = json.loads(event["note"], object_pairs_hook=self._object)
+                except (TypeError, ValueError):
+                    if str(event["note"]).lstrip().startswith("{") \
+                            and QUALIFICATION_SCHEMA in str(event["note"]):
+                        raise TrainError("unreadable original qualification normalization")
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                cited = value.get("source_reference")
+                if not isinstance(cited, dict) or cited.get("kind") != reference["kind"] \
+                        or cited.get("id") != reference["id"]:
+                    continue
+                if set(value) != QUALIFICATION_FIELDS or value["schema"] != QUALIFICATION_SCHEMA \
+                        or cited != reference or type(cited["id"]) is not int \
+                        or value["kind"] != "mechanical" \
+                        or value["state"] not in ("maintained", "withdrawn") \
+                        or type(value["work_item_id"]) is not int \
+                        or any(not isinstance(value[key], str) or not SHA.fullmatch(value[key])
+                               for key in ("frozen_sha", "base", "head")):
+                    raise TrainError("unsupported original qualification normalization")
+                if event["work_item_id"] != facts["lot"] or value["work_item_id"] != facts["lot"]:
+                    raise TrainError("qualification normalization names another lot")
+                if (value["frozen_sha"], value["base"], value["head"]) != (
+                        facts["source_head"], facts["base"], facts["head"]):
+                    continue
+                if event["actor"] != original["author"] or event["actor"] != record["actor"]:
+                    raise TrainError("qualification normalization has another author")
+                applicable.append((event["created_ts"], event["id"], value["state"]))
+            if not applicable or max(applicable)[2] != "maintained":
+                return None
+        return dict(facts=copy.deepcopy(facts), qualification=copy.deepcopy(qualification), active=True)
 
 
 class Recorded:
