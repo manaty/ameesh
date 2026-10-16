@@ -847,9 +847,12 @@ class CostBook:
             return []
         # la tranche lue est exactement [start, end) : tout ce qu'elle contient
         # est dans la tranche, et un octet invalide écarte sa ligne (JSON
-        # illisible) au lieu de faire échouer toute la lecture.
+        # illisible) au lieu de faire échouer toute la lecture. Coupée sur
+        # "\n" seul, comme le compte de l'exécuteur (`events_start`) : un
+        # `splitlines()` couperait aussi sur U+2028 ou U+0085, qu'un harnais
+        # écrit tels quels dans une chaîne JSON, et perdrait l'événement.
         texte = brut.decode("utf-8", "replace")
-        return _parse_events(texte.splitlines(), 0)
+        return _parse_events(texte.split("\n"), 0)
 
     # -- jauges de forfait --------------------------------------------------
     def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:

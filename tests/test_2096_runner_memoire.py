@@ -296,6 +296,19 @@ class JournalReadTest(unittest.TestCase):
         self.assertEqual(book.events(self.agent), [{"n": 1}, {"n": 2}])
         self.assertEqual(book.events(self.agent, start=1), [{"n": 2}])
 
+    def test_a_raw_line_separator_inside_a_string_keeps_its_event(self):
+        # Un harnais Node écrit U+2028 et U+0085 tels quels dans une chaîne
+        # JSON ; l'exécuteur compte les lignes sur "\n" (`events_start`), la
+        # tranche doit donc se couper de même, sans perdre l'événement.
+        book = self.write({"n": 0},
+                          '{"n": 1, "text": "a\u2028b\u0085c"}',
+                          {"n": 2})
+        with open(self.path, "rb") as fh:
+            self.assertEqual(sum(1 for _ in fh), 3)
+        self.assertEqual([e["n"] for e in book.events(self.agent)], [0, 1, 2])
+        self.assertEqual([e["n"] for e in book.events(self.agent, start=1, end=2)], [1])
+        self.assertEqual([e["n"] for e in book.events(self.agent, start=2)], [2])
+
     def test_reverse_lines_across_block_boundaries(self):
         lignes = [b"x" * (index * 7 % 40) + b"ligne-%d" % index for index in range(200)]
         self.write(*lignes)
