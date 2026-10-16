@@ -296,9 +296,9 @@ class OveragePartageTest(_Base):
         self.assertEqual(store.active(self.cfg.host, "codex")["account"], "primaire")
 
     def test_pas_de_tour_sur_le_compte_actif_retenu_entre_temps(self):
-        """B2, variante de l'auditeur : cible == compte actif lu en tête ; une
-        retenue publiée entre-temps est relue avant de rendre le compte — le
-        chemin sans bascule ne relance pas l'incident."""
+        """B1/B2, variante de l'auditeur : cible == compte actif lu en tête ;
+        une retenue publiée entre-temps est relue avant de rendre le compte —
+        la reprise place le tour sur un compte libre, jamais sur le retenu."""
         b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
         items = self._items(b)
         now = float(int(time.time()))
@@ -312,8 +312,95 @@ class OveragePartageTest(_Base):
                                side_effect=[set(), {"secondaire"}]):
             choix = accounts.choose(self.db, self.cfg.host, "codex", items,
                                     self._book(), now=now + 1.0, agent="runner-b")
-        self.assertIsNone(choix.profile)
-        self.assertIn("held for overage", choix.reason)
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+        self.assertEqual(choix.switched["to"], "primaire")
+        self.assertEqual(store.active(self.cfg.host, "codex")["account"], "primaire")
+
+    def test_le_forcage_est_leve_si_la_retenue_apparait_pendant_le_choix(self):
+        """B1 de la R2 : le forçage n'est pas validé d'avance — une retenue
+        publiée pendant la décision (après la lecture en tête) le fait lever
+        pour un compte libre, comme si elle avait été lue en tête."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items,
+                                       "secondaire", by="test"))
+        store = storage.of(self.db).accounts
+        with mock.patch.object(accounts, "_held_for_overage",
+                               side_effect=[set(), {"secondaire"}]):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now + 1.0, agent="runner-b")
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+        self.assertFalse(choix.forced)
+        self.assertFalse(store.active(self.cfg.host, "codex")["forced"])
+
+    def test_la_continuite_ne_garde_pas_une_retenue_apparue_pendant_le_choix(self):
+        """B1 de la R2 : la continuité est un retour qui lance un tour — une
+        retenue publiée pendant la décision la rompt, le tour part sur un
+        compte libre."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        storage.of(self.db).accounts.init_active(self.cfg.host, "codex", "primaire")
+        with mock.patch.object(accounts, "_held_for_overage",
+                               side_effect=[set(), {"secondaire"}]):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now + 1.0, agent="runner-b",
+                                    session_account="secondaire")
+        self.assertFalse(choix.kept)
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+
+    def test_le_choix_critique_ne_rend_pas_une_retenue_apparue_pendant_le_choix(self):
+        """B1 de la R2 : le choix propre d'un agent critique (`per_agent`) passe
+        par le même point de validation — la retenue publiée pendant la
+        décision écarte le compte du classement."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        storage.of(self.db).accounts.init_active(self.cfg.host, "codex", "primaire")
+        with mock.patch.object(accounts, "_held_for_overage",
+                               side_effect=[set(), {"secondaire"}]):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now + 1.0, critical=True)
+        self.assertTrue(choix.per_agent)
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+
+    def test_une_retenue_publiee_apres_la_bascule_survit_et_ecarte_le_compte(self):
+        """B2 de la R2 : la retenue publiée par un autre runner APRÈS le commit
+        de la bascule n'est pas effacée par un nettoyage hors verrou, et le
+        choix ne rend jamais le compte retenu (reprise sur l'état frais)."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        store = storage.of(self.db).accounts
+        store.init_active(self.cfg.host, "codex", "primaire")
+        vrai = type(store).switch_guarded
+
+        def bascule_puis_retenue(pilote, host, harness, *, to, **kw):
+            # le runner A quitte le secondaire en dépassement juste après le
+            # commit de la bascule de B : sa retenue est publiée sous le verrou
+            resultat = vrai(pilote, host, harness, to=to, **kw)
+            if resultat and to == "secondaire":
+                pilote.hold(host, harness, to, kw["now"] + 600,
+                            "codex plan: in overage (runner A)")
+            return resultat
+
+        with mock.patch.object(type(store), "switch_guarded", bascule_puis_retenue):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now, agent="runner-b")
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+        retenues = store.holds(self.cfg.host, "codex")
+        self.assertIn("secondaire", retenues)
+        self.assertGreater(float(retenues["secondaire"]["until_ts"]), now)
+        self.assertEqual(store.active(self.cfg.host, "codex")["account"], "primaire")
 
     def test_switch_guarded_refuse_une_cible_retenue(self):
         """Le verrou de la bascule : cible retenue ⇒ refus sans écriture ;
@@ -337,6 +424,9 @@ class OveragePartageTest(_Base):
             hold_until=maintenant + 600))
         self.assertEqual(len(self._bascules()), 1)
         self.assertIn("primaire", store.holds(self.cfg.host, "codex"))
+        # R2 auditeur, B2 : la retenue ÉCHUE de la cible est nettoyée dans la
+        # transaction de bascule (jamais un DELETE après le commit)
+        self.assertNotIn("secondaire", store.holds(self.cfg.host, "codex"))
 
     def test_la_pause_dit_la_retenue(self):
         """Tous les comptes retenus : la pause le dit, elle ne prétend pas

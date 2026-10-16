@@ -790,7 +790,11 @@ class Accounts(Domain):
         * quand `hold_reason` est donné, pose (ou rafraîchit) la retenue du
           compte **quitté** dans la même transaction — le compte qu'on quitte
           en dépassement devient indisponible pour les autres workers au même
-          instant où la bascule est visible.
+          instant où la bascule est visible ;
+        * les retenues **échues** de `to` sont nettoyées dans la même
+          transaction (R2 auditeur, B2) : un nettoyage APRÈS le commit
+          effacerait une retenue publiée entre-temps par la bascule d'un autre
+          runner, qui attend le même verrou.
 
         Faux sans rien écrire : compte vu changé, forçage manuel en place,
         aucun changement, ou retenue valide sur `to`."""
