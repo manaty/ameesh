@@ -1,0 +1,13 @@
+#1770 — transport incident : fix fixtures sur main fbb8eb58 (paquet h-2100)
+Candidat : 2c109e2f876beef4cea2ad5755b9c7ce56cb93a6 = fbb8eb58 + cherry-pick du delta mesure 7f7202a4.
+Portee : tests/test_l161e_map.py SEUL (1 fichier, +35/-2) ; blob du fichier =
+f824aabb588aec8f5cdfd380560ad0bd3d6cde0d, identique a celui mesure sur VM
+(34 tests, 18,802 s, OK, 1 saute) le 16/10 a 22:42Z.
+Verification locale (agents-2, harnais test-parts.py, driver psycopg, sans .pth de
+mesure) : 34 tests en 17,888 s, OK (11 sautes faute de couverture installee
+localement), module le plus lourd 18 s.
+Motif : main fbb8eb58 (paquet h-2100, 15 lots, SANS 1770) garde le module lourd
+(~1440 s mesure sur cb77f899) ; la part psycopg 2/6 d'un run carte sur cette base
+depasserait encore le plafond de 40 min. Le fix doit etre dans l'arbre mesure
+pour qu'une carte complete soit possible.
+Aucun autre fichier, aucune regle activee, aucune carte produite ici.
