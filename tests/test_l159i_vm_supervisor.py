@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """VM supervisor lifecycle with fake Podman; no VM or network access."""
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -49,8 +51,9 @@ class VMSupervisor(unittest.TestCase):
         self.addCleanup(self.uid.stop)
 
     def supervise(self, launch, stop=None, **kwargs):
+        kwargs.setdefault('log', lambda _: None)
         return V.supervise(self.recipe, stop or threading.Event(), launch=launch,
-                           now=lambda: 100, log=lambda _: None, **kwargs)
+                           now=lambda: 100, **kwargs)
 
     def test_exit_codes_preserve_volume_except_revocation_and_clear_code(self):
         marker = self.root / 'volume/executor.json'
@@ -138,7 +141,7 @@ class VMSupervisor(unittest.TestCase):
         raw = {'schema': 'ameesh-host-state/1', 'state': 'available', 'seq': 1,
                'until_ts': 9000, 'expires_ts': 99}
         self.state.write_text(json.dumps(raw))
-        self.assertEqual(V.gate_state(str(self.state), 100), 'stopped')
+        self.assertEqual(V.gate_state(str(self.state), 100), 'stale')
         raw['expires_ts'] = 190
         self.state.write_text(json.dumps(raw))
         def launch(_):
@@ -263,6 +266,81 @@ class VMSupervisor(unittest.TestCase):
                 self.supervise(launch, stop, run=run)
         self.assertIn(['podman', 'kill', V.NAME], calls)
         self.assertFalse(process.alive)
+
+    def test_window_end_stops_container_and_relaunches_at_next_window(self):
+        """#1402 N1 : la fin de fenêtre arrête le conteneur sans finir l'unité ;
+        la fenêtre suivante relance sans opérateur."""
+        available = self.state.read_text()
+        launches = []
+        def launch(_):
+            launches.append(1)
+            if len(launches) == 1:
+                raw = json.loads(available)
+                raw['until_ts'] = 99
+                self.state.write_text(json.dumps(raw))
+                return Process(0, running=True)
+            return Process(0)
+        class Stop:
+            def is_set(inner):
+                return False
+            def wait(inner, _):
+                self.state.write_text(available)
+                return False
+        calls = []
+        self.assertEqual(self.supervise(launch, Stop(),
+                                        run=lambda argv, **_: calls.append(argv) or Process(0)), 0)
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(calls, [['podman', 'stop', '--ignore', '--time=100', V.NAME]])
+
+    def test_fresh_guard_stop_keeps_the_unit_for_the_guard(self):
+        """#1402 N1 : sur `stopped` d'un garde vivant, le superviseur arrête le
+        conteneur et attend ; c'est le garde qui arrête l'unité (et la note
+        dans `guard.stopped`), le superviseur ne sort que sur signal."""
+        def launch(_):
+            self.state.write_text(json.dumps({'schema': 'ameesh-host-state/1', 'state': 'stopped',
+                                              'seq': 2, 'until_ts': 200, 'expires_ts': 190}))
+            return Process(143, running=True)
+        class Stop:
+            waits = 0
+            def is_set(inner):
+                return inner.waits >= 3
+            def wait(inner, _):
+                inner.waits += 1
+                return inner.is_set()
+        stop = Stop()
+        calls = []
+        self.assertEqual(self.supervise(launch, stop,
+                                        run=lambda argv, **_: calls.append(argv) or Process(0)), 0)
+        self.assertEqual(stop.waits, 3)
+        self.assertEqual(calls, [['podman', 'stop', '--ignore', '--time=100', V.NAME]])
+
+    def test_signal_exit_is_logged_with_its_name(self):
+        """#1402 N3 : un rc négatif (signal) reste 2, et le journal garde le rc
+        brut et le nom du signal."""
+        logs = []
+        self.assertEqual(self.supervise(lambda _: Process(-9), log=logs.append), 2)
+        self.assertEqual(logs, ['VM executor exited: -9 (SIGKILL)'])
+        self.assertEqual(V.exit_text(-200), '-200 (signal 200)')
+        self.assertEqual(V.exit_text(5), '5')
+
+    def test_main_names_the_python_refusal_and_no_recipe_path(self):
+        """#1402 (N de la R1 #1781) : le refus de version est lisible ; les
+        autres erreurs ne donnent que leur type, un message pouvant citer un
+        chemin de la recette."""
+        recipe = self.root / 'recipe.json'
+        recipe.write_text('{}')
+        for error, expected in (
+                (V.UnsupportedPython('the mediated supervisor requires Python >= 3.11 '
+                                     '(shutil.rmtree(dir_fd=) for the revocation wipe); '
+                                     'found 3.10'), 'requires Python >= 3.11'),
+                (FileNotFoundError(2, 'No such file', '/srv/secret-volume'), 'FileNotFoundError')):
+            with self.subTest(error=type(error).__name__):
+                out = io.StringIO()
+                with patch.object(V.sys, 'argv', ['vm_supervisor', str(recipe)]), \
+                        patch.object(V, 'supervise', side_effect=error), redirect_stdout(out):
+                    self.assertEqual(V.main(), 2)
+                self.assertIn(expected, out.getvalue())
+                self.assertNotIn('/srv/secret-volume', out.getvalue())
 
 
 if __name__ == '__main__':
