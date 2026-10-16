@@ -1,23 +1,23 @@
 ---
 type: Exploration
 status: exploration
-title: "Installeur piloté par le harnais de l’utilisateur"
+title: "Installer driven by the user's harness"
 ---
 
-# Installeur piloté par le harnais de l’utilisateur
+# Installer driven by the user's harness
 
-## Problème
+## Problem
 
-Une installation demande de relier le canon, le stockage, les services et les approbateurs. Le harnais déjà utilisé par la personne pourrait guider cette préparation, mais ses droits et ses erreurs restent à examiner.
+An installation requires linking the canon, the storage, the services and the approvers. The harness the person already uses could guide this preparation, but its rights and its errors remain to be examined.
 
 ## Intuitions
 
-Un parcours lisible pourrait expliquer les choix et les prérequis, puis vérifier l’état obtenu. L’installation et l’enrôlement humain pourraient rester deux opérations distinctes.
+A readable walkthrough could explain the choices and the prerequisites, then verify the resulting state. Installation and human enrolment could remain two distinct operations.
 
-## Questions ouvertes
+## Open questions
 
-- Comment détecter l’état existant et reprendre sans écraser la configuration ?
-- Quelles opérations exigent une action explicite de l’utilisateur ?
-- Comment vérifier l’installation sur différents postes sans dépendre d’un harnais particulier ?
+- How can the existing state be detected and resumed without overwriting the configuration?
+- Which operations require an explicit user action?
+- How can the installation be verified on different machines without depending on a particular harness?
 
-Contexte existant : [Décision sur le stockage local et l’installeur](../decisions/0016-stockage.md), [Plan de bascule existant](../bascule-v1.md). Ces références éclairent la question ; elles ne promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Decision on local storage and the installer](../decisions/0016-stockage.md), [Existing cutover plan](../bascule-v1.md). These references inform the question; they do not promote this card to a study or to decided work.
