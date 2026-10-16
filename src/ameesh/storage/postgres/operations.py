@@ -58,6 +58,13 @@ class Operations(interface.Operations):
             " WHERE name = %s RETURNING name", tuple(params + [name]))
         return bool(rows)
 
+    def set_dormant(self, name, owner, epoch, status_text) -> bool:
+        return bool(self.db.query(
+            "UPDATE agent_registry SET status_text = %s, updated_at = now()"
+            " WHERE name = %s AND status = 'idle' AND lease_owner = %s"
+            "   AND lease_epoch = %s AND lease_expires_at > clock_timestamp()"
+            " RETURNING name", (status_text, name, owner, int(epoch))))
+
     def set_session_work_item(self, name, owner, epoch, work_item) -> bool:
         rows = self.db.query(
             """
@@ -83,13 +90,15 @@ class Operations(interface.Operations):
         today = today or _dt.date.today().isoformat()
         return self.db.query(
             """
-            SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
+            SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   r.effort, r.tier,
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause
                    r.last_error,  -- L106 : le détail de « hôte non prêt »
@@ -98,6 +107,8 @@ class Operations(interface.Operations):
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
                    extract(epoch from r.lease_expires_at)::float8 AS lease_expires_ts,
                    extract(epoch from r.status_since)::float8     AS status_since_ts,
+                   -- #1521 : le début du motif affiché (status_text), pas du statut
+                   extract(epoch from r.status_reason_since)::float8 AS status_reason_since_ts,
                    extract(epoch from r.last_turn_at)::float8     AS last_turn_ts,
                    extract(epoch from r.updated_at)::float8       AS updated_ts,
                    extract(epoch from r.restart_requested_at)::float8 AS restart_requested_ts,
@@ -336,9 +347,14 @@ class Operations(interface.Operations):
         # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
         reviewer = ("w.reviewer" if has_reviewer(self.db)
                     else "''::text AS reviewer")
+        # #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
+        # `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
+        # migration. `released_by` en écarte les dépendants pinnés, dont la
+        # retenue ne tombe que par une commande `release` du registre.
         sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
-                   w.priority, w.app, w.workstream, __REVIEWER__,
+                   w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(

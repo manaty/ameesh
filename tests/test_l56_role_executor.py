@@ -21,6 +21,14 @@ from .test_cluster import TEST_DSN, _dsn_for
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
 
+#: Les rôles du contrat module (`role-module-writers.sql`) ont des noms fixes
+#: et vivent dans le CLUSTER, pas dans la base du run : sur le banc partagé,
+#: deux runs simultanés du module se marchaient dessus (DROP ROLE 2BP01, ACL
+#: laissée par l'autre run). Les verrous consultatifs étant pris par base, on
+#: sérialise la séquence création/usage/destruction dans une transaction
+#: persistante sur la base du banc, commune aux runs (y compris en psql).
+MODULE_WRITERS_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('ameesh-role-module-writers', 0))"
+
 
 class RoleExecutorTest(PgTestCase):
     @classmethod
@@ -115,6 +123,44 @@ class RoleExecutorTest(PgTestCase):
         finally:
             db.close()
 
+    def test_host_reads_a_real_cluster_identity(self):
+        """Codex r6: the event stream's position carries the cluster; a host
+        login, read-only like `ameesh serve`, must get a real one, not
+        `none` (every resume a reset). Revoked from PUBLIC (hardened
+        server): the script warns, and the superuser's grant restores it."""
+        from ameesh import storage
+
+        def cluster():
+            cfg = dataclasses.replace(self.cfg, dsn=self.host_dsn(), read_only=True)
+            db = db_mod.connect(cfg)
+            try:
+                return storage.of(db).events.bounds()["cluster"]
+            finally:
+                db.close()
+
+        own = storage.of(self.db).events.bounds()["cluster"]
+        # #928 : la position porte aussi l'identité propre du journal (j + 16 hexa)
+        self.assertRegex(own, "^[0-9a-f]{1,16}t[0-9a-f]{8}(j[0-9a-f]{16})?$")
+        self.assertEqual(cluster(), own)
+        functions = ("pg_control_system(), pg_control_checkpoint(),"
+                     " pg_current_wal_lsn(), pg_walfile_name(pg_lsn)")
+        # pg_catalog is per database: this test's own database only
+        self.addCleanup(self.db.execute,
+                        "GRANT EXECUTE ON FUNCTION %s TO PUBLIC" % functions)
+        self.addCleanup(self.db.execute, "REVOKE EXECUTE ON FUNCTION %s FROM %s" % (
+            functions, db_mod.quote_ident(self.role)))
+        self.db.execute("REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC")
+        self.assertIsNone(cluster())
+        proc = self.run_script(self.role)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("may not execute pg_control_system()", proc.stderr,
+                      attendu(proc.stderr))
+        self.db.execute("GRANT EXECUTE ON FUNCTION %s TO %s" % (
+            functions, db_mod.quote_ident(self.role)))
+        self.assertEqual(cluster(), own)
+        proc = self.run_script(self.role)
+        self.assertNotIn("may not execute", proc.stderr)
+
     def test_executor_cannot_forge_execution_proof_or_rewrite_policy(self):
         import json
         ModuleStore(self.db).replace("", modules.declarations(federation()))
@@ -148,51 +194,153 @@ class RoleExecutorTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             work.merged(self.db, lot, sha="abcdef1234")
 
+    def test_event_log_grant_reaches_an_isolated_writer(self):
+        """R2 auditeur P2-2: migration 0396's triggers write `ameesh_events`
+        with the writer's rights. An isolated writer granted table by table
+        before the migration (role-module-writers.sql, no ALTER DEFAULT
+        PRIVILEGES) gets 'permission denied for table ameesh_events' and can
+        no longer journal; the migration hands it the log's INSERT right."""
+        q = db_mod.quote_ident
+        role = "t_events_writer_" + uuid.uuid4().hex[:8]
+        self.db.execute("CREATE ROLE %s" % q(role))
+        self.addCleanup(self.db.execute, "DROP ROLE %s" % q(role))
+        self.addCleanup(self.db.execute, "DROP OWNED BY %s" % q(role))
+        self.db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(role)))
+        self.db.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s"
+                        " TO %s" % (q(self.schema), q(role)))
+        self.db.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s"
+                        % (q(self.schema), q(role)))
+        # the grant a protected deployment took before migration 0396 existed
+        self.db.execute("REVOKE ALL ON ameesh_events FROM %s" % q(role))
+        self.db.execute("REVOKE ALL ON SEQUENCE ameesh_events_id_seq FROM %s" % q(role))
+        lot = work.add(self.db, title="journal", app="demo")["id"]
+        insert = ("INSERT INTO work_item_events (work_item_id, state, actor)"
+                  " VALUES (%d, 'build', 'writer')" % lot)
+        with self.assertRaises(db_mod.DbError) as refused, self.db.transaction() as tx:
+            tx.execute("SET LOCAL ROLE %s" % q(role))
+            tx.execute(insert)
+        self.assertIn("permission denied for table ameesh_events", str(refused.exception))
+        self.db.execute("SELECT ameesh_events_grant_writers()")
+        before = self.db.query("SELECT count(*) AS n FROM ameesh_events"
+                               " WHERE object = 'lot:%d'" % lot)[0]["n"]
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ROLE %s" % q(role))
+            tx.execute(insert)
+        self.assertEqual(
+            self.db.query("SELECT count(*) AS n FROM ameesh_events"
+                          " WHERE object = 'lot:%d'" % lot)[0]["n"], before + 1)
+
     def test_module_writer_role_contract_and_executor_separation(self):
         q = db_mod.quote_ident
         names = ("ameesh_canon_sync", "ameesh_it_proof", "ameesh_it_qa")
-        placeholders = ", ".join(["%s"] * len(names))
-        existing = {r["rolname"] for r in self.db.query(
-            "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
-        script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
-        try:
-            for _ in range(2):
-                proc = subprocess.run(["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                                       "-f", script], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-            # This class has a private database: never mutate shared bench ACLs.
-            for grantee in (*names, "PUBLIC"):
-                with self.subTest(temp_grantee=grantee):
-                    target = "PUBLIC" if grantee == "PUBLIC" else q(grantee)
-                    self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
-                                    (q(self.database), target))
-                    try:
-                        proc = subprocess.run(
-                            ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                             "-f", script], capture_output=True, text=True, timeout=60,
-                            env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
-                        self.assertNotEqual(proc.returncode, 0)
-                        self.assertIn("must not create temporary objects", proc.stderr, attendu(proc.stderr))
-                    finally:
-                        self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+        # noms fixes du contrat, partagés par le cluster : sérialiser les runs
+        # concurrents du banc (cf. MODULE_WRITERS_LOCK).
+        with self.admin_db.transaction() as lock_db:
+            lock_db.execute(MODULE_WRITERS_LOCK)
+            placeholders = ", ".join(["%s"] * len(names))
+            existing = {r["rolname"] for r in self.db.query(
+                "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
+            script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
+
+            def run_writers():
+                return subprocess.run(
+                    ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                     "-f", script], capture_output=True, text=True, timeout=60,
+                    env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+
+            try:
+                for _ in range(2):
+                    proc = run_writers()
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                # This class has a private database: never mutate shared bench ACLs.
+                for grantee in (*names, "PUBLIC"):
+                    with self.subTest(temp_grantee=grantee):
+                        target = "PUBLIC" if grantee == "PUBLIC" else q(grantee)
+                        self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
                                         (q(self.database), target))
-            self.assertEqual(self.run_script(self.role).returncode, 0)
-            for name in names:
-                self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
-            with self.db.transaction() as tx:
-                tx.execute("SET LOCAL ROLE ameesh_canon_sync")
-                ModuleStore(tx).replace("", modules.declarations(federation()))
-            # Neither executor nor proof/QA writer is a policy writer.
-            for writer in ("ameesh_it_proof", "ameesh_it_qa"):
-                with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
-                    tx.execute("SET LOCAL ROLE %s" % writer)
-                    ModuleStore(tx).replace("", [])
-        finally:
-            for name in names:
-                self.db.execute("DROP OWNED BY %s" % q(name))
-                if name not in existing:
-                    self.db.execute("DROP ROLE %s" % q(name))
+                        try:
+                            proc = run_writers()
+                            self.assertNotEqual(proc.returncode, 0)
+                            self.assertIn("must not create temporary objects", proc.stderr, attendu(proc.stderr))
+                        finally:
+                            self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+                                            (q(self.database), target))
+                # #1194 (N1): the groups are NOLOGIN, so a member login holding
+                # TEMP re-opens the shadowing path; the audit walks the direct and
+                # inherited memberships, not just the group.
+                member = "t_writer_member_" + uuid.uuid4().hex[:8]
+                inherited = "t_writer_parent_" + uuid.uuid4().hex[:8]
+                other = "t_writer_other_" + uuid.uuid4().hex[:8]
+                self.db.execute("CREATE ROLE %s LOGIN" % q(member))
+                self.db.execute("CREATE ROLE %s NOLOGIN" % q(inherited))
+                self.db.execute("CREATE ROLE %s NOLOGIN" % q(other))
+                try:
+                    # TEMP on an unrelated role must not make the script fail.
+                    self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
+                                    (q(self.database), q(other)))
+                    proc = run_writers()
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    for group in names:
+                        with self.subTest(direct_writer_group=group):
+                            self.db.execute("GRANT %s TO %s" % (q(group), q(member)))
+                            self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
+                                            (q(self.database), q(member)))
+                            try:
+                                proc = run_writers()
+                                self.assertNotEqual(proc.returncode, 0)
+                                self.assertIn("has a member with TEMP", proc.stderr, attendu(proc.stderr))
+                            finally:
+                                self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+                                                (q(self.database), q(member)))
+                                self.db.execute("REVOKE %s FROM %s" % (q(group), q(member)))
+                    self.db.execute("GRANT %s TO %s" % (q("ameesh_it_qa"), q(inherited)))
+                    self.db.execute("GRANT %s TO %s" % (q(inherited), q(member)))
+                    for grantee in (inherited, member):
+                        with self.subTest(temp_member=grantee):
+                            self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
+                                            (q(self.database), q(grantee)))
+                            try:
+                                proc = run_writers()
+                                self.assertNotEqual(proc.returncode, 0)
+                                self.assertIn("has a member with TEMP", proc.stderr, attendu(proc.stderr))
+                            finally:
+                                self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+                                                (q(self.database), q(grantee)))
+                    # A member without TEMP leaves the contract intact.
+                    proc = run_writers()
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    # An additional parent can confer TEMP through inheritance or
+                    # only after SET ROLE; both paths allow creating a shadow table.
+                    self.db.execute("GRANT %s TO %s" % (q(other), q(member)))
+                    for inherit in (True, False):
+                        with self.subTest(temp_parent_inherit=inherit):
+                            self.db.execute("GRANT %s TO %s WITH INHERIT %s" %
+                                            (q(other), q(member), "TRUE" if inherit else "FALSE"))
+                            proc = run_writers()
+                            self.assertNotEqual(proc.returncode, 0)
+                            self.assertIn("has a member with TEMP", proc.stderr, attendu(proc.stderr))
+                    self.db.execute("REVOKE %s FROM %s" % (q(other), q(member)))
+                    proc = run_writers()
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                finally:
+                    self.db.execute("DROP OWNED BY %s, %s, %s" % (q(member), q(inherited), q(other)))
+                    self.db.execute("DROP ROLE %s, %s, %s" % (q(member), q(inherited), q(other)))
+                self.assertEqual(self.run_script(self.role).returncode, 0)
+                for name in names:
+                    self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
+                with self.db.transaction() as tx:
+                    tx.execute("SET LOCAL ROLE ameesh_canon_sync")
+                    ModuleStore(tx).replace("", modules.declarations(federation()))
+                # Neither executor nor proof/QA writer is a policy writer.
+                for writer in ("ameesh_it_proof", "ameesh_it_qa"):
+                    with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
+                        tx.execute("SET LOCAL ROLE %s" % writer)
+                        ModuleStore(tx).replace("", [])
+            finally:
+                for name in names:
+                    self.db.execute("DROP OWNED BY %s" % q(name))
+                    if name not in existing:
+                        self.db.execute("DROP ROLE %s" % q(name))
 
     def test_isolated_writer_records_observed_execution_without_policy_rights(self):
         import sys
@@ -240,6 +388,125 @@ class RoleExecutorTest(PgTestCase):
             self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
             self.db.execute("DROP OWNED BY %s" % q(parent))
             self.db.execute("DROP ROLE %s" % q(parent))
+
+    def test_executor_reads_claim_fences_without_release_controller_writes(self):
+        for relation in ('host_release_operations','host_release_fences','host_release_fence_receipts'):
+            for privilege in ('INSERT','UPDATE','DELETE'):
+                with self.subTest(relation=relation, privilege=privilege):
+                    self.assertFalse(self.db.query(
+                        'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                        (self.login, relation, privilege))[0]['allowed'])
+        self.assertEqual(self.as_host("SELECT ameesh_host_claims_open('synthetic-host')").returncode, 0)
+
+    def test_inherited_release_fence_writes_make_executor_audit_fail(self):
+        q = db_mod.quote_ident
+        parent = 't_release_parent_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % q(parent))
+        try:
+            self.db.execute('GRANT DELETE ON host_release_fences TO %s' % q(parent))
+            self.db.execute('GRANT %s TO %s' % (q(parent),q(self.role)))
+            result = self.run_script(self.role)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('forbidden DELETE on host_release_fences', result.stderr,
+                          attendu(result.stderr))
+        finally:
+            self.db.execute('REVOKE %s FROM %s' % (q(parent),q(self.role)))
+            self.db.execute('DROP OWNED BY %s' % q(parent))
+            self.db.execute('DROP ROLE %s' % q(parent))
+
+    def test_release_fence_migration_revokes_creation_time_executor_defaults(self):
+        import shutil
+        from pathlib import Path
+        import tempfile
+        q = db_mod.quote_ident
+        schema = 't_release_upgrade_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE SCHEMA %s' % q(schema))
+        cfg = dataclasses.replace(self.cfg, schema=schema)
+        db = db_mod.connect(cfg)
+        try:
+            db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT,INSERT,UPDATE,DELETE,'
+                       'TRUNCATE,REFERENCES,TRIGGER ON TABLES TO %s'
+                       % (q(schema),q(self.role)))
+            with tempfile.TemporaryDirectory() as directory:
+                shutil.copy(Path(REPO,'src/ameesh/migrations/0417_host_release_fences.sql'), directory)
+                migrations.migrate(db, directory)
+            for relation in ('host_release_operations','host_release_fences','host_release_fence_receipts'):
+                for privilege in ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'):
+                    self.assertFalse(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                        (self.role,schema+'.'+relation,privilege))[0]['allowed'])
+                self.assertTrue(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                    (self.role,schema+'.'+relation,'SELECT'))[0]['allowed'])
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA %s CASCADE' % q(schema))
+
+    def test_independent_release_role_writes_only_fences_and_locks_registry(self):
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_controller_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        try:
+            for _ in range(2):
+                result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                    '-v','role='+controller,'-f',str(sql)], env=env, text=True,capture_output=True,timeout=60)
+                self.assertEqual(result.returncode,0,result.stderr)
+            registry.upsert(self.db,'release-worker',harness='other',host='synthetic-host')
+            with self.db.transaction() as tx:
+                tx.execute('SET LOCAL ROLE %s' % q(controller))
+                tx.query('SELECT name FROM agent_registry WHERE name=%s FOR UPDATE',('release-worker',))
+                tx.execute('INSERT INTO host_release_operations(operation,host,manifest_digest) VALUES (%s,%s,%s)',
+                           ('controller-fixture','synthetic-host','a'*64))
+                tx.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)',
+                           ('synthetic-host','controller-fixture','synthetic-probe'))
+                for relation in ('agent_mailbox','mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending'):
+                    tx.query('SELECT * FROM '+q(relation)+' LIMIT 0')
+                tx.query('SELECT * FROM mesh_approvals_status LIMIT 0')
+                # SignedDecisionAuthority re-reads the owner key at every step.
+                tx.query('SELECT name, holder, public_key, public_key_fingerprint, key_role,'
+                         ' key_updated_at, key_revoked_at FROM mesh_keys LIMIT 0')
+            with self.assertRaises(db_mod.DbError):
+                with self.db.transaction() as tx:
+                    tx.execute('SET LOCAL ROLE %s' % q(controller))
+                    tx.execute("UPDATE agent_registry SET status='running' WHERE name='release-worker'")
+            self.db.execute('DELETE FROM host_release_fences WHERE operation=%s',('controller-fixture',))
+            self.db.execute('DELETE FROM host_release_operations WHERE operation=%s',('controller-fixture',))
+            # A column-only grant must be detected, even without table UPDATE.
+            self.db.execute('GRANT UPDATE(public_key) ON agent_registry TO %s' % q(controller))
+            result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('unrelated column write privilege',result.stderr,
+                          attendu(result.stderr))
+        finally:
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
+
+    def test_release_role_write_grant_on_a_view_makes_the_audit_fail(self):
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_controller_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        view = 't_release_view_' + uuid.uuid4().hex[:8]
+        try:
+            result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
+            self.assertEqual(result.returncode,0,result.stderr)
+            # A view is a write path too: a grant on it must be audited like a
+            # table, not silently ignored.
+            self.db.execute('CREATE VIEW %s AS SELECT name FROM agent_registry' % q(view))
+            self.db.execute('GRANT UPDATE ON %s TO %s' % (q(view),q(controller)))
+            result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('unrelated write privilege',result.stderr,attendu(result.stderr))
+        finally:
+            self.db.execute('DROP VIEW IF EXISTS %s' % q(view))
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
 
     def test_host_cannot_change_schema(self):
         for sql in ("CREATE TABLE intruder (x int)",

@@ -248,10 +248,13 @@ def _json(proc, what: str, kind):
 
 
 def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
-    """The open PR of `branch`: `{number, head, base, ci: green|red|pending}`."""
+    """The open PR of `branch`: `{number, head, base, ci: green|red|pending,
+    auto}`. `auto` (#1656) says GitHub auto-merge is armed: its
+    `--match-head-commit` is checked when it is armed, never again, so a head
+    rewritten under it would be merged without a new proof."""
     from . import radar
     proc = gh(["pr", "list", "--repo", slug, "--head", branch, "--state", "open", "--json",
-               "number,headRefOid,baseRefName,statusCheckRollup"])
+               "number,headRefOid,baseRefName,statusCheckRollup,autoMergeRequest"])
     if proc.returncode != 0:
         raise LandError("gh pr list: %s" % (proc.stderr or proc.stdout).strip()[:300])
     rows = _json(proc, "gh pr list", list)
@@ -262,7 +265,22 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
     return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"),
-            "base": rows[0].get("baseRefName"), "ci": ci}
+            "base": rows[0].get("baseRefName"), "ci": ci,
+            "auto": bool(rows[0].get("autoMergeRequest"))}
+
+
+def pr_disable_auto(slug: str, number, gh=_gh) -> str | None:
+    """#1656: disarms GitHub auto-merge on PR `number`; the error, or None.
+
+    A `gh pr merge --auto --match-head-commit` only checks the head when it
+    is armed: GitHub keeps no link to that commit. A head rewritten after
+    (even under `[skip ci]`) is then merged with no new qualification. Any
+    PR the queue manages is merged by ameesh itself, on the exact frozen
+    head; its auto-merge, whoever armed it, is disarmed first."""
+    proc = gh(["pr", "merge", str(number), "--repo", slug, "--disable-auto"])
+    if proc.returncode == 0:
+        return None
+    return (proc.stderr or proc.stdout or "").strip()[:300] or "exit %d" % proc.returncode
 
 
 def pr_merge(slug: str, number, sha: str, method: str, gh=_gh) -> str | None:
@@ -293,6 +311,18 @@ def pr_merged(slug: str, branch: str, sha: str, gh=_gh) -> dict | None:
         if merge_queue._same(row.get("headRefOid"), sha):
             return {"number": row.get("number"), "base": row.get("baseRefName")}
     return None
+
+
+def _merged_after_disarm(slug: str, branch: str, sha: str, gh) -> tuple[dict | None, str]:
+    """#1718: `pr_merged` read after a failed disarm, and what to add to the
+    ejection when it cannot be read. Its LandError must not reach the
+    retry path of `land`: the entry would go back to `queued` (or stay
+    `landing`) silently, auto-merge still armed — the ejection that asks
+    to disarm by hand is kept, fail closed."""
+    try:
+        return pr_merged(slug, branch, sha, gh=gh), ""
+    except LandError as exc:
+        return None, "; merged PRs unreadable (%s)" % str(exc)[:200]
 
 
 # --------------------------------------------------------------------------
@@ -383,7 +413,7 @@ class _Landing:
     once, at the end (`land_head`)."""
 
     def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
-                 cfg=None, clone=None):
+                 cfg=None, clone=None, replayer=None, parts=None):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
@@ -391,6 +421,10 @@ class _Landing:
         self.release = False
         self.projects = projects
         self.cfg, self.clone = cfg, clone
+        #: L1651 : le clone radar (pour relire la source de sélection versionnée
+        #: de la cible) et les parts dues déjà requalifiées par l'appelant
+        #: (§12 : le manifeste de paquet remplace la CI individuelle)
+        self.replayer, self.parts = replayer, parts
         self.entry = tuple(row.get(k) for k in
                            ("generation", "target", "frozen_id", "frozen_sha"))
 
@@ -464,7 +498,16 @@ class _Landing:
     def required_ci(self):
         if getattr(self.project, "ci_required", False):
             try:
-                merge_queue._required_ci(self.project, self.row["frozen_sha"])
+                parts = self.parts
+                if parts is None and getattr(self.project, "ci_parts", None):
+                    # L1651 (#1650) : la preuve de complétude est refaite ici,
+                    # sur la cible de cette entrée de file, avec la source de
+                    # sélection versionnée relue maintenant (le contrat peut
+                    # avoir bougé depuis l'admission).
+                    parts = merge_queue._parts_reader(
+                        self.project, self.project.repo, self.row.get("target") or "",
+                        self.row["frozen_sha"], self.replayer, cfg=self.cfg)
+                merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts)
             except merge_queue.QueueError as exc:
                 return self.eject(str(exc), "Restore green CI on the frozen commit, then "
                                   "ameesh work queue add %d." % self.lot)
@@ -492,18 +535,26 @@ class _Landing:
     def landed(self, merged: dict, base, *, pr=None) -> dict:
         self.release = True
         row, project = self.row, self.project
-        reason = "merged by ameesh (%s)" % merged["sha"][:12]
+        # #1682: a merge GitHub's auto-merge made at the frozen head, before
+        # the queue replayed anything, is constated: the queue's gates never
+        # ran on the merged tree, and the record must not say they did
+        constated = merged.get("state") == "constated"
+        who = "merged by GitHub auto-merge, constated by ameesh" if constated else "merged by ameesh"
+        reason = "%s (%s)" % (who, merged["sha"][:12])
         gates_text = ", ".join("`%s`" % g for g in project.gates)
         _passive(self.db, row.get("assignee"), self.lot, (
-            "Merge queue of %s, lot #%d « %s »: merged by ameesh (%s%s)%s. Gates passed on "
-            "the merged tree: %s. The branch sweep closes the lot."
-            % (row["target"], self.lot, row.get("title") or "", merged["sha"][:12],
+            "Merge queue of %s, lot #%d « %s »: %s (%s%s)%s. %s The branch sweep closes the lot."
+            % (row["target"], self.lot, row.get("title") or "", who, merged["sha"][:12],
                ", PR #%s" % pr if pr else ", on %s" % (base or "?")[:12],
                "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
-               if merged.get("state") == "replayed" else "", gates_text)),
+               if merged.get("state") == "replayed" else "",
+               "The queue's gates (%s) did not run on the merged tree: only the PR's "
+               "required checks did." % gates_text if constated
+               else "Gates passed on the merged tree: %s." % gates_text)),
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
-        how = self.record(reason, "merge queue of %s: landed by ameesh, %s%s" % (
-            row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""))
+        how = self.record(reason, "merge queue of %s: %s, %s%s" % (
+            row["target"], "constated GitHub auto-merge" if constated else "landed by ameesh",
+            merged["sha"][:12], ", PR #%s" % pr if pr else ""))
         review = self.review_after_merge(merged_sha=str(merged.get("sha") or ""), pr=pr)
         return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
                      "review_lot": review},
@@ -513,9 +564,14 @@ class _Landing:
 
 
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
-              gh=_gh) -> dict:
+              gh=_gh, parts=None) -> dict:
     """Lands (or follows the landing of) `row`, the head of its queue.
-    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`."""
+    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`.
+
+    L1651 (#1650) : `parts` porte la requalification d'un lot dont la CI
+    individuelle est remplacée par celle d'un paquet (§12, #1467) — les
+    contextes dus que l'appelant atteste, ou `()` ; None : la porte du projet
+    (`ci_parts`) s'applique telle quelle."""
     from . import radar, resolutions
     locks = locks if locks is not None else {}
     lot = int(row["work_item_id"])
@@ -539,7 +595,8 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
-                       cfg=cfg, clone=getattr(replayer, "path", None))
+                       cfg=cfg, clone=getattr(replayer, "path", None), replayer=replayer,
+                       parts=parts)
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
         try:
@@ -616,6 +673,45 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if not landing.write(state="landing", note="merge queue of %s: landing (%s)"
                          % (row["target"], project.land), actor=work.SYSTEM_SENDER):
         return landing.busy("lease on %s lost before landing" % landing.key)
+    if project.land == "pr":
+        found = None
+        status = pr_status(slug, row["branch"], gh=gh) if slug else None
+        if status is None:
+            # #1682: an armed auto-merge can merge the PR between two passes,
+            # at the exact frozen head. That merge is a fact like any other:
+            # found here, it is recorded instead of ejecting the queue entry.
+            # A merge at any other head (the #1162 rewrite) finds no match and
+            # keeps the ejection below.
+            found = pr_merged(slug, row["branch"], row["frozen_sha"], gh=gh) if slug else None
+            if found is not None:
+                return _after_merge(landing, found["number"], found["base"], None,
+                                    sha=row["frozen_sha"])
+            return landing.eject("no open PR for %s" % row["branch"],
+                                 "Open the PR, then ameesh work queue add %d." % lot)
+        # #1656: never leave an active auto-merge on a PR the queue manages. It
+        # would merge whatever head it finds — a rewritten one included, even
+        # under `[skip ci]` — with no new fire, freeze or parts proof (GitHub
+        # checks `--match-head-commit` only when the auto-merge is armed). ameesh
+        # merges itself, on the exact frozen head; disarm first, fail closed —
+        # before any ejection below (conflict, gate, CI), which would otherwise
+        # leave it armed for the head the author pushes next.
+        if status.get("auto"):
+            error = pr_disable_auto(slug, status["number"], gh=gh)
+            if error is not None:
+                # #1682: the auto-merge may have fired between the read and
+                # the disarm — the disarm then fails on an already merged PR.
+                # A merge at the frozen head into its target is constated;
+                # anything else keeps the fail-closed ejection.
+                found, unread = _merged_after_disarm(slug, row["branch"], row["frozen_sha"], gh)
+                if found is not None:
+                    return _after_merge(landing, found["number"], found["base"], None,
+                                        sha=row["frozen_sha"])
+                return landing.eject(
+                    "PR #%s: auto-merge armed and not disarmed (%s)%s"
+                    % (status["number"], error, unread),
+                    "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
+                    "queue add %d: an armed auto-merge merges a head the queue has not "
+                    "qualified (#1656)." % (status["number"], lot))
     base = fresh_target(replayer, project, row["target"])
     if project.land == "local" and resolutions._run(
             replayer.path, "merge-base", "--is-ancestor", row["frozen_sha"],
@@ -675,10 +771,6 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             return {"lot": lot, "result": "retry", "error": resolutions._err(proc)}
         return landing.landed(merged, base)
     # land: pr — the merge commit goes to the lot branch, its CI decides
-    status = pr_status(slug, row["branch"], gh=gh) if slug else None
-    if status is None:
-        return landing.eject("no open PR for %s" % row["branch"],
-                             "Open the PR, then ameesh work queue add %d." % lot)
     if status.get("base") != branch:
         return landing.eject("PR #%s targets %s, not %s" % (
             status["number"], status.get("base") or "?", branch),
@@ -772,6 +864,25 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
             return {"lot": lot, "result": "landed", "review_lot": review}
         return landing.eject("its PR is no longer open",
                              "Reopen it, then ameesh work queue add %d." % lot)
+    # #1656: an armed auto-merge would merge the head it finds without the
+    # parts proof and without the base re-read below — and would land a head
+    # rewritten after the fire. ameesh is the only actor that merges a PR it
+    # manages: disarm first, fail closed.
+    if status.get("auto"):
+        error = pr_disable_auto(slug, status["number"], gh=gh)
+        if error is not None:
+            # #1682: the auto-merge may have fired between the read and the
+            # disarm (the disarm then fails on a merged PR): a merge at the
+            # landing head is constated, like the "merged since" path above.
+            merged, unread = _merged_after_disarm(slug, row["branch"], row["landing_sha"], gh)
+            if merged is not None:
+                return _after_merge(landing, merged["number"], merged["base"], None)
+            return landing.eject(
+                "PR #%s: auto-merge armed and not disarmed (%s)%s — it could merge a head "
+                "the queue has not qualified" % (status["number"], error, unread),
+                "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
+                "queue add %d; ameesh merges itself on the exact frozen head (#1656)."
+                % (status["number"], lot))
     if status.get("base") != branch:
         return landing.eject("PR #%s targets %s, not %s" % (
             status["number"], status.get("base") or "?", branch),
@@ -838,13 +949,18 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     return _after_merge(landing, status["number"], after, unread)
 
 
-def _after_merge(landing: _Landing, pr, after, unread) -> dict:
+def _after_merge(landing: _Landing, pr, after, unread, *, sha: str | None = None) -> dict:
     """#194 r8: PR `pr` is merged (by this call or found merged): landed if
-    into its target, otherwise reported."""
+    into its target, otherwise reported. `sha` names the merged head when the
+    caller knows it (#1682: a merge found before the queue pushed its own
+    merge commit, recorded as constated; the default is the `landing_sha`
+    the queue recorded)."""
+    state = "pr" if sha is None else "constated"
+    if sha is None:
+        sha = landing.row["landing_sha"]
     if after != _branch_of(landing.row["target"]):
         return _merged_in_doubt(landing, pr, after, unread)
-    return landing.landed({"sha": landing.row["landing_sha"], "state": "pr", "files": []},
-                          None, pr=pr)
+    return landing.landed({"sha": sha, "state": state, "files": []}, None, pr=pr)
 
 
 def _merged_sha(db, lot: int) -> str:

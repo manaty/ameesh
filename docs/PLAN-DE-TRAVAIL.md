@@ -96,6 +96,21 @@ designate one. A reviewer whose **declared harness** is the author's (claude,
 codex and deepseek are distinct families) gets an indicative warning on
 stderr (#800): the designation is kept — canon §2 asks for another model
 family, and the real family is judged on the review turn (decision 18855a).
+Two corrections are gestures of the same authority (#1979):
+`ameesh work reviewer <id> --remove` removes a designation made by mistake
+(the lot goes back to waiting for a reviewer, and the alert asks for one
+again); `ameesh work reviewer <id> --no-verdict` marks "verdict not required"
+when no re-verdict is due (mechanical composition resolution, canon §11
+bis/#87, a verdict kept from a reviewed head) — the lot then waits only for
+its merge and no reminder reaches a reviewer. Designating a reviewer lifts
+the waiver; a current blocking verdict refuses it (a fix is due).
+
+The **review class** of the lot (canon §2, #1822) routes that wait too: a light
+lot's review happens after the merge, so a light lot with no current verdict
+waits for the merge, not for a verdict — even when a reviewer is designated.
+The class is read once per pass, and only for lots whose wait would otherwise
+be a verdict; when it cannot be read (no repository, no freeze, unreadable
+policy), the prudent verdict wait is kept instead of guessing a class.
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
@@ -137,7 +152,15 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    diff of the freeze is one commit of the target (**squash**). `--verbatim` does not
    normalize any whitespace (`--stable` would confuse `"a b"` and `"ab"`): false
    negative rather than false positive; without it (git < 2.40), only ancestry
-   proves. Closing is conditioned in the database on the examined freeze: a new
+   proves. Each of these proofs is voided by an **effective revert** (#1825): a
+   later `Revert "…"` that cites the commit carrying the content, undoes exactly
+   its patch, and is reapplied by no later commit — the content is not delivered
+   and the lot stays open (`how: reverted`). Detection is best-effort, not a
+   guarantee: it scans only the most recent commits of the target (200) and
+   requires `git patch-id --verbatim` (git ≥ 2.40); a revert outside that window,
+   or an ancestry proof without `--verbatim`, still closes a reverted lot
+   wrongly. `sync-branches` and `sync-merges` carry the same guard. Closing is
+   conditioned in the database on the examined freeze: a new
    freeze declared in the meantime prevents it (`refrozen`);
 3. **the linked PR** (as a fallback, or alone):
 
@@ -296,18 +319,26 @@ When agents are idle and the queue is empty (and no lot of the
 project is waiting), the `backlog_empty` alert invites the human lead to
 fill it.
 
-### Handoff on a budget pause (L233b)
+### Handoff on a budget pause (L233b, L165)
 
-On each pass, before any pick-up, `ameesh notify` hands the `intake` and
-`build` lots of a **non-critical Claude agent paused on budget** (status
-`blocked`, `budget : …`) to a **free DeepSeek agent of the same project**,
-within its budget and able to do the lot (team, capabilities): one lot per
-taker, longest idle first, at most `--handoff-max-per-hour` (4) per sliding
-hour for the whole mesh (`0` turns it off; `--handoff-idle`, 5 min, is the
-taker's minimum rest). Critical agents are those of L242b (declared,
-orchestrators, design, auditors). The assignment stays guarded and
-conditional on the assignee and the state; a note goes on the lot and an
-`event` mail to both agents. Never handed:
+On each pass, before any pick-up, `ameesh notify` handles the lots of a
+**non-critical Claude agent paused on budget** (status `blocked`,
+`budget : …`):
+
+* its **non-started lots (`intake`) are returned to the team queue**:
+  assignee cleared, a journal note says why; the automatic take (L165) then
+  gives them to any free capable agent of the team, DeepSeek or Codex, within
+  its budget and review class — no taker needs to be free at that moment;
+* its **started lots (`build`) are handed** to a **free DeepSeek or Codex
+  agent of the same project**, within its budget and able to do the lot
+  (team, capabilities): one lot per taker, longest idle first,
+  `--handoff-idle` (5 min) is the taker's minimum rest.
+
+At most `--handoff-max-per-hour` (4) returns and handoffs per sliding hour
+for the whole mesh (`0` turns it off). Critical agents are those of L242b
+(declared, orchestrators, design, auditors). A returned lot gets its journal
+note only (the automatic take warns the taker); a handed `build` lot also
+gets an `event` mail to both agents. Never handled:
 
 * a lot under review or frozen (`qa`, or a freeze milestone);
 * a sensitive lot: reserved capability (`decision`, `production`), or a
@@ -322,4 +353,4 @@ conditional on the assignee and the state; a note goes on the lot and an
   host.
 
 When the pause ends, nothing comes back on its own: the note says so, and
-the orchestrator decides. The codex review stays required.
+the orchestrator decides. A review by another family stays required.

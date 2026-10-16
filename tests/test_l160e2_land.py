@@ -33,7 +33,8 @@ class FakeLocks:
         now = time.time()
         cur = self.held.get(key)
         if epoch is not None:
-            if cur and cur[0] == owner and cur[1] == epoch:
+            # #1680: like PostgreSQL, a renewal never revives an expired lease
+            if cur and cur[0] == owner and cur[1] == epoch and cur[2] > now:
                 self.held[key] = (owner, epoch, now + ttl_s)
                 return epoch
             return None

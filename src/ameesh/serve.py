@@ -33,6 +33,20 @@ only, never the query string).
 `GET /.well-known/ameesh` (discovery) and `GET /api/v1/openapi.json` need no
 token: they say nothing about the mesh's state.
 
+`GET /api/v1/events` (L85) streams the event log (`events`, migration 0396)
+as Server-Sent Events, read through `fetch` (the client carries the
+`Authorization` header). One `LISTEN ameesh_events` connection per process
+(`Hub`) wakes the streams; each stream rereads the log after its own
+position (tx, id) in commit order (`events`), keeps what its human may see
+(`Context.sees`), and sends `id: <tx-id-cluster>` (the position of THAT event),
+`event: <type>`, `data: <json>`. `Last-Event-ID` resumes strictly after it
+(replay from the table, exactly once); `event: reset` says that events were
+lost (retention, a rebuilt base, another cluster): the client reloads its views;
+`event: delayed`, in place of the heartbeat, that events wait for an open
+transaction of the base (xmin), or behind rows of another cluster (logical
+restore: the log must be emptied) — nothing is lost, they come once it ends. A comment every 20 s keeps the connection
+alive; a stream ends after an hour (the client resumes); at most
+`MAX_STREAMS` streams at once, the others are 503 with `Retry-After`.
 `GET /ui/` (L88) is the standalone page: the embeddable components
 (`ameesh-ui.js`, built from `ui/` and committed under `ameesh/ui/static/`)
 assembled full screen. Static files of a fixed list, no token (the page asks
@@ -52,10 +66,12 @@ import os
 import re
 import stat
 import sys
+import threading
+import time
 import urllib.parse
 from typing import Callable
 
-from . import __version__, httpkit, serve_actions, storage
+from . import __version__, events, httpkit, serve_actions, storage
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -71,10 +87,15 @@ SOCKET_TIMEOUT = 15.0
 RATE_PER_MINUTE = 600
 #: lots listed at most (`?limit=`)
 MAX_LOTS = 500
+#: conversation page of an agent card (L83): default and hard bound
+CHAT_PAGE = 100
+MAX_CHAT = 500
 LANGUAGES = ("fr", "en")
 #: an agent, host or project name; a lot id; a thread entry id; a duration
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:+-]{0,127}$")
 _LOT_RE = re.compile(r"^[0-9]{1,9}$")
+#: a conversation cursor or page size (`?after=`, `?limit=`)
+_SEQ_RE = re.compile(r"^(0|[1-9][0-9]{0,15})$")
 _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
 _SINCE_RE = re.compile(r"^[0-9]{1,6}[mhdj]$|^[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:+.Z-]{0,20}$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
@@ -82,6 +103,18 @@ CSP = "default-src 'none'; frame-ancestors 'none'"
 #: `Idempotency-Key` of an action (L87), and how long its response is kept
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 IDEMPOTENCY_RETENTION_S = 86400
+#: event stream (L85): streams at once (below MAX_CONNECTIONS: the other
+#: routes stay reachable), heartbeat, lifetime, events read per query, the
+#: client's reconnection delay, the poll without LISTEN
+EVENTS_PATH = API + "/events"
+MAX_STREAMS = 8
+HEARTBEAT_S = 20.0
+STREAM_MAX_S = 3600.0
+EVENTS_BATCH = 200
+RETRY_MS = 3000
+POLL_S = 5.0
+#: an event held back by an open transaction is looked for again this often
+WAITING_POLL_S = 1.0
 #: the standalone page (L88): its own files and the API, nothing inline
 UI = "/ui"
 # the package's directory, then ui/static opened one name at a time from it,
@@ -120,6 +153,11 @@ class Context:
     #: the principal a deputy acts for (0033 §7, team mode L86); local mode: None
     on_behalf_of: str | None = None
 
+    def sees(self, event: dict) -> bool:
+        """Whether this human may see `event` (local mode: the owner sees
+        everything; L86 filters by project and role)."""
+        return True
+
 
 # --------------------------------------------------------------------------
 # routes
@@ -134,6 +172,7 @@ class Route:
     query: tuple = ()               # (name, OpenAPI schema, description)
     db: bool = True                 # reads the database
     auth: bool = True
+    stream: bool = False            # Server-Sent Events (L85), `build` unused
 
     @property
     def regex(self) -> re.Pattern:
@@ -203,6 +242,24 @@ def _agent(ctx: Context, db, params, query) -> dict:
     return {"schema": "ameesh-agent-detail/1", "agent": row}
 
 
+def _chat(ctx: Context, db, params, query) -> dict:
+    """An agent's shared conversation, ascending from `after` (L83): the same
+    `ameesh-conversation/1` history `ameesh chat` reads. No relation filter
+    yet: the API's token is the machine owner's; filtering by the 0033 §9
+    relations arrives with the OIDC tokens of team mode (L86)."""
+    from . import conversation, registry
+    if registry.get(db, params["agent"]) is None:
+        raise ApiError(404, "not_found", "unknown agent")
+    after = _checked(_one(query, "after"), _SEQ_RE, "after")
+    limit = _checked(_one(query, "limit"), _SEQ_RE, "limit")
+    try:
+        return conversation.history(
+            db, params["agent"], after=int(after) if after is not None else 0,
+            limit=min(int(limit), MAX_CHAT) if limit is not None else CHAT_PAGE)
+    except ValueError as exc:
+        raise ApiError(400, "bad_query", str(exc)) from exc
+
+
 def _lots(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli, stagnation
     limit = _checked(_one(query, "limit"), _LOT_RE, "limit")
@@ -210,7 +267,7 @@ def _lots(ctx: Context, db, params, query) -> dict:
     return {"schema": "ameesh-lots/1", "lots": mesh_cli.work_rows(
         db, state=_checked(_one(query, "state"), _NAME_RE, "state"),
         assignee=_checked(_one(query, "assignee"), _NAME_RE, "assignee"),
-        limit=limit, threshold=stagnation.stale_after(None))}
+        limit=limit, threshold=stagnation.stale_after(None), cfg=ctx.cfg)}
 
 
 def _lot(ctx: Context, db, params, query) -> dict:
@@ -229,10 +286,11 @@ def _decisions(ctx: Context, db, params, query) -> dict:
 
 
 def _alerts(ctx: Context, db, params, query) -> dict:
-    from . import exploitation
+    from . import alert_ack, exploitation
     thresholds = exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
-    return {"schema": "ameesh-alerts/1", "alerts": db_mod.batched(
-        db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))}
+    current = db_mod.batched(db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))
+    return {"schema": "ameesh-alerts/1", "alerts": alert_ack.annotate(
+        ctx.cfg, db, current, human=serve_actions.principal(ctx))}
 
 
 def _hosts(ctx: Context, db, params, query) -> dict:
@@ -273,6 +331,22 @@ def _openapi(ctx: Context, db, params, query) -> dict:
     return openapi()
 
 
+DELAY_REASONS = {"xmin": "open transaction (xmin)",
+                 "restore": "restored events above the transaction counter"
+                            " (logical restore: empty the log)"}
+
+
+def event_message(event: dict, cluster: str) -> str:
+    """One SSE message: `id` is the event's position "tx-id-cluster", where a
+    resume starts (strictly after it)."""
+    data = {"id": int(event["id"]), "type": event["type"], "object": event["object"],
+            "project": event.get("project"), "ts": event.get("ts"),
+            "data": event.get("data") or {}}
+    return "id: %s\nevent: %s\ndata: %s\n\n" % (
+        events.format_position((event["tx"], event["id"]), cluster), event["type"],
+        json.dumps(data, ensure_ascii=False, sort_keys=True, default=str))
+
+
 _LIMIT = ("limit", {"type": "integer", "minimum": 1, "maximum": MAX_LOTS},
           "lots listed at most (default 100)")
 ROUTES = (
@@ -286,6 +360,12 @@ ROUTES = (
     Route(API + "/agents", "ameesh-agents/1", "Agents (`ameesh list --json`)", _agents),
     Route(API + "/agents/{agent}", "ameesh-agent-detail/1", "One agent (`ameesh show --json`)",
           _agent),
+    Route(API + "/agents/{agent}/chat", "ameesh-conversation/1",
+          "An agent's shared conversation (`ameesh chat <agent>`, L78/L83)", _chat,
+          query=(("after", {"type": "integer", "minimum": 0},
+                  "entries after this sequence number (default 0)"),
+                 ("limit", {"type": "integer", "minimum": 1, "maximum": MAX_CHAT},
+                  "entries at most (default %d)" % CHAT_PAGE))),
     Route(API + "/lots", "ameesh-lots/1", "Lots (`ameesh work list --json`)", _lots,
           query=(("state", {"type": "string"}, "state of the lots"),
                  ("assignee", {"type": "string"}, "assignee of the lots"), _LIMIT)),
@@ -306,6 +386,9 @@ ROUTES = (
     Route(API + "/threads/{project}/{lot}", "ameesh-thread/1",
           "Lot thread (`ameesh fil show PROJECT LOT`)", _thread, db=False,
           query=(("since", {"type": "string"}, "entries after this entry id"),)),
+    Route(EVENTS_PATH, "ameesh-event/1",
+          "Event stream (Server-Sent Events): lots, turns, costs, threads, decisions, alerts",
+          None, stream=True),
     Route(OPENAPI_PATH, "openapi", "This document", _openapi, db=False, auth=False),
 )
 _PARAM_RE = {"id": _LOT_RE}
@@ -328,6 +411,13 @@ def match(path: str) -> tuple[Route, dict] | None:
         if m:
             return route, _params(m)
     return None
+
+
+def _has_shape(items, path: str) -> bool:
+    """Whether `path` has the shape of one of `items`, its parameters NOT
+    checked (#1497 N4): it decides a 405 (the route exists, not for this
+    method) — a parameter refused there would turn it into a 400 `bad_path`."""
+    return any(item.regex.match(path) for item in items)
 
 
 def match_action(path: str) -> tuple[serve_actions.Action, dict] | None:
@@ -383,6 +473,17 @@ SCHEMAS = {
     "ameesh-agent-detail/1": _obj("ameesh-agent-detail/1", ["agent"],
                                   agent=_obj(None, ["name", "key_ready"], name=_STR,
                                              key_ready={"type": "boolean"})),
+    "ameesh-conversation/1": _obj(
+        "ameesh-conversation/1",
+        ["agent", "entries", "last_seq", "oldest_seq", "next_seq", "more", "gap"],
+        agent=_STR,
+        entries={"type": "array", "items": _obj(
+            None, ["seq", "kind", "author", "text", "ts"],
+            seq={"type": "integer"}, kind=_STR, author=_STR, text=_STR, ts=_NUM,
+            truncated={"type": "boolean"}, session=_STR_NULL, turn=_STR_NULL,
+            event_id=_STR_NULL, project=_STR, lot=_STR_NULL, meta=_OBJ)},
+        last_seq={"type": "integer"}, oldest_seq={"type": ["integer", "null"]},
+        next_seq={"type": "integer"}, more={"type": "boolean"}, gap={"type": "boolean"}),
     "ameesh-lots/1": _obj("ameesh-lots/1", ["lots"], lots={
         "type": "array", "items": _obj(None, ["id", "title", "state", "delays"],
                                        id={"type": "integer"}, title=_STR, state=_STR)}),
@@ -393,7 +494,9 @@ SCHEMAS = {
     "ameesh-decisions/1": _obj("ameesh-decisions/1", ["requests", "prose", "approvals"],
                                requests=_LIST, prose=_LIST, approvals=_LIST),
     "ameesh-alerts/1": _obj("ameesh-alerts/1", ["alerts"], alerts={
-        "type": "array", "items": _obj("ameesh-alert/1", ["type"], type=_STR)}),
+        "type": "array", "items": _obj("ameesh-alert/1", ["type", "key", "acknowledged"],
+            type=_STR, key={"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            acknowledged={"type": "boolean"}, acknowledgement={"type": ["object", "null"]})}),
     "ameesh-hosts/1": _obj("ameesh-hosts/1", ["hosts"], hosts={
         "type": "array", "items": _HOST}),
     "ameesh-host/1": _HOST,
@@ -413,6 +516,10 @@ SCHEMAS = {
     "ameesh-error/1": _obj("ameesh-error/1", ["error", "message"], error=_STR, message=_STR),
     "ameesh-action/1": _obj("ameesh-action/1", ["action", "by", "for", "result"],
                             action=_STR, by=_STR, result=_OBJ, **{"for": _STR}),
+    # the `data` of one SSE message of /events (not a JSON response)
+    "ameesh-event/1": _obj(None, ["id", "type", "object", "project", "ts", "data"],
+                           id={"type": "integer"}, type={"enum": list(events.TYPES)},
+                           object=_STR, project=_STR_NULL, ts=_NUM, data=_OBJ),
 }
 
 
@@ -449,6 +556,24 @@ def openapi() -> dict:
                      "503": _response("database unavailable", "ameesh-error/1")}
         if "{" in route.path:
             responses["404"] = _response("not found", "ameesh-error/1")
+        if route.stream:
+            responses["200"] = {
+                "description": "text/event-stream: `id: <tx-id-cluster>` (the event's position, "
+                               "in commit order), `event: <type>`, "
+                               "`data:` an ameesh-event/1 object; `event: reset` (events "
+                               "lost: reload), `event: error` (stream ended), `event: "
+                               "delayed` (events wait for an open transaction); a comment "
+                               "every %d s" % HEARTBEAT_S,
+                "content": {"text/event-stream": {"schema": {"type": "string"},
+                                                  "x-ameesh-data": _ref(route.schema)}}}
+            responses["503"] = _response("database unavailable, or too many streams "
+                                         "(Retry-After)", "ameesh-error/1")
+            params.append({"name": "Last-Event-ID", "in": "header", "required": False,
+                           "schema": {"type": "string",
+                                      "pattern": "^[0-9]{1,20}-[0-9]{1,19}-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$"},
+                           "description": "resume strictly after this position (the last "
+                                          "`id:` received, \"tx-id-cluster\"); without it, the "
+                                          "new events only"})
         operation = {"operationId": re.sub(r"[^A-Za-z0-9]+", "_",
                                            route.path[len(API) + 1:]).strip("_"),
                      "summary": route.summary, "responses": responses}
@@ -492,9 +617,10 @@ def openapi() -> dict:
         "info": {"title": "ameesh API", "version": "1",
                  "description": "API of an ameesh mesh, local mode: reads (L84), each the "
                                 "serialisation of the matching `--json` output of the CLI "
-                                "(`schema` names it), and the human actions (L87), POST "
-                                "with a required `Idempotency-Key`. No route approves, "
-                                "produces or attaches a receipt.",
+                                "(`schema` names it); `/events` streams the event log "
+                                "(L85); and the human actions (L87), POST with a required "
+                                "`Idempotency-Key`. No route approves, produces or attaches "
+                                "a receipt.",
                  "license": {"name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only"}},
         "servers": [{"url": "http://127.0.0.1:%d" % DEFAULT_PORT}],
         "security": [{"bearer": []}],
@@ -542,7 +668,8 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
         if row["status"] is None:
             return 409, _err("idempotency_in_progress",
                              "the first request with this Idempotency-Key has not answered, "
-                             "or its outcome is unknown: check before acting again"), False
+                             "or its outcome is unknown: check before acting again, then "
+                             "release the key with `ameesh serve --release-key KEY`"), False
         return row["status"], row["response"], True
     try:
         result = action.build(ctx, db, params, body)
@@ -553,7 +680,9 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
                              "by": ctx.human, "for": serve_actions.principal(ctx),
                              "result": result}
     # any other exception leaves the key reserved: the action may have been
-    # done, a retry must not do it twice (409 above)
+    # done, a retry must not do it twice (409 above). Once the human has
+    # checked, `ameesh serve --release-key KEY` frees it (#1497 N2) instead of
+    # waiting for the 24 h purge.
     if status >= 500:
         requests.release(ctx.human, key)
         return status, data, False
@@ -606,6 +735,108 @@ def db_reader(cfg) -> Callable:
     return read
 
 
+class Hub:
+    """The process's single `LISTEN ameesh_events` connection: each
+    notification (or, without LISTEN, each poll that sees a new event) moves
+    `generation` on and wakes the streams, which reread the log themselves.
+
+    The connection is reopened after a cut (the streams then reread, in case
+    a notification was lost); without LISTEN (driver or base refusing it),
+    the last id is polled every `poll_s` seconds."""
+
+    def __init__(self, cfg, read: Callable, *, poll_s: float = POLL_S, listen: bool = True):
+        self.cfg = cfg
+        self.read = read
+        self.poll_s = poll_s
+        self.listen = listen
+        #: whether the LISTEN connection is up (otherwise: polling)
+        self.listening = False
+        self.generation = 0
+        self._last = None
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ameesh-serve-events",
+                                        daemon=True)
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def start(self) -> "Hub":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.wake()
+        self._thread.join(5)
+
+    def wake(self) -> None:
+        with self._cond:
+            self.generation += 1
+            self._cond.notify_all()
+
+    def wait(self, generation: int, timeout: float) -> int:
+        """The generation, once it differs from `generation` (or at `timeout`)."""
+        with self._cond:
+            self._cond.wait_for(lambda: self.generation != generation or self.stopped,
+                                timeout)
+            return self.generation
+
+    def _poll(self) -> None:
+        last = self.read(lambda db: storage.of(db).events.bounds()["head"])
+        if last != self._last:
+            self._last = last
+            self.wake()
+
+    def _run(self) -> None:
+        while not self.stopped:
+            db = listener = None
+            try:
+                if self.listen:
+                    try:
+                        db = db_mod.connect(self.cfg)
+                        listener = db_mod.listener(db, [events.CHANNEL])
+                    except Exception as exc:  # R2 auditeur P2-3
+                        # LISTEN refuse (veille chaude, coupure entre la
+                        # connexion et le LISTEN), ou erreur non traduite par
+                        # le pilote : on sonde, et on retente l'ecoute dans
+                        # une minute. Sans cela le fil du hub mourait et les
+                        # flux ne recevaient plus rien.
+                        log.warning("event listener refused: %s", type(exc).__name__)
+                self.listening = listener is not None
+                self.wake()   # (re)connected: what came meanwhile is reread
+                started = time.monotonic()
+                while not self.stopped:
+                    if listener is None:
+                        self._poll()
+                        if self._stop.wait(self.poll_s):
+                            break
+                        if self.listen and time.monotonic() - started > 60:
+                            break   # LISTEN tried again every minute
+                        continue
+                    message = listener.wait(1.0)
+                    if message is None:
+                        continue
+                    if message.get("event") == "down":
+                        log.warning("event listener down: polling, then reconnecting")
+                        break
+                    self.wake()
+            except (db_mod.DbError, OSError) as exc:
+                log.warning("event listener: %s", type(exc).__name__)
+            except Exception as exc:  # R2 auditeur P2-3: never kill the hub
+                log.warning("event listener: %s", type(exc).__name__)
+            finally:
+                self.listening = False
+                for closable in (listener, db):
+                    if closable is not None:
+                        try:
+                            closable.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+            self._stop.wait(self.poll_s)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """GET and HEAD read, POST acts (L87); anything else is 405."""
 
@@ -618,6 +849,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     read: Callable
     #: the writable connection of the actions; None: actions unavailable
     write: Callable | None = None
+    hub: "Hub | None"
 
     def version_string(self) -> str:
         return self.server_version
@@ -703,7 +935,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         found = match(url.path)
         if found is None:
-            if match_action(url.path) is not None:
+            if _has_shape(ACTIONS, url.path):
                 self._error(405, "method_not_allowed", "this route acts: POST",
                             (("Allow", "POST"),))
                 return
@@ -725,6 +957,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for name, values in query.items():
             if len(values) > 1:
                 raise ApiError(400, "bad_query", "%s given more than once" % name)
+        if route.stream:
+            self._stream()
+            return
         if route.db:
             data = self.read(lambda db: route.build(self.ctx, db, params, query))
         else:
@@ -736,7 +971,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         found = match_action(url.path)
         if found is None:
-            if (match(url.path) is not None or url.path == WELL_KNOWN or url.path == UI
+            if (_has_shape(ROUTES, url.path) or url.path == WELL_KNOWN or url.path == UI
                     or url.path.startswith(UI + "/")):
                 self._error(405, "method_not_allowed", "this route reads: GET or HEAD",
                             (("Allow", "GET, HEAD"),))
@@ -792,6 +1027,160 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if missing:
             raise ApiError(400, "bad_body", "missing field(s): %s" % ", ".join(missing))
         return data
+
+    # -- event stream (L85) --------------------------------------------------
+
+    def _stream(self) -> None:
+        last = self.headers.get_all("Last-Event-ID") or []
+        resume = events.parse_position(last[0]) if len(last) == 1 else None
+        if len(last) > 1 or (last and resume is None):
+            raise ApiError(400, "bad_header",
+                           "Last-Event-ID: a position tx-id-cluster expected")
+        if self.hub is None:
+            raise ApiError(503, "unavailable", "event stream unavailable")
+        if not self.server.streams.acquire(blocking=False):
+            self._error(503, "too_many_streams", "too many event streams",
+                        (("Retry-After", "10"),))
+            return
+        try:
+            bounds = self.read(lambda db: storage.of(db).events.bounds())
+            # An empty retained log still has a logical position: resetting
+            # below its watermark would reset again on every resume/wakeup.
+            head = max(bounds["head"], bounds["pruned"])
+            # None: the cluster's identity is refused to this role, so no
+            # resume can be trusted
+            self._cluster = cluster = bounds["cluster"] or events.UNKNOWN_CLUSTER
+            reset = None
+            if resume is None:
+                position = head
+            elif resume[1] != cluster or cluster == events.UNKNOWN_CLUSTER:
+                # `tx` orders within one cluster and timeline only: a logical
+                # restore or a point-in-time recovery starts again lower,
+                # below a position of the old one
+                position, reset = head, "another cluster or timeline"
+            elif resume[0] > max(bounds["top"], bounds["pruned"]):
+                # a position this base never gave: rebuilt, or another mesh
+                position, reset = head, "unknown position"
+            else:
+                position = resume[0]
+                # below the retention's watermark (the greatest position it
+                # deleted), events after this one may be gone
+                if position < bounds["pruned"]:
+                    position, reset = head, "events lost (retention)"
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            for name, value in httpkit.BASE_HEADERS + (("Content-Security-Policy", CSP),
+                                                       ("X-Accel-Buffering", "no")):
+                self.send_header(name, value)
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            head = "retry: %d\n\n" % RETRY_MS
+            if reset:
+                head += "id: %s\nevent: reset\ndata: %s\n\n" % (
+                    events.format_position(position, cluster),
+                    json.dumps({"reason": reset, "first": bounds["first"],
+                                "last": bounds["last"]}))
+            try:
+                self._write(head)
+                self._follow(position)
+            except OSError:
+                pass   # the client left (or stopped reading: socket timeout)
+        finally:
+            self.server.streams.release()
+
+    def _write(self, text: str) -> None:
+        self.wfile.write(text.encode("utf-8"))
+        self.wfile.flush()
+
+    def _drain(self, position: tuple) -> tuple:
+        """Sends the readable events after `position`: (new position, whether
+        anything was written, whether events wait for an open transaction,
+        whether the retention's watermark passed the position — events after
+        it may be gone, the client must reset)."""
+        wrote, lost = False, False
+        while True:
+            rows, waiting, pruned = self.read(
+                lambda db: storage.of(db).events.readable(position, EVENTS_BATCH))
+            if position < pruned:
+                # #928/F6: the retention deleted events after this cursor
+                # while the stream was open; the rows below would silently
+                # skip them, so the caller resets. One statement, one
+                # snapshot: watermark and rows agree.
+                lost = True
+            for row in rows:
+                row["tx"] = int(row["tx"])
+            out = "".join(event_message(row, self._cluster) for row in rows
+                          if self.ctx.sees(row))
+            if out:
+                self._write(out)
+                wrote = True
+            if rows:
+                position = (rows[-1]["tx"], int(rows[-1]["id"]))
+            if len(rows) < EVENTS_BATCH:
+                return position, wrote, waiting, lost
+
+    def _follow(self, position: tuple) -> None:
+        hub = self.hub
+        start = written = time.monotonic()
+        generation = hub.generation
+        pending, waiting, waiting_since, restore_logged = True, None, None, False
+        while not hub.stopped and time.monotonic() - start < STREAM_MAX_S:
+            if pending or waiting:
+                try:
+                    position, wrote, waiting, lost = self._drain(position)
+                    if lost:
+                        # same frame as a resume below the watermark: the
+                        # client reloads, then follows from the new head
+                        bounds = self.read(lambda db: storage.of(db).events.bounds())
+                        position = max(bounds["head"], bounds["pruned"])
+                        self._write("id: %s\nevent: reset\ndata: %s\n\n" % (
+                            events.format_position(position, self._cluster),
+                            json.dumps({"reason": "events lost (retention)",
+                                        "first": bounds["first"],
+                                        "last": bounds["last"]})))
+                        wrote = True
+                except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
+                    log.warning("event stream: database unavailable: %s", type(exc).__name__)
+                    self._write("event: error\ndata: %s\n\n" % json.dumps(
+                        {"error": "unavailable", "message": "database unavailable"}))
+                    return
+                if wrote:
+                    written = time.monotonic()
+                pending = False
+                if not waiting:
+                    waiting_since = None
+                elif waiting_since is None:
+                    waiting_since = time.monotonic()
+                if waiting == "restore" and not restore_logged:
+                    # at once: they hold the stream until the counter passes them
+                    log.warning("event stream: events of another cluster above the"
+                                " transaction counter (logical restore): empty the log,"
+                                " see EXPLOITATION (TRUNCATE ameesh_events,"
+                                " ameesh_events_pruned)")
+                    restore_logged = True
+            idle = time.monotonic() - written
+            if idle >= HEARTBEAT_S:
+                if waiting_since is not None:
+                    # observable: events wait for an open transaction (xmin),
+                    # or rows of another cluster sit above the counter
+                    # (logical restore); no `id`, the resume position stays
+                    self._write("event: delayed\ndata: %s\n\n" % json.dumps(
+                        {"reason": DELAY_REASONS.get(waiting, DELAY_REASONS["xmin"]),
+                         "waiting_s": round(time.monotonic() - waiting_since, 1)}))
+                else:
+                    self._write(": heartbeat\n\n")
+                written = time.monotonic()
+                continue
+            timeout = HEARTBEAT_S - idle
+            if waiting:
+                # an older open transaction holds events back: its end sends
+                # no notification if it wrote no event
+                timeout = min(timeout, WAITING_POLL_S)
+            current = hub.wait(generation, timeout)
+            if current != generation:
+                generation, pending = current, True
 
     def _ui(self, path: str) -> None:
         """The standalone page and its files: a fixed list, nothing else."""
@@ -859,22 +1248,32 @@ def _ui_open(name: str) -> int:
 
 class ServeHTTPServer(httpkit.BoundedHTTPServer):
     log = log
+    hub: "Hub | None" = None
+
+    def server_close(self) -> None:
+        if self.hub is not None:
+            self.hub.stop()
+        super().server_close()
 
 
 def make_server(ctx: Context, *, token: str, read: Callable, port: int = DEFAULT_PORT,
                 max_connections: int = MAX_CONNECTIONS,
-                rate_per_minute: int = RATE_PER_MINUTE,
+                rate_per_minute: int = RATE_PER_MINUTE, hub: Hub | None = None,
+                max_streams: int = MAX_STREAMS,
                 write: Callable | None = None) -> ServeHTTPServer:
-    """The server, bound to 127.0.0.1 (port 0: a free port). Without `write`,
-    the actions answer 503."""
+    """The server, bound to 127.0.0.1 (port 0: a free port). Without `hub`,
+    `/events` answers 503 and, without `write`, the actions answer 503; the
+    server stops the hub when closed."""
     if not token:
         raise ValueError("a token is required")
-    attrs = {"ctx": ctx, "token": token, "read": staticmethod(read)}
+    attrs = {"ctx": ctx, "token": token, "read": staticmethod(read), "hub": hub}
     if write is not None:
         attrs["write"] = staticmethod(write)
     handler = type("ServeHandler", (Handler,), attrs)
     server = ServeHTTPServer((BIND, int(port)), handler, max_connections=max_connections)
     server.limiter = httpkit.RateLimiter(rate_per_minute)
+    server.streams = threading.BoundedSemaphore(max_streams)
+    server.hub = hub
     return server
 
 
@@ -922,7 +1321,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--organisation", help="organisation named by /.well-known/ameesh")
     parser.add_argument("--openapi", action="store_true",
                         help="print the OpenAPI 3.1 document and exit")
+    parser.add_argument("--release-key", metavar="KEY",
+                        help="release an Idempotency-Key of the human whose action never "
+                             "answered (409 idempotency_in_progress), once its outcome has "
+                             "been checked, and exit; an answered key is never released")
     return parser
+
+
+def release_key(cfg, human: str, key: str) -> int:
+    """#1497 N2 : frees a reservation left by an action that raised (outcome
+    unknown), so the same request can be sent again with its key. Only an
+    unanswered reservation goes: a stored response stays (it is the replay)."""
+    if not _IDEMPOTENCY_RE.match(key or ""):
+        print("ameesh serve: invalid Idempotency-Key", file=sys.stderr)
+        return 2
+    try:
+        released = db_writer(cfg)(
+            lambda db: storage.of(db).api_requests.release(human, key))
+    except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
+        print("ameesh serve: database unavailable: %s" % exc, file=sys.stderr)
+        return 1
+    if not released:
+        print("ameesh serve: no unanswered reservation of %s for this key" % human,
+              file=sys.stderr)
+        return 1
+    print("ameesh serve: Idempotency-Key released for %s" % human)
+    return 0
 
 
 def dump_openapi() -> str:
@@ -940,6 +1364,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_mod.load()
     try:
         human = owner(cfg, args.human)
+        if args.release_key is not None:
+            # no token: the database is the authority here, not the HTTP API
+            return release_key(cfg, human, args.release_key)
         path = token_file(args.token_file)
         token = load_token(path)
     except ValueError as exc:
@@ -954,13 +1381,15 @@ def main(argv: list[str] | None = None) -> int:
     except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
         print("ameesh serve: database unavailable: %s" % exc, file=sys.stderr)
         return 1
+    hub = Hub(ctx.cfg, read)
     try:
-        server = make_server(ctx, token=token, read=read, port=args.port,
+        server = make_server(ctx, token=token, read=read, port=args.port, hub=hub,
                              write=db_writer(cfg))
     except OSError as exc:
         print("ameesh serve: port %s unavailable on %s: %s"
               % (args.port, BIND, exc.strerror or exc), file=sys.stderr)
         return 1
+    hub.start()
     print("ameesh serve: http://%s:%d%s for %s (Bearer token in %s)"
           % (BIND, server.server_address[1], API, human, path), flush=True)
     try:
@@ -972,5 +1401,6 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["ACTIONS", "API", "BIND", "Context", "DEFAULT_PORT", "ROUTES", "SCHEMAS", "act",
-           "discovery", "main", "make_server", "openapi", "owner"]
+__all__ = ["ACTIONS", "API", "BIND", "Context", "DEFAULT_PORT", "EVENTS_PATH", "Hub",
+           "ROUTES", "SCHEMAS", "act", "discovery", "main", "make_server", "openapi",
+           "owner"]

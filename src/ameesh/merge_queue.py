@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+from types import SimpleNamespace
 
 from . import plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -193,7 +194,7 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
 
 
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
-              commit_ci=None, cfg=None) -> dict:
+              commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
     pr, class, class_why}`; QueueError says what is missing. Commit ids are
     resolved to full ones before being compared; `ci` (`radar.github_ci(...,
@@ -211,13 +212,31 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     then the project's, then the repository's default) carries through the
     classification and the admission (revue #544 r2).
 
+    L756 (#566): a lot of class **release** must additionally certify its
+    frozen head with a **full-suite** run — a push or a manual dispatch,
+    never the impacted-only plan of a pull request (`full_ci`,
+    `radar.full_suite_ci` by default when the project declares a GitHub
+    repository).
+
     The CI is required **explicitly**: for a project without `ci_required`,
     `ci=None` (no reader) and a reader that answers nothing are refused, like
     a red CI — an absent status is not a green one (revue #544 r1). A project
     with `ci_required` may instead certify admission with GitHub's CI on the
     frozen commit when no PR vouches for it (`ci=None`, or a reader that
     answers nothing because there is no open PR): a green commit CI is not
-    blocked by the absence of a PR (revue #544 r2)."""
+    blocked by the absence of a PR (revue #544 r2).
+
+    L1651 (#1650): a project that declares `ci_parts` also proves the
+    **completeness** of the frozen CI — the exact set of parts the change set
+    makes due, recomputed by the project's versioned selector against the
+    target checked here (`_parts_reader`), each one present and
+    terminal-success on the frozen commit. `parts` (a callable returning the
+    due contexts, or a sequence) replaces that reader: a caller that
+    requalifies a lot — the §12 package manifest of the integration train
+    (#1467), where the package's full-suite CI substitutes for the individual
+    ones — passes what it vouches for, and `parts=()` disables the per-lot
+    proof for that gesture. Neither default is a fallback: an unreadable
+    contract refuses."""
     from . import lot_class
     from . import plan_github, radar
     row = work.get(db, lot)
@@ -263,6 +282,12 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          % (lot, tip[:12], " (last verdict: %s on %s)"
                             % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
                             if verdict else "", klass.get("class") or "?"))
+    # L756 (#566): un lot de classe release ne se contente pas du check de sa
+    # PR — une PR de version seule ne lance rien, et une PR peut n'avoir suivi
+    # que le plan impacté. Il lui faut une exécution de la suite complète
+    # (poussée ou lancement manuel) verte sur la tête gelée exacte.
+    if klass.get("class") == lot_class.RELEASE:
+        required_full_ci(project, tip, full_ci, lot=lot)
     needs_commit_ci = project is not None and getattr(project, "ci_required", False)
     status = None
     if ci is None:
@@ -289,11 +314,15 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         if light and status.get("draft"):
             raise QueueError("PR #%s is a draft: a light lot merges only from a "
                              "non-draft PR" % status.get("number"))
+    proof = None
     if needs_commit_ci:
-        _required_ci(project, tip, commit_ci)
+        if parts is None and getattr(project, "ci_parts", None):
+            parts = _parts_reader(project, repo, target, tip, clone, cfg=cfg)
+        _required_ci(project, tip, commit_ci, parts=parts)
+        proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),
-            "class_why": klass.get("why") or ""}
+            "class_why": klass.get("why") or "", "parts": proof}
 
 
 def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
@@ -343,9 +372,63 @@ def _class_worse(candidate: dict, best: dict) -> bool:
     return bool(best.get("doubt")) and not candidate.get("doubt")
 
 
-def _required_ci(project, sha: str, commit_ci=None) -> None:
+def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
+    """L1651 (#1650): le lecteur des parts dues d'une tête gelée.
+
+    Le contrat est celui du projet (`ci_parts`), versionné à `ci_parts.rev`
+    (la cible à défaut) et **relié à la cible réellement contrôlée** : une
+    déclaration qui épingle une autre branche que la cible de cette admission
+    ou de cet atterrissage refuse — le contrat d'une autre cible ne prouve pas
+    celle-ci. Le lecteur va chercher la référence à chaque appel
+    (`fetch_fresh`), donc à chaque contrôle, et recalcule les parts dues avec
+    le sélecteur du dépôt (`ci_parts.due`) ; toute incertitude devient un
+    `QueueError`, jamais un repli sur les statuts présents."""
+    from . import ci_parts
+    plan = project.ci_parts
+    wanted = _remote_branch(target or getattr(project, "target", ""))
+    if plan.rev and _remote_branch(plan.rev) != wanted:
+        raise QueueError("the ci_parts contract of project %s is versioned at %s, the target "
+                         "checked here is %s: the due parts of this target cannot be proven "
+                         "(align ci_parts.rev with the target, or requalify the admission)"
+                         % (project.name, plan.rev, target or "<none>"))
+    rev = plan.rev or wanted
+
+    def reader():
+        tips, holder = fetch_fresh(repo, [rev], clone)
+        base = tips.get(rev)
+        if not base:
+            raise QueueError("the versioned selection source %s of project %s is not on origin: "
+                             "the due parts of the frozen head %s cannot be proven"
+                             % (rev, project.name, sha[:12]))
+        try:
+            #: N2 de #1666 : le cache de l'hôte (par couple base/tête gelée)
+            #: évite de réextraire l'arbre de la cible à chaque contrôle.
+            proof = ci_parts.due(project, sha, base, holder, cache=ci_parts.cache_dir(cfg))
+        except ci_parts.PartsError as exc:
+            raise QueueError("the parts the change set makes due on the frozen head %s cannot "
+                             "be proven: %s" % (sha[:12], exc)) from exc
+        reader.proof = proof
+        return proof["due"]
+    #: L1651 : la provenance de la dernière preuve (`ci_parts.due`), pour la
+    #: note de file et le raccord du train (#1467) — jamais un vert sans elle
+    reader.proof = None
+    return reader
+
+
+def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
-    `sha` itself; QueueError otherwise (no run, running, red, unreadable)."""
+    `sha` itself; QueueError otherwise (no run, running, red, unreadable).
+
+    L1651 (#1650): `parts` (a callable returning the due contexts, or a
+    sequence; None: none) closes the completeness hole. Each due part must
+    exist in `commit_ci`'s `statuses` — the commit **status** space of that
+    exact commit — and be terminal success: a part never dispatched leaves no
+    status, and a `skipped` or `cancelled` attempt is not a green one. N1 de
+    #1666 : lire `contexts` (qui mêle runs, checks et statuts) laissait un run
+    ou un check portant le nom d'une part tenir lieu de part ; la preuve se
+    fait désormais dans l'espace des statuts seulement. No status of another
+    commit — the reader is pinned to `sha` — can stand for a part of this
+    one."""
     from . import plan_github, radar
     try:
         runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
@@ -363,23 +446,102 @@ def _required_ci(project, sha: str, commit_ci=None) -> None:
                          % (sha[:12], ", ".join(runs["failed"])))
     if not runs.get("green"):
         raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
+    if parts is None:
+        return
+    due = list(parts() if callable(parts) else parts)
+    #: N1 de #1666 : l'espace des **statuts de commit** seulement. Un lecteur
+    #: qui ne rend pas `statuses` (dict sans la clé, cache d'un autre format)
+    #: ne prouve aucune part : jamais de repli sur `contexts`.
+    statuses = runs.get("statuses") or {}
+    missing = [part for part in due if statuses.get(part) != "success"]
+    if missing:
+        detail = ", ".join("%s (%s)" % (part, statuses.get(part) or "no status")
+                           for part in missing)
+        raise QueueError("the CI on the frozen commit %s does not prove the parts the change "
+                         "set makes due (%d of %d missing or not successful: %s)"
+                         % (sha[:12], len(missing), len(due), detail))
+
+
+def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
+    """L756 (#566): a release lot certifies its frozen head with a **full
+    suite** run — a push or a manual dispatch, never the impacted-only plan of
+    a pull request, and never the empty check of a version-only PR. The suite
+    is the one the project **declares** (`radar.projects.<p>.full_suite`,
+    workflow files resolved to identities): each declared workflow must have
+    run on the exact head, green, its jobs included (`skipped`/`neutral`/unread
+    jobs certify nothing). QueueError otherwise (no run, running, missing, red,
+    unreadable); `full_ci` reads the runs (`radar.full_suite_ci` by default
+    when the project has a GitHub repo). Une suite non **déclarée** est refusée
+    pour ce qu'elle est — la clé `radar.projects.<p>.full_suite` manquante —,
+    jamais comme une lecture gh impossible (#886)."""
+    from . import plan_github, radar
+    who = "lot #%s" % lot if lot is not None else "this lot"
+    reader = full_ci
+    if reader is None:
+        if project is None or not getattr(project, "github", ""):
+            raise QueueError("%s is class release: no full-suite reader (project without a "
+                             "GitHub repository) — a full run on the frozen head %s is required"
+                             % (who, sha[:12]))
+        if not tuple(getattr(project, "full_suite", ()) or ()):
+            # #886 (P3, R2 mty-amh-qa-01 sur PR manaty/ameesh#633) : une
+            # déclaration manquante n'est pas une panne de lecture ; le message
+            # nomme la clé et ne renvoie pas à « once gh works ».
+            raise QueueError("%s is class release: project %s declares no full suite "
+                             "(radar.projects.%s.full_suite — the workflow files of the full "
+                             "run): a green full-suite run on the frozen head %s is required"
+                             % (who, project.name, project.name, sha[:12]))
+        reader = lambda one: radar.full_suite_ci(project, one)
+    try:
+        runs = reader(sha)
+    except plan_github.GithubError as exc:
+        raise QueueError("cannot read the full-suite runs on the frozen head %s (%s): try again "
+                         "once gh works" % (sha[:12], exc)) from exc
+    if not runs or not runs.get("runs"):
+        raise QueueError("%s is class release: no full-suite run (push or manual dispatch) on "
+                         "the frozen head %s yet (push it, let the workflow run)"
+                         % (who, sha[:12]))
+    if runs.get("pending"):
+        raise QueueError("the full suite on the frozen head %s is still running (%s)"
+                         % (sha[:12], ", ".join(runs["pending"])))
+    if runs.get("missing"):
+        raise QueueError("%s is class release: the declared full suite did not run on the "
+                         "frozen head %s (%s) — a green run of each declared workflow is "
+                         "required" % (who, sha[:12], ", ".join(runs["missing"])))
+    if runs.get("failed"):
+        raise QueueError("the full suite on the frozen head %s is red (%s)"
+                         % (sha[:12], ", ".join(runs["failed"])))
+    if not runs.get("green"):
+        raise QueueError("the full suite on the frozen head %s is not green" % sha[:12])
+    return runs
 
 
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None, commit_ci=None, cfg=None) -> dict:
-    """Puts `lot` into the queue of its target, once `readiness` passes."""
+          clone=None, commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
+    """Puts `lot` into the queue of its target, once `readiness` passes.
+    `parts` is `readiness`'s (L1651): the caller that requalifies a lot (§12
+    package manifest) passes the due contexts it vouches for, `()` to disable
+    the per-lot proof for that gesture."""
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
     ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project,
-                      commit_ci=commit_ci, cfg=cfg)
+                      commit_ci=commit_ci, full_ci=full_ci, cfg=cfg, parts=parts)
+    proof = ready.get("parts") or {}
+    # L1651 (#1650) : la note garde la provenance de la preuve de complétude
+    # (sélecteur versionné et commit de la cible), pour le raccord du train
+    # (#1467/1616) — la preuve n'est jamais un simple « vert »
+    parts_note = ""
+    if proof:
+        parts_note = ", parts %s@%s (%d due)" % (proof.get("selector") or "?",
+                                                 (proof.get("base") or "?")[:12],
+                                                 len(proof.get("due") or ()))
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s" % (
+        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s" % (
             ready["target"], ready["frozen_sha"][:12],
             ", PR #%s green" % ready["pr"] if ready["pr"] else "",
             ready.get("class") or "?", " (%s)" % ready["class_why"]
-            if ready.get("class_why") else ""), actor=actor)
+            if ready.get("class_why") else "", parts_note), actor=actor)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
@@ -885,6 +1047,45 @@ def radar_project(cfg, repo: str):
     return matching[0] if matching else None
 
 
+def writer_project(cfg, repo: str, app: str = "", project=None):
+    """The project identity a single-lot writer shares with the train (#1703).
+
+    `land.lock_key` keys a target lease on `project.name`. A packet train holds
+    the key of the **declared** radar project of its repository, so the direct
+    merge path (`merge_pr.direct_merge`) must resolve that same identity,
+    never a parallel one: the declared project comes first, whatever the
+    admitted lot's `app` says. Without a declared project no train can run on
+    this host, and the lot's `app` is then the explicit identity already
+    carried by the queue — no repository key is invented here (#1680). An
+    empty app refuses: an anonymous writer would open a key space of its own.
+    """
+    if project is None:
+        project = radar_project(cfg, repo)
+    if project is not None:
+        return project
+    name = (app or "").strip()
+    if not name:
+        raise QueueError("cannot reserve an undeclared target project")
+    return SimpleNamespace(name=name)
+
+
+def working_clone(cfg, repo: str, project) -> tuple:
+    """Le clone où `queue add` lit les branches fraîches, et le temporaire à
+    retirer (`None` quand c'est le clone du radar).
+
+    Un passage de radar a son clone privé (`radar.clone_dir`) ; un poste agent
+    ou pilote n'en a pas, et la file doit pourtant s'ouvrir de là (§2 : le
+    pilote met un lot en file depuis son poste). On prête alors un clone
+    jetable du dépôt local (`--shared`), le temps de la commande : la lecture
+    reste fraîche (`fetch_fresh`), le dépôt des agents n'est jamais écrit, et
+    rien ne survit à la commande."""
+    from . import radar, resolutions
+    if project is not None:
+        return resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)), None
+    scratch = tempfile.mkdtemp(prefix="ameesh-queue-")
+    return resolutions.Replayer(repo, os.path.join(scratch, "clone")), scratch
+
+
 def run(cfg, db, args) -> int:
     import sys
     from . import radar, resolutions
@@ -892,10 +1093,13 @@ def run(cfg, db, args) -> int:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
             project = radar_project(cfg, repo)
-            clone = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)) \
-                if project else None
-            row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
-                        clone=clone, cfg=cfg)
+            clone, scratch = working_clone(cfg, repo, project)
+            try:
+                row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
+                            clone=clone, cfg=cfg)
+            finally:
+                if scratch:
+                    shutil.rmtree(scratch, ignore_errors=True)
             print(json.dumps(row, ensure_ascii=False, indent=2, default=str) if args.json else
                   "lot #%d queued for %s at %s, class %s; the radar orders the queue at its "
                   "next pass" % (args.id, row["target"], row["frozen_sha"][:12],
