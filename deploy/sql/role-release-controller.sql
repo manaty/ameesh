@@ -77,6 +77,17 @@ BEGIN
             END LOOP;
         END IF;
     END LOOP;
+    -- Sequences carry their own privileges, outside relkind r/p: USAGE allows
+    -- nextval/currval and UPDATE allows setval, so a grant on a schema sequence
+    -- would move the schema's counters. The controller needs none of them.
+    FOR item IN SELECT c.oid,c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                 WHERE n.nspname=current_schema() AND c.relkind='S' LOOP
+        FOREACH p IN ARRAY ARRAY['USAGE','SELECT','UPDATE'] LOOP
+            IF has_sequence_privilege(r.oid,item.oid,p) THEN
+                RAISE EXCEPTION 'release controller has unrelated sequence privilege % on %', p, item.relname;
+            END IF;
+        END LOOP;
+    END LOOP;
 END
 $audit$;
 COMMIT;
