@@ -15,8 +15,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+from . import test_l160e2_land as _land
 from .test_1656_auto_merge import AutoGh
-from .test_l160e2_land import PrLandTest
 
 
 class RaceGh(AutoGh):
@@ -50,7 +50,7 @@ class RaceGh(AutoGh):
         return super().__call__(args, timeout=timeout)
 
 
-class AutoMergeConstatTest(PrLandTest):
+class AutoMergeConstatTest(_land.PrLandTest):
     def race(self, *, head=None, base="main"):
         """Le lot 4 est en file, l'auto-merge armé, et la fusion se déclenche
         au moment du désarmement — à `head` (le gel par défaut) et dans la
