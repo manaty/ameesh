@@ -1501,6 +1501,10 @@ class AgentWorker(threading.Thread):
         l'authentification) et tourne sous le compte de la session ; sinon la
         rotation attend : la bascule du prochain tour (`continuity`) résume
         sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
+        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
+            # L87b: the summary turn would be refused; wait without consuming a
+            # forced rotation or noting a cancellation on every pass.
+            return False
         if not self.budget_ok() or not self.auth_ready():
             return False
         if self.turn_harness() != account_turn.session_harness(self):
@@ -3251,6 +3255,8 @@ class AgentWorker(threading.Thread):
             self.stopping.set()
             return None
         self.agent = agent
+        if agent.get("operator_paused"):
+            return None  # L87b: keep prompts and mail; budget/pressure cannot lift this hold.
         if self._session_en_attente is not None:
             self._enregistre_session()
         if self._marque_base(agent):
@@ -3654,6 +3660,9 @@ class AgentWorker(threading.Thread):
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
         self.fast_failure = False
+        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien
@@ -4219,7 +4228,10 @@ class AgentWorker(threading.Thread):
         if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
                                    self._marqueurs_durables(
                                        "%s turn (%s)" % (shown, harness))):
-            log("[%s] lease lost or agent stopped before the turn" % self.name)
+            # L87b: pause may have won the row lock after pick/run_turn.
+            # Return a prompt already taken, without rewriting concurrent status.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            log("[%s] lease lost, agent stopped or operator paused before the turn" % self.name)
             return False
         lot = spec.get("lot")
         if lot and str(lot) != str(self.agent.get("session_work_item") or ""):
