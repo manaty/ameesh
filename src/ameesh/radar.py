@@ -71,7 +71,7 @@ SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "ci_parts",
-                "full_suite")
+                "full_suite", "required_statuses")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -171,6 +171,10 @@ class Project:
     path_gates: tuple = ()
     ci_required: bool = False
     protected: tuple = ()
+    #: #1748 (a): `((branch glob, context prefix), …)` — a PR head (or frozen
+    #: commit) of a matching branch is green only with at least one commit
+    #: status of that prefix in `success` (Nexlink: `integration/**` → `lot/`)
+    required_statuses: tuple = ()
     #: L1651 (#1650): les parts dues d'un change set gelé, recalculées par le
     #: sélecteur versionné du dépôt (`CiParts`) ; None : aucune preuve de
     #: complétude n'est demandée
@@ -396,6 +400,12 @@ def parse_settings(raw) -> Settings:
         if not isinstance(protected, (list, tuple)) or not all(
                 isinstance(p, str) and p.strip() for p in protected):
             raise SettingsError("%s.protected: a list of target globs expected" % where)
+        required = value.get("required_statuses", {})
+        if not isinstance(required, dict) or not all(
+                isinstance(g, str) and g.strip() and isinstance(p, str) and p.strip()
+                for g, p in required.items()):
+            raise SettingsError("%s.required_statuses: {\"branch glob\": \"context prefix\"} "
+                                "expected" % where)
         declared_suite = value.get("full_suite") or ()
         if isinstance(declared_suite, (str, dict)):
             declared_suite = (declared_suite,)
@@ -467,6 +477,8 @@ def parse_settings(raw) -> Settings:
                                  generated=tuple(generated), path_gates=tuple(by_path),
                                  ci_required=ci_required,
                                  protected=tuple(p.strip() for p in protected),
+                                 required_statuses=tuple((g.strip(), p.strip())
+                                                         for g, p in required.items()),
                                  ci_parts=ci_parts,
                                  full_suite=tuple(full_suite),
                                  full_suite_required=tuple(required_jobs),
@@ -1066,10 +1078,43 @@ def github_slug(project: Project) -> str | None:
     return match.group(1) if match else None
 
 
-def ci_green(rollup) -> bool:
+def required_statuses(project, branch: str | None) -> tuple:
+    """#1748 (a): the commit status prefixes `branch` must carry in `success`
+    (`required_statuses` of the project). An unknown branch gets every
+    declared prefix: a doubt never lowers the gate."""
+    import fnmatch
+    declared = getattr(project, "required_statuses", ()) or ()
+    name = (branch or "").strip()
+    # Match the same branch aliases that merge_queue.fetch_fresh resolves.
+    for ref_prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if name.startswith(ref_prefix):
+            name = name[len(ref_prefix):]
+            break
+    if not name:
+        return tuple(sorted({prefix for _, prefix in declared}))
+    return tuple(sorted({prefix for glob, prefix in declared
+                         if fnmatch.fnmatchcase(name, glob)}))
+
+
+def _status_success(contexts, required) -> list:
+    """The prefixes of `required` that no `success` context of `contexts`
+    (`(context, state)` pairs) carries."""
+    won = [c for c, state in contexts if (state or "").upper() == "SUCCESS"]
+    return [p for p in required if not any((c or "").startswith(p) for c in won)]
+
+
+def ci_green(rollup, required=()) -> bool:
     """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
-    terminés sans échec."""
+    terminés sans échec. #1748 (a) : chaque préfixe de `required`
+    (`required_statuses`) doit en outre être porté par un statut de commit
+    (`StatusContext`, jamais un check run, dont le nom est libre) en
+    `success` — des checks `skipped` ou `success` seuls ne suffisent plus."""
     if not rollup:
+        return False
+    statuses = [(c.get("context"), c.get("state")) for c in rollup
+                if c.get("__typename") == "StatusContext"
+                or "state" in c and "conclusion" not in c]
+    if _status_success(statuses, required):
         return False
     for check in rollup:
         if check.get("__typename") == "StatusContext" or "state" in check \
@@ -1109,7 +1154,8 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
             return None
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
                 "head": rows[0].get("headRefOid"),
-                "green": ci_green(rows[0].get("statusCheckRollup")),
+                "green": ci_green(rows[0].get("statusCheckRollup"),
+                                  required_statuses(project, branch)),
                 "draft": bool(rows[0].get("isDraft"))}
     return status
 
@@ -1118,7 +1164,7 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
 CI_PASSING = ("success", "skipped", "neutral")
 
 
-def commit_ci(project: Project, sha: str, gh=None) -> dict:
+def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
     (Actions, external app checks and commit statuses), the latest activity
     of each workflow database ID: `{runs,
@@ -1254,8 +1300,12 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
         else:
             note(status["context"], "success")
     count = len(latest) + len(external) + len(statuses["statuses"])
-    return {"runs": count, "green": bool(count) and not pending and not failed,
-            "pending": sorted(pending), "failed": sorted(failed), "contexts": contexts}
+    # #1748 (a): the declared prefixes of `branch` need a `success` status
+    missing = _status_success([(s["context"], s.get("state")) for s in statuses["statuses"]],
+                              required_statuses(project, branch))
+    return {"runs": count, "green": bool(count) and not pending and not failed and not missing,
+            "pending": sorted(pending), "failed": sorted(failed), "missing": missing,
+            "contexts": contexts}
 
 
 #: L756 (#566): les déclencheurs d'une exécution de la suite **complète** —

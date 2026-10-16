@@ -318,7 +318,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     if needs_commit_ci:
         if parts is None and getattr(project, "ci_parts", None):
             parts = _parts_reader(project, repo, target, tip, clone)
-        _required_ci(project, tip, commit_ci, parts=parts)
+        _required_ci(project, tip, commit_ci, parts=parts, branch=row["branch"])
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),
@@ -413,7 +413,8 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone):
     return reader
 
 
-def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
+def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
+                 branch: str | None = None) -> None:
     """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
     `sha` itself; QueueError otherwise (no run, running, red, unreadable).
 
@@ -425,7 +426,7 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     reader is pinned to `sha` — can stand for a part of this one."""
     from . import plan_github, radar
     try:
-        runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
         raise QueueError("project %s requires CI on the frozen commit (ci_required), "
                          "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
@@ -438,6 +439,10 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     if runs["failed"]:
         raise QueueError("the CI on the frozen commit %s is red (%s)"
                          % (sha[:12], ", ".join(runs["failed"])))
+    if runs.get("missing"):
+        raise QueueError("the frozen commit %s carries no successful %s status: its "
+                         "required validation has not concluded (required_statuses)"
+                         % (sha[:12], " / ".join("%s*" % p for p in runs["missing"])))
     if not runs.get("green"):
         raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
     if parts is None:

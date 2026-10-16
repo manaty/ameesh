@@ -247,7 +247,7 @@ def _json(proc, what: str, kind):
     return data
 
 
-def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
+def pr_status(slug: str, branch: str, gh=_gh, *, project=None) -> dict | None:
     """The open PR of `branch`: `{number, head, base, ci: green|red|pending,
     auto}`. `auto` (#1656) says GitHub auto-merge is armed: its
     `--match-head-commit` is checked when it is armed, never again, so a head
@@ -261,9 +261,13 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
     if not rows:
         return None
     rollup = rows[0].get("statusCheckRollup") or []
+    required = radar.required_statuses(project, branch)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
-    ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
+    # #1748 (a): all green but a required status not yet published: the
+    # package validation is still to come, never a green
+    ci = "green" if radar.ci_green(rollup, required) else "pending" \
+        if pending or not rollup or radar.ci_green(rollup) else "red"
     return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"),
             "base": rows[0].get("baseRefName"), "ci": ci,
             "auto": bool(rows[0].get("autoMergeRequest"))}
@@ -507,7 +511,8 @@ class _Landing:
                     parts = merge_queue._parts_reader(
                         self.project, self.project.repo, self.row.get("target") or "",
                         self.row["frozen_sha"], self.replayer)
-                merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts)
+                merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts,
+                                         branch=self.row.get("branch"))
             except merge_queue.QueueError as exc:
                 return self.eject(str(exc), "Restore green CI on the frozen commit, then "
                                   "ameesh work queue add %d." % self.lot)
@@ -675,7 +680,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
         return landing.busy("lease on %s lost before landing" % landing.key)
     if project.land == "pr":
         found = None
-        status = pr_status(slug, row["branch"], gh=gh) if slug else None
+        status = pr_status(slug, row["branch"], gh=gh, project=project) if slug else None
         if status is None:
             # #1682: an armed auto-merge can merge the PR between two passes,
             # at the exact frozen head. That merge is a fact like any other:
@@ -846,7 +851,7 @@ def pr_view(slug: str, number, gh=_gh) -> dict:
 def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     branch = _branch_of(row["target"])
-    status = pr_status(slug, row["branch"], gh=gh) if slug else None
+    status = pr_status(slug, row["branch"], gh=gh, project=project) if slug else None
     if status is None and slug and row.get("landing_sha"):
         # #194 r8: merged since (a merge call that timed out, or between two
         # passes): checked like any merge of ameesh's, never ejected
