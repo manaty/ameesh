@@ -1088,6 +1088,31 @@ class WatcherTest(PgTestCase):
         self.assertEqual(st.ci.base_failures(repo, "main", workflow="tests.yml")["run_id"],
                          2002)
 
+    def test_reference_garde_le_dernier_resultat_de_la_tete_recente(self):
+        """Une reprise actualise le résultat, jamais l'âge de sa tête."""
+        st = storage.of(self.db)
+        ancienne, recente = "0c" * 20, "0d" * 20
+        for premier, dernier in (("failure", "success"), ("success", "failure")):
+            repo = "manaty/reprise-" + premier
+            runs = ((2001, ancienne, "cancelled"), (2002, recente, premier),
+                    (2003, ancienne, "failure"), (2004, recente, dernier))
+            for minute, (run_id, head, status) in enumerate(runs):
+                st.ci.open_run(repo, run_id, head_sha=head, branch="main", event="push",
+                               base="main", work_item_id=None, url=None, workflow="tests.yml",
+                               created_at="2026-01-01T10:%02d:00Z" % minute)
+                if status == "failure":
+                    st.ci.add_failure(repo, run_id, part="psql 1/1", test="tests.test_a.T.test_1",
+                                      module="tests.test_a", status="echec", inherited=False,
+                                      excerpt="", replay="", duration_s=None, failed_at=None)
+                st.ci.conclude(repo, run_id, status)
+                self.db.execute("UPDATE ci_runs SET concluded_at = %s::timestamptz"
+                                " WHERE repo = %s AND run_id = %s",
+                                ("2026-01-01T11:%02d:00Z" % minute, repo, run_id))
+            reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+            self.assertEqual((reference["run_id"], reference["head_sha"]), (2004, recente))
+            self.assertEqual(reference["tests"], ["tests.test_a.T.test_1"]
+                             if dernier == "failure" else [])
+
     def test_pending_ne_cite_que_la_meme_tete(self):
         """#1110 P3 : le verdict ne cite comme « encore en cours » que les
         workflows de la même tête, pas ceux d'un autre lot."""

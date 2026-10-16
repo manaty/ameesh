@@ -144,19 +144,20 @@ class CiResults(interface.CiResults):
         # #1683 : la référence est la tête la plus récemment poussée, pas
         # l'exécution conclue le plus récemment — une exécution lente d'une
         # tête plus ancienne ne redevient pas la base. Pour chaque tête, sa
-        # première observation (un réessai ne la rajeunit pas).
+        # première observation, annulations comprises (un réessai ne la
+        # rajeunit pas), mais le résultat de sa dernière exécution conclue.
         rows = self.db.query(
             """
-            WITH heads AS (
-                SELECT DISTINCT ON (head_sha) run_id, head_sha,
-                       coalesce(created_at, first_seen_at) AS seen_at
+            WITH runs AS (
+                SELECT run_id, head_sha, status, concluded_at,
+                       min(coalesce(created_at, first_seen_at))
+                           OVER (PARTITION BY head_sha) AS seen_at
                   FROM ci_runs
-                 WHERE repo = %s AND branch = %s AND status IN ('success', 'failure')
-                   AND workflow = %s
-                 ORDER BY head_sha, coalesce(created_at, first_seen_at), run_id
+                 WHERE repo = %s AND branch = %s AND workflow = %s
             ), last AS (
-                SELECT run_id, head_sha FROM heads
-                 ORDER BY seen_at DESC, run_id DESC LIMIT 1
+                SELECT run_id, head_sha FROM runs
+                 WHERE status IN ('success', 'failure')
+                 ORDER BY seen_at DESC, concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f

@@ -3301,7 +3301,7 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def base_failures(self, repo: str, branch: str, *, workflow: str = "") -> dict:
-        """Exécution conclue (verte ou rouge) de la **tête la plus récemment
+        """Dernière exécution conclue (verte ou rouge) de la **tête la plus récemment
         poussée** de `branch`, pour ce workflow (#1683 : la conclusion la plus
         récente peut être celle d'une tête plus ancienne) : `{run_id, head_sha,
         tests}` (tests en échec), ou {} sans exécution. Le workflow évite de
