@@ -63,5 +63,12 @@ class RebaseTraceTest(banc.RebaseLotOptionsTest):
         self.assertIn("corps 2", sujets)
 
 
+# Le banc #1516 ne prête que ses greffons : ses témoins tournent dans leur
+# propre module, pas une seconde fois ici.
+for _nom in dir(banc.RebaseLotOptionsTest):
+    if _nom.startswith("test_"):
+        setattr(RebaseTraceTest, _nom, None)
+
+
 if __name__ == "__main__":
     unittest.main()
