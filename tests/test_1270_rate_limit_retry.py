@@ -17,7 +17,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import adapters, exploitation, rate_limit, registry
+from ameesh import adapters, db as db_mod, exploitation, rate_limit, registry
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -774,6 +774,40 @@ class CadenceTest(unittest.TestCase):
             AgentWorker._attendre_apres_echec(faux, 30.0)
         self.assertEqual(horloge["t"], 30.0)
         self.assertEqual(renews, [])
+
+    def test_panne_de_base_ne_boucle_pas_sur_un_bail_presque_echu(self):
+        for boucle in ("_attendre_reprise", "_attendre_apres_echec"):
+            for restant in (1.0, 10.0):
+                with self.subTest(boucle=boucle, restant=restant):
+                    faux, horloge, _ = self._faux()
+                    faux.name = "cadence"
+                    faux.lease_deadline = restant
+                    faux.renew_failures = 0
+                    faux.lease_lost = threading.Event()
+                    faux.stop_group_now = mock.Mock()
+                    faux.deadline_passed = lambda: AgentWorker.deadline_passed(faux)
+                    faux.wait_timeout = lambda cap: AgentWorker.wait_timeout(faux, cap)
+                    faux.renew = lambda: AgentWorker.renew(faux)
+                    appels = []
+
+                    def indisponible():
+                        appels.append(horloge["t"])
+                        horloge["t"] += 0.001
+                        return True, None, db_mod.Unavailable("connection refused")
+
+                    faux._renew_call = indisponible
+                    with mock.patch("ameesh.runner.time.time",
+                                    side_effect=lambda: horloge["t"]), \
+                            mock.patch("ameesh.runner.time.monotonic",
+                                       side_effect=lambda: horloge["t"]), \
+                            mock.patch("ameesh.runner.log_async"):
+                        getattr(AgentWorker, boucle)(faux, restant + 1.0)
+                    self.assertEqual(appels[0], 0.0, "premier essai immédiat")
+                    self.assertLessEqual(len(appels), 5,
+                                         "une panne ne doit pas boucler sans attente")
+                    self.assertTrue(faux.lease_lost.is_set())
+                    self.assertEqual(horloge["t"], restant,
+                                     "aucune attente au-delà du bail")
 
 
 class AlerteTest(PgTestCase):
