@@ -41,12 +41,13 @@ class _Base(PgTestCase):
     def lot(self, title, *, assignee=None):
         item = work.add(self.db, title=title, app="nexlink")
         if assignee:
-            work.assign(self.db, item["id"], assignee, cfg=self.cfg)
+            work.assign(self.db, item["id"], assignee, cfg=self.cfg,
+                        force="test: fixture, lots multiples (#540)")
         return work.get(self.db, item["id"])
 
     def promoted(self, assignee="dev1"):
         lot = self.lot("deployed", assignee=assignee)
-        work.merged(self.db, lot["id"], sha="a" * 40, actor=assignee)
+        work.close_merged(self.db, lot["id"], sha="a" * 40, actor=assignee)
         work.move(self.db, lot["id"], "promoted", note="déployé", actor="auditeur")
         return lot
 
@@ -131,6 +132,8 @@ class SweepAfterGuardsTest(_Base):
             agents_filter=None, once=True, runner_id="runner-test", dry_run=False)
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
+        # L85 (#373) : `sweep` prune aussi le journal d'événements.
+        fake.prune_events_once = lambda *args, **kwargs: None
         fake.release_stopped_lots_once = mock.Mock(return_value=[])
         for key, value in kwargs.items():
             setattr(fake, key, value)

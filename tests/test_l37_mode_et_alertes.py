@@ -267,7 +267,7 @@ class AlertesVivaciteTest(_Base):
         # agent arrêté doit rester visible, même si `open_lots_activity` l'exclut.
         self.register("dort", "claude", cwd=self.tmp)
         lot = work.add(self.db, title="promu", assignee="dort")
-        work.merged(self.db, lot["id"], sha="a" * 40, actor="dort")
+        work.close_merged(self.db, lot["id"], sha="a" * 40, actor="dort")
         work.move(self.db, lot["id"], "promoted", note="déployé", actor="dort")
         self.assertEqual([a for a in self._types() if a["lot"] == lot["id"]], [])
         registry.set_status(self.db, "dort", "stopped", status_text="arrêté",
