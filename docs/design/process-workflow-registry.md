@@ -178,30 +178,62 @@ sources = pr.read_sources(context)                # real collections, in the tx
 Contract: `manaty/ameesh#1379` (owner handoff 02:58Z, consumer qualification
 08:45Z). This section is **documentation only**: it publishes what the installed
 native seam decides today, what it refuses and which consumer-policy facts are
-still missing. It adds no verifier and no admission code.
+still missing. It adds no verifier and no admission code. "Today" means: no production
+caller invokes `install_verifiers` or `apply_command` yet; the seam is
+reachable from the Python API and the tests only.
 
 Q1/Q2/Q3 below are a first **capability/refusal** deliverable. They do **not**
 qualify `planning`/`start_work` against the business contract: those two guards
-accept today on the lot title and on the assignee alone.
+accept today on the lot title and on the assignee alone, and
+`capability_report()` lists them in `executable_guards` (installed, no declared
+source). "Executable" there means "callable", **not** "qualified": until the
+missing facts below are published, a consumer must treat them as not admitted
+(a refuse-by-default for these two guards is a possible later change, not made
+here).
 
 ### Requirement / native source / refusal / missing
 
 | # | requirement (consumer contract) | native source read today | refusal today | still missing |
 |---|---|---|---|---|
-| 1a | `planning`: current spec approved | none: `_check_planning` reads only `title`; the locked row also carries `app`, `workstream`, `type`, `state`, `reviewer`, `workflow_*` | `evidence-missing` (no title); `type-unsupported` (type outside `INSTALLED_TYPES`) | "current spec": artifact/digest, approving actor, validity window — **consumer policy, not published** |
-| 1b | `planning`/`start_work`: budget | `work_items.budget_usd numeric(12,4)` exists (migration 0004) but is **not projected** into C's snapshot (`_lock_lot`); no budget collection | none: no native budget check | envelope (lot vs agent vs account), threshold, period — **missing**; a native projection would be one more field in `_lock_lot` |
+| 1a | `planning` **and** `start_work`: current spec approved | none: `_check_planning` reads only `title`; the locked row also carries `app`, `workstream`, `type`, `state`, `reviewer`, `workflow_*` | `evidence-missing` (no title); `type-unsupported` (type outside `INSTALLED_TYPES`) | "current spec": artifact/digest, approving actor, validity window — **consumer policy, not published** |
+| 1b | `planning`/`start_work`: budget | three native envelopes, none read by C: lot `work_items.budget_usd numeric(12,4)` (migration 0004, **not projected** by `_lock_lot`); account `account_budgets` (migration 0443, daily per billing account); agent `budget_usd` (canon declarative field, `canon_sync.DECLARATIVE`) | none: no native budget check | which envelope (lot vs agent vs account), threshold, period — **missing**. Shape matters: a lot field added to `_lock_lot` is a plain projection and **escapes** `source-unavailable` (an absent field reads as empty, not as a missing source); an account/agent envelope would be one more declared collection in `SOURCE_KEYS`, fail-closed when absent |
 | 1c | reviewed governance authority | no generic native object; only candidates: native decision request L233 (open requests only), module proof `work_module_milestones` (`schemas`/`rules`, `actor_role`, `separation_of_duties`), `reviewer` designation | nothing generic | source role/actor and review rule — **missing**; any acceptance would be invented |
-| 2 | `revision_transfer`: admission/transfer explicitly reviewed, bounded to lot/project/revision/actor, refused on absent or stale proof | reserved name `TRANSFER_VERIFIER = "revision_transfer"` (`process_registry`), called by `transfer_revision`; **not installed** by `install_verifiers` (14 guards + `hold`), **not published** by the code matrix (`RESERVED_VERIFIERS`) | `verifier-uninstalled` (B refuses before C); nothing else is possible today | identity of a "reviewed revision" (`workflow_ref@version` vs milestone sha vs digest) and the independence rule — **missing** |
-| 3 | `docs`, `investigation`, `governance-tracking`, `promotion`, `human_operation` admitted by an **active project module**, without bypassing the SQL guard | `INSTALLED_TYPES` carries the five (+ `bug`, `evolution`); completion is per type; SQL guard `ameesh_module_requirements` (migration 0363): `bug`/`evolution`/`improvement` stay admitted, any other type needs `project_modules.types` for the lot's project; modules are written only by canon sync | SQL `AMEESH_MODULE_RULE: work item type % has no active module in project %` (every write of the lot — insert, state change or any other update — and module-milestone insert); C `type-unsupported` | no installed descriptor declares the five (`modules/it` declares `release`/`publication`), so the SQL guard refuses such a lot today: the module name and content are a **pilot decision**; `improvement` is admitted by the legacy SQL but absent from `INSTALLED_TYPES`, so C refuses it `type-unsupported` |
-| 4 | `observations` staging/preprod: reliable source absent, refusal kept | `observations` is declared in `SOURCE_COLLECTIONS` but absent from `SOURCE_KEYS`/`read_sources`: the snapshot never carries it | `source-unavailable` **before the guard check** (only `type-unsupported` is checked first), for `merged_and_staging_deployed`, `staging_pass`/`staging_failure`, `preprod_*`, `repair_started` | shape, attestation and freshness of the reliable source — **not designed, named missing**; nothing invented (no table edit, no client boolean) |
+| 2 | `revision_transfer`: admission/transfer explicitly reviewed, bounded to lot/project/revision/actor, refused on absent or stale proof | reserved name `TRANSFER_VERIFIER = "revision_transfer"` (`process_registry`), called by `transfer_revision`; **not installed** by `install_verifiers` (14 guards + `hold`), **not published** by the code matrix (`RESERVED_VERIFIERS`) | `verifier-uninstalled` (B refuses before C); nothing else is possible today. `capability_report().refusal("revision_transfer")` answers `guard-unsupported` (the name is in neither the guard registry nor `RESERVED_VERIFIERS`), not `verifier-uninstalled` | proof binding: lot (`work_item_id`) and project (`app`/`workstream`) are native in the locked row (`_lock_lot`), the revision (`workflow_ref@version` vs milestone sha vs digest) and the reviewing actor are not bound to a proof; the proof's source, its staleness rule and the independence rule — **missing** |
+| 3 | `docs`, `investigation`, `governance-tracking`, `promotion`, `human_operation` admitted by an **active project module**, without bypassing the SQL guard | `INSTALLED_TYPES` carries the five (+ `bug`, `evolution`); completion is per type; SQL guard `ameesh_module_requirements` (migration 0363): `bug`/`evolution`/`improvement` stay admitted, any other type needs `project_modules.types` for the lot's project; modules are written only by canon sync | SQL `AMEESH_MODULE_RULE: work item type % has no active module in project %` (every write of the lot — insert, state change or any other update — and module-milestone insert; trigger of 0363, `ameesh_module_requirements` redefined by 0427); C `type-unsupported` | the active module is canon-declared: `extensions.ameesh.projects.<project>.modules` names **installed** descriptors only (`modules.installed()`), whose types must be disjoint within a project; no installed descriptor declares the five (`modules/it` declares `release`/`publication`), so the SQL guard refuses such a lot today: the module name and content are a **pilot decision**; `improvement` is admitted by the legacy SQL but absent from `INSTALLED_TYPES`, so C refuses its `advance` `type-unsupported` (`hold`/`release` do not check the type and pass) |
+| 4 | `observations` staging/preprod: reliable source absent, refusal kept | `observations` is declared in `SOURCE_COLLECTIONS` but absent from `SOURCE_KEYS`/`read_sources`: the snapshot never carries it | `source-unavailable` before the guard's own check, after the earlier refusals (see the order below), for `merged_and_staging_deployed`, `staging_pass`/`staging_failure`, `preprod_*`, `repair_started` | shape, attestation and freshness of the reliable source — **not designed, named missing**; nothing invented (no table edit, no client boolean) |
 
-### Three refusals, kept distinct
+### Refusals: two levels (B and C)
 
-* `verifier-uninstalled` — B knows the guard name, no server callable is
+The refusal codes live at two levels, and only B's reach a caller of
+`apply_command`:
+
+* **B (`apply_command`)** raises `RegistryRefusal` with its own code. For a
+  guard, it is `verifier-uninstalled` (no callable installed) or
+  `verifier-refused` (C answered `ok=False`); a refusal writes no journal and
+  no receipt (rollback). B carries only C's message (`process_registry._verify`):
+  C's code is **not** propagated.
+* **C (the verifier callable, `server_verifier`)** returns a `Verification`
+  whose `facts["code"]` is the precise code (`source-unavailable`,
+  `type-unsupported`, `evidence-missing`, …). It is observable only by calling
+  the callable (or `verify(command, snapshot)`) directly.
+
+So through B, `source-unavailable`, `type-unsupported` and `evidence-missing`
+are all `verifier-refused`; telling them apart needs C's callable. Propagating
+C's code through B is a **missing seam point**, named here, not added.
+
+C checks, in order: `stage-stale`, `terminal-reopening`, `hold-advance`,
+`guard-unsupported`, `type-unsupported`, `source-unavailable`, then the
+reference checks (`evidence-invalid`, `evidence-missing`) and the guard
+itself. For an `advance`, B refuses first, before calling C:
+`stage-mismatch`, `terminal-reopened`, `held`, `edge-undeclared`. For `hold`/`release`,
+C checks neither type nor guard sources (except `decisions` for
+`waiting_human`).
+
+* `verifier-uninstalled` (B) — B knows the guard name, no server callable is
   installed for it; `revision_transfer` refuses this way today, before C runs;
-* `source-unavailable` — a collection the guard declares is absent from the
-  snapshot; fail-closed, before the guard check;
-* `type-unsupported` — the lot type is outside `INSTALLED_TYPES`; the SQL gate
+* `source-unavailable` (C) — a collection the guard declares is absent from
+  the snapshot; fail-closed, after the earlier refusals above;
+* `type-unsupported` (C) — the lot type is outside `INSTALLED_TYPES`; the SQL gate
   (`AMEESH_MODULE_RULE`) is **separate** and applies at every write of the lot
   (insert, state change, any other update), so the same lot can be refused by
   either gate for different reasons
@@ -212,7 +244,7 @@ accept today on the lot title and on the assignee alone.
 | name | installed by `install_verifiers` | in the code matrix | note |
 |---|---|---|---|
 | `hold` | yes | yes | `hold`/`release`; `waiting_human` additionally needs `decisions` |
-| `revision_transfer` | **no** | **no** (`RESERVED_VERIFIERS` = `("hold",)`) | reserved and called by B; published here at **documentation** level only |
+| `revision_transfer` | **no** | **no** (`RESERVED_VERIFIERS` = `("hold",)`; `capability_report().refusal` → `guard-unsupported`) | reserved and called by B; published here at **documentation** level only |
 
 ### First deliverable admitted now (Q1/Q2/Q3)
 
@@ -223,9 +255,11 @@ accept today on the lot title and on the assignee alone.
 * **Q2** — document `revision_transfer` as absent (today
   `verifier-uninstalled`). Publishing the name stays documentation for now; no
   `install_verifier("revision_transfer", …)` is added without a published
-  contract (identity of the reviewed revision, independence rule).
+  contract (lot/project binding, identity of the reviewed revision and actor,
+  proof source, staleness rule, independence rule).
 * **Q3** — keep the fail-closed `observations` → `source-unavailable` refusal
-  and qualify it with a witness.
+  and qualify it with a witness **on C's callable** (through B it is only
+  `verifier-refused`).
 
 `planning`/`start_work` stay on today's subset (title, assignee, installed
 type); the matrix publishes "not admitted" for the missing facts below.
@@ -234,10 +268,10 @@ type); the matrix publishes "not admitted" for the missing facts below.
 
 | # | fact | expected source |
 |---|---|---|
-| 1 | current approved spec: artifact/digest, approving actor, validity window | consumer policy |
-| 2 | budget: envelope, threshold, period | consumer policy (+ a native projection if the field is native) |
+| 1 | current approved spec (for `planning` and `start_work`): artifact/digest, approving actor, validity window | consumer policy |
+| 2 | budget: envelope (lot `budget_usd`, account `account_budgets`, agent `budget_usd`), threshold, period | consumer policy (+ a native declared collection, or a plain `_lock_lot` projection that escapes `source-unavailable`) |
 | 3 | governance: source role/actor and review rule | consumer policy / module rules |
-| 4 | reviewed revision identity and independence rule (transfer) | consumer policy |
+| 4 | transfer proof: binding to lot (`work_item_id`) and project (`app`/`workstream`, native), reviewed revision identity and reviewing actor, proof source, staleness rule, independence rule, refusal codes | consumer policy; codes published with the contract |
 | 5 | module declaring the five types (name, content) | pilot decision |
 | 6 | reliable observation source: shape, attestation, freshness | consumer policy |
 
@@ -254,13 +288,16 @@ SQL read by C.
 
 ### Discriminating cases proposed for review (no code)
 
+Witnesses name the level they observe: **C** = the verifier callable
+(`facts["code"]`), **B** = `apply_command` (`RegistryRefusal.code`).
+
 | control | witness |
 |---|---|
-| `planning` | empty title → `evidence-missing`; otherwise accepted, with spec/budget/governance **not** checked (the witness must show it) |
-| `start_work` | no assignee → `evidence-missing` |
-| type | `docs` lot, no module → SQL `AMEESH_MODULE_RULE` at insert; `release` lot with the `it` module active → SQL admitted; `improvement` lot → SQL admitted, then C `type-unsupported` |
-| `revision_transfer` | no verifier → `verifier-uninstalled`; once a contract is published: absent proof → named refusal, other revision → `revision-mismatch`, same actor → `reviewer-not-independent`, stale proof → named refusal |
-| `observations` | any staging/preprod advance → `source-unavailable`, no effect (rollback); a well-formed command refuses identically |
+| `planning` | empty title → C `evidence-missing`, B `verifier-refused`; otherwise accepted, with spec/budget/governance **not** checked (the witness must show it) |
+| `start_work` | no assignee → C `evidence-missing`, B `verifier-refused` |
+| type | `docs` lot, no module → SQL `AMEESH_MODULE_RULE` at insert; `release` lot with the `it` module active → SQL admitted; `improvement` lot → SQL admitted, then `advance` C `type-unsupported` / B `verifier-refused`, while `hold`/`release` pass |
+| `revision_transfer` | no verifier → B `verifier-uninstalled`, `capability_report().refusal` → `guard-unsupported`; once a contract is published, with its codes: absent proof, proof for **another lot**, proof for **another project**, other revision, same actor (not independent), stale proof → each a distinct refusal code published with the contract (none exists today) |
+| `observations` | any staging/preprod advance → C `source-unavailable`, B `verifier-refused`, no effect (rollback); a well-formed command refuses identically |
 
 ## Proofs
 
