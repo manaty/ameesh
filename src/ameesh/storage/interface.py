@@ -2576,6 +2576,14 @@ class Operations(Domain):
                         "turn_grace_seconds")
 
     @abc.abstractmethod
+    def publish_peek(self, name: str, owner: str, epoch: int, payload: dict) -> bool:
+        """Replace a sanitised observation under the live agent lease; false if fenced."""
+
+    @abc.abstractmethod
+    def read_peek(self, name: str, human: str) -> dict | None:
+        """Responsible human only; no snapshot data selected on a refused read."""
+
+    @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
         """Pose les réglages nommés (clés de `SETTINGS` ; `''` ou None =
         défaut, colonne effacée). Faux si l'agent est inconnu."""

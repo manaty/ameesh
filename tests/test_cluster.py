@@ -60,6 +60,7 @@ SIGNATURES = {
 #: contenus (texte libre) : refusés au rôle de base, seuls lisibles par le rôle
 #: « contenus » (role-superviseur-contenus.sql)
 CONTENUS = {
+    "agent_peek": {"payload"},
     "agent_mailbox": {"body", "payload", "meta"},
     "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
     "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},
@@ -86,6 +87,10 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #1465: the base's provenance receipt table has no supervisor GRANT.
+    # Preserve those closed columns while composing #1349; no right is added.
+    "provenance_receipts": {"subject", "sha", "actor", "session", "turn", "harness",
+                            "work_item_id", "at"},
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
     "agent_mesh_overview": {"roles"},
