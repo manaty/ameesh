@@ -236,6 +236,18 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
 .vthemes li { margin: 2px 0; overflow-wrap: anywhere; }
 p.summary { font-size: .86rem; margin: 6px 0; }
 #refresh-status.warn { font-size: .8rem; }
+/* L83 : la conversation d'un agent dans la fiche (0024) — lecture et saisie */
+.conv-list { margin: 4px 0; max-height: 260px; overflow-y: auto; border-top: 1px solid var(--grid); }
+.conv { border-bottom: 1px solid var(--grid); padding: 5px 0; }
+.conv-human { background: var(--page); }
+.conv-head { color: var(--muted); font-size: .74rem; }
+.conv-text { font-size: .84rem; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; }
+.conv-form { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; flex-wrap: wrap; }
+.conv-form textarea { flex: 1 1 14rem; min-height: 34px; resize: vertical; font: inherit; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--grid); border-radius: 6px; padding: 5px 7px; }
+.conv-form button { font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--grid); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+.conv-form button:disabled { color: var(--muted); cursor: default; }
 @media (max-width: 520px) { .stats { grid-template-columns: repeat(2, 1fr); } main { padding: 0 10px 10px; } }
 </style>
 </head>
@@ -283,7 +295,8 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   // au chargement puis à chaque Refresh ; "static" pour un fichier --html
   // (données embarquées, rien à relire)
   var MODE = /*__AMEESH_PROGRESS_MODE__*/"static";
-  var API = "/api/progress.json", TOKEN_KEY = "ameesh-progress-token", TOKEN = "";
+  var API = "/api/progress.json", CHAT = "/api/conversation.json";
+  var TOKEN_KEY = "ameesh-progress-token", TOKEN = "";
   var D = JSON.parse(document.getElementById("data").textContent || "null");
   var TABS = [["overview", "Overview"], ["versions", "Versions"], ["gantt", "Gantt"],
               ["lots", "Work items"], ["agents", "Agents"], ["budget", "Budget"],
@@ -393,6 +406,103 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     b.setAttribute("role", "img");
     if (label) b.setAttribute("aria-label", label);
     return b;
+  }
+  // L83 : une entrée de la conversation partagée d'un agent (ameesh-conversation/1).
+  // Le texte passe par textContent, jamais par du HTML ; au-delà de 4 000
+  // caractères l'aperçu est coupé (le détail complet se lit avec `ameesh chat`).
+  function convEntry(entry) {
+    var kind = entry.kind || "", meta = entry.meta || {}, who = entry.author || "?";
+    var line = el("div", "conv" + (kind === "human_message" ? " conv-human" : ""));
+    if (kind === "human_message") who += " [human]";
+    else if (kind === "turn_end") who = "end of turn" + (meta.status ? " · " + meta.status : "")
+      + (typeof meta.cost_usd === "number" ? " · " + usd(meta.cost_usd) : "");
+    else if (kind === "tool") who = "· " + (meta.tool || entry.text || "tool")
+      + (meta.status ? " (" + meta.status + ")" : "");
+    else if (kind === "input") who = "← " + who;
+    else if (kind === "state") who = "· " + (entry.text || "state");
+    line.appendChild(el("div", "conv-head", hm(entry.ts) + (who ? " " + who : "")));
+    var text = entry.text || "";
+    if (kind === "state" || kind === "tool") text = "";
+    if (text.length > 4000) text = text.slice(0, 4000) + " […]";
+    if (text) line.appendChild(el("div", "conv-text", text));
+    if (entry.truncated) line.appendChild(el("div", "conv-head", "… entry truncated"));
+    return line;
+  }
+  // L83 : la conversation partagée d'un agent, montrée et nourrie depuis la
+  // fiche 0024. Le serveur de la page (`progress --serve`) répond en lecture
+  // sur GET et accepte la seule saisie sur POST /api/conversation.json, avec
+  // le même jeton et la même origine ; en mode statique rien n'est joignable.
+  function agentConversation(name) {
+    var wrap = el("div", "conv"), list = el("div", "conv-list", "…");
+    wrap.appendChild(list);
+    if (MODE !== "served") {
+      list.textContent = "conversation available on the served page only (ameesh progress --serve)";
+      return wrap;
+    }
+    var form = el("form", "conv-form"), input = document.createElement("textarea");
+    input.rows = 2;
+    input.placeholder = "message to " + name + " (shared conversation)";
+    input.setAttribute("aria-label", "message to " + name);
+    var send = el("button", null, "Send");
+    send.type = "submit";
+    var state = el("span", "conv-head");
+    form.appendChild(input); form.appendChild(send); form.appendChild(state);
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var text = input.value.trim();
+      if (!text || send.disabled) return;
+      send.disabled = true; state.textContent = "sending…"; state.className = "conv-head";
+      var body = {agent: name, text: text};
+      var key = "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+      fetch(CHAT, {method: "POST", credentials: "omit", cache: "no-store",
+                   headers: {"Accept": "application/json",
+                             "Content-Type": "application/json",
+                             "Authorization": "Bearer " + TOKEN,
+                             "Idempotency-Key": key},
+                   body: JSON.stringify(body)})
+        .then(function (r) {
+          return r.json().then(function (d) { return {status: r.status, data: d}; },
+                                 function () { return {status: r.status, data: {}}; });
+        })
+        .then(function (res) {
+          if (res.status !== 200) {
+            throw new Error((res.data && res.data.message) || ("HTTP " + res.status));
+          }
+          input.value = ""; state.textContent = "sent";
+          return loadConversation(name, list);
+        })
+        .then(null, function (e) {
+          state.textContent = "not sent: " + e.message; state.className = "conv-head warn";
+        })
+        .then(function () { send.disabled = false; });
+    });
+    wrap.appendChild(form);
+    loadConversation(name, list);
+    return wrap;
+  }
+
+  function loadConversation(name, list) {
+    if (MODE !== "served") return;
+    fetch(CHAT + "?agent=" + encodeURIComponent(name) + "&limit=50",
+          {credentials: "omit", cache: "no-store",
+           headers: {"Accept": "application/json", "Authorization": "Bearer " + TOKEN}})
+      .then(function (r) {
+        if (!r.ok) {
+          return r.text().then(function (t) { throw new Error("HTTP " + r.status + ": " + t.trim()); });
+        }
+        return r.json();
+      })
+      .then(function (d) {
+        clear(list);
+        var entries = (d && d.entries) || [];
+        if (!entries.length) { list.appendChild(el("p", "empty", "no message yet")); return; }
+        entries.forEach(function (e) { list.appendChild(convEntry(e)); });
+        list.scrollTop = list.scrollHeight;
+      })
+      .then(null, function (e) {
+        clear(list);
+        list.appendChild(el("p", "empty warn", "conversation unavailable: " + e.message));
+      });
   }
 
   // -- périmètre : le projet choisi. Servie, la base filtre déjà (budget et
@@ -627,6 +737,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     var wait = lot.planned_wait;
     if (!wait) return "";
     if (wait.what === "scheduled") return "planned start " + wait.start;
+    if (wait.what === "hold") return "external hold until " + wait.until + " (" + wait.gate + ")";
     return "waiting on lots " + (wait.lots || []).map(function (id) { return "#" + id; }).join(", ");
   }
   function lotWaitLabel(lot) {
@@ -737,6 +848,8 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         ["latest progress", a.last_update ? a.last_update.text + " (" + ago(a.last_update.ts) + ")" : null],
         ["24 h", a.usd_24h !== undefined ? usd(a.usd_24h) + (a.turns_24h !== undefined ? " · " + a.turns_24h + " turn(s)" : "") : null],
         ["unread", a.unread]]));
+      section(box, "Conversation");
+      box.appendChild(agentConversation(name));
       var mine = (D.lots || []).filter(function (l) { return l.assignee === name && !l.closed && l.state !== "merged"; });
       if (mine.length) { section(box, "Open work items"); mine.forEach(function (l) { lotLine(box, l); }); }
       return name;

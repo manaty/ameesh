@@ -19,6 +19,11 @@
 # déjà relancée ne sont jamais masqués — le check reste rouge, un humain
 # tranche.
 #
+# #1002 : un événement `workflow_run` peut être rejoué à la main ; la garde
+# relit alors `run_attempt` courant et refuse un événement périmé. Le groupe de
+# concurrence sérialise en plus les gardes d'une même exécution, pour que deux
+# événements (tentative 1 puis 2) ne se croisent pas.
+#
 # Ce workflow s'exécute depuis la branche par défaut (le fichier doit y être
 # pour que `workflow_run` se déclenche) ; `actions/checkout` y prend donc le
 # code de la branche par défaut, jamais celui de la PR : le jeton `actions:
@@ -34,6 +39,12 @@ on:
 
 permissions:
   contents: read
+
+# #1002 : les gardes d'une même exécution « tests » ne se croisent pas ; une
+# tentative 2 attend la fin de la garde de la tentative 1 (jamais annulée).
+concurrency:
+  group: relance-hosted-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
 
 jobs:
   relance:

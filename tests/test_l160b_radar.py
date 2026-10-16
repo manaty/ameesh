@@ -21,10 +21,20 @@ from .support import EMPTY_CONFIG, SRC, PgTestCase, child_env
 MIG = "src/ameesh/migrations"
 
 
+def git_env():
+    """Environnement des git du banc (#1943) : hermétique à la configuration de
+    l'agent (`~/.gitconfig`, `/etc/gitconfig` : rerere, autocrlf, hooks…), qui
+    ne doit pas changer le verdict d'un test (canon §3 : même verdict sur tous
+    les postes). Même isolation que les autres bancs du dépôt (`test_canon`,
+    `test_1277`, `scripts/l160g-mergiraf.py`)."""
+    return dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
+                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+
 def _git(repo, *args):
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, env=env)
+    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                          env=git_env())
     if proc.returncode != 0:
         raise AssertionError("git %s : %s" % (" ".join(args), proc.stderr))
     return proc.stdout.strip()
@@ -159,6 +169,60 @@ class SettingsTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=raw):
                 radar.parse_settings(raw)
 
+    def test_full_suite_is_declared_by_workflow_file(self):
+        """L756: la suite complète est une identité (le fichier de workflow),
+        jamais un nom d'affichage libre."""
+        raw = {"projects": {"x": {"repo": "/r", "full_suite":
+                                  [".github/workflows/backend-suite.yml",
+                                   ".github/workflows/desktop-suite.yaml"]}}}
+        project = radar.parse_settings(raw).projects["x"]
+        self.assertEqual(project.full_suite, (".github/workflows/backend-suite.yml",
+                                              ".github/workflows/desktop-suite.yaml"))
+        single = radar.parse_settings({"projects": {
+            "x": {"repo": "/r", "full_suite": ".github/workflows/a.yml"}}}).projects["x"]
+        self.assertEqual(single.full_suite, (".github/workflows/a.yml",))
+        self.assertEqual(single.full_suite_required, ())
+        self.assertEqual(single.full_suite_tolerated, ())
+        named = radar.parse_settings({"projects": {"x": {"repo": "/r", "full_suite": [
+            {"path": ".github/workflows/tests.yml",
+             "jobs": ["plan", "psycopg *"], "tolerate": ["bilan des impactés"]},
+            ".github/workflows/backend-suite.yml"]}}}).projects["x"]
+        self.assertEqual(named.full_suite, (".github/workflows/tests.yml",
+                                            ".github/workflows/backend-suite.yml"))
+        self.assertEqual(named.full_suite_required,
+                         ((".github/workflows/tests.yml", ("plan", "psycopg *")),))
+        self.assertEqual(named.full_suite_tolerated,
+                         ((".github/workflows/tests.yml", ("bilan des impactés",)),))
+        for bad in (["Backend suite"],                                # un nom libre
+                    ["backend-suite.yml"],                            # hors .github/workflows
+                    [".github/workflows/a.txt"],                      # pas un workflow
+                    ["/etc/.github/workflows/a.yml"],                 # absolu
+                    [".github/workflows/../a.yml"],                   # remonte
+                    [".github/workflows/a.yml", ".github/workflows/a.yml"],  # doublon
+                    [{"path": ".github/workflows/a.yml"},             # jobs manquants
+                     {"path": ".github/workflows/a.yml", "jobs": []},
+                     {"path": ".github/workflows/a.yml", "jobs": [1]},
+                     {"path": ".github/workflows/a.yml", "jobs": ["a", "a"]},
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"], "extra": 1},
+                     {"path": ".github/workflows/a.yml", "jobs": ["*"]},      # * seul
+                     {"path": ".github/workflows/a.yml", "jobs": ["a*b"]},    # * non final
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"],
+                      "tolerate": ["a"]},                            # requis et toléré
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"],
+                      "tolerate": [1]},
+                     {"path": ".github/workflows/a.yml",
+                      "tolerate": ["a"]},                              # toléré sans requis
+                     {"jobs": ["a"]},
+                     {"path": 1, "jobs": ["a"]},
+                     [{"path": ".github/workflows/a.yml", "jobs": ["a"]},
+                      ".github/workflows/a.yml"]],                    # doublon entre formes
+                    [1],
+                    "Backend suite"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    radar.parse_settings({"projects": {"x": {"repo": "/r",
+                                                             "full_suite": bad}}})
+
 
 class ConflictsCommandTest(unittest.TestCase):
     """`ameesh conflicts` lit le journal de l'hôte, sans base."""
@@ -225,6 +289,31 @@ class RunPassTest(PgTestCase):
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM agent_mailbox")[0]["n"], 0)
         # sans `radar.projects` : rien
         self.assertEqual(radar.run_pass(self.cfg, self.db), [])
+
+
+class BancGitHermetiqueTest(unittest.TestCase):
+    """#1943 : le banc git des tests ne dépend pas de la config globale de
+    l'agent — `test_l160e` voyait un `.git/rr-cache` créé par le
+    `rerere.enabled=true` de son poste et rougissait (canon §3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l160b-hermetique-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = make_repo(self.tmp)
+
+    def test_une_config_globale_hostile_n_atteint_pas_le_banc(self):
+        hostile = os.path.join(self.tmp, "gitconfig")
+        with open(hostile, "w", encoding="utf-8") as fh:
+            fh.write("[rerere]\n\tenabled = true\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": hostile,
+                                          "GIT_CONFIG_NOSYSTEM": ""}):
+            # le conflit non résolu est le geste qui, sous rerere global,
+            # laissait le rr-cache que l'assertion « dépôt intact » voyait
+            _git(self.repo, "checkout", "-q", "-b", "conflit", "lot/2-b")
+            with self.assertRaises(AssertionError):
+                _git(self.repo, "merge", "-q", "--no-ff", "--no-commit", "lot/1-a")
+            self.assertFalse(os.path.exists(
+                os.path.join(self.repo, ".git", "rr-cache")))
 
 
 if __name__ == "__main__":

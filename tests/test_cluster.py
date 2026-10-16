@@ -37,7 +37,13 @@ SIGNATURES = {
                 "replace_receipt", "replace_nonce"},
     "action_attempts": {"receipt", "nonce"},
     "standing_approvals": {"receipt", "nonce", "challenge"},
-    "agent_registry": {"public_key"},
+    "agent_registry": {"public_key",
+                       # L87b (0441) : geste opérateur (motif, acteur,
+                       # mandant, horodatage) — choix fermé, ouvrable plus
+                       # tard comme état s'il est jugé utile à la supervision.
+                       "operator_paused", "operator_pause_reason",
+                       "operator_pause_by", "operator_pause_for",
+                       "operator_pause_at"},
     "agent_mesh_overview": {"public_key"},
     "key_holders": {"public_key"},     # #330
     "mesh_keys": {"public_key"},
@@ -54,6 +60,9 @@ SIGNATURES = {
     # 15/10 : conservation des droits actuels, aucun GRANT modifié).
     "api_idempotency": {"human", "key", "fingerprint", "status", "response",
                         "created_at", "done_at"},
+    # L87b (0441) : journal des transitions de la pause opérateur.
+    "operator_pause_events": {"id", "agent", "paused", "reason", "actor",
+                              "principal", "created_at"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }
@@ -84,8 +93,24 @@ CONTENUS = {
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.
-EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
-           for rel in set(SIGNATURES) | set(CONTENUS)}
+#: colonnes fermées en attendant leur classement (aucun GRANT modifié)
+FERMEES = {
+    # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
+    # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
+    "agent_mesh_overview": {"roles"},
+    # #1883 (0451) : l'identité d'un compte est l'empreinte sha256 du dossier
+    # résolu qu'il lit — jamais le chemin. Le propriétaire est alerté du conflit
+    # par notify (`account_identity`) et le lot n'ouvre aucun accès distant
+    # (arbitrage pilote du 16/10) : la table reste fermée, aucun GRANT modifié.
+    "account_identities": {"host", "harness", "account", "identity",
+                           "first_seen", "last_seen"},
+    # #1922 (0452) : registre Process des workflows (révision/étape, reçus d'étape) —
+    # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
+    "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
+    "work_item_events": {"command_id", "evidence", "workflow_stage", "workflow_version"},
+}
+EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set()) | FERMEES.get(rel, set())
+           for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES)}
 
 
 def ecarts_de_classement(cols: dict[str, dict[str, bool]]) -> list[str]:

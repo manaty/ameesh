@@ -18,7 +18,8 @@ import time
 from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
-from .work_dependencies import _DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK
+from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
+                                _UNPINNED)
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -30,6 +31,7 @@ _COLUMNS_TEMPLATE = """
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
     branch, branch_target, branch_head, migration, migration_repo,
+    migration_landed, migration_landed_repo,
     extract(epoch from branch_head_at)::float8 as branch_head_ts,
     partial_merge, extract(epoch from partial_seen_at)::float8 as partial_seen_ts,
     estimate_minutes, estimate_source, estimate_by, change_size,
@@ -44,16 +46,23 @@ _COLUMNS_TEMPLATE = """
 
 
 def has_reviewer(db) -> bool:
-    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ? La
-    réponse est mise en cache sur la connexion : une lecture par base."""
-    flag = getattr(db, "_has_reviewer", None)
-    if flag is None:
-        flag = bool(db.query(
-            "SELECT 1 AS ok FROM information_schema.columns"
-            " WHERE table_schema = current_schema() AND table_name = 'work_items'"
-            "   AND column_name = 'reviewer'"))
+    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ?
+
+    Seule la réponse POSITIVE est mise en cache sur la connexion : une colonne
+    n'apparaît pas puis ne disparaît pas. La réponse négative ne l'est pas —
+    un démon (runner, serve) démarré avant 0421 voit la colonne dès qu'elle
+    est appliquée, sans redémarrage (#798, #813) ; sinon il gardait des
+    lectures sans relecteur et refusait les désignations jusqu'au
+    redémarrage."""
+    if getattr(db, "_has_reviewer", False):
+        return True
+    flag = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        "   AND column_name = 'reviewer'"))
+    if flag:
         try:
-            db._has_reviewer = flag
+            db._has_reviewer = True
         except Exception:  # objet sans attributs (proxy) : on relira
             pass
     return flag
@@ -115,6 +124,9 @@ _RESERVE_WAIT_BASE_S = 0.005
 _RESERVE_WAIT_MAX_S = 0.5
 #: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
 MIGRATION_INDEX = "work_items_migration_repo_idx"
+#: l'index unique (dépôt, numéro atterri) de #1567 : deux lots d'un même dépôt
+#: ne nomment jamais le même numéro atterri
+MIGRATION_LANDED_INDEX = "work_items_migration_landed_idx"
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
@@ -352,8 +364,14 @@ class WorkItems(interface.WorkItems):
             return item
 
     def get(self, item_id) -> dict | None:
+        # #1922/B5 : `workflow_ref` (0452) est porté par la lecture, comme
+        # `reviewer` (#705) l'est par `item_columns` — `to_jsonb` rend '' sur
+        # une base d'avant la migration. Les commandes historiques le lisent
+        # par cette interface : un SELECT brut serait refusé sur une connexion
+        # d'exécuteur médié (`work move`/`note`/`close` d'une VM).
         rows = self.db.query(
-            "SELECT %s FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
+            "SELECT %s, coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref"
+            " FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
         return rows[0] if rows else None
 
     def items(self, *, state, assignee, limit) -> list[dict]:
@@ -376,7 +394,10 @@ class WorkItems(interface.WorkItems):
         d'écrit), puis journalise la transition. `held` (L233) : et si une
         demande de décision ouverte le tient — vérifiée dans la même
         instruction, la demande verrouillée (voir l'interface). Un passage
-        vers un état terminal libère la réservation de migration (#956)."""
+        vers un état terminal libère la réservation de migration (#956).
+        Un lot pinné sur une révision Process (`workflow_ref`) n'est jamais
+        déplacé ici : la garde est aussi dans le SQL, pour la course entre la
+        lecture de l'appelant et l'adoption concurrente (#1922/N8)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
         sql = """
             UPDATE work_items
@@ -386,9 +407,10 @@ class WorkItems(interface.WorkItems):
                    closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
                    started_at = CASE WHEN %s IN ('build', 'qa')
                                      THEN coalesce(started_at, now()) ELSE started_at END
-             WHERE id = %s AND state = %s __HELD__
+             WHERE id = %s AND state = %s AND __UNPINNED__ __HELD__
             RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", item_columns(self.db)).replace("__HELD__", _HELD if held else "")
+            """.replace("__COLUMNS__", item_columns(self.db)).replace(
+                "__UNPINNED__", _UNPINNED).replace("__HELD__", _HELD if held else "")
         params = ((state, loops, state, state, int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
         if state not in ("merged", "promoted", "closed"):
@@ -440,7 +462,13 @@ class WorkItems(interface.WorkItems):
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
         en cours est effacée (issue `annulee` au registre). #540 :
-        `queued_note` (voir l'interface)."""
+        `queued_note` (voir l'interface). #1696 : `ready_only` (prise
+        automatique, L165) exige `current=None` — une combinaison contraire
+        est une erreur d'appel, refusée avant le verrou, jamais un None muet."""
+        if ready_only and current is not None:
+            raise ValueError(
+                "assign(ready_only=True) exige current=None : la prise"
+                " automatique (L165/#1242) ne réassigne pas un lot attribué")
         with self.db.transaction() as tx:
             if ready_only:
                 # Même verrou que les éditions du graphe : une dépendance ne
@@ -453,7 +481,7 @@ class WorkItems(interface.WorkItems):
                     "                         WHERE work_item_id = %s)"
                     " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
                 item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
-                if current is not None or item is None or item["state"] != "intake" \
+                if item is None or item["state"] != "intake" \
                         or item["assignee"] is not None:
                     return None
                 if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
@@ -504,8 +532,12 @@ class WorkItems(interface.WorkItems):
         reviewer_set = ""
         params: list = [assignee]
         if has_reviewer(self.db):
+            # #813 : NO KEY UPDATE suffit à sérialiser deux réassignations, et
+            # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
+            # insertions au journal et aux jalons du lot, que FOR UPDATE
+            # bloquait jusqu'au commit.
             seen = self.db.query(
-                "SELECT reviewer FROM work_items WHERE id = %s FOR UPDATE",
+                "SELECT reviewer FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                 (int(item_id),))
             previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
             reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
@@ -540,7 +572,9 @@ class WorkItems(interface.WorkItems):
         transaction qui écrit (codex r1, #409) : deux `notify` sur deux hôtes
         ne dépassent ni le plafond ni ne donnent deux lots au même preneur ;
         un agent sorti de pause entre le contrôle git et l'écriture garde son
-        lot (sa ligne reste verrouillée jusqu'au commit)."""
+        lot (sa ligne reste verrouillée jusqu'au commit). `assignee` None rend
+        le lot à la file d'équipe (assigné NULL, L165) : le contrôle du
+        preneur n'a pas lieu."""
         with self.db.transaction() as tx:
             tx.query(_HANDOFF_LOCK)
             taken = tx.query(
@@ -549,8 +583,9 @@ class WorkItems(interface.WorkItems):
                 "   AND starts_with(note, %s)", (float(window_s), note_prefix))
             if int(taken[0]["n"]) >= int(max_per_window):
                 return None
-            if tx.query("SELECT 1 FROM work_items WHERE assignee = %%s"
-                        "   AND state NOT IN %s LIMIT 1" % _CLOSED, (assignee,)):
+            if assignee is not None and tx.query(
+                    "SELECT 1 FROM work_items WHERE assignee = %%s"
+                    "   AND state NOT IN %s LIMIT 1" % _CLOSED, (assignee,)):
                 return None
             if not tx.query("SELECT 1 FROM agent_registry WHERE name = %s"
                             "   AND status = 'blocked' AND starts_with(status_text, %s)"
@@ -834,9 +869,29 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
-    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note) -> dict:
+    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
+                      on_frozen=None, after_commit=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
-        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot."""
+        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
+
+        `on_frozen` (facultatif, #1617) : callback appelé **dans la
+        transaction** du jalon, juste après l'INSERT d'un jalon `frozen`, avec
+        `(tx, milestone, after_commit)`. Il écrit dans la même transaction que
+        le jalon — la désignation des relecteurs y dépose sa marque et ses
+        courriers atomiquement — et une exception annule le jalon avec elle.
+        `after_commit` est la liste des écritures de fil différées
+        (`mail.send(..., after_commit=…)`, motif #315) : `add_milestone` ne la
+        vide **pas**, c'est l'appelant qui tient le commit qui la vide après
+        son COMMIT. Sur une connexion racine le `with` commite, l'appelant vide
+        la liste juste après le retour ; dans une transaction déjà ouverte le
+        `with` imbriqué ne commite pas (psql et psycopg), et la vider ici
+        publierait le fil avant le commit externe — un rollback laisserait des
+        traces sans gel ni marque (revue codex cx2, B2). Sans callback ni
+        liste, rien ne change : le gel branché par défaut ne désigne personne.
+        Un `on_frozen` sur un autre kind est refusé."""
+        if on_frozen is not None and kind != "frozen":
+            raise ValueError("on_frozen only makes sense for the `frozen` milestone")
+        threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
@@ -849,7 +904,10 @@ class WorkItems(interface.WorkItems):
                 """,
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
-            return rows[0]
+            milestone = rows[0]
+            if on_frozen is not None:
+                on_frozen(tx, milestone, threads)
+        return milestone
 
     def delays(self, limit, *, ids=None) -> list[dict]:
         if ids is not None:
@@ -922,7 +980,7 @@ class WorkItems(interface.WorkItems):
             "migration %s released (%s, #956)" % (number, why), actor)
 
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
-                          release=False) -> dict | None:
+                          issue_ref, release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
         ouvert dans le dépôt `repo`, avec une ligne de journal. Sans
         `number` : le prochain libre de ce dépôt, au moins `floor`, calculé
@@ -933,7 +991,11 @@ class WorkItems(interface.WorkItems):
         DbError de l'index (#478). Seule la violation d'unicité de cet index
         réessaie : une autre erreur qui le nomme remonte telle quelle
         (codex #478 r1). Un `number` explicite déjà pris lève la DbError de
-        l'index, sans réessai."""
+        l'index, sans réessai. #1830 : `issue_ref` (lue par l'appelant) est une
+        condition du CAS, NULL et chaîne vide confondus — une correction
+        concurrente de la référence pendant le scan du dépôt ne peut plus
+        laisser `issue_ref` d'un dépôt avec `migration_repo` d'un autre ;
+        `release` l'ignore."""
         if release:
             value, params = "NULL", ()
         elif number is None:
@@ -946,6 +1008,8 @@ class WorkItems(interface.WorkItems):
         # `release` libère aussi un lot déjà terminal (#956) ; les autres
         # chemins ne visent qu'un lot ouvert.
         guard = "" if release else " AND state NOT IN ('merged', 'promoted', 'closed')"
+        issue_guard = "" if release else " AND coalesce(issue_ref, '') = coalesce(%%s, '')"
+        issue_params = () if release else (issue_ref,)
         deadline = time.monotonic() + _RESERVE_BUDGET_S
         wait = _RESERVE_WAIT_BASE_S
         while True:
@@ -957,12 +1021,16 @@ class WorkItems(interface.WorkItems):
                         # elle est libérée dans la transaction de la
                         # réservation, avec sa ligne de journal. Les lignes
                         # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
-                        # valeur déjà effacée.
+                        # valeur déjà effacée. `ORDER BY id` : ordre de
+                        # verrouillage canonique (#967) — deux transactions qui
+                        # reprennent les réservations héritées du même dépôt
+                        # verrouillent ainsi les mêmes lignes dans le même
+                        # ordre, jamais en sens inverse (interblocage).
                         for old in tx.query(
                                 "SELECT id, migration, state FROM work_items"
                                 " WHERE migration_repo = %s"
                                 "   AND state IN ('merged', 'promoted', 'closed')"
-                                " FOR UPDATE", (repo,)):
+                                " ORDER BY id FOR UPDATE", (repo,)):
                             tx.execute(
                                 "UPDATE work_items SET migration = NULL,"
                                 "       migration_repo = NULL, updated_at = now()"
@@ -973,10 +1041,11 @@ class WorkItems(interface.WorkItems):
                                     old["migration"], old["id"], old["state"]), actor)
                     sql = ("UPDATE work_items SET migration = %s, migration_repo = %%s,"
                            "       updated_at = now()"
-                           " WHERE id = %%s" + guard +
+                           " WHERE id = %%s" + guard + issue_guard +
                            " RETURNING %s") % (value, item_columns(self.db))
                     rows = tx.query(sql,
-                                    params + (None if release else repo, int(item_id)))
+                                    params + (None if release else repo, int(item_id))
+                                    + issue_params)
                     if not rows:
                         return None
                     WorkItems(tx)._event(int(item_id), rows[0]["state"],
@@ -1008,6 +1077,30 @@ class WorkItems(interface.WorkItems):
             "SELECT id, title, state FROM work_items WHERE migration = %s"
             " AND migration_repo = %s"
             " AND state NOT IN ('merged', 'promoted', 'closed')", (int(number), repo))
+        return rows[0] if rows else None
+
+    def record_landed_migration(self, item_id, number, repo, *, note, actor) -> dict | None:
+        """#1567 : enregistre (ou corrige) le numéro atterri d'un lot **déjà**
+        fusionné ou promu, dans une transaction avec sa ligne de journal ; None
+        si le lot n'est pas terminal. La réservation (`migration`,
+        `migration_repo`) n'est pas touchée : elle peut déjà être libérée."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_items SET migration_landed = %s, migration_landed_repo = %s,"
+                "       updated_at = now()"
+                " WHERE id = %s AND state IN ('merged', 'promoted')"
+                " RETURNING __COLUMNS__".replace("__COLUMNS__", item_columns(self.db)),
+                (int(number), repo, int(item_id)))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
+    def migration_landed_holder(self, number, repo) -> dict | None:
+        """Le lot qui nomme déjà ce numéro atterri dans ce dépôt (#1567)."""
+        rows = self.db.query(
+            "SELECT id, title, state FROM work_items WHERE migration_landed = %s"
+            " AND migration_landed_repo = %s", (int(number), repo))
         return rows[0] if rows else None
 
     # -- prepared conflict resolutions (L160d, 0057) ---------------------------
@@ -1139,7 +1232,8 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "UPDATE merge_locks SET expires_at = clock_timestamp()"
                 " + %s * interval '1 second'"
-                " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
+                " WHERE target = %s AND owner = %s AND epoch = %s"
+                " AND expires_at > clock_timestamp() RETURNING epoch",
                 (float(ttl_s), key, owner, int(epoch)))
             return int(rows[0]["epoch"]) if rows else None
         rows = self.db.query(
@@ -1231,7 +1325,7 @@ class WorkItems(interface.WorkItems):
             (package_id,))
 
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
-                     frozen_id=None) -> dict | None:
+                     frozen_id=None, landed=None) -> dict | None:
         """`current` → `merged` si le lot y est encore (sinon None, rien d'écrit),
         en UNE transaction : transition, journal, puis le jalon `merged` (posé
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
@@ -1245,14 +1339,22 @@ class WorkItems(interface.WorkItems):
         a changé, rien n'est écrit (None). Un gel ne peut pas s'insérer
         ensuite : `add_milestone` prend le même verrou de ligne.
 
+        `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
+        écrit dans la transaction de la fusion (`migration_landed`,
+        `migration_landed_repo`).
+
         Rien n'est écrit avant ce recontrôle : la fermeture est appelée dans
         la transaction qui porte aussi le réveil des dépendants (L385 suite),
         et un `UPDATE` suivi d'un `None` n'était annulé que par SA transaction
         — sous une transaction englobante, la ligne serait restée modifiée.
+        Un lot pinné sur une révision Process n'est jamais fermé ici : le
+        filtre est dans le SQL (#1922/N8).
         """
+        number, repo = landed if landed else (None, None)
         with self.db.transaction() as tx:
             locked = tx.query(
-                "SELECT id FROM work_items WHERE id = %s AND state = %s FOR UPDATE",
+                "SELECT id FROM work_items WHERE id = %s AND state = %s AND "
+                + _UNPINNED + " FOR UPDATE",
                 (int(item_id), current))
             if not locked:
                 return None
@@ -1267,11 +1369,14 @@ class WorkItems(interface.WorkItems):
                 """
                 UPDATE work_items
                    SET state = 'merged', updated_at = now(), closed_at = NULL,
-                       pr_ref = coalesce(%s, pr_ref)
-                 WHERE id = %s AND state = %s
+                       pr_ref = coalesce(%s, pr_ref),
+                       migration_landed = coalesce(%s, migration_landed),
+                       migration_landed_repo = coalesce(%s, migration_landed_repo)
+                 WHERE id = %s AND state = %s AND __UNPINNED__
                 RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", item_columns(self.db)),
-                (pr_ref, int(item_id), current))
+                """.replace("__COLUMNS__", item_columns(self.db)).replace(
+                    "__UNPINNED__", _UNPINNED),
+                (pr_ref, number, repo, int(item_id), current))
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), "merged", note, actor)
@@ -1286,16 +1391,18 @@ class WorkItems(interface.WorkItems):
         """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
         si le lot y est encore ; journal et jalon `closed` dans la même
         transaction. `delivered` (#988) écrit en plus le jalon `delivered`, qui
-        porte le `sha` de la tête relue."""
+        porte le `sha` de la tête relue. Un lot pinné sur une révision Process
+        n'est jamais fermé ici : le filtre est dans le SQL (#1922/N8)."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
                 UPDATE work_items
                    SET state = 'closed', close_reason = %s, superseded_by = %s,
                        updated_at = now(), closed_at = now()
-                 WHERE id = %s AND state = %s
+                 WHERE id = %s AND state = %s AND __UNPINNED__
                 RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", item_columns(self.db)),
+                """.replace("__COLUMNS__", item_columns(self.db)).replace(
+                    "__UNPINNED__", _UNPINNED),
                 (reason, superseded_by, int(item_id), current))
             if not rows:
                 return None
@@ -1466,11 +1573,19 @@ class WorkItems(interface.WorkItems):
             "  LEFT JOIN agent_registry r ON r.name = w.assignee"
             " ORDER BY w.id" % (item_columns(self.db), _CLOSED), (int(limit),))
 
-    def set_issue_ref(self, item_id, issue_ref, *, current) -> bool:
+    def set_issue_ref(self, item_id, issue_ref, *, current,
+                      migration_repo=interface.UNCHECKED) -> bool:
+        # #1654 : quand l'appelant a lu la réservation, le CAS la couvre aussi
+        # (`IS NOT DISTINCT FROM`, NULL compris) : une réservation prise entre
+        # sa lecture et cette écriture ne peut plus passer en silence.
+        guard, params = "", ()
+        if migration_repo is not interface.UNCHECKED:
+            guard = " AND migration_repo IS NOT DISTINCT FROM %s"
+            params = (migration_repo,)
         rows = self.db.query(
             "UPDATE work_items SET issue_ref = %s"
-            " WHERE id = %s AND coalesce(issue_ref, '') = coalesce(%s, '')"
-            " RETURNING id", (issue_ref, int(item_id), current))
+            " WHERE id = %s AND coalesce(issue_ref, '') = coalesce(%s, '')" + guard +
+            " RETURNING id", (issue_ref, int(item_id), current, *params))
         return bool(rows)
 
     # -- demandes d'humains sans lot (L130) --------------------------------------

@@ -735,7 +735,7 @@ class MeasurePgTest(PgTestCase):
         lot = work.add(self.db, title="turns", branch="lot/t")
         lid = int(lot["id"])
         work.move(self.db, lid, "build")
-        work.merged(self.db, lid, sha="abcdef1")
+        work.close_merged(self.db, lid, sha="abcdef1")
         self.t0 = float(self.db.query(
             "SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"]) - 100 * M
         self._at("UPDATE work_items SET started_at = to_timestamp(%s) WHERE id = %s", 0, lid)
@@ -779,7 +779,7 @@ class MeasurePgTest(PgTestCase):
         lot = work.add(self.db, title="late start", branch="lot/late")
         lid = int(lot["id"])
         work.move(self.db, lid, "build")
-        work.merged(self.db, lid, sha="abcdef1")
+        work.close_merged(self.db, lid, sha="abcdef1")
         self.t0 = float(self.db.query(
             "SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"]) - 100 * M
         self._at("UPDATE work_item_events SET created_at = to_timestamp(%s)"
@@ -814,7 +814,7 @@ class MeasurePgTest(PgTestCase):
         lot = work.add(self.db, title="late repair", branch="lot/lr")
         lid = int(lot["id"])
         work.move(self.db, lid, "build")
-        work.merged(self.db, lid, sha="abcdef1")
+        work.close_merged(self.db, lid, sha="abcdef1")
         self.t0 = float(self.db.query(
             "SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"]) - 100 * M
         self._at("UPDATE work_items SET started_at = to_timestamp(%s) WHERE id = %s", 0, lid)

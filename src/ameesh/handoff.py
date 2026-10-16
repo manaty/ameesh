@@ -1,15 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L233b : les lots d'un agent Claude en pause budget passent à un agent
-DeepSeek libre du même projet.
+"""L233b / L165 : les lots d'un agent Claude en pause budget.
 
 À chaque passage d'`ameesh notify`, pour chaque agent Claude NON critique
-(`auditor.is_critical`) en pause budget (`budget.PAUSE_PREFIX`), ses lots
-`intake` et `build` passent, un lot par agent preneur, à un agent DeepSeek
-libre (`sous_utilisation.idle_agents`) du même projet (`projects`), dans son
-budget, qui sait faire le lot (`backlog.lot_fits`). L'attribution reste
-gardée (`work.check_assignee`, réassignation conditionnelle à l'assigné ET à
-l'état) ; une note va sur le lot, un courrier aux deux agents ; un plafond
-par heure glissante borne le tout.
+(`auditor.is_critical`) en pause budget (`budget.PAUSE_PREFIX`) :
+
+- ses lots NON démarrés (`intake`) sont rendus à la file d'équipe (assigné
+  NULL, note au journal) : la prise automatique (`backlog.auto_take`, L165,
+  #754) les donne ensuite à tout agent libre capable de l'équipe, DeepSeek ou
+  Codex, dans son budget et sa classe de revue ;
+- ses lots DÉMARRÉS (`build`) sont repris directement, un lot par agent
+  preneur, par un agent DeepSeek ou Codex libre
+  (`sous_utilisation.idle_agents`) du même projet (`projects`), dans son
+  budget, qui sait faire le lot (`backlog.lot_fits`) — la branche poussée et
+  l'état git sont vérifiés avant la passation.
+
+L'attribution d'un `build` reste gardée (`work.check_assignee`,
+réassignation conditionnelle à l'assigné ET à l'état) ; une note va sur le
+lot, un courrier aux deux agents. Le rendu d'un `intake` est gardé de même
+(transaction sous verrou consultatif : source encore en pause, état encore
+`intake`) ; sa note suffit, la prise automatique prévient le preneur. Un
+plafond par heure glissante borne les rendus ET les reprises, pour tout le
+mesh.
 
 Jamais repris :
 - un lot en revue ou gelé (état `qa`, ou jalon de gel posé) ;
@@ -35,14 +46,21 @@ import time
 
 from . import storage
 
-#: début de la note de reprise (le plafond horaire compte ces lignes)
-HANDOFF_NOTE = "repris pendant la pause budget"
+#: début commun des notes de reprise (le plafond horaire compte ces lignes,
+#: rendus et reprises confondus ; la note d'un lot sauté, SKIP_NOTE, n'en fait
+#: pas partie)
+NOTE_PREFIX = "pause budget (reprise) : "
+#: début de la note de reprise d'un lot `build` (le plafond horaire compte ces
+#: lignes)
+HANDOFF_NOTE = NOTE_PREFIX + "lot repris"
+#: début de la note d'un lot `intake` rendu à la file d'équipe (L165)
+RETURN_NOTE = NOTE_PREFIX + "lot rendu à la file d'équipe"
 #: début de la note d'un lot `build` sauté (une fois par pause)
 SKIP_NOTE = "pause budget : lot non repris"
-#: harnais de l'agent en pause, et du preneur
+#: harnais de l'agent en pause, et des preneurs
 SOURCE_HARNESS = "claude"
-TARGET_HARNESS = "deepseek"
-#: états repris (jamais `qa` : en revue)
+TARGET_HARNESSES = ("deepseek", "codex")
+#: états traités : `intake` rendu à la file, `build` repris (jamais `qa`)
 STATES = ("intake", "build")
 #: reprises au plus par heure glissante, pour tout le mesh (0 : coupé)
 DEFAULT_MAX_PER_HOUR = 4
@@ -66,7 +84,8 @@ def paused(row: dict) -> bool:
 def assign_prefixes() -> tuple:
     """Débuts des notes d'une attribution du lot."""
     from . import backlog
-    return _ASSIGN_NOTES + (backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE, HANDOFF_NOTE)
+    return _ASSIGN_NOTES + (backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE,
+                            HANDOFF_NOTE, RETURN_NOTE)
 
 
 def last_assigner(events: list) -> str:
@@ -249,11 +268,20 @@ def handoff_note(item: dict, source: str, target: str, reason: str) -> str:
                 ", branche %s" % item["branch"] if item.get("branch") else ""))
 
 
+def return_note(item: dict, source: str, reason: str) -> str:
+    """Note d'un lot `intake` rendu à la file d'équipe (L165)."""
+    return ("%s : %s est en pause budget (%s). Le lot n'était pas démarré : il "
+            "retourne à la file d'équipe, sans assigné, où la prise automatique "
+            "peut le confier à tout agent libre capable de l'équipe, DeepSeek ou "
+            "Codex. À la fin de la pause, il ne revient pas seul : l'orchestrateur "
+            "décide." % (RETURN_NOTE, source, reason or "plafond atteint"))
+
+
 def target_message(item: dict, source: str) -> str:
     branch = item.get("branch")
     return (
         "Work item #%d \"%s\" is now yours: %s is paused on budget. State: %s.%s "
-        "The codex review stays required before any merge. When %s's pause ends, "
+        "A review by another family stays required before any merge. When %s's pause ends, "
         "nothing comes back on its own: the orchestrator decides. Never take an "
         "irreversible or production action without the usual approval." % (
             int(item["id"]), item.get("title") or "", source, item["state"],
@@ -275,9 +303,10 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                    idle_s: float = DEFAULT_IDLE_S, listing: list | None = None,
                    canons=None, declared=None, orchestras=None, budget_check=None,
                    dry_run: bool = False, state=None, git=None) -> list:
-    """Un passage ; rend les reprises faites (ou prévues en `dry_run`) :
-    `[{item, agent, previous, message_id}]`, et note les lots `build` sautés
-    pour leur état git."""
+    """Un passage ; rend les mouvements faits (ou prévus en `dry_run`) :
+    `[{item, agent, previous, message_id, queued}]` — `agent` vaut None et
+    `queued` True quand un lot `intake` est rendu à la file d'équipe — et note
+    les lots `build` sautés pour leur état git."""
     from . import auditor as auditor_mod
     from . import backlog, mail, projects, registry, sous_utilisation, work
     from . import budget as budget_mod
@@ -286,7 +315,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
         return []
     now = time.time() if now is None else float(now)
     st = storage.of(db)
-    room = int(max_per_hour) - st.work.auto_takes_since(backlog.TAKE_WINDOW_S, HANDOFF_NOTE)
+    room = int(max_per_hour) - st.work.auto_takes_since(backlog.TAKE_WINDOW_S, NOTE_PREFIX)
     if room <= 0:
         return []
     listing = st.operations.listing() if listing is None else listing
@@ -317,13 +346,13 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             orchestras = sous_utilisation.orchestrators(cfg, db, listing, canons=canons)
         except Exception:
             orchestras = []
-    # le plus long repos d'abord : aucun preneur n'a de lot (`idle_agents`)
+    # un lot `intake` se rend à la file sans preneur ; un `build` exige un
+    # preneur libre (DeepSeek ou Codex), le plus long repos d'abord : aucun
+    # preneur n'a de lot (`idle_agents`)
     targets = sorted((row for row in sous_utilisation.idle_agents(listing, now, idle_s)
-                      if row.get("harness") == TARGET_HARNESS
+                      if row.get("harness") in TARGET_HARNESSES
                       and row["name"] not in orchestras),
                      key=lambda r: (sous_utilisation.idle_since(r), r["name"]))
-    if not targets:
-        return []
     if budget_check is None:
         try:
             budget_check = backlog._default_budget_check(cfg, db)
@@ -338,6 +367,14 @@ def budget_handoff(cfg, db, *, now: float | None = None,
 
     host = getattr(cfg, "host", None)
     worktrees = None
+
+    def checked_git(item, source):
+        """L'état git du lot ; les worktrees de l'hôte ne sont lus qu'une fois."""
+        nonlocal worktrees
+        if worktrees is None:
+            worktrees = st.housekeeping.worktrees(host, ("active", "kept")) if host else []
+        return lot_git(item, source, host=host, worktrees=worktrees, state=state, git=git)
+
     used: set = set()
     done_list: list = []
     for source in sorted(sources, key=lambda r: r["name"]):
@@ -351,6 +388,39 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             project = projects.lot_project(item, project_of)
             if not project:
                 continue
+            # la dernière attribution, quelle que soit la longueur du journal
+            # (codex r1, #409)
+            if last_assigner(st.work.assignment_events(
+                    int(item["id"]), assign_prefixes())).startswith("human:"):
+                continue
+            if item["state"] == "intake":
+                # lot non démarré : rendu à la file d'équipe (assigné NULL) ;
+                # la prise automatique (L165, #754) choisit le preneur
+                checked = checked_git(item, source)
+                if not checked["ok"]:
+                    continue
+                if sensitive(checked["paths"], canons, project):
+                    continue
+                if dry_run:
+                    done_list.append({"item": item, "agent": None,
+                                      "previous": source["name"], "message_id": None,
+                                      "queued": True})
+                    continue
+                # relu sous verrou à l'écriture (codex r1, #409) : l'état encore
+                # `intake`, la source encore en pause, le plafond horaire ;
+                # aucun preneur n'est exigé
+                row = st.work.handoff(int(item["id"]), None, current=source["name"],
+                                      state="intake", paused_prefix=budget_mod.PAUSE_PREFIX,
+                                      note_prefix=NOTE_PREFIX, window_s=backlog.TAKE_WINDOW_S,
+                                      max_per_window=max_per_hour,
+                                      note=return_note(item, source["name"], reason),
+                                      actor=backlog.SENDER)
+                if row is None:
+                    continue                        # changé entre-temps
+                done_list.append({"item": row, "agent": None, "previous": source["name"],
+                                  "message_id": None, "queued": True})
+                continue
+            # lot démarré : un preneur libre du bon projet, dans son budget
             target = None
             for row in targets:
                 if row["name"] in used or projects.agent_project(row) != project:
@@ -374,17 +444,9 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 break
             if target is None:
                 continue
-            # la dernière attribution, quelle que soit la longueur du journal
-            # (codex r1, #409)
-            if last_assigner(st.work.assignment_events(
-                    int(item["id"]), assign_prefixes())).startswith("human:"):
-                continue
-            if worktrees is None:
-                worktrees = st.housekeeping.worktrees(host, ("active", "kept")) if host else []
-            checked = lot_git(item, source, host=host, worktrees=worktrees, state=state,
-                              git=git)
+            checked = checked_git(item, source)
             if not checked["ok"]:
-                if item["state"] == "build" and not dry_run and not _noted_since(
+                if not dry_run and not _noted_since(
                         st.work.events(int(item["id"]), EVENTS_READ),
                         float(source.get("status_since_ts") or 0.0)):
                     st.work.note(int(item["id"]), item["state"],
@@ -396,7 +458,8 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 continue
             if dry_run:
                 done_list.append({"item": item, "agent": target["name"],
-                                  "previous": source["name"], "message_id": None})
+                                  "previous": source["name"], "message_id": None,
+                                  "queued": False})
                 used.add(target["name"])
                 continue
             try:
@@ -408,8 +471,8 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             # contrôlé ci-dessus (pas un autre des STATES), la source encore en
             # pause, le preneur encore sans lot, le plafond horaire
             row = st.work.handoff(int(item["id"]), check["assignee"], current=source["name"],
-                                  state=item["state"], paused_prefix=budget_mod.PAUSE_PREFIX,
-                                  note_prefix=HANDOFF_NOTE, window_s=backlog.TAKE_WINDOW_S,
+                                  state="build", paused_prefix=budget_mod.PAUSE_PREFIX,
+                                  note_prefix=NOTE_PREFIX, window_s=backlog.TAKE_WINDOW_S,
                                   max_per_window=max_per_hour,
                                   note=handoff_note(item, source["name"], check["assignee"],
                                                     reason),
@@ -426,5 +489,6 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                       work_item_id=str(row["id"]), payload=payload)
             used.add(target["name"])
             done_list.append({"item": row, "agent": check["assignee"],
-                              "previous": source["name"], "message_id": message_id})
+                              "previous": source["name"], "message_id": message_id,
+                              "queued": False})
     return done_list

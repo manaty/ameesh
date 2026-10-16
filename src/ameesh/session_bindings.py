@@ -39,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from . import fil, platform, registry, storage
+from . import fastmail, fil, platform, registry, storage
 from .config import NAME_RE, Config
 
 #: harnais dont le hook passe un identifiant de session
@@ -239,6 +239,9 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
                    " (no pid check)"),
                meta={"action": "bind", "harness": harness, "session": session_id,
                      "host": host, "pid": pid})
+    # #1689 (N4) : le cache local de la session (chemin rapide) pouvait garder
+    # l'ancien nom ; une liaison qui change l'invalide.
+    fastmail.forget_liaison(cfg, harness, session_id)
     return result
 
 
@@ -253,6 +256,9 @@ def unbind(cfg: Config, db, *, session_id: str, harness: str, by: str) -> dict |
                    harness, session_id, row["agent"], cfg.host, by),
                meta={"action": "unbind", "harness": harness, "session": session_id,
                      "host": cfg.host})
+    # #1689 (N4) : la session ne doit plus être reconnue par le chemin rapide,
+    # même si aucune liaison active n'existait plus (cache d'un bind révoqué).
+    fastmail.forget_liaison(cfg, harness, session_id)
     return row
 
 
@@ -267,6 +273,9 @@ def revoke_agent(cfg: Config, db, agent: str, *, by: str, why: str) -> list[dict
         revoked = store.revoke(row["host"], row["harness"], row["session_id"])
         if revoked is not None:
             done.append(revoked)
+            # #1689 (N4) : le cache local de cette session ne doit plus la
+            # faire reconnaître (seul l'hôte courant a un cache à invalider).
+            fastmail.forget_liaison(cfg, row["harness"], row["session_id"])
     if done:
         _audit(cfg, db, by=by, agent=agent,
                text="Session binding(s) of %s revoked by %s (%s): %s." % (

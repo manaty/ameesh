@@ -170,17 +170,26 @@ Shared threads keep **one year** of entries by default (0033 §9):
   takes the census the host computed from the rewritten file (`kept`, the
   most recent entry, the file's logical `end`) and writes it in the same
   transaction. A census older than the row's `counted_until` is not applied;
-  at equal `end` it is applied, since at a constant logical end only an
-  expiry changes the thread. An index left behind by a lost recount
-  (failure, crash after the rename) is repaired by the next expiry from the
-  file as it is. Without a connection there is no index, so nothing expires:
+  at equal `end` it is applied only if it does not lengthen the line
+  (`kept <= entries`): at a constant logical end an expiry only shortens the
+  thread, so a longer census was read before it and is stale. An index left
+  behind by a lost recount (failure, crash after the rename) is repaired by
+  the next expiry from the file as it is. Without a connection there is no
+  index, so nothing expires:
   `fil expire` answers with an error and changes nothing, and `--dry-run`
   lists the entries past retention and succeeds. The runner, which has no
   local housekeeping there, expires through its executor connection (or
   opens one) and, when the index is missing, says so at most once a day (a
   day of the monotonic clock; an error of the notice is logged, the next one
-  still comes). Indexing an entry there works as before L361 (`threads.index`,
-  every entry counted).
+  still comes). Indexing an entry there is the same absolute census (L361c):
+  the host computes the file's census after writing the entry, and
+  `threads.recount` writes it — an entry indexed while an expiry census is in
+  flight is therefore neither counted twice nor erased by a shorter census
+  that lands after it. The mailbox trace (`agent_mailbox.meta`) stays a
+  separate, membership-checked `threads.index` write, with `count` false:
+  the trace marks the box without counting or quoting — it never writes
+  `entries` or `last_*`, so an entry expired meanwhile cannot come back
+  through it.
 * **R12 outbox**: an undelivered copy older than thread retention is
   deleted by `Log.prune` (its thread entry would expire on arrival);
   younger ones still wait for delivery, past detail retention.
