@@ -82,7 +82,8 @@ They establish protocol behavior with simulated effects, not an authenticated
 host pilot, root delegation, real claim fence or PostgreSQL lock integration.
 The next integration must enroll authority and supply durable host receipts and
 the bounded SSH/systemd adapters; helper/bootstrap and the controller's own
-installer wiring are also unfinished.
+installer wiring are prepared as source (the operator entry below) but executed
+on no host yet.
 
 ## Scoped signed decision adapter
 
@@ -253,7 +254,8 @@ they do not prove a real host restart. The administrator bootstrap and helper
 runtime, restricted SSH/sudo enrollment, independent service, config/caps/guard
 snapshots and the controller's own installer wiring are prepared but not
 installed; a real-host pilot, including the enrollment of the probe turn
-(`turn.json`), is still required. This
+(`turn.json`, assembled by `entree-operateur.py` below and installed by the
+signed bootstrap inventory), is still required. This
 checkpoint implements neither user-mode systemd nor other root operations and
 grants no root authority to an agent.
 
@@ -402,11 +404,52 @@ fixed unit, pinned host factory and its two pinned companions are now prepared
 as described below; the recovery-set and health companions refuse admission
 until their enrolled documents and private state exist. There is no installed
 bootstrap CLI, automatic
-root executor or runtime/credential enrollment. No real root/account/SSH/systemd
+root executor or runtime/credential enrollment. The operator entry below
+assembles the reviewed bundle and the probe enrollment; execution still belongs
+to the enrolled administrator backend. No real root/account/SSH/systemd
 effect is executed by this work. Tests combine disposable filesystem copies with
 simulated accounts/services and synthetic real signatures on disposable PostgreSQL
 through both drivers. Authenticated host pilot and external toolchain admission
 remain required.
+
+## Operator entry and probe turn enrollment
+
+`entree-operateur.py` is the source-side assembly the signed bootstrap was
+missing, and it is deliberately not a CLI. `prepare()` measures the staged
+`runtime` and `sources` trees with `runtime-release.py` and refuses a plan whose
+pinned digests differ — no silent repinning — then requires the host's observed
+inventory of every reviewed destination (`previous_files`), renders the
+canonical `delegation-release.py` review and returns the compact owner-signed
+question (bounded by `decide`'s 4000 characters). `install()` hands that
+reviewed bundle to the enrolled administrator backend (`bootstrap.run` over
+`installateur-bootstrap.py`'s host adapter) with the enrolled authority and its
+private journal; it accepts no caller-selected CLI, root, program or
+destination. `installateur-bootstrap.py` keeps refusing both, because the entry
+adds no route that could choose them.
+
+The probe turn is enrolled as one of the reviewed files. `pilote-sante.py`
+exposes the single `validate_enrollment` validator, `probe()` builds the exact
+`turn.json` document only for an agent whose registry row is on this exact host
+and whose own runner unit belongs to the enrolled restart policy, and
+`delegation-release.py` accepts such a document only at its fixed destination
+(`/etc/ameesh-release/turn.json`, mode 0600) as compact sorted JSON bounded to
+8 KiB. `prepare()` does not take that document on trust: as soon as a probe is
+enrolled it re-attests it through `enrolled_probe()` — the same `probe()` path,
+with the plan's host and restart policy and the enrolled registry (`db`) — so a
+document of another host or of an absent agent refuses before the question is
+rendered. Its digest enters the signed file inventory, so the signed question binds
+the exact probe identity; its bytes are installed with the same private
+snapshot, lost-reply reconciliation and revoke semantics as the other reviewed
+files (revoke removes or restores it like any other newly created reviewed
+file). The controller key is still enabled last, and `HostFactory.admit` then
+finds a `turn.json` shaped exactly as `HealthTurn` reads it. A missing,
+divergent or unreadable registry refuses; `prepare()` never invents an
+enrollment for an absent agent.
+
+Assembly and enrollment remain source only: no host is contacted, no root,
+SSH, systemd, migration or production effect is executed and no signed request
+is sent. A real-host pilot still needs the enrolled administrator backend, the
+administrator-staged trees and the owner's signed `install` decision.
 
 ## Independent service coordinator
 
@@ -628,8 +671,10 @@ verify effective units, caps and guard policy before returning a full configure
 or rollback receipt; `verification-release.py` (below) now supplies that
 effectiveness half and the pinned factory binds both halves. The recovery-set,
 health and authenticated-turn companions are supplied too (above); the
-controller's own installer wiring and the real-host enrollment of the probe turn
-remain unfinished (the daily retention provider is wired separately,
+controller's own installer wiring and the probe enrollment are assembled as
+source by `entree-operateur.py` (above) but executed on no host yet — the
+real-host enrollment of the probe turn still needs the enrolled administrator
+backend (the daily retention provider is wired separately,
 `L232B-PRIVATE-BACKUPS.md`). Targeted
 tests exercise real disposable files with simulated signed authority and database
 gates; no real host configuration or service is changed.
