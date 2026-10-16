@@ -797,7 +797,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     # agrégation, jamais de la lecture des notes.
     for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
-    last_events = {int(r["work_item_id"]): r.get("last_ts")
+    last_events = {int(r["work_item_id"]): float(r["last_ts"])
                    for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
