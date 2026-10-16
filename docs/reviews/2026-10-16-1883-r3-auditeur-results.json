@@ -1,0 +1,26 @@
+{
+  "publication_between_final_reads": {
+    "chosen": "secondaire",
+    "held_at_return": [
+      "secondaire"
+    ],
+    "holds_reads": 2,
+    "identity_reads": 2
+  },
+  "retry_is_not_validated": {
+    "chosen": "primaire",
+    "held_at_return": [
+      "primaire",
+      "secondaire"
+    ],
+    "holds_reads": 2,
+    "ranks": 2
+  },
+  "critical_configs_never_publish": {
+    "chosen_a": "secondaire",
+    "chosen_b": "secondaire",
+    "different_folders": true,
+    "published": [],
+    "identities": {}
+  }
+}
