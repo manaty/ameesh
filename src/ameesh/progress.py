@@ -177,12 +177,15 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
       plus récent), `merged`, `delivered` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
     * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : l'auteur du
-      verdict courant, sinon le relecteur désigné du lot (`work_items.reviewer`,
-      #705), sinon l'auteur du dernier verdict ;
+      verdict courant ; sinon le relecteur désigné du lot
+      (`work_items.reviewer`, #705) ; sinon None — un verdict périmé ne
+      désigne personne (#1318) ;
     * `verdict_current` : le verdict retenu porte-t-il sur le dernier gel ?
       Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
       renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
       ne compte pas ; sans SHA des deux côtés, comparaison des instants ;
+    * `verdict_required` : False quand le pilote a marqué « verdict non
+      requis » (`work.REVIEWER_NONE`, #1979) — la revue n'attend plus rien ;
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
@@ -267,11 +270,16 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # #705 : avant tout verdict — ou après un regel, le verdict précédent ne
     # vaut plus — le relecteur DÉSIGNÉ (`work move … qa --reviewer`) est celui
     # qu'on attend ; quand un verdict courant existe, c'est son auteur qui a
-    # réellement relu.
+    # réellement relu. #1318 : un verdict périmé ne désigne personne — sans
+    # relecteur désigné on attend « un relecteur (non désigné) », pas l'auteur
+    # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
-    reviewer = last["actor"] if last else None
-    if designated and not verdict_current:
-        reviewer = designated
+    reviewer = (last["actor"] if last else None) if verdict_current else designated
+    # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
+    # mécanique, canon §11 bis/#87) en marquant la colonne du relecteur
+    # (`work.waive_review`) : l'attente passe alors à la fusion, sans faux
+    # « waiting: verdict » ni rappel à un relecteur.
+    verdict_required = designated != work_mod.REVIEWER_NONE
     return {
         "requested": requested,
         "frozen": freezes[0]["at_ts"] if freezes else None,
@@ -280,6 +288,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "verdict_kind": last["kind"] if last else None,
         "reviewer": reviewer,
         "verdict_current": verdict_current,
+        "verdict_required": verdict_required,
         "merged": merged,
         "delivered": delivered,
         "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
@@ -315,7 +324,9 @@ def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
 
 def lot_state(work_state: str, jalons: dict) -> str:
     """État affiché d'un lot (décision 0024) : en revue, il n'est approuvé
-    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA)."""
+    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA) — ou,
+    #1979, par la marque « verdict non requis » du pilote (résolution de
+    composition mécanique, canon §11 bis/#87)."""
     if work_state in ("merged", "promoted"):
         return "merged"
     if work_state == "closed":
@@ -327,6 +338,13 @@ def lot_state(work_state: str, jalons: dict) -> str:
         if current is None:                 # jalons partiels : repli par les instants
             last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
             current = (jalons.get("verdict") or 0) >= last_frozen
+        # #1979 : dispensé de re-verdict, le lot n'est pas « en revue » : il
+        # est prêt à fusionner, comme après un verdict `ok` courant. Un verdict
+        # bloquant COURANT garde la main (une correction est due), comme dans
+        # `stagnation.waiting`.
+        if not (jalons.get("verdict_kind") == "blocked" and current) \
+                and jalons.get("verdict_required", True) is False:
+            return "approved"
         if jalons.get("verdict_kind") == "ok" and current:
             return "approved"
         return "review"
@@ -357,6 +375,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               now: float | None = None,
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
               messages_ts: float | None = None,
+              events_ts: float | None = None,
               planned_wait: dict | None = None,
               dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
@@ -366,7 +385,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
                      None)
-    last = stagnation.last_activity(item, events, declared or [], actions, messages_ts)
+    # `events` peut ne porter que les transitions (#1647) : `events_ts` rend
+    # le dernier instant du journal, notes comprises.
+    last = stagnation.last_activity(item, events, declared or [], actions, messages_ts,
+                                    events_ts=events_ts)
     now = time.time() if now is None else float(now)
     return {
         "id": int(item["id"]),
@@ -378,7 +400,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "state": lot_state(item.get("state") or "", jalons),
         "work_state": item.get("state") or "",
         "assignee": item.get("assignee") or None,
-        "reviewer": jalons["reviewer"],
+        # #1979 : une revue dispensée n'a pas de relecteur — l'état `approved`
+        # le dit ; le jeton de la colonne ne sort pas dans la vue.
+        "reviewer": (None if jalons["reviewer"] == work_mod.REVIEWER_NONE
+                     else jalons["reviewer"]),
         "milestones": {k: _round(jalons[k])
                        for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
@@ -449,11 +474,27 @@ def agent_state(row: dict) -> str:
         return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
+    if row.get("operator_paused") and status not in ("stopped", "dead"):
+        return "paused"
     if status == "blocked":
         return "paused"                 # pause budget ou comptable (L13)
     if status in ("stopped", "dead"):
         return "stopped"
     return "idle"                       # idle, queued
+
+
+def paused_on_budget(row: dict) -> bool:
+    """#1070 : l'agent est en pause BUDGET — la pause annoncée par son
+    exécuteur (`status` `blocked`, texte « budget : … »).
+
+    Distincte d'un `blocked` d'une autre cause (hôte non prêt,
+    authentification), que `agent_state` range lui aussi dans « paused » :
+    un bilan qui compte les agents en pause budget lit ce prédicat, pas le
+    préfixe d'un texte tronqué à l'affichage. La règle est celle de
+    `handoff.paused` (L233b), la seule définition de la pause budget : on la
+    reprend ici au lieu d'en entretenir une seconde."""
+    from . import handoff
+    return handoff.paused(row)
 
 
 def _excerpt(text: str | None, limit: int = TASK_CHARS) -> str | None:
@@ -501,6 +542,9 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "state": state,
         "status": row.get("status") or None,
         "status_text": _excerpt(row.get("status_text"), 160),
+        # #1070 : la pause budget se distingue d'un `blocked` d'une autre cause
+        # sans déchiffrer le texte
+        "paused_on_budget": paused_on_budget(row),
         "since_ts": _round(since),
         "turn": turn,
         "turns": int(row.get("turns") or 0),
@@ -510,12 +554,45 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
+        "operator_pause": ({
+            "reason": row.get("operator_pause_reason"),
+            "by": row.get("operator_pause_by"),
+            "for": row.get("operator_pause_for"),
+            "since_ts": _round(row.get("operator_pause_ts")),
+            "after_turn": state == "working",
+        } if row.get("operator_paused") else None),
     }
 
 
 # --------------------------------------------------------------------------
 # budget
 # --------------------------------------------------------------------------
+
+def _effective_pace(gauges: list, accounts: list[dict] | None) -> dict:
+    """{(harnais, fenêtre) : (multiplicateur, plafond effectif)} (#1227 N3).
+
+    `accounts.report` porte le plafond effectif par compte (#1176) ;
+    `book.gauges()` ne nomme pas le compte de son relevé. On ne s'en sert donc
+    que quand un seul compte déclaré du harnais porte la fenêtre : plusieurs
+    comptes, ou aucune information, gardent le défaut (90 %, ×1) — jamais un
+    plafond attribué au hasard.
+    """
+    keys = {(g.harness, g.key) for g in gauges}
+    found: dict = {}
+    for row in accounts or []:
+        harness = row.get("harness")
+        multiplier = float(row.get("pace_multiplier") or 1.0)
+        for gauge in row.get("gauges") or []:
+            key = (harness, gauge.get("key"))
+            if key not in keys:
+                continue
+            ceiling = float(gauge.get("pace_ceiling") or cost_mod.PACE_CEILING)
+            if key in found and found[key] != (multiplier, ceiling):
+                found[key] = None            # plusieurs comptes : ambigu
+            else:
+                found.setdefault(key, (multiplier, ceiling))
+    return found
+
 
 def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
                  paid_harnesses: Iterable[str] | None = None,
@@ -582,11 +659,25 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     # `pace_cap` et `exceeded` ne décriraient plus aucun compte (R1 #1028,
     # P2). Le rendu texte écarte ces harnais, déjà montrés compte par compte ;
     # le JSON garde la même valeur qu'`accounts.report`.
+    # #1227 N3 : le plafond effectif du compte (#1176, relèvement de fin de
+    # fenêtre compris) accompagne son rythme ; les jauges du dossier par
+    # défaut ne reçoivent le réglage déclaré que s'il n'est pas ambigu (un
+    # seul compte porte la fenêtre) — jamais un plafond attribué au hasard.
     actifs = {row["harness"]: row for row in (accounts or []) if row.get("active")}
-    plans = [_plan_view(g, now, 1.0) for g in gauges if g.harness not in actifs]
+    settings = _effective_pace(gauges, accounts)
+    plans = []
+    for g in gauges:
+        if g.harness in actifs:
+            continue                    # rendu compte par compte ci-dessous
+        multiplier, ceiling = (settings.get((g.harness, g.key))
+                               or (1.0, cost_mod.PACE_CEILING))
+        plans.append(_plan_view(g, now, multiplier, ceiling))
     for harness, row in actifs.items():
         multiplicateur = float(row.get("pace_multiplier") or 1.0)
-        plans.extend(_plan_view(g, now, multiplicateur)
+        ceilings = {g.get("key"): float(g.get("pace_ceiling") or cost_mod.PACE_CEILING)
+                    for g in row.get("gauges") or []}
+        plans.extend(_plan_view(g, now, multiplicateur,
+                                ceilings.get(g.key, cost_mod.PACE_CEILING))
                      for g in row.get("_gauges") or [])
     return {
         "currency": "USD",
@@ -600,16 +691,17 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     }
 
 
-def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float) -> dict:
+def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float,
+               ceiling: float = cost_mod.PACE_CEILING) -> dict:
     """Un plan de `budget.plans` : la jauge et le rythme du même compte."""
     return {
         "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
-        "pace_cap": round(g.pace_cap(now, multiplier), 4),
+        "pace_cap": round(g.pace_cap(now, multiplier, ceiling), 4),
         "elapsed": round(g.elapsed(now), 4),
         "resets_ts": _round(g.resets_at), "window_s": g.window_s,
         # #1561 : quand le relevé a été produit (None : source non datée)
         "read_at": _round(getattr(g, "read_at", None)),
-        "exceeded": g.exceeded(now, multiplier=multiplier),
+        "exceeded": g.exceeded(now, multiplier=multiplier, ceiling=ceiling),
     }
 
 
@@ -738,8 +830,12 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     items.sort(key=lambda i: (i.get("created_ts") or 0, int(i["id"])))
     ids = [int(i["id"]) for i in items]
     events: dict = {}
-    for ev in st.lot_events(ids):
+    # #1647 : transitions seules ; le dernier instant du journal vient d'une
+    # agrégation, jamais de la lecture des notes.
+    for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
+    last_events = {int(r["work_item_id"]): float(r["last_ts"])
+                   for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
         by_item.setdefault(int(row["work_item"]), []).append(row)
@@ -757,11 +853,32 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
-                      messages_ts=messages.get(int(item["id"])), agent_states=states,
+                      messages_ts=messages.get(int(item["id"])),
+                      events_ts=last_events.get(int(item["id"])), agent_states=states,
                       planned_wait=holds.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
+    # #1822 : un lot léger sans verdict courant attend la fusion, pas un
+    # verdict ; la classe n'est lue — une fois par passage — que pour ces lots.
+    from . import lot_class
+    classes: dict = {}
+    for lot, item in zip(lots, items):
+        if (lot.get("waiting_for") or {}).get("what") != "verdict":
+            continue
+        cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes,
+                                         milestones=declared.get(int(item["id"]), []))
+        if cls != lot_class.LIGHT:
+            continue
+        rid = int(item["id"])
+        acts = by_item.get(rid, [])
+        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid))
+        lot["waiting_for"] = stagnation.with_availability(
+            stagnation.waiting(item, jalons, acts,
+                               responsible=(packages.get(item.get("package_id"))
+                                            or {}).get("responsible"),
+                               review_class=cls),
+            states, externals)
     package_items = st.package_items()
     plan = plan_mod.summarize(package_rows, package_items)
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)
@@ -999,6 +1116,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
         elif agent["state"] in ("paused", "stopped") and agent["status_text"]:
             line("reason: %s" % agent["status_text"], "    ")
+        hold = agent.get("operator_pause")
+        if hold:
+            line("operator pause%s: %s (by %s for %s)" % (
+                " after this turn" if hold["after_turn"] else "",
+                hold["reason"], hold["by"], hold["for"]), "    ")
 
     out.append("")
     if snap["milestones"]:
@@ -1190,8 +1312,10 @@ def main(argv: list[str] | None = None) -> int:
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db, defer=True)
-            # L160f (#497) : un lecteur GitHub par exécution (cache mémoire)
-            reader = None if args.no_versions else versions_mod.Reader()
+            # L160f (#497) : un lecteur GitHub par exécution (cache mémoire),
+            # adossé au cache partagé de l'hôte (#848) entre exécutions
+            reader = None if args.no_versions else versions_mod.Reader(
+                cache_dir=cfg.state_dir)
             # L61 : lectures regroupées (db.batched) — deux allers-retours
             snap = db_mod.batched(db, lambda db: snapshot(
                 db, cfg, since=args.since, project=args.project, stale_after=threshold,

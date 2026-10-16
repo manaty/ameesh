@@ -566,63 +566,378 @@ def reap(pid: int) -> int | None:
 # détenteurs d'un fichier
 # --------------------------------------------------------------------------
 
-def _inside(target: str, real: str, is_dir: bool) -> bool:
+def _inside(target: str, real: str | None, is_dir: bool) -> bool:
+    if real is None:  # L63b: command line only, no file to look for
+        return False
     return target == real or (is_dir and target.startswith(real.rstrip(os.sep) + os.sep))
 
 
-def holders(path: str, needle: str | None = None, exclude=(), *,
-            mapped: bool = False) -> list[dict]:
+def holders(path: str | None, needle: str | None = None, exclude=(), *,
+            mapped: bool = False, session: bool = False, allow=()) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
     `needle` sur la ligne de commande (hors argv[0] et hors les PID de
-    `exclude`). #248 : avec `mapped`, aussi l'exécutable et les fichiers
-    projetés en mémoire (module natif `.node`, binaire electron). Chaque
-    détenteur : `{"pid", "why", "cmd"}`.
+    `exclude`). Avec `session`, `needle` est un identifiant de session : seule
+    une reprise en cours le nomme (l'argument d'un sélecteur de session,
+    `codex resume <id>`, `claude --resume <id>`, `dsh --session-id <id>`,
+    séparé ou lié par `=`) ; le même identifiant CITÉ dans un brief, un
+    message ou un chemin n'est pas un détenteur (#1283). #248 : avec `mapped`,
+    aussi l'exécutable et les fichiers projetés en mémoire (module natif
+    `.node`, binaire electron). Chaque détenteur : `{"pid", "why", "cmd"}`.
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
-    si ce processus-ci ne peut même pas lire SES fichiers ouverts, ou si l'OS
-    n'offre aucun moyen de les lire, `NotAvailable` : une liste vide voudrait
-    dire « personne ne tient la session », ce qui n'aurait pas été vérifié."""
-    real = os.path.realpath(path)
-    is_dir = os.path.isdir(real)
+    si ce processus-ci ne peut même pas lire SES fichiers ouverts, si l'OS
+    n'offre aucun moyen de les lire, ou (L63b) si un processus du même
+    utilisateur refuse la lecture de ses fichiers ouverts (non dumpable) sans
+    être le gestionnaire de services, et qu'AUCUN détenteur n'a été trouvé,
+    `NotAvailable` : une liste vide voudrait dire « personne ne tient la
+    session », ce qui n'aurait pas été vérifié. Un détenteur vérifié, lui,
+    reste une réponse vraie quel que soit le refus d'un tiers (#1749).
+    `path` None : `needle` seul, l'OS toujours exigé (L63b).
+
+    `allow` (L230) : noms des processus de l'utilisateur dont l'illisibilité
+    n'est PAS un doute — le choix explicite de l'owner de l'hôte, vide par
+    défaut ; le `comm` ET le nom de base d'`argv[0]` doivent s'y trouver
+    (même règle que `user_paths`), sinon le refus reste un doute. Un détenteur
+    CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste rapporté, même
+    si son nom est dans `allow` : l'allow ne lève que le doute, jamais une
+    observation."""
+    real = os.path.realpath(path) if path else None
+    is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
+    allow = frozenset(allow or ())
     ps = _psutil()
     if ps is not None:
-        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
+        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped,
+                               session=session, allow=allow)
     if _proc_ok():
-        return _holders_proc(real, is_dir, needle, exclude, mapped)
+        return _holders_proc(real, is_dir, needle, exclude, mapped,
+                             session=session, allow=allow)
     raise NotAvailable("file holders",
                        "neither psutil nor /proc to list open files")
 
 
-def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | None:
-    if not hit and needle and pid not in exclude and any(needle in a for a in argv[1:]):
-        hit = "session id on the command line"
+#: L63b: a doubt (open files denied) is read again this many times, this far
+#: apart: a process that is only exiting (its files already closed, /proc
+#: denies its `fd` until it is a zombie) is gone or a zombie by then; a live
+#: holder that is not dumpable stays a doubt
+DOUBT_RETRIES = 5
+DOUBT_RETRY_S = 0.1
+
+#: L63b, off Linux: system executables no user can write (SIP), e.g. macOS's
+#: ContextStoreAgent, which runs as the user and denies its open files. Not
+#: /usr/bin: a harness can run under Apple's python.
+SYSTEM_EXE_ROOTS = ("/System/", "/usr/libexec/")
+
+
+def _proc_status(pid) -> dict | None:
+    """The fields of /proc/<pid>/status (`{"Uid": [...], ...}`), readable
+    even when the process is not dumpable; None when it is gone. Any other
+    read error is raised: unknown is not "another user" (review #377 r2)."""
+    try:
+        with open(os.path.join(PROC, str(pid), "status"), encoding="utf-8",
+                  errors="replace") as fh:
+            text = fh.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    out = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            out[key] = value.split()
+    return out
+
+
+def service_managers(uid: int | None = None) -> frozenset:
+    """L63b: the PIDs of the user's service manager and of its `(sd-pam)`,
+    whose open files are never readable. Told by PID and credentials, never
+    by name, command line or start time, which a process can borrow (review
+    #377 r2-r4): the MainPID of user@<uid>.service, asked of PID 1
+    (`systemctl`), and its direct children whose supplementary groups are
+    EMPTY while the manager's are not. `(sd-pam)` is forked as root and
+    takes the uid without initgroups; a user process cannot empty its groups
+    (setgroups needs CAP_SETGID; denied in an unprivileged user namespace).
+    A manager without groups exempts no child. Empty without systemd or
+    /proc."""
+    import subprocess
+    uid = os.getuid() if uid is None else uid
+    if not _proc_ok():
+        return frozenset()
+    try:
+        done = subprocess.run(["systemctl", "show", "--property=MainPID", "--value",
+                               "user@%d.service" % uid],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    main = done.stdout.strip()
+    if done.returncode != 0 or not main.isdigit() or int(main) <= 1:
+        return frozenset()
+    main = int(main)
+    out = {main}
+    try:
+        status = _proc_status(main)
+    except OSError:
+        status = None
+    if not status or not status.get("Groups"):
+        return frozenset(out)
+    try:
+        pids = [p for p in os.listdir(PROC) if p.isdigit()]
+    except OSError:
+        pids = []
+    for pid in pids:
+        try:
+            fields = _stat_fields(int(pid))
+            child = _proc_status(pid) if len(fields) > 1 and fields[1] == str(main) else None
+        except (OSError, ValueError):
+            continue
+        if child is not None and "Groups" in child and not child["Groups"]:
+            out.add(int(pid))
+    return frozenset(out)
+
+
+def _allowed_proc(pid, allow) -> bool:
+    """L230 : le processus se nomme (`comm`) ET s'annonce (`argv[0]`) dans
+    `allow` — un nom emprunté ne blanchit pas un refus. Un `comm` vide ou un
+    `cmdline` illisible ne blanchit rien : le doute reste."""
+    if not allow:
+        return False
+    name = _read_text(os.path.join(PROC, str(pid), "comm")).strip()
+    try:
+        with open(os.path.join(PROC, str(pid), "cmdline"), "rb") as fh:
+            argv0 = fh.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return False
+    return bool(name) and name in allow and os.path.basename(argv0) in allow
+
+
+def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
+    """L63b: why a process whose open files were denied leaves the answer
+    unknown, read on /proc; None when it cannot hold anything of the user's:
+    gone, a zombie (no files left), running as another user (effective uid:
+    a setuid helper such as sudo is root's), the user's service manager
+    (`managers()`, by PID), or a process named by `allow` (L230, `comm` and
+    `argv[0]`; an unreadable status is a doubt)."""
+    try:
+        status = _proc_status(pid)
+    except OSError as exc:
+        return "%s (status unreadable: %s)" % (pid, exc.strerror or type(exc).__name__)
+    if status is None or (status.get("State") or ["?"])[0] in ("Z", "X"):
+        return None
+    uids = status.get("Uid") or []
+    if len(uids) < 2 or not uids[1].isdigit():
+        return "%s (uid unreadable)" % pid
+    if int(uids[1]) != uid or int(pid) in managers():
+        return None
+    if _allowed_proc(pid, allow):
+        return None
+    return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
+
+
+def _doubt_psutil(ps, pid: int, user, allow=()) -> str | None:
+    """`_doubt_proc` off Linux, by psutil: gone or zombie, another user
+    (effective uid, or user name on Windows), a system executable
+    (`SYSTEM_EXE_ROOTS`), or a process named by `allow` (L230, name and
+    `argv[0]`) is not a doubt; an unreadable answer is."""
+    try:
+        proc = ps.Process(pid)
+        if proc.status() == ps.STATUS_ZOMBIE or _owner(proc) != user:
+            return None
+        name = proc.name()
+        try:
+            exe = proc.exe() or ""
+        except ps.AccessDenied:
+            exe = ""
+    except ps.NoSuchProcess:   # ZombieProcess too
+        return None
+    except Exception as exc:
+        return "%d (%s)" % (pid, type(exc).__name__)
+    if exe.startswith(SYSTEM_EXE_ROOTS):
+        return None
+    if allow:
+        try:
+            argv0 = proc.cmdline()[0]
+        except (ps.AccessDenied, ps.ZombieProcess, OSError, IndexError):
+            argv0 = ""
+        if name in allow and os.path.basename(str(argv0)) in allow:
+            return None
+    return "%d %s" % (pid, name)
+
+
+def _owner(proc):
+    """Who a psutil process runs as: its effective uid (a setuid helper is
+    root's), its user name where the OS has no uids (Windows)."""
+    try:
+        uids = proc.uids()
+    except AttributeError:   # Windows
+        return proc.username()
+    return uids.effective
+
+
+def _settle(doubts: dict, again) -> None:
+    """L63b: `doubts` (pid -> who) read again by `again(pid)` (who, or None)
+    until none is left or `DOUBT_RETRIES` is spent; what is left is
+    `NotAvailable`: an empty list would say "nobody holds it" unchecked."""
+    import time
+    for _ in range(DOUBT_RETRIES):
+        if not doubts:
+            return
+        time.sleep(DOUBT_RETRY_S)
+        doubts = {pid: who for pid in doubts for who in [again(pid)] if who}
+    if doubts:
+        raise NotAvailable("file holders",
+                           "open files of process(es) of this user unreadable: %s"
+                           % ", ".join(list(doubts.values())[:5]))
+
+
+#: Sélecteurs de session d'une ligne de commande : une reprise en cours nomme
+#: la session juste après eux (`claude --resume <id>`, `dsh --session-id <id>`,
+#: ou leur valeur liée par `=`), ou après les options de la sous-commande
+#: (`codex exec resume --json <id>`, `codex resume --no-alt-screen <id>`). Un
+#: identifiant cité ailleurs dans un argv — brief JSON, message, prompt, valeur
+#: d'option — n'est pas un détenteur (#1283).
+SESSION_SELECTORS = ("resume", "--resume", "-r", "--session-id")
+
+#: Options de reprise SANS valeur, par binaire (`basename(argv[0])`) : le
+#: jeton suivant reste candidat au positional de session. Toute autre option
+#: est supposée prendre une valeur — la consommer évite de prendre son
+#: argument pour l'id (`codex resume -m gpt-5.1-codex <id>`) ; une valeur liée
+#: par `=` tient en un seul jeton. La grammaire dépend du binaire pour un même
+#: jeton : `-p` = `--print` chez Claude mais `--profile <nom>` chez Codex, `-c`
+#: = `--continue` chez Claude mais `--config <clé=valeur>` chez Codex — les
+#: confondre perd une vraie reprise ou prend un profil pour un id (#1283 R1 cx2,
+#: aide locale Codex : `-p`/`--profile` porte une valeur). Sources : descripteurs
+#: `harness_descriptors/*.json`, `dsh --help` local, revue cx2.
+_CODEX_FLAGS = frozenset({
+    "--json", "--no-alt-screen", "--all", "--ephemeral", "--worktree",
+    "--no-daemon", "--ignore-user-config", "--ignore-rules", "--strict-config",
+    "--include-non-interactive", "--search", "--oss", "--approve-for-me",
+    "--full-auto",
+    "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust", "-h", "--help", "-V", "--version",
+})
+_CLAUDE_FLAGS = frozenset({
+    "-p", "--print", "-c", "--continue", "--verbose", "--fork-session",
+    "--include-partial-messages", "--strict-mcp-config", "--ide",
+    "--replay-user-messages", "--dangerously-skip-permissions",
+    "-h", "--help", "-V", "--version",
+})
+_DSH_FLAGS = frozenset({
+    "--json", "--no-daemon", "--dump-config", "--dump-config-schema",
+    "--dump-default-config", "-h", "--help", "-V", "--version",
+})
+#: Repli d'un binaire inconnu (harnais porté par un script de banc) : les
+#: grammaires dont le `resume` est un sous-commande à positional. Les options
+#: courtes ambiguës (`-p`, `-c`) en sont absentes : supposées à valeur, comme
+#: chez Codex, puisque c'est la grammaire du `resume` nu.
+RESUME_FLAGS = {
+    "codex": _CODEX_FLAGS,
+    "claude": _CLAUDE_FLAGS,
+    "dsh": _DSH_FLAGS,
+    "": _CODEX_FLAGS | _DSH_FLAGS,
+}
+
+#: Options qui désignent « la session la plus récente » : aucun positional
+#: d'id ne suit, un jeton cité après elles est un prompt. `--all` n'en fait
+#: PAS partie : chez Codex il élargit la recherche (Show all sessions), il ne
+#: désigne pas la dernière — un id le suivant est bien le positional
+#: (#1283 R1 cx2, aide locale).
+RESUME_LATEST = frozenset({"--last"})
+
+
+def _resume_flags(argv: list[str]) -> frozenset[str]:
+    """La grammaire d'options du binaire lancé (repli : binaires connus)."""
+    nom = os.path.basename(argv[0]) if argv else ""
+    return RESUME_FLAGS.get(nom, RESUME_FLAGS[""])
+
+
+def _resume_positional(argv: list[str], index: int,
+                       flags: frozenset[str]) -> str | None:
+    """Le positional de session d'une reprise à partir de `index` : options
+    consommées (leur valeur avec), `--` respecté ; None si `--last` désigne la
+    plus récente, ou s'il n'y a plus de positional."""
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if arg in RESUME_LATEST:
+            return None
+        if arg.startswith("-"):
+            index += 1
+            if not arg.partition("=")[1] and arg not in flags \
+                    and index < len(argv) and not argv[index].startswith("-"):
+                index += 1
+            continue
+        return arg
+    return None
+
+
+def _session_argument(argv: list[str], needle: str) -> bool:
+    """`needle` est-il nommé par une reprise en cours, et non cité ?
+
+    Tous les sélecteurs de la ligne sont essayés : un mot `resume` du texte
+    (prompt, message) ne masque pas un `--resume <id>` plus loin."""
+    flags = _resume_flags(argv)
+    for index, arg in enumerate(argv[1:], start=1):
+        flag, sep, value = arg.partition("=")
+        if sep and flag in SESSION_SELECTORS:
+            if value == needle:
+                return True
+        elif arg == "resume":
+            if _resume_positional(argv, index + 1, flags) == needle:
+                return True
+        elif arg in ("--resume", "-r", "--session-id"):
+            if index + 1 < len(argv) and argv[index + 1] == needle:
+                return True
+    return False
+
+
+def _verdict(pid: int, hit: str, argv: list[str], needle, exclude,
+             session: bool = False) -> dict | None:
+    if not hit and needle and pid not in exclude:
+        if session:
+            if _session_argument(argv, needle):
+                hit = "session id on the command line"
+        elif any(needle in a for a in argv[1:]):
+            hit = "session id on the command line"
     if hit:
         return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160]}
     return None
 
 
-def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
+                    session=False, allow=()) -> list[dict]:
     me = os.getpid()
     try:
         ps.Process(me).open_files()
+        user = _owner(ps.Process(me))
     except Exception as exc:
         raise NotAvailable("file holders",
                            "open files unreadable even for this process (%s)"
                            % type(exc).__name__) from None
+    if _proc_ok():   # Linux: the same reading of a doubt as the /proc way
+        uid, managers = os.getuid(), _once(service_managers)
+
+        def doubt(pid):
+            return _doubt_proc(pid, uid, managers, allow)
+    else:
+        def doubt(pid):
+            return _doubt_psutil(ps, pid, user, allow)
     found = []
+    doubts: dict = {}
     for proc in ps.process_iter():
         pid = proc.pid
         hit = ""
         try:
             with proc.oneshot():
+                refused = False
                 try:
                     for item in proc.open_files():
                         if _inside(os.path.realpath(item.path), real, is_dir):
                             hit = "open file"
                             break
-                except (ps.AccessDenied, ps.ZombieProcess, OSError):
+                except ps.AccessDenied:
+                    refused = True
+                except (ps.ZombieProcess, OSError):
                     pass
                 if not hit and is_dir:
                     try:
@@ -643,10 +958,33 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
                     argv = []
         except ps.NoSuchProcess:
             continue
-        row = _verdict(pid, hit, argv, needle, exclude)
+        row = _verdict(pid, hit, argv, needle, exclude, session)
         if row:
             found.append(row)
+        elif refused:
+            who = doubt(pid)
+            if who:
+                doubts[pid] = who
+    # L63b : la relecture du doute ne sert que si RIEN n'a été trouvé. Un
+    # détenteur vérifié (fichier ouvert, dossier courant) tient l'entrée quel
+    # que soit le refus d'un processus tiers du même utilisateur ; jeter cette
+    # réponse positive rendait le ménage aveugle (« holders unreadable » pour
+    # tout /tmp) sur un poste où gpg-agent n'est pas dumpable (#1749).
+    if not found:
+        _settle(doubts, doubt)
     return found
+
+
+def _once(fn):
+    """`fn()` computed on the first call only (the service manager is
+    asked of systemd only when a doubt needs it)."""
+    memo: list = []
+
+    def get():
+        if not memo:
+            memo.append(fn())
+        return memo[0]
+    return get
 
 
 def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
@@ -670,7 +1008,8 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
     return ""
 
 
-def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
+                  allow=()) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
@@ -681,19 +1020,29 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
         raise NotAvailable("file holders",
                            "open files unreadable even for this process (%s)"
                            % exc) from None
+    uid, managers = os.getuid(), _once(service_managers)
     found = []
+    doubts: dict = {}
     for pid in pids:
         hit = ""
         fd_dir = os.path.join(PROC, pid, "fd")
+        # L63b: a refusal, on the listing or on a link (the process can stop
+        # being dumpable in between), is a doubt, never an empty answer
+        refused = False
         try:
             fds = os.listdir(fd_dir)
+        except (FileNotFoundError, ProcessLookupError):
+            continue   # gone
         except OSError:
-            fds = []
+            fds, refused = [], True
         for fd in fds:
             try:
                 target = os.readlink(os.path.join(fd_dir, fd))
+            except FileNotFoundError:
+                continue   # closed meanwhile
             except OSError:
-                continue
+                refused = True
+                break
             if _inside(target, real, is_dir):
                 hit = "open file"
                 break
@@ -710,9 +1059,17 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
                 argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
         except OSError:
             argv = []
-        row = _verdict(int(pid), hit, argv, needle, exclude)
+        row = _verdict(int(pid), hit, argv, needle, exclude, session)
         if row:
             found.append(row)
+        elif refused:
+            who = _doubt_proc(pid, uid, managers, allow)
+            if who:
+                doubts[pid] = who
+    # L63b : même règle que la voie psutil — un détenteur vérifié ne se jette
+    # pas parce qu'un tiers du même utilisateur refuse ses fichiers ouverts.
+    if not found:
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow))
     return found
 
 
@@ -767,14 +1124,44 @@ def _link(path: str) -> str:
     return target if target.startswith("/") else ""
 
 
+def _zombie(pid: int) -> bool:
+    """Le processus `pid` est-il un zombie (état `Z` de /proc/<pid>/stat) ?
+
+    Un zombie n'est plus qu'une entrée de table : il ne détient aucun fichier,
+    et ses liens `/proc` sont illisibles sans qu'il y ait un doute à avoir
+    (#1678, constat #1665 : un « timeout <defunct> » retenait tout le ménage
+    des worktrees). Un stat illisible (disparu, autre utilisateur) : False —
+    le doute ordinaire s'applique.
+
+    Le meneur d'un groupe dont un autre fil vit encore se lit aussi `Z` : il
+    n'est zombie que si tous ses fils (`/proc/<pid>/task`) le sont."""
+    try:
+        if _stat_fields(pid)[0] != "Z":
+            return False
+        tasks = os.listdir(os.path.join(PROC, str(int(pid)), "task"))
+        for tid in tasks:
+            path = os.path.join(PROC, str(int(pid)), "task", tid, "stat")
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    data = fh.read()
+            except FileNotFoundError:
+                continue   # fil disparu entre-temps
+            if data[data.rindex(")") + 2:].split()[0] != "Z":
+                return False
+        return bool(tasks)
+    except (OSError, IndexError, ValueError):
+        return False
+
+
 def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     """Where the processes of `uid` (default: this user) are, from `/proc`.
 
-    A process gone meanwhile is ignored. One that cannot be read (not
-    dumpable: setuid, file capabilities) is a doubt, unless its name (`comm`)
-    AND the base name of its `argv[0]` are both in `allow` or the service
-    manager: its `exe` link is unreadable too, its command line is not.
-    Without `/proc` (other OS), `available` is false."""
+    A process gone meanwhile is ignored, and so is a zombie (`_zombie`, #1678):
+    it holds nothing anymore. One that cannot be read (not dumpable: setuid,
+    file capabilities) is a doubt, unless its name (`comm`) AND the base name
+    of its `argv[0]` are both in `allow` or the service manager: its `exe` link
+    is unreadable too, its command line is not. Without `/proc` (other OS),
+    `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
@@ -790,6 +1177,9 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
             if os.lstat(base).st_uid != uid:
                 continue
         except OSError:
+            continue
+        if _zombie(int(pid)):
+            # plus un détenteur : ignoré comme un processus disparu (#1678)
             continue
         name = _read_text(os.path.join(base, "comm")).strip() or "?"
         who = "%s %s" % (pid, name)

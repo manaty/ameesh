@@ -47,6 +47,20 @@ class TurnCosts(interface.TurnCosts):
             " order by recorded_at desc, id desc limit 1", tuple(params))
         return rows[0] if rows else None
 
+    def last_before(self, agent, ts) -> dict | None:
+        rows = self.db.query(
+            "select harness, session, extract(epoch from recorded_at)::float8 as recorded_ts"
+            " from turn_costs where agent = %s and recorded_at <= to_timestamp(%s)"
+            " order by recorded_at desc, id desc limit 1", (agent, float(ts)))
+        return rows[0] if rows else None
+
+    def first_after(self, agent, ts) -> dict | None:
+        rows = self.db.query(
+            "select harness, session, extract(epoch from recorded_at)::float8 as recorded_ts"
+            " from turn_costs where agent = %s and recorded_at >= to_timestamp(%s)"
+            " order by recorded_at asc, id asc limit 1", (agent, float(ts)))
+        return rows[0] if rows else None
+
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,

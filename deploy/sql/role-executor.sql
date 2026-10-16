@@ -52,6 +52,10 @@ SELECT format('REVOKE EXECUTE ON FUNCTION %I.ameesh_module_agent(text) FROM %I',
 -- Module policy writes belong exclusively to isolated canon synchronization.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
               :'schema', :'role') WHERE to_regclass(format('%I.project_modules', :'schema')) IS NOT NULL \gexec
+-- Only the independently enrolled release controller may write these fences.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM %I', :'schema', name, :'role')
+  FROM unnest(ARRAY['host_release_operations','host_release_fences','host_release_fence_receipts']) name
+ WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
 -- #326 r4: the key journal's order is the server's; no setval on its ids
 SELECT format('REVOKE UPDATE ON SEQUENCE %I.key_events_id_seq FROM %I', :'schema', :'role')
  WHERE to_regclass(format('%I.key_events_id_seq', :'schema')) IS NOT NULL \gexec
@@ -71,6 +75,7 @@ DECLARE
     parent record;
     item record;
     privilege text;
+    missing text[];
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r AND rolcanlogin) THEN
         violations := array_append(violations, 'executor group must be NOLOGIN');
@@ -155,13 +160,13 @@ BEGIN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
                 END IF;
             END LOOP;
-        ELSIF item.relname = 'project_modules' THEN
+        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts') THEN
             IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
-                violations := violations || 'missing SELECT on project_modules';
+                violations := violations || format('missing SELECT on %s', item.relname);
             END IF;
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
                 IF has_table_privilege(r, item.oid, privilege) THEN
-                    violations := violations || format('forbidden %s on project_modules', privilege);
+                    violations := violations || format('forbidden %s on %s', privilege, item.relname);
                 END IF;
             END LOOP;
         ELSE
@@ -174,6 +179,18 @@ BEGIN
     END LOOP;
     IF cardinality(violations) > 0 THEN
         RAISE EXCEPTION 'ROLE CONTRACT FAILED for %: %', r, array_to_string(violations, '; ');
+    END IF;
+    -- Not a violation: the event stream's cluster identity (0396). Executable
+    -- by PUBLIC unless the server revoked them; then every resume is a reset.
+    SELECT array_agg(f ORDER BY f) INTO missing FROM unnest(ARRAY[
+        'pg_control_system()', 'pg_control_checkpoint()', 'pg_current_wal_lsn()',
+        'pg_walfile_name(pg_lsn)']) f
+     WHERE NOT has_function_privilege(r, f::regprocedure, 'EXECUTE');
+    IF missing IS NOT NULL THEN
+        RAISE WARNING 'role % may not execute %: event stream resumes will all reset; '
+                      'as a superuser: GRANT EXECUTE ON FUNCTION % TO %',
+                      r, array_to_string(missing, ', '), array_to_string(missing, ', '),
+                      quote_ident(r);
     END IF;
 END
 $audit$;

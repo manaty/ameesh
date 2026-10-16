@@ -49,6 +49,15 @@ def grouped(db, item_ids):
 # L385 suite : réveiller l'agent d'un dépendant quand sa dernière attente tombe
 # --------------------------------------------------------------------------
 
+def _pinned(row) -> bool:
+    """Le lot est-il pinné sur une révision Process (colonne 0452) ?
+
+    Lu dans la ligne d'activité (`open_lots_activity` porte `workflow_ref` par
+    `to_jsonb`, '' sur une base d'avant la migration), jamais par une sonde de
+    colonne ni un SELECT brut (#1922/B5)."""
+    return bool(str(row.get("workflow_ref") or ""))
+
+
 def released_by(db, blocker_id) -> list[dict]:
     """Lots ouverts dont la fermeture de `blocker_id` lève l'attente.
 
@@ -65,6 +74,12 @@ def released_by(db, blocker_id) -> list[dict]:
     vérité que `planned_wait`. Les lots fermés, fusionnés ou sans arête vers
     `blocker_id` n'en font jamais partie.
 
+    #1922/N13 : un lot pinné sur une révision Process n'est pas libéré par la
+    fermeture — seul un `release` du registre, vérifié par C, lève sa retenue.
+    Il est donc écarté ici, à la source : la réouverture `intake` des
+    dépendants non assignés (B4) comme le courrier de réveil à leur agent
+    promettraient une reprise que le registre seul peut autoriser.
+
     C'est le caractère « dernière attente » qui rend le réveil idempotent :
     tant qu'un autre bloqueur tient, la fermeture ne rend personne ; la
     fermeture qui suit, sérialisée par le verrou de graphe, est la seule à
@@ -73,7 +88,8 @@ def released_by(db, blocker_id) -> list[dict]:
     st = storage.of(db)
     blocker_id = int(blocker_id)
     open_items = st.operations.open_lots_activity(None)
-    rows = [r for r in open_items if int(r["id"]) != blocker_id]
+    rows = [r for r in open_items
+            if int(r["id"]) != blocker_id and not _pinned(r)]
     ids = [int(r["id"]) for r in rows]
     if not ids:
         return []
@@ -107,9 +123,10 @@ def _released_text(row, blocker_id, blocker_state, blocker_reason=""):
     lot = int(row["id"])
     title = (row.get("title") or "").strip()[:60]
     title = " \"%s\"" % title if title else ""
-    if blocker_state == "merged":
-        return ("Dependency released: lot #%d is merged; lot #%d%s no longer waits on "
-                "any lot. Resume it when you are ready." % (int(blocker_id), lot, title))
+    if blocker_state in ("merged", "promoted"):
+        return ("Dependency released: lot #%d is %s; lot #%d%s no longer waits on "
+                "any lot. Resume it when you are ready."
+                % (int(blocker_id), blocker_state, lot, title))
     why = " (%s)" % blocker_reason if blocker_reason else ""
     return ("Dependency released: lot #%d was closed%s, not merged; lot #%d%s no longer "
             "waits on any lot. Reassess the prerequisite before resuming."
@@ -133,10 +150,20 @@ def notify_released(db, blocker_id, *, blocker_state, blocker_reason="",
     Ne rattrape AUCUNE erreur : avaler l'échec ici committerait la fermeture
     sans son réveil, précisément le défaut que ce chemin doit exclure. Le fil
     lisible est écrit après le commit (`after_commit`, appelé par l'appelant).
+
+    #1668 : un dépendant NON ASSIGNÉ n'a pas de destinataire ; s'il est encore
+    `blocked` alors que plus rien ne le retient, il repasse `intake` dans la
+    même transaction — il redevient démarrable au self-service sans geste
+    d'agent, au lieu d'attendre une alerte stale (jusqu'à 14 h).
+
     Rend une ligne par courrier déposé (`lot`, `to`, `message_id`)."""
     from . import mail
     out: list[dict] = []
     rows = released_by(db, blocker_id)
+    unassigned = [int(r["id"]) for r in rows if not (r.get("assignee") or "").strip()]
+    if unassigned:
+        storage.of(db).work_dependencies.release_unassigned(
+            unassigned, actor=work.SYSTEM_SENDER)
     for row in rows:
         to = (row.get("assignee") or "").strip()
         if not to or to.startswith(work.HUMAN_PREFIX):
@@ -158,6 +185,8 @@ def wait_label(wait):
         return None
     if wait["what"] == "scheduled":
         return "planned start %s" % wait["start"]
+    if wait["what"] == "hold":
+        return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 

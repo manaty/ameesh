@@ -68,21 +68,22 @@ class ChoixParEcheanceTest(_Base):
     def test_le_cas_du_matin_va_au_secondaire(self):
         """Le cas du 2026-10-10 : primaire à 20 % de sa fenêtre de 7 jours,
         5 h du secondaire inutilisée qui se remet à zéro dans 52 min. Le
-        secondaire est aussi le plus en retard sur son rythme (L117)."""
+        secondaire perd son budget le plus vite (#1789/N1) et il est aussi le
+        plus en retard sur son rythme (L117)."""
         items = self._items()
         now = time.time()
         _codex_deux_fenetres(items[0].path, (10, now + 3 * HEURE), (20, now + 4 * JOUR))
         _codex_deux_fenetres(items[1].path, (0, now + 52 * 60), (5, now + 6 * JOUR))
         choix = self._choisir(items, now)
         self.assertEqual(choix.profile.name, "secondaire")
-        self.assertIn("codex-10080min 5% used (pace 24%), furthest behind "
-                      "its pace; ahead of: primaire codex-10080min 20% used",
+        self.assertIn("codex-10080min 5% used (pace 24%), losing its budget "
+                      "fastest; ahead of: primaire codex-10080min 20% used",
                       choix.why)
         self.assertEqual(choix.switched["kind"], "bascule")
         self.assertEqual([(b["from_account"], b["to_account"]) for b in self._bascules()],
                          [("primaire", "secondaire")])
         # le journal des bascules porte la raison du choix
-        self.assertIn("furthest behind its pace", self.db.query(
+        self.assertIn("losing its budget fastest", self.db.query(
             "SELECT reason FROM account_switches")[0]["reason"])
 
     def test_egalite_ordre_declare(self):
@@ -220,7 +221,7 @@ class RapportTest(_Base):
         self.assertIn("lost at reset if nothing changes: codex-300min 100% "
                       "in 52 min", texte)
         self.assertIn("next choice for a new session: codex-10080min 5% "
-                      "used (pace 24%), furthest behind its pace; ahead of: "
+                      "used (pace 24%), losing its budget fastest; ahead of: "
                       "primaire codex-10080min 20% used (pace 53%)", texte)
         # lecture seule : aucun relevé écrit (L71)
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM quota_gauge_readings")[0]["n"],
@@ -265,14 +266,15 @@ class ExecuteurTest(_Base):
                 self.assertEqual(len(tours), 1)
                 self.assertEqual(tours[0]["compte"]["CODEX_HOME"], comptes[0]["path"])
                 self.assertIn("resume", tours[0]["argv"])
-                # cxb n'a pas de session : le plus en retard → secondaire
+                # cxb n'a pas de session : le budget qui s'évapore le plus vite
+                # (#1789/N1) → secondaire
                 self._tour(neuf)
                 self.assertEqual(self.turns()[-1]["compte"]["CODEX_HOME"],
                                  comptes[1]["path"])
             texte = "\n".join(journal)
             self.assertIn("primaire — continuity", texte)
             self.assertIn("secondaire — codex-300min 0% used "
-                          "(pace 90%), furthest behind its pace", texte)
+                          "(pace 90%), losing its budget fastest", texte)
             # cxb a maintenant sa session sur le secondaire : continuité,
             # journalisée une fois, pas à chaque sondage
             avant = len(journal)

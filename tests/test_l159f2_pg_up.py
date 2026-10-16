@@ -90,6 +90,9 @@ elif cmd == "start":
     state[args[1]]["running"] = True
     save()
 elif cmd == "run":
+    # #1547 (N2) : ce que le shim d'un tour a laissé dans l'environnement
+    with open(os.environ["FAKE_DOCKER_LABEL_LOG"], "a") as f:
+        f.write((os.environ.get("AMEESH_CONTAINER_LABELS") or "") + "\n")
     vol = opt("-v").split(":", 1)[0]
     state[opt("--name")] = {"running": True, "volumes": [vol]}
     save()
@@ -107,11 +110,13 @@ class PgUpVolumeTest(unittest.TestCase):
         os.chmod(docker, 0o755)
         self.state = os.path.join(self.dir, "state.json")
         self.log = os.path.join(self.dir, "calls.log")
+        self.labels = os.path.join(self.dir, "labels.log")
         self.env = {
             "PATH": bin_dir + os.pathsep + "/usr/bin:/bin",
             "HOME": self.dir,
             "FAKE_DOCKER_STATE": self.state,
             "FAKE_DOCKER_LOG": self.log,
+            "FAKE_DOCKER_LABEL_LOG": self.labels,
         }
 
     def tearDown(self):
@@ -122,6 +127,7 @@ class PgUpVolumeTest(unittest.TestCase):
         with open(self.state, "w") as f:
             json.dump(containers, f)
         open(self.log, "w").close()
+        open(self.labels, "w").close()
         proc = subprocess.run(["bash", SCRIPT], env=dict(self.env, **env),
                               capture_output=True, text=True, timeout=60)
         with open(self.state) as f:
@@ -140,6 +146,104 @@ class PgUpVolumeTest(unittest.TestCase):
         proc, after, _ = self.run_script({}, AMEESH_PG_PASSWORD="x")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(after["ameesh-pg"]["volumes"], ["ameesh-pg-data"])
+
+    def test_the_shared_bench_volume_is_not_declared_disposable(self):
+        """#2003 : conservation par DÉFAUT — le volume par défaut du banc
+        partagé ne porte aucune étiquette, donc le ménage ne le récolte jamais
+        (ses données survivent au conteneur, contrat de `pg-up.sh`)."""
+        proc, _, calls = self.run_script(
+            {}, AMEESH_PG_NAME="ameesh-pg", AMEESH_PG_PASSWORD="x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(len(crees), 1)
+        self.assertEqual(crees[0], ["volume", "create", "ameesh-pg-data"])
+
+    def test_a_custom_bench_volume_is_kept_without_the_caller_declaration(self):
+        """#2003 : un banc sous un autre nom reste PERSISTANT par défaut —
+        aucune étiquette sans déclaration explicite de l'appelant."""
+        proc, _, calls = self.run_script(
+            {}, AMEESH_PG_NAME="ameesh-dev7-pgtest", AMEESH_PG_PASSWORD="x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(len(crees), 1)
+        self.assertEqual(crees[0], ["volume", "create", "ameesh-dev7-pgtest-data"])
+
+    def test_a_declared_lot_bench_volume_is_disposable(self):
+        """#2003 : l'appelant DÉCLARE le banc jetable (`AMEESH_PG_DISPOSABLE=1`)
+        — son volume porte `ameesh.bench=disposable`, seule déclaration qui
+        autorise la récolte après `docker_volume_idle` d'absence continue."""
+        proc, _, calls = self.run_script(
+            {}, AMEESH_PG_NAME="ameesh-dev7-pgtest", AMEESH_PG_PASSWORD="x",
+            AMEESH_PG_DISPOSABLE="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(len(crees), 1)
+        self.assertEqual(crees[0], ["volume", "create", "--label",
+                                    "ameesh.bench=disposable",
+                                    "ameesh-dev7-pgtest-data"])
+
+    def test_the_declaration_also_accepts_the_historical_prefix(self):
+        """L'alias `AGENT_MESH_PG_*` porte la même déclaration."""
+        proc, _, calls = self.run_script(
+            {}, AGENT_MESH_PG_NAME="essai-pg", AGENT_MESH_PG_PASSWORD="x",
+            AGENT_MESH_PG_DISPOSABLE="oui")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(crees[0], ["volume", "create", "--label",
+                                    "ameesh.bench=disposable", "essai-pg-data"])
+
+    def test_a_custom_volume_on_the_shared_name_follows_the_declaration(self):
+        """Le volume par défaut du banc partagé seul est protégé : un volume
+        choisi par l'appelant suit la déclaration — conservé sans elle,
+        jetable avec elle."""
+        proc, _, calls = self.run_script(
+            {}, AMEESH_PG_NAME="ameesh-pg", AMEESH_PG_VOLUME="pg-essai",
+            AMEESH_PG_PASSWORD="x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(crees[0], ["volume", "create", "pg-essai"])
+        proc, _, calls = self.run_script(
+            {}, AMEESH_PG_NAME="ameesh-pg", AMEESH_PG_VOLUME="pg-essai",
+            AMEESH_PG_PASSWORD="x", AMEESH_PG_DISPOSABLE="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(crees[0], ["volume", "create", "--label",
+                                    "ameesh.bench=disposable", "pg-essai"])
+
+    def test_the_shared_default_volume_ignores_the_declaration(self):
+        """#2003 : le banc partagé reste persistant même si l'appelant demande
+        la déclaration jetable : l'étiquette n'est jamais posée sur son volume
+        par défaut, et l'ignorance est dite."""
+        proc, _, calls = self.run_script(
+            {}, AMEESH_PG_NAME="ameesh-pg", AMEESH_PG_PASSWORD="x",
+            AMEESH_PG_DISPOSABLE="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(crees[0], ["volume", "create", "ameesh-pg-data"])
+        self.assertIn("reste persistant", proc.stderr)
+
+    def test_the_historical_shared_name_keeps_its_default_volume(self):
+        """`agent-mesh-pg-data` est le volume du banc partagé historique : il
+        reste sans étiquette, donc jamais récolté."""
+        proc, _, calls = self.run_script(
+            {}, AMEESH_PG_NAME="agent-mesh-pg", AMEESH_PG_PASSWORD="x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        crees = [c for c in calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(crees[0], ["volume", "create", "agent-mesh-pg-data"])
+
+    def test_the_shared_bench_never_receives_a_turn_label(self):
+        """#1547 (N2) : `env -u AMEESH_CONTAINER_LABELS` — même quand le shim
+        d'un tour pose l'étiquette dans l'environnement, le banc partagé n'en
+        hérite pas : il ne devient la ressource ni d'un tour ni d'un lot."""
+        proc, after, calls = self.run_script(
+            {}, AMEESH_PG_NAME="B", AMEESH_PG_PASSWORD="x",
+            AMEESH_CONTAINER_LABELS="ameesh.turn=t1,ameesh.agent=a1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue([c for c in calls if c[0] == "run"])   # le banc est créé
+        self.assertTrue(after["B"]["running"])
+        with open(self.labels) as f:
+            vues = f.read()
+        self.assertEqual(vues.strip(), "")     # docker n'a vu aucune étiquette
 
     def test_creation_on_a_mounted_volume_is_refused(self):
         other = {"autre": {"running": False, "volumes": ["partage"]}}

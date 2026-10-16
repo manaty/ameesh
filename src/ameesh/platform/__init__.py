@@ -11,12 +11,19 @@ le reste du code. Un sous-module par sujet :
   chemin d'un descripteur, table des processus (groupes), sous-moissonneur et
   moisson d'un enfant, environnement initial d'un processus (L124) ;
 * `terminal` : le terminal de l'humain ;
+* `notify` : la notification de bureau (L66) — `notify-send` sous Linux,
+  `osascript` sous macOS, toast Windows par `powershell.exe` sous WSL2 ;
 * `host` : mémoire, swap, charge, alimentation, système de fichiers,
   allocation btrfs (#246) ;
 * `offload_shell` : le côté VM du déport (L159b), Linux seulement par
   construction ; script autonome (bibliothèque standard seule, aucun import
   d'ameesh), installé seul et lancé en `python3 -I` : il lit `/proc`
   lui-même.
+* `turn_cgroup` : le cgroup v2 délégué d'un tour (L498) — création, placement,
+  `cgroup.events`, kill et enlèvement ; trampoline autonome (bibliothèque
+  standard seule, aucun import d'ameesh) lancé par son chemin de fichier, il
+  lit `/proc/self/cgroup` lui-même pour valider son placement avant l'exec du
+  harnais.
 
 Appuyé sur psutil (roues binaires Linux, macOS, Windows) ; sous Linux, un
 repli par `/proc` reste en place si psutil est absent.
@@ -84,7 +91,7 @@ def machine() -> str:
     return stdlib_platform.machine() or ""
 
 
-from .process import (alive, ancestry, become_subreaper, boot_time, children,  # noqa: E402
+from .process import (PROC, alive, ancestry, become_subreaper, boot_time, children,  # noqa: E402
                       command_argv, command_line, environ, env_values, fd_path, holders,
                       open_fd_count, parent_pid, process_table, process_group_exists,
                       reap, exited_child, self_cgroup_paths, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
