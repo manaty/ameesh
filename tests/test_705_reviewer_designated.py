@@ -264,6 +264,34 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertIn("ameesh work reviewer %d <agent>" % lot["id"],
                       briefs["orchestrateur"])
 
+    def test_stale_lot_ne_reveille_pas_un_assigneur_historique(self):
+        """#1862 : un agent qui a réassigné un lot dans les 30 jours n'est pas
+        un orchestrateur pour `stale_lot` — la clause historique mettait
+        presque toute l'équipe dans les destinataires (32 noms mesurés le
+        15/10) et chaque lot stagnant réveillait une vingtaine d'agents sans
+        mandat. Les orchestrateurs DÉCLARÉS restent prévenus."""
+        self.register("orchestrateur", "claude", cwd=self.tmp)
+        self.register("preneur", "claude", cwd=self.tmp)
+        self.register("receveur", "claude", cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
+                        " WHERE name IN ('orchestrateur', 'preneur')")
+        lot = self._lot(app="ameesh")
+        autre = work.add(self.db, title="à confier", assignee="chef")
+        work.assign(self.db, int(autre["id"]), "receveur", actor="preneur")
+        # l'historique (L94) compte bien ce preneur comme assigneur…
+        self.assertIn("preneur", storage.of(self.db).operations.assigners(since_s=3600.0))
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._stale(lot["id"])
+
+        # …mais il ne reçoit pas l'alerte d'un lot stagnant qui n'est pas le sien
+        alert = self._stale_alert(lot["id"])
+        self.assertIn("orchestrateur", alert["orchestrators"])
+        self.assertNotIn("preneur", alert["orchestrators"])
+        briefs = self._briefs(alert)
+        self.assertIn("orchestrateur", briefs)
+        self.assertNotIn("preneur", briefs)
+
     def test_le_courrier_de_l_alerte_part_au_relecteur(self):
         self.register("relecteur", "codex", cwd=self.tmp)
         self.register("orchestrateur", "claude", cwd=self.tmp)

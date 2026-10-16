@@ -147,6 +147,14 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
     from . import exploitation
     exploitation.annotate(cfg, db, rows)
+    # #1070 : la pause budget, distincte du `state` « paused » d'un `blocked`
+    # hors budget (hôte non prêt, authentification) — un lecteur machine n'a
+    # pas à déchiffrer un `status_text` français. Posé ici plutôt que dans
+    # `exploitation.agent_view` (§8 prod) : `agent_rows` sert aussi
+    # `GET /api/v1/agents`, les deux chemins le portent sans toucher au prod.
+    from . import progress
+    for row in rows:
+        row["paused_on_budget"] = progress.paused_on_budget(row)
     return rows
 
 
@@ -217,6 +225,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
         # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
+        from . import progress
         from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
@@ -240,22 +249,42 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
             "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS", "BUDGET",
             "KEY", "SEEN"))
+        session_differs = False
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
                 status = "%s/%s" % (status, row["status_text"][:22])
+            if row.get("operator_paused") and row.get("status") not in ("stopped", "dead", "blocked"):
+                status = ("pause-next" if row.get("status") == "running" else "op-paused")
+            if progress.paused_on_budget(row):
+                # #1070 : le mot « pause » doit survivre à la troncature de la
+                # colonne — « blocked/bud » masquait les pauses budget (le
+                # bilan du bureau en comptait zéro).
+                status = "paused/%s" % row["status_text"][:22]
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
+            # #1250 : la colonne dit le harnais de la session VIVANTE (L242b) ;
+            # une étoile signale qu'il diffère du harnais déclaré, et le pied
+            # explique la marque (la déclaration reste lisible dans `show`).
+            live = registry.live_harness(row)
+            declared = row.get("harness") or ""
+            starred = bool(live) and live != declared
+            if starred:
+                session_differs = True
             print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
-                (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
+                ((live or "?")[:9] + ("*" if starred else "")),
+                (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
             ))
+        if session_differs:
+            print("* session harness: the live session runs under another "
+                  "harness than the declared one (L242b)")
         # Les lots sur la même vue (0018 point 5) : le compte par phase et ce
         # qui attend le plus, pour que `ameesh list` dise où en est le travail.
         if lots:
@@ -794,6 +823,12 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         print("harness  : %-9s host: %-12s status: %s%s" % (
             row.get("harness") or "?", row.get("host") or "—", row.get("status"),
             (" (%s)" % row["status_text"]) if row.get("status_text") else ""))
+        # L242b/#1250 : le harnais DÉCLARÉ ne dit pas sous lequel la session
+        # tourne (harnais emprunté) ; quand la session vivante en a un autre,
+        # la ligne le dit — c'est la lecture qui a produit le cas #1024.
+        live = registry.live_harness(row)
+        if live and live != (row.get("harness") or ""):
+            print("session harness: %s" % live)
         if row.get("stop_reason"):
             print("stopped  : %s" % row["stop_reason"])
         # L37 (0030) : mode explicite ; un agent externe exige un responsable
@@ -1220,12 +1255,16 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
 
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
               limit: int | None = None, threshold: float | None = None,
-              cfg=None) -> list:
+              cfg=None, freeze: bool = False) -> list:
     """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84).
 
     `cfg` : le contexte de classe de revue (#1822), pour que la ligne d'un lot
-    léger attende la fusion, pas un verdict."""
-    from . import plan, stagnation
+    léger attende la fusion, pas un verdict.
+
+    `freeze` ajoute à chaque ligne le gel effectif dérivé (#1756), en un seul
+    balayage de jalons : le composeur du paquet horaire lit ce champ au lieu
+    de JOINdre lui-même le dernier jalon `frozen`."""
+    from . import plan, plan_git, stagnation
     if threshold is None:
         threshold = stagnation.DEFAULT_THRESHOLD_S
 
@@ -1241,6 +1280,13 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
                   work.delays(db, ids=[row["id"] for row in rows])}
         for row in rows:
             row["delays"] = delays.get(row["id"])
+        if freeze:
+            marks: dict = {}
+            for mark in storage.of(db).progress.lot_milestones(
+                    [row["id"] for row in rows]):
+                marks.setdefault(int(mark["work_item_id"]), []).append(mark)
+            for row in rows:
+                row["freeze"] = plan_git.freeze_candidate(marks.get(int(row["id"]), []))
         return rows
 
     # L61 : lectures regroupées — deux allers-retours en tout
@@ -1257,6 +1303,8 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
             return None
         item["events"] = work.events(db, lot_id)
         item["milestones"] = work.milestones(db, lot_id)
+        from . import plan_git
+        item["freeze"] = plan_git.freeze_candidate(item["milestones"])
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
@@ -1452,7 +1500,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
-                             threshold=stagnation.stale_after(args.stale_after), cfg=cfg)
+                             threshold=stagnation.stale_after(args.stale_after),
+                             cfg=cfg, freeze=getattr(args, "freeze", False))
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -1542,10 +1591,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["branch"], item.get("branch_target") or "repository default target",
                     " (last commit seen ahead: %s)" % item["branch_head"][:12]
                     if item.get("branch_head") else ""))
-            if item.get("migration"):
-                print("migration: %s reserved in %s (L122)" % (
-                    work.migration_layout(item, cfg).label(item["migration"]),
-                    item.get("migration_repo")))
+            migration = work.migration_line(item, cfg)
+            if migration:
+                print("migration: %s" % migration)
             for mark in item["module_milestones"]:
                 print("module   : %s/%s · %s · by %s" % (
                     mark["module"], mark["kind"], mark["subject"], mark["actor"]))
@@ -1625,9 +1673,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
-                               actor=args.actor)
+                               actor=args.actor, migration_landed=args.migration_landed,
+                               cfg=cfg)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
+            elif done["result"] == "landed":
+                print("lot #%d already %s: %s" % (
+                    args.id, done["item"]["state"], done["detail"]))
             else:
                 print("lot #%d → merged (commit %s, declared by %s)" % (
                     args.id, args.sha.strip().lower()[:12], args.actor))
@@ -2444,6 +2496,10 @@ def build_parser() -> argparse.ArgumentParser:
     pw_list.add_argument("--assignee", default=None)
     pw_list.add_argument("--limit", type=int, default=50)
     pw_list.add_argument("--json", action="store_true")
+    pw_list.add_argument("--freeze", action="store_true",
+                         help="#1756: add the effective freeze per row — the declared "
+                              "freeze, or the last favourable verdict's commit when it "
+                              "covers the head (origin, provenance, explicit causes)")
     pw_list.add_argument("--stale-after", default=None,
                          help="work item is stale with no activity for (default 6h, L29)")
     pw_list.set_defaults(func=cmd_work)
@@ -2507,6 +2563,10 @@ def build_parser() -> argparse.ArgumentParser:
                        "on the target): any open state → merged, merged milestone with the commit")
     pw_merged.add_argument("id", type=int)
     pw_merged.add_argument("--sha", required=True, help="the merge commit")
+    pw_merged.add_argument("--migration-landed", type=int, default=None, metavar="N",
+                           help="the migration number that actually landed (L122/#1567), when "
+                                "the landing renumbered the reservation; recorded with the "
+                                "merge, or corrected on an already merged lot")
     pw_merged.add_argument("--note", default="")
     pw_merged.add_argument("--actor", default="",
                            help="default: the session's bound identity (AGENT_MAIL_NAME)")

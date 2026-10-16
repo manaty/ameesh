@@ -1,0 +1,14 @@
+{
+  "schema": "ameesh-vm-executor-recipe/1",
+  "image": "registry.example.org/ameesh-executor@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "server_url": "https://mesh.example.org",
+  "mesh": "example-mesh",
+  "host": "example-vm",
+  "volume": "/srv/ameesh-guest/executor/example-mesh",
+  "state_dir": "/run/ameesh-gate/state",
+  "ack_dir": "/run/ameesh-gate/ack",
+  "enroll_dir": "/run/ameesh-enroll",
+  "cpus": 2,
+  "memory_mb": 3072,
+  "tmp_mb": 256
+}

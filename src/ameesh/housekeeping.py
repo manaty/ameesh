@@ -133,6 +133,10 @@ TMP_TOP = 5
 #: #1547 (N3) : conteneurs hors tour détaillés dans le relevé de ménage — le
 #: journal garde le compte total (`others_total`), jamais une liste non bornée
 OTHERS_TOP = 20
+#: L162/L230 : début de la raison rendue quand l'OS ne dit pas qui tient une
+#: entrée ; l'hôte qui a déclaré des processus illisibles sans doute
+#: (`unreadable_ok`) repose alors la question avec son allow
+HOLDERS_UNREADABLE = "holders unreadable"
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
@@ -230,9 +234,10 @@ class Policy:
     artifacts: tuple | None = None
     #: L230: inactivity (seconds) of a worktree before its artifacts go
     artifact_idle: float = build_artifacts.DEFAULT_IDLE_S
-    #: L230: names of the user's processes whose unreadability (not dumpable:
-    #: capabilities, setuid) does not block a deletion; empty by default, set
-    #: per host in its Host card
+    #: L230/L162: names of the user's processes whose unreadability (not
+    #: dumpable: capabilities, setuid) does not block a deletion — the build
+    #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
+    #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
@@ -1770,14 +1775,20 @@ def unsaved_git_work(path: str) -> str:
     return ""
 
 
-def tmp_holder(path: str) -> str:
+def tmp_holder(path: str, allow=()) -> str:
     """Le processus qui tient `path` (fichier ouvert dedans, dossier courant,
     chemin sur sa ligne de commande), en clair ; vide si aucun. Si l'OS ne
-    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed)."""
+    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed).
+    `allow` (L230) : noms des processus dont l'illisibilité n'est pas un doute
+    — le choix de l'hôte, vide par défaut ; un détenteur constaté reste dit.
+    L'appel sans `allow` pose la question d'origine (un seul argument) : c'est
+    lui qui découvre l'illisibilité, `_orphan_verdict` repose la question avec
+    l'allow de l'hôte quand il y en a un."""
     try:
-        found = platform.holders(_real(path), needle=os.path.abspath(path))
+        found = platform.holders(_real(path), needle=os.path.abspath(path),
+                                 allow=allow)
     except platform.NotAvailable as exc:
-        return "holders unreadable (%s)" % exc
+        return "%s (%s)" % (HOLDERS_UNREADABLE, exc)
     if not found:
         return ""
     first = found[0]
@@ -1881,6 +1892,11 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
     if work:
         return "garde", "git work to keep — %s" % work
     holder = tmp_holder(path)
+    if holder.startswith(HOLDERS_UNREADABLE) and policy.unreadable_ok:
+        # L230 : la première lecture est muette (processus non dumpable) ;
+        # l'hôte qui a nommé ces processus repose la question avec son allow,
+        # et un détenteur CONSTATÉ reste rapporté.
+        holder = tmp_holder(path, allow=policy.unreadable_ok)
     if holder:
         return "attend", holder
     return "suppression", "left by turn %s of %s, unchanged for %s, held by no " \
@@ -2245,19 +2261,28 @@ def owns_worktree(path: str, cwd: str | None, other_cwds) -> bool:
 #: (L118b), `work/<id>[-…]`, `agent/<nom>-<id>[-…]`, `review/<nom>-<id>[-…]`.
 #: Le nom de l'agent peut porter un chiffre (`mty-nxl-rel-01`, `deepseek3`) :
 #: sous `lot/` et `work/` l'id est le premier groupe numérique, sous `agent/`
-#: et `review/` le dernier.
+#: et `review/` le dernier. #1694 : une branche peut citer plusieurs groupes
+#: (`review/claude2-t3-unit-459-460-r2`) ; ils sont essayés dans cet ordre.
 CITED_LOT = re.compile(r"^(lot|work|agent|review)/(.+)$")
 
 
-def cited_lot(branch: str) -> int | None:
-    """#1665 : l'id de lot cité par un nom de branche, ou None."""
+def cited_lots(branch: str) -> list[int]:
+    """#1694: every lot id a branch name cites, in trial order — first to last
+    under `lot/`/`work/`, last to first under `agent/`/`review/` (the agent
+    name may itself carry a digit, the lot id is the last group there). Empty
+    when the branch cites no number."""
     found = CITED_LOT.match(branch or "")
     if not found:
-        return None
-    groupes = [part for part in found.group(2).split("-") if part.isdigit()]
-    if not groupes:
-        return None
-    return int(groupes[0] if found.group(1) in ("lot", "work") else groupes[-1])
+        return []
+    groupes = [int(part) for part in found.group(2).split("-") if part.isdigit()]
+    return groupes if found.group(1) in ("lot", "work") else list(reversed(groupes))
+
+
+def cited_lot(branch: str) -> int | None:
+    """#1665 : l'id de lot cité par un nom de branche, ou None — le premier
+    candidat de `cited_lots`, pour les appelants qui n'en veulent qu'un."""
+    lots = cited_lots(branch)
+    return lots[0] if lots else None
 
 
 def named_lot(name: str, agent: str) -> int | None:
@@ -2274,26 +2299,36 @@ def lot_of_worktree(db, agent: str, path: str, branch: str = "") -> str | None:
     ou, à défaut, son dossier nomment l'id, et ce lot est assigné à CET agent.
     Sinon None : le worktree reste non attribué (jamais retiré à ce titre, il
     suivra la règle des orphelins). Un lot d'un autre agent, inconnu, ou un
-    registre illisible ne prouve rien : None."""
-    ident = cited_lot(branch) or named_lot(os.path.basename(os.path.normpath(path)), agent)
-    if ident is None or not agent:
+    registre illisible ne prouve rien : None.
+
+    #1694: the branch candidates are tried in `cited_lots` order and the first
+    lot owned by the agent wins; the folder name is only read when the branch
+    cites no number (the #1665 rule)."""
+    if not agent:
         return None
-    try:
-        row = storage.of(db).work.get(ident)
-    except Exception:
-        return None
-    if not row or row.get("assignee") != agent:
-        return None
-    return str(ident)
+    idents = cited_lots(branch)
+    if not idents:
+        nom = named_lot(os.path.basename(os.path.normpath(path)), agent)
+        idents = [nom] if nom is not None else []
+    for ident in idents:
+        try:
+            row = storage.of(db).work.get(ident)
+        except Exception:
+            return None
+        if row and row.get("assignee") == agent:
+            return str(ident)
+    return None
 
 
-def worktree_in_use(path: str) -> bool:
+def worktree_in_use(path: str, allow=()) -> bool:
     """Un processus de l'hôte travaille-t-il dans ce worktree (dossier courant
     ou fichier ouvert dedans) ? Lu par la couche plateforme (L63). Si l'OS ne
     permet pas de le savoir, la réponse est OUI (fail-closed) : le worktree
-    attend plutôt que d'être retiré sous les pieds d'un agent."""
+    attend plutôt que d'être retiré sous les pieds d'un agent. `allow` (L230) :
+    noms des processus dont l'illisibilité n'est pas un doute — le choix de
+    l'hôte, vide par défaut ; un détenteur CONSTATÉ reste rapporté."""
     try:
-        return bool(platform.holders(_real(path)))
+        return bool(platform.holders(_real(path), allow=allow))
     except platform.NotAvailable:
         return True
 
@@ -2661,7 +2696,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if st["locked"]:
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
-        if worktree_in_use(path):
+        if worktree_in_use(path, allow=allow):
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))
             continue

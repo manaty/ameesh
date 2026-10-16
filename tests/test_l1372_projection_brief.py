@@ -225,7 +225,7 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         self.assertIn(reprise.PROCESS_RULES_HEADER, texte)
         self.assertIn(reprise.RULES_DIAG_PREFIX, texte)
         self.assertIn("has no short projection", texte)
-        self.assertIn("the brief keeps what fits", texte)
+        self.assertIn("the brief may keep only what fits", texte)
         self.assertIn("[…]", texte)
         self.assertNotIn("§14 Staging", texte)      # la fin manque, et c'est dit
         self.assertLessEqual(len(texte.encode()), reprise.BRIEF_MAX_BYTES)
@@ -284,6 +284,30 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
                  if l.startswith(reprise.RULES_DIAG_PREFIX)]
         self.assertLessEqual(len(("\n".join(diags) + "\n").encode()),
                              reprise.RULES_DIAG_MAX)
+
+    def test_une_premiere_ligne_de_diagnostic_trop_longue_est_coupee(self):
+        # #1624 N1 : une première ligne plus longue que le plafond est coupée,
+        # le bloc tient dans `cap` (jamais cap+1) et les lignes suivantes,
+        # abandonnées, restent dites par l'agrégat.
+        premiere = "%scarte fautive : %s" % (reprise.RULES_DIAG_PREFIX, "x" * 400)
+        bloc = reprise._diag_block([premiere, "seconde carte fautive"], 120)
+        self.assertLessEqual(len(bloc.encode()), 120)
+        self.assertTrue(bloc.startswith(reprise.RULES_DIAG_PREFIX))
+        self.assertIn("1 more rule diagnostics", bloc)
+
+    def test_le_constat_de_coupe_ne_survit_pas_a_la_seconde_passe(self):
+        # #1624 N3 : la seconde passe des diagnostics peut raccourcir le bloc
+        # au point que les règles tiennent entières ; le constat de coupe ne
+        # doit alors pas rester affiché (sur-déclaration), et réciproquement
+        # un constat affiché doit correspondre à une coupe réelle.
+        diags = ["carte %03d : projection illisible" % i for i in range(120)]
+        for taille in range(1500, 3050, 37):
+            rules = "- " + ("r" * taille)
+            bloc = reprise._rules_bloc(rules, 4000, diags)
+            if "the rules block is cut" in bloc:
+                self.assertNotIn(rules, bloc, "coupe annoncée sans coupe réelle")
+            else:
+                self.assertIn(rules, bloc, "coupe réelle non annoncée")
 
     def test_un_resume_plein_ne_chasse_pas_la_projection(self):
         # la place des règles reste réservée d'abord (#538) : la projection

@@ -245,10 +245,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
-    # #964 : `--assign` = le geste explicite qui autorise un `--lot` à
-    # assigner un lot LIBRE (ou tenu par un humain) au destinataire, même
-    # hors détection d'orchestrateur (historique L94 compris) ; jamais un
-    # lot tenu par un agent (#1066).
+    # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
+    # FREE lot (or one held by a human) to the recipient, even outside the
+    # orchestrator detection (L94 history included); never a lot held by an
+    # agent (#1066).
     assign = "--assign" in args
     args = [arg for arg in args if arg != "--assign"]
     # #506: --app may name a project nobody declares yet, on purpose
@@ -540,11 +540,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       kind=kind, urgent=urgent, thread_meta=thread_meta,
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
-    # #1604 : un envoi local touche la boîte des destinataires de CET hôte ;
-    # leur marqueur local repasse à « à vérifier » sans attendre la base. Un
-    # destinataire d'un autre hôte n'a pas de marqueur ici : rien à faire.
-    for nom in set(targets) | set(cc):
-        fastmail.bump(cfg, nom)
+    # #1689 (N1) : le marqueur local des destinataires est posé par le dépôt
+    # lui-même (`mail.send`, `FileBackend.send`), pour tout émetteur local et
+    # pas seulement cette commande.
     if skipped:
         print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
@@ -759,20 +757,41 @@ class _Remise:
         self.reste = 1 if len(rows) >= taille else 0
         return self.msgs
 
-    def garder(self, retenir, limite: int | None = None) -> list[dict]:
-        """L514: keeps the reserved messages `retenir` accepts, at most
-        `limite`; the others are released unseen (they wait for later)."""
-        gardes = [m for m in self.msgs if retenir(m)]
-        if limite is not None:
-            gardes = gardes[:max(0, limite)]
-        rendus = [m for m in self.msgs if m not in gardes]
-        self.msgs = gardes
-        if self.pg and rendus:
-            try:
-                mail.release(self.bk.db, self.name, self.jeton,
-                             [int(m["id"]) for m in rendus if m.get("id") is not None])
-            except Exception:  # the reservation expires by itself
-                pass
+    def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
+        """L514/#885 : réserve les SEULS messages qui ne peuvent pas attendre.
+
+        Lecture préalable sans verrou (`mail.unread_mid_turn` : le filtre est
+        dans la requête, pas dans les `UNREAD_LIMIT` premiers non-lus), puis une
+        seule réservation des ids éligibles. Rien d'éligible : aucun geste
+        d'écriture — ni verrou de registre, ni libération des autres non-lus
+        (le churn d'un `PostToolUse`), et un verdict derrière plus de 200
+        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+        if not self.pg:
+            tous = self.bk.unread(self.name)
+            gardes = [m for m in tous if mail.mid_turn(m)]
+            self.msgs = gardes if limite is None else gardes[:max(0, limite)]
+            self.reste = len(gardes) - len(self.msgs)
+            return self.msgs
+        if limite is not None and limite <= 0:
+            # borne du tour épuisée : rien à montrer, et rien à écrire (même
+            # une urgence attend le tour suivant, comme `garder(..., 0)`).
+            self.msgs = []
+            self.reste = 0
+            return []
+        taille = mail.UNREAD_LIMIT if limite is None else limite
+        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille)
+        ids = [int(m["id"]) for m in voulus if m.get("id") is not None]
+        if not ids:
+            self.msgs = []
+            self.reste = 0
+            return []
+        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                            ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                            limit=taille)
+        self.ouverte = bool(rows)
+        self.msgs = [mail.normalize(row) for row in rows]
+        # comme `prendre` : une lecture pleine peut cacher d'autres éligibles
+        self.reste = 1 if len(rows) >= taille else 0
         return self.msgs
 
     def restants_apres(self) -> int:
@@ -1066,6 +1085,22 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
     # `agent_id` : inscrite ici, elle devenait la session reprise au tour
     # suivant, que dsh refuse (« is a subagent or forked session »).
+    if binding.source == "explicit" and bk.kind == "pg":
+        # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a hérité)
+        # ne prend jamais le courrier d'un agent mené par l'exécuteur (bail
+        # vivant). La réservation le refuse aussi, sous verrou ; ce contrôle-ci
+        # le dit. #1689 (N2) : le refus précède l'inscription — sinon le
+        # tampon d'inscription de ce shell (clé sans bail) faisait dire au
+        # chemin rapide « inscription à jour », et le marqueur local taisait ce
+        # diagnostic à chaque PostToolUse.
+        try:
+            holder = sb.lease_holder(bk.db, name)
+        except Exception:
+            return 0
+        if holder:
+            print("agent-mail: %s is driven by the runner (live lease of %s) — "
+                  "mail left in place" % (name, holder), file=sys.stderr)
+            return 0
     session_id = None if binding.bound_to_lease else data.get("session_id")
     try:
         inscription = [tool, data.get("cwd"), session_id,
@@ -1081,16 +1116,6 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 if session_id:
                     registry.record_session_history(bk.db, name, str(session_id))
                 _register_done(cfg, name, inscription)
-        if binding.source == "explicit" and bk.kind == "pg":
-            # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
-            # hérité) ne prend jamais le courrier d'un agent mené par
-            # l'exécuteur (bail vivant). La réservation le refuse aussi, sous
-            # verrou ; ce contrôle-ci le dit.
-            holder = sb.lease_holder(bk.db, name)
-            if holder:
-                print("agent-mail: %s is driven by the runner (live lease of %s) — "
-                      "mail left in place" % (name, holder), file=sys.stderr)
-                return 0
         set_title(cfg, bk, name)
         if event not in ("Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"):
             return 0
@@ -1133,8 +1158,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         try:
             limite = borne - etat["remis"] if etat is not None else None
             if event == "PostToolUse" and mid_turn_filtered(tool, binding):
-                # L514: in a dsh or codex turn, only what must not wait
-                msgs = remise.garder(mail.mid_turn, limite) if remise.prendre() else []
+                # L514/#885: in a dsh or codex turn, only what must not wait
+                msgs = remise.prendre_mi_tour(limite)
             else:
                 msgs = remise.prendre(limite)
             avis = ""

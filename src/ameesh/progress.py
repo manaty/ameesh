@@ -454,11 +454,27 @@ def agent_state(row: dict) -> str:
         return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
+    if row.get("operator_paused") and status not in ("stopped", "dead"):
+        return "paused"
     if status == "blocked":
         return "paused"                 # pause budget ou comptable (L13)
     if status in ("stopped", "dead"):
         return "stopped"
     return "idle"                       # idle, queued
+
+
+def paused_on_budget(row: dict) -> bool:
+    """#1070 : l'agent est en pause BUDGET — la pause annoncée par son
+    exécuteur (`status` `blocked`, texte « budget : … »).
+
+    Distincte d'un `blocked` d'une autre cause (hôte non prêt,
+    authentification), que `agent_state` range lui aussi dans « paused » :
+    un bilan qui compte les agents en pause budget lit ce prédicat, pas le
+    préfixe d'un texte tronqué à l'affichage. La règle est celle de
+    `handoff.paused` (L233b), la seule définition de la pause budget : on la
+    reprend ici au lieu d'en entretenir une seconde."""
+    from . import handoff
+    return handoff.paused(row)
 
 
 def _excerpt(text: str | None, limit: int = TASK_CHARS) -> str | None:
@@ -506,6 +522,9 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "state": state,
         "status": row.get("status") or None,
         "status_text": _excerpt(row.get("status_text"), 160),
+        # #1070 : la pause budget se distingue d'un `blocked` d'une autre cause
+        # sans déchiffrer le texte
+        "paused_on_budget": paused_on_budget(row),
         "since_ts": _round(since),
         "turn": turn,
         "turns": int(row.get("turns") or 0),
@@ -515,6 +534,13 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
+        "operator_pause": ({
+            "reason": row.get("operator_pause_reason"),
+            "by": row.get("operator_pause_by"),
+            "for": row.get("operator_pause_for"),
+            "since_ts": _round(row.get("operator_pause_ts")),
+            "after_turn": state == "working",
+        } if row.get("operator_paused") else None),
     }
 
 
@@ -788,7 +814,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     # agrégation, jamais de la lecture des notes.
     for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
-    last_events = {int(r["work_item_id"]): r.get("last_ts")
+    last_events = {int(r["work_item_id"]): float(r["last_ts"])
                    for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
@@ -1070,6 +1096,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
         elif agent["state"] in ("paused", "stopped") and agent["status_text"]:
             line("reason: %s" % agent["status_text"], "    ")
+        hold = agent.get("operator_pause")
+        if hold:
+            line("operator pause%s: %s (by %s for %s)" % (
+                " after this turn" if hold["after_turn"] else "",
+                hold["reason"], hold["by"], hold["for"]), "    ")
 
     out.append("")
     if snap["milestones"]:

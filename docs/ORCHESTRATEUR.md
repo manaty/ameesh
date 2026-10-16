@@ -11,7 +11,10 @@ sur quoi, ce qui attend, ce qui est livré.
 ameesh reconnaît un orchestrateur de trois façons : sa fiche Agent du canon
 porte `roles: [orchestrateur]`, il est déclaré dans
 `AMEESH_ALERT_ORCHESTRATORS`, ou il a confié des lots (`work assign`,
-`work delegate`) dans les 30 derniers jours. La fiche est la voie durable.
+`work delegate`) dans les 30 derniers jours. Cette dernière déduction cesse
+dès qu'une fiche de son organisation (son canon) déclare des rôles (L242c) :
+la fiche est alors la seule voie durable. Seule compte la fiche de son
+propre canon, jamais une fiche homonyme d'un autre.
 
 ## Tout travail confié passe par un lot
 
@@ -408,6 +411,27 @@ l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
 
+## Intégration par paquets §12 : contrôle d'inclusion avant le feu
+
+Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
+lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
+et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
+à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+
+```sh
+scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
+    --head origin/integration/paquet-23h-20261015 \
+    --expected-file "$TMPDIR/admissions-23h.txt"
+```
+
+Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
+composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
+ne suffit pas après un revert (#1638). Sans liste attendue, il sort `2`, sauf
+`--no-expected` qui assume le contrôle partiel. Un contenu *partiel* ou *vide*
+est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
+bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
+`docs/PAQUET-INCLUSION.md`.
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot
@@ -604,8 +628,9 @@ restée 4 h fusionnée sans être déployée :
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI, sober proofs (canon « Processus de lot » §§3, 6,
-   12) — and changes only through a reviewed commit.
+   packages, review before CI and no CI per lot between cuts, sober proofs
+   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
+   reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
    un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
    d'exécuteur du poste le lance dans une unité systemd distincte :

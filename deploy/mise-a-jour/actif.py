@@ -545,9 +545,15 @@ def main(argv: list[str] | None = None) -> int:
             print("emission ambigue pour %s, aucun renvoi (relais operateur) : %s"
                   % (nom, exc), file=sys.stderr)
             continue
-        except Exception as exc:  # noqa: BLE001 — sans relecture, pas de renvoi
-            echecs.append(nom)
-            print("relecture de l'envoi impossible pour %s (aucun renvoi) : %s"
+        except Exception as exc:  # noqa: BLE001 — sans relecture, absence non prouvee
+            # meme regime que la fenetre pleine au plafond : la relecture a
+            # echoue (base injoignable, erreur de lecture), donc l'absence du
+            # depot n'est pas prouvee. La marque durable reste ambigue et le
+            # relais operateur verifie le depot avant toute relance (code 5,
+            # libelle « ambigu », comme annonce par la doc et la docstring).
+            ambigus.append(nom)
+            print("emission ambigue pour %s, aucun renvoi "
+                  "(relecture impossible, relais operateur) : %s"
                   % (nom, exc), file=sys.stderr)
             continue
         if deja is not None:

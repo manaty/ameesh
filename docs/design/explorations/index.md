@@ -6,34 +6,34 @@ title: "Explorations"
 
 # Explorations
 
-Une exploration conserve une idée hors de la feuille de route. Un fichier par
-idée, avec `type: Exploration` et `status: exploration`, décrit uniquement le
-problème, les intuitions et les questions ouvertes. Les liens vers les études,
-les décisions ou les documents existants apportent du contexte.
+An exploration keeps an idea off the roadmap. One file per idea, with
+`type: Exploration` and `status: exploration`, describes only the problem,
+the intuitions and the open questions. Links to existing studies, decisions
+or documents provide context.
 
-Ces fiches ne portent ni lots proposés, ni dates, ni estimations, ni critère
-« fait ». Aucun agent n’en déduit un lot, un WorkPackage, une entrée de backlog
-ou une ligne de roadmap. La promotion vers une [étude](../etudes/) puis vers
-des lots exige une décision explicite de l’owner, consignée dans
-[decisions/](../decisions/) ; l’exploration seule n’est pas une autorisation.
-Une fiche de plan, de roadmap ou de lot référence alors l’étude décidée,
-jamais cette réserve d’idées.
+These cards carry no proposed lots, no dates, no estimates and no "done"
+criterion. No agent derives a lot, a WorkPackage, a backlog entry or a
+roadmap line from them. Promotion to a [study](../etudes/) and then to lots
+requires an explicit owner decision, recorded in [decisions/](../decisions/);
+an exploration alone is not an authorization. A plan, roadmap or lot card
+then references the decided study, never this reserve of ideas.
 
-La règle commune est publiée dans le
-[Processus de lot, §4](https://github.com/manaty/home/blob/main/processus/lots.md#4-files-de-travail),
-après fusion de [home#52](https://github.com/manaty/home/pull/52).
+The common rule is published in the
+[Process card, §4](https://github.com/manaty/home/blob/main/processus/lots.md#4-files-de-travail),
+after [home#52](https://github.com/manaty/home/pull/52) merges.
 
-- [Provisionnement d’ameesh-approve hébergé](ameesh-approve-heberge.md)
-- [Évaluation des modèles](evaluation-modeles.md)
-- [Descripteurs de harnais et conformité](descripteurs-harnais.md)
-- [Signaux et boucle d’auto-réparation](auto-reparation.md)
-- [Transports supplémentaires pour les fils](transports.md)
-- [Porte exposée comme proxy MCP](proxy-mcp.md)
-- [Pilote SQLite pour un profil personnel](sqlite.md)
-- [Un utilisateur Unix par agent](uid-par-agent.md)
-- [Installeur piloté par le harnais de l’utilisateur](installeur.md)
+- [Provisioning a hosted ameesh-approve](ameesh-approve-heberge.md)
+- [Model evaluation](evaluation-modeles.md)
+- [Harness descriptors and conformance](descripteurs-harnais.md)
+- [Signals and the self-repair loop](auto-reparation.md)
+- [Additional transports for threads](transports.md)
+- [Gate exposed as an MCP proxy](proxy-mcp.md)
+- [SQLite driver for a personal profile](sqlite.md)
+- [One Unix user per agent](uid-par-agent.md)
+- [Installer driven by the user's harness](installeur.md)
+- [Versionnement pour agents : dépendances explicites et attestation par changement](versionnement-agents.md)
 
-La garde `tests.test_l1124_explorations` contrôle les fiches et les références
-locales depuis les plans, roadmaps et lots. Elle fait partie des lecteurs de
-documentation en CI. Les lots et plans du canon externe ne sont pas présents
-dans ce dépôt : leur validation appartient au canon.
+The `tests.test_l1124_explorations` guard checks the cards and the local
+references from plans, roadmaps and lots. It is part of the documentation
+readers in CI. Lots and plans of the external canon are not present in this
+repository: their validation belongs to the canon.
