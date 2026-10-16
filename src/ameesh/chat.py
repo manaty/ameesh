@@ -13,10 +13,10 @@ terminal client on an agent's shared conversation (L79).
         `ameesh_chat`, polling when the driver cannot listen), the agent's
         state and its open lots. A typed line is sent to the agent as mail;
         `!urgent <text>` preempts the turn in progress and `!stop [text]`
-        interrupts it without a new message, both through
-        `AMEESH_INTERRUPT_SENDERS` (refused or delivered as a normal message,
-        never forced); `!quit` leaves. The client writes nothing when it does
-        not come from a human's terminal: it turns read-only there;
+        interrupts it now (a short body is sent when no text is given), both
+        through `AMEESH_INTERRUPT_SENDERS` (refused or delivered as a normal
+        message, never forced); `!quit` leaves. The client writes nothing when
+        it does not come from a human's terminal: it turns read-only there;
   ameesh chat --instruction  prints the chat instructions (text versioned in the repository);
   ameesh chat --dry-run      says what would be launched (or shown), without
         launching, following or writing anything.
@@ -187,11 +187,54 @@ STOP_BODY = "(stop requested from ameesh chat)"
 #: ligne d'aide du client
 CLIENT_HELP_TEXT = (
     "  !urgent <text>  send now, preempting the turn in progress (if authorised)\n"
-    "  !stop [text]    interrupt the turn without a new message (if authorised)\n"
+    "  !stop [text]    interrupt the turn now; a short body is sent when text is "
+    "empty (if authorised)\n"
     "  !state          refresh the agent's state\n"
     "  !quit           leave (also Ctrl-D)\n"
     "  <anything else> sent to the agent as mail"
 )
+
+
+# --------------------------------------------------------------------------
+# L83 : l'écriture serveur d'un message humain dans la conversation
+# --------------------------------------------------------------------------
+
+def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
+                       text: str, lot=None, event_id: str | None = None) -> dict:
+    """Le message d'un humain dans la conversation partagée d'un agent (L83).
+
+    Le serveur écrit : l'appelant a authentifié `human` (`human:<id>`, le
+    rédacteur) et vérifié son droit de parler à `agent` (0033 §7/§9 ; L86
+    vérifie le jeton OIDC et le lien au canon, jamais ici) ; `sender` est le
+    nom de boîte nu, tel que `agent-mail send` l'écrit. Le message part
+    d'abord dans la boîte (il réveille l'agent, `payload human`), puis il est
+    reflété par une entrée `human_message` : `mail.send` écrit la copie
+    lisible (R12), l'entrée ne porte donc pas de seconde sortie. Un échec
+    après le courrier laisse le message délivré et l'erreur dite : le
+    courrier est la délivrance, l'entrée son reflet. L'entrée est rangée dans
+    le projet de la copie R12 : celui du lot quand un lot est posé
+    (`fil.lot_project`, la règle de `mail.send`), sinon celui de l'agent.
+
+    `event_id` est stable (`mail:<id>` par défaut) : un rejeu après la
+    délivrance ne crée pas de seconde entrée.
+    """
+    from . import conversation, fil, mail, registry
+    if not NAME_RE.match(agent or ""):
+        raise ValueError("invalid agent name: %r" % (agent,))
+    row = registry.get(db, agent)
+    work_item_id = None if lot is None else str(lot)
+    message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
+                           payload={"human": True}, work_item_id=work_item_id)
+    log = conversation.Log(db, cfg, agent=agent,
+                           project=fil.project_for(cfg, fil.lot_project(db, work_item_id),
+                                                   fil.agent_project(row)),
+                           lot=work_item_id)
+    entry = log.append("human_message", text, author=human,
+                       event_id=event_id or "mail:%d" % message_id, thread=False)
+    return {"agent": agent, "message_id": message_id,
+            "lot": None if lot is None else int(lot),
+            "entry": {key: entry.get(key)
+                      for key in ("seq", "kind", "author", "ts", "event_id")}}
 
 
 def _stamp(ts, *, now=None):
@@ -217,6 +260,8 @@ class ClientView:
         self.out = out
         self._last = None
         self._text_turn = None
+        self._text_key = None
+        self._texts_seen = set()
 
     def line(self, text=""):
         self.out.write("%s\n" % text)
@@ -237,6 +282,16 @@ class ClientView:
         stamp = _stamp(entry.get("ts"), now=now)
         truncated = bool(entry.get("truncated"))
         if kind == "text":
+            if turn is not None:
+                # #887 : le journal porte parfois deux entrées `text` identiques
+                # pour le même tour ; le client ne les affiche qu'une fois.
+                if (author, turn) != self._text_key:
+                    self._text_key = (author, turn)
+                    self._texts_seen = set()
+                if text in self._texts_seen:
+                    self._last = (kind, author, turn)
+                    return
+                self._texts_seen.add(text)
             if self._last == ("text", author, turn):
                 self._block(text, truncated=truncated)
             else:
@@ -568,7 +623,7 @@ class TerminalClient:
                     return 0
             if self._eof.is_set() and self._queue.empty():
                 return 0
-            signal = None
+            wakeup = None
             if listener is None:
                 self.sleep(self.poll)
             else:
@@ -579,16 +634,22 @@ class TerminalClient:
                     listener.close()
                     listener = None
                 elif item is not None:
-                    signal = item
+                    wakeup = item
             try:
                 cursor = self.read_new(cursor)
             except db_mod.DbError as exc:
                 self.view.line("  … history unavailable: %s" % db_mod.explain(exc, 160))
                 self.sleep(self.poll)
-            if signal is not None and signal.get("channel") == config_mod.CHANNEL_LEASE \
+            if wakeup is not None and wakeup.get("channel") == config_mod.CHANNEL_LEASE \
                     and self.row is not None:
-                for line in state_lines(self.cfg, self.db, self.agent, now=self.now)[1:2]:
-                    self.view.line("  · " + line)
+                # #887 : une coupure de base sur l'état ne fait pas tomber le client.
+                try:
+                    lines = state_lines(self.cfg, self.db, self.agent, now=self.now)[1:2]
+                except db_mod.DbError as exc:
+                    self.view.line("  … state unavailable: %s" % db_mod.explain(exc, 160))
+                else:
+                    for line in lines:
+                        self.view.line("  · " + line)
 
 
 def client_conflicts(args) -> list[str]:

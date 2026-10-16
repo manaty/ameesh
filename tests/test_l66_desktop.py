@@ -15,6 +15,7 @@ import re
 import shutil
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest import mock
 
 from ameesh import cli, config, notify
@@ -239,6 +240,18 @@ class DesktopProbeTest(_Banc):
         self.assertIn("test displayed to human:test", line)
         self.assertEqual(len(self.entries()), 1)
 
+    def test_desktop_probe_uses_the_configured_timeout(self):
+        """N1 : `notify.timeout` reaches the probe's sender, not the default."""
+        cfg = self.cfg(notify={"default_human": "human:test",
+                               "default": ["desktop"], "timeout": 2.5})
+        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        with mock.patch.object(notify, "Sender") as sender, \
+                mock.patch.object(notify, "send_test", return_value=[]) as send:
+            ok, _line = notify.desktop_probe(cfg, env=env)
+        self.assertTrue(ok)
+        sender.assert_called_once_with(env=env, timeout=2.5)
+        self.assertEqual(send.call_count, 1)
+
     def test_route_desktop_sans_binaire(self):
         cfg = self.cfg(notify={"default_human": "human:test", "default": ["desktop"]})
         env = {"PATH": self.empty}
@@ -292,6 +305,27 @@ class DoctorDesktopTest(PgTestCase):
         self.assertNotIn("KO", lignes[0])
         self.assertIn("no `desktop` route configured", lignes[0])
         self.assertIn("notify-send not found", lignes[0])
+
+
+class ControleCaracteresTest(unittest.TestCase):
+    """N2 : a control character copied from a terminal no longer breaks the
+    Windows toast (LoadXml) nor the AppleScript string."""
+
+    INTERDITS = "\x00\x01\x08\x0b\x0c\x0e\x1f"
+
+    def test_the_toast_xml_drops_forbidden_controls(self):
+        script = pnotify._toast_script("ti\x1btre", "corps" + self.INTERDITS, "low")
+        payload = re.search(r"FromBase64String\('([^']+)'\)", script).group(1)
+        document = base64.b64decode(payload).decode("utf-8")
+        for char in self.INTERDITS + "\x1b":
+            self.assertNotIn(char, document)
+        self.assertIn("titre", document)
+        self.assertIn("corps", document)
+        ET.fromstring(document)  # LoadXml would accept it
+
+    def test_the_applescript_string_drops_forbidden_controls(self):
+        self.assertEqual(pnotify._applescript_string("ti\x1btre" + self.INTERDITS),
+                         '"titre"')
 
 
 if __name__ == "__main__":

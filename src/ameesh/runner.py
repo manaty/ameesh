@@ -31,6 +31,7 @@ import argparse
 import dataclasses
 import getpass
 import json
+import math
 import os
 import queue
 import shutil
@@ -181,6 +182,19 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 LIVE_REVIEW_START_SLACK_S = 300.0
 #: L85 : rétention du journal d'événements, au plus une fois par heure
 EVENTS_PRUNE_EVERY_S = 3600.0
+
+
+def _finite_ts(value) -> bool:
+    """#1691: is `value` a usable finite instant?
+
+    A date read back by the `psql` pilot may come as text (`'Infinity'` for an
+    infinite `timestamptz`): `float()` accepts or rejects it, and a value that
+    cannot be converted is an unknown date — never an exception raised into
+    the runner loop, which promises not to raise."""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -1127,38 +1141,6 @@ class AgentWorker(threading.Thread):
                 self.stop_group_now("restart requested", grace=1.0)
                 return
 
-    def yield_to_host(self, reason: str) -> None:
-        """Porte d'hôte (L112) : l'échéance du retrait est atteinte, ou l'hôte
-        s'arrête — le tour en cours s'arrête (point de passage unique, grâce
-        brève) ; sa consigne repartira en attente, la session est gardée."""
-        self.host_yield = reason
-        self.wake.set()
-        threading.Thread(target=self.stop_group_now, args=("l'hôte se retire : %s" % reason,),
-                         kwargs={"grace": 1.0}, daemon=True,
-                         name="%s-retrait" % self.name).start()
-
-    def _leave_for_host(self) -> None:
-        """Porte d'hôte fermée (L112) : plus aucun tour ici. État de la
-        session écrit, consigne éventuelle remise en attente, statut dit ;
-        le bail est rendu par `run()` en sortant. Écritures au mieux : si le
-        réseau est déjà coupé, le bail échoit seul et le courrier sera
-        re-livré, signalé."""
-        gate = getattr(self.runner, "host_gate", None)
-        etat = gate.current if gate is not None else None
-        texte = "hôte indisponible (%s, %s) : reprise au retour de l'hôte" % (
-            etat.state if etat else "?", etat.reason if etat else "?")
-        log_async("[%s] l'hôte se retire : bail rendu (%s)" % (self.name, texte))
-        if self.lease_lost.is_set():
-            return
-        try:
-            if self._session_en_attente is not None:
-                self._enregistre_session()
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            row = registry.get(self.db, self.name) or {}
-            if row.get("status") in ("running", "idle", "queued"):
-                registry.set_status(self.db, self.name, "queued", status_text=texte)
-        except db_mod.DbError as exc:
-            log_async("[%s] état de retrait non écrit (%s)" % (self.name, db_mod.explain(exc)))
     def _audit_deadline_monitor(self, done: threading.Event, deadline: float) -> None:
         """L234 : échéance monotone indépendante du flux et de la base.
 
@@ -1489,6 +1471,10 @@ class AgentWorker(threading.Thread):
         l'authentification) et tourne sous le compte de la session ; sinon la
         rotation attend : la bascule du prochain tour (`continuity`) résume
         sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
+        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
+            # L87b: the summary turn would be refused; wait without consuming a
+            # forced rotation or noting a cancellation on every pass.
+            return False
         if not self.budget_ok() or not self.auth_ready():
             return False
         if self.turn_harness() != account_turn.session_harness(self):
@@ -3130,6 +3116,8 @@ class AgentWorker(threading.Thread):
             self.stopping.set()
             return None
         self.agent = agent
+        if agent.get("operator_paused"):
+            return None  # L87b: keep prompts and mail; budget/pressure cannot lift this hold.
         if self._session_en_attente is not None:
             self._enregistre_session()
         if self._marque_base(agent):
@@ -3505,6 +3493,9 @@ class AgentWorker(threading.Thread):
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
         self.fast_failure = False
+        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien
@@ -4044,7 +4035,10 @@ class AgentWorker(threading.Thread):
         if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
                                    self._marqueurs_durables(
                                        "%s turn (%s)" % (shown, harness))):
-            log("[%s] lease lost or agent stopped before the turn" % self.name)
+            # L87b: pause may have won the row lock after pick/run_turn.
+            # Return a prompt already taken, without rewriting concurrent status.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            log("[%s] lease lost, agent stopped or operator paused before the turn" % self.name)
             return False
         lot = spec.get("lot")
         if lot and str(lot) != str(self.agent.get("session_work_item") or ""):
@@ -5676,7 +5670,12 @@ class Runner:
         fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
         `PRUNE_MAX_S` secondes ; le reste à l'heure suivante) ; rien en dry-run
         ni en exécuteur médié (le journal est au serveur du mesh). Une erreur
-        (base, réglage) est journalisée une fois, jamais fatale à la passe."""
+        (base, réglage) est journalisée une fois, jamais fatale à la passe.
+
+        #928/F6 : l'élagage passe par sa PROPRE connexion. Sa transaction
+        (jusqu'à `PRUNE_MAX_S`, avec verrous et délais) tiendrait sinon le
+        verrou de transaction de la connexion partagée de l'exécuteur, sur
+        lequel les renouvellements de bail attendent."""
         from . import events as events_mod
 
         now = time.monotonic() if now is None else now
@@ -5685,12 +5684,23 @@ class Runner:
                 and now - self._events_pruned_at < EVENTS_PRUNE_EVERY_S):
             return None
         self._events_pruned_at = now
+        db, own = self.db, None
+        if getattr(self, "cfg", None) is not None:
+            try:
+                own = db_mod.open_db(self.cfg)
+            except db_mod.DbError as exc:
+                message = "event log retention not applied (%s)" % exc
+                if message != self._events_prune_error:
+                    log_async(message)
+                self._events_prune_error = message
+                return None
+            db = own
         try:
-            gone = events_mod.prune(self.db, max_batches=events_mod.PRUNE_MAX_BATCHES,
+            gone = events_mod.prune(db, max_batches=events_mod.PRUNE_MAX_BATCHES,
                                     max_s=events_mod.PRUNE_MAX_S)
             # rien supprimé alors qu'il reste des événements expirés : la
             # rétention est bloquée (jamais un 0 silencieux)
-            left = 0 if gone else events_mod.expired(self.db)
+            left = 0 if gone else events_mod.expired(db)
             if left:
                 raise ValueError("%d expired event(s) left, none deleted" % left)
         except (db_mod.DbError, ValueError) as exc:
@@ -5699,6 +5709,9 @@ class Runner:
                 log_async(message)
             self._events_prune_error = message
             return None
+        finally:
+            if own is not None:
+                own.close()
         self._events_prune_error = None
         if gone:
             log_async("event log: %d event(s) past retention deleted" % gone)
@@ -6584,9 +6597,10 @@ class Runner:
         housekeeping pass: entries older than `thread_retention_days` leave
         this host's thread files. Never raises.
 
-        L361b : l'hôte médié n'a pas de transaction ; la connexion de
-        l'exécuteur (`self.db`) porte l'opération serveur `threads.recount`,
-        qui verrouille, recompte et expire en une seule fois."""
+        L361b : a mediated host has no transaction; the executor connection
+        (`self.db`) carries the server operation `threads.recount`, which
+        locks, counts again and expires in one shot. When it has to open one
+        itself, it closes it; a connection it was given is left open."""
         now = time.time() if now is None else now
         # the day counted on the monotonic clock (r8), the wall clock kept
         # for the retention thresholds
@@ -6595,35 +6609,40 @@ class Runner:
         if due is not None and tick < due:
             return None
         self._threads_expire_next = tick + 86400.0
+        created = None
         if db is None:
             db = getattr(self, "db", None)
         if db is None and not self.dry_run and fil.expiry_unavailable(self.cfg, None):
-            # L361b : un hôte médié n'a pas de ménage local ; sa connexion
-            # d'exécuteur porte `threads.recount`. Sans elle, rien n'expire.
+            # L361b: a mediated host has no local housekeeping; its executor
+            # connection carries `threads.recount`. Without it, nothing expires.
             try:
-                db = db_mod.connect(self.cfg)
+                db = created = db_mod.connect(self.cfg)
             except db_mod.DbError as exc:
                 log_async("thread expiry skipped: index unavailable (%s)"
                           % " ".join(str(exc).split())[:200])
                 return None
         try:
-            reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
-        except fil.ExpiryUnavailable as exc:  # said once per pass
-            log_async("thread expiry skipped: %s" % exc)
-            return None
-        except Exception as exc:  # never fatal for the runner
-            log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
-            return None
-        for report in reports:
-            if report.get("error") or report.get("held"):
-                log_async("thread expiry %s: %s" % (report["thread"],
-                                                     report.get("error") or report["held"]))
-            if report["dropped"]:
-                log_async("thread %s: %d entr%s before %s %s, %d kept" % (
-                    report["thread"], report["dropped"],
-                    "y" if report["dropped"] == 1 else "ies", report["before"],
-                    "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
-        return reports
+            try:
+                reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
+            except fil.ExpiryUnavailable as exc:  # said once per pass
+                log_async("thread expiry skipped: %s" % exc)
+                return None
+            except Exception as exc:  # never fatal for the runner
+                log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
+                return None
+            for report in reports:
+                if report.get("error") or report.get("held"):
+                    log_async("thread expiry %s: %s" % (report["thread"],
+                                                         report.get("error") or report["held"]))
+                if report["dropped"]:
+                    log_async("thread %s: %d entr%s before %s %s, %d kept" % (
+                        report["thread"], report["dropped"],
+                        "y" if report["dropped"] == 1 else "ies", report["before"],
+                        "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
+            return reports
+        finally:
+            if created is not None:      # only the connection opened here
+                created.close()
 
     def sweep_dead_letters_once(self, db, now: float | None = None,
                                 clock: float | None = None) -> dict | None:
@@ -6681,6 +6700,7 @@ class Runner:
                 self.measure_once(db)
                 self.lot_sessions_purge(db)
             self.radar_once(db)
+            self.incident_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
             message = "branch sweep failed (%s: %s)" % (type(exc).__name__, exc)
@@ -6741,6 +6761,49 @@ class Runner:
             if message != getattr(self, "_radar_error", None):
                 log_async(message)
             self._radar_error = message
+
+    def incident_once(self, db) -> None:
+        """#1681 : ouvre les incidents des exécutions terminales rouges de la
+        branche d'intégration (develop Nexlink, main ameesh), à la source
+        courante du veilleur (`ci.latest_concluded`) et à la même tête. Une
+        exécution déjà portée par son incident n'est pas rouverte ; seules les
+        ouvertures et les relevés illisibles sont journalisés. Ne lève jamais.
+
+        #1467 : les passages du train (`self.train_passages`) apportent les
+        faits exacts du paquet (atterrissage par membre, rapport, carte
+        qualifiée par dépôt et tête) par `train_incidents.consume` ; sans
+        module (pas encore atterri), sans passage, ou si ce helper échoue,
+        `incident.consume(db)` fait foi — un incident n'est jamais perdu."""
+        from . import incident
+        try:
+            lines = None
+            try:
+                from . import train_incidents
+            except Exception:  # module du train #1467 pas encore atterri
+                train_incidents = None
+            if train_incidents is not None:
+                try:
+                    lines = train_incidents.consume(
+                        db, getattr(self, "train_passages", ()), consumer=incident)
+                except Exception as exc:  # le relevé direct reste la garde
+                    message = "train facts unreadable (%s: %s)" % (type(exc).__name__, exc)
+                    if message != getattr(self, "_incident_train_error", None):
+                        log_async("CI incident: %s; direct reading" % message)
+                    self._incident_train_error = message
+            if lines is None:
+                lines = incident.consume(db)
+            for line in lines:
+                where = "%s %s run %s" % (line.get("repo"), line.get("branch"),
+                                          line.get("run_id"))
+                if line.get("created"):
+                    log_async("CI incident %s: lot #%s ouvert%s (%s)" % (
+                        where, line.get("id"),
+                        " assigné à %s" % line["author"] if line.get("assigned") else "",
+                        line.get("status") or "?"))
+                elif "illisible" in str(line.get("why") or ""):
+                    log_async("CI incident %s: %s" % (where, line["why"]))
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            log_async("CI incident failed (%s: %s)" % (type(exc).__name__, exc))
 
     def start_branch_sweep_poll(self) -> None:
         """Relevé périodique des branches (`AMEESH_BRANCH_SWEEP_INTERVAL`,
@@ -7329,7 +7392,8 @@ class Runner:
         étiqueté par le tour sur l'un des moteurs (`containers.all_runtimes`).
         Dans le doute, la ligne reste : sans groupe noté, groupe vivant (même
         réutilisé ; les zombies seuls ne comptent pas), processus à
-        l'environnement illisible lancé après la ligne, moteur muet, table
+        l'environnement illisible lancé pendant le tour (marges comprises ;
+        sans fin connue, tout lancement depuis son début), moteur muet, table
         des processus ou démarrage de l'hôte inconnus. Pas avant le feu vert
         du démarrage (`_boot_settle_ready` :
         un conteneur relancé par sa politique peut manquer encore). Une ligne
@@ -7379,16 +7443,29 @@ class Runner:
                     % (exc, int(LIVE_REVIEW_EVERY_S)))
                 return []
             unread = scan["unread"]
-            if None in unread:
+            if any(not _finite_ts(stamp) for stamp in unread):
                 log("turn resources not settled: a process with an unreadable "
                     "environment and no start time; next review in %ds"
                     % int(LIVE_REVIEW_EVERY_S))
                 return []
-            latest = max(unread, default=None)
+            def unread_may_belong(row: dict) -> bool:
+                if not unread:
+                    return False
+                start, end = row.get("started_ts"), row.get("ended_ts")
+                if not _finite_ts(start):
+                    return True  # no lower bound proves a process unrelated
+                if end is not None and (not _finite_ts(end) or end < start):
+                    return True
+                # #1266: inspect EVERY start, not just the latest: a process
+                # after the end must not hide a possible survivor born inside.
+                # An unfinished turn retains #339's unbounded upper interval.
+                return any(stamp >= start - LIVE_REVIEW_START_SLACK_S
+                           and (end is None or stamp <= end + LIVE_REVIEW_START_SLACK_S)
+                           for stamp in unread)
+
             candidates = [row for row in candidates
                           if row["turn_id"] not in scan["values"]
-                          and (latest is None or row.get("started_ts") is None
-                               or latest < float(row["started_ts"]) - LIVE_REVIEW_START_SLACK_S)]
+                          and not unread_may_belong(row)]
             if not candidates:
                 return []
             engines, silent = containers_mod.all_runtimes(self.cfg)
