@@ -1,26 +1,46 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1924 : verificateurs finis de workflows Process (#1915, tranche C).
 
-Aucune base : le module teste est une API pure. Chaque garde du registre fini
-a son accord et son refus ; les refus portent un code stable, un verificateur
-dont la source manque refuse au lieu d'accepter, et un booleen client ne vaut
-jamais une preuve.
+Aucune base : le coeur teste est une API pure. Chaque garde du registre fini a
+son accord et son refus ; les refus portent un code stable, une source absente
+refuse au lieu d'accepter, un booleen client ne vaut jamais une preuve, et une
+preuve de deploiement exige un recu accepte referencant une observation reelle
+distincte (une demande ne prouve pas son succes).
 """
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from ameesh.process_verifiers import (CODE_TYPES, GUARD_NAMES, HOLDS,
                                       INSTALLED_TYPES, MAX_REPAIRS,
-                                      REFUSAL_CODES, SOURCE_COLLECTIONS,
-                                      Command, Snapshot, capabilities,
-                                      completion_policy, verify, verify_hold)
+                                      OBSERVATION_KINDS, REFUSAL_CODES,
+                                      SOURCE_COLLECTIONS, Command, Snapshot,
+                                      capabilities, completion_policy, verify,
+                                      verify_hold)
 
 REV = "a" * 40
 OTHER = "b" * 40
 COMMAND_ID = "11111111-1111-4111-8111-111111111111"
-ALL_SOURCES = ("milestones", "events", "ci", "decisions", "authority",
-               "deliveries", "deployments")
+ALL_SOURCES = ("milestones", "receipts", "observations", "decisions",
+               "deliveries")
+
+OBSERVATIONS = (
+    {"id": "obs-staging-deployed", "env": "staging", "sha": REV,
+     "kind": "deployed"},
+    {"id": "obs-staging-pass", "env": "staging", "sha": REV, "kind": "pass"},
+    {"id": "obs-staging-fail", "env": "staging", "sha": REV, "kind": "fail"},
+    {"id": "obs-preprod-deployed", "env": "preprod", "sha": REV,
+     "kind": "deployed"},
+    {"id": "obs-preprod-pass", "env": "preprod", "sha": REV, "kind": "pass"},
+    {"id": "obs-preprod-fail", "env": "preprod", "sha": REV, "kind": "fail"},
+)
+
+#: les recus acceptes de B, chacun referencant une observation distincte.
+RECEIPTS = tuple(
+    {"guard": "deploy_observation", "action": "advance", "event_id": index + 1,
+     "accepted": True, "evidence": {"observation": observation["id"]}}
+    for index, observation in enumerate(OBSERVATIONS))
 
 #: references minimales qui font accepter chaque garde sur la fixture pleine.
 REFERENCES = {
@@ -29,13 +49,14 @@ REFERENCES = {
     "review_requested": {"head": REV},
     "qa_started": {"head": REV},
     "qa_repair": {"head": REV},
-    "merged_and_staging_deployed": {"merge": REV, "staging": "dep-staging"},
-    "staging_pass": {"staging": "dep-staging"},
-    "staging_failure": {"staging": "dep-staging-fail"},
-    "preprod_deployed": {"preprod": "dep-preprod"},
-    "preprod_pass": {"preprod": "dep-preprod"},
-    "preprod_failure": {"preprod": "dep-preprod-fail"},
-    "repair_started": {"failure": "dep-staging-fail"},
+    "merged_and_staging_deployed": {"merge": REV,
+                                    "staging": "obs-staging-deployed"},
+    "staging_pass": {"staging": "obs-staging-pass"},
+    "staging_failure": {"staging": "obs-staging-fail"},
+    "preprod_deployed": {"preprod": "obs-preprod-deployed"},
+    "preprod_pass": {"preprod": "obs-preprod-pass"},
+    "preprod_failure": {"preprod": "obs-preprod-fail"},
+    "repair_started": {"failure": "obs-staging-fail"},
     "stop_work": {"reason": "abandoned"},
     "work_completed": {"delivery": "del-1"},
 }
@@ -62,22 +83,10 @@ def full_snapshot(**overrides) -> Snapshot:
             {"kind": "verdict", "sha": REV, "verdict": "blocked"},
             {"kind": "verdict", "sha": REV, "verdict": "ok"},
         ),
-        events=(),
-        ci=(),
+        receipts=RECEIPTS,
+        observations=OBSERVATIONS,
         decisions_pending=1,
-        authority={"actor": "agent:dev1", "deploy_sources": ("ci",),
-                   "can_stop": True},
         deliveries=({"id": "del-1", "sha": REV, "accepted": True},),
-        deployments=(
-            {"id": "dep-staging", "env": "staging", "sha": REV,
-             "conclusion": "pass", "source": "ci"},
-            {"id": "dep-staging-fail", "env": "staging", "sha": REV,
-             "conclusion": "fail", "source": "ci"},
-            {"id": "dep-preprod", "env": "preprod", "sha": REV,
-             "conclusion": "pass", "source": "ci"},
-            {"id": "dep-preprod-fail", "env": "preprod", "sha": REV,
-             "conclusion": "fail", "source": "ci"},
-        ),
         sources=ALL_SOURCES,
     )
     values.update(overrides)
@@ -86,9 +95,8 @@ def full_snapshot(**overrides) -> Snapshot:
 
 def command_for(guard: str, **overrides) -> Command:
     values = dict(work_item_id=7, command_id=COMMAND_ID, guard=guard,
-                  from_stage="work", to_stage="next", expected_version=3,
-                  actor="agent:dev1", source="cli",
-                  references=dict(REFERENCES.get(guard, {})))
+                  from_stage="work", to_stage="next", actor="agent:dev1",
+                  source="cli", references=dict(REFERENCES.get(guard, {})))
     values.update(overrides)
     return Command(**values)
 
@@ -118,12 +126,21 @@ class VerificateursTest(unittest.TestCase):
             self.skipTest("#1918 (A) pas encore fusionne dans ce worktree")
         self.assertEqual(tuple(VERIFIER_NAMES), GUARD_NAMES)
 
+    def test_max_reparations_aligne_sur_la_borne_native(self):
+        try:
+            from ameesh.work import MAX_QA_LOOPS
+        except ImportError:  # pragma: no cover
+            self.skipTest("borne native indisponible")
+        self.assertEqual(MAX_REPAIRS, MAX_QA_LOOPS)
+
     def test_capabilities_couvre_le_registre(self):
         caps = capabilities()
         self.assertEqual(tuple(cap.guard for cap in caps), GUARD_NAMES)
         by_name = {cap.guard: cap for cap in caps}
         self.assertEqual(by_name["staging_pass"].sources,
-                         ("deployments", "authority"))
+                         ("receipts", "observations"))
+        self.assertEqual(by_name["merged_and_staging_deployed"].references,
+                         ("merge", "staging"))
         self.assertEqual(by_name["review_requested"].references, ("head",))
         self.assertEqual(by_name["work_completed"].references,
                          ("delivery", "outcome", "pr"))
@@ -145,7 +162,6 @@ class VerificateursTest(unittest.TestCase):
                 self.assertTrue(decision.accepted, (guard, decision))
                 self.assertEqual(decision.code, "accepted")
                 self.assertEqual(decision.stage, "next")
-                self.assertEqual(decision.version, 4)
 
     def test_un_refus_par_garde(self):
         cases = (
@@ -157,18 +173,21 @@ class VerificateursTest(unittest.TestCase):
             ("qa_started", {}, {"milestones": ()}, "freeze-missing"),
             ("qa_repair", {}, {"milestones": ()}, "verdict-missing"),
             ("merged_and_staging_deployed",
-             {"references": {"merge": OTHER, "staging": "dep-staging"}}, {},
+             {"references": {"merge": OTHER,
+                             "staging": "obs-staging-deployed"}}, {},
              "merge-missing"),
             ("staging_pass", {"references": {"staging": "nope"}}, {},
-             "deployment-missing"),
-            ("staging_failure", {"references": {"staging": "dep-staging"}}, {},
-             "deployment-result-mismatch"),
+             "source-unavailable"),
+            ("staging_failure", {"references": {"staging": "obs-staging-pass"}},
+             {}, "observation-result-mismatch"),
             ("preprod_deployed", {"references": {"preprod": "nope"}}, {},
-             "deployment-missing"),
-            ("preprod_pass", {"references": {"preprod": "dep-preprod-fail"}},
-             {}, "deployment-result-mismatch"),
-            ("preprod_failure", {"references": {"preprod": "dep-preprod"}}, {},
-             "deployment-result-mismatch"),
+             "source-unavailable"),
+            ("preprod_pass",
+             {"references": {"preprod": "obs-preprod-fail"}}, {},
+             "observation-result-mismatch"),
+            ("preprod_failure",
+             {"references": {"preprod": "obs-preprod-pass"}}, {},
+             "observation-result-mismatch"),
             ("repair_started", {"references": {"failure": "nope"}}, {},
              "failure-missing"),
             ("stop_work", {"references": {"reason": "finished"}}, {},
@@ -181,7 +200,6 @@ class VerificateursTest(unittest.TestCase):
                 decision = verify(command_for(guard, **command_over),
                                   full_snapshot(**snapshot_over))
                 self.assertRefusal(code, decision)
-                self.assertEqual(decision.version, 3)
 
     # -- portes communes ---------------------------------------------------
 
@@ -192,10 +210,6 @@ class VerificateursTest(unittest.TestCase):
     def test_forme_de_commande_refusee(self):
         cases = (
             ({"command_id": "pas-un-uuid"}, "UUID"),
-            ({"actor": ""}, "acteur"),
-            ({"source": ""}, "source"),
-            ({"expected_version": -1}, "expected_version"),
-            ({"expected_version": True}, "expected_version"),
             ({"from_stage": "work", "to_stage": "work"}, "inchangee"),
         )
         for overrides, needle in cases:
@@ -204,6 +218,10 @@ class VerificateursTest(unittest.TestCase):
                                   full_snapshot())
                 self.assertRefusal("command-invalid", decision)
                 self.assertIn(needle, decision.message)
+        decision = verify(replace(command_for("planning"), guard=""),
+                          full_snapshot())
+        self.assertRefusal("command-invalid", decision)
+        self.assertIn("garde", decision.message)
 
     def test_booleen_client_refuse(self):
         decision = verify(
@@ -222,11 +240,7 @@ class VerificateursTest(unittest.TestCase):
                           full_snapshot())
         self.assertRefusal("evidence-missing", decision)
 
-    def test_version_et_etape_perimees(self):
-        self.assertRefusal(
-            "version-stale",
-            verify(command_for("planning", expected_version=2),
-                   full_snapshot()))
+    def test_etape_perimee(self):
         self.assertRefusal(
             "stage-stale",
             verify(command_for("planning", from_stage="other"),
@@ -257,9 +271,47 @@ class VerificateursTest(unittest.TestCase):
 
     def test_source_non_collectee_refuse_au_lieu_d_accepter(self):
         decision = verify(command_for("staging_pass"),
-                          full_snapshot(sources=("milestones", "authority")))
+                          full_snapshot(sources=("receipts",)))
         self.assertRefusal("source-unavailable", decision)
-        self.assertIn("deployments", decision.message)
+        self.assertIn("observations", decision.message)
+
+    # -- preuves de deploiement : observation reelle et recu accepte -------
+
+    def test_observation_non_installee_refuse(self):
+        decision = verify(command_for("staging_pass"),
+                          full_snapshot(observations=()))
+        self.assertRefusal("source-unavailable", decision)
+        self.assertIn("non installee", decision.message)
+
+    def test_demande_de_deploiement_ne_prouve_pas_son_succes(self):
+        without_witness = tuple(
+            receipt for receipt in RECEIPTS
+            if receipt["evidence"]["observation"] != "obs-staging-pass")
+        decision = verify(command_for("staging_pass"),
+                          full_snapshot(receipts=without_witness))
+        self.assertRefusal("observation-unwitnessed", decision)
+        refused = tuple(
+            dict(receipt, accepted=False)
+            if receipt["evidence"]["observation"] == "obs-staging-pass"
+            else receipt for receipt in RECEIPTS)
+        decision = verify(command_for("staging_pass"),
+                          full_snapshot(receipts=refused))
+        self.assertRefusal("observation-unwitnessed", decision)
+
+    def test_observation_d_une_autre_revision(self):
+        other = ({"id": "obs-staging-pass", "env": "staging", "sha": OTHER,
+                  "kind": "pass"},)
+        decision = verify(command_for("staging_pass"),
+                          full_snapshot(observations=other))
+        self.assertRefusal("revision-mismatch", decision)
+
+    def test_revision_de_travail_requise(self):
+        without = full_snapshot(revision="")
+        for guard in ("staging_pass", "preprod_deployed", "repair_started",
+                      "work_completed"):
+            with self.subTest(guard=guard):
+                self.assertRefusal("revision-missing",
+                                   verify(command_for(guard), without))
 
     # -- types et completion ----------------------------------------------
 
@@ -343,7 +395,7 @@ class VerificateursTest(unittest.TestCase):
                                references={"outcome": "note publiee"}),
                    without_review))
 
-    # -- relecture, deploiements, arret -----------------------------------
+    # -- relecture, arret, reparations, holds ------------------------------
 
     def test_relecteur_independant(self):
         self.assertRefusal(
@@ -355,57 +407,24 @@ class VerificateursTest(unittest.TestCase):
             verify(command_for("review_requested"),
                    full_snapshot(item=item(reviewer=""))))
 
-    def test_source_de_deploiement_autorisee(self):
-        other_source = full_snapshot(
-            authority={"actor": "agent:dev1", "deploy_sources": ("humain",),
-                       "can_stop": True})
-        self.assertRefusal("deployment-source-refused",
-                           verify(command_for("staging_pass"), other_source))
-        without = full_snapshot(
-            authority={"actor": "agent:dev1", "can_stop": True})
-        self.assertRefusal("deployment-source-refused",
-                           verify(command_for("staging_pass"), without))
-
-    def test_deploiement_d_une_autre_revision(self):
-        snap = full_snapshot(deployments=(
-            {"id": "dep-staging", "env": "staging", "sha": OTHER,
-             "conclusion": "pass", "source": "ci"},))
-        self.assertRefusal("revision-mismatch",
-                           verify(command_for("staging_pass"), snap))
-
-    def test_revision_de_travail_requise(self):
-        without = full_snapshot(revision="")
-        for guard in ("staging_pass", "repair_started", "work_completed"):
-            with self.subTest(guard=guard):
-                self.assertRefusal("revision-missing",
-                                   verify(command_for(guard), without))
-
-    def test_arret_par_autorite(self):
+    def test_arret_explicite(self):
         self.assertTrue(verify(command_for("stop_work"),
                                full_snapshot()).accepted)
-        self.assertRefusal(
-            "authority-refused",
-            verify(command_for("stop_work"),
-                   full_snapshot(authority={"actor": "agent:autre",
-                                            "can_stop": True,
-                                            "deploy_sources": ("ci",)})))
-        self.assertRefusal(
-            "authority-refused",
-            verify(command_for("stop_work"),
-                   full_snapshot(authority={"actor": "agent:dev1",
-                                            "can_stop": False,
-                                            "deploy_sources": ("ci",)})))
         self.assertRefusal(
             "evidence-missing",
             verify(command_for("stop_work",
                                references={"reason": "superseded"}),
                    full_snapshot()))
-
-    # -- reparations bornees et holds -------------------------------------
+        decision = verify(
+            command_for("stop_work", references={"reason": "superseded",
+                                                 "superseded_by": 1924}),
+            full_snapshot())
+        self.assertTrue(decision.accepted, decision)
 
     def test_reparations_bornees(self):
         at_bound = full_snapshot(item=item(loops=MAX_REPAIRS))
-        for guard in ("qa_repair", "staging_failure", "repair_started"):
+        for guard in ("qa_repair", "staging_failure", "preprod_failure",
+                      "repair_started"):
             with self.subTest(guard=guard):
                 self.assertRefusal("repair-bound",
                                    verify(command_for(guard), at_bound))
@@ -427,6 +446,9 @@ class VerificateursTest(unittest.TestCase):
         self.assertRefusal("hold-unsupported",
                            verify_hold("paused", full_snapshot()))
         self.assertEqual(set(HOLDS), {"blocked", "waiting_human"})
+
+    def test_kinds_observations_stables(self):
+        self.assertEqual(OBSERVATION_KINDS, ("deployed", "pass", "fail"))
 
 
 if __name__ == "__main__":  # pragma: no cover

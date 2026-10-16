@@ -1,24 +1,35 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Workflows Process (#1915, tranche C) : verificateurs finis sur preuves reelles.
 
-Le composant C decide, pour une commande de transition, si les **preuves
-reelles** exigees par la garde et par le type du lot sont reunies. Il est pur :
-il ne lit ni n'ecrit aucune base, n'execute aucune expression venue d'un canon
-et ne modifie pas le compilateur A (#1918, gele). B (#1922) l'appelle **dans sa
-transaction**, apres avoir verrouille le lot, recontrole l'acteur, la source et
-l'epoque d'autorite et construit un `Snapshot` depuis ses tables et sources
-reelles ; C rend une `Decision`, B persiste etape/version/recu.
+C decide, pour une commande de transition, si les **preuves reelles** exigees
+par la garde et par le type du lot sont reunies. Le coeur (`verify`,
+`verify_hold`) est **pur** : aucune lecture SQL, aucune ecriture, aucune
+expression venue d'un canon. B (`process_registry`, #1922) tient la
+transaction : verrou du lot, autorite/epoch, revision, version optimiste du
+journal, arete et retenue, recu idempotent ; il appelle l'appelable serveur
+installe pour la garde, **dans sa transaction**, avec un `VerificationContext`.
+Le lecteur des sources SQL (`read_sources`) est du cote B : C ne lit jamais la
+base lui-meme (arbitrage pilote du 16/10).
+
+Deux versions distinctes, jamais confondues :
+
+* `workflow_ref` + `workflow_version` : la **revision Process** pinnee (A,
+  #1918) ; elle ne change que par transfert explicite ;
+* `expected_version` / `Receipt.version` : la **version optimiste du journal**,
+  tenue par B. C ne la verifie pas et ne la rend pas.
 
 Regles de decision :
 
-* la requete ne porte que des **references** (sha, execution, deploiement,
-  decision, lot) : un booleen client, une valeur d'un autre type ou une cle
-  inconnue sont des refus (`evidence-invalid`) ; jamais un accord par defaut ;
-* une collection exigee par la garde absente du snapshot est un refus
+* la requete ne porte que des **references** (sha, observation, recu, lot) ;
+  un booleen client, une valeur d'un autre type ou une cle inconnue sont des
+  refus (`evidence-invalid`) ; jamais un accord par defaut ;
+* une collection exigee par la garde absente des sources est un refus
   (`source-unavailable`) : un verificateur indisponible refuse sa transition,
   il ne l'accepte pas en silence ;
-* le snapshot est la seule source de verite ; C ne relit pas la requete pour
-  decider au-dela des references qu'elle nomme.
+* une preuve de deploiement staging/preprod est un **recu B accepte qui
+  reference une observation reelle distincte** : un recu de demande de
+  deploiement ne prouve pas son succes (`observation-unwitnessed`) ; une
+  observation referencee mais non installee refuse (`source-unavailable`).
 
 Registre fini (contrat #1379, commentaire 6207021753) : `GUARD_NAMES`. Types
 installes opt-in : `INSTALLED_TYPES` ; les types de code (`CODE_TYPES`)
@@ -31,9 +42,8 @@ decision native reellement en attente (`decisions_pending >= 1`), jamais un
 simple drapeau. Les reparations sont bornees par `MAX_REPAIRS` ; aucune
 reouverture terminale.
 
-Sources d'un snapshot (`Snapshot.sources`) : `milestones`, `events`, `ci`,
-`decisions`, `authority`, `deliveries`, `deployments`. `item`, `workflow_*` et
-`revision` sont des scalaires du snapshot, pas des collections.
+Collections d'un snapshot (noms des sources lues par B) : `milestones`,
+`receipts`, `observations`, `decisions`, `deliveries`.
 """
 from __future__ import annotations
 
@@ -73,33 +83,34 @@ INSTALLED_TYPES = (
 #: Types de code : leur completion exige une livraison/acceptation reelle.
 CODE_TYPES = ("bug", "evolution")
 
-#: Reparations bornees (compteur natif `loops`), comme la machine a etats.
+#: Reparations bornees, alignees sur la boucle qa -> build native (B verifie
+#: deja la borne avant d'appeler C ; ce controle est une defense en profondeur).
 MAX_REPAIRS = 2
 
 #: Retenues natives : elles gardent l'etape et la revision.
 HOLDS = ("blocked", "waiting_human")
 
+#: Environnements de deploiement observes.
+ENVIRONMENTS = ("staging", "preprod")
+
+#: Genres d'observation de deploiement : deploye, passe, echoue.
+OBSERVATION_KINDS = ("deployed", "pass", "fail")
+
 #: Collections qu'un snapshot peut declarer avoir collectees.
 SOURCE_COLLECTIONS = (
     "milestones",
-    "events",
-    "ci",
+    "receipts",
+    "observations",
     "decisions",
-    "authority",
     "deliveries",
-    "deployments",
 )
 
 #: Codes de refus stables (le code d'acceptation est `accepted`).
 REFUSAL_CODES = (
-    "authority-refused",
     "command-invalid",
     "completion-evidence-missing",
     "completion-not-accepted",
     "completion-review-missing",
-    "deployment-missing",
-    "deployment-result-mismatch",
-    "deployment-source-refused",
     "evidence-invalid",
     "evidence-missing",
     "failure-missing",
@@ -110,6 +121,8 @@ REFUSAL_CODES = (
     "item-mismatch",
     "item-missing",
     "merge-missing",
+    "observation-result-mismatch",
+    "observation-unwitnessed",
     "repair-bound",
     "reviewer-missing",
     "reviewer-not-independent",
@@ -120,7 +133,6 @@ REFUSAL_CODES = (
     "terminal-reopening",
     "type-unsupported",
     "verdict-missing",
-    "version-stale",
     "workflow-absent",
 )
 
@@ -133,8 +145,10 @@ REFUSAL_CODES = (
 class Command:
     """Une commande de transition : intention + references, jamais un verdict.
 
-    `references` ne porte que des chaines (sha, execution, deploiement,
-    decision) ou des entiers (numero de lot) ; tout le reste est refuse.
+    `references` porte les faits structures du client (B les appelle
+    `evidence`) : des chaines (sha, observation, lot) ou des entiers ; tout le
+    reste est refuse. `actor`/`source` ne sont pas rejuges ici : l'autorite est
+    tenue par B dans sa transaction.
     """
 
     work_item_id: int
@@ -142,7 +156,6 @@ class Command:
     guard: str
     from_stage: str
     to_stage: str
-    expected_version: int
     actor: str = ""
     source: str = ""
     references: Mapping[str, Any] = field(default_factory=dict)
@@ -150,11 +163,14 @@ class Command:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """Etat reel lu par B dans sa transaction, et collections collectees.
+    """Preuves lues par B, dans sa transaction, et passees a C.
 
-    `revision` est la tete de travail reelle du lot (gel, fusion) ; les
-    enregistrements de deploiement doivent la nommer. `sources` dit ce que B a
-    reellement collecte : une garde dont une collection manque refuse.
+    `workflow_ref`/`workflow_version` sont la revision Process pinnee (jamais
+    la version du journal). `revision` est la tete de travail reelle du lot
+    (gel, fusion, livraison). `receipts` ne porte que des recus **acceptes** ;
+    `observations` des enregistrements reels distincts (deploiement staging ou
+    preprod). `sources` dit ce que B a reellement collecte : une garde dont une
+    collection manque refuse au lieu d'accepter.
     """
 
     item: Mapping[str, Any] = field(default_factory=dict)
@@ -163,12 +179,10 @@ class Snapshot:
     workflow_version: int = 0
     revision: str = ""
     milestones: tuple[Mapping[str, Any], ...] = ()
-    events: tuple[Mapping[str, Any], ...] = ()
-    ci: tuple[Mapping[str, Any], ...] = ()
+    receipts: tuple[Mapping[str, Any], ...] = ()
+    observations: tuple[Mapping[str, Any], ...] = ()
     decisions_pending: int = 0
-    authority: Mapping[str, Any] = field(default_factory=dict)
     deliveries: tuple[Mapping[str, Any], ...] = ()
-    deployments: tuple[Mapping[str, Any], ...] = ()
     sources: tuple[str, ...] = ()
 
 
@@ -180,7 +194,6 @@ class Decision:
     code: str
     message: str = ""
     stage: str = ""
-    version: int = 0
     references: tuple[str, ...] = ()
 
 
@@ -248,12 +261,12 @@ def _ref(command: Command, key: str) -> str:
     return _text((command.references or {}).get(key))
 
 
-def _ref_int(command: Command, key: str) -> int:
-    return _as_int((command.references or {}).get(key))
-
-
 def _loops(snapshot: Snapshot) -> int:
     return max(_as_int(snapshot.item.get("loops")), 0)
+
+
+def _revision(snapshot: Snapshot) -> str:
+    return _text(snapshot.revision)
 
 
 def _milestone(snapshot: Snapshot, kind: str, sha: str = "") -> Mapping | None:
@@ -278,24 +291,26 @@ def _verdict(snapshot: Snapshot, verdict: str, sha: str = "") -> Mapping | None:
     return None
 
 
-def _deployment(snapshot: Snapshot, env: str, *, ident: str = "",
-                sha: str = "") -> Mapping | None:
-    for row in snapshot.deployments:
-        if _text(row.get("env")) != env:
-            continue
-        if ident and _text(row.get("id")) != ident:
-            continue
-        if sha and _text(row.get("sha")) != sha:
-            continue
-        return row
+def _observation(snapshot: Snapshot, ident: str) -> Mapping | None:
+    for row in snapshot.observations:
+        if _text(row.get("id")) == ident:
+            return row
     return None
 
 
-def _failed_deployment(snapshot: Snapshot, ident: str = "") -> Mapping | None:
-    for env in ("staging", "preprod"):
-        row = _deployment(snapshot, env, ident=ident)
-        if row is not None and _text(row.get("conclusion")) == "fail":
-            return row
+def _witness(snapshot: Snapshot, observation_id: str) -> Mapping | None:
+    """Le recu B accepte qui reference cette observation, s'il existe.
+
+    Un recu explicitement non accepte ne prouve rien ; l'absence du drapeau
+    vaut accepte (la collection ne porte que des recus acceptes).
+    """
+    for receipt in snapshot.receipts:
+        if receipt.get("accepted") is False:
+            continue
+        evidence = receipt.get("evidence") or {}
+        if isinstance(evidence, Mapping) and _text(
+                evidence.get("observation")) == observation_id:
+            return receipt
     return None
 
 
@@ -307,12 +322,13 @@ def _delivery(snapshot: Snapshot, ident: str = "") -> Mapping | None:
     return None
 
 
-def _deploy_source_allowed(snapshot: Snapshot, deployment: Mapping) -> bool:
-    allowed = snapshot.authority.get("deploy_sources") if snapshot.authority else None
-    if not allowed:
-        return False
-    source = _text(deployment.get("source"))
-    return bool(source) and source in {_text(entry) for entry in allowed}
+def _failed_observation(snapshot: Snapshot, ident: str = "") -> Mapping | None:
+    for row in snapshot.observations:
+        if ident and _text(row.get("id")) != ident:
+            continue
+        if _text(row.get("kind")) == "fail":
+            return row
+    return None
 
 
 def _closed(snapshot: Snapshot) -> bool:
@@ -321,27 +337,25 @@ def _closed(snapshot: Snapshot) -> bool:
     return _text(snapshot.item.get("state")) == "closed"
 
 
+def revision_of(milestones) -> str:
+    """La tete de travail native : gel, puis fusion, puis livraison."""
+    for kind in ("frozen", "merged", "delivered"):
+        for row in milestones or ():
+            if _text(row.get("kind")) == kind and _text(row.get("sha")):
+                return _text(row.get("sha"))
+    return ""
+
+
 # --------------------------------------------------------------------------
 # verdicts
 # --------------------------------------------------------------------------
 
 def _accept(command: Command, references: tuple = ()) -> Decision:
-    return Decision(True, "accepted", "", command.to_stage,
-                    command.expected_version + 1, tuple(references))
+    return Decision(True, "accepted", "", command.to_stage, tuple(references))
 
 
 def _refuse(code: str, message: str, snapshot: Snapshot) -> Decision:
-    return Decision(False, code, message, snapshot.workflow_stage,
-                    _as_int(snapshot.workflow_version))
-
-
-def _no_deploy_source(snapshot: Snapshot) -> Decision:
-    return _refuse("deployment-source-refused",
-                   "source de deploiement absente ou non autorisee", snapshot)
-
-
-def _revision(snapshot: Snapshot) -> str:
-    return _text(snapshot.revision)
+    return Decision(False, code, message, snapshot.workflow_stage)
 
 
 # --------------------------------------------------------------------------
@@ -383,11 +397,10 @@ def _check_qa_started(command: Command, snapshot: Snapshot) -> Decision:
                        "snapshot sans revision de travail", snapshot)
     if _milestone(snapshot, "frozen", head) is None:
         return _refuse("freeze-missing",
-                       "aucun gel de la revision %s" % (head or "(absente)"),
-                       snapshot)
+                       "aucun gel de la revision %s" % head, snapshot)
     if not _text(snapshot.item.get("reviewer")):
         return _refuse("reviewer-missing", "aucun relecteur designe", snapshot)
-    return _accept(command, ("head",) if head else ())
+    return _accept(command, ("head",) if _ref(command, "head") else ())
 
 
 def _check_qa_repair(command: Command, snapshot: Snapshot) -> Decision:
@@ -397,12 +410,45 @@ def _check_qa_repair(command: Command, snapshot: Snapshot) -> Decision:
                        "snapshot sans revision de travail", snapshot)
     if _verdict(snapshot, "blocked", sha) is None:
         return _refuse("verdict-missing",
-                       "aucun verdict bloque sur la revision %s"
-                       % (sha or "(absente)"), snapshot)
+                       "aucun verdict bloque sur la revision %s" % sha, snapshot)
     if _loops(snapshot) >= MAX_REPAIRS:
         return _refuse("repair-bound",
                        "reparations deja au maximum (%d)" % MAX_REPAIRS, snapshot)
     return _accept(command, ("head",) if _ref(command, "head") else ())
+
+
+def _observation_proof(command: Command, snapshot: Snapshot, env: str,
+                       ref_key: str, kind: str, sha: str,
+                       *, repair: bool = False) -> Decision:
+    """Une observation reelle, referencee par un recu accepte distinct."""
+    if not sha:
+        return _refuse("revision-missing",
+                       "snapshot sans revision de travail", snapshot)
+    ident = _ref(command, ref_key)
+    observation = _observation(snapshot, ident)
+    if observation is None:
+        return _refuse("source-unavailable",
+                       "observation %s non installee" % (ident or "(absente)"),
+                       snapshot)
+    if _text(observation.get("env")) != env:
+        return _refuse("observation-result-mismatch",
+                       "observation %s hors de l'environnement %s"
+                       % (ident, env), snapshot)
+    if _text(observation.get("sha")) != sha:
+        return _refuse("revision-mismatch",
+                       "observation %s d'une autre revision" % ident, snapshot)
+    if _text(observation.get("kind")) != kind:
+        return _refuse("observation-result-mismatch",
+                       "observation %s non %s" % (ident, kind), snapshot)
+    if _witness(snapshot, ident) is None:
+        return _refuse("observation-unwitnessed",
+                       "aucun recu accepte ne reference l'observation %s : "
+                       "une demande de deploiement ne prouve pas son succes"
+                       % ident, snapshot)
+    if repair and _loops(snapshot) >= MAX_REPAIRS:
+        return _refuse("repair-bound",
+                       "reparations deja au maximum (%d)" % MAX_REPAIRS, snapshot)
+    return _accept(command, (ref_key, "observation:%s" % ident))
 
 
 def _check_merged_and_staging_deployed(command: Command,
@@ -412,98 +458,57 @@ def _check_merged_and_staging_deployed(command: Command,
         return _refuse("merge-missing",
                        "aucune fusion reelle de %s" % (merge or "(absente)"),
                        snapshot)
-    ident = _ref(command, "staging")
-    deployment = _deployment(snapshot, "staging", ident=ident, sha=merge)
-    if deployment is None:
-        return _refuse("deployment-missing",
-                       "aucun deploiement staging de la revision fusionnee",
-                       snapshot)
-    if not _deploy_source_allowed(snapshot, deployment):
-        return _no_deploy_source(snapshot)
-    return _accept(command, ("merge", "staging"))
-
-
-def _environment_result(command: Command, snapshot: Snapshot, env: str,
-                        ref_key: str, expected: str, *, repair: bool) -> Decision:
-    ident = _ref(command, ref_key)
-    deployment = _deployment(snapshot, env, ident=ident)
-    if deployment is None:
-        return _refuse("deployment-missing",
-                       "aucun deploiement %s %s" % (env, ident or "de la revision"),
-                       snapshot)
-    revision = _revision(snapshot)
-    if not revision:
-        return _refuse("revision-missing",
-                       "snapshot sans revision de travail", snapshot)
-    if _text(deployment.get("sha")) != revision:
-        return _refuse("revision-mismatch",
-                       "deploiement %s sur une autre revision" % env, snapshot)
-    if not _deploy_source_allowed(snapshot, deployment):
-        return _no_deploy_source(snapshot)
-    if _text(deployment.get("conclusion")) != expected:
-        return _refuse("deployment-result-mismatch",
-                       "deploiement %s non %s" % (env, expected), snapshot)
-    if repair and _loops(snapshot) >= MAX_REPAIRS:
-        return _refuse("repair-bound",
-                       "reparations deja au maximum (%d)" % MAX_REPAIRS, snapshot)
-    return _accept(command, (ref_key,))
+    return _observation_proof(command, snapshot, "staging", "staging",
+                              "deployed", merge)
 
 
 def _check_staging_pass(command: Command, snapshot: Snapshot) -> Decision:
-    return _environment_result(command, snapshot, "staging", "staging", "pass",
-                               repair=False)
+    return _observation_proof(command, snapshot, "staging", "staging", "pass",
+                              _revision(snapshot))
 
 
 def _check_staging_failure(command: Command, snapshot: Snapshot) -> Decision:
-    return _environment_result(command, snapshot, "staging", "staging", "fail",
-                               repair=True)
-
-
-def _check_preprod_pass(command: Command, snapshot: Snapshot) -> Decision:
-    return _environment_result(command, snapshot, "preprod", "preprod", "pass",
-                               repair=False)
-
-
-def _check_preprod_failure(command: Command, snapshot: Snapshot) -> Decision:
-    return _environment_result(command, snapshot, "preprod", "preprod", "fail",
-                               repair=True)
+    return _observation_proof(command, snapshot, "staging", "staging", "fail",
+                              _revision(snapshot), repair=True)
 
 
 def _check_preprod_deployed(command: Command, snapshot: Snapshot) -> Decision:
-    ident = _ref(command, "preprod")
-    deployment = _deployment(snapshot, "preprod", ident=ident)
-    if deployment is None:
-        return _refuse("deployment-missing",
-                       "aucun deploiement preprod %s" % (ident or "de la revision"),
-                       snapshot)
+    return _observation_proof(command, snapshot, "preprod", "preprod",
+                              "deployed", _revision(snapshot))
+
+
+def _check_preprod_pass(command: Command, snapshot: Snapshot) -> Decision:
+    return _observation_proof(command, snapshot, "preprod", "preprod", "pass",
+                              _revision(snapshot))
+
+
+def _check_preprod_failure(command: Command, snapshot: Snapshot) -> Decision:
+    return _observation_proof(command, snapshot, "preprod", "preprod", "fail",
+                              _revision(snapshot), repair=True)
+
+
+def _check_repair_started(command: Command, snapshot: Snapshot) -> Decision:
     revision = _revision(snapshot)
     if not revision:
         return _refuse("revision-missing",
                        "snapshot sans revision de travail", snapshot)
-    if _text(deployment.get("sha")) != revision:
-        return _refuse("revision-mismatch",
-                       "deploiement preprod sur une autre revision", snapshot)
-    if not _deploy_source_allowed(snapshot, deployment):
-        return _no_deploy_source(snapshot)
-    return _accept(command, ("preprod",))
-
-
-def _check_repair_started(command: Command, snapshot: Snapshot) -> Decision:
     ident = _ref(command, "failure")
-    failure = _failed_deployment(snapshot, ident)
+    failure = _failed_observation(snapshot, ident)
     if failure is None:
         return _refuse("failure-missing",
                        "aucun echec enregistre %s" % (ident or "sur la revision"),
                        snapshot)
-    revision = _revision(snapshot)
-    if not revision:
-        return _refuse("revision-missing",
-                       "snapshot sans revision de travail", snapshot)
+    if _text(failure.get("env")) not in ENVIRONMENTS:
+        return _refuse("observation-result-mismatch",
+                       "echec %s hors environnement de deploiement" % ident,
+                       snapshot)
     if _text(failure.get("sha")) != revision:
         return _refuse("revision-mismatch",
                        "echec enregistre sur une autre revision", snapshot)
-    if not _deploy_source_allowed(snapshot, failure):
-        return _no_deploy_source(snapshot)
+    if _witness(snapshot, _text(failure.get("id"))) is None:
+        return _refuse("observation-unwitnessed",
+                       "aucun recu accepte ne reference l'echec %s" % ident,
+                       snapshot)
     if _loops(snapshot) >= MAX_REPAIRS:
         return _refuse("repair-bound",
                        "reparations deja au maximum (%d)" % MAX_REPAIRS, snapshot)
@@ -519,13 +524,6 @@ def _check_stop_work(command: Command, snapshot: Snapshot) -> Decision:
             (command.references or {}).get("superseded_by")):
         return _refuse("evidence-missing",
                        "supersession sans lot remplacant", snapshot)
-    authority = snapshot.authority or {}
-    if _text(authority.get("actor")) != command.actor:
-        return _refuse("authority-refused",
-                       "acteur different de l'autorite recontrolee", snapshot)
-    if not authority.get("can_stop"):
-        return _refuse("authority-refused",
-                       "cet acteur n'a pas le droit d'arreter le lot", snapshot)
     return _accept(command, ("reason",))
 
 
@@ -580,29 +578,29 @@ _SPECS = (
     GuardSpec("qa_repair", "verdict bloque et reparation encore permise",
               ("milestones",), (), ("head",), _check_qa_repair),
     GuardSpec("merged_and_staging_deployed",
-              "fusion reelle et deploiement staging de la meme revision",
-              ("milestones", "deployments", "authority"),
-              ("merge",), ("staging",), _check_merged_and_staging_deployed),
-    GuardSpec("staging_pass", "passage staging reel de la revision",
-              ("deployments", "authority"), ("staging",), (),
+              "fusion reelle et observation staging deployee de la meme revision",
+              ("milestones", "receipts", "observations"),
+              ("merge", "staging"), (), _check_merged_and_staging_deployed),
+    GuardSpec("staging_pass", "observation staging pass de la revision",
+              ("receipts", "observations"), ("staging",), (),
               _check_staging_pass),
-    GuardSpec("staging_failure", "echec staging reel et reparation permise",
-              ("deployments", "authority"), ("staging",), (),
+    GuardSpec("staging_failure", "observation staging fail et reparation permise",
+              ("receipts", "observations"), ("staging",), (),
               _check_staging_failure),
-    GuardSpec("preprod_deployed", "deploiement preprod de la revision",
-              ("deployments", "authority"), ("preprod",), (),
+    GuardSpec("preprod_deployed", "observation preprod deployee de la revision",
+              ("receipts", "observations"), ("preprod",), (),
               _check_preprod_deployed),
-    GuardSpec("preprod_pass", "passage preprod reel de la revision",
-              ("deployments", "authority"), ("preprod",), (),
+    GuardSpec("preprod_pass", "observation preprod pass de la revision",
+              ("receipts", "observations"), ("preprod",), (),
               _check_preprod_pass),
-    GuardSpec("preprod_failure", "echec preprod reel et reparation permise",
-              ("deployments", "authority"), ("preprod",), (),
+    GuardSpec("preprod_failure", "observation preprod fail et reparation permise",
+              ("receipts", "observations"), ("preprod",), (),
               _check_preprod_failure),
-    GuardSpec("repair_started", "reparation engagee sur un echec enregistre",
-              ("deployments", "authority"), (), ("failure",),
+    GuardSpec("repair_started", "reparation engagee sur un echec observe",
+              ("receipts", "observations"), ("failure",), (),
               _check_repair_started),
-    GuardSpec("stop_work", "arret explicite par autorite (abandon/supersession)",
-              ("authority",), ("reason",), ("superseded_by",), _check_stop_work),
+    GuardSpec("stop_work", "arret explicite (abandon/supersession)",
+              (), ("reason",), ("superseded_by",), _check_stop_work),
     GuardSpec("work_completed", "completude par type sur preuves reelles",
               ("deliveries", "milestones"), (), ("delivery", "outcome", "pr"),
               _check_work_completed),
@@ -612,7 +610,7 @@ _SPECS_BY_NAME = {spec.name: spec for spec in _SPECS}
 
 
 # --------------------------------------------------------------------------
-# API
+# API pure
 # --------------------------------------------------------------------------
 
 def _command_problem(command: Any) -> str:
@@ -624,13 +622,8 @@ def _command_problem(command: Any) -> str:
         uuid.UUID(command.command_id)
     except (ValueError, AttributeError, TypeError):
         return "command_id n'est pas un UUID"
-    if not _text(command.actor):
-        return "acteur requis"
-    if not _text(command.source):
-        return "source requise"
-    if isinstance(command.expected_version, bool) or not isinstance(
-            command.expected_version, int) or command.expected_version < 0:
-        return "expected_version: entier >= 0 attendu"
+    if not _text(command.guard):
+        return "garde requise"
     if not _text(command.from_stage) or not _text(command.to_stage):
         return "etapes from/to requises"
     if command.from_stage == command.to_stage:
@@ -651,11 +644,12 @@ def _command_problem(command: Any) -> str:
 
 
 def verify(command: Command, snapshot: Snapshot) -> Decision:
-    """Le verdict de C pour une commande, sur un snapshot reel. Jamais d'exception.
+    """Le verdict de C pour une commande, sur des preuves reelles. Sans exception.
 
     L'ordre est celui des portes : forme de la commande, garde du registre,
-    lot, workflow, version/etape (CAS recontrole), terminal, type, sources,
-    references, puis la garde elle-meme.
+    lot, revision Process, etape (coherence avec la ligne verrouillee), terminal,
+    type, sources, references, puis la garde elle-meme. La version du journal
+    (`expected_version`) n'est pas lue ici : elle appartient a B.
     """
     if not isinstance(snapshot, Snapshot):
         return Decision(False, "command-invalid", "snapshot absent")
@@ -674,11 +668,6 @@ def verify(command: Command, snapshot: Snapshot) -> Decision:
     if not _text(snapshot.workflow_ref):
         return _refuse("workflow-absent",
                        "projet sans workflow : aucune transition C", snapshot)
-    if command.expected_version != _as_int(snapshot.workflow_version):
-        return _refuse("version-stale",
-                       "expected_version %s, version native %s"
-                       % (command.expected_version, snapshot.workflow_version),
-                       snapshot)
     if command.from_stage != snapshot.workflow_stage:
         return _refuse("stage-stale",
                        "etape de depart %r, etape native %r"
@@ -717,7 +706,7 @@ def verify_hold(hold: str, snapshot: Snapshot) -> Decision:
     if hold not in HOLDS:
         return Decision(False, "hold-unsupported",
                         "retenue %r hors du registre" % hold,
-                        snapshot.workflow_stage, _as_int(snapshot.workflow_version))
+                        snapshot.workflow_stage)
     if hold == "waiting_human":
         if "decisions" not in set(snapshot.sources):
             return _refuse("source-unavailable",
@@ -726,8 +715,7 @@ def verify_hold(hold: str, snapshot: Snapshot) -> Decision:
             return _refuse("hold-no-decision",
                            "waiting_human sans decision native en attente",
                            snapshot)
-    return Decision(True, "accepted", "", snapshot.workflow_stage,
-                    _as_int(snapshot.workflow_version))
+    return Decision(True, "accepted", "", snapshot.workflow_stage)
 
 
 def capabilities() -> tuple[Capability, ...]:
@@ -751,3 +739,111 @@ def completion_policy(kind: str) -> CompletionPolicy:
                                 "non-code : resultat propre et revue applicable ; "
                                 "aucun pouvoir de gouvernance nouveau")
     raise KeyError(kind)
+
+
+# --------------------------------------------------------------------------
+# seam B (#1922, process_registry) : l'appelable serveur installe par garde
+# --------------------------------------------------------------------------
+
+def context_command(context: Any) -> Command:
+    """La `Command` de B -> la commande pure de C (references = evidence)."""
+    raw = getattr(context, "command", None)
+    authority = getattr(raw, "authority", None)
+    references = getattr(raw, "evidence", None) or {}
+    return Command(
+        work_item_id=_as_int(getattr(raw, "work_item_id", 0)),
+        command_id=_text(getattr(raw, "command_id", "")),
+        guard=_text(getattr(raw, "guard", "")),
+        from_stage=_text(getattr(context, "from_stage", ""))
+        or _text(getattr(raw, "from_stage", "")),
+        to_stage=_text(getattr(context, "to_stage", ""))
+        or _text(getattr(raw, "to_stage", "")),
+        actor=_text(getattr(authority, "actor", "")),
+        source=_text(getattr(authority, "source", "")),
+        references=dict(references) if isinstance(references, Mapping) else {},
+    )
+
+
+def _context_sources(context: Any) -> Mapping:
+    """Les sources lues par B : attribut `sources`, lecteur du contexte, ou
+    `read_sources` publie par `process_registry`. Aucune lecture SQL ici."""
+    sources = getattr(context, "sources", None)
+    if isinstance(sources, Mapping):
+        return sources
+    reader = getattr(context, "read_sources", None)
+    if callable(reader):
+        return dict(reader() or {})
+    try:
+        from . import process_registry as registry
+    except ImportError:  # pragma: no cover - B pas encore fusionne
+        return {}
+    reader = getattr(registry, "read_sources", None)
+    if callable(reader):
+        return dict(reader(context) or {})
+    return {}
+
+
+def context_snapshot(context: Any) -> Snapshot:
+    """Le `VerificationContext` de B -> le snapshot pur de C."""
+    item = dict(getattr(context, "work_item", None) or {})
+    sources = _context_sources(context) or {}
+    milestones = tuple(sources.get("milestones", ()) or ())
+    decisions = tuple(sources.get("decisions", ()) or ())
+    return Snapshot(
+        item=item,
+        workflow_ref=_text(item.get("workflow_ref")),
+        workflow_stage=_text(item.get("workflow_stage")),
+        workflow_version=max(_as_int(item.get("workflow_version")), 0),
+        revision=revision_of(milestones),
+        milestones=milestones,
+        receipts=tuple(sources.get("receipts", ()) or ()),
+        observations=tuple(sources.get("observations", ()) or ()),
+        decisions_pending=len(decisions),
+        deliveries=tuple(sources.get("deliveries", ()) or ()),
+        sources=tuple(name for name in SOURCE_COLLECTIONS if name in sources),
+    )
+
+
+_SERVER_VERIFIERS: dict[tuple, Callable] = {}
+
+
+def server_verifier(guard: str, verification_cls: Any = None) -> Callable:
+    """L'appelable serveur d'une garde : `VerificationContext -> Verification`.
+
+    Meme objet rendu pour un meme couple (garde, classe de `Verification`) :
+    `install_verifier` de B est idempotent pour un objet identique.
+    """
+    key = (guard, verification_cls)
+    existing = _SERVER_VERIFIERS.get(key)
+    if existing is not None:
+        return existing
+
+    def check(context: Any) -> Any:
+        decision = verify(context_command(context), context_snapshot(context))
+        cls = verification_cls
+        if cls is None:
+            from . import process_registry as registry
+            cls = registry.Verification
+        return cls(ok=decision.accepted,
+                   reason=decision.message or decision.code,
+                   facts={"code": decision.code, "stage": decision.stage,
+                          "references": list(decision.references)})
+
+    _SERVER_VERIFIERS[key] = check
+    return check
+
+
+def install_verifiers(registry: Any = None) -> tuple[str, ...]:
+    """Installe les 14 appelables serveur dans `process_registry` (B).
+
+    Sans `registry`, importe `ameesh.process_registry` ; avec, utilise l'objet
+    fourni (tests, autre hote). Rend les gardes installees, dans l'ordre du
+    registre fini. Aucun verificateur par defaut cote B : sans cet appel, une
+    avance reste `verifier-uninstalled`.
+    """
+    if registry is None:
+        from . import process_registry as registry
+    verification_cls = getattr(registry, "Verification")
+    for guard in GUARD_NAMES:
+        registry.install_verifier(guard, server_verifier(guard, verification_cls))
+    return GUARD_NAMES
