@@ -1198,7 +1198,10 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
-        """L160e (0058): takes the lot out of the queue, with a journal line."""
+        """L160e (0058): takes the lot out of the queue, with a journal line.
+        Locks the lot before its queue row and records a typed `removed`
+        receipt for the deleted row's freeze in the same transaction.
+        A free-text journal note cannot write this receipt."""
 
     @abc.abstractmethod
     def land_lock(self, key: str, owner: str, ttl_s: float, *,

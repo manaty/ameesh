@@ -164,7 +164,9 @@ Le cadrage du pilote du **16 octobre à 14:16** précise la frontière de
 confiance : l'adaptateur n'écrit les reçus que dans `queue_add(packet=...)`
 et `queue_remove`, depuis l'identité de la ligne allouée ou supprimée sous
 verrou, dans leur transaction. Il n'expose aucun écrivain générique de reçu ;
-le contrat médié refuse le domaine `work` et n'ajoute aucune opération.
+le contrat médié refuse `work.queue_add`, `work.queue_remove` et
+`work.queue_update` et n'ajoute aucune opération. `work.note` reste admise,
+mais n'écrit que le journal libre, jamais un reçu.
 Ce contrôle des chemins applicatifs ne constitue pas une séparation des
 droits SQL. Le rôle exécuteur existant reçoit `SELECT, INSERT, UPDATE, DELETE`
 sur toutes les tables et les futures tables du schéma dans
