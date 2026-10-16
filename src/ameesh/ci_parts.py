@@ -255,8 +255,11 @@ def sandbox_argv(bwrap: str, argv, *, root: str, files: str, writable, env: dict
     seule s'il n'est pas déjà dans le runtime (`node` hors `/usr`, `python`
     d'un venv). L'arbre de la cible et les entrées sont montés en lecture
     seule ; les seuls chemins inscriptibles sont les répertoires de travail et
-    de sortie, propres à cette preuve. Rien de l'hôte n'est monté en entier :
-    pas de `/`, pas de `/home`."""
+    de sortie, propres à cette preuve. L'environnement du bac à sable est vidé
+    puis reconstruit avec **toutes** les variables de `selector_env` — aucune
+    liste figée, pour que la composition avec le correctif #1938
+    (`LD_LIBRARY_PATH` d'un runtime relocalisé) ne perde rien. Rien de l'hôte
+    n'est monté en entier : pas de `/`, pas de `/home`."""
     program = shutil.which(argv[0], path=env.get("PATH"))
     if program is None:
         raise PartsError("the selector %s cannot start (%s is not in PATH)"
@@ -278,9 +281,8 @@ def sandbox_argv(bwrap: str, argv, *, root: str, files: str, writable, env: dict
     for path in writable:
         cmd += ["--bind", path, path]
     cmd += ["--chdir", root]
-    for key in ("PATH", "HOME", "TMPDIR", "GITHUB_WORKSPACE", "LC_ALL"):
-        if key in env:
-            cmd += ["--setenv", key, env[key]]
+    for key, value in env.items():
+        cmd += ["--setenv", key, value]
     return cmd + ["--", real] + list(argv[1:])
 
 

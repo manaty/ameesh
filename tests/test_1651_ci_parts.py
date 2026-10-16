@@ -121,7 +121,7 @@ while index < len(args):
 if not cmd:
     raise SystemExit("fake bwrap: no command")
 with open({log!r}, "a", encoding="utf-8") as handle:
-    handle.write(json.dumps(args) + "\\n")
+    handle.write(json.dumps({{"argv": args, "env": env}}) + "\\n")
 os.execvpe(cmd[0], cmd, env)
 '''
 
@@ -740,6 +740,20 @@ class SandboxTest(_Contract):
             with self.assertRaisesRegex(ci_parts.PartsError, "cannot be isolated"):
                 ci_parts.due(self.project, tip, self.base(), self.repo)
 
+    def test_every_selector_env_variable_reaches_the_sandbox(self):
+        """Composition avec #1938 : `LD_LIBRARY_PATH` (runtime relocalisé) doit
+        survivre au bac à sable, sans liste figée de variables."""
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        real = ci_parts.selector_env
+        with mock.patch.object(
+                ci_parts, "selector_env",
+                lambda root, home: dict(real(root, home),
+                                        LD_LIBRARY_PATH="/opt/hostedtoolcache/lib")):
+            ci_parts.due(self.project, tip, self.base(), self.repo)
+        run = self.invocations()[-1]
+        self.assertEqual(run["env"]["LD_LIBRARY_PATH"], "/opt/hostedtoolcache/lib")
+
     def test_the_selector_runs_with_the_network_cut_and_a_read_only_tree(self):
         branch = self.lot_touching("backend")
         tip = _git(self.repo, "rev-parse", branch)
@@ -747,7 +761,7 @@ class SandboxTest(_Contract):
         self.assertEqual(proof["due"], ("lot/backend-suite",))
         calls = self.invocations()
         self.assertEqual(len(calls), 2)      # le témoin de démarrage, puis le sélecteur
-        probe, run = calls
+        probe, run = calls[0]["argv"], calls[1]["argv"]
         self.assertIn("--unshare-net", probe)
         self.assertIn("--unshare-all", run)
         self.assertIn("--die-with-parent", run)
