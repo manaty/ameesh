@@ -298,7 +298,40 @@ def _coverage_disponible() -> bool:
 _coverage_installe = _coverage_disponible
 
 
-class CouvertureTronqueeTest(unittest.TestCase):
+class _PetitDepot:
+    """#1770 : les cas de corruption appellent `carte.merge` plusieurs fois, et
+    chaque appel rescannait `SRC.rglob("*.py")` sur tout le dépôt (~10 s en
+    local, ~40 s sur un runner chargé) : le module pesait 24 min de carte.
+
+    Un arbre source minimal, de même forme que le dépôt (`src/ameesh/*.py` et
+    `src/ameesh/migrations/`), garde les mêmes assertions — `relative_path`
+    ramène tout chemin mesuré à `src/…` — sans rescanner le dépôt. Aucun
+    produit n'est touché : seules les globales du lecteur de carte sont
+    pointées sur la fixture le temps du cas."""
+
+    #: même forme que le dépôt : un module mesuré et une migration lue.
+    FICHIERS = {
+        "src/ameesh/db.py": "def lire():\n    return 1\n",
+        "src/ameesh/autre.py": "VALEUR = 1\n",
+        "src/ameesh/migrations/0001_fixture.sql": "create table t (x integer);\n",
+    }
+
+    def setUp(self):
+        super().setUp()
+        racine = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, racine)
+        for relatif, contenu in self.FICHIERS.items():
+            chemin = racine / relatif
+            chemin.parent.mkdir(parents=True, exist_ok=True)
+            chemin.write_text(contenu, encoding="utf-8")
+        for nom, valeur in (("REPO", racine), ("SRC", racine / "src"),
+                            ("MIGRATIONS", racine / "src" / "ameesh" / "migrations")):
+            patcheur = mock.patch.object(carte, nom, valeur)
+            patcheur.start()
+            self.addCleanup(patcheur.stop)
+
+
+class CouvertureTronqueeTest(_PetitDepot, unittest.TestCase):
     """#1257 : une couverture tronquée (processus tué pendant l'écriture de sa
     donnée) ne fait plus échouer la fusion de la carte ; elle est ignorée et
     nommée, et les autres parts restent mesurées."""
@@ -557,7 +590,7 @@ class _FauxCoverageData:
         return {}
 
 
-class ArtefactIncompletTest(unittest.TestCase):
+class ArtefactIncompletTest(_PetitDepot, unittest.TestCase):
     """#1690 : un artefact de mesure illisible est signalé, jamais compté."""
 
     @staticmethod
