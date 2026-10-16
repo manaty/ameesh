@@ -1883,7 +1883,7 @@ class LotBranchTest(unittest.TestCase):
         self.assertEqual(self._ran(p), sorted(self.mods))
         self.assertEqual(self._ran(p, "psql"), sorted(self.mods))
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
 
     def test_release_pull_request_never_takes_the_impacted_selection(self):
         # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
@@ -3012,7 +3012,7 @@ class LotFreezePlanTest(unittest.TestCase):
         p = self._plan("lot", head_ref="release/1.10.0")
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertIn("release/**", p["selection"]["why"])
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_demande_full_garde_la_suite_complete(self):
@@ -3020,7 +3020,7 @@ class LotFreezePlanTest(unittest.TestCase):
         p = self._plan("full")
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
 
     def test_demande_full_ne_prend_pas_la_voie_version_seule(self):
         # #1343 : une demande explicite `ci-full-<sha>` ne peut pas verdir par
@@ -3030,7 +3030,7 @@ class LotFreezePlanTest(unittest.TestCase):
                                        "files": ["pyproject.toml"]})
         self.assertFalse(p["version_only"], p["why"])
         self.assertNotEqual(p["parts"]["psycopg"], [])
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
 
     def test_repli_d_un_gel_garde_la_forme_du_lot(self):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
@@ -3042,7 +3042,7 @@ class LotFreezePlanTest(unittest.TestCase):
     def test_repli_d_un_gel_release_garde_la_suite_complete(self):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
                                base_ref="main", head_ref="release/1.10.0")
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_cli_mode_lot_sans_base_refuse(self):
