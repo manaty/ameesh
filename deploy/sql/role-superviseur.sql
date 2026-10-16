@@ -531,7 +531,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
     -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
-    -- est un CONTENU)
+    -- est un CONTENU). `run_attempt` (#901, 0429) : quel essai de l'exécution
+    -- relancée (`gh run rerun`) porte la ligne.
     ('ci_runs', ARRAY[
         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
         'status', 'superseded_by', 'url', 'workflow', 'first_seen_at', 'concluded_at',
@@ -539,11 +540,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #747 (0424) : de l'ÉTAT, l'attente et l'exécution séparées ;
         -- created_at = création GitHub du run, started_at = premier relevé
         -- `in_progress` (l'extrait de sortie reste un contenu, ailleurs)
-        'created_at', 'started_at'
+        'created_at', 'started_at', 'run_attempt'
     ]),
     ('ci_test_failures', ARRAY[
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
-        'duration_s', 'failed_at', 'message_id', 'recorded_at'
+        'duration_s', 'failed_at', 'message_id', 'recorded_at', 'run_attempt'
     ]),
     -- #845 (0426) : garde de la CI par l'API — état des runners et de la file
     -- (même nature que ci_runs : identifiants, noms, horodatages, comptages,
