@@ -223,6 +223,30 @@ class RoutingTest(sessions._Base):
         self.assertEqual(restants, [mid_b])                   # A remis, B intact
         self.assertNotEqual(mid_a, mid_b)
 
+    def test_mid_turn_holds_urgent_secondary_mail_and_reaches_the_primary(self):
+        from ameesh import backend as backend_mod, identity
+        os.rmdir(self.secondary)
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, payload, work_item_id)"
+            " SELECT 'orch', 'worker', 'B urgent retenu ' || i,"
+            " '{\"urgent\":true}'::jsonb, %s FROM generate_series(1, 201) i",
+            (str(self.b),))
+        mid_a = mail.send(self.db, 'orch', 'worker', 'A urgent remisable',
+                          work_item_id=str(self.a), payload={'urgent': True})
+        with mock.patch.dict(os.environ, self._hook_env()):
+            bk, _ = backend_mod.open_backend(self.cfg)
+            self.addCleanup(bk.close)
+            binding = identity.resolve_binding(self.cfg, bk.db, harness='claude',
+                                               session_id='session-A')
+            remise = cli._Remise(self.cfg, bk, 'worker', binding)
+            self.addCleanup(remise.abandonner)
+            self.assertEqual([int(m['id']) for m in remise.prendre_mi_tour(1)], [mid_a])
+            remise.solder()
+        rows = self.db.query("SELECT meta FROM agent_mailbox WHERE recipient='worker'"
+                             " AND delivered_at IS NULL")
+        self.assertEqual(len(rows), 201)
+        self.assertTrue(all('consigne' not in row['meta'] for row in rows))
+
     def _hook_env(self) -> dict:
         return {'AGENT_MAIL_NAME': 'worker',
                 'AMEESH_RUNNER_ID': self.worker.runner.runner_id,
