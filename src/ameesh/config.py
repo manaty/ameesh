@@ -188,6 +188,7 @@ class Config:
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
+    runner_liveness_interval: float = 60.0  # #508 : écriture groupée, au moins 60 s
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
@@ -557,6 +558,9 @@ def load(env: dict | None = None) -> Config:
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
+        runner_liveness_interval=max(60.0, _as_float(
+            pick("AMEESH_RUNNER_LIVENESS_INTERVAL", "AGENT_MESH_RUNNER_LIVENESS_INTERVAL"),
+            cfg.runner_liveness_interval)),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
         mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
