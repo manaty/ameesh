@@ -1416,15 +1416,28 @@ def _git_env() -> dict:
     return env
 
 
+#: #1749 : une **sonde de présence** (l'objet est-il là ?) ne doit pas
+#: réveiller le fetch paresseux d'un clone partiel : il part, échoue, et
+#: laisse son transport orphelin, adopté par l'exécuteur puis jamais
+#: moissonné (des milliers de `git <defunct>`). Git honore
+#: `GIT_NO_LAZY_FETCH` (2.43) ; les lectures qui ont besoin du contenu
+#: (patchs, blobs) gardent le fetch.
+NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
+
+
 def _git(repo: str, *args: str, stdin: bytes | None = None,
-         timeout: float = GIT_TIMEOUT) -> subprocess.CompletedProcess:
+         timeout: float = GIT_TIMEOUT, env_extra: dict | None = None,
+         ) -> subprocess.CompletedProcess:
     """git sans crochets, sans fsmonitor, sans objets de remplacement, sans pager."""
     cmd = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
            "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull,
            *args]
+    env = _git_env()
+    if env_extra:
+        env.update(env_extra)
     try:
         return subprocess.run(cmd, cwd=repo, input=stdin, capture_output=True,
-                              env=_git_env(), timeout=timeout, check=False)
+                              env=env, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         raise GitError("git not found") from exc
     except subprocess.TimeoutExpired as exc:

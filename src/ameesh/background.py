@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 
 from . import containers as containers_mod
@@ -45,6 +47,51 @@ COMMAND_MAX = 80
 NOTE_MAX_BYTES = 1500
 #: au plus ce nombre de processus et de conteneurs cités par tour
 CITED_MAX = 3
+
+#: #1749 : les `Popen` de ce processus, gardés faiblement. Le moissonneur
+#: d'orphelins (`_reap_strays`) doit distinguer un enfant zombie qu'un
+#: `Popen` attend encore (son statut lui appartient : le voler rendrait un
+#: code 0 mensonger, #476) d'un descendant **adopté** — un orphelin dont le
+#: vrai parent est mort, que personne n'attend et que le sous-moissonneur
+#: laisserait sinon en zombie pour toujours (des milliers de `git <defunct>`,
+#: constat du bureau du 15/10).
+_own_popen: "weakref.WeakSet" = weakref.WeakSet()
+#: le greffon n'est posé qu'une fois par processus ; récursif car le
+#: moissonneur le tient pendant sa passe, `Popen.__init__` pendant la sienne
+_own_lock = threading.RLock()
+_own_hook = False
+
+
+def _watch_own_children() -> None:
+    """Retient chaque `Popen` créé par ce processus (une fois).
+
+    Un `Popen` vivant dont l'enfant n'est pas encore attendu est la seule
+    preuve qu'un zombie enfant du processus n'est pas un orphelin adopté. Le
+    verrou est tenu pendant tout `__init__` : un enfant forké puis mort avant
+    son enregistrement ne peut pas être pris pour un adopté."""
+    global _own_hook
+    with _own_lock:
+        if _own_hook:
+            return
+        _own_hook = True
+        init = subprocess.Popen.__init__
+
+        def recorded(self, *args, **kwargs):
+            with _own_lock:
+                init(self, *args, **kwargs)
+                try:
+                    _own_popen.add(self)
+                except TypeError:       # pragma: no cover - Popen est faible
+                    pass
+
+        subprocess.Popen.__init__ = recorded
+
+
+def _owned_children() -> set:
+    """PID des enfants qu'un `Popen` vivant de ce processus attend encore."""
+    with _own_lock:
+        return {p.pid for p in list(_own_popen)
+                if p.pid and p.returncode is None}
 
 
 def _short(text: str, limit: int = COMMAND_MAX) -> str:
@@ -233,6 +280,8 @@ class Tracker:
         self.entries: list[Entry] = []
         #: l'exécuteur adopte-t-il les orphelins de ses tours (codes de sortie) ?
         self.subreaper = platform.become_subreaper()
+        #: #1749 : de quoi reconnaître nos `Popen` d'un orphelin adopté
+        _watch_own_children()
         self._strays_at = 0.0
         self.thread: threading.Thread | None = None
         self.observed_children: dict[int, float] = {}
@@ -822,7 +871,16 @@ class Tracker:
             return code
 
     def _reap_strays(self, table: list[dict], suivis: list[Entry]) -> None:
-        """Reap only observed turn descendants, never an arbitrary Popen child."""
+        """Moissonne les descendants observés, et les orphelins **adoptés**.
+
+        Un zombie enfant de ce processus est soit l'enfant d'un `Popen` de ce
+        processus — son statut appartient à qui l'attend (#476 : le voler
+        rendrait un code 0 mensonger) —, soit un descendant adopté par le
+        sous-moissonneur : son vrai parent est mort, personne ne l'attend, et
+        le laisser ferait une fuite de zombies (#1749). Un descendant observé
+        garde son pidfd (`_reap_observed`) ; les autres ne sont moissonnés
+        qu'après vérification d'identité (`_reap_identity`, anti-recyclage de
+        PID) et seulement si aucun `Popen` vivant ne les attend."""
         moi = os.getpid()
         with self.observed_lock:
             known = dict(self.observed_children)
@@ -830,16 +888,28 @@ class Tracker:
         unknown = []
         with self.runner.launch_lock:
             proteges = set(self.runner.harness_pids)
-            for p in table:
-                if p["ppid"] != moi or not p["zombie"]:
-                    continue
-                if p["pid"] in proteges or p["pgid"] in proteges \
-                        or p["pgid"] in suivis_pgid:
-                    continue
-                if known.get(p["pid"]) != p.get("start") or p.get("start") is None:
-                    unknown.append(p["pid"])
-                    continue
-                if self._reap_observed(p["pid"], p.get("start")) is None:
+            # le verrou des `Popen` tient toute la passe : aucun enfant ne
+            # peut naître, mourir et être pris pour un adopté entre deux
+            with _own_lock:
+                owned = _owned_children()
+                for p in table:
+                    if p["ppid"] != moi or not p["zombie"]:
+                        continue
+                    if p["pid"] in proteges or p["pgid"] in proteges \
+                            or p["pgid"] in suivis_pgid:
+                        continue
+                    start = p.get("start")
+                    if start is None:
+                        unknown.append(p["pid"])
+                        continue
+                    if known.get(p["pid"]) == start:
+                        if self._reap_observed(p["pid"], start) is None:
+                            unknown.append(p["pid"])
+                        continue
+                    if p["pid"] not in owned:
+                        # orphelin adopté : personne ne détient son statut
+                        if self._reap_identity(p["pid"], start) is not None:
+                            continue
                     unknown.append(p["pid"])
         self.unknown_zombies = len(unknown)
         if len(unknown) >= self.UNKNOWN_ZOMBIES_WARN and not self._zombies_warned:

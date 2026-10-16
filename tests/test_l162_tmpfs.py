@@ -22,7 +22,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import adapters, exploitation, mail, menage, registry, storage
+from ameesh import adapters, exploitation, mail, menage, platform, registry, storage
 from ameesh import runner as runner_mod
 
 from .support import PgTestCase
@@ -280,19 +280,6 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
 # avec la base : entrées abandonnées supprimées, alertes
 # ==========================================================================
 
-def _sans_detenteur(test: unittest.TestCase) -> None:
-    """Neutralise la réponse du détenteur d'une entrée de /tmp. Sur un poste
-    où un processus du même utilisateur refuse la lecture de ses fichiers
-    ouverts (gpg-agent, `ameesh-offload`…), `platform.holders` lève
-    `NotAvailable` et le ménage garde l'entrée (fail-closed, L63b) : la
-    décision testée ici est celle de l'âge et des autres garde-fous, pas celle
-    des processus — la détection réelle a ses propres tests
-    (`tests/test_l63_platform.py`)."""
-    patcher = mock.patch.object(menage, "tmp_holder", lambda *a, **k: "")
-    patcher.start()
-    test.addCleanup(patcher.stop)
-
-
 class AbandonDbTest(_Systeme, PgTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -325,6 +312,19 @@ class AbandonDbTest(_Systeme, PgTestCase):
     def _passage(self, decalage: float, **kw) -> dict:
         return menage.run_pass(self.cfgl, self.db, kw.pop("policy", self.pol), host="pc",
                                actor="t", now=time.time() + decalage, **kw)
+
+    def _sans_doute_d_un_tiers(self) -> None:
+        """L63b : quand un processus du même utilisateur cache ses fichiers
+        ouverts (gpg-agent non dumpable, #1749), la sonde ne peut pas prouver
+        qu'aucun détenteur ne reste et le ménage garde toute entrée (« holders
+        unreadable », fail-closed) — garde-fou témoigné par test_l63_platform.
+        Ici, ce sont les décisions du ménage qu'on observe : le doute d'un tiers
+        de l'hôte, étranger au test, est neutralisé pour qu'elles ne dépendent
+        pas de l'hôte ; la détection réelle (fichier ouvert, dossier courant)
+        reste en jeu."""
+        patch = mock.patch.object(platform.process, "_settle", lambda *a, **k: None)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _en_tour(self, agent: str) -> None:
         """`agent` en tour sur l'hôte « pc » : statut running, bail vivant."""
@@ -450,7 +450,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertEqual(recents, {heures, jours})
 
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
-        _sans_detenteur(self)
+        self._sans_doute_d_un_tiers()
         abandon = os.path.join(self.sys, "preuve-images")
         self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwx", abandon],
                         capture_output=True)
@@ -492,6 +492,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertNotIn("tmp_orphan", types)
 
     def test_garde_fous(self):
+        self._sans_doute_d_un_tiers()
         ouvert = os.path.join(self.sys, "ouvert")
         sale = os.path.join(self.sys, "clone-sale")
         homonyme = os.path.join(self.sys, "recree")
@@ -519,14 +520,6 @@ class AbandonDbTest(_Systeme, PgTestCase):
             "agent": "a1", "detail": "test", "data": {"turn": "x"}}], actor="test")
         occupant = subprocess.Popen(["sleep", "60"], cwd=ouvert)
         self.addCleanup(occupant.kill)
-        # Même raison que `_sans_detenteur`, mais `ouvert` doit être tenue tant
-        # que l'occupant vit, puis libre : la réponse du détenteur est fixée.
-        detenteur = mock.patch.object(
-            menage, "tmp_holder",
-            side_effect=lambda p: "held by process %d (cwd: sleep 60)" % occupant.pid
-            if p == ouvert and occupant.poll() is None else "")
-        detenteur.start()
-        self.addCleanup(detenteur.stop)
         rapport = self._passage(3 * HEURE)
         sorts = {o["path"]: (o["status"], o["detail"]) for o in rapport["orphans"]}
         self.assertEqual(sorts[ouvert][0], "attend")
@@ -554,7 +547,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
                             for a in alertes))
 
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
-        _sans_detenteur(self)
+        self._sans_doute_d_un_tiers()
         main = _repo(self.tmp)
         relecture = os.path.join(self.sys, "relecture")
         self._tour(lambda: _git("worktree", "add", "-q", "--detach", relecture, cwd=main),
