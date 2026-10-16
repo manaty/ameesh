@@ -799,9 +799,10 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(self.pip_calls(), [])
 
     def test_relaunching_install_keeps_the_original_recovery_target(self):
-        # A→B, le premier pip réussit puis le second échoue : le journal vaut A,
-        # mais direct_url.json pointe déjà B. Relancer installer ne doit pas
-        # prendre B pour cible de récupération ni écraser le journal.
+        # A→B, la préparation échoue : #1969 laisse la version ACTIVE intacte
+        # (direct_url.json pointe encore A, plus de pip dans le venv vivant).
+        # Relancer installer ne doit pas prendre B pour cible de récupération ni
+        # écraser le journal.
         plus_ancien = self.plus_ancien
         (self.parts / 'previous-sha').write_text(plus_ancien + '\n')
         (self.state / 'pip-fail-at').write_text('2\n')
@@ -809,7 +810,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(len(self.pip_calls()), 2)
         self.assertEqual(self.installed_url(),
-                         (self.parts / ('src-' + self.target[:7])).as_uri())
+                         (self.parts / ('src-' + self.old[:7])).as_uri())
         q = self.run_vm('installer', self.target)
         self.assertNotEqual(q.returncode, 0)
         self.assertIn('installation inachevée', q.stderr)
@@ -826,13 +827,14 @@ class VmAgentsInstallTest(VmAgentsHarness):
             self.assertNotIn('src-' + self.target[:7], call)
 
     def test_relaunching_first_install_keeps_the_recovery_journal(self):
-        # Même cas sans previous-sha : le journal seul porte la récupération.
+        # Même cas sans previous-sha : le journal seul porte la récupération, et
+        # la version active reste intacte après l'échec de préparation (#1969).
         (self.parts / 'previous-sha').unlink()
         (self.state / 'pip-fail-at').write_text('2\n')
         p = self.run_vm('installer', self.target)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(self.installed_url(),
-                         (self.parts / ('src-' + self.target[:7])).as_uri())
+                         (self.parts / ('src-' + self.old[:7])).as_uri())
         q = self.run_vm('installer', self.target)
         self.assertNotEqual(q.returncode, 0)
         self.assertEqual(len(self.pip_calls()), 2)
