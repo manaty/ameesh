@@ -58,6 +58,10 @@ def acknowledge(cfg, db, key: str, *, actor: str, principal: str | None = None,
     alert = next((a for a in current(cfg, db, **thresholds) if key_of(a) == key), None)
     if alert is None:
         raise AckRefused("not_found", "no current alert with this key")
+    # The local console pass must work without the mesh database (#1179),
+    # so it cannot honour a persistent acknowledgement or observe its end.
+    if alert.get("type") in notify.LOCAL_TYPES:
+        raise AckRefused("local_alert", "local pool alerts cannot be acknowledged")
     recipient, _ = notify.Router(cfg, db, notify.parse_config(cfg.notify)).resolve(alert)
     if principal != recipient:
         raise AckRefused("forbidden", "only the alert's human recipient can acknowledge it")

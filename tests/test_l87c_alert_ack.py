@@ -6,6 +6,7 @@ import concurrent.futures
 import dataclasses
 import json
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -32,6 +33,30 @@ class IdentityTest(unittest.TestCase):
             self.assertNotEqual(alert_ack.key_of(a), alert_ack.key_of(alert(**change)))
         a = dict(type="turn_unpriced", agent="a", since=1, model="one")
         self.assertNotEqual(alert_ack.key_of(a), alert_ack.key_of(dict(a, model="two")))
+
+    def test_orphan_routing_reads_the_lot_once_per_pass(self):
+        reads = []
+        owner = {"human": "human:first"}
+
+        def responsible(router, lot):
+            if lot is not None:
+                reads.append(lot)
+                return owner["human"]
+            return None
+
+        cfg = SimpleNamespace(canon=None, github=None)
+        n = notify.Notifier(cfg, notify.parse_config({"types": ["orphan_lot"]}),
+                            sender=notify.DrySender(), log=lambda _: None)
+        a = dict(type="orphan_lot", lot=1, agent="stopped", reason="stopped")
+        with mock.patch.object(notify.Router, "lot_responsible", autospec=True,
+                               side_effect=responsible):
+            n.run_pass(None, [a])
+            self.assertEqual(reads, [1])
+            self.assertEqual(next(iter(n.state["active"].values()))["human"], "human:first")
+            owner["human"] = "human:second"
+            n.run_pass(None, [a])
+        self.assertEqual(reads, [1, 1])
+        self.assertEqual(next(iter(n.state["active"].values()))["human"], "human:second")
 
 
 class AcknowledgementTest(PostMixin, PgTestCase):
@@ -89,6 +114,34 @@ class AcknowledgementTest(PostMixin, PgTestCase):
             with self.assertRaises(alert_ack.AckRefused) as exc:
                 self.ack()
             self.assertEqual(exc.exception.code, "native_only")
+        self.assertEqual(self.history(), [])
+
+    def test_local_pool_ack_is_explicitly_refused_before_ordinary_pass(self):
+        for kind in notify.LOCAL_TYPES:
+            with self.subTest(kind=kind):
+                self.a = alert(type=kind)
+                exploitation.alerts.return_value = [self.a]
+                with self.assertRaises(alert_ack.AckRefused) as exc:
+                    self.ack()
+                self.assertEqual(exc.exception.code, "local_alert")
+                exploitation.alerts.return_value = []
+                self.notifier().run_pass(self.db)
+                self.assertIs(exploitation.alerts.call_args.kwargs["local_pool"], False)
+                self.assertEqual(self.history(), [])
+                exploitation.alerts.return_value = [self.a]
+
+    def test_http_refuses_local_pool_ack_with_explicit_code(self):
+        self.start(serve.Context(cfg=self.cfg, human="human:owner"),
+                   serve.db_reader(self.cfg), write=serve.db_writer(self.cfg))
+        for kind in notify.LOCAL_TYPES:
+            with self.subTest(kind=kind):
+                self.a = alert(type=kind)
+                exploitation.alerts.return_value = [self.a]
+                key = alert_ack.key_of(self.a)
+                status, _h, body = self.post("/api/v1/alerts/%s/ack" % key,
+                                            key="local-" + kind)
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["error"], "local_alert", body)
         self.assertEqual(self.history(), [])
 
     def test_concurrent_acknowledgements_record_one_actor(self):
