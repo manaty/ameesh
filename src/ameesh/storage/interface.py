@@ -71,7 +71,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    overdue_delegations returned_delegations backlog_add backlog
                    auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
-   packages       all get upsert retire
+   packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
                    launch settle replace cancel
@@ -1841,6 +1841,17 @@ class WorkPackages(Domain):
     @abc.abstractmethod
     def retire(self, idents: Sequence[str]) -> int:
         """Marque ces fiches retirées du canon (`present` faux, jamais effacées)."""
+
+    @abc.abstractmethod
+    def lock_sync(self) -> None:
+        """Verrou transactionnel des fiches, pris AVANT leur lecture (L42/0031) :
+        un par SCHÉMA, tous canons confondus — les identifiants de paquets sont
+        globaux, le premier canon qui en déclare un le garde — et le même pour
+        toute écriture de `canon` (`canon.rebase_default`). À appeler dans une
+        transaction ouverte : il tient jusqu'au COMMIT, comme
+        `authenticators.lock_registry`. L'attente du verrou ne compte pas dans
+        le délai de requête de la session (un premier sync long ne fait pas
+        échouer les suivants)."""
 
 
 # --------------------------------------------------------------------------
