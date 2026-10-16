@@ -1028,8 +1028,10 @@ def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
         head = LOT_HEAD_RE.match(pr.get("headRefName") or "")
         if head and pr.get("isCrossRepository") is False:
             item = work_mod.get(db, int(head.group(1)))
-            if item is None or not item.get("branch") \
-                    or short_branch(item["branch"]) == pr["headRefName"]:
+            # #2102 : une branche détachée du lot ne le désigne plus
+            if item is None or (not item.get("branch") and not work_mod.is_detached(
+                    st, int(head.group(1)), pr["headRefName"])) \
+                    or short_branch(item.get("branch")) == pr["headRefName"]:
                 explicit = [int(head.group(1))]
     if explicit:
         return [(i, None) for i in explicit], by_issue

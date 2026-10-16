@@ -1389,6 +1389,14 @@ class WorkItems(Domain):
         (détachement), vérifiés sous le verrou de la ligne du lot ; None sinon."""
 
     @abc.abstractmethod
+    def detach_branch(self, item_id: int, expected: str | None, *, note: str,
+                      actor: str) -> dict | None:
+        """#2102 : retire la branche (et la cible, le dernier commit vu) d'un
+        lot ouvert, avec une ligne de journal, seulement si sa branche est
+        encore `expected` (None : aucune), vérifié sous le verrou de la ligne
+        du lot ; None sinon (lot fermé, ou branche changée entre-temps)."""
+
+    @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:

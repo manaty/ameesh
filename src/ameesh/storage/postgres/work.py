@@ -1026,6 +1026,23 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
             return rows[0]
 
+    def detach_branch(self, item_id, expected, *, note, actor) -> dict | None:
+        """#2102 : comme `attach_implicit_branch`, la ligne est verrouillée
+        avant la comparaison : une branche posée entre la lecture de
+        l'appelant et ce verrou n'est jamais effacée."""
+        with self.db.transaction() as tx:
+            if not tx.query(
+                    "SELECT 1 FROM work_items WHERE id = %%s"
+                    "   AND branch IS NOT DISTINCT FROM %%s AND state NOT IN %s"
+                    " FOR UPDATE" % _CLOSED, (int(item_id), expected)):
+                return None
+            rows = tx.query(
+                "UPDATE work_items SET branch = NULL, branch_target = NULL,"
+                "       branch_head = NULL, branch_head_at = NULL, updated_at = now()"
+                " WHERE id = %%s RETURNING %s" % item_columns(self.db), (int(item_id),))
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
     # -- numéro de migration réservé (L122) ----------------------------------
     def _release_migration(self, tx, item_id, row, *, why, actor) -> None:
         """#956 : libère la réservation du lot qui entre dans un état terminal

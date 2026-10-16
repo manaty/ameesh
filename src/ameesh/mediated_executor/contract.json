@@ -4348,6 +4348,7 @@
     "delays",
     "delegate",
     "designate_reviewer",
+    "detach_branch",
     "due_delegations",
     "estimate_history",
     "estimates",

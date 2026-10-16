@@ -164,6 +164,29 @@ class DetachSweepTest(_Base):
                                                   actor="orch"))
         self.assertEqual(work.get(self.db, n)["branch"], "agent/explicite")
 
+    def test_reassociation_pendant_le_detachement_n_est_pas_effacee(self):
+        # témoin QA (sens inverse) : entre la lecture du lot par detach_branch
+        # et son écriture, une autre branche est posée explicitement
+        lot = self.lot()
+        n = lot["id"]
+        work.set_branch(self.db, n, "lot/%d-vieille" % n, actor="orch")
+        original = work.get
+        raced = []
+
+        def get(db, item_id):
+            row = original(db, item_id)
+            if not raced:
+                raced.append(item_id)               # set_branch relit le lot
+                work.set_branch(self.db, n, "agent/neuve", actor="orch")
+            return row
+
+        with mock.patch.object(work, "get", side_effect=get):
+            with self.assertRaisesRegex(work.WorkError, "changed meanwhile.*agent/neuve"):
+                work.detach_branch(self.db, n, reason="PR supplantée")
+        self.assertEqual(work.get(self.db, n)["branch"], "agent/neuve")
+        self.assertFalse([e for e in work.events(self.db, n)
+                          if e["note"].startswith(work.DETACH_NOTE)])
+
     def test_prefixe_sans_confusion(self):
         lot = self.lot()
         n = lot["id"]
