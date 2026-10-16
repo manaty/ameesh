@@ -56,7 +56,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
    pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
-   turn_costs      last_reading insert spent ledger correct
+   turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
                    pending_recipients_sorted unread_total dead_letters forward
@@ -505,6 +505,20 @@ class TurnCosts(Domain):
         l'agent pour ce harnais — de cette session seulement si `session` est
         donnée : session, cum_usd, cum_input_tokens, cum_cached_input_tokens,
         cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
+
+    @abc.abstractmethod
+    def last_before(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la dernière ligne écrite de `agent` à `ts` (epoch) ou avant :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. Lecture seule,
+        pour relire le harnais qui tournait avant un instant donné (le gel d'un
+        lot)."""
+
+    @abc.abstractmethod
+    def first_after(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
+        écrit la ligne d'un tour à sa fin : le tour qui a posé un gel est le
+        premier écrit APRÈS l'instant du gel. Lecture seule."""
 
     @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,

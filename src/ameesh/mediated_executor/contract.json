@@ -3957,7 +3957,7 @@
   }
  ],
  "refused": {
-  "interface_total": 420,
+  "interface_total": 422,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4293,6 +4293,8 @@
    ],
    "turn_costs": [
     "correct",
+    "first_after",
+    "last_before",
     "ledger",
     "paid_lines",
     "spent_between",
