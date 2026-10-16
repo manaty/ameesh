@@ -47,6 +47,10 @@ class TextTest(unittest.TestCase):
                       "frozen head", "cancelled", "Sober proofs",
                       "a proof is a link", "sha256", "merge-tree", "3 lines"):
             self.assertIn(words, text)
+        # #1676 : le paquet est celui de la coupure, avec tous les lots prêts —
+        # plus la promesse « about ten lots » que le §11 bis a remplacée
+        self.assertIn("next cut's single package", text)
+        self.assertNotIn("about ten lots", text)
         self.assertIsNone(fil.unreadable_reason(text))
 
     def test_units(self):
