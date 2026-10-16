@@ -45,16 +45,18 @@ import os
 import time
 
 from . import storage
+from .storage import interface
 
 #: début commun des notes de reprise (le plafond horaire compte ces lignes,
 #: rendus et reprises confondus ; la note d'un lot sauté, SKIP_NOTE, n'en fait
-#: pas partie)
-NOTE_PREFIX = "pause budget (reprise) : "
+#: pas partie) — textes définis dans `storage.interface`, avec les préfixes
+#: d'attribution (§4)
+NOTE_PREFIX = interface.HANDOFF_PREFIX
 #: début de la note de reprise d'un lot `build` (le plafond horaire compte ces
 #: lignes)
-HANDOFF_NOTE = NOTE_PREFIX + "lot repris"
-#: début de la note d'un lot `intake` rendu à la file d'équipe (L165)
-RETURN_NOTE = NOTE_PREFIX + "lot rendu à la file d'équipe"
+HANDOFF_NOTE = interface.HANDOFF_NOTE
+#: début de la note d'un lot `intake` rendu à la file d'équipe (L165, main #757)
+RETURN_NOTE = interface.HANDOFF_RETURN_NOTE
 #: début de la note d'un lot `build` sauté (une fois par pause)
 SKIP_NOTE = "pause budget : lot non repris"
 #: harnais de l'agent en pause, et des preneurs
@@ -70,8 +72,10 @@ DEFAULT_IDLE_S = 300.0
 LOTS_PER_AGENT = 50
 #: lignes de journal lues pour la note d'un lot sauté (une fois par pause)
 EVENTS_READ = 1000
-#: débuts de note d'une attribution (`work assign`, création, prises)
-_ASSIGN_NOTES = ("assigned to ", "assigné à ", "created and assigned to ")
+#: débuts de note d'une attribution (`work assign`, création, délégation,
+#: prises automatiques, reprise budget) — une seule source, avec `wip_exceptions`
+#: et `requeued_sql` (§4)
+_ASSIGN_NOTES = interface.ASSIGN_NOTE_PREFIXES
 
 
 def paused(row: dict) -> bool:
@@ -82,10 +86,10 @@ def paused(row: dict) -> bool:
 
 
 def assign_prefixes() -> tuple:
-    """Débuts des notes d'une attribution du lot."""
-    from . import backlog
-    return _ASSIGN_NOTES + (backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE,
-                            HANDOFF_NOTE, RETURN_NOTE)
+    """Débuts des notes d'une attribution du lot (toutes : attribution,
+    création, délégation, prises automatiques, reprise sur pause budget) ;
+    le retour d'un lot `intake` à la file (L165, main #757) en fait partie."""
+    return _ASSIGN_NOTES + (RETURN_NOTE,)
 
 
 def last_assigner(events: list) -> str:

@@ -315,8 +315,43 @@ When agents are idle and the queue is empty (and no lot of the
 project is waiting), the `backlog_empty` alert invites the human lead to
 fill it.
 
-### Handoff on a budget pause (L233b, L165)
+### WIP limit: at most 2 lots in `build` per agent (§4)
 
+Owner 14/10/2026, canon §4: an agent holds at most
+`ameesh.work.BUILD_LIMIT` (2) lots in `build`, **all projects
+confused** (the cap is global, not per team). Two guards:
+
+* **the automatic pick-up refuses the third lot**: the count and the
+  assignment are written in one transaction under the agent's advisory
+  lock (`assign_capped`), so two simultaneous pick-ups cannot cross the cap;
+* **the sweep returns the surplus**: `ameesh work wip [--apply] [--limit N]
+  [--json]` gives back to the team queue the lots of an agent above the
+  cap, the least recently active first. Without `--apply` it only shows
+  what would be returned (dry run, nothing written). Each return is
+  revalidated **under the agent's lock** (`unassign_surplus`): the lot must
+  still be `build`, still assigned to that agent, carry no pilot exception,
+  and the surplus must still be real — two concurrent sweeps never return
+  more than the surplus, and a lot moved to `qa` or pulled back meanwhile is
+  left alone. A returned lot keeps its state, its branch, its branch head
+  and its reviews; an `event` mail tells the agent, and a free agent of its
+  team can take it as it is.
+
+An agent can hand back an `intake` or `build` lot itself: `ameesh work
+return <id> [--reason T]` (the assignee, a human, or a pilot); a lot under
+review (`qa`), waiting for a human or blocked is not handed back that way.
+The pilot's **explicit** exception is recorded on the lot's last assignment
+by `ameesh work assign <id> <agent> --wip-exception "why"` (human or
+orchestrator/design); the sweep leaves that lot alone. Every note that hands
+a lot over counts as an assignment (assignment, delegation, automatic
+pick-ups, budget handoff), so the next one without the marker removes the
+exception; `work assign` on the same agent with a branch only sets the
+branch, leaving the running delegation and the pilot exception in place.
+`ameesh list` shows a per-agent `BUILD` column (flagged with `!` above the
+cap), `ameesh progress` carries `builds`, and `ameesh notify` can run the
+sweep (`--wip-max-returns N`, off by default; `--wip-apply` returns the
+lots, without it the pass is a dry run).
+
+### Handoff on a budget pause (L233b, L165)
 On each pass, before any pick-up, `ameesh notify` handles the lots of a
 **non-critical Claude agent paused on budget** (status `blocked`,
 `budget : …`):
