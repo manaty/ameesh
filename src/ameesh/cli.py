@@ -778,14 +778,15 @@ class _Remise:
         return self.msgs
         return self.msgs
 
-    def _deliverable(self, borne: int) -> list[int]:
+    def _deliverable(self, borne: int, *, mode: str = "unread") -> list[int]:
         """#811 B1/R3 : les ids à réserver, les lots retenus laissés en place.
 
         Même règle que l'exécuteur (`lot_workdir.deliverable_unread`), dérivée
         du registre et du Host pour être visible du hook."""
         from . import lot_workdir, registry
         agent = registry.get(self.bk.db, self.name) or {"name": self.name}
-        rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent, besoin=borne)
+        rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent,
+                                             besoin=borne, mode=mode)
         return [int(row["id"]) for row in rows if row.get("id") is not None]
 
     def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
@@ -810,8 +811,7 @@ class _Remise:
             self.reste = 0
             return []
         taille = mail.UNREAD_LIMIT if limite is None else limite
-        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille)
-        ids = [int(m["id"]) for m in voulus if m.get("id") is not None]
+        ids = self._deliverable(taille, mode="mid_turn")
         if not ids:
             self.msgs = []
             self.reste = 0

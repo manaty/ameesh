@@ -158,7 +158,7 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None) 
     (exécuteur médié) ne fait pas boucler : on s'arrête quand la page ne
     progresse plus."""
     lire = {"unread": mail.unread, "active": mail.unread_active,
-            "urgent": mail.unread_urgent}[mode]
+            "urgent": mail.unread_urgent, "mid_turn": mail.unread_mid_turn}[mode]
     name = agent.get("name")
     besoin = max(1, int(besoin))
     if len(projects.agent_projects(agent)) < 2:
