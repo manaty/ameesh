@@ -244,8 +244,8 @@ def _slo_breach(alert: dict) -> str:
     head = ("SLO breach, level %d: lot #%d%s (%s), step `%s` late by %s (target %s)%s."
             % (level, lot, " \"%s\"" % title if title else "",
                alert.get("lot_state") or "?", step,
-               sous_utilisation._duration(alert.get("overdue_s") or 0),
-               sous_utilisation._duration(alert.get("target_s") or 0),
+               sous_utilisation._duration(alert.get("value") or 0),
+               sous_utilisation._duration(alert.get("threshold") or 0),
                ", assigned to %s" % who if who else ", unassigned"))
     if level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
