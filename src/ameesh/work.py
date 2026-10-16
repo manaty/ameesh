@@ -708,8 +708,11 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
         raise WorkError("empty reviewer")
     if name.startswith(HUMAN_PREFIX):
         return name
-    if registry.get(db, name) is not None:
-        return name
+    # #423 : un alias se résout au nom primaire, comme l'assigné — sinon la
+    # règle « le relecteur n'est pas l'assigné » compare deux orthographes.
+    row = registry.get(db, name)
+    if row is not None:
+        return row["name"]
     cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     human = known_human(db, name, cfg)
     if human:

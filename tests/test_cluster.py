@@ -88,7 +88,7 @@ CONTENUS = {
 FERMEES = {
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
-    "agent_mesh_overview": {"roles"},
+    "agent_mesh_overview": {"roles", "aliases"},  # #423 : 0418 avant 0428 sur un schéma neuf
 }
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set()) | FERMEES.get(rel, set())
            for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES)}
