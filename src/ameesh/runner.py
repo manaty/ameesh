@@ -1097,14 +1097,24 @@ class AgentWorker(threading.Thread):
         longue que le bail (#1270, jusqu'à 600 s pour un bail de 300 s)
         dormait jusqu'à la deadline, puis `renew()` était refusé
         (`deadline_passed`) — le worker rendait le bail au lieu de reprendre
-        (R1 cx3 B1). On découpe donc au pas du battement de tour (`ttl/3`),
-        sans plancher : la tranche vaut `min(cap, ttl/3)` et ne dépasse jamais
-        l'échéance du bail. Chaque tranche est suivie d'un `renew()` par
-        l'appelant (boucle de reprise, boucle principale).
+        (R1 cx3 B1). On découpe donc au pas du battement de tour (`ttl/3`).
+        Chaque tranche est suivie d'un `renew()` par l'appelant (boucle de
+        reprise, boucle principale).
+
+        #2139 : une tranche ne doit pas seulement **ne pas dépasser**
+        l'échéance, elle doit laisser une tranche pleine pour renouveler. Se
+        borner au temps restant planifiait un réveil À l'échéance dès qu'il
+        restait moins d'une tranche : la moindre gigue d'ordonnancement
+        faisait alors voir `deadline_passed` à `renew()`, ou n'accordait à
+        l'aller-retour de base qu'un budget nul — le worker rendait un bail
+        encore valide (marges de 0,16 s mesurées sous charge, #2139). Passé ce
+        point la tranche vaut 0 : l'appelant renouvelle immédiatement, avec le
+        temps restant comme budget d'appel.
         """
         pas = (self.runner.lease_ttl / 3.0) if self.runner.lease_ttl > 0 else 3.0
         if self.lease_deadline > 0:
-            pas = min(pas, max(0.0, self.lease_deadline - time.time()))
+            reste = self.lease_deadline - time.time() - pas
+            pas = min(pas, max(0.0, reste))
         return max(0.0, min(float(cap), pas))
 
     #: réveil maximal du veilleur : il relit l'échéance au moins à ce rythme.
