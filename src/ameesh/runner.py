@@ -194,6 +194,18 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 LIVE_REVIEW_START_SLACK_S = 300.0
 #: L85 : rétention du journal d'événements, au plus une fois par heure
 EVENTS_PRUNE_EVERY_S = 3600.0
+#: #2096 : bornes de l'affichage gardé pour un tour de résumé (repli d'un flux
+#: sans `final`). Le plafond en fragments ne borne pas la taille : un flux
+#: bavard gardait des mégaoctets jusqu'au tour suivant. Seule la tête est lue
+#: (`turn_summary` la borne à `adapters.SUMMARY_MAX_CHARS`), la queue est
+#: perdue de toute façon.
+SUMMARY_DISPLAY_MAX_FRAGMENTS = 10_000
+SUMMARY_DISPLAY_MAX_CHARS = 64_000
+#: #2096 : croissance de RSS (octets) à partir de laquelle un tour rend au
+#: noyau les arènes qu'il a fait croître (pic de flux, de parsing ou de
+#: journalisation). En deçà, l'allocateur garde sa marge : un tour ordinaire ne
+#: paie pas le geste.
+TURN_TRIM_RSS_GROWTH = 32 * 1024 * 1024
 
 
 def _finite_ts(value) -> bool:
@@ -516,9 +528,11 @@ class AgentWorker(threading.Thread):
         self.last_output = ""
         #: L218 : réponse finale du dernier tour (`final` du flux, None si le
         #: flux n'en donne pas), et, pour un tour de résumé, tout son affichage
-        #: (repli d'un flux sans `final`, texte brut)
+        #: (repli d'un flux sans `final`, texte brut). #2096 : les deux sont
+        #: bornés (caractères) — voir `SUMMARY_DISPLAY_MAX_*`.
         self.last_final: str | None = None
         self.summary_display: list[str] = []
+        self._summary_chars = 0
         #: plafond de contexte (L60) : jetons d'entrée relus (cache compris) par
         #: le dernier tour inscrit au grand livre, et sa session
         self.last_turn_reread = 0
@@ -1705,6 +1719,25 @@ class AgentWorker(threading.Thread):
         texte = "\n".join(ligne for ligne in self.summary_display
                           if not ligne.startswith(adapters.END_OF_TURN_MARK))
         return adapters.bound_summary(texte)
+
+    def _keep_summary_display(self, text: str) -> bool:
+        """#2096 : garde un fragment d'affichage pour le repli de
+        `turn_summary`, dans les deux bornes (fragments et caractères). Seule
+        la tête de l'affichage est lue ensuite : la queue perdue ne change
+        rien au résumé, et le pic du tour reste borné.
+
+        Les marqueurs de fin de tour ne sont pas gardés : `turn_summary` les
+        ôte à la lecture, et un flux qui les répète ne doit pas consommer le
+        budget qui revient au vrai affichage."""
+        if text.startswith(adapters.END_OF_TURN_MARK):
+            return False
+        if len(self.summary_display) >= SUMMARY_DISPLAY_MAX_FRAGMENTS:
+            return False
+        if self._summary_chars >= SUMMARY_DISPLAY_MAX_CHARS:
+            return False
+        self.summary_display.append(text)
+        self._summary_chars += len(text) + 1  # + le "\n" du join
+        return True
 
     def _rotate(self, raison: str) -> bool:
         """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
@@ -3965,7 +3998,7 @@ class AgentWorker(threading.Thread):
         if (registry.get(self.db, self.name) or {}).get("operator_paused"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
-        from .platform import session_lock
+        from .platform import process, session_lock
         if self._attach_pending():
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
@@ -3978,6 +4011,9 @@ class AgentWorker(threading.Thread):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
         self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
+        # #2096 : le RSS avant le tour, pour ne rendre les arènes au noyau que
+        # si le tour a fait croître le processus (voir `_release_turn_memory`).
+        rss_avant = process.rss_bytes()
         try:
             return self._run_guarded_turn(spec)
         finally:
@@ -3989,6 +4025,32 @@ class AgentWorker(threading.Thread):
                 finally:
                     if self.resident is None:
                         self._release_session_lock()
+            # Après le retour de `_run_guarded_turn`, ses gros tampons sont
+            # morts (sa trame est détruite) : c'est le moment de rendre.
+            self._release_turn_memory(rss_avant)
+
+    def _release_turn_memory(self, rss_before: int | None) -> None:
+        """#2096 : rend au noyau la mémoire libre de l'allocateur après un tour
+        qui a fait croître le processus (pic de flux, de parsing ou de
+        journalisation). L'allocateur garde le plafond du pic alors que ses
+        objets sont morts : sans ce retour, le RSS d'un exécuteur ne redescend
+        jamais et la somme des exécuteurs fait basculer l'hôte sous pression.
+
+        Best-effort : ne lève jamais, et ne fait rien si la croissance du tour
+        reste sous `TURN_TRIM_RSS_GROWTH` (un tour ordinaire ne paie pas le
+        geste) ou si la plateforme ne sait pas mesurer/rendre."""
+        try:
+            from .platform import process
+            apres = process.rss_bytes()
+            if rss_before is None or apres is None or apres - rss_before < TURN_TRIM_RSS_GROWTH:
+                return
+            croissance = apres - rss_before
+            rendu = process.release_free_memory()
+            log_async("[%s] turn memory: RSS +%.1f MiB, arenas %s"
+                      % (self.name, croissance / (1024.0 * 1024.0),
+                         "returned to the kernel" if rendu else "not releasable here"))
+        except Exception as exc:  # une mesure ratée ne défait pas le tour
+            log_async("[%s] turn memory not released (%s)" % (self.name, exc))
 
     def _run_guarded_turn(self, spec: dict) -> bool:
         """Un tour. Pour un tour de courrier, protocole de remise unique :
@@ -4863,6 +4925,7 @@ class AgentWorker(threading.Thread):
         self.host_yield = None
         self.last_final = None
         self.summary_display = []
+        self._summary_chars = 0
         # L105 : plafonds pendant le tour — jetons relus (une fois par appel)
         # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
         plafonne = spec.get("prompt") != adapters.SUMMARY_PROMPT
@@ -5105,12 +5168,15 @@ class AgentWorker(threading.Thread):
                 conversation_recorder.append("input", spec.get("prompt") or "",
                                              author="ameesh:runner")
             with open(events_path, "a", encoding="utf-8") as events:
-                for line in flux:
-                    line = line.rstrip("\n")
+                for raw in flux:
+                    line = raw.rstrip("\n")
                     if not line:
                         continue
                     lignes += 1
-                    events.write(line + "\n")
+                    # #2096 : la ligne brute est écrite telle quelle (`raw` finit
+                    # par son saut de ligne) — `line + "\n"` en faisait une copie
+                    # du même ordre que le pic du tour.
+                    events.write(raw if raw.endswith("\n") else raw + "\n")
                     events.flush()
                     parsed = self._parse(adapter, line)
                     if conversation_recorder is not None:
@@ -5159,11 +5225,15 @@ class AgentWorker(threading.Thread):
                         self._compta_annonce(modele_annonce)  # persisté tout de suite
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
-                        self.last_output = (self.last_output + "\n" + text)[-4000:]
-                        if not plafonne and len(self.summary_display) < 10_000:
-                            self.summary_display.append(text)
+                        # #2096 : borner avant de concaténer — le texte affiché
+                        # peut faire des mégaoctets et la copie entière ne sert
+                        # qu'à en garder les 4 000 derniers caractères.
+                        self.last_output = (self.last_output + "\n"
+                                            + text[-4000:])[-4000:]
+                        if not plafonne:
+                            self._keep_summary_display(text)
                     if "final" in parsed:
-                        self.last_final = str(parsed["final"] or "")
+                        self.last_final = adapters.bound_final(str(parsed["final"] or ""))
                     if parsed.get("safe_point") and not clos and self.host_yield is None \
                             and self.runner.gate_holds():
                         # L159f : l'hôte se retire (tout tour, résumé compris) —
@@ -5222,6 +5292,10 @@ class AgentWorker(threading.Thread):
                         error = "lease lost during the turn"
                         self.stop_group_now("lease lost during the turn", grace=0, hard=True)
                         break
+            # #2096 : les tampons du dernier événement (ligne brute, dictionnaire
+            # parsé) ne vivent pas plus que le flux — la suite du tour (attente du
+            # harnais, compta, conversation) ne doit pas garder le pic.
+            raw, line, parsed = "", "", {}
             if rp is None:
                 if (not self.runner.once and self.turn_grace_seconds() > 0
                         and not self._urgent_end()):
