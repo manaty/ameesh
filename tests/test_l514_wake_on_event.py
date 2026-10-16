@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import ci, cli, hostcheck, mail, registry, storage, work
@@ -276,11 +277,12 @@ class DoctorHooksTest(unittest.TestCase):
     binaire n'existe pas — l'incident du 2026-10-12 (`/usr/local/bin/agent-mail`
     absent, tous les hooks dsh en 127 : aucune remise, aucun Stop)."""
 
-    def _home(self, *, binary=False) -> str:
+    def _home(self, *, binary=False, rel="agent-mail") -> str:
         home = tempfile.mkdtemp(prefix="l514-hooks-")
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         if binary:
-            path = os.path.join(home, "agent-mail")
+            path = os.path.join(home, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("#!/bin/sh\nexit 0\n")
             os.chmod(path, 0o755)
@@ -297,15 +299,17 @@ class DoctorHooksTest(unittest.TestCase):
                           for event, command in events.items()}}
 
     def _lines(self, home: str, harness: str = "deepseek",
-               manager_path: str = "") -> dict:
+               manager_path: str = "", environ: dict | None = None) -> dict:
         """Les lignes du doctor ; `manager_path` remplace le PATH du
         gestionnaire systemd (vide : celui de la session du doctor, le
-        comportement d'avant #514 N2)."""
+        comportement d'avant #514 N2) ; `environ` s'ajoute à l'environnement
+        du harnais (HOME, pour les chemins `$HOME` des hooks)."""
         variable = {"deepseek": "DSH_HOME", "codex": "CODEX_HOME",
                     "claude": "CLAUDE_CONFIG_DIR"}[harness]
+        env = {variable: home, **(environ or {})}
         with mock.patch.object(hostcheck.adapters, "systemd_manager_path",
                                return_value=manager_path):
-            return hostcheck.hook_lines(None, [harness], environ={variable: home})
+            return hostcheck.hook_lines(None, [harness], environ=env)
 
     def test_hook_commands_reads_the_nested_format(self):
         document = self._document({"PostToolUse": "bin/agent-mail hook deepseek"})
@@ -325,6 +329,63 @@ class DoctorHooksTest(unittest.TestCase):
         texte = "\n".join(out["lines"])
         self.assertIn(missing, texte)
         self.assertIn("127", texte)
+
+    def test_hook_binaire_sous_home_variable_est_trouve(self):
+        """Incident staging b9a2 (16/10) : un hook écrit `$HOME/.local/bin/
+        agent-mail` ; `expanduser` seul ne développe pas la variable, le
+        binaire passait pour absent (faux KO). Le chemin est résolu sans
+        exécuter de shell."""
+        home = self._home(binary=True, rel=os.path.join(".local", "bin", "agent-mail"))
+        for command in ("$HOME/.local/bin/agent-mail hook deepseek",
+                        "${HOME}/.local/bin/agent-mail hook deepseek"):
+            with self.subTest(command=command):
+                self._write(home, self._document({"PostToolUse": command,
+                                                  "Stop": command}))
+                out = self._lines(home, environ={"HOME": home})
+                self.assertTrue(out["ok"], out["lines"])
+                self.assertNotIn("127", "\n".join(out["lines"]))
+
+    def test_hook_binaire_sous_home_variable_absent_reste_ko(self):
+        """La variable développée vers un chemin absent reste un KO : la
+        résolution ne masque jamais un vrai binaire manquant."""
+        home = self._home(binary=True, rel=os.path.join(".local", "bin", "agent-mail"))
+        self._write(home, self._document(
+            {"PostToolUse": "$HOME/.local/bin/missing-agent-mail hook deepseek"}))
+        out = self._lines(home, environ={"HOME": home})
+        self.assertFalse(out["ok"])
+        self.assertIn("127", "\n".join(out["lines"]))
+
+    def test_hook_variable_non_definie_reste_litterale_et_ko(self):
+        """Une variable non définie n'est pas remplacée en silence : le chemin
+        littéral `$VAR/...` reste contrôlé et signalé absent."""
+        home = self._home()
+        self._write(home, self._document(
+            {"PostToolUse": "$AMEESH_L514_ABSENT/agent-mail hook deepseek"}))
+        out = self._lines(home, environ={"HOME": home})
+        self.assertFalse(out["ok"])
+        self.assertIn("AMEESH_L514_ABSENT", "\n".join(out["lines"]))
+
+    def test_binary_missing_developpe_les_variables_du_hook(self):
+        """Le contrôle unitaire résout `$HOME` et `${HOME}` avec
+        l'environnement reçu ; absent ou non définie reste manquant."""
+        home = self._home(binary=True, rel=os.path.join(".local", "bin", "agent-mail"))
+        environ = {"HOME": home}
+        self.assertFalse(hostcheck._binary_missing(
+            "$HOME/.local/bin/agent-mail", environ=environ))
+        self.assertFalse(hostcheck._binary_missing(
+            "${HOME}/.local/bin/agent-mail", environ=environ))
+        self.assertTrue(hostcheck._binary_missing(
+            "$HOME/.local/bin/absent-agent-mail", environ=environ))
+        self.assertTrue(hostcheck._binary_missing(
+            "$AMEESH_L514_ABSENT/agent-mail", environ=environ))
+
+    def test_chemins_litteraux_existants_restent_ok(self):
+        """Un chemin littéral existant n'est pas touché par la résolution."""
+        home = self._home(binary=True)
+        command = os.path.join(home, "agent-mail") + " hook deepseek"
+        self._write(home, self._document({"PostToolUse": command}))
+        out = self._lines(home)
+        self.assertTrue(out["ok"], out["lines"])
 
     def test_binary_missing_sous_le_path_du_gestionnaire_est_ko(self):
         """#514 N2 : le gestionnaire systemd peut lancer les harnais avec SON
@@ -412,6 +473,34 @@ class DoctorHooksTest(unittest.TestCase):
         out = self._lines(home)
         self.assertFalse(out["ok"])
         self.assertIn("unreadable", "\n".join(out["lines"]))
+
+
+class SenderVeilleTest(unittest.TestCase):
+    """Incident staging b9a2 : le registre portait une ligne `veille` —
+    l'identité d'ENVOI de la consigne de veille (`watch.SENDER`), mode
+    `execute`, jamais de session ni de tour — que le doctor servait comme un
+    agent, d'où un harnais `other` inconnu en KO. La ligne est écartée
+    nommément ; un vrai agent à harnais inconnu garde son KO."""
+
+    @staticmethod
+    def _row(name: str, harness: str) -> dict:
+        return {"name": name, "harness": harness, "host": "vm", "mode": "execute",
+                "status": "idle"}
+
+    def test_le_sender_de_veille_n_est_pas_un_agent_servi(self):
+        rows = [self._row("veille", "other"), self._row("impl-x", "deepseek")]
+        with mock.patch.object(hostcheck.registry, "overview", return_value=rows):
+            served = hostcheck.served_agents(SimpleNamespace(host="vm"), None)
+        self.assertEqual([row["name"] for row in served], ["impl-x"])
+
+    def test_un_harnais_inconnu_reel_reste_ko(self):
+        rows = [self._row("veille", "other"), self._row("impl-inconnu", "other")]
+        with mock.patch.object(hostcheck.registry, "overview", return_value=rows):
+            served = hostcheck.served_agents(SimpleNamespace(host="vm"), None)
+            items = hostcheck.harness_report(served)
+        self.assertEqual([item["harness"] for item in items], ["other"])
+        self.assertEqual(items[0]["agents"], ["impl-inconnu"])
+        self.assertFalse(items[0]["ok"])
 
 
 if __name__ == "__main__":
