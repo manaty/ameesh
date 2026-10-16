@@ -153,6 +153,11 @@ def health_report(db, cfg: Config, profile, request, *, environ=None, run=None,
 
     L'interface ne change pas (`host_preflight` lit la même table) ; seule
     l'alimentation est nouvelle. Rend l'état de la sonde, `""` si inconnu.
+
+    La source enregistrée est `sentinel` : c'est la même sonde, écrite par le
+    même chemin que la passe à la demande `ameesh accounts check`, et la
+    contrainte `credential_health_source_check` n'admet que
+    `sentinel | turn | manual | relay` (trouvé par le témoin de bout en bout #366).
     """
     from . import storage
     verdict = probe_health(cfg, profile, request.harness, environ=environ, run=run, now=now)
@@ -161,7 +166,7 @@ def health_report(db, cfg: Config, profile, request, *, environ=None, run=None,
     store = storage.of(db).credentials
     current = (store.health(cfg.host, request.harness) or {}).get(request.account) or {}
     store.report(cfg.host, request.harness, request.account, verdict.state,
-                 reason=verdict.text(), source="login", expires_at=verdict.expires_at,
+                 reason=verdict.text(), source="sentinel", expires_at=verdict.expires_at,
                  fingerprint=verdict.fingerprint,
                  expect_failures=int(current.get("failures") or 0))
     return verdict.state

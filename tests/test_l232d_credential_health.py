@@ -130,7 +130,10 @@ class HealthReportTest(unittest.TestCase):
         (host, harness, account, written, kwargs), = self.credentials.calls
         self.assertEqual((host, harness, account, written),
                          ("host-1", "codex", "default", "healthy"))
-        self.assertEqual(kwargs["source"], "login")     # jamais « sentinel »
+        # valeur admise par credential_health_source_check : le témoin E2E #366 a
+        # montré que « login » viole la contrainte, et `ameesh accounts check`
+        # écrit déjà « sentinel » avec exactement les mêmes sondes
+        self.assertEqual(kwargs["source"], "sentinel")
         self.assertEqual(kwargs["expect_failures"], 3)  # l'historique est conservé
         self.assertIn("refresh token present", kwargs["reason"])
         self.assertIsNotNone(kwargs["fingerprint"])
