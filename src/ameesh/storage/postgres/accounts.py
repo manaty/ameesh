@@ -109,6 +109,15 @@ class Accounts(interface.Accounts):
                     " set until_ts = excluded.until_ts, reason = excluded.reason,"
                     " created_at = now()",
                     (host, harness, depart, hold_until, hold_reason))
+            # #1883 (R2 auditeur, B2) : les retenues ÉCHUES de la cible sont
+            # nettoyées DANS la transaction, sous le même verrou. Un DELETE
+            # après le commit effacerait une retenue publiée entre-temps par un
+            # autre runner (sa bascule attend le verrou, donc passe après) ;
+            # une retenue VALIDE, elle, a déjà refusé la bascule plus haut.
+            tx.execute(
+                "delete from account_holds where host = %s and harness = %s"
+                " and account = %s and (until_ts is null or until_ts <= %s)",
+                (host, harness, to, now))
         return True
 
     def set_auto(self, host, harness, *, reason, expected=None) -> bool:

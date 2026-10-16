@@ -1504,7 +1504,6 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     active = by_name(items, active_name) or items[0]
     # L226b : un compte en échec d'authentification n'est jamais choisi
     sick = auth_failure.failing(db, host, harness)
-    candidates = healthy(items, sick)
     # L226b/#1883 (R1 auditeur, B1) : les retenues d'overage publiées par les
     # AUTRES processus de l'hôte sont lues EN TÊTE et priment sur tout
     # placement — forçage, continuité comme classement. Un compte facturé
@@ -1513,180 +1512,214 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # nom) : c'est le contrat « jamais de dépassement ».
     retenus = _held_for_overage(store, host, harness, now)
 
-    # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
-    # échec d'authentification est rendu tel quel : la garde de l'exécuteur
-    # bloque l'agent, elle ne bascule pas contre un geste humain)
-    def forced(profile: Profile) -> Choice:
-        current = ev(profile)
-        if profile.name in retenus:
-            return Choice(None, profile, reason=(
-                "account %s forced (ameesh accounts use): in overage for another "
-                "runner of this host" % profile.name), forced=True)
-        if current.ok or (not paced and current.unpaced_ok):
-            return Choice(profile, profile, forced=True,
-                          why="forced (ameesh accounts use)")
-        return Choice(None, profile, reason="account %s forced (ameesh accounts use): %s"
-                      % (profile.name, current.reason), forced=True)
+    # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu de
+    # retenues ; `choose` la rejoue sur un jeu FRAIS avant de rendre un
+    # compte (voir la reprise après l'appel).
+    def decide(retenus: set[str]) -> Choice:
+        """La décision de placement pour un jeu de retenues donné.
 
-    if row.get("forced"):
-        held = forced(active)
-        if held.profile is not None:
-            return held
-        # L226b (bureau, 2026-10-12): a forced account at its threshold does
-        # not hold the agent while another healthy account is under its own —
-        # the force is lifted (journaled `auto`) and the automatic choice runs.
-        # #1672 : le remplaçant doit être réellement plaçable — un compte à
-        # relevé périmé ne lève pas le forçage pour une pause.
-        free = [p for p in candidates if p.name != active.name
-                and p.name not in retenus
-                and placeable(ev(p), now)
-                and (ev(p).ok if paced else ev(p).unpaced_ok)]
-        if critical:
-            pass        # L242b : choix propre à l'agent, le forçage reste aux autres
-        elif not free:
-            return held
-        elif not simulate and not store.set_auto(
-                host, harness, expected=active.name,
-                reason="forced account %s at threshold (%s); %s free"
-                % (active.name, cache[active.name].reason, free[0].name)):
-            # #295: the row changed since it was read — a human forced another
-            # account meanwhile: that force holds (never lifted in the same turn)
-            row = store.active(host, harness) or {}
-            now_forced = by_name(items, row.get("account"))
-            if row.get("forced") and now_forced is not None:
-                return forced(now_forced)
+        Un compte retenu ne reçoit aucun tour : les retenues publiées pour
+        l'hôte priment sur le forçage, la continuité et le classement.
+        Le jeu est relu à l'instant du placement (R2 auditeur, B1)."""
+        nonlocal row, cache
+        candidates = healthy(items, sick)
 
-    # 2. continuité : la session garde son compte tant qu'il est sous son seuil
-    # (les autres comptes ne sont alors pas relus : rien à choisir). Un compte
-    # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
-    # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
-    own = by_name(items, session_account) if session_account else None
-    if own is not None and own in candidates and own.name not in retenus and ev(own).ok:
-        return Choice(own, active, kept=True,
-                      why="continuity: the session stays on %s, under its threshold" % own.name)
-    for profile in items:
-        ev(profile)
-    if retenus:  # #1883 : jamais de placement sur un compte qu'un autre runner a fui en dépassement
-        candidates = [p for p in candidates if p.name not in retenus]
-    # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
-    ranked = rank(candidates, cache, now)
-    if not ranked and not paced:
-        # L226b: past its pace a healthy account stays usable, never past an
-        # absolute rule
-        ranked = rank(candidates, cache, now, paced=False)
-    beyond = False
-    if not ranked and critical:
-        # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
-        # agent critique seulement, en dernier (jamais en overage) ; au retour
-        # d'un emprunt, avec la même marge (#389 r2)
-        relaxed = dict(cache)
-        for profile in candidates:
-            if profile.default and profile.cap is None:
-                relaxed[profile.name] = evaluate(book, profile, items, now, environ,
-                                                 record=False, critical=True,
-                                                 reserve=margin)
-        # le rythme tient ici même garde désactivée (#324 r1)
-        ranked = rank(candidates, relaxed, now)
-        if ranked:
-            beyond = True
-            cache = relaxed
-    if not ranked:
-        blocked = [p for p in items if p.name in sick
-                   and (cache[p.name].ok if paced else cache[p.name].unpaced_ok)]
-        if blocked:
-            # L226b : des comptes sous leur seuil, mais aucun sain — jamais de
-            # repli payé en plus : le compte en panne est rendu, la garde de
-            # l'exécuteur tient l'agent en `auth_blocked` et l'alerte part
-            stuck = active if active in blocked else blocked[0]
-            return Choice(stuck, active, auth_blocked=True,
-                          why="no healthy %s account: %s" % (
-                              harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
-                                  "reason") or "authentication failing")
-                                  for p in items if p.name in sick)))
-        # #1672 : un relevé plus vieux que toute fenêtre encore ouverte est
-        # écarté du placement — le dire, plutôt que de le compter comme « au
-        # seuil » (le relevé ne mesure plus l'état du compte). C'est une
-        # prudence sur une information ancienne, pas la preuve d'un quota.
-        # la remise à zéro la plus proche d'une fenêtre encore ouverte rouvre
-        # le compte (L71) : l'annoncer, comme pause_label le fait au seuil
-        from .cost import until_label
-        withheld = ["%s until %s" % (p.name, until_label(min(
-                        float(g.resets_at) for g in cache[p.name].gauges
-                        if g.resets_at and not g.reset_passed(now)), now))
-                    for p in items
-                    if p.name not in sick and cache[p.name].gauges
-                    and reading_outdated(cache[p.name].gauges, now)]
-        why = "%sall %s accounts at threshold — %s" % (
-            pause_label(cache), harness, _label(cache))
+        # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
+        # échec d'authentification est rendu tel quel : la garde de l'exécuteur
+        # bloque l'agent, elle ne bascule pas contre un geste humain)
+        def forced(profile: Profile) -> Choice:
+            current = ev(profile)
+            if profile.name in retenus:
+                return Choice(None, profile, reason=(
+                    "account %s forced (ameesh accounts use): in overage for another "
+                    "runner of this host" % profile.name), forced=True)
+            if current.ok or (not paced and current.unpaced_ok):
+                return Choice(profile, profile, forced=True,
+                              why="forced (ameesh accounts use)")
+            return Choice(None, profile, reason="account %s forced (ameesh accounts use): %s"
+                          % (profile.name, current.reason), forced=True)
+
+        if row.get("forced"):
+            held = forced(active)
+            if held.profile is not None:
+                return held
+            # L226b (bureau, 2026-10-12): a forced account at its threshold does
+            # not hold the agent while another healthy account is under its own —
+            # the force is lifted (journaled `auto`) and the automatic choice runs.
+            # #1672 : le remplaçant doit être réellement plaçable — un compte à
+            # relevé périmé ne lève pas le forçage pour une pause.
+            free = [p for p in candidates if p.name != active.name
+                    and p.name not in retenus
+                    and placeable(ev(p), now)
+                    and (ev(p).ok if paced else ev(p).unpaced_ok)]
+            if critical:
+                pass        # L242b : choix propre à l'agent, le forçage reste aux autres
+            elif not free:
+                return held
+            elif not simulate and not store.set_auto(
+                    host, harness, expected=active.name,
+                    reason="forced account %s at threshold (%s); %s free"
+                    % (active.name, cache[active.name].reason, free[0].name)):
+                # #295: the row changed since it was read — a human forced another
+                # account meanwhile: that force holds (never lifted in the same turn)
+                row = store.active(host, harness) or {}
+                now_forced = by_name(items, row.get("account"))
+                if row.get("forced") and now_forced is not None:
+                    return forced(now_forced)
+
+        # 2. continuité : la session garde son compte tant qu'il est sous son seuil
+        # (les autres comptes ne sont alors pas relus : rien à choisir). Un compte
+        # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
+        # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
+        own = by_name(items, session_account) if session_account else None
+        if (own is not None and own in candidates and own.name not in retenus
+                and ev(own).ok):
+            return Choice(own, active, kept=True,
+                          why="continuity: the session stays on %s, under its "
+                              "threshold" % own.name)
+        for profile in items:
+            ev(profile)
+        # #1883 : jamais de placement sur un compte qu'un autre runner a fui
+        # en dépassement
         if retenus:
-            why = ("%sno %s account to place: %s held for overage seen on this "
-                   "host — %s" % (pause_label(cache), harness,
-                                  ", ".join(sorted(retenus)), _label(cache)))
-        elif withheld:
-            why = ("%sno %s account to place: reading older than every open "
-                   "window (%s) — %s" % (pause_label(cache), harness,
-                                         ", ".join(withheld), _label(cache)))
-        return Choice(None, active, reason=why)
-    target = ranked[0]
-    why = reason_of(ranked, cache, now)
-    if beyond:
-        why = ("critical agent: %s beyond its %.0f%% cap, every other account at "
-               "threshold (owner decision 2026-10-12); %s" % (
-                   target.name, PRIMARY_CAP * 100, why))
-    left = own if own is not None else (active if target.name != active.name else None)
-    if left is not None and left.name in sick:
-        why = "%s authentication failing (%s); %s" % (
-            left.name, sick[left.name].get("reason") or "?", why)
-    elif left is not None and not cache[left.name].ok:
-        why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
-    if critical:
-        # L242b : jamais le dernier choix partagé ; la bascule est celle de
-        # l'agent (depuis le compte de sa session, sinon le choix partagé)
-        origin = own if own is not None else active
-        moved = None
-        if target.name != origin.name:
-            moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
-        return Choice(target, active, switched=moved, why=why, per_agent=True)
-    if target.name == active.name:
-        # #1883 (R1 auditeur, B2) : rien n'est écrit ici — relire la retenue au
-        # dernier moment, sinon un instantané périmé (retenue publiée par un
-        # autre runner après la lecture en tête) ferait partir le tour sur un
-        # compte qu'on vient de fuir en dépassement.
+            candidates = [p for p in candidates if p.name not in retenus]
+        # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
+        ranked = rank(candidates, cache, now)
+        if not ranked and not paced:
+            # L226b: past its pace a healthy account stays usable, never past an
+            # absolute rule
+            ranked = rank(candidates, cache, now, paced=False)
+        beyond = False
+        if not ranked and critical:
+            # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
+            # agent critique seulement, en dernier (jamais en overage) ; au retour
+            # d'un emprunt, avec la même marge (#389 r2)
+            relaxed = dict(cache)
+            for profile in candidates:
+                if profile.default and profile.cap is None:
+                    relaxed[profile.name] = evaluate(book, profile, items, now, environ,
+                                                     record=False, critical=True,
+                                                     reserve=margin)
+            # le rythme tient ici même garde désactivée (#324 r1)
+            ranked = rank(candidates, relaxed, now)
+            if ranked:
+                beyond = True
+                cache = relaxed
+        if not ranked:
+            blocked = [p for p in items if p.name in sick
+                       and (cache[p.name].ok if paced else cache[p.name].unpaced_ok)]
+            if blocked:
+                # L226b : des comptes sous leur seuil, mais aucun sain — jamais de
+                # repli payé en plus : le compte en panne est rendu, la garde de
+                # l'exécuteur tient l'agent en `auth_blocked` et l'alerte part
+                stuck = active if active in blocked else blocked[0]
+                return Choice(stuck, active, auth_blocked=True,
+                              why="no healthy %s account: %s" % (
+                                  harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
+                                      "reason") or "authentication failing")
+                                      for p in items if p.name in sick)))
+            # #1672 : un relevé plus vieux que toute fenêtre encore ouverte est
+            # écarté du placement — le dire, plutôt que de le compter comme « au
+            # seuil » (le relevé ne mesure plus l'état du compte). C'est une
+            # prudence sur une information ancienne, pas la preuve d'un quota.
+            # la remise à zéro la plus proche d'une fenêtre encore ouverte rouvre
+            # le compte (L71) : l'annoncer, comme pause_label le fait au seuil
+            from .cost import until_label
+            withheld = ["%s until %s" % (p.name, until_label(min(
+                            float(g.resets_at) for g in cache[p.name].gauges
+                            if g.resets_at and not g.reset_passed(now)), now))
+                        for p in items
+                        if p.name not in sick and cache[p.name].gauges
+                        and reading_outdated(cache[p.name].gauges, now)]
+            why = "%sall %s accounts at threshold — %s" % (
+                pause_label(cache), harness, _label(cache))
+            if retenus:
+                why = ("%sno %s account to place: %s held for overage seen on this "
+                       "host — %s" % (pause_label(cache), harness,
+                                      ", ".join(sorted(retenus)), _label(cache)))
+            elif withheld:
+                why = ("%sno %s account to place: reading older than every open "
+                       "window (%s) — %s" % (pause_label(cache), harness,
+                                             ", ".join(withheld), _label(cache)))
+            return Choice(None, active, reason=why)
+        target = ranked[0]
+        why = reason_of(ranked, cache, now)
+        if beyond:
+            why = ("critical agent: %s beyond its %.0f%% cap, every other account at "
+                   "threshold (owner decision 2026-10-12); %s" % (
+                       target.name, PRIMARY_CAP * 100, why))
+        left = own if own is not None else (active if target.name != active.name else None)
+        if left is not None and left.name in sick:
+            why = "%s authentication failing (%s); %s" % (
+                left.name, sick[left.name].get("reason") or "?", why)
+        elif left is not None and not cache[left.name].ok:
+            why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
+        if critical:
+            # L242b : jamais le dernier choix partagé ; la bascule est celle de
+            # l'agent (depuis le compte de sa session, sinon le choix partagé)
+            origin = own if own is not None else active
+            moved = None
+            if target.name != origin.name:
+                moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
+            return Choice(target, active, switched=moved, why=why, per_agent=True)
+        if target.name == active.name:
+            # #1883 (R2 auditeur, B1) : rien n'est écrit ici — c'est le point de
+            # validation de `choose` qui relit la retenue de ce retour, comme de
+            # tous les autres.
+            return Choice(target, active, why=why)
+        switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}
+        if simulate:
+            return Choice(target, target, switched=switched, why=why)
+        # L226b/#1883 (R1 auditeur, B2) : la retenue valide sur la CIBLE est
+        # revérifiée DANS la transaction de bascule, sous le même verrou que les
+        # autres workers — un classement sur un instantané périmé ne fait jamais
+        # partir un tour sur un compte retenu. La retenue du compte quitté en
+        # dépassement est posée dans la MÊME transaction.
+        left_ev = cache.get(active.name)
+        quitte_en_overage = left_ev is not None and in_overage(left_ev.gauges, now)
+        if store.switch_guarded(
+                host, harness, expected=active.name, to=target.name, kind="bascule",
+                reason=why, agent=agent, now=now,
+                hold_reason=_overage_reason(harness, agent) if quitte_en_overage else None,
+                hold_until=(now + OVERAGE_HOLD_S) if quitte_en_overage else None):
+            # #1883 (R2 auditeur, B2) : les retenues échues de la cible sont
+            # nettoyées DANS la transaction de bascule, sous le verrou ; un
+            # `release` ici effacerait une retenue publiée après la validation.
+            return Choice(target, target, switched=switched, why=why)
+        # refusée : un autre worker a changé le compte, ou une retenue est apparue
+        # sur la cible entre le classement et la bascule. Ne JAMAIS rendre une
+        # cible retenue : le tour partirait facturé au-delà du forfait.
+        fresh = store.active(host, harness) or {}
         if target.name in _held_for_overage(store, host, harness, now):
-            return Choice(None, active,
-                          reason="no %s account to place: %s held for overage seen "
-                                 "on this host" % (harness, target.name))
-        return Choice(target, active, why=why)
-    switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}
-    if simulate:
-        return Choice(target, target, switched=switched, why=why)
-    # L226b/#1883 (R1 auditeur, B2) : la retenue valide sur la CIBLE est
-    # revérifiée DANS la transaction de bascule, sous le même verrou que les
-    # autres workers — un classement sur un instantané périmé ne fait jamais
-    # partir un tour sur un compte retenu. La retenue du compte quitté en
-    # dépassement est posée dans la MÊME transaction.
-    left_ev = cache.get(active.name)
-    quitte_en_overage = left_ev is not None and in_overage(left_ev.gauges, now)
-    if store.switch_guarded(
-            host, harness, expected=active.name, to=target.name, kind="bascule",
-            reason=why, agent=agent, now=now,
-            hold_reason=_overage_reason(harness, agent) if quitte_en_overage else None,
-            hold_until=(now + OVERAGE_HOLD_S) if quitte_en_overage else None):
-        store.release(host, harness, target.name)  # retenue d'avant 0034, s'il en reste
-        return Choice(target, target, switched=switched, why=why)
-    # refusée : un autre worker a changé le compte, ou une retenue est apparue
-    # sur la cible entre le classement et la bascule. Ne JAMAIS rendre une
-    # cible retenue : le tour partirait facturé au-delà du forfait.
-    fresh = store.active(host, harness) or {}
-    if target.name in _held_for_overage(store, host, harness, now):
-        return Choice(None, by_name(items, fresh.get("account")) or active,
-                      reason="no %s account to place: %s held for overage seen on "
-                             "this host" % (harness, target.name))
-    # course : un forçage posé entre-temps prime, évalué comme en 1 (L226b :
-    # un primaire au-dessus de son plafond ou un compte en overage n'est pas lancé)
-    if fresh.get("forced"):
-        return forced(by_name(items, fresh.get("account")) or active)
-    return Choice(target, by_name(items, fresh.get("account")) or target, why=why)
+            return Choice(None, by_name(items, fresh.get("account")) or active,
+                          reason="no %s account to place: %s held for overage seen on "
+                                 "this host" % (harness, target.name))
+        # course : un forçage posé entre-temps prime, évalué comme en 1 (L226b :
+        # un primaire au-dessus de son plafond ou un compte en overage n'est pas lancé)
+        if fresh.get("forced"):
+            return forced(by_name(items, fresh.get("account")) or active)
+        return Choice(target, by_name(items, fresh.get("account")) or target, why=why)
+
+    # #1883 (R2 auditeur, B1) : point unique de validation de TOUT retour qui
+    # lance un tour (hors `auth_blocked`, que la garde de l'exécuteur ne lance
+    # pas). Les retenues sont relues à l'instant du placement, après la lecture
+    # des jauges comme après la bascule : un compte qu'un autre runner de l'hôte
+    # vient de fuir en dépassement ne reçoit pas de tour, même si le forçage, la
+    # continuité ou le classement l'ont retenu sur un instantané périmé (deux
+    # configurations peuvent lire deux dossiers sous le même nom).
+    choice = decide(retenus)
+    if choice.profile is not None and not choice.auth_blocked:
+        frais = _held_for_overage(store, host, harness, now)
+        if choice.profile.name in frais:
+            # une seule reprise : la décision est rejouée sur l'état frais —
+            # forçage levé pour un compte libre, continuité rompue, compte
+            # écarté du classement. Le compte actif partagé est relu : une
+            # bascule de la première décision a pu le déplacer.
+            row = store.active(host, harness) or row
+            active_name = row.get("account")
+            active = by_name(items, active_name) or active
+            choice = decide(frais)
+    return choice
 
 
 def healthy(items: list[Profile], sick: dict) -> list[Profile]:
