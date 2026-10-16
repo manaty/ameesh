@@ -90,6 +90,9 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 # L226b/#1883 : un compte de forfait facturé au-delà du plan —
+                 # l'owner le sait tout de suite, la règle est « jamais de dépassement »
+                 "account_overage",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
