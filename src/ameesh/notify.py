@@ -1015,7 +1015,10 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "decision", "grouped",
          # #789 t2 (canon §9) : un P1 garde son niveau et ses cibles dans
          # l'état — la livraison au propriétaire et la résolution les relisent
-         "critical", "targets")
+         "critical", "targets",
+         # #1901 : l'hôte qui a observé l'alerte (porte d'hôte) reste dans
+         # l'état — une famille non relue ne résout pas ses alertes
+         "observation_host")
 
 
 # --------------------------------------------------------------------------
@@ -1054,20 +1057,27 @@ class Notifier:
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
                  ) -> list:
         from . import alert_ack
+        from .mediated_executor import availability
         observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         now = float(self.clock())
+        #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
+        #: au registre illisible) ; une alerte absente d'un relevé incomplet
+        #: n'est pas résolue pour autant.
+        unreadable: list[str] = []
         if current is None:
             # #1179 : la console du pool local n'est pas lue par la passe
             # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
             # seul juge de ses alertes. Une console illisible n'y échoue plus.
             current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
+                                          unreadable=unreadable,
                                           **(thresholds or {}))
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
         acknowledgements = alert_ack.reconcile(
             db, current, observed_ts=observed_ts, dry_run=self.dry_run,
-            observation_host=getattr(self.cfg, "host", None)) if db is not None else []
+            observation_host=getattr(self.cfg, "host", None),
+            unreadable=unreadable) if db is not None else []
         # Reuse each subject's route for acknowledgement and group membership;
         # lot/package lookups belong to this snapshot, not to every projection.
         routes = {id(a): router.resolve(a) for a in current}
@@ -1113,6 +1123,14 @@ class Notifier:
                 # #1179 : ces alertes appartiennent à `run_local_pass`, seul à
                 # pouvoir les résoudre ; ne pas les voir ici n'est pas une
                 # preuve de résolution.
+                continue
+            observer = entry["alert"].get("observation_host")
+            if (availability.GATE_FAMILY in unreadable
+                    and entry["alert"].get("type") in availability.ALERT_TYPES
+                    and observer in (None, getattr(self.cfg, "host", None))):
+                # #1901 : la famille « porte d'hôte » n'a pas été lue par cette
+                # passe ; ni résolution ni acquittement invalidé sur une absence.
+                # L'état antérieur à #1901 ne gardait pas observation_host.
                 continue
             del active[key]
             if self._acknowledged(entry, acknowledgements):
