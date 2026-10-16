@@ -60,7 +60,8 @@ import subprocess
 import tempfile
 
 from . import plan_git, storage, work
-from .canon import FETCH_TIMEOUT, GIT_TIMEOUT, GitError, _git, _git_env
+from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git,
+                    _git_env)
 
 REF_PREFIX = "refs/ameesh/resolutions/"
 #: fallback for hosts that refuse refs outside `refs/heads`
@@ -100,8 +101,9 @@ def branch_name(lot: int, other: int) -> str:
 # --------------------------------------------------------------------------
 
 def _run(cwd: str, *args: str, timeout: float = GIT_TIMEOUT,
-         stdin: bytes | None = None) -> subprocess.CompletedProcess:
-    return _git(cwd, *args, stdin=stdin, timeout=timeout)
+         stdin: bytes | None = None,
+         env_extra: dict | None = None) -> subprocess.CompletedProcess:
+    return _git(cwd, *args, stdin=stdin, timeout=timeout, env_extra=env_extra)
 
 
 def _text(proc) -> str:
@@ -364,12 +366,16 @@ def _ensure_commit(repo: str, row: dict) -> bool:
     """Makes the recorded resolution commit available locally (fetched from
     `origin` when it was prepared on another host)."""
     sha = row["commit_sha"]
-    if _run(repo, "cat-file", "-e", sha + "^{commit}").returncode == 0:
+    # #1749 : les deux sondes de présence restent locales ; le fetch explicite
+    # ci-dessous est le seul pas réseau.
+    if _run(repo, "cat-file", "-e", sha + "^{commit}",
+            env_extra=NO_LAZY_FETCH).returncode == 0:
         return True
     if row.get("ref"):
         source = row["ref"] if row["ref"].startswith("refs/") else "refs/heads/" + row["ref"]
         _run(repo, "fetch", "--quiet", "origin", source, timeout=FETCH_TIMEOUT)
-    return _run(repo, "cat-file", "-e", sha + "^{commit}").returncode == 0
+    return _run(repo, "cat-file", "-e", sha + "^{commit}",
+                env_extra=NO_LAZY_FETCH).returncode == 0
 
 
 def _status(path: str) -> list[str]:

@@ -256,6 +256,28 @@ class ReleasedWakeTest(PgTestCase):
         self.assertIn("Dependency released: back to intake (no assignee, #1668)", notes)
         self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
 
+    def test_a_pinned_blocked_dependent_is_not_released_by_a_legacy_closure(self):
+        """#1922/B4 (relecture Claude) : la réouverture historique ne lève pas
+        une retenue du registre Process. Un lot pinné, non assigné, retenu
+        `blocked` par le registre (vérifié par C) et dont le dernier
+        prérequis tombe restait rouvert `intake` : la retenue tombait sans
+        commande `release` ni vérificateur C, et l'étape restait (ex. review
+        avec state intake). Filtre `workflow_ref` dans le SQL."""
+        self.assign(self.a, None)
+        self.db.execute(
+            "UPDATE work_items SET state = 'blocked', workflow_ref = %s,"
+            " workflow_stage = 'review', workflow_version = 1 WHERE id = %s",
+            ("acme/process-workflow@0f1e2d3c", self.a))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        row = self.db.query(
+            "SELECT state, workflow_stage FROM work_items WHERE id = %s", (self.a,))[0]
+        self.assertEqual(row["state"], "blocked")
+        self.assertEqual(row["workflow_stage"], "review")
+        notes = [e["note"] for e in work.events(self.db, self.a)]
+        self.assertNotIn("Dependency released: back to intake (no assignee, #1668)", notes)
+        self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
+
     def test_an_assigned_blocked_dependent_keeps_its_state(self):
         """#1668 : un lot assigné garde son état — le courrier de réveil porte
         le geste à son agent, qui juge la suite (pas de réouverture forcée)."""
