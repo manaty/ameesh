@@ -859,7 +859,7 @@ class WorkItems(interface.WorkItems):
         )
 
     def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
-                      on_frozen=None, after_commit=None) -> dict:
+                      on_frozen=None, after_commit=None, proof=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
         s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
 
@@ -877,7 +877,11 @@ class WorkItems(interface.WorkItems):
         publierait le fil avant le commit externe — un rollback laisserait des
         traces sans gel ni marque (revue codex cx2, B2). Sans callback ni
         liste, rien ne change : le gel branché par défaut ne désigne personne.
-        Un `on_frozen` sur un autre kind est refusé."""
+        Un `on_frozen` sur un autre kind est refusé.
+
+        `proof` (facultatif, #1465) : quand il porte un sha complet, sa ligne de
+        provenance est écrite dans la MÊME transaction — le fait et sa preuve
+        naissent ensemble, ou pas du tout. Indépendant du callback de gel."""
         if on_frozen is not None and kind != "frozen":
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
@@ -894,6 +898,14 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if proof and proof.get("sha"):
+                tx.execute(
+                    "INSERT INTO provenance_receipts"
+                    "       (subject, sha, actor, session, turn, harness, work_item_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (subject) DO NOTHING",
+                    ("milestone:%d" % int(milestone["id"]), proof["sha"], proof["actor"],
+                     proof["session"], proof["turn"], proof["harness"], int(item_id)))
             if on_frozen is not None:
                 on_frozen(tx, milestone, threads)
         return milestone
