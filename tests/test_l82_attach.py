@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import uuid
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import adapters, attach, harnesses, mail, registry, reprise, resident_runner
@@ -23,6 +24,16 @@ from .test_l75_resident import claude_doc
 
 
 class DeadlineTest(unittest.TestCase):
+    def test_a_short_probe_is_not_refused_as_an_attached_session(self):
+        with tempfile.TemporaryDirectory() as state:
+            probe = session_lock.try_lock(state, "attach-request")
+            self.addCleanup(probe.close)
+            cfg = SimpleNamespace(agent_dir=lambda _name: state)
+            with mock.patch("ameesh.runner.time.sleep", side_effect=lambda _: probe.close()), \
+                    mock.patch("ameesh.runner._run_attach", return_value=0) as run:
+                self.assertEqual(run_attach(cfg, object(), "probe82"), 0)
+            run.assert_called_once()
+
     def test_duration_and_notice_are_monotonic(self):
         self.assertEqual(attach.duration("2h"), 7200)
         self.assertEqual(attach.duration("30m"), 1800)
@@ -183,16 +194,25 @@ class AttachTest(PgTestCase):
             mail.send(self.db, "source", "att82", "queued during attach")
             result = []
             original_claim = registry.attach_claim
+            original_lock = session_lock.try_lock
+            requested = threading.Event()
+
+            def request_lock(state, kind):
+                lock = original_lock(state, kind)
+                if kind == "attach-request" and lock is not None:
+                    requested.set()
+                return lock
 
             def claim(*args, **kwargs):
                 self.assertFalse(rp.alive, "resident must be closed BEFORE taking its lease")
                 return original_claim(*args, **kwargs)
 
-            with mock.patch.object(registry, "attach_claim", side_effect=claim):
+            with mock.patch.object(registry, "attach_claim", side_effect=claim), \
+                    mock.patch.object(session_lock, "try_lock", side_effect=request_lock):
                 thread = threading.Thread(target=lambda: result.append(
                     run_attach(self.cfg, self.db, "att82")), daemon=True)
                 thread.start()
-                self.wait_for(lambda: session_lock.requested(worker.state_dir), timeout=10)
+                self.assertTrue(requested.wait(10), "attach did not request the session")
                 self.assertEqual(registry.get(self.db, "att82")["lease_owner"], runner.runner_id)
                 self.assertIsNone(worker.pick())
                 thread.join(timeout=15)
