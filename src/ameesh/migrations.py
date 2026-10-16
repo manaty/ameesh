@@ -19,14 +19,16 @@ from .db import DbError, PsqlDriver, PsycopgDriver, quote_ident
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9._-]+)\.sql$")
 _LOCK = "ameesh_migrations"
-#: Attente maximale d'un verrou de table par une migration (L835) : la
-#: transaction lève le statement_timeout (une migration peut être longue),
-#: mais une migration qui attend ACCESS EXCLUSIVE fait la queue devant tous
-#: les lecteurs et écrivains de la table — sans borne, elle les bloque
+#: Attente maximale d'un verrou (de table comme de ligne) par une migration
+#: (L835) : la transaction lève le statement_timeout (une migration peut être
+#: longue), mais une migration qui attend ACCESS EXCLUSIVE fait la queue devant
+#: tous les lecteurs et écrivains de la table — sans borne, elle les bloque
 #: indéfiniment. Passé ce délai, la transaction est annulée : la migration
 #: échoue, reste en attente, et rien n'est enregistré (le DDL est
-#: transactionnel). Une migration qui doit attendre plus pose son propre
-#: `set local lock_timeout` : elle s'exécute après, son réglage l'emporte.
+#: transactionnel). `lock_timeout` vaut pour toute acquisition de verrou, y
+#: compris une ligne tenue par une autre transaction (`select … for update`) :
+#: une migration de données qui doit attendre une ligne pose donc son propre
+#: `set local lock_timeout`, qui l'emporte — sinon elle échoue à 5 s.
 #:
 #: Le verrou consultatif qui sérialise les migrations, lui, n'est pas borné
 #: (posé avant ce réglage) : deux `migrate` concurrents s'attendent au lieu de
