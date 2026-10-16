@@ -75,7 +75,7 @@ class CacheVenvTest(unittest.TestCase):
         # reconstruction, sous la clé du run retrouvée par restore-keys.
         deps = _etape("      - id: deps")
         self.assertNotIn("cache-hit", deps)
-        self.assertIn("import psycopg, cryptography, psutil", deps)
+        self.assertIn("import psycopg, cryptography, psutil, coverage, yaml", deps)
         self.assertIn("rm -rf .venv-ci", deps)
         self.assertIn("python -m venv .venv-ci", deps)
         self.assertIn('echo "reconstruit=1" >> "$GITHUB_OUTPUT"', deps)

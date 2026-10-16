@@ -30,6 +30,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -170,9 +171,20 @@ class SelectedTurnRefusedTest(unittest.TestCase):
     def test_run_turn_remet_la_consigne_et_refuse(self):
         runner = types.SimpleNamespace(
             draining=threading.Event(), restart_for_stale=True, runner_id="runner-1")
+        # #290 : `run_turn` refuse l'attach et prend le verrou de session
+        # avant le tour ; la doublure les satisfait sans E/S (le refus périmé
+        # testé reste dans `_run_guarded_turn`).
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
         worker = types.SimpleNamespace(
-            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True)
-        # #1462 : run_turn lit d'abord la pause opérateur dans le registre —
+            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
+            _attach_pending=lambda: False, _session_lock=mock.Mock(),
+            resident=object(), state_dir=state_dir.name)
+        # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
+        # la doublure porte la vraie logique de tour et une enveloppe inerte.
+        worker._run_guarded_turn = types.MethodType(
+            runner_mod.AgentWorker._run_guarded_turn, worker)
+        # #1462 : run_turn lit d’abord la pause opérateur dans le registre —
         # agent non pausé ici, la doublure de base ne porte pas de requêtes.
         with mock.patch.object(registry, "restore_prompt", return_value=True) as restore, \
                 mock.patch.object(registry, "get", return_value={}), \

@@ -585,8 +585,10 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     si ce processus-ci ne peut même pas lire SES fichiers ouverts, si l'OS
     n'offre aucun moyen de les lire, ou (L63b) si un processus du même
     utilisateur refuse la lecture de ses fichiers ouverts (non dumpable) sans
-    être le gestionnaire de services, `NotAvailable` : une liste vide voudrait
-    dire « personne ne tient la session », ce qui n'aurait pas été vérifié.
+    être le gestionnaire de services, et qu'AUCUN détenteur n'a été trouvé,
+    `NotAvailable` : une liste vide voudrait dire « personne ne tient la
+    session », ce qui n'aurait pas été vérifié. Un détenteur vérifié, lui,
+    reste une réponse vraie quel que soit le refus d'un tiers (#1749).
     `path` None : `needle` seul, l'OS toujours exigé (L63b).
 
     `allow` (L230) : noms des processus de l'utilisateur dont l'illisibilité
@@ -849,7 +851,13 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False, allow=()) -
             who = doubt(pid)
             if who:
                 doubts[pid] = who
-    _settle(doubts, doubt)
+    # L63b : la relecture du doute ne sert que si RIEN n'a été trouvé. Un
+    # détenteur vérifié (fichier ouvert, dossier courant) tient l'entrée quel
+    # que soit le refus d'un processus tiers du même utilisateur ; jeter cette
+    # réponse positive rendait le ménage aveugle (« holders unreadable » pour
+    # tout /tmp) sur un poste où gpg-agent n'est pas dumpable (#1749).
+    if not found:
+        _settle(doubts, doubt)
     return found
 
 
@@ -943,7 +951,10 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, allow=()) -> list
             who = _doubt_proc(pid, uid, managers, allow)
             if who:
                 doubts[pid] = who
-    _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow))
+    # L63b : même règle que la voie psutil — un détenteur vérifié ne se jette
+    # pas parce qu'un tiers du même utilisateur refuse ses fichiers ouverts.
+    if not found:
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow))
     return found
 
 

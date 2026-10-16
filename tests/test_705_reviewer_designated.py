@@ -420,7 +420,15 @@ class ReviewerDesignationTest(PgTestCase):
         """#813 point 2 : `_reassign` tient la ligne en NO KEY UPDATE — pendant
         qu'il la tient, une insertion au journal du lot (contrôle de clé
         étrangère, FOR KEY SHARE) écrit sans attendre. FOR UPDATE la bloquait
-        jusqu'au commit."""
+        jusqu'au commit.
+
+        #1946 : le témoin ne parie plus sur une horloge. Il pose la demande
+        de verrou du contrôle de clé étrangère elle-même, en NOWAIT : elle
+        n'échoue que si un verrou incompatible la précède (FOR UPDATE), et
+        jamais parce que la machine est chargée. L'ancien `lock_timeout` de
+        200 ms lisait « bloqué » toute attente de verrou plus longue que lui,
+        fût-elle étrangère au verrou testé : faux rouge sous charge du
+        16/10 (refonte #1425), vert en isolation."""
         from ameesh.storage.postgres.work import WorkItems
         lot = self._lot()
         other = self.connect()
@@ -431,7 +439,12 @@ class ReviewerDesignationTest(PgTestCase):
         def event(items, item_id, state, note, actor):
             try:
                 with other.transaction() as tx:
-                    tx.execute("SET LOCAL lock_timeout = '200ms'")
+                    # Garde-fou seulement (un verrou de table régresserait en
+                    # attente) : 30 s, très au-delà de toute attente légitime.
+                    tx.execute("SET LOCAL lock_timeout = '30s'")
+                    # Le verrou exact de RI_FKey_check_ins, sans attente.
+                    tx.execute("SELECT 1 FROM work_items WHERE id = %s"
+                               " FOR KEY SHARE NOWAIT", (int(item_id),))
                     tx.execute("INSERT INTO work_item_events"
                                " (work_item_id, state, note, actor)"
                                " VALUES (%s, 'build', 'concurrent', 'test')",
