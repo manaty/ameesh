@@ -10,7 +10,9 @@ courrier de l'alerte), puis sur Postgres réel (publication, `work add
 from __future__ import annotations
 
 import json
+import types
 import unittest
+from unittest import mock
 
 from ameesh import alert_briefs, estimates, exploitation, registry, storage, work
 
@@ -94,6 +96,29 @@ class BuildReferenceTest(unittest.TestCase):
 
 
 class BriefTest(unittest.TestCase):
+
+    def test_bias_ne_reveille_pas_un_ancien_assigneur(self):
+        # #1980 : une réaffectation ancienne ne donne aucun mandat pour
+        # corriger les estimations d'un tiers, même dans la même équipe.
+        listing = [{"name": name, "canon": "legacy", "chantier": "app"}
+                   for name in ("dev1", "docs", "orch", "pilot", "auditeur")]
+        canon = types.SimpleNamespace(
+            agents=[types.SimpleNamespace(title="pilot", roles=["orchestrateur"])],
+            owns=lambda name: name == "home")
+        listing[3]["canon"] = "home"
+        ref = {"id": 5, "published_ts": NOW,
+               "body": {"bias": [{"estimator": "dev1", "median_ratio": 3,
+                                  "p80_ratio": 5, "lots": 4}]}}
+        ops = types.SimpleNamespace(assigners=lambda since_s: ["docs"])
+        with mock.patch.object(estimates, "current_reference", return_value=ref), \
+                mock.patch("ameesh.canon.load_configured", return_value=[canon]), \
+                mock.patch("ameesh.storage.of",
+                           return_value=types.SimpleNamespace(operations=ops)):
+            alerts = exploitation._estimate_bias(
+                types.SimpleNamespace(), object(), listing, None, declared=["orch"])
+        self.assertEqual(len(alerts), 1)
+        out = alert_briefs.briefs(alerts[0], listing, auditor_names=["auditeur"])
+        self.assertEqual(set(out), {"dev1", "orch", "pilot", "auditeur"})
 
     def test_estimateur_et_orchestrateurs(self):
         alert = {"type": "estimate_bias", "agent": "dev1", "value": 0.1,
