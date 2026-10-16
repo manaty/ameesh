@@ -23,11 +23,23 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import shutil
 import subprocess
-from xml.sax.saxutils import escape as _xml_escape
+from xml.sax.saxutils import escape as _xml_escape_raw
 
 from . import NotAvailable, SYSTEM
+
+#: XML 1.0 forbids most C0 control characters even escaped, and AppleScript
+#: does not want them raw either: an ESC copied from a terminal by an agent
+#: made `LoadXml` fail on Windows (a NotifyError that looks permanent and
+#: triggers useless retries). Tab, newline and carriage return stay allowed.
+_FORBIDDEN_CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_escape(value) -> str:
+    """`value` escaped for XML, after dropping the forbidden controls."""
+    return _xml_escape_raw(_FORBIDDEN_CONTROL.sub("", str(value)))
 
 #: delai par defaut d'un affichage (une notification ne bloque pas un tour)
 DEFAULT_TIMEOUT_S = 10.0
@@ -200,8 +212,11 @@ def _run(argv: list, env: dict, timeout: float, name: str, stdin: str | None = N
 
 def _applescript_string(value) -> str:
     """Une chaine AppleScript entre guillemets : echappe \\, ", et les sauts
-    de ligne (`\\n` est compris dans une chaine AppleScript)."""
-    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    de ligne (`\\n` est compris dans une chaine AppleScript).
+
+    Forbidden control characters are dropped before escaping (N2)."""
+    text = _FORBIDDEN_CONTROL.sub("", str(value))
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
     return '"%s"' % text
 
