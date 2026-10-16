@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import threading
 import types
@@ -260,6 +261,36 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertEqual(self.ops.queue(None), [])
         admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
         self.assertEqual(unknown.enroll(candidate, base, actor="restart"), admitted)
+
+    def test_recorded_enrollment_survives_clone_loss_and_fresh_connection_then_reports_withdrawal(self):
+        base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
+        admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        before = work.events(self.db, item)
+        sequence = self.db.query("SELECT last_value FROM merge_queue_generation_seq")
+        clone_path = preparation.repository.clone.path
+        shutil.rmtree(clone_path)
+        other = self.connect()
+        self.addCleanup(other.close)
+        repository = train_git.Repository(self.project, resolutions.Replayer(self.tmp, clone_path))
+        history = train_history.Recorded(other, clone_path, provider=preparation.history.provider)
+        admissions = train_admissions.Admissions(other, self.project, history,
+            policy=self.admissions.policy,
+            targeted_ci=mock.Mock(side_effect=AssertionError("unexpected individual CI")))
+        fresh = train_candidates.Preparation(other, self.project, repository=repository,
+                                             history=history, policy=admissions.policy)
+        unknown = mock.Mock(return_value=None)
+        restarted = train_candidates.Enrollment(fresh, admissions, initial=unknown)
+        result = restarted.enroll_many([candidate], base, actor="restarted-fixture")
+        self.assertEqual(result, dict(admitted=[admitted], deferred=[]))
+        unknown.assert_called_once_with(other, subject=preparation.prepare(candidate, base)["subject"])
+        self.assertEqual(work.events(self.db, item), before)
+        self.assertEqual(self.db.query("SELECT last_value FROM merge_queue_generation_seq"), sequence)
+        self.ops.queue_remove(item, note="withdrawn after restart", actor="fixture")
+        refused = restarted.enroll_many([candidate], base, actor="restarted-fixture")
+        self.assertEqual(refused["admitted"], [])
+        self.assertEqual([r["work_item_id"] for r in refused["deferred"]], [item])
+        self.assertIn("changed/withdrawn", refused["deferred"][0]["reason"])
+        self.assertEqual(self.ops.queue(None), [])
 
     def test_light_admission_with_no_verdict_uses_versioned_zero_review_policy(self):
         # #1734: a LIGHT lot must not disappear behind a positive-vote filter.

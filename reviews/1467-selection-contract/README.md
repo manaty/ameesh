@@ -173,6 +173,12 @@ effet de publication. Le runtime conserve ses propres revalidations avant
 publication et promotion. Le raccord à un profil actif et les fournisseurs
 échéance canon / suites et événements Nexlink restent distincts.
 
+Le témoin de reprise consommateur supprime aussi le clone privé puis reconstruit
+tous les adaptateurs avec une seconde connexion SQL. Une qualification initiale
+inconnue conserve alors la génération tracée, sans événement ni numéro nouveau
+et sans CI individuelle. Un retrait commis ensuite sur la première connexion
+reste un report nommé sur la seconde ; aucune ligne n'est recréée.
+
 ## Port de transport qualifié
 
 Source de ce raccord : cadrage mesh-design **#69852 du 16 octobre à 03:12**,
