@@ -472,7 +472,8 @@ class WakeTest(PgTestCase):
                         service.index('ExecStart='))
         self.assertIn("Restart=on-failure", service)   # a failed firing retries
         timer = found["ameesh-wake-4-w121-deadline.timer"]
-        self.assertIn("OnActiveSec=1800\n", timer)
+        self.assertIn("OnCalendar=", timer)
+        self.assertNotIn("OnActiveSec=", timer)
         self.assertIn("AccuracySec=1s\n", timer)
         self.assertNotIn("OnUnitActiveSec", timer)     # one shot, not a period
 

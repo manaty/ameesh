@@ -929,13 +929,14 @@ class RealTargetTest(_Base):
 
 
 class ContentDeliveryTest(_Base):
-    """#1005 : `sync-merges` sans `--target` suit la cible réelle du clone —
-    celle du lot (`branch_target`), sinon `ameesh.target` du dépôt, sinon sa
-    branche par défaut, puis les refs d'intégration — au lieu d'`origin/main`
-    par défaut (cas #560 et #905, restés « waiting for merge » sur `develop`).
+    """#1005 : un lot livré sur la branche d'intégration (`develop`) par une
+    fusion `--no-ff` qui ne cite pas le lot (cas #560 et #905, restés
+    « waiting for merge ») est fermé par le relevé automatique de l'exécuteur
+    (dernier gel ancêtre de la ref) et par `sync-merges` sans `--target`, qui
+    suivent la cible réelle du clone au lieu d'`origin/main` par défaut.
 
-    Le relevé automatique du lot (branche ou citation) n'est pas modifié ici ;
-    le patch-id exact (cherry-pick, rebase, squash) reste le travail de
+    Le relevé automatique borne la preuve à l'ancêtre (une commande git) ; le
+    patch-id exact (cherry-pick, rebase, squash) reste le travail de
     `sync-merges`. Une cible déclarée ne ferme jamais ailleurs."""
 
     def setUp(self):
@@ -971,6 +972,24 @@ class ContentDeliveryTest(_Base):
              _git(self.repo, "rev-parse", "HEAD"))
         return sha
 
+    def livrer_imbrique(self):
+        """B2 R2 (cx3) : le gel entre dans develop par une fusion IMBRIQUÉE —
+        une fusion locale `--no-ff` sur la branche porteuse `agent/carrier`,
+        puis la fusion de cette branche (la PR GitHub #627). La fusion locale
+        n'est PAS sur la chaîne première-parente de develop : le porteur est
+        la PR #627."""
+        _git(self.repo, "checkout", "-q", "-b", "frozen", "develop")
+        sha = self.commit("frozen")
+        _git(self.repo, "checkout", "-q", "-b", "agent/carrier", "develop")
+        self.commit("carrier")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch 'frozen' into agent/carrier", "frozen")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge pull request #627 from manaty/agent/carrier", "agent/carrier")
+        self.publish_develop()
+        return sha
+
     def publish_develop(self):
         _git(self.repo, "update-ref", "refs/remotes/origin/develop",
              _git(self.repo, "rev-parse", "develop"))
@@ -986,6 +1005,206 @@ class ContentDeliveryTest(_Base):
     def sync(self, **kw):
         return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
 
+    def test_1005_gel_ancetre_de_develop_ferme_le_lot(self):
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num:
+                          lus.append(num) or "Livraison complète.")["results"][0]
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(entry["target"], "origin/develop")
+        self.assertEqual(entry["off_target"], "origin/main")
+        self.assertEqual(entry["how"], "content-ancestor")
+        self.assertEqual(lus, [627])   # le corps de la PR PORTEUSE est lu (B2)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        jalon = self.merged_milestone(lot["id"])
+        self.assertEqual(jalon["sha"], sha)
+        self.assertIn("origin/develop", jalon["note"])
+        self.assertIn("declare `git config ameesh.target", jalon["note"])
+
+    def test_1005_corps_porteur_partiel_retient_le_lot(self):
+        """B2 : la PR porteuse du gel (PR627, branche agent/…) déclare le lot
+        partiel : le contenu est bien ancêtre, mais le lot reste ouvert."""
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+        entry = self.sync(pr_body=lambda repo, num:
+                          "Première partie.\n\nameesh-work-partial: %d"
+                          % lot["id"])["results"][0]
+        self.assertEqual(entry["how"], "partial")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("ameesh-work-partial: %d" % lot["id"], entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_corps_porteur_illisible_retient_le_lot(self):
+        """B2 : sans citation, le corps de la PR porteuse est illisible : on ne
+        ferme pas sans savoir."""
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+
+        def illisible(repo, num):
+            raise plan_git.GitError("gh: not logged in")
+
+        entry = self.sync(pr_body=illisible)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("unreadable", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_fusion_imbriquee_porteur_partiel_retient(self):
+        """B2 R2 (cx3) : le gel entre par une fusion IMBRIQUÉE (fusion locale
+        `--no-ff` dans la branche porteuse, puis PR GitHub #627). Le porteur
+        est la fusion de la CIBLE (chaîne première-parente), pas la fusion
+        locale : le corps de la PR #627 est lu, et partiel il retient le lot
+        (avant correctif, la fusion locale était retenue, son message local
+        n'a pas de PR, et le lot fermait indûment)."""
+        sha = self.livrer_imbrique()
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "ameesh-work-partial: %d" % lot["id"])["results"][0]
+        self.assertEqual(lus, [627])           # la PR porteuse, pas la fusion locale
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(entry["how"], "partial")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("ameesh-work-partial: %d" % lot["id"], entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_fusion_imbriquee_porteur_complet_ferme(self):
+        """B2 R2 : même fusion imbriquée, corps de la PR porteuse complet : la
+        preuve par le contenu est retenue APRÈS lecture de #627, et le gel
+        examiné est bien celui qui ferme (B1)."""
+        sha = self.livrer_imbrique()
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "Livraison complète.")["results"][0]
+        self.assertEqual(lus, [627])
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
+
+    def test_1005_fusion_imbriquee_porteur_illisible_retient(self):
+        """B2 R2 : la PR porteuse d'une fusion imbriquée est illisible : on ne
+        ferme pas sans savoir, même si la fusion locale n'a pas de PR."""
+        sha = self.livrer_imbrique()
+        lot = self.lot(sha)
+
+        def illisible(repo, num):
+            raise plan_git.GitError("gh: not logged in")
+
+        entry = self.sync(pr_body=illisible)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("unreadable", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_porteur_hors_fenetre_citations_est_lu(self):
+        """B2 R2 (cx3, scène old-carrier) : le porteur est cherché sur la cible
+        SANS le `since_all` des citations ; une PR porteuse antérieure à la
+        fenêtre des citations est quand même lue (partielle : lot ouvert)."""
+        vieux = "2020-01-02T03:04:05+00:00"
+        env = {"GIT_AUTHOR_DATE": vieux, "GIT_COMMITTER_DATE": vieux}
+        _git(self.repo, "checkout", "-q", "-b", "agent/vieux", "develop")
+        sha = self.commit("vieux")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge pull request #627 from manaty/agent/vieux", "agent/vieux", env=env)
+        self.publish_develop()
+        lot = self.lot(sha)                    # création du lot : bien après la PR
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "ameesh-work-partial: %d" % lot["id"])["results"][0]
+        self.assertEqual(lus, [627])
+        self.assertEqual(entry["how"], "partial")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_poussee_directe_ferme_sans_lecture(self):
+        """B2 R2 contrôle : un gel poussé directement sur develop (sans fusion)
+        n'a pas de porteur : aucun corps à lire, la preuve par le contenu vaut."""
+        sha = self.commit("direct")            # commit direct sur develop
+        self.publish_develop()
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
+        self.assertEqual(lus, [])
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1005_avance_rapide_ferme_sans_lecture(self):
+        """B2 R2 contrôle : une avance rapide reste fermée, même quand la
+        chaîne première-parente porte des fusions ANTÉRIEURES au gel : elles
+        ne le portent pas, aucune n'est le porteur. Une fenêtre tronquée reste
+        concluante ici : si la fusion la plus récente ne porte pas le gel,
+        aucune fusion plus ancienne ne le porte (monotonie)."""
+        self.livrer("agent/pre", "Merge pull request #1 from manaty/agent/pre")
+        self.livrer("agent/pre2", "Merge pull request #2 from manaty/agent/pre2")
+        _git(self.repo, "checkout", "-q", "-b", "agent/ff", "develop")
+        sha = self.commit("ff")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--ff-only", "agent/ff")
+        self.publish_develop()
+        lot = self.lot(sha)
+        lus = []
+        with mock.patch.object(plan_git, "MAX_CARRIER_SCAN", 1):
+            entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
+        self.assertEqual(lus, [])
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1005_porteur_hors_fenetre_lecture_reste_ouvert(self):
+        """B2 R2 : la fenêtre de lecture de la chaîne première-parente est
+        bornée (limite + 1, pour voir la troncature) ; quand elle s'arrête
+        avant le porteur, le lot reste OUVERT au lieu de conclure à l'absence
+        de PR — puis la fenêtre complète lit #627 et ferme."""
+        sha = self.livrer("agent/carrier",
+                          "Merge pull request #627 from manaty/agent/carrier")
+        for rang in range(3):                  # trois fusions plus récentes
+            self.livrer("agent/apres%d" % rang,
+                        "Merge pull request #%d from manaty/agent/apres%d"
+                        % (630 + rang, rang))
+        lot = self.lot(sha)
+        lus = []
+        with mock.patch.object(plan_git, "MAX_CARRIER_SCAN", 2):
+            entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                              or "Livraison complète.")["results"][0]
+        self.assertEqual(lus, [])              # rien de lu : porteur indéterminé
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("carrier", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        # fenêtre complète : le porteur #627 est lu, le lot ferme
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num)
+                          or "Livraison complète.")["results"][0]
+        self.assertEqual(lus, [627])
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1005_regel_concurrent_ne_ferme_pas(self):
+        """B1 : un gel déclaré pendant le relevé (après la lecture, avant
+        l'écriture) n'a pas été examiné : la fermeture est refusée."""
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        _git(self.repo, "checkout", "-q", "-b", "agent/regel", "develop")
+        nouveau = self.commit("regel")          # jamais fusionné
+        _git(self.repo, "checkout", "-q", "develop")
+
+        def lire(repo, num):
+            work.milestone(self.db, lot["id"], "frozen", sha=nouveau, actor="ouvrier")
+            return "Livraison complète."
+
+        entry = self.sync(pr_body=lire)["results"][0]
+        self.assertEqual(entry["result"], "refrozen")
+        self.assertIn("new freeze declared in the meantime", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        # le nouveau gel n'est pas ancêtre : le relevé suivant laisse ouvert
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
     def test_1005_gel_non_livre_laisse_le_lot_ouvert(self):
         _git(self.repo, "checkout", "-q", "-b", "agent/jamais", "develop")
         sha = self.commit("jamais")
@@ -995,6 +1214,25 @@ class ContentDeliveryTest(_Base):
         entry = self.sync()["results"][0]
         self.assertEqual(entry["result"], "open")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_cible_declaree_contenu_develop_note_sans_fermeture(self):
+        """B2 R2 contrôle : sur une ref qui ne ferme pas (cible déclarée), la
+        preuve par le contenu n'est qu'un résidu signalé : le corps du porteur
+        n'est pas lu (rien à qualifier)."""
+        _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "origin/main")
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
+        self.assertEqual(lus, [])              # closing=False : aucune lecture
+        self.assertEqual(entry["result"], "off-target")
+        self.assertIn("origin/develop", entry["detail"])
+        self.assertIn("declared target origin/main", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("origin/develop" in (n or "") for n in notes), notes)
+        self.sync()                    # le résidu ne se répète pas
+        self.assertEqual([e["note"] for e in work.events(self.db, lot["id"])], notes)
 
     def test_1005_sync_merges_sans_target_suit_develop(self):
         sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")

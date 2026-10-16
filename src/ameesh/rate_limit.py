@@ -8,8 +8,8 @@ Un **quota épuisé** (plafond de forfait, crédit) est distingué du débit
 passager : le même rythme lent s'applique, mais l'état et le texte le nomment.
 Dans le doute — texte illisible — on ne conclut rien sur le budget : la garde
 comptable (L226b) reste seule juge, et l'agent suit la reprise cadencée. Un
-débit ne se déduit que d'un texte du fournisseur (`error`, fin de `stderr`) :
-le dernier message du modèle ne conclut rien.
+débit **comme un quota** ne se déduit que d'un texte du fournisseur (`error`,
+fin de `stderr`) : le dernier message du modèle ne conclut rien (#1397).
 
 L'état vit dans `status_text` sous une forme lisible et analysable
 (``[rate_limited x2 since 2026-10-14T08:20:00Z, retry in 120s, retry at …]``) :
@@ -30,7 +30,9 @@ from datetime import datetime, timezone
 #: plafond, pas une cadence passagère. Ce sont des **signatures fournisseur
 #: positives** : le seul mot « billing » (ou « plafond ») d'un texte libre ne
 #: classe jamais un quota (R1 cx3 B2 : « I updated the billing page » ne doit
-#: pas désarmer L48).
+#: pas désarmer L48). Lus seulement dans `error` et `stderr_tail` (#1397) : le
+#: résultat libre du tour peut *parler* d'un quota (« not near the usage
+#: limit ») sans en subir, il ne classe donc rien.
 QUOTA_PATTERNS = (
     re.compile(r"insufficient[_ -]?quota", re.I),
     re.compile(r"exceeded your current quota", re.I),
@@ -105,8 +107,6 @@ QUOTA = "quota"
 DELAYS = (60.0, 120.0, 300.0, 600.0)
 #: durée d'un épisode de débit avant que l'alerte #1268 puisse se lever
 PERSIST_S = 900.0
-#: texte de résultat lu par `classify` seulement s'il est court (comme L226b)
-MAX_RESULT_CHARS = 4000
 
 _STATE_RE = re.compile(
     r"\[(rate_limited|quota) x(\d+) since (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z),"
@@ -114,20 +114,12 @@ _STATE_RE = re.compile(
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _texts(error=None, result=None, stderr_tail=None):
-    """Textes lus pour un **quota**, résultat libre compris."""
-    out = [error or "", stderr_tail or ""]
-    if result and len(result) <= MAX_RESULT_CHARS:
-        out.append(result)
-    return out
-
-
 def _directs(error=None, stderr_tail=None):
     """Textes écrits par le **fournisseur** : erreur et fin de stderr.
 
     Le résultat libre du tour (dernier message du modèle) n'en fait pas
-    partie : un modèle qui *parle* d'un débit ne le subit pas et ne doit ni
-    désarmer L48 ni taire l'alerte #1268 (P2 dev1 du 14/10).
+    partie : un modèle qui *parle* d'un débit ou d'un quota ne le subit pas et
+    ne doit ni désarmer L48 ni taire l'alerte #1268 (P2 dev1 du 14/10, #1397).
     """
     return [t for t in (error or "", stderr_tail or "") if t]
 
@@ -141,16 +133,16 @@ def classify(error: str | None = None, result: str | None = None,
     simple 429 (le doute reste un débit passager ; la garde comptable L226b
     reste seule juge du budget).
 
-    Le quota prime sur le débit **tous textes confondus** : un « 429 » sur
-    l'erreur et un `insufficient_quota` sur stderr classent quota (R1 cx3 B2).
-    Un débit, lui, ne se déduit que d'un texte du fournisseur (`error`,
-    `stderr_tail`) : le résultat libre du tour n'est jamais lu pour lui.
+    Le quota prime sur le débit **parmi les textes du fournisseur** : un « 429 »
+    sur l'erreur et un `insufficient_quota` sur stderr classent quota
+    (R1 cx3 B2). Ni le débit ni le quota ne se déduisent d'un texte du modèle :
+    `result` reste dans la signature (le runner le passe) mais n'est **jamais**
+    lu (#1397) — un résultat libre qui parle d'un quota ne classe rien.
     Un genre ne se déduit que d'une signature fournisseur positive.
     """
-    textes = [t for t in _texts(error, result, stderr_tail) if t]
-    if any(motif.search(texte) for texte in textes for motif in QUOTA_PATTERNS):
-        return QUOTA
     directs = _directs(error, stderr_tail)
+    if any(motif.search(texte) for texte in directs for motif in QUOTA_PATTERNS):
+        return QUOTA
     if any(motif.search(texte) for texte in directs for motif in TRANSIENT_PATTERNS):
         return RATE_LIMITED
     return None

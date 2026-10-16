@@ -44,16 +44,23 @@ _COLUMNS_TEMPLATE = """
 
 
 def has_reviewer(db) -> bool:
-    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ? La
-    réponse est mise en cache sur la connexion : une lecture par base."""
-    flag = getattr(db, "_has_reviewer", None)
-    if flag is None:
-        flag = bool(db.query(
-            "SELECT 1 AS ok FROM information_schema.columns"
-            " WHERE table_schema = current_schema() AND table_name = 'work_items'"
-            "   AND column_name = 'reviewer'"))
+    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ?
+
+    Seule la réponse POSITIVE est mise en cache sur la connexion : une colonne
+    n'apparaît pas puis ne disparaît pas. La réponse négative ne l'est pas —
+    un démon (runner, serve) démarré avant 0421 voit la colonne dès qu'elle
+    est appliquée, sans redémarrage (#798, #813) ; sinon il gardait des
+    lectures sans relecteur et refusait les désignations jusqu'au
+    redémarrage."""
+    if getattr(db, "_has_reviewer", False):
+        return True
+    flag = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        "   AND column_name = 'reviewer'"))
+    if flag:
         try:
-            db._has_reviewer = flag
+            db._has_reviewer = True
         except Exception:  # objet sans attributs (proxy) : on relira
             pass
     return flag
@@ -504,8 +511,12 @@ class WorkItems(interface.WorkItems):
         reviewer_set = ""
         params: list = [assignee]
         if has_reviewer(self.db):
+            # #813 : NO KEY UPDATE suffit à sérialiser deux réassignations, et
+            # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
+            # insertions au journal et aux jalons du lot, que FOR UPDATE
+            # bloquait jusqu'au commit.
             seen = self.db.query(
-                "SELECT reviewer FROM work_items WHERE id = %s FOR UPDATE",
+                "SELECT reviewer FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                 (int(item_id),))
             previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
             reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
@@ -834,9 +845,29 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
-    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note) -> dict:
+    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
+                      on_frozen=None, after_commit=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
-        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot."""
+        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
+
+        `on_frozen` (facultatif, #1617) : callback appelé **dans la
+        transaction** du jalon, juste après l'INSERT d'un jalon `frozen`, avec
+        `(tx, milestone, after_commit)`. Il écrit dans la même transaction que
+        le jalon — la désignation des relecteurs y dépose sa marque et ses
+        courriers atomiquement — et une exception annule le jalon avec elle.
+        `after_commit` est la liste des écritures de fil différées
+        (`mail.send(..., after_commit=…)`, motif #315) : `add_milestone` ne la
+        vide **pas**, c'est l'appelant qui tient le commit qui la vide après
+        son COMMIT. Sur une connexion racine le `with` commite, l'appelant vide
+        la liste juste après le retour ; dans une transaction déjà ouverte le
+        `with` imbriqué ne commite pas (psql et psycopg), et la vider ici
+        publierait le fil avant le commit externe — un rollback laisserait des
+        traces sans gel ni marque (revue codex cx2, B2). Sans callback ni
+        liste, rien ne change : le gel branché par défaut ne désigne personne.
+        Un `on_frozen` sur un autre kind est refusé."""
+        if on_frozen is not None and kind != "frozen":
+            raise ValueError("on_frozen only makes sense for the `frozen` milestone")
+        threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
@@ -849,7 +880,10 @@ class WorkItems(interface.WorkItems):
                 """,
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
-            return rows[0]
+            milestone = rows[0]
+            if on_frozen is not None:
+                on_frozen(tx, milestone, threads)
+        return milestone
 
     def delays(self, limit, *, ids=None) -> list[dict]:
         if ids is not None:
@@ -957,12 +991,16 @@ class WorkItems(interface.WorkItems):
                         # elle est libérée dans la transaction de la
                         # réservation, avec sa ligne de journal. Les lignes
                         # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
-                        # valeur déjà effacée.
+                        # valeur déjà effacée. `ORDER BY id` : ordre de
+                        # verrouillage canonique (#967) — deux transactions qui
+                        # reprennent les réservations héritées du même dépôt
+                        # verrouillent ainsi les mêmes lignes dans le même
+                        # ordre, jamais en sens inverse (interblocage).
                         for old in tx.query(
                                 "SELECT id, migration, state FROM work_items"
                                 " WHERE migration_repo = %s"
                                 "   AND state IN ('merged', 'promoted', 'closed')"
-                                " FOR UPDATE", (repo,)):
+                                " ORDER BY id FOR UPDATE", (repo,)):
                             tx.execute(
                                 "UPDATE work_items SET migration = NULL,"
                                 "       migration_repo = NULL, updated_at = now()"
@@ -1139,7 +1177,8 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "UPDATE merge_locks SET expires_at = clock_timestamp()"
                 " + %s * interval '1 second'"
-                " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
+                " WHERE target = %s AND owner = %s AND epoch = %s"
+                " AND expires_at > clock_timestamp() RETURNING epoch",
                 (float(ttl_s), key, owner, int(epoch)))
             return int(rows[0]["epoch"]) if rows else None
         rows = self.db.query(

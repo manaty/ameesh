@@ -170,14 +170,18 @@ RECENT_FAILURE_DAYS = 7
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
 #: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète reste en six parts.
+#: saturé) ; la suite psql complète passe à neuf parts (#1692) : sur le run
+#: 38736559499 attempt 2, les six parts ont pesé 26-45,5 min sous saturation
+#: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
+#: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
+#: mesuré, huit en laisseraient ~34.
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+PARTS = {"psycopg": (4, 4), "psql": (3, 9)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
-#: comme dans celui de 45 min de psql.
+#: comme dans celui de 60 min de psql (#1251).
 PR_TARGET_PART_S = 300
 #: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
 #: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
@@ -366,6 +370,8 @@ class _RuntimeImports(ast.NodeVisitor):
     import, a function body does not), outside any condition, loop, `try` or
     `with` — a `with` body may never run (its `__enter__` may fail, or an
     earlier statement may raise and be suppressed), so it is no proof.
+    An unconditional module-level `raise` or `sys.exit` also leaves every
+    later import without proof, while keeping its possible selection edge.
     A lazy or conditional import alone is a possible load, never a proof
     (relecture Codex, B2 résiduel)."""
 
@@ -375,6 +381,7 @@ class _RuntimeImports(ast.NodeVisitor):
         self.guaranteed: list[ast.stmt] = []
         self._deferred = 0  # inside a function or lambda body: not run at import
         self._guarded = 0   # inside a condition, a loop or a try: may not run
+        self._terminated = False  # module execution cannot reach later imports
 
     def _visit_function(self, node: ast.AST) -> None:
         self._deferred += 1
@@ -399,6 +406,19 @@ class _RuntimeImports(ast.NodeVisitor):
     visit_With = _visit_guarded
     visit_AsyncWith = _visit_guarded
 
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self.generic_visit(node)
+        if not self._deferred and not self._guarded:
+            self._terminated = True
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        func = node.func
+        if (not self._deferred and not self._guarded
+                and isinstance(func, ast.Attribute) and func.attr == "exit"
+                and isinstance(func.value, ast.Name) and func.value.id == "sys"):
+            self._terminated = True
+
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
             # the guard never runs: only its `else` does (at module level)
@@ -409,7 +429,7 @@ class _RuntimeImports(ast.NodeVisitor):
 
     def _record(self, node: ast.stmt) -> None:
         self.imports.append(node)
-        if not self._deferred and not self._guarded:
+        if not self._deferred and not self._guarded and not self._terminated:
             self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -545,11 +565,34 @@ def _reverse_closure(reverse: dict[str, set[str]], path: str) -> set[str]:
 
 # -- the map --------------------------------------------------------------
 
+def ignored_coverages(card: dict) -> list:
+    """Couvertures que la fusion de la carte a écartées (#1257). Une carte
+    antérieure à la clé n'en porte pas : sa mesure est complète par
+    construction (l'ancien code échouait sur un fichier illisible au lieu de
+    l'ignorer)."""
+    mesure = card.get("measure") or card.get("mesure") or {}
+    if not isinstance(mesure, dict):
+        return []
+    ignorees = mesure.get("couverture_ignoree")
+    if not ignorees:
+        return []
+    return ignorees if isinstance(ignorees, list) else [ignorees]
+
+
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
                 repo: pathlib.Path = REPO) -> tuple[str, float | None]:
     """Why the map cannot be used ("" if it can), and its age in hours."""
     if card is None:
         return "no map", None
+    ignorees = ignored_coverages(card)
+    if ignorees:
+        # #1257 (R1 B3) : une couverture écartée à la fusion rend la mesure
+        # partielle — les modules que le processus perdu mesurait manquent, et
+        # les durées connues feraient passer la sélection pour sûre. La carte ne
+        # juge plus la restriction : repli suite complète, jamais une décision
+        # sur une carte partielle.
+        return (f"map measured with {len(ignorees)} ignored coverage file(s) "
+                "(partial measure)"), None
     try:
         generated = datetime.datetime.fromisoformat(card["genere"])
     except (KeyError, TypeError, ValueError):

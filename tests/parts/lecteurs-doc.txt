@@ -8,9 +8,11 @@
 # Un module par ligne, dans l'ordre alphabétique, sa raison en commentaire.
 
 test_l107_executor_contract  # docs/EXECUTEUR-MEDIEE.md (compteurs du contrat de l'exécuteur, L107)
+test_l1124_explorations  # docs/design/explorations et fiches de plan/roadmap/lot (sas hors roadmap, #1124)
 test_l159a_capacity_guard  # docs/schemas (JSON schemas of the capacity guard, L159a)
 test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
 test_l233_decide_only  # docs/ORCHESTRATEUR.md (decision rule: decide ask only)
 test_l33_chatbot  # docs/design et site/docs (index du chatbot), site/landing
 test_l84_serve  # docs/api/openapi-v1.json (OpenAPI contract of the read API, L84)
+test_l953_image_approve  # docs/IMAGE-APPROVE.md (politique de publication de l'image approve, #953)
 test_site_art  # site/landing/index.html

@@ -18,7 +18,8 @@ sous-utilisation se trompaient et la frise restait vide.
   lot qu'il citait). Un rôle déclaré n'y change rien (#859) : la remise est
   un geste explicite, `ameesh work assign`. Un lot SANS agent assigné reste
   distribuable par l'historique de distribution (L94 ; le bureau distribue
-  ainsi, canon §4).
+  ainsi, canon §4) — ou par le geste explicite `--assign` (#964), ouvert à
+  tout expéditeur.
   #858 : un refus de la garde qui ne tient qu'au DESTINATAIRE (profil
   divergé en attendant le prochain canon sync, responsable manquant, agent
   externe…) ne fait pas perdre le message — il est déposé, rattaché au lot,
@@ -33,6 +34,10 @@ Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
 lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
 Correctif du 2026-10-13 (#1066) : la remise implicite du lot tenu par
 l'expéditeur lui-même est refusée comme celle du lot d'un autre agent.
+Ajout #964 : `--assign` est le geste explicite qui autorise l'attribution
+d'un lot LIBRE (ou tenu par un humain) par un expéditeur que l'historique
+ne détecte pas comme orchestrateur ; il ne prend jamais le lot d'un agent,
+même le sien (la remise passe par `ameesh work assign`).
 """
 from __future__ import annotations
 
@@ -135,7 +140,7 @@ def _assignment_deferred(item: dict, recipient: str, why: str) -> str:
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
-                 force: str | None = None,
+                 assign: bool = False, force: str | None = None,
                  parent_lot: int | None = None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
@@ -151,6 +156,13 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     lot, l'attribution est différée et l'avertissement dit pourquoi. Un
     message perdu emportait le réveil ; un réveil différé se rattrape à la
     prochaine réclamation.
+
+    `assign` (#964) : le geste explicite `--assign` du courrier. Sans lui, un
+    `--lot` n'assigne que venant d'un expéditeur que la détection
+    d'orchestrateur reconnaît (dont l'historique de distribution, L94) ; il
+    reste sinon une étiquette de fil. Avec lui, tout expéditeur peut confier
+    un lot LIBRE (ou tenu par un humain), jamais un lot tenu par un agent —
+    même le sien (#1066) : la remise passe par `ameesh work assign`.
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
@@ -175,11 +187,18 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         has_open = bool(work_mod.open_lots(db, recipient))
         if lot is None and has_open:
             return out
-        if not is_orchestrator(cfg, db, sender):
-            # un `--lot` d'un autre agent n'assigne rien ; mais une étiquette
-            # qui désigne un lot ouvert est rendue par son numéro, pour tout
-            # expéditeur : le fil, l'activité du lot et le lot en cours
-            # (`ameesh projects`) la lisent. Sinon, étiquette libre (inchangé).
+        # #964 : `--assign` est le geste explicite qui dispense de la
+        # détection d'orchestrateur. Sans lui, l'historique de distribution
+        # (L94) garde le droit de confier un lot LIBRE — c'est ainsi que le
+        # bureau distribue (canon §4, #859) ; un lot tenu par un agent, lui,
+        # n'est jamais remis par l'étiquette, même à un orchestrateur
+        # déclaré (#1066, plus bas).
+        orchestrator = is_orchestrator(cfg, db, sender)
+        if not assign and not orchestrator:
+            # une étiquette qui désigne un lot ouvert est rendue par son
+            # numéro, pour tout expéditeur : le fil, l'activité du lot et le
+            # lot en cours (`ameesh projects`) la lisent. Sinon, étiquette
+            # libre (inchangé).
             if lot is not None:
                 try:
                     item = resolve_lot(db, lot)
@@ -188,7 +207,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                 if item is not None:
                     out.update(lot=item, work_item_id=str(item["id"]))
             return out
-        out["orchestrator"] = True
+        out["orchestrator"] = orchestrator
     else:
         has_open = True
         out["orchestrator"] = is_orchestrator(cfg, db, sender)

@@ -82,7 +82,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("if: needs.plan.outputs.code == 'true'", self.text)
         self.assertIn("if: needs.plan.outputs.docs_only == 'true'", self.text)
         self.assertIn("python -m unittest -v ${{ needs.plan.outputs.doc_readers }}", self.text)
-        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, doc-readers]", self.text)
+        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]", self.text)
         self.assertIn('test "${{ needs.doc-readers.result }}" = success', self.text)
 
     def test_main_en_cours_preservee_et_file_bornee(self):

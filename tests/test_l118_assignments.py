@@ -180,6 +180,20 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["work_item_id"], str(lot["id"]))
 
+    def test_profil_divergue_depot_differe_n_avertit_pas_sans_lot(self):
+        """#1614 (#1407) : un `--lot` résolu puis déposé en mode différé
+        (profil divergé, #858) est un rattachement effectif — l'avertissement
+        « has no open lot » ne doit pas apparaître (condition `item is None`
+        de b85c5e5ef), seule la raison du différé est dite."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        self.diverge("dev1")
+        proc = self.send("dev1", "À toi : reprends ce lot.", "--from", "orch",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("has no open lot", proc.stderr)
+        self.assertIn("lot #%d not assigned to dev1" % lot["id"], proc.stderr)
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+
     def test_new_lot_pour_un_destinataire_non_reveillable_cree_sans_assigne(self):
         """#858 : `--new-lot` vers un agent non réveillable crée le lot sans
         assigné au lieu de perdre le message et la demande."""
@@ -247,6 +261,58 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("matches no open lot", proc.stderr)
         self.assertEqual(self.unread("dev1")[-1]["work_item_id"], "SUJET-LIBRE")
+
+    def test_assign_explicite_attribue(self):
+        # #964 : `--assign` est le geste explicite qui confie un lot LIBRE
+        # même à un expéditeur que la détection d'orchestrateur ne reconnaît
+        # pas (sans historique de distribution) ; sans lui, son --lot reste
+        # une étiquette de fil (invariant #859/#1066 conservé).
+        self.agent("dev3")
+        self.assertFalse(assignments.is_orchestrator(self.cfg, self.db, "dev3"))
+        lot = work.add(self.db, title="relecture à confier")
+        proc = self.send("dev1", "Pour information.", "--from", "dev3", "--lot",
+                         str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        proc = self.send("dev1", "À toi : relis puis gèle.", "--from", "dev3",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lot #%d assigned to dev1" % lot["id"], proc.stdout)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual(item["assignee"], "dev1")
+        self.assertEqual(self.unread("dev1")[-1]["work_item_id"], str(lot["id"]))
+
+    def test_assign_ne_prend_pas_le_lot_d_un_autre(self):
+        # même avec --assign, le lot d'un autre agent n'est pas repris :
+        # la reprise passe par `ameesh work assign` (invariant du module)
+        self.agent("dev3")
+        lot = work.add(self.db, title="implémentation", assignee="dev3")
+        proc = self.send("dev1", "Relis le lot de dev3.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("belongs to dev3: not reassigned", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev3")
+
+    def test_assign_exige_le_lot_et_refuse_l_accuse(self):
+        proc = self.send("dev1", "Coucou.", "--from", "dev2", "--assign")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--assign requires --lot", proc.stderr)
+        proc = self.send("dev1", "Coucou.", "--from", "dev2", "--lot", "X", "--assign",
+                         "--ack")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("contradict", proc.stderr)
+        self.assertEqual(self.unread("dev1"), [])
+
+    def test_assign_garde_l_assignataire(self):
+        # l'assigné passe par la même garde que `work assign` (L37) :
+        # un nom hors registre refuse le courrier, rien n'est déposé
+        lot = work.add(self.db, title="libre")
+        proc = self.send("inconnu", "Travail pour toi.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("message not delivered", proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.unread("inconnu"), [])
 
     def test_reference_ambigue_refusee(self):
         work.add(self.db, title="DUP : un")

@@ -369,15 +369,19 @@ def recipient_of(lot: dict | None) -> str | None:
 # relevé
 # --------------------------------------------------------------------------
 
-def gh_api(gh=None):
-    """La fonction `chemin -> JSON` de l'API GitHub, par `gh api`."""
+def gh_api(gh=None, *, cache_dir=None, ttl=None, clock=None):
+    """La fonction `chemin -> JSON` de l'API GitHub : le jeton partagé, avec
+    le cache et le quota partagés (#848) quand ils sont donnés, sinon le repli
+    local `gh api`."""
     from . import plan_github
 
-    def api(path: str):
-        nonlocal gh
-        gh = gh or plan_github.Gh()
-        return plan_github._json(gh, ["api", path])
-    return api
+    client = plan_github.client(
+        gh=gh, cache_dir=cache_dir, clock=clock or time.time,
+        ttl=plan_github.DEFAULT_CI_TTL if ttl is None else ttl)
+    if client is None:
+        raise plan_github.GithubError("no GitHub token (%s) and no local gh"
+                                      % ", ".join(plan_github.TOKEN_VARS))
+    return client.get
 
 
 def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
@@ -405,9 +409,12 @@ class Watcher:
     """Le relevé de la CI, mené par `ameesh notify` à chaque passage, sur
     l'hôte désigné (`github.host`). Une erreur (GitHub, base) d'un dépôt est
     journalisée une fois par passage et n'arrête ni les autres dépôts, ni
-    les alertes."""
+    les alertes. Les lectures passent par le client à jeton et son cache
+    partagé (#848) : une lecture identique n'est pas repayée à chaque
+    passage, et un quota épuisé arrête le passage sans boucle."""
 
-    def __init__(self, cfg, *, api=None, log=None, clock=None, dry_run: bool = False):
+    def __init__(self, cfg, *, api=None, log=None, clock=None, dry_run: bool = False,
+                 ttl=None):
         self.cfg = cfg
         self.api = api
         self.log = log or (lambda _text: None)
@@ -417,6 +424,17 @@ class Watcher:
         self._workflows_cache: dict[str, tuple] = {}
         #: avertissements déjà journalisés par ce passage de service
         self._warned_workflows: set = set()
+        self.ttl = None if ttl is None else float(ttl)
+
+    def _cache_ttl(self) -> float:
+        """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
+        if self.ttl is not None:
+            return self.ttl
+        from . import plan_github
+        try:
+            return plan_github.settings_of(self.cfg).ci_ttl
+        except plan_github.SettingsError:
+            return plan_github.DEFAULT_CI_TTL
 
     def settings(self):
         """Les réglages `github` validés, ou None (déjà journalisé)."""
@@ -484,15 +502,25 @@ class Watcher:
 
     def tick(self, db) -> list[dict]:
         """Un relevé de chaque dépôt ; rend les envois et retraits."""
+        from . import plan_github
+
         repos = self.repos()
         if not repos or self.dry_run:
             return []
         if self.api is None:
-            self.api = gh_api()
+            self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
+                              ttl=self._cache_ttl(), clock=self.clock)
         out: list[dict] = []
         for repo in repos:
             try:
                 out += self.watch(db, repo)
+            except plan_github.GithubRateLimited as exc:
+                # quota épuisé : aucun autre appel ne part avant le reset
+                when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) \
+                    if exc.reset else "unknown"
+                self.log("CI %s: GitHub quota exhausted (reset at %s): pass stopped"
+                         % (repo, when))
+                break
             except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
                 self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
         return out
@@ -937,15 +965,24 @@ def main_red(db) -> list[dict]:
     l'échec d'une autre, #1110), et une exécution encore en cours dont un échec
     est déjà relevé (#846 : un main rouge ne reste pas silencieux derrière ses
     jobs agrégateurs, qui peuvent attendre un runner des heures).
+    Une exécution en cours plus ancienne que la dernière conclue de son
+    workflow est écartée : une exécution supprimée ou introuvable (l'API rend
+    `{}`) n'est jamais conclue, et son job rouge garderait l'alerte, qui bloque
+    les déploiements, sans fin (#1453).
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
-    out = []
+    out, newest = [], {}
     for row in st.ci.latest_concluded(BASE_BRANCHES):
+        key = (row["repo"], row["branch"], row.get("workflow"))
+        newest[key] = max(newest.get(key, 0), int(row["run_id"]))
         if row.get("status") != "failure":
             continue
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
     for row in st.ci.running_on(BASE_BRANCHES):
+        if int(row["run_id"]) < newest.get(
+                (row["repo"], row["branch"], row.get("workflow")), 0):
+            continue
         # hérités exclus : un échec déjà rouge à la dernière exécution conclue
         # de la base est déjà porté par l'alerte de celle-ci, de même clé
         own = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))
@@ -1021,6 +1058,42 @@ def render_status(report: dict) -> list[str]:
     return lines
 
 
+def quota_line(state_dir, *, now=None) -> str | None:
+    """Une ligne lisible sur les lectures GitHub partagées de l'hôte (#848),
+    ou None tant qu'aucune lecture n'a été comptée.
+
+    Elle dit l'économie (requêtes, 304, cache servi) et le quota restant par
+    ressource d'API (`core`, `graphql`…) : de quoi lire la CI sans ajouter
+    d'appel, et voir venir l'épuisement — sans confondre les buckets."""
+    from . import plan_github
+
+    stats = plan_github.quota_stats(state_dir)
+    counters, quotas = stats["counters"], stats["quota"]
+    if not counters and not quotas:
+        return None
+    parts = []
+    requests = int(counters.get("requests") or 0)
+    hits = int(counters.get("hits") or 0)
+    if requests or hits:
+        parts.append("%d request(s) (%d not modified), %d served from the shared cache"
+                     % (requests, int(counters.get("not_modified") or 0), hits))
+    now = time.time() if now is None else float(now)
+    for resource, quota in sorted(quotas.items()):
+        if not isinstance(quota, dict):
+            continue
+        remaining = quota.get("remaining")
+        if remaining is not None:
+            label = "quota" if resource == plan_github.DEFAULT_RESOURCE \
+                else "quota %s" % resource
+            parts.append("%s %s/%s" % (label, remaining, quota.get("limit", "?")))
+        blocked = float(quota.get("blocked_until") or 0.0)
+        if blocked > now:
+            suffix = "" if resource == plan_github.DEFAULT_RESOURCE else " (%s)" % resource
+            parts.append("exhausted until %s%s"
+                         % (time.strftime("%H:%M:%SZ", time.gmtime(blocked)), suffix))
+    return "GitHub reads (shared): " + ", ".join(parts) if parts else None
+
+
 def cmd_ci(cfg, args) -> int:
     from .db import open_db
     db = open_db(cfg)
@@ -1031,6 +1104,10 @@ def cmd_ci(cfg, args) -> int:
         return 1
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
-    else:
-        print("\n".join(render_status(report)))
+        return 0
+    lines = render_status(report)
+    line = quota_line(getattr(cfg, "state_dir", None))
+    if line:
+        lines.append(line)
+    print("\n".join(lines))
     return 0

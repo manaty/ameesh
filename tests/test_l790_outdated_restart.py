@@ -151,6 +151,9 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         )
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
+        # L85 (#373) : `sweep` prune le journal d'événements après la moisson
+        # des baux — la doublure doit fournir le point d'entrée, borné ici.
+        fake.prune_events_once = lambda *args, **kwargs: None
         with mock.patch.object(registry, "reap", return_value=[]), \
                 mock.patch.object(registry, "claimable") as claimable:
             runner_mod.Runner.sweep(fake)
