@@ -108,7 +108,7 @@ def canon_governed_sql(alias: str = "agent_registry") -> str:
         "a": a, "max": LINEAGE_MAX}
 
 
-def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
+def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = False) -> str:
     """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
 
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
@@ -136,20 +136,28 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     paramètre lié (`%s`) : elle s'insère telle quelle dans une requête
     paramétrée, avec les deux pilotes. Utilisée par `claimable()` et
     `claim()` ; à réutiliser telle quelle pour `ameesh attach` (C9).
+
+    `probe=True` (L232b) : la réclamation d'un agent **nommé** (le pas de tour
+    du contrôleur) passe par `ameesh_agent_claims_open`, qui rouvre la
+    fermeture de release au seul agent sonde enrôlé de l'hôte. Les décisions
+    d'ordonnancement (`claimable`, `wakeable`, aperçu) gardent le prédicat
+    strict d'une fermeture.
     """
     a = _alias(alias)
     # L42 (0031) : l'état est celui du canon DE L'AGENT sur son hôte (colonne
     # `canon` ; NULL = canon par défaut, clé '') — un canon invalide ne ferme
     # que ses propres agents et leurs éphémères (qui portent son canon)
-    return """(ameesh_host_claims_open(%(a)s.host) AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
+    open_sql = ("ameesh_agent_claims_open(%(a)s.host, %(a)s.name)" if probe
+                else "ameesh_host_claims_open(%(a)s.host)")
+    sql = """(""" + open_sql + """ AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
        OR (EXISTS (SELECT 1 FROM canon_state s
                     WHERE s.host = %(a)s.host AND s.canon = coalesce(%(a)s.canon, '')
                       AND s.status = 'ok')
            AND coalesce(%(a)s.placement_ok, false)
            AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
                    %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
-                   %(a)s.credential_mode))))""" % {
-        "governed": canon_governed_sql(a), "a": a}
+                   %(a)s.credential_mode))))"""
+    return sql % {"governed": canon_governed_sql(a), "a": a}
 
 
 def placement_admitted_sql(alias: str = "agent_registry") -> str:
@@ -327,7 +335,12 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
                      WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
-                   __CLAIM_OK__ AS canon_claim_ok
+                   __CLAIM_OK__ AS canon_claim_ok,
+                   -- #1250 : le harnais de la session VIVANTE (0384), absent de
+                   -- la vue dont les colonnes sont figées à sa création ;
+                   -- sous-requête pour ne pas qualifier toutes les colonnes.
+                   (SELECT r.session_harness FROM agent_registry r
+                     WHERE r.name = o.name) AS session_harness
             FROM agent_mesh_overview o
             LEFT JOIN LATERAL (
                 SELECT operator_paused, operator_pause_reason, operator_pause_by,
@@ -573,7 +586,9 @@ class Leases(interface.Leases):
         """
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
-        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
+        # L232b : réclamation d'un agent nommé (pas de tour du contrôleur) —
+        # seul l'agent sonde de la fermeture de release rouvre la condition.
+        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True))
         rows = self.db.query(sql, (name, owner, ttl_seconds, owner, owner, owner, owner))
         return rows[0] if rows else None
 
@@ -887,7 +902,7 @@ class Leases(interface.Leases):
                AND verrou.pending_prompt IS NOT NULL
                AND NOT verrou.operator_paused
                AND NOT verrou.handoff_fenced
-               AND ameesh_host_claims_open(r.host)
+               AND ameesh_agent_claims_open(r.host, r.name)
                AND verrou.status <> 'stopped'
                AND verrou.lease_expires_at > clock_timestamp()
             RETURNING verrou.pending_prompt
@@ -911,7 +926,7 @@ class Leases(interface.Leases):
                AND verrou.lease_expires_at > clock_timestamp()
                AND NOT verrou.handoff_fenced
                AND NOT verrou.operator_paused
-               AND ameesh_host_claims_open(r.host)
+               AND ameesh_agent_claims_open(r.host, r.name)
                AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
             RETURNING r.name
             """,
