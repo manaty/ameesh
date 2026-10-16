@@ -119,6 +119,10 @@ class ApproveService:
         self._token_digest = hashlib.sha256(service_token.encode("utf-8")).digest()
         self._login_token_digest = (hashlib.sha256(login_token.encode("utf-8")).digest()
                                     if login_token else None)
+        if self._login_token_digest is not None and hmac.compare_digest(
+                self._login_token_digest, self._token_digest):
+            raise config_mod.ApproveConfigError(
+                "login token must be DISTINCT from the team service token")
         self.policy = receipts.Policy(rp_id=cfg.rp_id, origins=cfg.origins,
                                       allow_facades=frozenset({"webauthn"}), level=cfg.level)
 

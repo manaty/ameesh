@@ -58,7 +58,8 @@ never an environment variable:
   device-auth grant goes to the process that generated the code, which the
   service cannot bind).
 - `login_token_file` must be a **different file** from `token_file`; the
-  service refuses the configuration otherwise.
+  service refuses the configuration otherwise. It also refuses equal token
+  values, even when they come from two different files.
 - the login token is held by the login **supervisor/executor** of the account,
   out of the agents' reach (no agent process reads it, no agent-readable
   file). Its custody is a pilot decision (see preconditions); a token readable

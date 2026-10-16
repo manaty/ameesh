@@ -21,6 +21,7 @@ import unittest
 from urllib.parse import urlsplit
 
 from ameesh import receipts
+from ameesh.approve.config import ApproveConfig, ApproveConfigError
 from ameesh.approve.service import ApproveService
 
 from .test_approve import AGENT, ALICE, ApproveBase
@@ -403,6 +404,16 @@ class LoginChallengeTest(ApproveBase):
         # le code privé est effacé dès le reçu signé
         self.assertIsNone(self.service.store.login_private(data["login_id"]))
         self.assertFalse(os.path.exists(private))
+
+
+class LoginTokenIsolationTest(unittest.TestCase):
+    def test_meme_jeton_refuse_meme_dans_deux_fichiers_distincts(self):
+        cfg = ApproveConfig(
+            rp_id="approve.example.test", origins=("https://approve.example.test",),
+            login_api="open", token_file="/service-token", login_token_file="/login-token")
+        with self.assertRaisesRegex(ApproveConfigError, "DISTINCT"):
+            ApproveService(cfg, None, None, service_token="shared-test-token",
+                           login_token="shared-test-token", store=object())
 
 
 class LoginApiClosedTest(ApproveBase):
