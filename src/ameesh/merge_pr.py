@@ -93,7 +93,6 @@ import re
 import shutil
 import tempfile
 import time
-from types import SimpleNamespace
 
 from . import land, merge_queue, migrations, packet_reservation, plan_git, radar, resolutions, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -556,14 +555,20 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # #1680: use the queue's exact target spelling and project identity.
         # Before #1374 lands, origin/develop and develop are distinct keys;
         # inventing a canonical key here would bypass the installed queue.
-        lease_project = project
-        if lease_project is None:
-            app = (work.get(db, lot).get("app") or "").strip()
-            if not app:
-                raise MergePrError("cannot reserve an undeclared target project")
-            lease_project = SimpleNamespace(name=app)
-        reservation = packet_reservation.WriterLease(db, lease_project, ready["target"])
-        reservation.acquire()
+        # #1703 N2: that identity is resolved by one shared helper
+        # (`merge_queue.writer_project`): the declared radar project first,
+        # else the admitted lot's app — the same name the queue carries.
+        # #1703 N1: a dry run writes nothing (it stops before the push), so it
+        # must not take, hold or refuse on that lease: taking it refused a
+        # live merge while the proof ran, and blocked the queue meanwhile.
+        if not dry_run:
+            try:
+                lease_project = merge_queue.writer_project(
+                    cfg, repo, (work.get(db, lot).get("app") or ""), project=project)
+            except merge_queue.QueueError as exc:
+                raise MergePrError(str(exc)) from exc
+            reservation = packet_reservation.WriterLease(db, lease_project, ready["target"])
+            reservation.acquire()
         api_base = (view.get("baseRefOid") or "").lower()
         merge_state = (view.get("mergeStateStatus") or "").upper()
 
@@ -626,6 +631,10 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                                   "class": ready.get("class") or "",
                                   "class_why": ready.get("class_why") or ""},
                     "message": text}
+        if reservation is not None:
+            # #1703 N2: the identity actually held is observable, so an
+            # operator can compare it with the train's key on the same target.
+            evidence["reservation"] = reservation.key
         # #1003 B1: the radar project's gates, on the merged tree, as the
         # queue does before pushing (no declared gate: nothing to run).
         if project is not None and (getattr(project, "gates", ())
@@ -660,7 +669,8 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                                "review, freeze again"
                                % (target, remote_target[:12] or "?", tip[:12], target))
         if dry_run:
-            evidence.update(state="dry-run", pushed=False, remote_tip="")
+            evidence.update(state="dry-run", pushed=False, remote_tip="",
+                            reservation="not taken (dry-run)")
             return evidence
 
         ref = "refs/heads/%s" % target
