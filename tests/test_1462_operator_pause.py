@@ -176,12 +176,15 @@ class PauseTest(PgTestCase):
         threading.Thread.__init__(worker)
         worker.db, worker.name, worker.epoch = self.db, "worker", epoch
         worker.runner = mock.Mock(runner_id="runner-test")
-        with mock.patch.object(worker, "_run_turn", side_effect=AssertionError("turn launched")):
+        worker.fast_failure = True
+        with mock.patch.object(worker, "_attach_pending", side_effect=AssertionError("attach checked")), \
+                mock.patch.object(worker, "_run_turn", side_effect=AssertionError("turn launched")):
             self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "picked prompt"}))
         row = registry.get(self.db, "worker")
         self.assertEqual(row["pending_prompt"], "picked prompt")
         self.assertTrue(row["operator_paused"])
         self.assertEqual(row["status"], "queued")
+        self.assertFalse(worker.fast_failure)
 
     def test_due_rotation_waits_while_paused_without_cancelling(self):
         self.change()
