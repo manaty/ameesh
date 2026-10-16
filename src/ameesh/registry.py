@@ -161,6 +161,29 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
         name, owner, ttl_seconds, require_responsible=_responsible_required(db))
 
 
+def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+    """Bail vivant et détenu par ce runner, AVEC la ligne lue au passage.
+
+    #811 : le hook a besoin des projets de l'agent (mono/multi) pour son
+    budget de remise (L61) ; la lecture du bail les ramène déjà (`state` porte
+    `projects`, `team`, `chantier`), le troisième élément évite une seconde
+    lecture du registre. `None` quand le backend ne les porte pas.
+    """
+    row = storage.of(db).leases.state(name)
+    if row is None:
+        return False, "agent %s not in the registry" % name, None
+    if row.get("status") == "stopped":
+        return False, "agent stopped", row
+    if (row.get("lease_owner") or "") != owner:
+        return False, "lease held by %s" % (row.get("lease_owner") or "nobody"), row
+    if int(row.get("lease_epoch") or 0) != int(epoch):
+        return (False, "epoch %s in the registry, %s in the session"
+                % (row.get("lease_epoch"), epoch), row)
+    if not row.get("live"):
+        return False, "lease expired", row
+    return True, "", row
+
+
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
     """Le bail est-il vivant et détenu par ce runner à cet epoch ?
 
@@ -168,18 +191,8 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     une session dont le bail a expiré ou a changé de main ne peut plus
     consommer le courrier de l'agent.
     """
-    row = storage.of(db).leases.state(name)
-    if row is None:
-        return False, "agent %s not in the registry" % name
-    if row.get("status") == "stopped":
-        return False, "agent stopped"
-    if (row.get("lease_owner") or "") != owner:
-        return False, "lease held by %s" % (row.get("lease_owner") or "nobody")
-    if int(row.get("lease_epoch") or 0) != int(epoch):
-        return False, "epoch %s in the registry, %s in the session" % (row.get("lease_epoch"), epoch)
-    if not row.get("live"):
-        return False, "lease expired"
-    return True, ""
+    ok, reason, _ = lease_agent(db, name, owner, epoch)
+    return ok, reason
 
 
 def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:

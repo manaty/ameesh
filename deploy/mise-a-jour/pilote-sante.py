@@ -30,8 +30,10 @@ Evidence, all read around the call:
 
 The enrolled `turn.json` document carries exact keys `agent`, `unit`, `account`,
 `home` and `seconds`; the runner unit must be the enrolled agent's own unit and
-the account a plain login name. Document bodies, provider text and session
-identifiers never enter an error or a receipt.
+the account a plain login name. `validate_enrollment` is the single validator of
+that document, so an operator entry that assembles an enrollment is judged by
+exactly the rules the controller enforces. Document bodies, provider text and
+session identifiers never enter an error or a receipt.
 
 This module is source only: it is not installed, no service is enabled and no
 root, SSH, systemd, PostgreSQL migration or production effect is executed by
@@ -62,6 +64,33 @@ class TurnError(ValueError):
     pass
 
 
+def validate_enrollment(enrollment):
+    """Exact enrolled probe document (`turn.json`), validated once for everyone.
+
+    Keys are exactly `agent`, `unit`, `account`, `home` and `seconds`; the unit
+    is the agent's own runner unit and the deadline is bounded (5 to 120
+    seconds). Returns a copy, so a caller cannot keep a handle on the values
+    the controller later reads.
+    """
+    if (not isinstance(enrollment, dict)
+            or set(enrollment) != {'agent', 'unit', 'account', 'home', 'seconds'}):
+        raise TurnError('invalid turn enrollment')
+    agent, unit = enrollment['agent'], enrollment['unit']
+    account, home, seconds = enrollment['account'], enrollment['home'], enrollment['seconds']
+    if not isinstance(agent, str) or AGENT.fullmatch(agent) is None:
+        raise TurnError('invalid probe agent')
+    if unit != 'ameesh-runner@' + agent + '.service':
+        raise TurnError('invalid probe runner unit')
+    if not isinstance(account, str) or ACCOUNT.fullmatch(account) is None:
+        raise TurnError('invalid probe account')
+    if (not isinstance(home, str) or '..' in home or HOME.fullmatch(home) is None
+            or home == '/'):
+        raise TurnError('invalid probe home')
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or not 5 <= seconds <= 120:
+        raise TurnError('invalid turn deadline')
+    return dict(agent=agent, unit=unit, account=account, home=home, seconds=seconds)
+
+
 class HealthTurn:
     """One enrolled probe's completed turn, verified and never invented."""
 
@@ -72,25 +101,12 @@ class HealthTurn:
             raise TurnError('enrolled turn database required')
         if not isinstance(host, str) or AGENT.fullmatch(host) is None:
             raise TurnError('invalid enrolled host')
-        if (not isinstance(enrollment, dict)
-                or set(enrollment) != {'agent', 'unit', 'account', 'home', 'seconds'}):
-            raise TurnError('invalid turn enrollment')
-        agent, unit = enrollment['agent'], enrollment['unit']
-        account, home, seconds = enrollment['account'], enrollment['home'], enrollment['seconds']
-        if not isinstance(agent, str) or AGENT.fullmatch(agent) is None:
-            raise TurnError('invalid probe agent')
-        if unit != 'ameesh-runner@' + agent + '.service':
-            raise TurnError('invalid probe runner unit')
-        if not isinstance(account, str) or ACCOUNT.fullmatch(account) is None:
-            raise TurnError('invalid probe account')
-        if (not isinstance(home, str) or '..' in home or HOME.fullmatch(home) is None
-                or home == '/'):
-            raise TurnError('invalid probe home')
-        if isinstance(seconds, bool) or not isinstance(seconds, int) or not 5 <= seconds <= 120:
-            raise TurnError('invalid turn deadline')
+        enrollment = validate_enrollment(enrollment)
         self.db, self.host, self.system = db, host, system
-        self.agent, self.unit = agent, unit
-        self.account, self.home, self.seconds = account, home, seconds
+        self.agent, self.unit = enrollment['agent'], enrollment['unit']
+        self.account, self.home, self.seconds = (enrollment['account'],
+                                                 enrollment['home'],
+                                                 enrollment['seconds'])
 
     # -- controller contract ------------------------------------------------
     def one_turn(self, *, operation, step, release, root):

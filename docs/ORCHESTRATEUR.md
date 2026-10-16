@@ -300,7 +300,18 @@ Elle est posée sur le lot dès que le relevé la voit en avance sur sa cible.
 La fusion GitHub de cette branche (« Merge pull request #N from
 owner/lot/<id>-… ») ou une fusion locale (« Merge branch 'lot/<id>-…' »)
 ferme le lot, même après la suppression de la branche. Le relevé lit alors le
-corps de la PR (`gh`). Une PR qui ne livre qu'une partie d'un lot parapluie
+corps de la PR (`gh`).
+
+**Détacher une branche obsolète** (#2102). Quand la PR d'un lot est fermée ou
+supplantée et que le lot reste ouvert (vérification restante, autre
+livraison), sa branche sort du lot sans changer son état, son titulaire ni
+son relecteur : `ameesh work branch <id> --detach --reason "PR #N supplantée
+par #M"`. La ligne de journal garde le nom, le dernier commit vu, la cible et
+la raison ; Git n'est pas touché. Le radar ne lit plus cette branche, et le
+relevé ne l'associe plus implicitement, même si `lot/<id>-…` existe encore.
+Un lot sans branche peut nommer celle à ne plus deviner (`ameesh work branch
+<id> lot/<id>-… --detach --reason …`). La réassociation est explicite :
+`ameesh work branch <id> <branche> [--target T]`. Une PR qui ne livre qu'une partie d'un lot parapluie
 (#139) porte dans sa description :
 
 ```
@@ -369,13 +380,23 @@ le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
 commit de fusion et une note qui dit comment la fusion a été constatée.
 
 À la main, quand le relevé ne peut pas la voir (lot sans assigné, autre
-hôte, commit qui ne le désigne pas) :
+hôte), depuis un clone du dépôt du lot :
 
 ```
-ameesh work merged <id> --sha <commit de fusion> [--note "…"]
+ameesh work merged <id> --sha <commit de fusion> [--repo <clone local>] [--note "…"]
 ```
 
 depuis tout état ouvert, en une fois ; l'acteur est votre identité liée.
+La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
+(ou le dépôt configuré pour son projet), puis le commit dans sa cible.
+Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
+de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
+Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
+pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
+n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
+dossier courant. La lecture reste locale : récupérer la cible au préalable
+si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by

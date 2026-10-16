@@ -328,7 +328,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('quota_gauge_readings', ARRAY[
         'id', 'harness', 'gauge_key', 'used', 'resets_at', 'window_s', 'observed_at',
-        'account'
+        'account', 'produced_at', 'source'
     ]),
     ('provider_balances', ARRAY[
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
@@ -376,7 +376,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159e6 (0361): the guard's last restart (unit names and reasons)
         'guard_restart',
         -- L159f (0069): host gate state, seq and the guard's short reason
-        'gate_state', 'gate_seq', 'gate_reason'
+        'gate_state', 'gate_seq', 'gate_reason',
+        -- #2022 (0455): process and zombie counts, the publishing runner
+        'procs_total', 'procs_zombie', 'runner_id', 'runner_procs', 'runner_zombies'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',

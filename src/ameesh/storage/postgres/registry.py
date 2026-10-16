@@ -650,7 +650,8 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             SELECT lease_owner, lease_epoch, status,
-                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
+                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live,
+                   projects, team, chantier
               FROM agent_registry WHERE name = %s
             """,
             (name,),
