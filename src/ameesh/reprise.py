@@ -1062,6 +1062,11 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
         raise RepriseError("invalid agent name: %r" % (name,))
+    # L243b (B1) : résoudre à l'entrée, puis écrire sous le primaire — la
+    # lecture (`registry.get`) résout déjà, les écritures non : garder l'alias
+    # ferait chercher une ligne inexistante et refuser un agent connu.
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="reprise.adopt")
     if harness not in HARNESSES:
         raise RepriseError("harness %r: adopt can resume %s" % (harness, ", ".join(HARNESSES)))
     if not SESSION_RE.match(session_id or ""):
@@ -1348,6 +1353,10 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
         raise RepriseError("invalid agent name: %r" % (name,))
+    # L243b (B1) : même résolution que la lecture, à l'entrée : tout ce qui
+    # suit (bail, NOTIFY, oubli local, fil) écrit sous le nom primaire.
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="reprise.resume")
     row = registry.get(db, name)
     if row is None:
         raise RepriseError("unknown agent: %s" % name)

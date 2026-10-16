@@ -263,6 +263,8 @@ class WorkDepot:
         epoch_text = h.get(contract.HDR_LEASE_EPOCH.lower(), "")
         if not _AGENT_RE.match(agent) or not owner or not epoch_text.isdigit():
             return _error("bad_args", "agent, owner et epoch du bail attendus")
+        if hasattr(self.lease_check, "resolve_agent"):
+            agent = self.lease_check.resolve_agent(agent)
         fence = Fence(agent, owner, int(epoch_text))
         try:
             if not self.lease_check(principal, agent, owner, fence.epoch):
@@ -407,6 +409,11 @@ class WorkDepot:
 class _LeaseChecker:
     def __init__(self, pool):
         self.pool = pool
+
+    def resolve_agent(self, name: str) -> str:
+        from ..agent_names import resolve
+        with self.pool.connection() as conn:
+            return resolve(name, db=conn, operation="worktree.agent")
 
     def __call__(self, principal, agent: str, owner: str, epoch: int) -> bool:
         if not owner.startswith("exec:%s:" % principal.executor_id):
