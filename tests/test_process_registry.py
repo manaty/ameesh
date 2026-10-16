@@ -1650,6 +1650,50 @@ class RegistryTest(PgTestCase):
             version=waiting.version), spec=self.spec)
         self.assertEqual(after.state, "build")
 
+    @unittest.skipUnless(pv is not None, "tranche C (#1924) absente de main")
+    def test_seam_reel_acteur_du_verdict_et_id_de_livraison(self):
+        """#1994 : les deux coutures B -> C passent par le `read_sources` réel.
+
+        (1) l'acteur du verdict est projeté : `work_completed` accepte une revue
+        réelle (avant le correctif : `completion-review-missing`) ; (2) l'id de
+        livraison est projeté en chaîne, comme la référence client : une
+        livraison de code référencée par son id est trouvée (avant :
+        `completion-evidence-missing`)."""
+        saved = pr.installed_verifiers()
+
+        def restore():
+            pr.INSTALLED_VERIFIERS.clear()
+            pr.INSTALLED_VERIFIERS.update(saved)
+
+        self.addCleanup(restore)
+        pv.install_verifiers(pr)
+
+        sha = "c" * 40
+        # Un lot de code : la livraison est référencée par son id (chaîne) et
+        # la revue par son acteur — les deux coutures du même `read_sources`.
+        code = self.pinned(stage="staging", state="merged")
+        delivered = int(self.db.query(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'delivered', %s, %s) RETURNING id",
+            (code, sha, ACME_ACTOR))[0]["id"])
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor,"
+            "                                verdict)"
+            " VALUES (%s, 'verdict', %s, %s, 'ok')", (code, sha, "relecteur-1"))
+        context = pr.VerificationContext(
+            db=self.db, work_item=self.row(code),
+            command=self.command(code, frm="staging", to="done",
+                                 guard="work_completed"),
+            spec=self.spec, from_stage="staging", to_stage="done")
+        sources = pr.read_sources(context)
+        verdicts = [m for m in sources["milestones"] if m["kind"] == "verdict"]
+        self.assertEqual([m["actor"] for m in verdicts], ["relecteur-1"])
+        self.assertEqual([d["id"] for d in sources["deliveries"]], [str(delivered)])
+        completed = pr.apply_command(self.db, self.command(
+            code, frm="staging", to="done", guard="work_completed",
+            facts={"delivery": str(delivered)}), spec=self.spec)
+        self.assertEqual(completed.state, "promoted")
+
 
 @unittest.skipUnless(pw is not None, "slice A (#1918) missing from main")
 class CompiledArtifactTest(PgTestCase):
