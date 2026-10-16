@@ -6876,6 +6876,7 @@ class Runner:
                 self.measure_once(db)
                 self.lot_sessions_purge(db)
             self.radar_once(db)
+            self.incident_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
             message = "branch sweep failed (%s: %s)" % (type(exc).__name__, exc)
@@ -6936,6 +6937,49 @@ class Runner:
             if message != getattr(self, "_radar_error", None):
                 log_async(message)
             self._radar_error = message
+
+    def incident_once(self, db) -> None:
+        """#1681 : ouvre les incidents des exécutions terminales rouges de la
+        branche d'intégration (develop Nexlink, main ameesh), à la source
+        courante du veilleur (`ci.latest_concluded`) et à la même tête. Une
+        exécution déjà portée par son incident n'est pas rouverte ; seules les
+        ouvertures et les relevés illisibles sont journalisés. Ne lève jamais.
+
+        #1467 : les passages du train (`self.train_passages`) apportent les
+        faits exacts du paquet (atterrissage par membre, rapport, carte
+        qualifiée par dépôt et tête) par `train_incidents.consume` ; sans
+        module (pas encore atterri), sans passage, ou si ce helper échoue,
+        `incident.consume(db)` fait foi — un incident n'est jamais perdu."""
+        from . import incident
+        try:
+            lines = None
+            try:
+                from . import train_incidents
+            except Exception:  # module du train #1467 pas encore atterri
+                train_incidents = None
+            if train_incidents is not None:
+                try:
+                    lines = train_incidents.consume(
+                        db, getattr(self, "train_passages", ()), consumer=incident)
+                except Exception as exc:  # le relevé direct reste la garde
+                    message = "train facts unreadable (%s: %s)" % (type(exc).__name__, exc)
+                    if message != getattr(self, "_incident_train_error", None):
+                        log_async("CI incident: %s; direct reading" % message)
+                    self._incident_train_error = message
+            if lines is None:
+                lines = incident.consume(db)
+            for line in lines:
+                where = "%s %s run %s" % (line.get("repo"), line.get("branch"),
+                                          line.get("run_id"))
+                if line.get("created"):
+                    log_async("CI incident %s: lot #%s ouvert%s (%s)" % (
+                        where, line.get("id"),
+                        " assigné à %s" % line["author"] if line.get("assigned") else "",
+                        line.get("status") or "?"))
+                elif "illisible" in str(line.get("why") or ""):
+                    log_async("CI incident %s: %s" % (where, line["why"]))
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            log_async("CI incident failed (%s: %s)" % (type(exc).__name__, exc))
 
     def start_branch_sweep_poll(self) -> None:
         """Relevé périodique des branches (`AMEESH_BRANCH_SWEEP_INTERVAL`,
