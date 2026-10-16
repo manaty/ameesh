@@ -1,8 +1,9 @@
 # L232d — plan proposé pour les adaptateurs de connexion OAuth (lot #366)
 
 Auteur : mty-amh-impl-04, 2026-10-16 ~11:45Z. Branche `lot/l232d`, base `main` 20aa67782.
-Statut : **proposition soumise à mesh-design avant implémentation** (note d'auteur du 14/10
-10:03Z). Aucun code écrit, aucune CI, aucun geste distant, aucun root, aucune dépense.
+Statut : **plan validé par mesh-design le 16/10 12:07Z (message #81614) ; réponses en §12 ;
+socle (tranche 1) en construction.** Aucune CI de lot, aucun geste distant, aucun root,
+aucune dépense.
 Source de périmètre : étude `docs/design/etudes/l232-autonomous-host-provisioning.md`
 (§ « OAuth: ameesh prepares, a human consents in a browser », § « What stays with the
 owner », § « Delivery in four implementation lots ») et corps du lot #366.
@@ -224,4 +225,46 @@ Relevé sur `ameesh-agents-1` (cet hôte) et via `ameesh harness versions` :
 - **Conséquence** : §4 est confirmé pour Claude et GitHub sur les versions ci-dessus ;
   deux garde-fous s'ajoutent ; la vérification Codex est ajoutée aux préconditions de la
   tranche 1.
+
+## 12. Réponses de mesh-design (source : message #81614, 2026-10-16T12:07:41+00:00)
+
+Le plan `e0115ca34` est lu et retenu ; l'estimation native du lot passe à 24 h (12 h socle
++ 12 h pilote, même lot). Réponses, dans l'ordre des six questions de §10 :
+
+1. **Vue privée** : oui à l'extension d'`ameesh-approve`, **genre de reçu distinct**.
+   L'assertion WebAuthn est **requise avant affichage** ; le lien seul est muet. Les gardes
+   des actions L5 sont conservées telles quelles. Le résumé signé est lié à
+   hôte/fournisseur/compte/échéance, **sans code ni condensat**. Le reçu « terminé » ne
+   prouve **pas** le grant fournisseur : la santé et le compte attendu sont vérifiés
+   séparément.
+2. **Canal hôte** : exécution **locale par l'exécuteur du compte** sur l'hôte cible.
+   Aucun nouveau SSH, root ou `ForceCommand` dans ce lot ; si un hôte n'a pas cet
+   exécuteur, préparer seulement l'écart concret, sans inventer de délégation.
+3. **Claude** : `claude auth login --claudeai` seulement, environnement de compte épuré ;
+   `setup-token` / type `oauth_token` **hors pilote**.
+4. **Réestimation** : accord 12 h + 12 h dans le même lot. Le socle et les témoins factices
+   se construisent en `build` dès maintenant ; l'arête #365 garde sa portée pour le pilote
+   réel et ne bloque pas le socle (aucune dépendance de code). Mettre à jour ce plan avec
+   les réponses datées et leur source (fait ici).
+5. **Pilote** : candidat `ameesh-agents-1` (dsh puis Claude déjà installé), sous preuve
+   d'admission/préflight et profil de test isolé. Ne déplacer aucun agent vivant, ne toucher
+   aucun compte utilisé pour valider le plan. La préparation précisera agent/profil de test,
+   bail/caps/garde, rollback et vue privée ; consentement fournisseur demandé quand ce
+   résultat est prêt. Codex ne justifie aucune installation : son test réel attend un
+   hôte/version déjà admis ; `--device-auth` est confirmé par `login --help` sur
+   `pc-smichea` (codex 0.159.3) et par la doc officielle, **sans lancer de login** ; la
+   forme de sortie réelle reste à qualifier privément au pilote, sans bloquer les autres
+   adaptateurs.
+6. **Frontière #365** : canal OAuth **séparé** d'`ameesh-secrets`, sans élargissement de son
+   dispatcher. `#2031` est admis sur `81833ce8` (`39813384` dépassé) ; #365 reste
+   indépendant.
+
+Précisions de plan ajoutées à la source :
+
+- dossiers `0700` et fichiers `0600` (pas « un foyer 0600 ») ;
+- échéance du défi : `min(15 min, expiration fournisseur)` ;
+- codes uniquement en état privé ;
+- classe **sécurité/secrets** : avis requis **avant activation** ; tests ciblés, **aucune CI
+  de lot** ;
+- avancer le socle sans attendre d'autre réponse.
 
