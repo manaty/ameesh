@@ -418,6 +418,25 @@ class AgentWorker(threading.Thread):
     chacun avec son battement de bail.
     """
 
+    #: #1914 : marque et pas d'un tour différé — verrou de session tenu par un
+    #: tiers (hors attach). Le statut, marqué (L35), n'est posé qu'au-delà du
+    #: délai de grâce, jamais par-dessus un autre blocage ni sur un agent
+    #: arrêté, et n'est levé que par la même marque.
+    DEFERRED_STATUS = "session lock held"
+    DEFERRED_RETRY = 0.5
+    DEFERRED_RETRY_MAX = 30.0
+    #: #1914 : état des tours différés — remis à zéro dès qu'un tour part
+    #: (`_deferral_over`). Défauts de classe, comme `resident` : une
+    #: construction partielle ne doit pas lever.
+    deferred_since: float | None = None
+    deferred_streak = 0
+    deferred_alerted = False
+    deferred_wait_s = DEFERRED_RETRY
+    #: #1914 : motif du dernier report, posé par `run_turn` (« session lock
+    #: held » ou « attach requested ») — le worker n'espace et ne rend visible
+    #: qu'un verrou tenu par un tiers.
+    deferred_reason = ""
+
     #: L76 : le processus résident de l'agent entre ses tours, ou None.
     #: Défaut de classe : les constructions partielles (`__new__` sans
     #: `__init__`, chemin `--once` et tests de la porte d'hôte) doivent
@@ -4019,27 +4038,108 @@ class AgentWorker(threading.Thread):
             self._release_session_lock()
         return True
 
+    def deferred_lock_grace(self) -> float:
+        """#1914 : délai de grâce d'un tour différé par un verrou de session
+        tenu par un tiers (hors attach). En deçà, c'est le post-tour normal
+        d'un résident qui rend le verrou : quelques passations d'attach
+        (`attach.HANDOFF_TIMEOUT`), pas de bruit."""
+        from . import attach as attach_mod
+        return 2.0 * attach_mod.HANDOFF_TIMEOUT
+
+    def monotonic(self) -> float:
+        """#1914 : horloge monotone des tours différés. Méthode à part pour que
+        la sonde déterministe la remplace sans patcher le module `time` (des
+        échéances de base y sont calculées)."""
+        return time.monotonic()
+
+    def _deferred_turn(self) -> float:
+        """#1914 : un tour est reporté (#1686 N2) — compter les reports
+        consécutifs. Au-delà du délai de grâce d'un verrou tenu par un tiers,
+        le rendre visible **une fois** (journal + statut marqué) et espacer les
+        reprises, au lieu de prendre et rendre la consigne deux fois par
+        seconde sans fin. Un attach demandé, lui, garde le pas court : le
+        résident doit reprendre la main dès la passation finie. Rend le pas de
+        reprise."""
+        maintenant = self.monotonic()
+        if self.deferred_since is None:
+            self.deferred_since = maintenant
+        self.deferred_streak += 1
+        if self.deferred_reason != self.DEFERRED_STATUS:
+            return self.DEFERRED_RETRY
+        if maintenant - self.deferred_since < self.deferred_lock_grace():
+            return self.DEFERRED_RETRY
+        self.deferred_wait_s = min(self.DEFERRED_RETRY_MAX,
+                                   max(2.0 * self.DEFERRED_RETRY,
+                                       2.0 * self.deferred_wait_s))
+        if self.deferred_alerted:
+            return self.deferred_wait_s
+        self.deferred_alerted = True
+        texte = ("%s on %s: another process holds session-use; turns deferred "
+                 "without failure, retries spaced"
+                 % (self.DEFERRED_STATUS, self.runner.host or "this host"))
+        log("[%s] %s (streak %d, %.0fs)" % (self.name, texte, self.deferred_streak,
+                                            maintenant - self.deferred_since))
+        try:
+            # Blocage marqué, fencé par le bail : rien n'est posé sur un agent
+            # arrêté ni par-dessus un autre blocage (budget, auth, hôte…).
+            registry.set_marked_block(self.db, self.name, self.runner.runner_id,
+                                      self.epoch, self.DEFERRED_STATUS, texte,
+                                      self.DEFERRED_STATUS)
+        except db_mod.DbError as exc:
+            log_async("[%s] deferred lock status not written (%s)"
+                      % (self.name, db_mod.explain(exc)))
+        return self.deferred_wait_s
+
+    def _deferral_over(self) -> None:
+        """#1914 : la série de reports est finie (un tour a été lancé, a
+        échoué, il n'y a plus rien à prendre, ou le worker s'arrête) — compteur
+        remis à zéro et marque de verrou levée si elle est encore la nôtre."""
+        if self.deferred_since is None and not self.deferred_alerted:
+            return
+        etait = self.deferred_alerted
+        self.deferred_since = None
+        self.deferred_streak = 0
+        self.deferred_alerted = False
+        self.deferred_wait_s = self.DEFERRED_RETRY
+        self.deferred_reason = ""
+        if not etait:
+            return
+        try:
+            # Ne lève que la marque posée par ce worker (texte et préfixe
+            # exacts, bail contrôlé) : un autre blocage reste en place.
+            registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                        self.epoch, self.DEFERRED_STATUS,
+                                        self.DEFERRED_STATUS)
+        except db_mod.DbError as exc:
+            log_async("[%s] deferred lock status not cleared (%s)"
+                      % (self.name, db_mod.explain(exc)))
+
     def run_turn(self, spec: dict) -> bool | None:
         """Exclude attach for the whole turn and life of its resident.
 
         Rend `True` (tour lancé), `False` (échec) ou `None` quand le tour est
         **différé** sans échec (#1686 N2) : attach demandé ou verrou de session
         tenu ; la consigne est restaurée. Le worker ne compte pas un report
-        comme un échec rapide et ne lui applique pas l'attente d'échec."""
+        comme un échec rapide et ne lui applique pas l'attente d'échec.
+        #1914 : `deferred_reason` porte le motif du report — le worker ne rend
+        visible qu'un verrou tenu par un tiers."""
         self.fast_failure = False
         if (registry.get(self.db, self.name) or {}).get("operator_paused"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
         from .platform import process, session_lock
         if self._attach_pending():
+            self.deferred_reason = "attach requested"
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return None
         if getattr(self, "_session_lock", None) is None:
             self._session_lock = session_lock.try_lock(self.state_dir, "session-use")
             if self._session_lock is None:
+                self.deferred_reason = "session lock held"
                 registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
                 return None
         if self._attach_pending():
+            self.deferred_reason = "attach requested"
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return None
         self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
@@ -6013,6 +6113,7 @@ class AgentWorker(threading.Thread):
                     continue
                 self._base_retablie()
                 if spec is None:
+                    self._deferral_over()  # #1914 : plus rien à prendre
                     self._resident_between_turns()  # L76 : mort, sommeil
                     self.wake.wait(timeout=self.wait_timeout(
                         min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0))))
@@ -6036,10 +6137,13 @@ class AgentWorker(threading.Thread):
                     # croissante. On retente au pas court, sans boucle serrée et
                     # sans dépasser l'échéance du bail (le renouvellement du
                     # tour suivant doit rester possible) : le verrou est rendu à
-                    # la fin du post-tour du résident.
-                    self.wake.wait(timeout=self.wait_timeout(0.5))
+                    # la fin du post-tour du résident. #1914 : un verrou tenu
+                    # par un tiers au-delà du délai de grâce devient visible
+                    # (journal + statut) et les reprises s'espacent.
+                    self.wake.wait(timeout=self.wait_timeout(self._deferred_turn()))
                     self.wake.clear()
                     continue
+                self._deferral_over()  # #1914 : la série de reports est finie
                 if reussi:
                     self.fast_failures = 0
                     self._host_reason, self._host_delay = "", 0.0  # L106
@@ -6065,6 +6169,11 @@ class AgentWorker(threading.Thread):
                 # dépasser le bail.
                 self._attendre_apres_echec(self.failure_wait())
         finally:
+            # #1914 : le worker qui s'arrête ne laisse pas derrière lui un
+            # blocage « session lock held » périmé (levé sous bail : si un
+            # remplaçant a déjà repris la main, la marque n'est plus la nôtre
+            # et rien n'est touché).
+            self._deferral_over()
             self._mark_power_stop()
             self.release_lease()
 
