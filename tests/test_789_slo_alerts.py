@@ -14,7 +14,8 @@ import os
 import time
 import unittest
 
-from ameesh import alert_briefs, exploitation, notify, registry, work, work_dependencies
+from ameesh import (alert_briefs, exploitation, notify, registry, storage, work,
+                    work_dependencies)
 
 from .support import FAKEBIN, PgTestCase
 
@@ -81,6 +82,22 @@ class AlerteTest(_Base):
         self.assertIn("slo_breach", alert_briefs.BRIEFED_TYPES)
 
     def test_niveau_2_pilote(self):
+        self.age(2.5 * HEURE)
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts],
+                         [(2, ["pilot"])])
+        self.assertEqual(alerts[0]["orchestrators"], ["orch"])
+
+    def test_niveau_2_ne_prend_pas_un_assigneur_pour_pilote(self):
+        # #1982 : l'historique L94 (agents ayant confié des lots) ne fait pas
+        # un pilote — l'heuristique `history=True` briefait des agents de
+        # chantier sans mandat ; le niveau 2 vise le rôle (déclaré ou canon).
+        registry.upsert(self.db, "dist", harness="claude", host=self.cfg.host)
+        registry.upsert(self.db, "dev2", harness="claude", host=self.cfg.host)
+        autre = work.add(self.db, title="à distribuer")
+        work.assign(self.db, int(autre["id"]), "dev2", actor="dist")
+        self.assertIn("dist", storage.of(self.db).operations.assigners(
+            since_s=30 * 24 * HEURE))
         self.age(2.5 * HEURE)
         alerts = self.slo()
         self.assertEqual([(a["level"], a["targets"]) for a in alerts],
