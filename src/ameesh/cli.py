@@ -693,7 +693,8 @@ def cmd_statusline(cfg: Config) -> int:
     # #1604 : le rendu est fréquent ; la ligne et l'état de la boîte sont
     # réutilisés quelques secondes par le chemin rapide (jamais bloquant).
     try:
-        fastmail.write_statusline(cfg, fastmail.statusline_key(data), ligne)
+        # #1628 : la clé porte le nom résolu, comme celle du chemin rapide.
+        fastmail.write_statusline(cfg, fastmail.statusline_key(data, name), ligne)
         if binding.ok:
             fastmail.note(cfg, name, pending=bool(unread), unread=unread)
     except Exception:
@@ -725,8 +726,8 @@ class _Remise:
     l'annuler si rien n'a été montré. Repli fichier : lecture et marquage v0.
     """
 
-    def __init__(self, bk, name: str, binding) -> None:
-        self.bk, self.name = bk, name
+    def __init__(self, cfg, bk, name: str, binding) -> None:
+        self.cfg, self.bk, self.name = cfg, bk, name
         self.pg = getattr(bk, "kind", None) == "pg"
         self.owner = binding.runner_id if binding.bound_to_lease else None
         self.epoch = binding.epoch if self.owner else None
@@ -740,22 +741,51 @@ class _Remise:
         self.solde = False
 
     def prendre(self, limite: int | None = None) -> list[dict]:
-        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour)."""
+        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour).
+
+        #811 B1/R3 : un message dont l'unique lot est un secondaire déclaré
+        sans dossier n'est pas réservé — l'exécuteur retient ce courrier, mais
+        son état de différé vit en mémoire et le hook ne le voit pas : sans
+        cette garde partagée il le remettrait dans la session d'un autre lot et
+        le marquerait livré. La lecture franchit en outre le préfixe retenu,
+        qui pouvait masquer un message remisable plus récent."""
         if not self.pg:
             tous = self.bk.unread(self.name)
             self.msgs = tous if limite is None else tous[:max(0, limite)]
             self.reste = len(tous) - len(self.msgs)
             return self.msgs
-        taille = 200 if limite is None else max(1, limite)
-        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=taille)
-        self.ouverte = bool(rows)
-        self.msgs = [mail.normalize(row) for row in rows]
+        borne = 200 if limite is None else max(1, limite)
+        besoin, lus = borne, 0
+        self.msgs = []
+        while len(self.msgs) < borne:
+            ids = self._deliverable(besoin)
+            if len(ids) <= lus:       # boîte épuisée ou backend à page bornée
+                break
+            lus = len(ids)
+            # Les réservations actives (y compris celles de notre jeton) sont
+            # écartées avant la LIMIT SQL. Compléter depuis une page plus large
+            # si elles occupaient le préfixe lu, même en mono-projet (#811 R3).
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                                limit=borne - len(self.msgs))
+            self.msgs.extend(mail.normalize(row) for row in rows)
+            self.ouverte = bool(self.msgs)
+            besoin = max(mail.UNREAD_LIMIT, besoin * 2, lus * 2)
         # une réservation pleine peut cacher des non-lus : on le dit (au pire
         # pour rien, le prochain hook reviendra par le chemin complet).
-        self.reste = 1 if len(rows) >= taille else 0
+        self.reste = 1 if len(self.msgs) >= borne else 0
         return self.msgs
+        return self.msgs
+
+    def _deliverable(self, borne: int) -> list[int]:
+        """#811 B1/R3 : les ids à réserver, les lots retenus laissés en place.
+
+        Même règle que l'exécuteur (`lot_workdir.deliverable_unread`), dérivée
+        du registre et du Host pour être visible du hook."""
+        from . import lot_workdir, registry
+        agent = registry.get(self.bk.db, self.name) or {"name": self.name}
+        rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent, besoin=borne)
+        return [int(row["id"]) for row in rows if row.get("id") is not None]
 
     def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
         """L514/#885 : réserve les SEULS messages qui ne peuvent pas attendre.
@@ -1184,7 +1214,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # pour que le chemin rapide ne conclue pas « rien à faire ».
             _marque_boite(cfg, name, attente)
             return 0
-        remise = _Remise(bk, name, binding)
+        remise = _Remise(cfg, bk, name, binding)
+        #: #1628 : un drapeau local, pas `sys.exc_info()` — un `cmd_hook` appelé
+        #: depuis un `except` verrait l'exception extérieure et ne marquerait
+        #: jamais la boîte.
+        remise_ok = True
         try:
             # #289 : la garde `and borne` date la remise a zero (une borne
             # nulle n'a rien reserve) ; la structure L514 de la chaine est
@@ -1240,12 +1274,17 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             remise.solder()
             if etat is not None:
                 _tour_remis(cfg, name, etat, msgs)
+        except BaseException:
+            # BaseException : une interruption (Ctrl-C, SystemExit) en cours de
+            # remise ne doit pas non plus poser le marqueur.
+            remise_ok = False
+            raise
         finally:
             remise.abandonner()
             # #1604 : marqueur posé seulement après un passage complet sans
             # exception (une base en panne ne doit pas se dire « rien à faire »),
             # et sans requête : la réservation sait ce qu'elle a laissé.
-            if sys.exc_info()[0] is None:
+            if remise_ok:
                 _marque_boite(cfg, name, remise.restants_apres())
     except Exception:
         return 0
