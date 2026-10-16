@@ -668,8 +668,11 @@ class ForcedRaceTest(_AuthBase):
         store_type = type(storage.of(self.db).accounts)
         original = store_type.switch
 
-        def switch(store, host, harness, *, expected, to, kind, reason, agent, **kw):
+        def switch_guarded(store, host, harness, *, expected, to, kind, reason, agent,
+                           now, **kw):
             # the owner forces the primary between our read and our switch
+            # (#1883 : le choix bascule par `switch_guarded`, et le forçage
+            # manuel par `switch` — c'est ce couple que ce témoin enjambe)
             original(store, host, harness, expected=None, to="primaire", kind="manuel",
                      reason="forçage manuel", agent=None, forced=True)
             return False
@@ -677,7 +680,7 @@ class ForcedRaceTest(_AuthBase):
         with mock.patch.dict(os.environ, {"HOME": maison}):
             book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
             _codex_rollout(home, 60, now + 1800)  # above the primary cap (50 %)
-            with mock.patch.object(store_type, "switch", switch):
+            with mock.patch.object(store_type, "switch_guarded", switch_guarded):
                 choix = accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                         now=now)
         self.assertTrue(choix.forced)

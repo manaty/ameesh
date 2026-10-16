@@ -37,7 +37,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import accounts, cost, exploitation, storage
+from ameesh import accounts, cost, exploitation, notify, storage
 
 from .test_l30_accounts import _Base, _dossier
 
@@ -232,6 +232,112 @@ class OveragePartageTest(_Base):
         self.assertEqual(choix.profile.name, "primaire", choix.why)
         self.assertFalse(choix.forced)
 
+    def test_la_continuite_ne_garde_pas_un_compte_retenu(self):
+        """B1 de la R1 auditeur : `account_turn.choose` décide le PROCHAIN tour
+        de la session — un compte retenu ne bénéficie plus de la continuité,
+        même si la lecture locale le dit sain."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        self._depassement(items, now)
+        # runner B : deuxième configuration du même nom, lecture saine, session
+        # en cours sur le compte retenu
+        c = _dossier(os.path.join(self.tmp, "comptes", "codex-3"), creds="auth.json")
+        _journal(c, week=(5, now + 6 * DAY))
+        autres = self._items(c)
+        choix = accounts.choose(self.db, self.cfg.host, "codex", autres,
+                                self._book(), now=now + 1.0,
+                                session_account="secondaire")
+        self.assertFalse(choix.kept)
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+
+    def test_le_forcage_ne_contourne_pas_une_retenue_publiee_apres(self):
+        """B1 : une retenue publiée APRÈS le forçage (par un autre runner) ne
+        peut pas être contournée par le forçage — le compte retenu ne reçoit
+        aucun tour, le forçage est levé pour un compte libre."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items,
+                                       "secondaire", by="test"))
+        # un autre runner lit le secondaire en dépassement et publie la retenue
+        storage.of(self.db).accounts.hold(self.cfg.host, "codex", "secondaire",
+                                          now + 600, "codex plan: in overage")
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                self._book(), now=now + 1.0)
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+        self.assertFalse(choix.forced)
+
+    def test_bascule_refusee_si_la_retenue_apparait_apres_le_classement(self):
+        """B2 : un classement sur un instantané périmé ne fait pas partir un
+        tour — la retenue de la cible est revérifiée sous le verrou de la
+        bascule, et la relecture après refus ne rend jamais la cible retenue."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        store = storage.of(self.db).accounts
+        store.init_active(self.cfg.host, "codex", "primaire")
+        # la retenue est publiée après le classement : l'instantané lu en tête
+        # de choose l'ignore, la transaction de bascule la voit
+        store.hold(self.cfg.host, "codex", "secondaire", now + 600,
+                   "codex plan: in overage")
+        before = len(self._bascules())
+        with mock.patch.object(accounts, "_held_for_overage",
+                               side_effect=[set(), {"secondaire"}]):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now + 1.0, agent="runner-b")
+        self.assertIsNone(choix.profile)          # aucun tour, aucune bascule
+        self.assertIn("held for overage", choix.reason)
+        self.assertEqual(len(self._bascules()), before)
+        self.assertEqual(store.active(self.cfg.host, "codex")["account"], "primaire")
+
+    def test_pas_de_tour_sur_le_compte_actif_retenu_entre_temps(self):
+        """B2, variante de l'auditeur : cible == compte actif lu en tête ; une
+        retenue publiée entre-temps est relue avant de rendre le compte — le
+        chemin sans bascule ne relance pas l'incident."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._items(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        store = storage.of(self.db).accounts
+        store.init_active(self.cfg.host, "codex", "secondaire")
+        store.hold(self.cfg.host, "codex", "secondaire", now + 600,
+                   "codex plan: in overage")
+        with mock.patch.object(accounts, "_held_for_overage",
+                               side_effect=[set(), {"secondaire"}]):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                    self._book(), now=now + 1.0, agent="runner-b")
+        self.assertIsNone(choix.profile)
+        self.assertIn("held for overage", choix.reason)
+
+    def test_switch_guarded_refuse_une_cible_retenue(self):
+        """Le verrou de la bascule : cible retenue ⇒ refus sans écriture ;
+        retenue expirée ⇒ bascule, et retenue du compte quitté dans la MÊME
+        transaction."""
+        store = storage.of(self.db).accounts
+        store.init_active(self.cfg.host, "codex", "primaire")
+        maintenant = time.time()
+        store.hold(self.cfg.host, "codex", "secondaire", maintenant + 600, "overage")
+        self.assertFalse(store.switch_guarded(
+            self.cfg.host, "codex", expected="primaire", to="secondaire",
+            kind="bascule", reason="r", agent="t", now=maintenant))
+        self.assertEqual(store.active(self.cfg.host, "codex")["account"], "primaire")
+        self.assertEqual(self._bascules(), [])
+        self.db.execute("UPDATE account_holds"
+                        " SET until_ts = extract(epoch from now()) - 1")
+        self.assertTrue(store.switch_guarded(
+            self.cfg.host, "codex", expected="primaire", to="secondaire",
+            kind="bascule", reason="r", agent="t", now=maintenant,
+            hold_reason="primaire plan: in overage",
+            hold_until=maintenant + 600))
+        self.assertEqual(len(self._bascules()), 1)
+        self.assertIn("primaire", store.holds(self.cfg.host, "codex"))
+
     def test_la_pause_dit_la_retenue(self):
         """Tous les comptes retenus : la pause le dit, elle ne prétend pas
         qu'ils sont tous au seuil."""
@@ -291,6 +397,24 @@ class AlerteOverageTest(_Base):
                  week=(47, now + 5 * DAY), credits=CREDITS)
         _journal(self.declared[0]["path"], week=(34, now + 6 * DAY))
         self.assertEqual(self._alertes(cfg, now), [])
+
+    def test_depassement_sans_fenetre_datee_ne_renotifie_pas(self):
+        """P2 de la R1 auditeur : sans fenêtre datée, `since` reste None —
+        l'identité de l'alerte ne dépend pas de l'heure de passage (une date
+        inventée, `now`, changeait la clé à chaque passe)."""
+        cfg = self._cfg()
+        now = float(int(time.time()))
+        # la fenêtre courte est saturée mais sans remise à zéro connue
+        _journal(self.declared[1]["path"], short=(100, None),
+                 week=(47, now + 5 * DAY), credits=CREDITS)
+        _journal(self.declared[0]["path"], week=(34, now + 6 * DAY))
+        premiere = self._alertes(cfg, now)
+        self.assertEqual(len(premiere), 1)
+        self.assertIsNone(premiere[0]["since"])
+        seconde = self._alertes(cfg, now + 5.0)
+        self.assertEqual(len(seconde), 1)
+        self.assertIsNone(seconde[0]["since"])
+        self.assertEqual(notify.key_of(premiere[0]), notify.key_of(seconde[0]))
 
 
 if __name__ == "__main__":

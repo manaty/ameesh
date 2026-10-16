@@ -1413,20 +1413,17 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     return why
 
 
-def _hold_overage(store, host: str, harness: str, profile: Profile, now: float,
-                  agent: str | None) -> None:
-    """#1883 : publie sur l'hôte qu'un compte quitté **est** en dépassement.
-
-    `account_holds` portait les retenues de rythme de 0027 §3, remplacées par
-    le classement (0034) ; elle sert ici à une **règle absolue** : un compte
-    facturé au-delà de son plan n'est pris par aucun runner de l'hôte, même
-    quand la lecture locale d'un autre processus ne voit pas le dépassement
-    (deux configurations peuvent lire deux dossiers sous le même nom). La
-    retenue n'est posée QUE par une bascule réelle qui quitte ce compte : une
-    pause, ou une lecture locale saine, ne bloque personne."""
-    store.hold(host, harness, profile.name, now + OVERAGE_HOLD_S,
-               "%s plan: in overage (billed beyond the plan)%s"
-               % (harness, ", seen by %s" % agent if agent else ""))
+def _overage_reason(harness: str, agent: str | None) -> str:
+    """#1883 : le motif publié dans `account_holds` pour un compte quitté en
+    dépassement (`account_holds` portait les retenues de rythme de 0027 §3,
+    remplacées par le classement 0034 ; elle sert ici à une **règle absolue** :
+    un compte facturé au-delà de son plan n'est pris par aucun runner de
+    l'hôte, même quand la lecture locale d'un autre processus ne voit pas le
+    dépassement. La retenue n'est posée QUE par une bascule réelle qui quitte
+    ce compte, dans la transaction de la bascule : une pause, ou une lecture
+    locale saine, ne bloque personne."""
+    return ("%s plan: in overage (billed beyond the plan)%s"
+            % (harness, ", seen by %s" % agent if agent else ""))
 
 
 def _held_for_overage(store, host: str, harness: str, now: float) -> set[str]:
@@ -1507,12 +1504,23 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # L226b : un compte en échec d'authentification n'est jamais choisi
     sick = auth_failure.failing(db, host, harness)
     candidates = healthy(items, sick)
+    # L226b/#1883 (R1 auditeur, B1) : les retenues d'overage publiées par les
+    # AUTRES processus de l'hôte sont lues EN TÊTE et priment sur tout
+    # placement — forçage, continuité comme classement. Un compte facturé
+    # au-delà du plan ne reçoit aucun tour, même si la lecture locale d'ici le
+    # dit sain (deux configurations peuvent lire deux dossiers sous le même
+    # nom) : c'est le contrat « jamais de dépassement ».
+    retenus = _held_for_overage(store, host, harness, now)
 
     # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
     # échec d'authentification est rendu tel quel : la garde de l'exécuteur
     # bloque l'agent, elle ne bascule pas contre un geste humain)
     def forced(profile: Profile) -> Choice:
         current = ev(profile)
+        if profile.name in retenus:
+            return Choice(None, profile, reason=(
+                "account %s forced (ameesh accounts use): in overage for another "
+                "runner of this host" % profile.name), forced=True)
         if current.ok or (not paced and current.unpaced_ok):
             return Choice(profile, profile, forced=True,
                           why="forced (ameesh accounts use)")
@@ -1529,6 +1537,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # #1672 : le remplaçant doit être réellement plaçable — un compte à
         # relevé périmé ne lève pas le forçage pour une pause.
         free = [p for p in candidates if p.name != active.name
+                and p.name not in retenus
                 and placeable(ev(p), now)
                 and (ev(p).ok if paced else ev(p).unpaced_ok)]
         if critical:
@@ -1547,22 +1556,17 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 return forced(now_forced)
 
     # 2. continuité : la session garde son compte tant qu'il est sous son seuil
-    # (les autres comptes ne sont alors pas relus : rien à choisir)
+    # (les autres comptes ne sont alors pas relus : rien à choisir). Un compte
+    # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
+    # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
     own = by_name(items, session_account) if session_account else None
-    if own is not None and own in candidates and ev(own).ok:
+    if own is not None and own in candidates and own.name not in retenus and ev(own).ok:
         return Choice(own, active, kept=True,
                       why="continuity: the session stays on %s, under its threshold" % own.name)
     for profile in items:
         ev(profile)
-    # L226b/#1883 : une retenue d'overage posée par un AUTRE processus de
-    # l'hôte (une bascule qui a quitté ce compte en dépassement) l'écarte du
-    # classement, même si la lecture locale le dit sain — c'est la lecture qui
-    # divergeait le 16/10. Le forçage (étape 1) et la continuité d'une session
-    # déjà engagée (étape 2) passent avant : un geste humain et un tour en
-    # cours ne sont pas bloqués par la lecture d'un autre runner.
-    held = _held_for_overage(store, host, harness, now)
-    if held:
-        candidates = [p for p in candidates if p.name not in held]
+    if retenus:  # #1883 : jamais de placement sur un compte qu'un autre runner a fui en dépassement
+        candidates = [p for p in candidates if p.name not in retenus]
     # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
     ranked = rank(candidates, cache, now)
     if not ranked and not paced:
@@ -1613,10 +1617,10 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     and reading_outdated(cache[p.name].gauges, now)]
         why = "%sall %s accounts at threshold — %s" % (
             pause_label(cache), harness, _label(cache))
-        if held:
+        if retenus:
             why = ("%sno %s account to place: %s held for overage seen on this "
                    "host — %s" % (pause_label(cache), harness,
-                                  ", ".join(sorted(held)), _label(cache)))
+                                  ", ".join(sorted(retenus)), _label(cache)))
         elif withheld:
             why = ("%sno %s account to place: reading older than every open "
                    "window (%s) — %s" % (pause_label(cache), harness,
@@ -1643,25 +1647,42 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
         return Choice(target, active, switched=moved, why=why, per_agent=True)
     if target.name == active.name:
+        # #1883 (R1 auditeur, B2) : rien n'est écrit ici — relire la retenue au
+        # dernier moment, sinon un instantané périmé (retenue publiée par un
+        # autre runner après la lecture en tête) ferait partir le tour sur un
+        # compte qu'on vient de fuir en dépassement.
+        if target.name in _held_for_overage(store, host, harness, now):
+            return Choice(None, active,
+                          reason="no %s account to place: %s held for overage seen "
+                                 "on this host" % (harness, target.name))
         return Choice(target, active, why=why)
     switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}
     if simulate:
         return Choice(target, target, switched=switched, why=why)
-    if store.switch(host, harness, expected=active.name, to=target.name, kind="bascule",
-                    reason=why, agent=agent):
+    # L226b/#1883 (R1 auditeur, B2) : la retenue valide sur la CIBLE est
+    # revérifiée DANS la transaction de bascule, sous le même verrou que les
+    # autres workers — un classement sur un instantané périmé ne fait jamais
+    # partir un tour sur un compte retenu. La retenue du compte quitté en
+    # dépassement est posée dans la MÊME transaction.
+    left_ev = cache.get(active.name)
+    quitte_en_overage = left_ev is not None and in_overage(left_ev.gauges, now)
+    if store.switch_guarded(
+            host, harness, expected=active.name, to=target.name, kind="bascule",
+            reason=why, agent=agent, now=now,
+            hold_reason=_overage_reason(harness, agent) if quitte_en_overage else None,
+            hold_until=(now + OVERAGE_HOLD_S) if quitte_en_overage else None):
         store.release(host, harness, target.name)  # retenue d'avant 0034, s'il en reste
-        # #1883 : on quitte `active` alors qu'il est en dépassement — le
-        # publier pour l'hôte, afin que les autres runners ne le reprennent pas
-        # sur la foi de leur propre lecture (dossiers différents sous le même
-        # nom de compte).
-        left_ev = cache.get(active.name)
-        if left_ev is not None and in_overage(left_ev.gauges, now):
-            _hold_overage(store, host, harness, active, now, agent)
         return Choice(target, target, switched=switched, why=why)
-    # course : un autre worker a changé le dernier choix entre-temps ; un
-    # forçage posé entre-temps prime, évalué comme en 1 (L226b : un primaire
-    # au-dessus de son plafond ou un compte en overage n'est pas lancé)
+    # refusée : un autre worker a changé le compte, ou une retenue est apparue
+    # sur la cible entre le classement et la bascule. Ne JAMAIS rendre une
+    # cible retenue : le tour partirait facturé au-delà du forfait.
     fresh = store.active(host, harness) or {}
+    if target.name in _held_for_overage(store, host, harness, now):
+        return Choice(None, by_name(items, fresh.get("account")) or active,
+                      reason="no %s account to place: %s held for overage seen on "
+                             "this host" % (harness, target.name))
+    # course : un forçage posé entre-temps prime, évalué comme en 1 (L226b :
+    # un primaire au-dessus de son plafond ou un compte en overage n'est pas lancé)
     if fresh.get("forced"):
         return forced(by_name(items, fresh.get("account")) or active)
     return Choice(target, by_name(items, fresh.get("account")) or target, why=why)

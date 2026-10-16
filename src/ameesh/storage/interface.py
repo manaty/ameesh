@@ -773,6 +773,29 @@ class Accounts(Domain):
         un autre worker a déjà basculé : rien n'est écrit."""
 
     @abc.abstractmethod
+    def switch_guarded(self, host: str, harness: str, *, expected: str | None, to: str,
+                       kind: str, reason: str, agent: str | None, now: float,
+                       hold_reason: str | None = None,
+                       hold_until: float | None = None) -> bool:
+        """#1883 : bascule validée contre les retenues, en UNE transaction.
+
+        Même contrat que `switch` (compare-and-changer `expected`, un forçage
+        manuel n'est pas défait par l'automate), PLUS, sous le **même verrou**
+        de la ligne `account_active` :
+
+        * une retenue **valide** de `to` (`until_ts > now`) refuse la bascule :
+          rien n'est écrit, l'appelant relit l'actif — c'est ce qui ferme la
+          course « classement sur un instantané, retenue publiée entre-temps »
+          (R1 auditeur, B2) ;
+        * quand `hold_reason` est donné, pose (ou rafraîchit) la retenue du
+          compte **quitté** dans la même transaction — le compte qu'on quitte
+          en dépassement devient indisponible pour les autres workers au même
+          instant où la bascule est visible.
+
+        Faux sans rien écrire : compte vu changé, forçage manuel en place,
+        aucun changement, ou retenue valide sur `to`."""
+
+    @abc.abstractmethod
     def set_auto(self, host: str, harness: str, *, reason: str,
                  expected: str | None = None) -> bool:
         """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
