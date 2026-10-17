@@ -55,8 +55,11 @@ assert os.environ.get('AMEESH_SCHEMA') == 'test_runner_schema'
 scenario = (state / 'scenario').read_text()
 if sys.argv[1:] == ['resume', '--help']:
     # #2152 / R1 B2 : le script ne draine que si la reprise conditionnelle
-    # existe côté cible (--expect-reason).
-    print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
+    # existe côté cible (--expect-reason). Le drapeau simule un CLI antérieur.
+    if (state / 'sans-expect-reason').exists():
+        print('usage: ameesh resume ... --operator --reason R')
+    else:
+        print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
     sys.exit(0)
 if sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error': sys.exit(1)
@@ -78,6 +81,12 @@ elif sys.argv[1] == 'show':
             and not (state / 'remplace-fait').exists():
         motif.write_text('pause humaine etrangere')
         (state / 'remplace-fait').touch()
+    # N5 B2 : levée humaine de notre premier drain, l'agent restant en tour :
+    # le second drain doit seul rester suivi (aucune entrée périmée).
+    if scenario == 'chaines-relance' and motif.exists() and '#2152' in motif.read_text() \
+            and not (state / 'levee-humaine').exists():
+        pause.unlink(); motif.unlink(missing_ok=True)
+        (state / 'levee-humaine').touch()
     if scenario == 'expired': row['lease_expires_ts'] = time.time()-1
     if scenario == 'no-lease': row['lease_owner'] = None
     if scenario == 'foreign-owner': row['lease_owner'] = 'another-runner'
@@ -95,7 +104,7 @@ elif sys.argv[1] == 'show':
                                        'drain-refuse-identite') \
             and not pause.exists():
         row['status'] = 'running'
-    if name == 'dev9' and scenario == 'chaines-toujours':
+    if name == 'dev9' and scenario in ('chaines-toujours', 'chaines-relance'):
         row['status'] = 'running'
     if pause.exists():
         row['operator_paused'] = True
@@ -146,6 +155,8 @@ elif sys.argv[1] in ('pause', 'resume'):
                           'changed': change, 'event_id': 1}))
     else:
         if '--operator' not in args: sys.exit(2)
+        if (state / 'sans-expect-reason').exists() and '--expect-reason' in args:
+            sys.exit(2)
         if scenario == 'chaines-resume-error': sys.exit(1)
         attendu = args[args.index('--expect-reason') + 1] if '--expect-reason' in args else None
         raison = motif.read_text() if motif.exists() else ''
@@ -223,8 +234,14 @@ print(time.time() + (60 if scenario == 'db-ahead' else 0))
 #: #2152 : le drain se décide sur l'horloge réelle (SECONDS de bash). Seule
 #: l'attente de la boucle de redémarrage (15 s) fait avancer le banc d'une
 #: demi-seconde ; les attentes de bail (5 s) restent instantanées.
-SLEEP = '#!/bin/sh\n[ "$1" = 15 ] && exec %s 0.5\nexit 0\n' % (
-    shutil.which('sleep') or '/bin/sleep')
+SLEEP = ('#!/bin/sh\n'
+         'if [ "$1" = 15 ]; then\n'
+         '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
+         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
+         '  fi\n'
+         '  exec %s 0.5\n'
+         'fi\n'
+         'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
 
 
 class AgentHostTest(unittest.TestCase):
@@ -429,16 +446,33 @@ class AgentHostTest(unittest.TestCase):
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_drain_lifts_the_pause_when_the_timeout_is_reached(self):
-        """Le drain ne doit pas survivre à un échec : le trap de sortie le lève."""
+        """N4 : le drain ne survit pas à l'échéance ; celle-ci vient de
+        l'horloge injectée (aucun budget de temps réel)."""
         self.env['DRAIN_ATTENTE'] = '1'
-        # 5 s : le drain (1 s) est posé avant l'échéance globale, même si la
-        # première passe (redémarrage des autres agents) consomme 1 à 2 s.
         self.env['ATTENTE_MAX'] = '5'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='chaines-toujours')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('toujours en tour', p.stderr)
         self.assertIn('pause dev9', self.operateur())
         self.assertIn('resume dev9', self.operateur())
+        self.assertIn('drain levé (sortie du script)', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_second_drain_after_a_human_lift_tracks_the_live_pause(self):
+        """N5 B2 : après une levée humaine, le re-drain ne garde pas le motif
+        périmé ; c'est la pause vivante qui est levée à la sortie."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '10'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        p = self.run_vm(scenario='chaines-relance')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('toujours en tour', p.stderr)
+        self.assertTrue((self.state / 'levee-humaine').exists())
+        poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev9')]
+        self.assertEqual(len(poses), 2)
         self.assertIn('drain levé (sortie du script)', p.stdout)
         self.assertFalse((self.state / 'pause-dev9').exists())
 

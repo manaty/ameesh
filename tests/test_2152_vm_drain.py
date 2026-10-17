@@ -62,7 +62,11 @@ def opt(flag):
 
 if action == 'resume' and sys.argv[2:] == ['--help']:
     # #2152 : le script ne draine que si la reprise conditionnelle existe.
-    print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
+    # Le drapeau simule un CLI antérieur (N5 B1).
+    if (state / 'sans-expect-reason').exists():
+        print('usage: ameesh resume ... --operator --reason R')
+    else:
+        print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
     sys.exit(0)
 if action == 'show':
     paused = pause.exists()
@@ -82,6 +86,8 @@ elif action == 'pause':
     print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': True,
                       'changed': True, 'event_id': 1}))
 elif action == 'resume':
+    if (state / 'sans-expect-reason').exists() and '--expect-reason' in sys.argv[3:]:
+        sys.exit(2)
     attendu = opt('--expect-reason')
     raison = motif.read_text() if motif.exists() else ''
     if pause.exists() and attendu is not None and raison == attendu:
@@ -97,9 +103,16 @@ elif action == 'resume':
 sys.exit(0)
 '''
 
-#: #2152 : seule l'attente de la boucle (15 s) avance l'horloge du banc.
-SLEEP = '#!/bin/sh\n[ "$1" = 15 ] && exec %s 0.5\nexit 0\n' % (
-    shutil.which('sleep') or '/bin/sleep')
+#: #2152 : seule l'attente de la boucle (15 s) avance l'horloge du banc ;
+#: N4 : quand HORLOGE_FICHIER est posé, elle avance de 2 s par attente.
+SLEEP = ('#!/bin/sh\n'
+         'if [ "$1" = 15 ]; then\n'
+         '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
+         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
+         '  fi\n'
+         '  exec %s 0.5\n'
+         'fi\n'
+         'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
 
 
 class RedemarrageServeurDrainTest(unittest.TestCase):
@@ -152,6 +165,23 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertIn('reprise prouvée (operator_paused=false)', p.stdout)
         self.assertIn('dev9 : redémarré (était idle)', p.stdout)
         self.assertIn('systemctl restart ameesh-runner@dev9', (self.state / 'ssh.log').read_text())
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_unsupported_cli_never_poses_a_pause(self):
+        """N5 B1 : CLI antérieur à --expect-reason — aucune pause posée, on
+        attend sans drain puis on s'arrête à l'échéance."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '5'
+        (self.state / 'sans-expect-reason').touch()
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('drain #2152 indisponible', p.stderr)
+        self.assertIn('toujours en tour', p.stderr)
+        journal = self.poste()
+        self.assertNotIn('pause dev9', journal)
+        self.assertNotIn('resume dev9 --operator', journal)
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_foreign_pause_is_not_lifted(self):

@@ -311,6 +311,16 @@ echec_agent() {
 # opérateur humain (vm.sh lancé hors session d'agent) ; sinon la pose est
 # refusée, le script s'arrête sans redémarrer l'agent et le dit.
 DRAINS=()  # entrées « persona<TAB>motif exact de la pause posée »
+# N4 : l'horloge du drain est injectable par les bancs (fichier de secondes),
+# pour ne pas dépendre d'un budget de temps réel ; en production, c'est
+# l'horloge monotone du shell.
+horloge() {
+  if [ -n "${HORLOGE_FICHIER:-}" ] && [ -r "$HORLOGE_FICHIER" ]; then
+    cat "$HORLOGE_FICHIER"
+  else
+    printf '%s' "$SECONDS"
+  fi
+}
 drain_lieu() {
   if [ "$MODE" = agents ]; then printf 'agents %s sur %s' "$ACTION" "$HOTE_AGENTS"
   else printf '%s sur %s' "$ACTION" "$VM"; fi
@@ -391,6 +401,10 @@ pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état r
 poser_drain() {  # $1 persona, $2 secondes déjà attendues
   local motif sortie change etat pose raison
   motif=$(drain_motif "$(drain_jeton)")
+  # R1 B2 : le motif courant remplace l'ancien — après une levée humaine, un
+  # re-drain ne doit pas garder une entrée périmée que drain_motif_de lirait
+  # en premier à la sortie (et laisserait la pause vivante orpheline).
+  drain_retire "$1"
   # Track the intent before the call: both its reply and the reconciliation
   # read can fail after commit. EXIT still attempts the conditional cleanup.
   DRAINS+=("$1"$'\t'"$motif")
@@ -489,7 +503,7 @@ lever_drains() {  # sortie du script : aucun drain ne survit à la commande
 trap 'lever_drains || true' EXIT
 
 redemarrer_agents() {
-  local noms p st avant ligne heure attendu tenu restantes suivantes debut=$SECONDS
+  local noms p st avant ligne heure attendu tenu restantes suivantes debut=$(horloge)
   local etat deja_pause ecoule
   local -A debut_tour=()
   local non_verifiees=()
@@ -521,8 +535,8 @@ redemarrer_agents() {
         # une pause opérateur courte (drain), qui prend effet à la fin du tour.
         # Une pause déjà posée par un autre acteur n'est ni doublée ni levée.
         if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
-          if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$SECONDS; fi
-          ecoule=$((SECONDS - debut_tour[$p]))
+          if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$(horloge); fi
+          ecoule=$(( $(horloge) - debut_tour[$p] ))
           if [ "$ecoule" -ge "$DRAIN_ATTENTE" ]; then
             poser_drain "$p" "$ecoule" || return 1
           fi
@@ -566,7 +580,7 @@ redemarrer_agents() {
     done
     restantes=("${suivantes[@]}")
     if [ "${#restantes[@]}" -gt 0 ]; then
-      if [ $((SECONDS - debut)) -ge "$ATTENTE_MAX" ]; then
+      if [ $(( $(horloge) - debut )) -ge "$ATTENTE_MAX" ]; then
         echo "toujours en tour après ${ATTENTE_MAX}s : ${restantes[*]}" >&2; return 1
       fi
       sleep 15
@@ -1096,10 +1110,16 @@ installer() {
 redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
-  local restantes suivantes debut=$SECONDS st avant ligne heure tenu attendu
+  local restantes suivantes debut=$(horloge) st avant ligne heure tenu attendu
   local etat deja_pause ecoule
   local -A debut_tour=()
   non_verifiees=()
+  # R1 B1 : un CLI (ou une base) antérieur à 0458 ne saurait pas lever la
+  # pause conditionnelle ; ne jamais poser un drain qu'on ne saurait pas lever.
+  if [ "$DRAIN_ATTENTE" -gt 0 ] && ! drain_supporte; then
+    echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --expect-reason (installer le code #2152 avant de redémarrer) — attente sans drain" >&2
+    DRAIN_ATTENTE=0
+  fi
   # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
   # elles, l'exécuteur redémarré échouerait
   exiger_migrations "$(ssh_vm "git -C $SRC rev-parse HEAD")" redemarrer
@@ -1133,8 +1153,8 @@ redemarrer() {
         # d'attendre sans fin un agent qui enchaîne les tours ; une pause déjà
         # posée par un autre acteur n'est ni doublée ni levée.
         if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
-          if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$SECONDS; fi
-          ecoule=$((SECONDS - debut_tour[$p]))
+          if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$(horloge); fi
+          ecoule=$(( $(horloge) - debut_tour[$p] ))
           if [ "$ecoule" -ge "$DRAIN_ATTENTE" ]; then
             poser_drain "$p" "$ecoule" || exit 1
           fi
@@ -1162,7 +1182,7 @@ redemarrer() {
     done
     restantes=("${suivantes[@]+"${suivantes[@]}"}")
     if [ ${#restantes[@]} -gt 0 ]; then
-      if [ $((SECONDS - debut)) -gt "$ATTENTE_MAX" ]; then
+      if [ $(( $(horloge) - debut )) -gt "$ATTENTE_MAX" ]; then
         echo "toujours en tour après ${ATTENTE_MAX}s : ${restantes[*]} — à redémarrer à la main" >&2
         exit 1
       fi
