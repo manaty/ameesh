@@ -36,6 +36,7 @@ test_1467_train_history  # stockage : historique de jalons sans troncature, anci
 test_1467_train_runner  # stockage : passage, clone privé, provenance et promotion Git réels (#1467)
 test_1467_train_runtime  # stockage : raccord train/feu SQL et gardes finales avant effet (#1467)
 test_1467_train_storage  # stockage : intentions CAS et bail cible partagé (#1467)
+test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
@@ -47,6 +48,7 @@ test_810_multi_project_consumers  # stockage : `projects` lu par la vue par proj
 test_831_packages_lock_scope  # storage : un verrou de sync par schéma (tous canons), attente hors statement_timeout (#831)
 test_811_lot_workdirs  # stockage : dossiers de projets par lot, reprise de session et prise secondaire (L243-4)
 test_753_stop_returns_lots  # stockage : retour transactionnel des lots, journal et réattribution des promus (#753)
+test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
