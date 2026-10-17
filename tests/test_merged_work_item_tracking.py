@@ -431,6 +431,18 @@ class MergeSweepTest(_Base):
         self.assertEqual(work.get(self.db, livre["id"])["state"], "merged")
         self.assertEqual(work.get(self.db, exclu["id"])["state"], "intake")
 
+    def test_diese_retire_apres_le_numero_ne_ferme_pas_le_lot(self):
+        # #2259 : « Merge #N retiré » cite un retrait, pas une livraison.
+        # Restreindre la négation aux numéros d'après le mot fermait encore
+        # le lot (régression du 17/10) ; le participe nie aussi ce qui précède.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("feature/retrait", "Merge #%d retiré" % n)
+        self.sync()
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
+
     # --- L118b : la fusion d'une branche lot/<id>-… ferme le lot -----------
 
     def test_fusion_github_d_une_branche_lot_ferme_le_lot(self):
@@ -793,6 +805,12 @@ class MergeSweepTest(_Base):
             "Merge #14 sans (#12 ni (#13))": {14: "#id"},
             "Merge sans #12 ni #13": {},
             "Merge exclues #12": {},
+            "Merge #12 retiré": {},
+            "Merge (#12) retiré": {},
+            "Merge #12 reverted": {},
+            "Merge #12 sans #13": {12: "#id"},
+            "Merge #12 without #13": {12: "#id"},
+            "Merge #12 hors #13": {12: "#id"},
             "Merge x\n\nameesh-work: #12\n  ameesh-work: 13": {12: "ameesh-work",
                                                                13: "ameesh-work"},
             "Merge x\n\nvoir ameesh-work: 14 plus tard": {},

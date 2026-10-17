@@ -860,10 +860,12 @@ HASH_REF_RE = re.compile(r"(?<![\w/#&])#([1-9][0-9]{0,17})(?!\w)")
 CLAUSE_SPLIT_RE = re.compile(r"[;/|—–]|\s+-\s+|\(|\)|,")
 #: #2259 : mots qui nient les `#<id>` de leur proposition — « recomposition
 #: sans #598 » (commit 84c68e9d4, Nexlink) désignait #598 et fermait son lot
-#: alors que sa PR était ouverte et sa tête hors de la cible. Même prudence
-#: pour « retiré », « hors », « without », « revert », « exclu ».
-NEGATED_REF_RE = re.compile(
-    r"\b(?:sans|ni|hors|retir[ée]e?s?|exclue?s?|exclu[ea]nt|without|reverts?|reverted)\b",
+#: alors que sa PR était ouverte et sa tête hors de la cible. Une préposition
+#: ne nie que ce qui la suit (« #2221 sans #598 » garde 2221) ; un participe
+#: nie toute la proposition (« #598 retiré », « (#598) exclu »).
+PREFIX_NEGATED_REF_RE = re.compile(r"\b(?:sans|ni|hors|without)\b", re.IGNORECASE)
+POSTFIX_NEGATED_REF_RE = re.compile(
+    r"\b(?:retir[ée]e?s?|exclue?s?|exclu[ea]nt|reverts?|reverted)\b",
     re.IGNORECASE)
 #: clé de configuration git du dépôt : comment ses commits de fusion citent un
 #: lot en plus de `ameesh-work:` — `hash` : `#<id>` dans le titre
@@ -1147,12 +1149,18 @@ def negated_hash_positions(title: str) -> set[int]:
             left, right = child["begin"] - 1 - begin, min(child["end"] + 1, end) - begin
             text = text[:left] + " " * (right - left) + text[right:]
         for left, right in _title_clauses(text):
-            negative = NEGATED_REF_RE.search(text[left:right])
-            if negative:
-                # « #14 livré sans #12 » livre #14 : seuls les numéros
-                # APRÈS le mot de négation sont niés (précision impl-08).
-                negated.update(m.start() for m in HASH_REF_RE.finditer(
-                    title, begin + left + negative.end(), begin + right))
+            clause = text[left:right]
+            prefixes = list(PREFIX_NEGATED_REF_RE.finditer(clause))
+            postfixes = list(POSTFIX_NEGATED_REF_RE.finditer(clause))
+            if not prefixes and not postfixes:
+                continue
+            for match in HASH_REF_RE.finditer(title, begin + left, begin + right):
+                position = match.start() - begin - left
+                # « #14 livré sans #12 » livre #14 : une préposition ne nie
+                # que les numéros APRÈS elle. « #12 retiré » et « (#12)
+                # exclu » nient aussi ceux d'avant le participe.
+                if postfixes or any(m.end() <= position for m in prefixes):
+                    negated.add(match.start())
     return negated
 
 
