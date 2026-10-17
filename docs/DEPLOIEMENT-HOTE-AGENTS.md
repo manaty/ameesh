@@ -146,8 +146,22 @@ La séquence de staging écrit chaque événement en JSONL (`date`, `hôte`, `é
 l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
 verdict, et pour une remise réelle le message de sonde, son destinataire,
 l’hôte de ce destinataire et son délai) : c’est la preuve structurée que le
-signal ci-dessous exige. Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, ou
-`auto` sans persona menée — ne prouve aucune remise.
+signal ci-dessous exige. L’événement porte aussi ce rapport comme objet
+`rapport`, et une notification d’échec le reprend en clair : un KO de sonde
+garde son message, son destinataire et son motif, jamais un simple « santé en
+échec » (#2190). Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, `auto` sans
+persona menée, ou toutes les personas menées occupées ou en pause opérateur —
+ne prouve aucune remise.
+
+La sonde ne vise qu’une persona **menée et libre** (bail vivant, pas en tour,
+pas en pause opérateur) : une persona occupée ne reçoit le courrier qu’à la fin
+de son tour, et une persona en pause garde `status` `idle` mais son exécuteur
+refuse le tour ; la sonde mesurerait leur file d’attente, pas la chaîne de
+l’hôte. Si aucune persona menée n’est libre, le verdict est `sans-sonde` et
+nomme les personas occupées ou en pause ; le délai de 300 s ne s’applique qu’à
+une remise partie vers une persona libre, et exige toujours la réponse outil et
+la fin propre du tour (#2190). Le courrier actif en attente chez une persona
+en pause n’est pas compté comme bloqué : son tour est refusé par construction.
 
 ## Signal « staging actif » (#1323)
 
@@ -166,23 +180,24 @@ séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
 concernés. Un échec, un retour automatique, une séquence partielle
 (`--hotes`), un journal d’une autre exécution ou une santé sans sonde de
 remise réelle (`--sans-sonde`, `SONDE_<HOTE>=jamais`, `auto` sans persona
-menée) n’émettent **aucun signal de réussite** : chaque événement de la
-fenêtre doit porter le commit visé, et le message de sonde est relu en base
+menée, ou toutes occupées ou en pause) n’émettent **aucun signal de réussite** :
+chaque événement de la fenêtre doit porter le commit visé, et le message de sonde est
+relu en base
 (expéditeur système, destinataire, hôte, commit, remise effective). Aucune
 clôture de lot n’est automatique : le rapporteur reprend lui-même sa
 vérification après déploiement.
 
 Un hôte **sans exécutant** (mode serveur, comme `manaty-mesh-1`) ne peut pas
 prouver sa chaîne par une remise locale : sa preuve est le `controler` vert
-plus une **sonde croisée**, remise à une persona menée d’un autre hôte
+plus une **sonde croisée**, remise à une persona menée et libre d’un autre hôte
 canonique **après son redémarrage** — la remise traverse alors sa base, le
 message étant déposé dans la base du serveur et relevé par l’exécuteur de
 l’autre hôte. `sante-courrier.py --serveur` produit cette sonde et nomme
 l’hôte destinataire (`hote_destinataire`) ; `actif.py` relit la remise en base
 et exige qu’elle soit postérieure au `redemarrer` de l’hôte mesuré. Un serveur
 qui porte des exécutants garde la règle locale : une santé `sans-sonde`
-(aucune persona menée) n’atteste rien, et une sonde croisée n’est acceptée que
-pour un hôte à zéro persona.
+(aucune persona menée libre) n’atteste rien, et une sonde croisée n’est
+acceptée que pour un hôte à zéro persona.
 
 L’émission est bornée et **idempotente** : un seul courrier par rapporteur et
 par commit, même si la séquence est relancée. La clé d’émission est écrite
