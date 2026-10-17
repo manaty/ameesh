@@ -30,7 +30,12 @@ then, build from the repository (`npm run dist`) or use the served module.
 
 ```js
 import { connectHost } from "@ameesh/ui";
-import "@ameesh/ui/tokens";        // the published CSS tokens, once
+import { tokensSheet } from "@ameesh/ui/tokens"; // the sheet; install it once
+
+// The import has no side effect: the host page installs the token sheet.
+const tokens = new CSSStyleSheet();
+tokens.replaceSync(tokensSheet());
+document.adoptedStyleSheets = [...document.adoptedStyleSheets, tokens];
 
 const host = {
   // from the human's session; the components never store it
@@ -65,6 +70,14 @@ inlines Lit — that is `/ui/ameesh-ui.js`).
         src="https://mesh.example.org/ui/ameesh-ui.js"
         integrity="sha384-…"
         crossorigin="anonymous"></script>
+```
+
+The served build also ships the token sheet as `/ui/ameesh-ui.css`; a page
+that copies the served module links it once instead of installing
+`tokensSheet`:
+
+```html
+<link rel="stylesheet" href="https://mesh.example.org/ui/ameesh-ui.css">
 ```
 
 Subresource Integrity pins the exact bytes the page executes: compute the

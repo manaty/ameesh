@@ -142,7 +142,20 @@ limited to the mesh's origin. Texts are rendered as text, never as HTML.
 The theme goes through public CSS tokens (`--ameesh-color-page`,
 `--ameesh-color-ink`, `--ameesh-color-good`, `--ameesh-color-critical`,
 `--ameesh-font`, `--ameesh-radius`…), light and dark, and the `theme` attribute.
-`import "@ameesh/ui/tokens"` writes the token sheet.
+The `@ameesh/ui/tokens` module exports the sheet; the import has **no side
+effect**, so the host installs it once:
+
+```js
+import { tokensSheet } from "@ameesh/ui/tokens";
+
+const tokens = new CSSStyleSheet();
+tokens.replaceSync(tokensSheet());
+document.adoptedStyleSheets = [...document.adoptedStyleSheets, tokens];
+```
+
+The standalone page links the same sheet as `/ui/ameesh-ui.css`, written by
+`npm run build` (`<link rel="stylesheet" href="/ui/ameesh-ui.css">`) — a host
+page that copies the served module can use that link instead.
 
 ## Guides
 

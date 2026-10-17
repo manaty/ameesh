@@ -18,6 +18,10 @@ What the reference shows:
   open in the system browser (`shell.openExternal`) and only on a known
   origin, notifications are shown by the main process, and the event stream is
   held there so an alert still notifies with the window closed;
+* **navigation**: the host contract's `open(target)` reaches the main process,
+  which answers on `ameesh:navigate`; the preload bridges that one channel to
+  a bounded `onNavigate(callback)` subscription (the returned function
+  unsubscribes), so the renderer's router never touches `ipcRenderer`;
 * **renderer**: the application's own page, bundled with `@ameesh/ui`, under a
   strict CSP whose `connect-src` names the mesh.
 

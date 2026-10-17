@@ -11,12 +11,38 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
 
+/**
+ * The main process answers `ameesh:open` on `ameesh:navigate` (main.mjs): the
+ * renderer's router subscribes here — not on a DOM event nothing dispatches,
+ * and not on `ipcRenderer`, which never crosses the bridge. One channel,
+ * callbacks only, and an unsubscribe: a bounded bridge, not the IPC surface.
+ */
+const navigateListeners = new Set();
+ipcRenderer.on("ameesh:navigate", (_event, target) => {
+  for (const listener of [...navigateListeners]) {
+    try {
+      listener(target);
+    } catch {
+      // one renderer listener must not break the channel for the others
+    }
+  }
+});
+
 contextBridge.exposeInMainWorld("ameeshHost", {
   getToken: (mesh) => invoke("ameesh:get-token", mesh),
   openApproval: (url) => invoke("ameesh:open-approval", url),
   notify: (alert) => invoke("ameesh:notify", alert),
   meshes: () => invoke("ameesh:meshes"),
   open: (target) => invoke("ameesh:open", target),
+  onNavigate: (listener) => {
+    if (typeof listener !== "function") {
+      throw new TypeError("onNavigate expects a function");
+    }
+    navigateListeners.add(listener);
+    return () => {
+      navigateListeners.delete(listener);
+    };
+  },
   theme: "auto",
   language: "en",
 });

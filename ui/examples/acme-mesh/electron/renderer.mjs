@@ -6,8 +6,13 @@ import { connectHost } from "@ameesh/ui";
 const host = window.ameeshHost;
 const off = connectHost(host, { root: document, mesh: "acme" });
 
-window.addEventListener("ameesh:navigate", (event) => {
-  // the application's router decides; the components only raised the event
-  console.log("navigate", event.detail);
+// The preload owns the `ameesh:navigate` channel and exposes a bounded
+// subscription; the application's router decides what a target means.
+const offNavigate = host.onNavigate((target) => {
+  console.log("navigate", target);
 });
-window.addEventListener("beforeunload", off);
+
+window.addEventListener("beforeunload", () => {
+  offNavigate();
+  off();
+});
