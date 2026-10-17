@@ -536,23 +536,29 @@ DIRECTORY_NOTE_PREFIX = "L243-4:"
 
 class _DirNotes:
     """Les éléments dont le refus de dossier a déjà été noté, lus une fois par
-    passe (#1900 N2).
+    passe (#1900 N2), bornés aux candidats de la passe (#2162).
 
     La lecture est paresseuse — aucun item ne manque de dossier, aucune
-    requête — et bornée au préfixe DIRECTORY_NOTE_PREFIX ; `has` répond
-    ensuite en mémoire, `add` retient l'élément que `_directory_ready` vient
-    d'écrire. Sans elle, chaque passe d'`auto_take` relisait les 100 derniers
-    événements de chaque lot dont le dossier manque, pour chaque agent
-    candidat."""
+    requête — et bornée au préfixe DIRECTORY_NOTE_PREFIX et aux ids candidats
+    (lots et améliorations, au plus 200 chacun) ; `has` répond ensuite en
+    mémoire, `add` retient l'élément que `_directory_ready` vient d'écrire.
+    Sans elle, chaque passe d'`auto_take` relisait les 100 derniers événements
+    de chaque lot dont le dossier manque, pour chaque agent candidat, et le
+    relevé non borné relisait tout le journal des lots clos."""
 
-    def __init__(self, store):
+    def __init__(self, store, ids):
         self._store = store
+        # #2162 : déduplication exacte par id — le filtre porte sur les ids
+        # des candidats, jamais sur une fenêtre temporelle, sinon une note
+        # ancienne d'un vieux lot serait réécrite.
+        self._ids = sorted({int(item_id) for item_id in ids})
         self._items: set[int] | None = None
 
     def _load(self) -> set[int]:
         if self._items is None:
             self._items = {int(row["work_item_id"])
-                           for row in self._store.events_noted(DIRECTORY_NOTE_PREFIX, 0.0)}
+                           for row in self._store.events_noted(
+                               DIRECTORY_NOTE_PREFIX, 0.0, ids=self._ids)}
         return self._items
 
     def has(self, item_id) -> bool:
@@ -646,9 +652,6 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
-    # #1900 N2 : une lecture paresseuse et bornée des notes de dossier pour
-    # toute la passe (les deux boucles ci-dessous la partagent).
-    dir_notes = _DirNotes(st.work)
 
     # #804 : la place restante est relue avant **chaque** prise, pas une fois
     # par passe. Les compteurs sont en base et partagés par tous les
@@ -680,6 +683,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     queue = st.work.backlog(open_only=True, limit=200, ready_only=True) if room > 0 else []
     if not lots and not queue:
         return []
+    # #1900 N2 / #2162 : une lecture paresseuse des notes de dossier pour toute
+    # la passe (les deux boucles ci-dessous la partagent), bornée aux ids
+    # candidats — `unassigned_lots(200)` et `backlog(limit=200)` bornent chaque
+    # liste à 200, soit au plus 400 ids ; le journal des lots clos n'est plus lu.
+    dir_notes = _DirNotes(st.work, [item["id"] for item in lots]
+                                   + [item["id"] for item in queue])
     listing = st.operations.listing() if listing is None else listing
     from . import auditor as auditor_mod
     try:
