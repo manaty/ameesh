@@ -30,6 +30,8 @@ ADMIN_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.
 # ont déjà leur base.
 AMEESH_TEST_DB=""
 PGPASS_DIR=""
+PGPASS_FILE=""
+PGPASS_ERR=""
 # jamais la configuration de l'hôte (~/.config/ameesh/config.json) : sur un
 # poste basculé, elle fixerait canon, fils et hôte sous les tests. Fichier VIDE
 # mais existant : un chemin explicite absent est refusé (#1127) ; il est
@@ -50,8 +52,8 @@ trap nettoyer EXIT
 # le profil privé ne vaut que pour les deux passes de tests ; les gestes
 # d'administration (création, garde, suppression) gardent le profil du poste
 banc() {
-  if [ -n "$PGPASS_DIR" ]; then
-    PGPASSFILE="$PGPASS_DIR/pgpass" "$@"
+  if [ -n "$PGPASS_FILE" ]; then
+    PGPASSFILE="$PGPASS_FILE" "$@"
   else
     "$@"
   fi
@@ -64,14 +66,24 @@ if [ "${AMEESH_PG_UP:-1}" != 0 ] && [ -z "${AMEESH_TEST_DSN:-}" ] \
     -c "CREATE DATABASE \"$AMEESH_TEST_DB\""
   if [ -z "${PGPASSWORD:-}" ]; then
     PGPASS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ameesh-pgpass-XXXXXX")"
-    python3 scripts/pgpass-banc.py "$ADMIN_DSN" "$PGPASS_DIR/pgpass" \
-      || { rm -rf -- "$PGPASS_DIR"; PGPASS_DIR=""; }
+    # le refus du profil n'est pas du bruit : le serveur peut accepter une
+    # connexion sans mot de passe. Il ne s'affiche que si la garde échoue.
+    if python3 scripts/pgpass-banc.py "$ADMIN_DSN" "$PGPASS_DIR/pgpass" \
+         2>"$PGPASS_DIR/refus"; then
+      PGPASS_FILE="$PGPASS_DIR/pgpass"
+    else
+      PGPASS_ERR="$PGPASS_DIR/refus"
+      rm -f -- "$PGPASS_DIR/pgpass"
+    fi
   fi
   export AMEESH_TEST_DSN="${ADMIN_DSN%/*}/$AMEESH_TEST_DB"
   # la garde échoue avant les deux passes, avec le contrat plutôt qu'une
   # salve de « fe_sendauth: no password supplied »
   if ! banc psql -w --dbname "$AMEESH_TEST_DSN" -v ON_ERROR_STOP=1 -q \
        -c 'SELECT 1' >/dev/null 2>&1; then
+    if [ -n "$PGPASS_ERR" ] && [ -s "$PGPASS_ERR" ]; then
+      cat -- "$PGPASS_ERR" >&2
+    fi
     echo "base jetable $AMEESH_TEST_DB injoignable : donnez PGPASSWORD, ou" \
          "ajoutez 127.0.0.1:55432:*:agent_mesh:<mot de passe> à ~/.pgpass" >&2
     exit 1
