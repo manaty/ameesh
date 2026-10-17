@@ -29,7 +29,11 @@ from . import sous_utilisation
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
-                 "critical_budget_pause", "idle_actionable_lot", "slo_breach")
+                 "critical_budget_pause", "idle_actionable_lot", "slo_breach",
+                 # #1466 : une pause qui dure est un plafond périmé, un compte
+                 # retiré ou une configuration que l'exécuteur ne lit pas ; les
+                 # orchestrateurs peuvent vérifier, l'auditeur suit
+                 "budget_pause_long")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -63,7 +67,12 @@ def _workstream(row: dict) -> str:
 
 def _of_teams(orchestras, by_name: dict, teams: set) -> list:
     """Les orchestrateurs d'un des projets (ou sans projet) ; sans projet
-    connu, tous."""
+    connu, tous.
+
+    `orchestras` vient de `sous_utilisation.alert_orchestrators` (#1114) :
+    l'historique d'attribution ne confère pas le rôle, donc un agent sans
+    projet n'est ici qu'un hub explicitement déclaré (rôle au canon ou
+    `AMEESH_ALERT_ORCHESTRATORS`), jamais un assigneur récent."""
     if not teams:
         return list(orchestras)
     return [o for o in orchestras if not _projects(by_name, o)
@@ -172,12 +181,19 @@ def _stale_lot(alert: dict) -> str:
             "ameesh work dependencies %d --add <blocker>; if a package vehicle is to "
             "carry it, declare the landing: ameesh work landing %d --vehicle "
             "<vehicle lot> --until <YYYY-MM-DD>" % (lot, lot))
+    # #1664 : une porte hors mesh (fenêtre opérateur, décision humaine sans
+    # demande ouverte) n'est portée par aucun lot ; le pilote la consigne en
+    # hold, qui éteint la relance comme une dépendance déclarée.
+    park = ("if it is parked on a gate no open lot carries (operator window, human "
+            "decision), the pilot records the hold that stops the reminders: "
+            "ameesh work note %d \"hold: <reason>\" (the pilot lifts it with an "
+            "\"unhold: <reason>\" note or a state change)" % lot)
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
-            "--sha <reviewed head>; %s; otherwise %s; if it is no longer needed: ameesh work "
+            "--sha <reviewed head>; %s; %s; otherwise %s; if it is no longer needed: ameesh work "
             "close %d --abandoned (or --superseded-by <id>)."
-            % (head, lot, lot, hold, move, lot))
+            % (head, lot, lot, hold, park, move, lot))
 
 
 def _plan_underused(alert: dict) -> str:
@@ -242,7 +258,11 @@ def _idle_actionable_lot(alert: dict) -> str:
 def _slo_breach(alert: dict) -> str:
     """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
     délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
-    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, owner pour un P1)."""
+    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, owner pour un P1).
+
+    #2231 : quand l'attente est une fusion (`merge*`) ou un déblocage
+    (`unblock`), le porteur n'est pas le blocage — le brief vise le pilote/le
+    composeur et ne prescrit ni relance ni réassignation du porteur."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1)
@@ -258,7 +278,33 @@ def _slo_breach(alert: dict) -> str:
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
     # le lot a changé de main entre-temps, au lieu d'écraser le premier geste.
     holder = " --if-holder %s" % who if who else ""
-    if level >= 3:
+    waiting = alert.get("waiting") or {}
+    what = waiting.get("what") if isinstance(waiting, dict) else None
+    if alert.get("step") != "verdict_merge":
+        # The targets move to the pilot on `verdict_merge` only
+        # (`exploitation._slo_targets`): the brief follows them, so a text
+        # addressed to the pilot never reaches the assignee.
+        what = None
+    if what in ("merge", "merge-approval", "merge-outcome"):
+        if level >= 3:
+            move = ("bureau or auditor: the lot waits for its merge vehicle/package — "
+                    "the composer/pilot carries it, and reassigning or nudging its holder "
+                    "does not advance it; push the pilot/composer to include it in the next "
+                    "package")
+        else:
+            move = ("pilot: the lot is frozen with its review verdict acquired and waits "
+                    "for its merge vehicle/package — the composer/pilot carries it; do not "
+                    "reassign or nudge its holder, include it in the next package")
+    elif what == "unblock":
+        if level >= 3:
+            move = ("bureau or auditor: the lot is `blocked` and the pilot owns the "
+                    "unblock (or the recorded decision) — do not reassign its holder; "
+                    "push the pilot to unblock it or to say why the lot waits")
+        else:
+            move = ("pilot: the lot is `blocked` and waits for its unblock/decision — "
+                    "do not reassign its holder; unblock it or record the decision "
+                    "(ameesh work note %d \"hold: <reason>\")" % lot)
+    elif level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
                 "for the pilot if it is itself late" % (lot, holder, lot))
@@ -279,6 +325,17 @@ def _critical_budget_pause(alert: dict) -> str:
     return ("Critical agent paused on budget: %s. Expected action: check the accounts "
             "(ameesh accounts list) and the mesh caps (ameesh budget); free an account or "
             "raise a cap with the owner, or hand its urgent work to another agent."
+            % (alert.get("detail") or "?"))
+
+
+def _budget_pause_long(alert: dict) -> str:
+    """#1466 : une pause budget qui dure n'est plus ordinaire. Aux
+    orchestrateurs de l'équipe et aux auditeurs."""
+    return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
+            "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
+            "the runner reads (ameesh doctor; a profile can diverge from the host's "
+            "config.json); free an account, fix the profile, or have the runner restart, "
+            "then `ameesh resume` the agent if its runner is not live."
             % (alert.get("detail") or "?"))
 
 
@@ -375,8 +432,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                 # inversement (une alerte reçue pousse à assigner, ce qui
                 # entretient la liste des orchestrateurs par historique).
                 teams = {(alert.get("lot_team") or "").strip()} - {""}
-            if reviewer and str(reviewer) in by_name:
-                extra[str(reviewer)] = _verdict_due(alert)
+            # #2076 : plusieurs relecteurs désignés, chacun briefé pour son
+            # verdict ; #917 garde l'équipe du lot quand l'assigné est inconnu.
+            for name in str(reviewer or "").split(","):
+                name = name.strip()
+                if name in by_name:
+                    extra[name] = _verdict_due(alert)
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = _projects(by_name, alert.get("agent"))
@@ -385,6 +446,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             teams = _projects(by_name, alert.get("agent"))
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
+            teams = _projects(by_name, alert.get("agent"))
+        elif kind == "budget_pause_long":
+            text = _budget_pause_long(alert)
             teams = _projects(by_name, alert.get("agent"))
         else:
             text = _plan_underused(alert)
@@ -420,7 +484,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     if kind != "stale_lot":
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
-    if kind == "critical_budget_pause":
+    if kind in ("critical_budget_pause", "budget_pause_long"):
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     return out
 

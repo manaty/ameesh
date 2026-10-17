@@ -9,6 +9,10 @@
 #
 # Le banc partagé reçoit une base jetable par exécution (#1992) ; un
 # AMEESH_TEST_DSN explicite (CI, job déporté) est respecté tel quel.
+# #2170 : quand le profil de connexion ne couvre que `agent_mesh`, l'entrée
+# du banc est transmise aux bases jetables par un PGPASSFILE privé (couple
+# hôte/port et utilisateur du profil, base `*`), sans modifier ~/.pgpass ni
+# accorder de droit ; PGPASSWORD reste prioritaire.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,6 +29,9 @@ ADMIN_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.
 # explicite (CI, job déporté, outil) reste respecté tel quel : ces exécutions
 # ont déjà leur base.
 AMEESH_TEST_DB=""
+PGPASS_DIR=""
+PGPASS_FILE=""
+PGPASS_ERR=""
 # jamais la configuration de l'hôte (~/.config/ameesh/config.json) : sur un
 # poste basculé, elle fixerait canon, fils et hôte sous les tests. Fichier VIDE
 # mais existant : un chemin explicite absent est refusé (#1127) ; il est
@@ -34,18 +41,53 @@ export AMEESH_CONFIG
 nettoyer() {
   rm -f -- "$AMEESH_CONFIG" || true
   if [ -n "$AMEESH_TEST_DB" ]; then
-    psql --dbname "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q \
+    psql -w --dbname "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q \
       -c "DROP DATABASE IF EXISTS \"$AMEESH_TEST_DB\" WITH (FORCE)" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$PGPASS_DIR" ]; then
+    rm -rf -- "$PGPASS_DIR" || true
   fi
 }
 trap nettoyer EXIT
+# le profil privé ne vaut que pour les deux passes de tests ; les gestes
+# d'administration (création, garde, suppression) gardent le profil du poste
+banc() {
+  if [ -n "$PGPASS_FILE" ]; then
+    PGPASSFILE="$PGPASS_FILE" "$@"
+  else
+    "$@"
+  fi
+}
 printf '{}\n' > "$AMEESH_CONFIG"
 if [ "${AMEESH_PG_UP:-1}" != 0 ] && [ -z "${AMEESH_TEST_DSN:-}" ] \
    && [ -z "${AGENT_MESH_TEST_DSN:-}" ]; then
   AMEESH_TEST_DB="agent_mesh_test_$(date +%s)_$$_${RANDOM}"
-  psql --dbname "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q \
+  psql -w --dbname "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q \
     -c "CREATE DATABASE \"$AMEESH_TEST_DB\""
+  if [ -z "${PGPASSWORD:-}" ]; then
+    PGPASS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ameesh-pgpass-XXXXXX")"
+    # le refus du profil n'est pas du bruit : le serveur peut accepter une
+    # connexion sans mot de passe. Il ne s'affiche que si la garde échoue.
+    if python3 scripts/pgpass-banc.py "$ADMIN_DSN" "$PGPASS_DIR/pgpass" \
+         2>"$PGPASS_DIR/refus"; then
+      PGPASS_FILE="$PGPASS_DIR/pgpass"
+    else
+      PGPASS_ERR="$PGPASS_DIR/refus"
+      rm -f -- "$PGPASS_DIR/pgpass"
+    fi
+  fi
   export AMEESH_TEST_DSN="${ADMIN_DSN%/*}/$AMEESH_TEST_DB"
+  # la garde échoue avant les deux passes, avec le contrat plutôt qu'une
+  # salve de « fe_sendauth: no password supplied »
+  if ! banc psql -w --dbname "$AMEESH_TEST_DSN" -v ON_ERROR_STOP=1 -q \
+       -c 'SELECT 1' >/dev/null 2>&1; then
+    if [ -n "$PGPASS_ERR" ] && [ -s "$PGPASS_ERR" ]; then
+      cat -- "$PGPASS_ERR" >&2
+    fi
+    echo "base jetable $AMEESH_TEST_DB injoignable : donnez PGPASSWORD, ou" \
+         "ajoutez 127.0.0.1:55432:*:agent_mesh:<mot de passe> à ~/.pgpass" >&2
+    exit 1
+  fi
 else
   export AMEESH_TEST_DSN="$ADMIN_DSN"
 fi
@@ -79,7 +121,7 @@ fi
 
 echo
 echo "=== pilote psql ==="
-AMEESH_DRIVER=psql python3 "${TEST_ARGS[@]}"
+banc env AMEESH_DRIVER=psql python3 "${TEST_ARGS[@]}"
 
 VENV=${AMEESH_TEST_VENV:-.venv}  # L159b : venv en cache sur la VM de déport
 if [ ! -x "$VENV/bin/python" ]; then
@@ -89,13 +131,13 @@ fi
 if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import psycopg, yaml" 2>/dev/null; then
   echo
   echo "=== pilote psycopg ==="
-  AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
+  banc env AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
 elif [ -x "$VENV/bin/pip" ]; then
   echo "=== installation de psycopg dans $VENV ==="
   if "$VENV/bin/pip" install --quiet 'psycopg[binary]' cryptography pyyaml 2>/dev/null; then
     echo
     echo "=== pilote psycopg ==="
-    AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
+    banc env AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
   else
     echo "psycopg non installé (hors ligne ?) : passe psql seulement"
   fi

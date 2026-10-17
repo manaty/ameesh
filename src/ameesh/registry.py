@@ -139,6 +139,11 @@ def overview(db: Db) -> list[dict]:
     return storage.of(db).agents.overview()
 
 
+def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> None:
+    """Preuve de vie du runner, indépendante du bail (#508)."""
+    storage.of(db).agents.runner_seen(host, owner, names)
+
+
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 
@@ -304,6 +309,22 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     return storage.of(db).leases.clear_session(name, owner, epoch)
 
 
+def adopt_session_origin(db: Db, name: str, session_id: str, lot: str, owner: str,
+                         epoch: int, *, harness: str | None = None,
+                         cwd: str | None = None) -> bool:
+    """#1900 B1 : note l'origine d'une session sans origine, **fencé**.
+
+    Sous verrou de ligne et bail vivant (owner, epoch, échéance recontrôlée
+    après l'attente), et seulement si la ligne porte encore `session_id` et
+    `lot` : une session remplacée entre-temps (rotation, remplaçant, autre lot)
+    n'est jamais réécrite. N'écrit que l'origine, le dossier et le harnais.
+    Renvoie False si le bail n'est plus le nôtre, s'il a expiré pendant
+    l'attente du verrou, ou si la session/le lot ont changé.
+    """
+    return storage.of(db).leases.adopt_session_origin(
+        name, owner, epoch, session_id, lot, harness=harness, cwd=cwd)
+
+
 def record_session_history(db: Db, name: str, session_id: str,
                            account: str | None = None) -> None:
     """Record an accepted session after runner or hook session filtering."""
@@ -452,7 +473,11 @@ def set_mode(db: Db, name: str, mode: str) -> bool:
 def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
     """`wakeable`, plus une remarque non bloquante (L46) : `(ok, raison,
     remarque)`. La remarque dit qu'un agent réveillable n'est pas réclamable
-    À L'INSTANT parce que le canon de son hôte n'est pas `ok`."""
+    À L'INSTANT parce que le canon de son hôte n'est pas `ok`.
+
+    #2200 : une pause opérateur n'est PAS réveillable — le geste humain dit
+    « aucun nouveau tour » et `claim` la respecte déjà ; la disponibilité
+    partagée (attribution, courrier, adoption, alertes) la nomme donc."""
     row = storage.of(db).agents.wake_check(name)
     if row is None:
         return False, "%s is not in the registry (unknown agent)" % name, ""
@@ -460,6 +485,16 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         return False, ("%s is an external agent (human session, cannot be woken)%s"
                        % (name, "" if row.get("responsible")
                           else " and has no human owner")), ""
+    if row.get("operator_paused"):
+        # #2200 : une pause opérateur est un geste humain explicite (« aucun
+        # nouveau tour »). `claim` la respecte déjà en SQL ; la disponibilité
+        # partagée doit dire la même chose, sinon un lot est confié à un agent
+        # qui ne le prendra pas. `resume --operator` la lève nommément.
+        reason = (row.get("operator_pause_reason") or "").strip()
+        by = (row.get("operator_pause_by") or "").strip()
+        return False, ("%s is under operator pause%s%s"
+                       % (name, " by %s" % by if by else "",
+                          ": %s" % reason if reason else "")), ""
     if not row.get("alive"):
         return False, "%s is an expired ephemeral agent" % name, ""
     if cfg is None:

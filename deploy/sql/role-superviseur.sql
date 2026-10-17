@@ -53,6 +53,11 @@
 --       executor_tokens.token_sha256, executor_invitations.code_sha256,
 --       executor_assertion_jti.jti, executors.public_key, .device_attestation,
 --       exec_idempotency.response
+--   * #1467 (0442) : plans de train et reçus rejouables ; tables entièrement
+--     fermées aux deux rôles superviseurs, sans nouveau GRANT :
+--       integration_trains.*, integration_train_fires.*,
+--       integration_train_queue_receipts.*
+--       provenance_receipts.* (#1465, 0445, préalable du train)
 --   * empreinte d'un identifiant de connexion (#210) — SHA-256 tronqué d'un
 --     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
 --     reconnaîtrait un jeton fuité ; inutile à la supervision :
@@ -179,7 +184,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0403 : attente de bail depuis (un instant)
         'lease_wait_since',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
-        'workstream'
+        'workstream',
+        -- #508 (0411) : la vue est recréée avec `r.*` et expose les mêmes
+        -- colonnes que `agent_registry` ; preuve de vie du runner, sans
+        -- contenu ni secret, accordée à l'identique de la table
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
@@ -192,6 +201,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_by', 'canon_ref', 'capabilities', 'last_event_at',
         'placement_ok', 'placement_diagnostic', 'placement_ref',
         'placement_profile',
+        -- #508 (0411) : preuve de vie du runner, sans contenu ni secret
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner',
         -- L232a (0371) : clôture de passage entre hôtes
         'handoff_fenced',
         -- #1521 (0446) : début du motif de statut, sans contenu
@@ -619,7 +630,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'change_size',
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte
         -- stale_lot le nomme, le superviseur doit donc le lire
-        'reviewer'
+        'reviewer', 'reviewers'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[

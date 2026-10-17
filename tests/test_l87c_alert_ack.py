@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import json
+import os
 import threading
 from types import SimpleNamespace
 import unittest
@@ -292,6 +293,85 @@ class AcknowledgementTest(PostMixin, PgTestCase):
         n.run_pass(self.db, [self.a])
         self.assertEqual(n.state["summary"], {})
         self.assertEqual(self.sent, [])
+
+    def test_another_pass_perimeter_does_not_declare_resolution(self):
+        custom = {"stale_lot_s": 3600.0}
+        self.ack(**custom)
+        domain = storage.of(self.db).alert_acknowledgements
+        self.assertEqual(json.loads(domain.live()[0]["perimeter"]), custom)
+        seen = []
+
+        def evaluate(thresholds):
+            seen.append(thresholds)
+            return [self.a]
+
+        alert_ack.reconcile(self.db, [], observed_ts=domain.clock(),
+                            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+                            evaluate=evaluate)
+        self.assertIsNone(self.history()[0]["invalidation_reason"])
+        self.assertEqual(seen, [custom])
+        # The same pass, once in the ack's own perimeter: resolved.
+        alert_ack.reconcile(self.db, [], observed_ts=domain.clock(),
+                            perimeter=alert_ack.canonical(custom), evaluate=evaluate)
+        self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
+        self.assertEqual(seen, [custom])          # one re-observation per perimeter
+
+    def test_a_severity_change_in_the_ack_perimeter_rearms_it(self):
+        custom = {"stale_lot_s": 3600.0}
+        self.ack(**custom)
+        changed = dict(self.a, critical=True, reason="critique")
+        alert_ack.reconcile(
+            self.db, [], observed_ts=storage.of(self.db).alert_acknowledgements.clock(),
+            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+            evaluate=lambda thresholds: [changed])
+        self.assertEqual(self.history()[0]["invalidation_reason"], "severity_changed")
+
+    def test_legacy_unknown_perimeter_is_judged_by_the_pass(self):
+        self.ack()
+        self.db.execute("update alert_acknowledgements set perimeter = null")
+        alert_ack.reconcile(self.db, [], observed_ts=storage.of(self.db)
+                            .alert_acknowledgements.clock(),
+                            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+                            evaluate=lambda thresholds: [self.a])
+        self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
+
+    def test_a_perimeter_naming_an_unknown_threshold_is_reobserved_without_it(self):
+        self.ack(stale_lot_s=3600.0)
+        self.db.execute("update alert_acknowledgements"
+                        " set perimeter = '{\"gone_s\":1,\"stale_lot_s\":3600.0}'")
+        seen = []
+        alert_ack.reconcile(self.db, [], observed_ts=storage.of(self.db)
+                            .alert_acknowledgements.clock(),
+                            perimeter=alert_ack.canonical(alert_ack.default_thresholds()),
+                            evaluate=lambda thresholds: seen.append(thresholds) or [self.a])
+        self.assertEqual(seen, [{"stale_lot_s": 3600.0}])
+        self.assertIsNone(self.history()[0]["invalidation_reason"])
+
+    def test_notify_does_not_resolve_an_ack_from_another_perimeter(self):
+        self.ack(stale_lot_s=3600.0)
+        n = self.notifier()
+        n.run_pass(self.db, [])                   # defaults, the ack's own: kept
+        self.assertIsNone(self.history()[0]["invalidation_reason"])
+        n.run_pass(self.db, [], thresholds={"stale_lot_s": 3600.0})
+        self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
+
+    def test_notify_without_thresholds_declares_the_perimeter_it_observed(self):
+        observed = []
+        exploitation.alerts.side_effect = (
+            lambda _cfg, _db, **kw: observed.append(kw) or [self.a])
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_LONG_TURN": "999"}), \
+                mock.patch.object(alert_ack, "reconcile",
+                                  wraps=alert_ack.reconcile) as reconcile:
+            self.notifier().run_pass(self.db)
+        self.assertEqual(len(observed), 1)
+        thresholds = {k: v for k, v in observed[0].items()
+                  if k not in ("now", "local_pool", "unreadable")}
+        # #2105 : the pass observes with the perimeter it declares to
+        # reconcile — without thresholds, the parser's defaults, environment
+        # included.
+        self.assertEqual(reconcile.call_args.kwargs["perimeter"],
+                         alert_ack.canonical(thresholds))
+        self.assertEqual(thresholds.get("long_turn_s"), 999.0)
 
     def test_ack_between_last_raise_and_resolution_silences_resolution(self):
         n = self.notifier()

@@ -15,7 +15,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, exploitation, notify, registry, work, work_dependencies
+from ameesh import (alert_briefs, exploitation, notify, registry, storage, work,
+                    work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -61,6 +62,16 @@ class _Base(PgTestCase):
                 " WHERE work_item_id = %s AND state = 'build'",
                 (float(since_s), self.lot["id"]))
 
+    def qa(self, verdict_s=3000.0):
+        """Le lot passe en qa avec un verdict `ok` posé il y a `verdict_s`."""
+        work.move(self.db, self.lot["id"], "build")
+        work.move(self.db, self.lot["id"], "qa")
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, actor, verdict)"
+            " VALUES (%s, 'verdict', now() - make_interval(secs => %s), 'rel', 'ok')",
+            (self.lot["id"], float(verdict_s)))
+        self.now = time.time()
+
     def briefs(self, alert):
         listing = [{"name": n, "team": ""} for n in ("dev1", "orch", "bureau", "auditeur")]
         return alert_briefs.briefs(alert, listing, orchestrator_names=("orch",),
@@ -83,6 +94,22 @@ class AlerteTest(_Base):
         self.assertIn("slo_breach", alert_briefs.BRIEFED_TYPES)
 
     def test_niveau_2_pilote(self):
+        self.age(2.5 * HEURE)
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts],
+                         [(2, ["pilot"])])
+        self.assertEqual(alerts[0]["orchestrators"], ["orch"])
+
+    def test_niveau_2_ne_prend_pas_un_assigneur_pour_pilote(self):
+        # #1982 : l'historique L94 (agents ayant confié des lots) ne fait pas
+        # un pilote — l'heuristique `history=True` briefait des agents de
+        # chantier sans mandat ; le niveau 2 vise le rôle (déclaré ou canon).
+        registry.upsert(self.db, "dist", harness="claude", host=self.cfg.host)
+        registry.upsert(self.db, "dev2", harness="claude", host=self.cfg.host)
+        autre = work.add(self.db, title="à distribuer")
+        work.assign(self.db, int(autre["id"]), "dev2", actor="dist")
+        self.assertIn("dist", storage.of(self.db).operations.assigners(
+            since_s=30 * 24 * HEURE))
         self.age(2.5 * HEURE)
         alerts = self.slo()
         self.assertEqual([(a["level"], a["targets"]) for a in alerts],
@@ -152,6 +179,86 @@ class BriefsTest(_Base):
         for text in out.values():
             self.assertIn("late by 35 min (target 15 min)", text)
         self.assertIn("the owner is notified", out["bureau"])
+
+
+class AttentePorteurTest(_Base):
+    """#2231 : quand le blocage n'est pas chez le porteur (attente de paquet,
+    lot `blocked`), l'alerte vise le pilote/le composeur et ne prescrit ni
+    relance ni réassignation du porteur. L'horloge GO → merge ne part qu'une
+    fois tous les avis requis acquis sur la tête gelée."""
+
+    def test_attente_paquet_vise_le_pilote(self):
+        self.qa(verdict_s=50 * 60)
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 1, ["pilot"])])
+        alert = alerts[0]
+        self.assertEqual((alert["waiting"] or {}).get("what"), "merge")
+        self.assertEqual(alert["orchestrators"], ["orch"])
+        out = self.briefs(alert)
+        self.assertEqual(sorted(out), ["orch"])
+        self.assertIn("merge vehicle/package", out["orch"])
+        self.assertIn("do not reassign or nudge its holder", out["orch"])
+        self.assertNotIn("ameesh work assign", out["orch"])
+
+    def test_attente_paquet_niveau_3_pousse_le_pilote(self):
+        self.qa(verdict_s=100 * 60)
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts],
+                         [(3, ["pilot", "bureau", "auditeur"])])
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
+        for text in out.values():
+            self.assertIn("merge vehicle/package", text)
+            self.assertIn("push the pilot/composer", text)
+            self.assertNotIn("reassign it now", text)
+
+    def test_lot_bloque_vise_le_pilote(self):
+        self.qa(verdict_s=50 * 60)
+        work.move(self.db, self.lot["id"], "blocked",
+                  note="attente d'un 2e avis hors DeepSeek/Claude (Codex 22/10)")
+        self.now = time.time()
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["targets"]) for a in alerts],
+                         [("verdict_merge", ["pilot"])])
+        self.assertEqual((alerts[0]["waiting"] or {}).get("what"), "unblock")
+        out = self.briefs(alerts[0])
+        self.assertIn("`blocked`", out["orch"])
+        self.assertIn("unblock", out["orch"])
+        self.assertNotIn("reassign it now", out["orch"])
+
+    def test_premier_avis_ne_fait_pas_le_go(self):
+        self.qa(verdict_s=50 * 60)
+        klass = {"class": "sensitive", "doubt": False, "frozen_sha": "a" * 40,
+                 "repo": None}
+        with mock.patch("ameesh.lot_class.of_lot", return_value=klass), \
+                mock.patch("ameesh.merge_queue.review_gate",
+                           return_value={"ok": False, "required": 2, "accepted": [1]}):
+            self.assertEqual(self.slo(), [])
+        with mock.patch("ameesh.lot_class.of_lot", return_value=klass), \
+                mock.patch("ameesh.merge_queue.review_gate",
+                           return_value={"ok": True, "required": 2,
+                                         "accepted": [1, 2]}):
+            alerts = self.slo()
+        self.assertEqual([(a["step"], a["targets"]) for a in alerts],
+                         [("verdict_merge", ["pilot"])])
+
+    def test_classe_douteuse_ne_tait_pas_l_alerte(self):
+        self.qa(verdict_s=50 * 60)
+        klass = {"class": "sensitive", "doubt": True, "frozen_sha": "", "repo": None}
+        with mock.patch("ameesh.lot_class.of_lot", return_value=klass):
+            self.assertEqual(len(self.slo()), 1)
+
+
+    def test_unblock_outside_verdict_merge_keeps_the_assignee_text(self):
+        # The brief follows `_slo_targets`: outside `verdict_merge` the targets
+        # stay the assignee's, so the text is not the pilot's.
+        alert = {"lot": self.lot["id"], "level": 1, "step": "signal_assigned",
+                 "waiting": {"what": "unblock"}, "agent": "dev1",
+                 "value": 5400, "threshold": 3600}
+        text = alert_briefs._slo_breach(alert)
+        self.assertIn("assignee: act on it", text)
+        self.assertNotIn("do not reassign its holder", text)
 
 
 class NotifyLivreTest(_Base):

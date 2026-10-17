@@ -736,7 +736,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         else:
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
-                source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]))
+                source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]),
+                repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
             entry["result"] = done["result"]
             detail = "%s — %s" % (entry["detail"], done["detail"])
             entry["detail"] = detail
@@ -855,6 +856,20 @@ GITHUB_MERGE_PR_RE = re.compile(r"^Merge pull request #([1-9][0-9]{0,17}) from \
 #: `#<id>` dans le titre d'un commit de fusion (« Merge #93 … », « … (#91) ») ;
 #: ni `PR#9`, ni `depot#9`, ni `##9`, ni `#9a`
 HASH_REF_RE = re.compile(r"(?<![\w/#&])#([1-9][0-9]{0,17})(?!\w)")
+#: #2259 : séparateurs de proposition d'un titre de fusion ; une négation ne
+#: vaut que dans sa proposition (« sans #598 / #599 livré » garde #599)
+CLAUSE_SPLIT_RE = re.compile(r"[;/|—–]|\s+-\s+|\(|\)|,")
+#: #2259 : mots qui nient les `#<id>` de leur proposition — « recomposition
+#: sans #598 » (commit 84c68e9d4, Nexlink) désignait #598 et fermait son lot
+#: alors que sa PR était ouverte et sa tête hors de la cible. Une préposition
+#: ne nie que ce qui la suit (« #2221 sans #598 » garde 2221, « sauf #598 »
+#: exclut 598) ; un participe nie toute la proposition (« #598 retiré »,
+#: « (#598) exclu »).
+PREFIX_NEGATED_REF_RE = re.compile(r"\b(?:sans|sauf|ni|hors|without|except)\b",
+                                   re.IGNORECASE)
+POSTFIX_NEGATED_REF_RE = re.compile(
+    r"\b(?:retir[ée]e?s?|exclue?s?|exclu[ea]nt|reverts?|reverted)\b",
+    re.IGNORECASE)
 #: clé de configuration git du dépôt : comment ses commits de fusion citent un
 #: lot en plus de `ameesh-work:` — `hash` : `#<id>` dans le titre
 LOT_REF_GIT_KEY = "ameesh.lotRef"
@@ -1093,12 +1108,72 @@ def merge_commits(repo: str, target: str, since_ts: float | None = None,
     return rows
 
 
+def _title_clauses(title: str) -> list[tuple[int, int]]:
+    """Les bornes des propositions d'un titre (séparateurs exclus)."""
+    bounds = []
+    begin = 0
+    for separator in CLAUSE_SPLIT_RE.finditer(title or ""):
+        bounds.append((begin, separator.start()))
+        begin = separator.end()
+    bounds.append((begin, len(title or "")))
+    return bounds
+
+
+def negated_hash_positions(title: str) -> set[int]:
+    """Les départs des `#<id>` que leur proposition nie dans un titre (#2259).
+
+    « paquet 52 v2 : … recomposition sans #598 ni correctif .github » ne
+    désigne pas le lot 598 : sa PR peut rester ouverte. Le découpage par
+    proposition garde une citation positive voisine (« sans #598, #599
+    livré » désigne 599). Un titre sans négation ne change rien. Les
+    positions (et non les numéros) laissent compter une citation positive du
+    même lot dans une autre proposition.
+    """
+    # R Codex #2259 : une négation vaut aussi pour un groupe qui la suit
+    # (« sans (#12) »), tandis que « #14 (sans #12) » garde
+    # #14. Les niveaux sont traités sans récursion, même si le titre imbrique
+    # beaucoup de parenthèses ; chaque groupe masque ses mots au parent.
+    title = title or ""
+    levels = [{"begin": 0, "end": len(title), "children": []}]
+    stack = [levels[0]]
+    for pos, char in enumerate(title):
+        if char == "(":
+            group = {"begin": pos + 1, "end": len(title), "children": []}
+            stack[-1]["children"].append(group)
+            levels.append(group)
+            stack.append(group)
+        elif char == ")" and len(stack) > 1:
+            stack.pop()["end"] = pos
+    negated: set[int] = set()
+    for level in levels:
+        begin, end = level["begin"], level["end"]
+        text = title[begin:end]
+        for child in level["children"]:
+            left, right = child["begin"] - 1 - begin, min(child["end"] + 1, end) - begin
+            text = text[:left] + " " * (right - left) + text[right:]
+        for left, right in _title_clauses(text):
+            clause = text[left:right]
+            prefixes = list(PREFIX_NEGATED_REF_RE.finditer(clause))
+            postfixes = list(POSTFIX_NEGATED_REF_RE.finditer(clause))
+            if not prefixes and not postfixes:
+                continue
+            for match in HASH_REF_RE.finditer(title, begin + left, begin + right):
+                position = match.start() - begin - left
+                # « #14 livré sans #12 » livre #14 : une préposition ne nie
+                # que les numéros APRÈS elle. « #12 retiré » et « (#12)
+                # exclu » nient aussi ceux d'avant le participe.
+                if postfixes or any(m.end() <= position for m in prefixes):
+                    negated.add(match.start())
+    return negated
+
+
 def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
     """`{lot: forme}` des lots que désigne le message d'un commit de fusion :
     une ligne `ameesh-work: <id>` (forme `ameesh-work`), le titre de la fusion
     d'une branche `lot/<id>-…` (forme `lot-branch`, L118b), et, avec
     `hash_refs`, `#<id>` dans le titre (forme `#id`) — pas dans le corps, qui
-    peut recopier les titres des commits fusionnés. Un lot déclaré partiel
+    peut recopier les titres des commits fusionnés. Un `#<id>` nié par sa
+    proposition ne désigne pas le lot (#2259). Un lot déclaré partiel
     (`ameesh-work-partial: <id>`) n'est pas désigné."""
     found: dict[int, str] = {}
     lines = (message or "").strip().splitlines()
@@ -1109,8 +1184,10 @@ def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
     if branch:
         found.setdefault(int(branch.group("lot")), "lot-branch")
     if hash_refs:
+        negated = negated_hash_positions(title)
         for match in HASH_REF_RE.finditer(title):
-            found.setdefault(int(match.group(1)), "#id")
+            if match.start() not in negated:
+                found.setdefault(int(match.group(1)), "#id")
     for match in PARTIAL_TRAILER_RE.finditer(message or ""):
         found.pop(int(match.group(1)), None)
     return found
@@ -1905,7 +1982,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                       % (source, target, primary, TARGET_GIT_KEY, target))
         done = work_mod.close_merged(
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target,
-            source=source, frozen_id=found.get("frozen_id"))
+            source=source, frozen_id=found.get("frozen_id"),
+            repo=repo)                          # L539 : dépôt du relevé, indice de classe
         entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
         if done["result"] == "merged":
             if found.get("kind") == "content":
@@ -1927,5 +2005,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                        text=text, project=fil.project_for(db.cfg, fil.agent_project(reg)),
                        lot=str(lot), meta={"kind": "event"})
         results.append(entry)
+    # L539 (#1104) : les relevés ne revoient jamais un lot déjà fusionné ; ce
+    # rattrapage borné rouvre les relectures dont l'ouverture avait échoué à la
+    # fusion (R1 #1104 P2-2). Jamais en dry-run, jamais bloquant.
+    review_catch_up: dict = {}
+    if not dry_run:
+        try:
+            from . import review_lot
+            review_catch_up = review_lot.catch_up(
+                db, limit=review_lot.CATCH_UP_LIMIT)
+        except Exception:  # noqa: BLE001 - un rattrapage ne casse pas le relevé
+            review_catch_up = {}
     return {"host": host, "dry_run": bool(dry_run), "results": results,
-            "merged": sum(1 for r in results if r["result"] == "merged")}
+            "merged": sum(1 for r in results if r["result"] == "merged"),
+            "review_catch_up": review_catch_up}

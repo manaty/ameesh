@@ -38,6 +38,9 @@
   agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
+  agent-mesh ci run <item> [--avis N] [--exception …]   the CI of a frozen lot, once,
+        [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
+  agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
 
 The owner's authority is never inferred from text: it is proven by an Ed25519
@@ -58,7 +61,7 @@ import time
 from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
-from . import migrations, placement, registry
+from . import migrations, placement, progress, registry
 from . import rebalance as rebalance_mod
 from . import fil, release, signing, storage, work
 from .config import Config
@@ -148,12 +151,12 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
     from . import exploitation
     exploitation.annotate(cfg, db, rows)
-    # #1070 : la pause budget, distincte du `state` « paused » d'un `blocked`
-    # hors budget (hôte non prêt, authentification) — un lecteur machine n'a
-    # pas à déchiffrer un `status_text` français. Posé ici plutôt que dans
-    # `exploitation.agent_view` (§8 prod) : `agent_rows` sert aussi
-    # `GET /api/v1/agents`, les deux chemins le portent sans toucher au prod.
-    from . import progress
+    # #1070 : the budget pause, distinct from the `state` "paused" of a
+    # `blocked` for another cause (host not ready, authentication) — a
+    # machine reader must not have to decode a French `status_text`. Set
+    # here rather than in `exploitation.agent_view` (§8 prod): `agent_rows`
+    # also serves `GET /api/v1/agents`; both paths carry it without touching
+    # prod.
     for row in rows:
         row["paused_on_budget"] = progress.paused_on_budget(row)
     return rows
@@ -176,6 +179,9 @@ def agent_detail(db, name: str) -> dict | None:
     if row is None:
         return None
     row = dict(row)
+    # #1070 : the budget pause reaches `show --json` too, as it does
+    # `list --json` and `/api/v1/agents` (set in `_annotate_agents`)
+    row["paused_on_budget"] = progress.paused_on_budget(row)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
@@ -226,7 +232,6 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
         # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
-        from . import progress
         from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
@@ -261,9 +266,9 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("operator_paused") and row.get("status") not in ("stopped", "dead", "blocked"):
                 status = ("pause-next" if row.get("status") == "running" else "op-paused")
             if progress.paused_on_budget(row):
-                # #1070 : le mot « pause » doit survivre à la troncature de la
-                # colonne — « blocked/bud » masquait les pauses budget (le
-                # bilan du bureau en comptait zéro).
+                # #1070 : the word "pause" must survive the column truncation
+                # — "blocked/bud" hid the budget pauses (the bureau's tally
+                # counted none).
                 status = "paused/%s" % row["status_text"][:22]
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
@@ -926,6 +931,7 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
 
 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
+    from . import progress
     db = _open(cfg)
     try:
         row = agent_detail(db, args.agent)
@@ -935,10 +941,17 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0
+        # #2200 : la pause opérateur se lit dans le résumé texte, pas seulement
+        # dans le JSON — un `idle` avec bail vivant ne dit pas « ne reprendra
+        # pas » et a fait router des lots vers un agent pausé.
+        pause = progress.operator_pause_of(row)
+        status = row.get("status")
+        if pause and status not in ("stopped", "dead", "blocked"):
+            status = "pause-next" if pause.get("after_turn") else "op-paused"
         print("agent    : %s" % row["name"])
         print("workspace: %s" % (row.get("chantier") or "—"))
         print("harness  : %-9s host: %-12s status: %s%s" % (
-            row.get("harness") or "?", row.get("host") or "—", row.get("status"),
+            row.get("harness") or "?", row.get("host") or "—", status,
             (" (%s)" % row["status_text"]) if row.get("status_text") else ""))
         # L242b/#1250 : le harnais DÉCLARÉ ne dit pas sous lequel la session
         # tourne (harnais emprunté) ; quand la session vivante en a un autre,
@@ -948,6 +961,18 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             print("session harness: %s" % live)
         if row.get("stop_reason"):
             print("stopped  : %s" % row["stop_reason"])
+        if pause:
+            who = pause.get("by") or "?"
+            if pause.get("for") and pause["for"] != who:
+                who += " for %s" % pause["for"]
+            print("paused   : operator pause since %s by %s — %s" % (
+                _fmt_moment(pause.get("since_ts")), who,
+                pause.get("reason") or "(no reason given)"))
+            if pause.get("after_turn"):
+                print("           this turn finishes, then no new turn starts")
+            else:
+                print("           no new turn starts until it is lifted "
+                      "(ameesh resume %s --operator --reason <reason>)" % row["name"])
         # L37 (0030) : mode explicite ; un agent externe exige un responsable
         if row.get("mode") == "externe":
             print("mode     : externe (human session, cannot be woken)%s" % (
@@ -1716,8 +1741,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
             if item.get("reviewer") == work.REVIEWER_NONE:
                 print("reviewer : — (verdict not required, #1979)")
-            elif item.get("reviewer"):
-                print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
+            else:
+                from .work_reviewers import designated
+                if designated(item):
+                    print("reviewer : %s (designated for the review, #2076)" %
+                          ", ".join(designated(item)))
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -1841,15 +1869,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "",
                 " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
+            # #800 : la désignation est conservée ; l'avertissement de famille
+            # est indicatif (canon §2).
+            if item.get("reviewer_warning"):
+                print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
-            # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
+            # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
             # sans aller-retour build/qa ; c'est la commande que l'alerte
             # `stale_lot` recommande à l'orchestrateur du projet.
             # #1979 : `--remove` retire la désignation, `--no-verdict` marque
             # « verdict non requis » (résolution de composition mécanique,
             # canon §11 bis/#87) : l'attente passe à la fusion, sans rappel.
-            if args.agent and (args.remove or args.no_verdict):
+            if args.no_verdict and (args.agent or args.remove):
                 print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
                       "mutually exclusive", file=sys.stderr)
                 return 2
@@ -1857,10 +1889,28 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
                       file=sys.stderr)
                 return 2
-            if args.remove:
+            if args.remove and args.agent:
+                item = work.designate_reviewer(cfg, db, args.id, args.agent,
+                                               actor=args.actor, remove=True)
+                if item.get("reviewer_changed") is False:
+                    # #2084/N2 : dire le non-effet, sans écrire un faux
+                    # « removed » au journal.
+                    print("lot #%d: reviewer %s was not designated: nothing removed "
+                          "(state %s, by %s)" % (
+                              item["id"], args.agent, item["state"],
+                              args.actor or "the bound identity"))
+                else:
+                    print("lot #%d: reviewer %s removed (state %s, by %s)" % (
+                        item["id"], args.agent, item["state"],
+                        args.actor or "the bound identity"))
+            elif args.remove:
                 item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
-                print("lot #%d: reviewer designation removed (state %s, by %s)" % (
-                    item["id"], item["state"], args.actor or "the bound identity"))
+                if item.get("reviewer_changed") is False:
+                    print("lot #%d: no reviewer designation to remove (state %s, by %s)" % (
+                        item["id"], item["state"], args.actor or "the bound identity"))
+                else:
+                    print("lot #%d: reviewer designation removed (state %s, by %s)" % (
+                        item["id"], item["state"], args.actor or "the bound identity"))
             elif args.no_verdict:
                 item = work.waive_review(cfg, db, args.id, actor=args.actor)
                 print("lot #%d: verdict not required (state %s, by %s)" % (
@@ -1871,6 +1921,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d: reviewer %s (state %s, designated by %s)" % (
                     item["id"], item["reviewer"], item["state"],
                     args.actor or "the bound identity"))
+                # #800 : la désignation est conservée ; l'avertissement de
+                # famille est indicatif (canon §2).
+                if item.get("reviewer_warning"):
+                    print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
@@ -2567,6 +2621,45 @@ def build_parser() -> argparse.ArgumentParser:
                              help="maximum runs shown (default 5)")
     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
     p_ci_status.set_defaults(func=cmd_ci)
+    # #1343 (canon §3) : la CI d'un lot part au gel, après les verdicts requis,
+    # par une étiquette `ci-lot-<sha>`/`ci-full-<sha>` posée sur la PR.
+    p_ci_run = ci_sub.add_parser(
+        "run", help="request the CI of a frozen lot, once, on the frozen head, "
+                    "by the ci-lot/ci-full label (#1343)")
+    p_ci_run.add_argument("id", type=int, help="work item number")
+    p_ci_run.add_argument("--sha", default="", help="the frozen commit (default: the "
+                          "last `frozen` milestone)")
+    p_ci_run.add_argument("--avis", type=int, default=1,
+                          help="required independent verdicts on the frozen commit: "
+                               "0 (lot léger), 1 (sensible), 2 (SQL/sécurité/prod)")
+    p_ci_run.add_argument("--exception", choices=("incident", "unblock"), default="",
+                          help="incident|unblock: CI in parallel of the review, marked "
+                               "(canon §3); requires --reason")
+    p_ci_run.add_argument("--reason", default="",
+                          help="why (the exception, the full suite): written to the lot")
+    p_ci_run.add_argument("--full", action="store_true",
+                          help="whole suite (release, package, explicit request), not the "
+                               "lot selection; requires --reason")
+    p_ci_run.add_argument("--force", action="store_true",
+                          help="request the CI again although this composition already "
+                               "ran, none green (red or cancelled): explicit resumption")
+    p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
+                          "issue_ref or github.projects)")
+    p_ci_run.add_argument("--dry-run", action="store_true",
+                          help="decide and print, pose no label")
+    p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
+    p_ci_run.set_defaults(func=cmd_ci)
+    p_ci_cancel = ci_sub.add_parser(
+        "cancel", help="cancel the open runs of a lot that do not carry its frozen commit")
+    p_ci_cancel.add_argument("id", type=int, help="work item number")
+    p_ci_cancel.add_argument("--all", action="store_true",
+                             help="also cancel the run of the frozen commit")
+    p_ci_cancel.add_argument("--repo", default="", help="owner/name (default: the lot's "
+                             "issue_ref or github.projects)")
+    p_ci_cancel.add_argument("--dry-run", action="store_true",
+                             help="list the runs, cancel nothing")
+    p_ci_cancel.add_argument("--json", action="store_true", help="`ameesh-ci-cancel/1` report")
+    p_ci_cancel.set_defaults(func=cmd_ci)
 
     # L750/L756 : le périmètre d'une release et sa porte (`ameesh release`)
     release.add_parser(sub, cmd_release)
@@ -2779,18 +2872,19 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.add_argument("--reviewer", default=None, metavar="AGENT",
                          help="#705: designate the reviewer of the review that starts, only "
                               "when moving to qa: waiting(), the progress view and the stale_lot "
-                              "alert name them before any verdict")
+                              "alert name them before any verdict; a reviewer of the author's "
+                              "declared harness warns (indicative, #800)")
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
-        help="#705: designate (or change) the reviewer of a lot already in qa, "
+        help="#2076: add a designated reviewer of a lot already in qa, "
              "without a build/qa round trip")
     pw_reviewer.add_argument("id", type=int)
     pw_reviewer.add_argument("agent", nargs="?", metavar="AGENT",
                              help="a registry agent, or human:<id>; never the lot's assignee")
     pw_reviewer.add_argument("--remove", action="store_true",
-                             help="#1979: remove the designation (the review goes back to "
-                                  "« verdict from a reviewer (none designated) »)")
+                             help="#2076: remove AGENT's designation; without AGENT, "
+                                  "remove all designations (#1979)")
     pw_reviewer.add_argument("--no-verdict", dest="no_verdict", action="store_true",
                              help="#1979: mark « verdict not required » (mechanical composition "
                                   "resolution, canon §11 bis/#87): the lot waits for its merge "
@@ -2871,7 +2965,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_expire.add_argument("--actor", default="")
     pw_expire.set_defaults(func=cmd_work)
 
-    pw_note = work_sub.add_parser("note")
+    pw_note = work_sub.add_parser(
+        "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text")
     pw_note.add_argument("--actor", default="")
@@ -2998,6 +3093,19 @@ def build_parser() -> argparse.ArgumentParser:
     pa_check.add_argument("--json", action="store_true")
     pa_check.add_argument("--dry-run", action="store_true", help="probe only, write nothing")
     pa_check.set_defaults(func=cmd_accounts)
+    from . import login_cli as login_cli_mod
+    pa_login = acc_sub.add_parser(
+        "login", help="private OAuth login challenge for a declared account (L232d)")
+    pa_login.add_argument("harness", help="harness: " + ", ".join(login_cli_mod.adapter_names()))
+    pa_login.add_argument("account", nargs="?", default=None,
+                          help="declared account (default: the harness's primary account)")
+    pa_login.add_argument("--approver", required=True,
+                          help="human:<id> who will sign the challenge")
+    pa_login.add_argument("--scope", default="", help="short text shown in the signed summary")
+    pa_login.add_argument("--wait", type=float, default=login_cli_mod.TTL_WAIT_S,
+                          help="bounded wait for the receipt, in seconds (default 900)")
+    pa_login.add_argument("--json", action="store_true")
+    pa_login.set_defaults(func=login_cli_mod.cmd_accounts_login)
     p_acc.set_defaults(func=cmd_accounts)
 
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
@@ -3190,6 +3298,14 @@ def _cost_report_reads(cfg: Config, db) -> None:
     _real_spend_24h(db)
 
 
+def _config_origin(cfg: Config) -> dict:
+    """#1466 : provenance de la configuration lue — fichier, base héritée et
+    clés qu'un profil écrase (les comptes, notamment)."""
+    return {"path": cfg.config_path, "base": cfg.config_base,
+            "shadowed": list(cfg.config_shadowed or ()),
+            "source": cfg.config_source}
+
+
 def cmd_accounts(cfg: Config, args) -> int:
     """`ameesh accounts list|use <harnais> <compte>|auto [harnais]|healthy
     <harnais> [<compte>]` (L30, 0027 ; L226b).
@@ -3284,10 +3400,22 @@ def cmd_accounts(cfg: Config, args) -> int:
             except db_mod.DbError:
                 sante = []  # base sans la migration 0060
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
+                              "config": _config_origin(cfg),
                               "accounts": rows, "switches": bascules,
                               "credentials": sante, "proposal": prop.as_dict()},
                              ensure_ascii=False, indent=2, default=str))
             return 0
+        if cfg.config_base:
+            # #1466 : d'où viennent ces comptes — un profil peut diverger de
+            # la configuration de l'hôte sans que personne ne le voie
+            note = ("config     : %s (profile; host config %s)"
+                    % (cfg.config_path, cfg.config_base))
+            if cfg.config_shadowed:
+                note += "; overrides: %s" % ", ".join(cfg.config_shadowed)
+            if "accounts" in (cfg.config_shadowed or ()):
+                note += ("\n             WARNING: this profile's `accounts` override the "
+                         "host's; a stale profile diverges silently from other runners")
+            print(note)
         print(accounts_mod.format_rows(rows))
         print(prop.text())
         if bascules:
@@ -3303,7 +3431,6 @@ def cmd_accounts(cfg: Config, args) -> int:
 
 
 def _since_seconds(text: str) -> float:
-    from . import progress
     now = time.time()
     return max(0.0, now - progress.parse_since(text, now))
 

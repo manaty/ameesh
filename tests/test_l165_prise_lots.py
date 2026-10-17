@@ -302,19 +302,23 @@ class PriseDeLotTest(_Lots):
         self.assertEqual(work.get(self.db, pour_deepseek["id"])["assignee"], "deepseek7")
 
     def test_seuil_de_repos_propre_aux_lots(self):
+        # #1677 (b) : le seuil de temps ne borne plus la prise des lots quand
+        # le relevé porte `actionable_lots` — un agent sans lot actionnable est
+        # au repos, quel que soit le temps depuis son dernier tour. Zéro reste
+        # l'interrupteur qui désactive la prise.
         self.agent("claude1", team="nexlink", since_s=20 * 60)
         lot = self.lot("lot")
-        self.assertEqual(self.take(lot_idle_s=30 * 60), [])
         self.assertEqual(self.take(lot_idle_s=0), [])
         self.assertEqual(self.take(lot_max_per_hour=0), [])
         # un lot tout juste créé est laissé à qui l'a créé
         self.db.execute("UPDATE work_items SET created_at = now() WHERE id = %s",
                         (lot["id"],))
-        self.assertEqual(self.take(), [])
+        self.assertEqual(self.take(lot_idle_s=30 * 60), [])
         self.db.execute("UPDATE work_items SET created_at = now() - interval '10 minutes'"
                         " WHERE id = %s", (lot["id"],))
-        # défaut : 15 min de repos suffisent, la file en demande 30
-        self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
+        # 20 min de repos, seuil de lot à 30 min : la prise part quand même
+        self.assertEqual([t["item"]["id"] for t in self.take(lot_idle_s=30 * 60)],
+                         [lot["id"]])
 
     def test_ordre_priorite_puis_dates_prevues(self):
         self.agent("a1", team="nexlink", since_s=3 * HEURE)
@@ -443,6 +447,22 @@ class PriseDeLotTest(_Lots):
         # même passage ; l'orchestrateur, lui, ne se sert jamais.
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
                          [("claude1", un["id"]), ("deepseek7", deux["id"])])
+
+    def test_orchestrateur_sert_un_lot_qu_aucun_autre_ne_prend(self):
+        """#1739 : sans autre preneur, l'orchestrateur prend le lot laissé, et
+        la note d'attribution garde la trace du repli."""
+        self.agent("orchestrateur", team="nexlink", since_s=5 * HEURE)
+        lot = self.lot("demande")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"], t.get("fallback")) for t in out],
+                         [("orchestrateur", lot["id"], True)])
+        self.assertNotIn("orchestrateur", out[0]["notified"])
+        note = self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s"
+            " ORDER BY id DESC LIMIT 1", (lot["id"],))[0]["note"]
+        self.assertIn(backlog.LOT_TAKE_NOTE, note)
+        self.assertIn("aucun autre preneur ; orchestrateur", note)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "orchestrateur")
 
     def test_lot_avant_la_file_et_garde_fous(self):
         self.agent("claude1", team="nexlink")

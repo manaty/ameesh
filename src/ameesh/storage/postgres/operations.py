@@ -19,6 +19,7 @@ from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
 from .work import has_reviewer
+from .work_dependencies import current_verdict as _current_verdict
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
@@ -88,6 +89,16 @@ class Operations(interface.Operations):
     def listing(self, *, today: str | None = None) -> list[dict]:
         import datetime as _dt
         today = today or _dt.date.today().isoformat()
+        # #1726 : une relecture désignée (#705) sans verdict courant occupe son
+        # relecteur — sans quoi, sans lot à lui, il passerait pour « au repos »
+        # et la prise lui donnerait un lot ou une autre relecture. La colonne
+        # `reviewer` n'existe qu'après la migration 0421.
+        review_due = ""
+        if has_reviewer(self.db):
+            review_due = ("""
+                     + (SELECT count(*) FROM work_items w
+                         WHERE w.state = 'qa' AND w.reviewer = r.name
+                           AND """ + _current_verdict("w") + """ IS NULL)""")
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
@@ -98,6 +109,11 @@ class Operations(interface.Operations):
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   -- #2200 : la pause opérateur, portée par la lecture partagée
+                   -- des alertes (état « paused », jamais « idle »)
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+                   r.operator_pause_for,
+                   extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause
@@ -122,6 +138,8 @@ class Operations(interface.Operations):
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
                    coalesce(al.n, 0)::bigint AS active_lots,
+                   -- #1677 : les lots qui demandent encore un geste de l'agent
+                   coalesce(ac.n, 0)::bigint AS actionable_lots,
                    -- L60 : Codex compte déjà le cache dans input_tokens
                    (CASE WHEN t.harness = 'codex'
                          THEN greatest(t.input_tokens, t.cached_input_tokens)
@@ -156,6 +174,21 @@ class Operations(interface.Operations):
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND w.state NOT IN """ + _WAITING_ON_OTHERS + """
                      AND (w.planned_start IS NULL OR w.planned_start <= j.today)) al ON true
+              LEFT JOIN LATERAL (
+                  -- #1677 : ce que l'agent doit encore faire — ses lots qui
+                  -- l'occupent, plus la correction d'un lot en qa dont le
+                  -- verdict COURANT est bloquant (B1 : un `blocked` d'une tête
+                  -- regelée depuis n'attend plus de correction). Aucun lot
+                  -- actionnable = au repos, quel que soit le temps depuis le
+                  -- dernier tour.
+                  -- #1726 : une relecture désignée sans verdict courant
+                  -- (relecteur #705, lot en qa) compte aussi : l'agent doit
+                  -- son verdict avant de prendre autre chose.
+                  SELECT count(*)""" + review_due + """ AS n FROM work_items w
+                   WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
+                     AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
+                          OR (w.state = 'qa' AND """ + _current_verdict("w") + """ = 'blocked'))
+                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)) ac ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c
@@ -342,18 +375,18 @@ class Operations(interface.Operations):
             "  FROM work_items WHERE assignee = %s AND state NOT IN " + _CLOSED +
             " ORDER BY updated_at DESC, id DESC", (name,))
 
-    def open_lots_activity(self, limit) -> list[dict]:
-        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
-        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
-        reviewer = ("w.reviewer" if has_reviewer(self.db)
-                    else "''::text AS reviewer")
-        # #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
-        # `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
-        # migration. `released_by` en écarte les dépendants pinnés, dont la
-        # retenue ne tombe que par une commande `release` du registre.
-        sql = ("""
+    #: corps commun de `open_lots_activity` / `state_lots_activity` : la
+    #: dernière activité d'un lot (ligne, transitions, jalons, actions,
+    #: messages). `%%s` du LIMIT est échappé : `_lots_activity` injecte le
+    #: WHERE, qui peut lui-même porter un `%s`.
+    #: #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
+    #: `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
+    #: migration. `released_by` en écarte les dépendants pinnés, dont la
+    #: retenue ne tombe que par une commande `release` du registre.
+    _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   to_jsonb(w)->'reviewers' AS reviewers,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
                             nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,
@@ -372,12 +405,29 @@ class Operations(interface.Operations):
                                   WHERE a.work_item = w.id) ac ON true
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM agent_mailbox b
                                   WHERE b.work_item_id = w.id::text) mb ON true
-             WHERE w.state NOT IN """ + _CLOSED + """
+             WHERE %s
              ORDER BY last_activity_ts ASC, w.id
-             LIMIT %s
-            """).replace("__REVIEWER__", reviewer)
+             LIMIT %%s
+            """
+
+    def _lots_activity(self, where, params) -> list[dict]:
+        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
+        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
+        reviewer = ("w.reviewer" if has_reviewer(self.db)
+                    else "''::text AS reviewer")
         return self.db.query(
-            sql, (int(limit) if limit is not None else None,))
+            self._LOTS_ACTIVITY.replace("__REVIEWER__", reviewer) % where,
+            params)
+
+    def open_lots_activity(self, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state NOT IN " + _CLOSED,
+            (int(limit) if limit is not None else None,))
+
+    def state_lots_activity(self, state, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state = %s",
+            (state, int(limit) if limit is not None else None))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:

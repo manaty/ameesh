@@ -139,6 +139,64 @@ class PauseTest(PgTestCase):
         self.assertEqual(registry.get(self.db, "worker")["operator_pause_reason"], "maintenance")
         self.assertEqual(self.events()[0]["reason"], "maintenance")
 
+    def test_conditional_resume_lifts_only_the_expected_reason(self):
+        """#2152 / R1 B1 : la reprise conditionnelle (migration 0458) ne lève
+        que la pause dont la raison est exactement celle attendue."""
+        self.change(reason="drain #2152 [nous]")
+        out = agent_pause.change(self.db, "worker", paused=False, reason="reprise",
+                                 actor="human:alice", expect_reason="drain #2152 [autre]")
+        self.assertFalse(out["changed"])
+        self.assertTrue(out["operator_paused"])
+        row = registry.get(self.db, "worker")
+        self.assertTrue(row["operator_paused"])
+        self.assertEqual(row["operator_pause_reason"], "drain #2152 [nous]")
+        # La conditionnelle sans effet n'écrit aucun événement.
+        self.assertEqual([e["paused"] for e in self.events()], [True])
+        out = agent_pause.change(self.db, "worker", paused=False, reason="reprise",
+                                 actor="human:alice", expect_reason="drain #2152 [nous]")
+        self.assertTrue(out["changed"])
+        self.assertFalse(out["operator_paused"])
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual([e["paused"] for e in self.events()], [True, False])
+
+    def test_conditional_resume_after_a_foreign_replacement_leaves_it(self):
+        """#2152 / R1 B1 (niveau base) : levée externe puis NOUVELLE pause
+        étrangère ; la reprise sur l'ancien motif ne touche pas la nouvelle."""
+        self.change(reason="drain #2152 [nous]")
+        self.change(False, reason="levée externe")
+        self.change(reason="pause humaine etrangere", principal="human:bob")
+        out = agent_pause.change(self.db, "worker", paused=False, reason="reprise",
+                                 actor="human:alice", expect_reason="drain #2152 [nous]")
+        self.assertFalse(out["changed"])
+        self.assertTrue(out["operator_paused"])
+        row = registry.get(self.db, "worker")
+        self.assertEqual(row["operator_pause_reason"], "pause humaine etrangere")
+        self.assertEqual(row["operator_pause_by"], "human:alice")
+        self.assertEqual([e["paused"] for e in self.events()], [True, False, True])
+
+    def test_conditional_resume_refuses_to_set_a_pause(self):
+        with self.assertRaises(agent_pause.PauseRefused):
+            agent_pause.change(self.db, "worker", paused=True, reason="maintenance",
+                               actor="human:alice", expect_reason="drain")
+        with self.assertRaises(agent_pause.PauseRefused):
+            agent_pause.change(self.db, "worker", paused=False, reason="maintenance",
+                               actor="human:alice", expect_reason=" ")
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual(self.events(), [])
+
+    def test_conditional_sql_entrypoint_has_no_public_execution_or_definer(self):
+        row = self.db.query(
+            "SELECT prosecdef, EXISTS (SELECT 1 FROM aclexplode(proacl) a "
+            "WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') AS public_exec "
+            "FROM pg_proc WHERE oid = "
+            "'ameesh_operator_resume_if(text,text,text,text,text)'::regprocedure")[0]
+        self.assertEqual(row, {"prosecdef": False, "public_exec": False})
+        # Un motif vide est refusé par la fonction elle-même (pas de levée
+        # « par défaut » par un appel SQL direct).
+        with self.assertRaises(Exception):
+            self.db.query("SELECT * FROM ameesh_operator_resume_if(%s, %s, %s, %s, %s)",
+                          ("worker", "reprise", "human:alice", "human:alice", " "))
+
     def test_operator_resume_wakes_the_runner_after_commit(self):
         name = self.schema
         registry.upsert(self.db, name, harness="deepseek", host=self.cfg.host)
@@ -241,6 +299,32 @@ class PauseTest(PgTestCase):
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(len(self.events()), 2)
         self.assertIsNone(registry.get(self.db, "worker")["pending_prompt"])
+
+    def test_cli_conditional_resume_keeps_a_foreign_pause(self):
+        """#2152 / R1 B1 : `resume --operator --expect-reason` ne lève que la
+        pause attendue ; une pause étrangère reste en place."""
+        out = self.mesh("pause", "worker", "--human", "human:alice",
+                        "--reason", "pause humaine etrangere", "--json")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        out = self.mesh("resume", "worker", "--operator", "--human", "human:alice",
+                        "--reason", "reprise", "--expect-reason", "drain #2152 [nous]",
+                        "--json")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        data = json.loads(out.stdout)
+        self.assertEqual((data["changed"], data["operator_paused"]), (False, True))
+        self.assertTrue(registry.get(self.db, "worker")["operator_paused"])
+        out = self.mesh("resume", "worker", "--operator", "--human", "human:alice",
+                        "--reason", "reprise",
+                        "--expect-reason", "pause humaine etrangere")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("operator pause cleared", out.stdout)
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+
+    def test_cli_expect_reason_requires_operator(self):
+        out = self.mesh("resume", "worker", "--expect-reason", "drain",
+                        "--human", "human:alice", "--reason", "reprise")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("--expect-reason requires --operator", out.stderr)
 
     def test_cli_agent_identity_cannot_become_a_human_even_with_a_stale_lease(self):
         out = self.mesh("pause", "worker", "--reason", "maintenance", "--human", "human:alice",

@@ -78,25 +78,53 @@ def rss_bytes(pid: int | None = None) -> int | None:
     return None
 
 
+#: #2107/#2108 : motifs de `trim_free_memory` — le journal doit distinguer
+#: « rien à rendre » d'une plateforme qui n'offre pas `malloc_trim`.
+TRIM_RETURNED = "returned"
+TRIM_NOTHING = "nothing"
+TRIM_UNSUPPORTED = "unsupported"
+TRIM_FAILED = "failed"
+
+#: libellés lisibles des motifs, pour le journal du runner
+TRIM_LABELS = {
+    TRIM_RETURNED: "returned to the kernel",
+    TRIM_NOTHING: "nothing to return (malloc_trim freed no page)",
+    TRIM_UNSUPPORTED: "not supported here (no malloc_trim)",
+    TRIM_FAILED: "trim failed",
+}
+
+
+def trim_free_memory() -> str:
+    """#2107/#2108 : motif du retour de mémoire libre à l'allocateur (glibc
+    `malloc_trim`) — `returned` (des pages sont rendues), `nothing` (l'appel
+    est offert mais aucune page n'était libre), `unsupported` (pas de
+    `malloc_trim` : musl, macOS, Windows), `failed` (l'appel a échoué).
+
+    Best-effort : ne lève jamais. Le libellé exact évite de diagnostiquer une
+    plateforme non prise en charge quand le trim a simplement rendu 0 page."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None)
+        trim = libc.malloc_trim
+    except Exception:  # OSError, AttributeError ; TypeError sous Windows (CDLL(None))
+        return TRIM_UNSUPPORTED
+    try:
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        return TRIM_RETURNED if trim(0) else TRIM_NOTHING
+    except Exception:
+        return TRIM_FAILED
+
+
 def release_free_memory() -> bool:
     """Rend au noyau la mémoire libre de l'allocateur (glibc `malloc_trim`).
 
     #2096 : l'allocateur garde le plafond d'allocation d'un pic (un gros tour)
     alors que les objets sont morts ; sans ce retour, le RSS d'un exécuteur ne
     redescend pas. Best-effort : False si l'allocateur ne l'offre pas (musl,
-    macOS) ou si l'appel échoue — ne lève jamais."""
-    import ctypes
-    try:
-        libc = ctypes.CDLL(None)
-        trim = libc.malloc_trim
-    except Exception:  # OSError, AttributeError ; TypeError sous Windows (CDLL(None))
-        return False
-    try:
-        trim.argtypes = [ctypes.c_size_t]
-        trim.restype = ctypes.c_int
-        return bool(trim(0))
-    except Exception:
-        return False
+    macOS), si l'appel échoue, ou s'il n'y avait rien à rendre — ne lève
+    jamais. `trim_free_memory` dit lequel de ces cas (#2107/#2108)."""
+    return trim_free_memory() == TRIM_RETURNED
 
 
 def _stat_fields(pid: int) -> list[str]:
@@ -580,15 +608,31 @@ def children(pid: int | None = None) -> list[dict]:
     raise NotAvailable("enfants d'un processus", "ni liste du noyau ni psutil")
 
 
-def exited_child(pid: int) -> bool:
-    """Observe an exited direct child without consuming its wait status."""
+def exited_child_status(pid: int) -> int | None:
+    """Exit status of an exited direct child, WITHOUT consuming it.
+
+    None while it runs, when it is not our child, or when the OS cannot
+    observe it. A negative status means killed by that signal. The child
+    stays a zombie, so its pid — and the process-group id that an exited
+    session leader keeps — cannot be reused until the caller reaps it
+    (a `killpg` on that pgid is then aimed at our group, not a recycled one).
+    """
     if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")):
-        return False
+        return None
     try:
         info = os.waitid(os.P_PID, int(pid), os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        return info is not None and info.si_pid == int(pid)
     except (ChildProcessError, OSError):
-        return False
+        return None
+    if info is None or info.si_pid != int(pid):
+        return None
+    if getattr(os, "CLD_EXITED", None) is not None and info.si_code == os.CLD_EXITED:
+        return int(info.si_status)
+    return -int(info.si_status)
+
+
+def exited_child(pid: int) -> bool:
+    """Observe an exited direct child without consuming its wait status."""
+    return exited_child_status(pid) is not None
 
 
 def reap(pid: int) -> int | None:

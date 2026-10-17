@@ -913,8 +913,9 @@ class CostBook:
 
         Compare turn-marker timestamps across agents. Only a stream without
         any marker uses the `primary` account (the harness's default one,
-        L1078) and file modification time; with `primary` None, no account
-        claims them.
+        L1078), dated by the event itself or left undated, never by the file
+        modification time (#1720); with `primary` None, no account claims
+        them.
 
         #1132 : la comparaison porte sur l'instant de production, puis la
         lecture est complétée par l'historique partagé (`_gauges_with_history`)
@@ -942,7 +943,7 @@ class CostBook:
                     # make a racy snapshot old enough to be cached.
                     seen = time.time_ns()
                     events, stat, complete = _claude_account_tail(path)
-                    readings = _claude_account_readings(events, stat.st_mtime, agent)
+                    readings = _claude_account_readings(events, agent)
                     if complete and not _racy(stat, seen):
                         self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
                     else:
@@ -2097,7 +2098,8 @@ def _claude_windows(event: dict, read_at: float | None = None) -> list | None:
     """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles.
 
     `read_at` (#1561) : l'horodatage du relevé — le marqueur de compte qui
-    précède le tour, ou la date du flux pour un flux sans marqueur.
+    précède le tour, ou la date de l'événement pour un flux sans marqueur
+    (#1720, 0.0 = non daté).
     """
     info = event.get("rate_limit_info") or {}
     windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
@@ -2265,25 +2267,37 @@ def _parse_events(lines: Iterable[str], start: int, end: int | None = None) -> l
 def _lines_reverse(path: str, bloc: int = 1 << 20) -> Iterator[bytes]:
     """Les lignes d'un fichier, de la dernière à la première (#2096).
 
-    Lit par blocs depuis la fin et recolle la ligne à cheval sur deux blocs :
-    la mémoire reste bornée par le bloc et la plus longue ligne, jamais par le
+    Lit par blocs depuis la fin et recolle la ligne à cheval sur deux blocs.
+    Les morceaux de cette ligne s'accumulent dans une liste et ne sont joints
+    qu'une fois, quand elle est complète : une ligne géante (un événement de
+    plusieurs Mo) coûte alors O(n), au lieu de la concaténation quadratique
+    d'un `bloc + reste` qui recopiait toute la ligne à chaque tour (#2125).
+    La mémoire reste bornée par le bloc et la plus longue ligne, jamais par le
     fichier. Les lignes sont rendues en octets, décodées par l'appelant."""
     try:
         with open(path, "rb") as flux:
             flux.seek(0, os.SEEK_END)
             pos = flux.tell()
-            reste = b""
+            morceaux: list[bytes] = []  # la ligne en cours, de sa fin vers son début
             while pos > 0:
                 debut = max(0, pos - bloc)
                 flux.seek(debut)
-                donnees = flux.read(pos - debut) + reste
+                donnees = flux.read(pos - debut)
                 pos = debut
                 parties = donnees.split(b"\n")
-                reste = parties[0]  # peut-être la fin d'une ligne antérieure
-                for ligne in reversed(parties[1:]):
+                if len(parties) == 1:
+                    # aucun saut de ligne : tout le bloc prolonge la ligne en cours
+                    morceaux.append(parties[0])
+                    continue
+                morceaux.append(parties[-1])
+                yield b"".join(reversed(morceaux))
+                morceaux = [parties[0]]  # peut-être la fin d'une ligne antérieure
+                for ligne in reversed(parties[1:-1]):
                     yield ligne
-            if reste:
-                yield reste
+            if morceaux:
+                ligne = b"".join(reversed(morceaux))
+                if ligne:                # même contrat que l'ancien `if reste`
+                    yield ligne
     except OSError:
         return
 
@@ -2475,24 +2489,44 @@ def _last_claude_reading(events: list, agent: str, mtime: float):
     return best
 
 
-def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dict:
+def _claude_event_date(event: dict) -> float:
+    """La date que l'événement porte lui-même, 0.0 s'il n'en porte pas (#1720).
+
+    Un `rate_limit_event` Claude réel n'a ni `ts` ni `timestamp` : un flux sans
+    marqueur reste donc **non daté**, au lieu d'être daté de la mtime du journal
+    (dernière écriture de n'importe quel événement), qui le faisait passer pour
+    plus frais qu'un widget plus récent (#1648).
+    """
+    for key in ("ts", "timestamp"):
+        date = _epoch(event.get(key))
+        if date:
+            return date
+    return 0.0
+
+
+def _claude_account_readings(events: list, agent: str = "") -> dict:
     """Attribute all accounts in one pass; None is a verified legacy stream.
 
-    Each reading is (stamp, produced, Gauges): the overage flags stay on the
+    Each reading is (read_at, produced, Gauges): the overage flags stay on the
     gauges (L226b, #1649) and the production instant (#1132) is the marker ts
-    of the publishing turn, never the file mtime — which only breaks ties
-    between undated streams.
+    of the publishing turn. `read_at` (#1720) est le ts du marqueur pour un flux
+    marqué, la date de l'événement pour un flux sans marqueur, 0.0 (non daté)
+    quand il n'en porte pas — jamais la mtime du fichier.
 
     #1132 : chaque mesure porte sa provenance. `produced_at` est le ts du
-    marqueur du tour qui l'a publiée — jamais le mtime du fichier, qui ne sert
-    qu'à départager deux flux sans marqueur (non datés). Une mesure dont une
-    fenêtre était déjà close au début du tour est un rejeu : elle est rendue
-    NON datée, pour ne pas remplacer une mesure fraîche. Un rejeu publié après
-    une mesure fraîche du même compte ne la remplace pas non plus : le compte
-    garde la meilleure mesure du flux (`_reading_rank`).
+    marqueur du tour qui l'a publiée, jamais le mtime du fichier. Une mesure
+    dont une fenêtre était déjà close au début du tour est un rejeu : elle est
+    rendue NON datée, pour ne pas remplacer une mesure fraîche. Un rejeu publié
+    après une mesure fraîche du même compte ne la remplace pas non plus : le
+    compte garde la meilleure mesure du flux (`_reading_rank`).
+
+    #1720 : un flux sans marqueur ne se date plus de la mtime du journal
+    (dernière écriture de n'importe quel événement), qui le faisait passer pour
+    plus frais qu'un widget plus récent (#1648) ; il se date de l'événement
+    lui-même (`_claude_event_date`), sinon il reste non daté.
     """
     marked = any(_is_claude_marker(e) for e in events)
-    current, stamp, produced = None, (0.0 if marked else mtime), None
+    current, stamp, produced = None, 0.0, None
     readings = {}
     for event in events:
         if _is_claude_marker(event):
@@ -2500,7 +2534,8 @@ def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dic
             produced = _marker_ts(event)
             stamp = produced if produced is not None else 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
-            gauges = _claude_windows(event, stamp)
+            read_at = stamp if marked else _claude_event_date(event)
+            gauges = _claude_windows(event, read_at)
             if gauges is None:
                 continue
             at = produced
@@ -2509,8 +2544,8 @@ def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dic
             # #1661 : `_stamp_gauges` recopie chaque fenêtre (`replace`) et rend
             # un `Gauges` neuf : le cache ne partage jamais la liste mutable du
             # producteur, et l'overage reste porté par les `Gauges` (#1649).
-            found = (stamp, at, _stamp_gauges(gauges, at, agent,
-                                              _claude_overage(event)))
+            found = (read_at, at, _stamp_gauges(gauges, at, agent,
+                                                _claude_overage(event)))
             old = readings.get(current)
             if old is None or _reading_rank(found) >= _reading_rank(old):
                 readings[current] = found

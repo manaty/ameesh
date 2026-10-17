@@ -174,31 +174,53 @@ class TurnMemoryReleaseTest(unittest.TestCase):
     """Rendre les arènes au noyau seulement après un tour qui a fait croître le
     processus ; jamais d'exception, jamais de geste inutile."""
 
-    def _release(self, before, after, failing=False):
+    def _release(self, before, after, failing=False, motif=None):
         worker = bare_worker()
         rss = mock.Mock(side_effect=OSError("mesure impossible")) if failing \
             else mock.Mock(return_value=after)
         with mock.patch("ameesh.platform.process.rss_bytes", rss), \
-                mock.patch("ameesh.platform.process.release_free_memory") as rel, \
-                mock.patch("ameesh.runner.log_async"):
+                mock.patch("ameesh.platform.process.trim_free_memory",
+                           return_value=process.TRIM_RETURNED if motif is None else motif) as trim, \
+                mock.patch("ameesh.runner.log_async") as log:
             worker._release_turn_memory(before)
-        return rel
+        return trim, log
 
     def test_no_release_below_the_growth_threshold(self):
-        rel = self._release(100 * 2 ** 20, 100 * 2 ** 20 + TURN_TRIM_RSS_GROWTH - 1)
-        rel.assert_not_called()
+        trim, _ = self._release(100 * 2 ** 20, 100 * 2 ** 20 + TURN_TRIM_RSS_GROWTH - 1)
+        trim.assert_not_called()
 
     def test_release_after_a_big_turn(self):
-        rel = self._release(100 * 2 ** 20, 100 * 2 ** 20 + TURN_TRIM_RSS_GROWTH)
-        rel.assert_called_once_with()
+        trim, _ = self._release(100 * 2 ** 20, 100 * 2 ** 20 + TURN_TRIM_RSS_GROWTH)
+        trim.assert_called_once_with()
 
     def test_unknown_before_never_releases(self):
-        rel = self._release(None, 800 * 2 ** 20)
-        rel.assert_not_called()
+        trim, _ = self._release(None, 800 * 2 ** 20)
+        trim.assert_not_called()
 
     def test_a_failing_measure_never_raises(self):
-        rel = self._release(0, None, failing=True)
-        rel.assert_not_called()
+        trim, _ = self._release(0, None, failing=True)
+        trim.assert_not_called()
+
+    def _label(self, motif):
+        _, log = self._release(100 * 2 ** 20,
+                               100 * 2 ** 20 + TURN_TRIM_RSS_GROWTH, motif=motif)
+        return log.call_args[0][0]
+
+    def test_zero_page_trim_is_not_a_missing_platform(self):
+        # #2108 : « rien à rendre » n'est pas « plateforme non prise en charge »
+        message = self._label(process.TRIM_NOTHING)
+        self.assertIn("nothing to return", message)
+        self.assertNotIn("not releasable here", message)
+
+    def test_missing_malloc_trim_is_named(self):
+        # #2107 : le journal distingue l'absence de support du zéro page rendue
+        self.assertIn("not supported here", self._label(process.TRIM_UNSUPPORTED))
+
+    def test_returned_pages_are_named(self):
+        self.assertIn("returned to the kernel", self._label(process.TRIM_RETURNED))
+
+    def test_unknown_motif_is_rendered_as_is(self):
+        self.assertIn("bizarre", self._label("bizarre"))
 
 
 class PlatformMemoryTest(unittest.TestCase):
@@ -218,19 +240,44 @@ class PlatformMemoryTest(unittest.TestCase):
                 self.malloc_trim = lambda pad: (calls.append(pad), 1)[1]
 
         with mock.patch("ctypes.CDLL", return_value=FakeLibc()):
+            self.assertEqual(process.trim_free_memory(), process.TRIM_RETURNED)
             self.assertTrue(process.release_free_memory())
-        self.assertEqual(calls, [0])
+        self.assertEqual(calls, [0, 0])
 
-    def test_release_without_the_symbol_is_false(self):
+    def test_release_without_the_symbol_is_unsupported(self):
         with mock.patch("ctypes.CDLL", return_value=object()):
+            self.assertEqual(process.trim_free_memory(), process.TRIM_UNSUPPORTED)
             self.assertFalse(process.release_free_memory())
 
-    def test_release_without_a_libc_is_false(self):
+    def test_release_without_a_libc_is_unsupported(self):
         # TypeError : `CDLL(None)` sous Windows (pas de handle du processus)
         for exc in (OSError("no libc"), TypeError("expected str, got NoneType")):
             with self.subTest(exc=type(exc).__name__), \
                     mock.patch("ctypes.CDLL", side_effect=exc):
+                self.assertEqual(process.trim_free_memory(), process.TRIM_UNSUPPORTED)
                 self.assertFalse(process.release_free_memory())
+
+    def test_a_trim_that_returns_zero_is_nothing_to_return(self):
+        # #2107/#2108 : l'appel est offert, mais aucune page n'était libre
+        class FakeLibc:
+            def __init__(self):
+                self.malloc_trim = lambda pad: 0
+
+        with mock.patch("ctypes.CDLL", return_value=FakeLibc()):
+            self.assertEqual(process.trim_free_memory(), process.TRIM_NOTHING)
+            self.assertFalse(process.release_free_memory())
+
+    def test_a_trim_that_raises_is_failed(self):
+        def boom(pad):
+            raise OSError("trim cassé")
+
+        class FakeLibc:
+            def __init__(self):
+                self.malloc_trim = boom
+
+        with mock.patch("ctypes.CDLL", return_value=FakeLibc()):
+            self.assertEqual(process.trim_free_memory(), process.TRIM_FAILED)
+            self.assertFalse(process.release_free_memory())
 
 
 class JournalReadTest(unittest.TestCase):
@@ -317,6 +364,54 @@ class JournalReadTest(unittest.TestCase):
         # petit bloc : chaque ligne franchit une frontière de bloc
         rendu = [ligne for ligne in cost._lines_reverse(self.path, bloc=16) if ligne]
         self.assertEqual(rendu, list(reversed(attendu)))
+
+    def test_a_giant_line_is_reassembled_in_linear_work(self):
+        # #2125 : une ligne géante (un événement de plusieurs Mo) était
+        # recollée par `bloc + reste` à chaque tour, donc la ligne déjà lue
+        # était recopiée en entier : O(n² / bloc) d'octets. Le témoin compte
+        # les octets que les concaténations recopient, pas une durée (canon
+        # §3) : une jointure unique par ligne n'en recopie aucun, l'ancien
+        # code en recopiait ~135 Mo pour une ligne de 1 Mo.
+        ligne = b"x" * (1 << 20)
+        self.write(ligne, b"fin")
+        recopies = []
+
+        class Compte(bytes):
+            def __add__(self, autre):
+                recopies.append(len(self) + len(autre))
+                return bytes.__add__(self, autre)
+
+        vrai_open = open
+
+        class Flux:
+            """Le fichier réel, dont les lectures rendent des octets comptés."""
+
+            def __init__(self, flux):
+                self.flux = flux
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.flux.close()
+                return False
+
+            def seek(self, *args):
+                return self.flux.seek(*args)
+
+            def tell(self):
+                return self.flux.tell()
+
+            def read(self, taille=-1):
+                return Compte(self.flux.read(taille))
+
+        def compte_open(chemin, mode="rb", *args, **kwargs):
+            return Flux(vrai_open(chemin, mode, *args, **kwargs))
+
+        with mock.patch.object(cost, "open", compte_open, create=True):
+            rendu = [l for l in cost._lines_reverse(self.path, bloc=4096) if l]
+        self.assertEqual(rendu, [b"fin", ligne])
+        self.assertLessEqual(sum(recopies), len(ligne))
 
     def test_session_of_reads_from_the_end(self):
         book = self.write(*[{"type": "x", "n": i} for i in range(300)],
