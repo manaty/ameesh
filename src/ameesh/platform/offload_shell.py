@@ -45,7 +45,9 @@ Each job runs:
   for the whole job (from its slot) end setup, hooks and command alike;
 * with a private TMPDIR inside the job directory, removed at the end;
 * without XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS for the command and the
-  setup (the client's code): the profile's own hooks keep them (rootless
+  setup (the client's code), and under a seccomp filter that refuses
+  `socket(AF_UNIX)` (job-user executor, B3 of the #354 R1 review): the
+  profile's own hooks, root-owned install-side code, keep both (rootless
   podman);
 * killed whole at the end: its slice, and the process group of each phase
   (without `scope`); what survives anyway only writes into closed pipes;
@@ -82,6 +84,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -188,12 +191,38 @@ def load_config(path: str) -> dict:
     cfg.setdefault("gate", {"mode": "none"})
     # root-owned on a real VM (install.sh): the guest cannot write a hook
     cfg.setdefault("profiles", os.path.join(root, "profiles"))
+    # L159b2: the job's UID is not the shell's by default on an installed VM
+    cfg.setdefault("executor", EXECUTOR_USER_SCOPE)
+    if cfg["executor"] not in EXECUTORS:
+        raise ValueError("unknown executor %r (expected one of %s)"
+                         % (cfg["executor"], ", ".join(EXECUTORS)))
+    if cfg["executor"] == EXECUTOR_JOB_USER:
+        cfg.setdefault("job_user", "ameesh-job")
+        #: the group shared with the job: the shell is a member of it, so it
+        #: can give the job the folders it must write (install.sh)
+        cfg.setdefault("job_group", "ameesh-jobs")
+        cfg.setdefault("job_home", os.path.join(root, "home"))
+        cfg.setdefault("launcher", "/usr/local/lib/ameesh-guest/ameesh-job-launcher")
     return cfg
 
 
-def _dir(cfg: dict, *parts: str) -> str:
+def _dir(cfg: dict, *parts: str, mode: int = 0o700) -> str:
     path = os.path.join(cfg["root"], *parts)
-    os.makedirs(path, mode=0o700, exist_ok=True)
+    fresh = not os.path.isdir(path)
+    os.makedirs(path, mode=mode, exist_ok=True)
+    if fresh:
+        # makedirs applies the umask; the job's traversal of a directory the
+        # shell has just made (L159b2: cache entries, job folders) must not
+        # depend on it. Keep the parent's setgid bit: without it the next
+        # level down takes the shell's primary group instead of the shared
+        # group, and `grant` (chmod only, the shell cannot chgrp what it does
+        # not own as a member) cannot repair it (B1 of the #354 R1 review).
+        try:
+            if os.stat(os.path.dirname(path)).st_mode & stat.S_ISGID:
+                mode |= stat.S_ISGID
+            os.chmod(path, mode)
+        except OSError:
+            pass
     return path
 
 
@@ -502,16 +531,42 @@ def prune_mirror(cfg: dict, mirror: str) -> None:
 # jobs
 # --------------------------------------------------------------------------
 
+def _open_private(path: str, flags: int = os.O_WRONLY | os.O_CREAT | os.O_TRUNC) -> int:
+    """A file of the shell's own state: the job must never be able to make the
+    shell write *through* a link it planted there (B2 of the #354 R1 review).
+    O_NOFOLLOW refuses the link; O_EXCL refuses a re-planted entry."""
+    flags |= os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno not in (errno.ELOOP, errno.EEXIST):
+            raise
+    # a link (or a stale entry) is in the way: remove the entry itself, never
+    # its target, then create ours exclusively
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return os.open(path, flags | os.O_EXCL, 0o600)
+
+
+def _write_private(path: str, data: str = "") -> None:
+    with os.fdopen(_open_private(path), "w", encoding="utf-8") as fh:
+        fh.write(data)
+
+
 def _write_meta(path: str, meta: dict) -> None:
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with os.fdopen(_open_private(tmp), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, sort_keys=True)
     os.replace(tmp, path)
 
 
 def _read_meta(job_dir: str) -> dict | None:
     try:
-        with open(os.path.join(job_dir, "meta.json"), encoding="utf-8") as fh:
+        fd = os.open(os.path.join(job_dir, "meta.json"),
+                     os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(fd, encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return None
@@ -679,11 +734,378 @@ def close_slice(job_id: str) -> None:
     _systemctl("revert", slice_name)
 
 
+#: how a job's phases reach their slice (L159b2)
+EXECUTOR_USER_SCOPE = "user-scope"
+EXECUTOR_JOB_USER = "job-user"
+EXECUTORS = (EXECUTOR_USER_SCOPE, EXECUTOR_JOB_USER)
+
+
+class Executor:
+    """Where the phases of one job run.
+
+    `user-scope` (historical): the shell's own systemd user manager, so the
+    job keeps the shell's UID -- `_no_dump` and `foreign_holders` close what
+    that lets a job reach. `job-user`: a dedicated user, through the
+    root-owned launcher, so the kernel already denies the job the shell's
+    `/proc`, HOME, mirrors and caches, and cannot write the repositories the
+    shell's own git reads (reviews r5/r7 of #213)."""
+
+    name = EXECUTOR_USER_SCOPE
+    #: True while the job shares the shell's UID (the /proc of one is readable)
+    same_uid = True
+    #: True when the phase's environment travels on stdin (the launcher's JSON)
+    env_on_stdin = False
+    #: True when the phases run in a systemd slice with a per-job cap
+    scope = False
+
+    def __init__(self, cfg: dict, job_id: str):
+        self.cfg = cfg
+        self.job_id = job_id
+
+    # -- before anything runs ----------------------------------------------
+    def check(self, env: dict) -> None:
+        """Refuse the job (the client falls back) rather than report the
+        failure of the launch as the command's own exit code."""
+
+    def tune_env(self, env: dict) -> None:
+        """The host's identity for the job (HOME, USER, LOGNAME)."""
+
+    def client_env(self, phase: str, env: dict) -> dict:
+        """What the client's own code (command, setup) may see of the host."""
+        return env
+
+    # -- how a phase is launched -------------------------------------------
+    def argv(self, phase: str, argv: list[str]) -> list[str]:
+        return argv
+
+    # -- the job's containment ---------------------------------------------
+    def open(self) -> None:
+        """Caps the job's slice before anything runs in it."""
+
+    def kill(self) -> None:
+        """SIGKILLs whatever is left of the job."""
+
+    def close(self) -> None:
+        """`kill`, then drops the job's runtime containment."""
+
+    # -- what the job may reach --------------------------------------------
+    def grant(self, path: str) -> None:
+        """A path the shell just made: let the job write it and its tree."""
+
+    def granted(self, path: str) -> bool:
+        """True when a tree the shell built already carries what the job
+        needs from it: then it is never granted again."""
+        return True
+
+    def grant_traverse(self, path: str) -> None:
+        """A path of the shell's own state that the job must only enter (its
+        job folder): group read and traverse, never group write, so nothing
+        the job plants there can be followed by the shell (B2 of the #354 R1
+        review)."""
+
+    def clean(self, path: str) -> None:
+        """Remove a path the job may have filled in."""
+        shutil.rmtree(path, ignore_errors=True)
+
+
+class UserScopeExecutor(Executor):
+    """The shell's own systemd user manager: the job keeps the shell's UID."""
+
+    name = EXECUTOR_USER_SCOPE
+    same_uid = True
+    env_on_stdin = False
+
+    def __init__(self, cfg: dict, job_id: str):
+        super().__init__(cfg, job_id)
+        self.scope = bool(cfg.get("scope"))
+
+    def check(self, env: dict) -> None:
+        if self.scope:
+            check_user_manager(env)
+
+    def client_env(self, phase: str, env: dict) -> dict:
+        if phase in ("command", "setup") and not self.scope:
+            # with a scope, the `env -u` wrapper in `argv` does this: the
+            # address stays in systemd-run's own environment
+            return {k: v for k, v in env.items() if k not in BUS_ENV}
+        return env
+
+    def argv(self, phase: str, argv: list[str]) -> list[str]:
+        if not self.scope:
+            return argv
+        if phase in ("command", "setup"):
+            # systemd-run needs the user manager's address, the scope's
+            # process (the client's code) does not get it
+            unset = [w for key in BUS_ENV for w in ("-u", key)]
+            argv = ["/usr/bin/env", *unset, "--"] + argv
+        slice_name, unit = unit_names(self.job_id)
+        if phase != "command":
+            unit += "-" + phase
+        return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                "--slice", slice_name, "--unit", unit, "--"] + argv
+
+    def open(self) -> None:
+        open_slice(self.cfg, self.job_id)
+
+    def kill(self) -> None:
+        if self.scope:
+            _systemctl("kill", "--signal=SIGKILL", unit_names(self.job_id)[0])
+
+    def close(self) -> None:
+        if self.scope:
+            close_slice(self.job_id)
+
+
+class JobUserExecutor(Executor):
+    """A dedicated user (L159b2), through the root-owned launcher.
+
+    The job has another UID than the shell: it reads neither the shell's
+    `/proc` (so not the nonce nor the session's streams), nor its HOME,
+    mirrors and caches, and it cannot write the repositories the shell's own
+    git will read. Its systemd manager (linger) still owns the job's slice,
+    so rootless Podman and its cgroup delegation keep working."""
+
+    name = EXECUTOR_JOB_USER
+    same_uid = False
+    env_on_stdin = True
+    scope = True
+
+    @property
+    def user(self) -> str:
+        return str(self.cfg["job_user"])
+
+    @property
+    def group(self) -> str:
+        return str(self.cfg.get("job_group") or "ameesh-jobs")
+
+    @property
+    def home(self) -> str:
+        return str(self.cfg.get("job_home") or self.cfg["root"])
+
+    def _gid(self) -> int | None:
+        import grp
+        try:
+            return grp.getgrnam(self.group).gr_gid
+        except KeyError:
+            # an install.sh older than the shared group: the setgid
+            # inheritance still gives the job what it was granted
+            return None
+
+    @property
+    def launcher(self) -> str:
+        return str(self.cfg["launcher"])
+
+    def _launcher(self, *args: str) -> list[str]:
+        # sudo resets the environment: everything the job needs travels in the
+        # launcher's JSON on stdin, never as arguments (except the phase's own
+        # argv, which the launcher hands to systemd-run after `--`)
+        return ["/usr/bin/sudo", "-n", "-u", self.user, "--", self.launcher, *args]
+
+    def _call(self, *args: str) -> subprocess.CompletedProcess:
+        return _helper(self._launcher(*args))
+
+    def check(self, env: dict) -> None:
+        if not os.path.isfile(self.launcher):
+            raise Refused("job launcher %s is missing (run deploy/guest/install.sh)"
+                          % self.launcher)
+        res = self._call("check")
+        if res.returncode != 0:
+            raise Refused("job launcher unavailable for %s: %s"
+                          % (self.user, res.stderr.decode(errors="replace").strip()))
+
+    def tune_env(self, env: dict) -> None:
+        env["HOME"] = self.home
+        env["USER"] = self.user
+        env["LOGNAME"] = self.user
+        # hooks (rootless Podman) need the job's own manager; the launcher
+        # sets the same values for the phases it starts
+        run_dir = "/run/user/%d" % _uid_of(self.user)
+        env["XDG_RUNTIME_DIR"] = run_dir
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=%s/bus" % run_dir
+
+    def client_env(self, phase: str, env: dict) -> dict:
+        if phase in ("command", "setup"):
+            # the client's code does not get the job's user manager: it could
+            # start a unit outside the job's slice through it
+            return {k: v for k, v in env.items() if k not in BUS_ENV}
+        return env
+
+    def argv(self, phase: str, argv: list[str]) -> list[str]:
+        return self._launcher("run", "--job", self.job_id, "--phase", phase, "--", *argv)
+
+    def open(self) -> None:
+        res = self._call("open", "--job", self.job_id)
+        if res.returncode != 0:
+            raise Refused("cannot cap the job slice: %s"
+                          % res.stderr.decode(errors="replace").strip())
+
+    def kill(self) -> None:
+        self._call("kill", "--job", self.job_id)
+
+    def close(self) -> None:
+        self._call("close", "--job", self.job_id)
+
+    def grant(self, path: str) -> None:
+        """The shell owns what it has just made (checkout, job folder, cache
+        entry): add the group's write bit and the setgid bit, so the job can
+        build there and its own files keep the shared group. By descriptor
+        (`_grant_tree`), so a same-UID job cannot race the walk with a planted
+        link (B3 of the #354 R2 review). The group is set explicitly where the
+        shell is a member of it (install.sh): setgid inheritance alone breaks
+        on a folder the shell did not create under a setgid parent (B1 of the
+        #354 R1 review)."""
+        try:
+            _grant_tree(path, self._gid())
+        except OSError:
+            return
+
+    def granted(self, path: str) -> bool:
+        """A ready cache is usable when the shared group already owns it and
+        can write it: the shell granted it when it built it. A tree the job
+        may have written (group write) is never granted again -- a same-UID
+        job could have planted a link inside it (B3 of the #354 R2 review) --
+        so a cache that does not qualify is rebuilt instead."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode) or not stat.S_IMODE(st.st_mode) & 0o020:
+            return False
+        gid = self._gid()
+        return gid is None or st.st_gid == gid
+
+    def grant_traverse(self, path: str) -> None:
+        """The job's own folder: it enters it (`work`, `tmp` are granted
+        below) but cannot create, rename or remove anything *in* it, so
+        `meta.json` and `cancel` stay out of its reach. Opened `O_NOFOLLOW`
+        and changed on the descriptor (B3 of the #354 R2 review)."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return
+        try:
+            st = os.fstat(fd)
+            gid = self._gid()
+            if gid is not None and st.st_gid != gid:
+                try:
+                    os.fchown(fd, -1, gid)
+                except OSError:
+                    pass
+            os.fchmod(fd, stat.S_IMODE(st.st_mode) | 0o050 | stat.S_ISGID)
+        except OSError:
+            return
+        finally:
+            os.close(fd)
+
+    def clean(self, path: str) -> None:
+        """The job may have left files the shell cannot enter (0700): the
+        launcher empties them as the job's UID, the shell removes what is
+        left."""
+        self._call("clean", "--path", path)
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _uid_of(user: str) -> int:
+    import pwd
+    try:
+        return pwd.getpwnam(user).pw_uid
+    except KeyError:
+        # a VM whose install.sh never created the job user: the client falls
+        # back locally instead of reading a traceback
+        raise Refused("no such job user %r (run deploy/guest/install.sh)" % user) from None
+
+
+def _grant_fd(fd: int, gid: int | None = None) -> None:
+    """Grant one already-open inode: `fchmod`/`fchown` on the descriptor, so
+    no path is ever re-resolved (B3 of the #354 R2 review)."""
+    st = os.fstat(fd)
+    if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+        return
+    mode = stat.S_IMODE(st.st_mode) | 0o060      # the shared group reads/writes
+    if stat.S_ISDIR(st.st_mode):
+        mode |= 0o2010                            # traverse, and setgid below
+    elif mode & 0o100:
+        mode |= 0o010                             # runnable, so group-runnable
+    if gid is not None and st.st_gid != gid:
+        try:
+            # the shell is a member of the shared group (install.sh); a
+            # non-member falls back to the setgid inheritance. Before the
+            # chmod: a chown can drop the setgid bit of a directory.
+            os.fchown(fd, -1, gid)
+        except OSError:
+            pass
+    os.fchmod(fd, mode)
+
+
+def _grant_tree(path: str, gid: int | None = None) -> None:
+    """`_grant_fd` over a tree, by descriptor: every directory is opened
+    `O_NOFOLLOW|O_DIRECTORY` before it is read, every entry `O_NOFOLLOW`
+    before it is granted, and a link is never followed nor granted. A same-UID
+    job racing the walk with a planted link therefore cannot make the shell
+    chmod its target (B3 of the #354 R2 review). A grant that raises closes
+    the directories still stacked, so the walk leaks no descriptor (N3 of the
+    #354 R2 review)."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        root_fd = os.open(path, flags | os.O_DIRECTORY)
+    except OSError:
+        return
+    stack = [root_fd]
+    try:
+        while stack:
+            fd = stack.pop()
+            try:
+                _grant_fd(fd, gid)
+                try:
+                    names = os.listdir(fd)
+                except OSError:
+                    names = ()
+                for name in names:
+                    if name in (".", ".."):
+                        continue
+                    try:
+                        child = os.open(name, flags | os.O_DIRECTORY, dir_fd=fd)
+                    except OSError:
+                        child = -1
+                    if child >= 0:
+                        stack.append(child)
+                        continue
+                    try:
+                        child = os.open(name, flags, dir_fd=fd)
+                    except OSError:
+                        continue      # a link, a socket, an entry we may not open
+                    try:
+                        _grant_fd(child, gid)
+                    finally:
+                        os.close(child)
+            finally:
+                os.close(fd)
+    finally:
+        # an error while granting must not leave the directories still on the
+        # stack open: close what is left before the exception leaves
+        for fd in stack:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def make_executor(cfg: dict, job_id: str) -> Executor:
+    kind = str(cfg.get("executor") or EXECUTOR_USER_SCOPE)
+    if kind == EXECUTOR_USER_SCOPE:
+        return UserScopeExecutor(cfg, job_id)
+    if kind == EXECUTOR_JOB_USER:
+        return JobUserExecutor(cfg, job_id)
+    raise Refused("unknown executor %r" % kind)
+
+
 class Job:
     """Runs the phases of one job under the same supervision: cancel, SSH
     session loss, host gate and one deadline for the whole job."""
 
-    def __init__(self, cfg: dict, job_id: str, job_dir: str):
+    def __init__(self, cfg: dict, job_id: str, job_dir: str,
+                 executor: Executor | None = None):
         self.cfg = cfg
         self.job_id = job_id
         self.cancel_flag = os.path.join(job_dir, "cancel")
@@ -693,7 +1115,8 @@ class Job:
         self.limit = int(cfg["max_job_seconds"])
         self.stop: dict = {}
         self.proc: subprocess.Popen | None = None
-        self.scope = bool(cfg.get("scope"))
+        self.executor = executor or make_executor(cfg, job_id)
+        self.scope = self.executor.scope
         #: every phase's pipes and process group, closed and killed by `close`
         self.relays: list[Relay] = []
         self.groups: list[int] = []
@@ -734,25 +1157,13 @@ class Job:
         return "" if st == "available" else "host %s%s" % (st, ": " + why if why else "")
 
     def argv(self, phase: str, argv: list[str]) -> list[str]:
-        if not self.scope:
-            return argv
-        if phase in ("command", "setup"):
-            # systemd-run needs the user manager's address, the scope's
-            # process (the client's code) does not get it
-            unset = [w for key in BUS_ENV for w in ("-u", key)]
-            argv = ["/usr/bin/env", *unset, "--"] + argv
-        slice_name, unit = unit_names(self.job_id)
-        if phase != "command":
-            unit += "-" + phase
-        return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-                "--slice", slice_name, "--unit", unit, "--"] + argv
+        return self.executor.argv(phase, argv)
 
     def close(self) -> None:
         """End of the job: kills what is left of every phase, then relays
         their pipes' last output and closes them. Without `scope`, a process
         that left its group (setsid) lives on, writing into closed pipes."""
-        if self.scope:
-            _systemctl("kill", "--signal=SIGKILL", unit_names(self.job_id)[0])
+        self.executor.kill()
         for pgid in self.groups:
             try:
                 os.killpg(pgid, signal.SIGKILL)
@@ -764,8 +1175,7 @@ class Job:
             relay.join(DRAIN_S + 1)
 
     def kill(self) -> None:
-        if self.scope:
-            _systemctl("kill", "--signal=SIGKILL", unit_names(self.job_id)[0])
+        self.executor.kill()
         proc = self.proc
         if proc is None:
             return
@@ -786,13 +1196,13 @@ class Job:
         to stderr (hooks: the client's stdout is the command's alone), or
         captured; stderr to stderr. Returns (exit code, captured stdout); a
         supervised phase ends early, killed, when `check` says so."""
-        if not self.scope and phase in ("command", "setup"):
-            env = {k: v for k, v in env.items() if k not in BUS_ENV}
+        env = self.executor.client_env(phase, env)
         out_r, out_w = os.pipe()
         err_r, err_w = os.pipe()
+        stdin = subprocess.PIPE if self.executor.env_on_stdin else subprocess.DEVNULL
         try:
             proc = subprocess.Popen(self.argv(phase, argv), cwd=cwd, env=env, stdout=out_w,
-                                    stderr=err_w, stdin=subprocess.DEVNULL,
+                                    stderr=err_w, stdin=stdin,
                                     start_new_session=True)
         except BaseException:
             for fd in (out_r, err_r):
@@ -801,6 +1211,14 @@ class Job:
         finally:
             os.close(out_w)
             os.close(err_w)
+        if self.executor.env_on_stdin:
+            # the launcher reads the job's environment as JSON on stdin; its
+            # own stdin is then at EOF, which the phase inherits
+            try:
+                proc.stdin.write(json.dumps(env).encode())
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
         self.proc = proc
         self.groups.append(proc.pid)
         chunks: list[bytes] = []
@@ -843,10 +1261,11 @@ def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
     """The dependency cache of the profile, built once per lock-file hash."""
     if not profile["setup"]:
         return ""
-    base = _dir(job.cfg, "cache", profile_name)
+    # the job enters it: the leaf must be traversable by the shared group
+    base = _dir(job.cfg, "cache", profile_name, mode=0o750)
     key = _lock_hash(work, profile)
     final = os.path.join(base, key)
-    fd = os.open(final + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _open_private(final + ".lock", os.O_RDWR | os.O_CREAT)
     try:
         # another job may be building it: wait, still supervised
         while True:
@@ -860,21 +1279,28 @@ def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
         ready = os.path.join(final, ".ready")
         if os.path.exists(ready):
             os.utime(final)
-            return final
+            if job.executor.granted(final):
+                return final
+            # a cache built before the shared group (or by an interrupted
+            # install) does not carry what the job needs: it is NOT re-granted
+            # by path, a same-UID job could have planted a link or a hard link
+            # inside it (B3 of the #354 R2 review). Rebuilt below, under the
+            # shared group; the next runs reuse it.
         emit("setup", {"profile": profile_name, "cache": key})
         # built in place (a venv records its own path); `.ready` marks a
         # complete cache, so a setup killed halfway is redone
-        shutil.rmtree(final, ignore_errors=True)
+        job.executor.clean(final)
         os.makedirs(final, mode=0o700)
+        job.executor.grant(final)
         rc, _ = job.run("setup", ["/bin/sh", "-ec", profile["setup"]], work,
                         dict(env, OFFLOAD_CACHE=final))
         if job.stop:
-            shutil.rmtree(final, ignore_errors=True)
+            job.executor.clean(final)
             raise Stopped()
         if rc != 0:
-            shutil.rmtree(final, ignore_errors=True)
+            job.executor.clean(final)
             raise Refused("profile %s: setup failed (exit %d)" % (profile_name, rc))
-        open(ready, "w").close()
+        _write_private(ready)
         return final
     finally:
         os.close(fd)
@@ -967,23 +1393,29 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         return 2
     touch_snapshot(mirror, req["commit"])
     env = base_env(cfg)
-    if cfg.get("scope"):
-        try:
-            check_user_manager(env)
-        except Refused as exc:
-            result.update(outcome="refused", reason=str(exc))
-            emit_result(result)
-            return 75
+    executor = make_executor(cfg, job_id)
+    try:
+        executor.tune_env(env)
+        if executor.scope:
+            executor.check(env)
+    except Refused as exc:
+        result.update(outcome="refused", reason=str(exc))
+        emit_result(result)
+        return 75
     prune_orphans(cfg)
-    job_dir = os.path.join(_dir(cfg, "jobs"), job_id)
+    job_dir = os.path.join(_dir(cfg, "jobs", mode=0o750), job_id)
     os.makedirs(job_dir, mode=0o700)
+    # the job enters its folder, but only `work` and `tmp` below are writable
+    # by it: meta.json and the cancel flag stay out of its reach, so it cannot
+    # plant the links the shell would follow (B2 of the #354 R1 review)
+    executor.grant_traverse(job_dir)
     meta_path = os.path.join(job_dir, "meta.json")
     meta = {"job": job_id, "state": "waiting", "repo": req["repo"], "commit": req["commit"],
             "profile": req["profile"], "argv": req["argv"], "created_ts": int(started),
             "shell_pid": os.getpid(), "shell_start": _proc_identity(os.getpid())}
     _write_meta(meta_path, meta)
     emit("job", job_id)
-    job = Job(cfg, job_id, job_dir)
+    job = Job(cfg, job_id, job_dir, executor=executor)
 
     def on_signal(signum, _frame):
         # the SSH session went away (SIGHUP), or `cancel` (SIGTERM)
@@ -1009,17 +1441,24 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         job.set_limit(min(int(cfg["max_job_seconds"]), req["timeout"] or 10 ** 9))
         tmp = os.path.join(job_dir, "tmp")
         os.makedirs(tmp, mode=0o700)
+        job.executor.grant(tmp)
         checkout(mirror, work, req["commit"])
+        job.executor.grant(work)
         env.update(TMPDIR=tmp, TMP=tmp, TEMP=tmp, OFFLOAD_JOB=job_id, OFFLOAD_WORK=work)
-        if job.scope:
+        if job.executor.scope:
             env["OFFLOAD_SLICE"] = unit_names(job_id)[0]
-            open_slice(cfg, job_id)
+            job.executor.open()
             sliced = True
         profile = load_profile(cfg, req["profile"])
         env["OFFLOAD_CACHE"] = prepare_cache(job, req["profile"], profile, work, env)
         for key, value in profile["env"].items():
             env[key] = _expand(str(value), env)
-        env.update(req["env"])
+        # B1 of the #354 R2 review: the client's `--env` goes to the command
+        # only. The hooks run in the job's scope with the user manager, and an
+        # `LD_AUDIT` from the client would load its library there before any
+        # filter (the launcher also strips the loader variables from them).
+        cmd_env = dict(env)
+        cmd_env.update(req["env"])
         cwd = os.path.join(work, req["cwd"]) if req["cwd"] else work
         if not os.path.isdir(cwd):
             raise Refused("run: --cwd %s does not exist in the snapshot" % req["cwd"])
@@ -1032,11 +1471,11 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
             for line in out.splitlines():
                 if ENV_RE.match(line):
                     key, value = line.split("=", 1)
-                    env[key] = value
+                    cmd_env[key] = value
         meta.update(state="running", started_ts=int(time.time()), limit_s=job.limit)
         _write_meta(meta_path, meta)
         emit("start", {"job": job_id, "profile": req["profile"], "limit_s": job.limit})
-        rc, _ = job.run("command", req["argv"], cwd, env)
+        rc, _ = job.run("command", req["argv"], cwd, cmd_env)
         result["exit"] = rc
         if job.stop:
             raise Stopped()
@@ -1053,20 +1492,25 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         return 70
     finally:
         try:
+            # B4 of the #354 R2 review: what the command left behind shares
+            # the job's UID and is still alive; the `after` hook runs without
+            # the payload's filter and with the manager's address. Kill the
+            # scope before it, so nothing of the payload survives into it.
+            job.executor.kill()
             if profile is not None and profile["after"]:
                 # teardown (the job's containers), even after a stop
                 _hook(job, "after", profile["after"], work, env, supervised=False)
         finally:
             job.close()
             if sliced:
-                close_slice(job_id)
+                job.executor.close()
             result["seconds"] = round(time.time() - started, 1)
             # journal and cleanup first: once the result is out, the client
             # may move on (and the session may be gone already)
             _journal(cfg, dict(meta, **result))
             if slot_fd is not None:
                 os.close(slot_fd)
-            shutil.rmtree(job_dir, ignore_errors=True)
+            job.executor.clean(job_dir)
             emit_result(result)
 
 
@@ -1087,35 +1531,59 @@ def prune_orphans(cfg: dict) -> None:
     slot lock went with the process, but the suite and its containers may
     still run. Kill the job's slice, run the profile's teardown, then drop
     the folder."""
-    jobs = _dir(cfg, "jobs")
+    jobs = _dir(cfg, "jobs", mode=0o750)
     for name in os.listdir(jobs):
         meta = _read_meta(os.path.join(jobs, name))
         if meta is None or _shell_alive(meta):
             continue
         job_id = str(meta.get("job") or name)
-        if cfg.get("scope"):
-            _systemctl("kill", "--signal=SIGKILL", unit_names(job_id)[0])
+        job_dir = os.path.join(jobs, name)
+        executor = make_executor(cfg, job_id)
+        executor.kill()
         try:
             profile = load_profile(cfg, str(meta.get("profile") or "default"))
         except Refused:
             profile = None
         if profile is not None and profile["after"]:
-            env = dict(base_env(cfg), OFFLOAD_JOB=job_id,
-                       OFFLOAD_WORK=os.path.join(jobs, name, "work"))
-            if cfg.get("scope"):
+            env = base_env(cfg)
+            executor.tune_env(env)
+            tmp = os.path.join(job_dir, "tmp")
+            env.update(OFFLOAD_JOB=job_id, OFFLOAD_WORK=os.path.join(job_dir, "work"),
+                       TMPDIR=tmp, TMP=tmp, TEMP=tmp)
+            if executor.scope:
                 env["OFFLOAD_SLICE"] = unit_names(job_id)[0]
-            try:
-                subprocess.run(["/bin/sh", "-ec", profile["after"]], env=env,
-                               cwd=cfg["root"], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=AFTER_HOOK_S)
-            except subprocess.TimeoutExpired:
-                pass
-        if cfg.get("scope"):
-            close_slice(job_id)
+            _quiet_phase(executor, "after", ["/bin/sh", "-ec", profile["after"]],
+                         cfg["root"], env, AFTER_HOOK_S)
+        executor.close()
         meta["state"] = "orphan"
         _journal(cfg, dict(meta, outcome="error", reason="orphan job killed and removed"))
-        shutil.rmtree(os.path.join(jobs, name), ignore_errors=True)
+        executor.clean(job_dir)
+
+
+def _quiet_phase(executor: Executor, phase: str, argv: list[str], cwd: str,
+                 env: dict, timeout: float) -> None:
+    """A phase whose output goes nowhere (the teardown of an orphan job)."""
+    env = executor.client_env(phase, env)
+    stdin = subprocess.PIPE if executor.env_on_stdin else subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(executor.argv(phase, argv), cwd=cwd, env=env,
+                                stdin=stdin, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return
+    if executor.env_on_stdin:
+        try:
+            proc.stdin.write(json.dumps(env).encode())
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _journal(cfg: dict, entry: dict) -> None:
@@ -1123,7 +1591,11 @@ def _journal(cfg: dict, entry: dict) -> None:
     entry = {k: v for k, v in entry.items() if k not in ("shell_pid", "shell_start", "pid")}
     entry["ended_ts"] = int(time.time())
     try:
-        with open(os.path.join(cfg["root"], "jobs.jsonl"), "a", encoding="utf-8") as fh:
+        # 0600: with a job user (L159b2) the volume is traversable by the
+        # shared group, and every job's command lines stay the shell's alone
+        fd = os.open(os.path.join(cfg["root"], "jobs.jsonl"),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
     except OSError:
         pass
@@ -1158,7 +1630,7 @@ def cmd_cancel(cfg: dict, args: list[str]) -> int:
     meta = _read_meta(job_dir)
     if meta is None:
         raise Refused("no job %s" % args[0])
-    open(os.path.join(job_dir, "cancel"), "w").close()
+    _write_private(os.path.join(job_dir, "cancel"))
     _signal_shell(meta, signal.SIGTERM)  # never a process that reused the PID
     sys.stdout.write("cancelled %s\n" % args[0])
     return 0
@@ -1194,18 +1666,26 @@ def main(argv: list[str] | None = None) -> int:
         global NONCE
         NONCE = secrets.token_hex(16)
         emit("session")
-    holders = foreign_holders()
-    if holders:
-        # an error, never `refused`: the client must not rerun locally what
-        # another process may be watching
-        reason = "session streams held by another process: " + ", ".join(holders[:5])
-        if words[0] == "run":
-            emit_result({"job": None, "outcome": "error", "exit": None, "reason": reason})
-        else:
-            emit("error", reason)
-        return 70
     try:
         cfg = load_config(config)
+    except (OSError, ValueError) as exc:
+        emit("error", str(exc))
+        return 70
+    if make_executor(cfg, "probe").same_uid:
+        # with a dedicated job user (L159b2) the kernel already denies the
+        # job's UID the shell's /proc: the scan has nothing left to find
+        # (review r7 of #213)
+        holders = foreign_holders()
+        if holders:
+            # an error, never `refused`: the client must not rerun locally what
+            # another process may be watching
+            reason = "session streams held by another process: " + ", ".join(holders[:5])
+            if words[0] == "run":
+                emit_result({"job": None, "outcome": "error", "exit": None, "reason": reason})
+            else:
+                emit("error", reason)
+            return 70
+    try:
         return VERBS[words[0]](cfg, words[1:])
     except Refused as exc:
         emit("refused", str(exc))

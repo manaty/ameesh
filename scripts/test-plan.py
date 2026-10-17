@@ -9,6 +9,8 @@
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
     scripts/test-plan.py tally leaks.json [leaks.json…]
+    scripts/test-plan.py couverture [--repo OWNER/REPO] [--ref REFS] [--sha SHA]
+                                    [--api URL] [--github-output F] [--summary F]
 
 `plan` runs once per CI run (job `plan` of .github/workflows/tests.yml) and
 decides, for every test module, its class and the parts it runs in; every
@@ -59,8 +61,9 @@ version number never takes the lane: L157 is a pull-request rule.
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
-missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
+missing, unreadable, older than 48 h, not an ancestor of HEAD, or built on
+unreadable measure artefacts (`measure.artefacts_incomplets`, #1690/#1716):
+the order falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
 default) and the plan is marked unsure. A file the map cannot judge (Python
 outside `src/ameesh`, a non-documentation file no test reads, a syntax
 error) uses the textual heuristic for that file and marks the plan unsure;
@@ -114,6 +117,22 @@ P3). `leaks` reads the plan and the part streams of a run and writes one
 record (`ameesh-test-leaks/1`), kept as the `leaks` artifact; `tally`
 aggregates records for the two-week review (L161i): phase 2 requires fewer
 than 1 leak per 50 PRs.
+
+**Coverage of a package push** (`couverture`, canon §12). A package
+integration branch pushed while its PR is open used to launch two full
+suites — the `push integration/**` run and the `pull_request` run of
+tests.yml — both carrying the required `tests` check on the same head; the
+cancelled one left its aggregate red (incident #1342, PR #1050). tests.yml
+no longer triggers on `push integration/**`; the gate
+`.github/workflows/paquet.yml` reads the branch's open pull requests (GitHub
+API, read-only) and asks this command whether one carries exactly the pushed
+head (`head.sha == github.sha`, base `main`, `release/**` or
+`integration/**`). If so, the suite is already carried by that PR's
+`pull_request` run and the gate calls nothing; otherwise — no PR, another
+head, a base outside tests.yml's scope, unreadable API, incomplete context —
+it calls tests.yml (`workflow_call`) so a push without a PR keeps its full
+suite. The decision never reads a run: no success is inferred from another
+run's existence, and the fallback is always "the suite runs".
 """
 from __future__ import annotations
 
@@ -130,6 +149,8 @@ import pathlib
 import re
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
@@ -150,14 +171,18 @@ RECENT_FAILURE_DAYS = 7
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
 #: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète reste en six parts.
+#: saturé) ; la suite psql complète passe à neuf parts (#1692) : sur le run
+#: 38736559499 attempt 2, les six parts ont pesé 26-45,5 min sous saturation
+#: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
+#: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
+#: mesuré, huit en laisseraient ~34.
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+PARTS = {"psycopg": (4, 4), "psql": (3, 9)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
-#: comme dans celui de 45 min de psql.
+#: comme dans celui de 60 min de psql (#1251).
 PR_TARGET_PART_S = 300
 #: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
 #: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
@@ -335,6 +360,88 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _getattr_member(node: ast.Call) -> tuple[str, str] | None:
+    """`getattr(<name>, '<constant>', ...)` lu statiquement : le couple
+    (porteur, membre), ou `None` (forme dynamique, argument manquant). Le
+    défaut éventuel est sans effet ici : `sys.exit`/`os._exit` existent
+    toujours, donc l'appel termine quel que soit le défaut. Le porteur peut
+    être affecté par walrus (`getattr((s := sys), 'exit')`, #1906) : on
+    déballe `ast.NamedExpr` avant le test de nom."""
+    if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
+        return None
+    if len(node.args) < 2:
+        return None
+    owner, attr = node.args[0], node.args[1]
+    if isinstance(owner, ast.NamedExpr):
+        owner = owner.value
+    if (isinstance(owner, ast.Name) and isinstance(attr, ast.Constant)
+            and isinstance(attr.value, str)):
+        return owner.id, attr.value
+    return None
+
+
+def _is_exit_func(node: ast.expr, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether an expression designates a known import-time termination: a
+    bound name, `sys.exit`/`os._exit`, or their static `getattr` read (#1878)
+    (aliases of `sys`, `os` and of the imported names included). Le porteur
+    peut être affecté par walrus (`(s := sys).exit(1)`, #1906)."""
+    if isinstance(node, ast.NamedExpr):
+        # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
+        return _is_exit_func(node.value, exit_names, sys_names, os_names)
+    if isinstance(node, ast.Name):
+        return node.id in exit_names
+    if isinstance(node, ast.Attribute):
+        owner = node.value.value if isinstance(node.value, ast.NamedExpr) else node.value
+        if isinstance(owner, ast.Name):
+            if node.attr == "exit":
+                return owner.id in sys_names
+            if node.attr == "_exit":
+                return owner.id in os_names
+        return False
+    if isinstance(node, ast.Call):
+        read = _getattr_member(node)
+        if read is None:
+            return False
+        owner, attr = read
+        return ((attr == "exit" and owner in sys_names)
+                or (attr == "_exit" and owner in os_names))
+    return False
+
+
+def _is_exit_call(node: ast.Call, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether a call is a known import-time termination: the builtins
+    `exit()`/`quit()`, `sys.exit()`/`os._exit()` (aliases of `sys`, `os` and of
+    the imported names included)."""
+    return _is_exit_func(node.func, exit_names, sys_names, os_names)
+
+
+def _may_terminate(node: ast.AST, names: set[str], exit_names: set[str],
+                   sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether running this statement may end the import: a reachable `raise`,
+    a false `assert`, or an exit call (#1627).
+
+    Deliberately conservative — a `raise` caught by an enclosing `try` still
+    counts (a proof lost, never a false proof) — and the body of an
+    `if TYPE_CHECKING:` / `if False:` is dead, as in `_never_runs`. A function
+    or lambda body runs later, not at import, so it terminates nothing here."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Raise):
+        return True
+    if isinstance(node, ast.Assert):
+        return _never_runs(node.test, names)
+    if isinstance(node, ast.Call) and _is_exit_call(node, exit_names, sys_names, os_names):
+        return True
+    if isinstance(node, ast.If) and _never_runs(node.test, names):
+        children: list[ast.AST] = list(node.orelse)  # seul le `else` s'exécute
+    else:
+        children = list(ast.iter_child_nodes(node))
+    return any(_may_terminate(child, names, exit_names, sys_names, os_names)
+               for child in children)
+
+
 class _RuntimeImports(ast.NodeVisitor):
     """The import statements that may run, and those the module certainly runs
     when it is imported.
@@ -346,8 +453,15 @@ class _RuntimeImports(ast.NodeVisitor):
     import, a function body does not), outside any condition, loop, `try` or
     `with` — a `with` body may never run (its `__enter__` may fail, or an
     earlier statement may raise and be suppressed), so it is no proof.
+    An unconditional module-level `raise` or `sys.exit` also leaves every
+    later import without proof, while keeping its possible selection edge.
     A lazy or conditional import alone is a possible load, never a proof
-    (relecture Codex, B2 résiduel)."""
+    (relecture Codex, B2 résiduel). A reachable termination — a guarded
+    `raise`, an `except` that exits, `exit()`/`sys.exit()`/`os._exit()`, a
+    false `assert` — stops the proofs too: the imports after it may never run
+    (#1627). A name bound to such a callable by assignment or by a star import
+    (`e = sys.exit`, `from os import *` then `_exit()`) terminates as well, the
+    binding being followed conservatively (#1860)."""
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
@@ -355,10 +469,23 @@ class _RuntimeImports(ast.NodeVisitor):
         self.guaranteed: list[ast.stmt] = []
         self._deferred = 0  # inside a function or lambda body: not run at import
         self._guarded = 0   # inside a condition, a loop or a try: may not run
+        self._terminated = False  # module execution cannot reach later imports
+        # #1627 : une terminaison atteignable arrête les preuves du corps
+        # (module ou classe) : les imports suivants restent possibles seulement.
+        self._exit_names = {"exit", "quit"}  # builtins, `from sys import exit`
+        self._sys_names = {"sys"}            # `sys.exit`, alias compris
+        self._os_names = {"os"}              # `os._exit`, alias compris
 
     def _visit_function(self, node: ast.AST) -> None:
+        # Décorateurs, valeurs par défaut et annotations s'évaluent à la
+        # définition, donc à l'import : seul le corps est différé (#1474).
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for child in ast.iter_child_nodes(node):
+            if not any(child is statement for statement in body):
+                self.visit(child)
         self._deferred += 1
-        self.generic_visit(node)
+        for child in body:
+            self.visit(child)
         self._deferred -= 1
 
     visit_FunctionDef = _visit_function
@@ -379,6 +506,74 @@ class _RuntimeImports(ast.NodeVisitor):
     visit_With = _visit_guarded
     visit_AsyncWith = _visit_guarded
 
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self.generic_visit(node)
+        if not self._deferred and not self._guarded:
+            self._terminated = True
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        if not self._deferred and _is_exit_call(
+                node, self._exit_names, self._sys_names, self._os_names):
+            self._terminated = True
+
+    def _target_names(self, target: ast.expr) -> list[str]:
+        """Les noms qu'une cible d'affectation lie vraiment : `e`, `e, f`,
+        `(e, *f)`. Un abonnement ou un attribut (`d[k]`, `obj.handler`) ne
+        rebaptise aucun nom et n'en lie aucun."""
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Starred):
+            return self._target_names(target.value)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [name for element in target.elts
+                    for name in self._target_names(element)]
+        return []
+
+    def _learn_exit_names(self, target: ast.expr, value: ast.expr | None) -> None:
+        """Un nom affecté d'une sortie connue en devient une (#1860) :
+        `e = sys.exit` puis `e()`. Un nom affecté d'un module `sys`/`os`
+        devient un de ses alias (#1878) : `s = sys` puis `s.exit()`. Les
+        ensembles ne rétrécissent jamais — une réaffectation peut être
+        conditionnelle (#1474) : une preuve perdue n'est jamais une fausse
+        preuve. Une cible multiple lisible est suivie élément par élément ;
+        toute autre forme est gardée entière dès que la valeur mentionne une
+        sortie ou un de ces modules (conservateur)."""
+        if value is None:
+            return
+        if (isinstance(target, (ast.Tuple, ast.List))
+                and isinstance(value, (ast.Tuple, ast.List))
+                and len(target.elts) == len(value.elts)):
+            for sub_target, sub_value in zip(target.elts, value.elts):
+                self._learn_exit_names(sub_target, sub_value)
+            return
+        names = self._target_names(target)
+        if not names:
+            return
+        mentioned = [node.id for node in ast.walk(value)
+                     if isinstance(node, ast.Name)]
+        if any(name in self._sys_names for name in mentioned):
+            self._sys_names.update(names)
+        if any(name in self._os_names for name in mentioned):
+            self._os_names.update(names)
+        if any(_is_exit_func(node, self._exit_names, self._sys_names,
+                             self._os_names)
+               for node in ast.walk(value)):
+            self._exit_names.update(names)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        for target in node.targets:
+            self._learn_exit_names(target, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
+
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
             # the guard never runs: only its `else` does (at module level)
@@ -387,15 +582,54 @@ class _RuntimeImports(ast.NodeVisitor):
             return
         self._visit_guarded(node)
 
+    def _visit_body(self, body: list[ast.stmt]) -> None:
+        """The body of a module or a class runs at import, in order: a
+        reachable termination cuts the proofs that follow it (#1627)."""
+        for child in body:
+            self.visit(child)
+            if not self._deferred and not self._terminated and _may_terminate(
+                    child, self.names, self._exit_names, self._sys_names, self._os_names):
+                self._terminated = True
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._visit_body(node.body)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # Ces expressions s'évaluent avant le corps : une sortie y interdit
+        # aussi de certifier les imports du corps, pas seulement ceux d'après.
+        for expression in (*node.decorator_list, *node.bases,
+                           *(keyword.value for keyword in node.keywords)):
+            self.visit(expression)
+        self._visit_body(node.body)
+
     def _record(self, node: ast.stmt) -> None:
         self.imports.append(node)
-        if not self._deferred and not self._guarded:
+        if not self._deferred and not self._guarded and not self._terminated:
             self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "sys":
+                self._sys_names.add(alias.asname or "sys")
+            elif alias.name == "os":
+                self._os_names.add(alias.asname or "os")
         self._record(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        if module == "sys":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "exit")
+        elif module == "os":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "_exit")
+        if any(alias.name == "*" for alias in node.names):
+            # #1860 : `from os import *` lie `_exit` au corps du module (les
+            # builtins `exit`/`quit` et `from sys import *` sont déjà couverts).
+            if module == "os":
+                self._exit_names.add("_exit")
+            elif module == "sys":
+                self._exit_names.add("exit")
         self._record(node)
 
 
@@ -525,11 +759,34 @@ def _reverse_closure(reverse: dict[str, set[str]], path: str) -> set[str]:
 
 # -- the map --------------------------------------------------------------
 
+def ignored_coverages(card: dict) -> list:
+    """Couvertures que la fusion de la carte a écartées (#1257). Une carte
+    antérieure à la clé n'en porte pas : sa mesure est complète par
+    construction (l'ancien code échouait sur un fichier illisible au lieu de
+    l'ignorer)."""
+    mesure = card.get("measure") or card.get("mesure") or {}
+    if not isinstance(mesure, dict):
+        return []
+    ignorees = mesure.get("couverture_ignoree")
+    if not ignorees:
+        return []
+    return ignorees if isinstance(ignorees, list) else [ignorees]
+
+
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
                 repo: pathlib.Path = REPO) -> tuple[str, float | None]:
     """Why the map cannot be used ("" if it can), and its age in hours."""
     if card is None:
         return "no map", None
+    ignorees = ignored_coverages(card)
+    if ignorees:
+        # #1257 (R1 B3) : une couverture écartée à la fusion rend la mesure
+        # partielle — les modules que le processus perdu mesurait manquent, et
+        # les durées connues feraient passer la sélection pour sûre. La carte ne
+        # juge plus la restriction : repli suite complète, jamais une décision
+        # sur une carte partielle.
+        return (f"map measured with {len(ignorees)} ignored coverage file(s) "
+                "(partial measure)"), None
     try:
         generated = datetime.datetime.fromisoformat(card["genere"])
     except (KeyError, TypeError, ValueError):
@@ -539,6 +796,19 @@ def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
         return f"map older than {MAX_AGE_H} h ({age:.0f} h)", age
     if not card.get("commit") or not is_ancestor(card["commit"], head, repo):
         return f"map commit {str(card.get('commit'))[:12]} is not an ancestor of {head}", age
+    # #1716 : #1690 écarte un artefact de mesure illisible et le nomme dans
+    # `artefacts_incomplets`, mais la carte reste amputée des tests que cet
+    # artefact portait : un bloc peut ressortir couvert par le seul artefact
+    # lisible, et la sélection se réduire à l'insu du plan. La carte entière
+    # est suspecte — on ne sait pas quels blocs l'artefact perdu couvrait —
+    # donc ordre complet, comme pour toute carte inutilisable.
+    incomplets = (card.get("measure") or card.get("mesure") or {}).get(
+        "artefacts_incomplets") or []
+    if incomplets:
+        fichiers = ", ".join(str(i.get("fichier", "?")) for i in incomplets[:3]
+                             if isinstance(i, dict))
+        return (f"map with {len(incomplets)} unreadable measure artefact(s)"
+                + (f" ({fichiers})" if fichiers else "")), age
     return "", age
 
 
@@ -551,7 +821,7 @@ def is_foundation(path: str) -> bool:
 
 
 def read_list(path: pathlib.Path, known: list[str], required: bool = False) -> list[str]:
-    """`parts.read_list`, whose SystemExit (stale or unsorted entry) becomes a
+    """`parts.read_list`, whose SystemExit (stale entry) becomes a
     ValueError: `main` catches it and falls back to the full suite."""
     if not path.exists() and not required:
         return []
@@ -1199,6 +1469,138 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     return out
 
 
+# -- paquet : une seule suite par tête (canon §12) --------------------------
+#
+# Une poussée sur la branche d'intégration d'un paquet et la PR ouverte sur
+# cette branche déclenchaient deux suites complètes, deux runs portant le même
+# check requis `tests` sur la même tête : annuler l'un laissait l'agrégat rouge
+# de l'autre (incident #1342, PR #1050 bloquée par le `tests` du run push
+# annulé). tests.yml ne se déclenche plus sur `push integration/**` ; le
+# portier .github/workflows/paquet.yml lit les PR ouvertes et n'appelle la
+# suite que si aucune ne couvre la tête exacte. La décision ne regarde jamais
+# un run : aucune réussite n'est déduite de l'existence d'un autre run.
+
+#: préfixe des branches d'intégration de paquet (canon §12)
+PACKAGE_PREFIX = "integration/"
+#: la base d'une PR de paquet (canon §12)
+PR_BASE = "main"
+#: une PR dont la source ou la cible est sous ces préfixes est une PR de
+#: release : elle déclenche tests.yml (canon §3)
+PR_BASE_PREFIXES = ("release/", "integration/")
+
+
+def pr_base_covered(base: str | None) -> bool:
+    """True si une PR sur cette base déclenche tests.yml (canon §3, §12)."""
+    base = (base or "").strip()
+    return base == PR_BASE or base.startswith(PR_BASE_PREFIXES)
+
+
+def couverture_decision(pulls, sha: str) -> dict:
+    """La PR ouverte qui couvre exactement la tête `sha`, sinon rien.
+
+    Ne lit que des PR ouvertes : aucune lecture de run, donc aucune réussite
+    déduite d'un autre run. Une PR dont la tête n'est pas ce commit exact ne
+    couvre pas la poussée (une nouvelle tête reprend sa décision), et une PR
+    dont la base ne déclenche pas tests.yml ne couvre rien : dans tous les
+    autres cas la suite tourne (repli sûr).
+    """
+    sha = (sha or "").strip()
+    same_head = []
+    for pr in pulls or []:
+        if (pr.get("state") or "open") != "open":
+            continue
+        head = ((pr.get("head") or {}).get("sha") or "").strip()
+        if head != sha:
+            continue
+        same_head.append(pr)
+        base = (pr.get("base") or {}).get("ref") or ""
+        if not pr_base_covered(base):
+            continue
+        number = pr.get("number")
+        return {"covered": True, "pr": number,
+                "why": f"PR #{number} (base {base}) couvre la tête {sha[:12]}"}
+    if same_head:
+        pr = same_head[0]
+        base = (pr.get("base") or {}).get("ref") or "?"
+        return {"covered": False, "pr": None,
+                "why": (f"PR #{pr.get('number')} est sur cette tête mais sa base "
+                        f"{base} ne déclenche pas tests.yml : la suite tourne")}
+    if pulls:
+        return {"covered": False, "pr": None,
+                "why": "PR ouvertes mais aucune sur cette tête exacte : la suite tourne"}
+    return {"covered": False, "pr": None,
+            "why": "aucune PR ouverte sur cette branche : la suite tourne"}
+
+
+def pulls_open(repo: str, branch: str, api: str, token: str, opener=None) -> list:
+    """Les PR ouvertes dont la tête est `branch` (API GitHub, lecture seule).
+
+    `head=owner:branch` filtre côté serveur ; 100 par page suffit pour une
+    branche d'intégration, et une lecture incomplète fait tourner la suite
+    (jamais l'inverse). Une erreur d'API ou de réseau remonte à l'appelant,
+    qui la traduit en repli sûr.
+    """
+    owner = repo.split("/", 1)[0]
+    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{branch}",
+                                    "per_page": "100"})
+    url = f"{api.rstrip('/')}/repos/{repo}/pulls?{query}"
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ameesh-tests-plan",
+    })
+    lire = opener or urllib.request.urlopen
+    with lire(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"payload inattendu ({type(data).__name__})")
+    return data
+
+
+def couverture_texte(out: dict, ref: str) -> str:
+    """Le résumé lisible de la décision, pour le journal du portier."""
+    etat = "couverte" if out["covered"] else "non couverte"
+    suite = ("la suite complète est portée par le run `pull_request` de tests.yml"
+             if out["covered"] else
+             "la suite complète tourne dans ce run (`paquet.yml`)")
+    return f"poussée {ref} : {etat} — {out['why']}\n{suite}\n"
+
+
+def couverture(args) -> int:
+    """Le portier `paquet.yml` : la poussée est-elle couverte par une PR ?
+
+    Repli sûr : contexte incomplet, ref hors `integration/**`, API illisible
+    ou non listée — la suite tourne, jamais l'inverse. Sortie toujours 0 :
+    l'échec du portier ne doit pas supprimer la validation de la branche.
+    """
+    out = {"covered": False, "pr": None, "why": ""}
+    branch = (args.ref or "").removeprefix("refs/heads/")
+    if not (args.repo and branch and args.sha):
+        out["why"] = "contexte incomplet (repo, ref ou sha) : la suite tourne"
+    elif not branch.startswith(PACKAGE_PREFIX):
+        out["why"] = f"poussée hors {PACKAGE_PREFIX}** : rien à dédupliquer"
+    else:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+        try:
+            pulls = pulls_open(args.repo, branch, args.api, token)
+            out = couverture_decision(pulls, args.sha)
+        except Exception as exc:  # noqa: BLE001 - repli sûr : la suite tourne
+            out = {"covered": False, "pr": None,
+                   "why": (f"PR illisibles ({type(exc).__name__}: {exc}) : "
+                           "la suite tourne")}
+    text = couverture_texte(out, args.ref or branch)
+    if args.github_output:
+        with open(args.github_output, "a", encoding="utf-8") as fh:
+            fh.write(f"covered={'true' if out['covered'] else 'false'}\n")
+            fh.write(f"covered_pr={out['pr'] if out['pr'] is not None else ''}\n")
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as fh:
+            fh.write(f"### Couverture de la poussée\n\n{text}")
+    print(text, end="")
+    return 0
+
+
 def doc_readers(classes: dict, card: dict,
                 modules: list[str]) -> tuple[list[str], list[str]]:
     """Readers of a documentation-only change, judged with a usable map: the
@@ -1557,8 +1959,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--summary")
     p = sub.add_parser("tally", help="leaks over many runs")
     p.add_argument("records", nargs="+")
+    p = sub.add_parser("couverture",
+                       help="cette poussée de paquet est-elle couverte par une PR ouverte ?")
+    p.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
+                   help="owner/repo (défaut : $GITHUB_REPOSITORY)")
+    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
+                   help="github.ref de la poussée (défaut : $GITHUB_REF)")
+    p.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""),
+                   help="tête poussée (défaut : $GITHUB_SHA)")
+    p.add_argument("--api", default=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+                   help="racine de l'API GitHub (défaut : $GITHUB_API_URL)")
+    p.add_argument("--github-output", help="appends the job outputs to this file")
+    p.add_argument("--summary", help="appends the Markdown summary to this file")
     args = ap.parse_args(argv)
 
+    if args.command == "couverture":
+        return couverture(args)
     if args.command == "plan":
         card, why = _load_map(args.map)
         if card is None and args.map:

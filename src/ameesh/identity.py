@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import tempfile
 from dataclasses import dataclass
 
@@ -50,6 +51,9 @@ class Binding:
     #: L41 (0030) : la liaison de session (ligne `session_bindings`) si
     #: source == "session"
     session: dict | None = None
+    #: #811 : les projets de l'agent, quand la lecture du bail les a ramenés
+    #: (`projects`, `team`, `chantier`) ; None si le backend ne les porte pas.
+    projects: tuple[str, ...] | None = None
 
     @property
     def bound_to_lease(self) -> bool:
@@ -102,6 +106,18 @@ def legacy_name(cwd: str | None, cfg: Config) -> str:
     return base[:64] or "racine"
 
 
+def _projects_of(row: dict | None) -> tuple[str, ...] | None:
+    """#811 : les projets de l'agent quand le bail les a ramenés.
+
+    `None` si la ligne ne porte aucun des faits attendus (`projects`, `team`,
+    `chantier`) : un backend médié peut ne rendre que le bail, et l'appelant
+    doit alors relire le registre comme avant."""
+    if not row or not any(key in row for key in ("projects", "team", "chantier")):
+        return None
+    from . import projects  # import tardif : identité ne dépend pas du registre
+    return tuple(projects.agent_projects(row))
+
+
 def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
                     session_id: str | None = None) -> Binding:
     """L'identité de cette session : explicite, et liée au bail si le runner l'a posée.
@@ -129,9 +145,9 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
             return Binding(name=name, source="runner", runner_id=runner_id,
                            reason="unreadable AMEESH_LEASE_EPOCH")
         from . import registry  # import tardif : identity ne dépend pas de la base
-        ok, reason = registry.lease_matches(db, name, runner_id, epoch)
+        ok, reason, row = registry.lease_agent(db, name, runner_id, epoch)
         return Binding(name=name, source="runner", runner_id=runner_id, epoch=epoch,
-                       ok=ok, reason=reason)
+                       ok=ok, reason=reason, projects=_projects_of(row))
     return Binding(name=name, source="explicit", ok=True)
 
 
@@ -231,6 +247,34 @@ def git_identity(name: str) -> dict:
     adresse = "%s@%s" % (name, GIT_EMAIL_DOMAIN)
     return {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": adresse,
             "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": adresse}
+
+
+def repo_config_identity(cwd: str) -> dict:
+    """L'identité git écrite dans la configuration PARTAGÉE du dépôt (#896).
+
+    Les worktrees d'un même dépôt partagent `.git/config` : un `user.name`
+    posé par un agent vaut pour tous les autres (incident du 13/10/2026, où
+    une session reprise commitait sous le nom d'un tiers). Le tour ne s'en
+    sert jamais — il pose `GIT_AUTHOR_*`/`GIT_COMMITTER_*` (#834) — mais un
+    commit lancé hors harnais depuis ce dossier serait signé de ce nom :
+    l'appelant le signale. Rend les valeurs posées, jamais pour s'en servir ;
+    `{}` si le dossier n'est pas un dépôt, si git manque ou répond trop
+    lentement.
+    """
+    try:
+        fait = subprocess.run(
+            ["git", "-C", cwd, "config", "--local", "--get-regexp", r"^user\."],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if fait.returncode != 0:
+        return {}
+    pose: dict[str, str] = {}
+    for ligne in fait.stdout.splitlines():
+        cle, _, valeur = ligne.partition(" ")
+        if valeur.strip():
+            pose[cle] = valeur.strip()
+    return pose
 
 
 def write_alias(cfg: Config, name: str, directory: str, workstream: str = "") -> str:

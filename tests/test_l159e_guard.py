@@ -623,6 +623,135 @@ class SignalsTest(unittest.TestCase):
         self.assertIsNone(guard.busy_count(("x",), run=lambda *a, **k: (_ for _ in ()).throw(
             OSError("no systemctl"))))
 
+    def test_busy_tasks_count_jobs_not_idle_listeners(self):
+        # #1256 R1 : quatre écouteurs persistants restent `active` sans job ;
+        # avec `busy_tasks`, une unité ne compte que si une tâche de SON
+        # cgroup correspond (le worker du job). Un cgroup illisible compte :
+        # un job qu'on ne peut pas exclure ne fait pas gagner l'invité.
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = os.path.join(tmp, "cg")
+            proc = os.path.join(tmp, "proc")
+
+            def unit_cgroup(name, pids):
+                d = os.path.join(cg, "system.slice", name)
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                    fh.write("".join("%s\n" % p for p in pids))
+
+            def task(pid, argv):
+                d = os.path.join(proc, str(pid))
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "cmdline"), "wb") as fh:
+                    fh.write(b"\0".join(a.encode() for a in argv) + b"\0")
+
+            unit_cgroup("actions.runner.a.service", [10])          # écouteur idle
+            task(10, ["/opt/actions-runner/bin/Runner.Listener", "run"])
+            unit_cgroup("actions.runner.b.service", [20, 21])      # un job
+            task(20, ["/opt/actions-runner/bin/Runner.Listener", "run"])
+            task(21, ["/opt/actions-runner/bin/Runner.Worker", "spawnclient", "1", "2"])
+            # c : pas de cgroup.procs -> illisible -> compte
+
+            class Proc:
+                def __init__(self, out):
+                    self.returncode, self.stdout = 0, out
+
+            def run(argv, **kw):
+                if argv[:2] == ["systemctl", "list-units"]:
+                    return Proc("actions.runner.a.service loaded active running x\n"
+                                "actions.runner.b.service loaded active running y\n"
+                                "actions.runner.c.service loaded active running z\n")
+                if argv[:2] == ["systemctl", "show"]:
+                    return Proc("/system.slice/%s\n" % argv[2])
+                raise AssertionError(argv)
+
+            # sans motif de tâche : les trois unités actives comptent (l'ancien
+            # comportement, juste quand le job EST l'unité)
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run), 3)
+            # avec : seul b (job) et c (illisible) comptent
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 2)
+
+        # le témoin demandé par la R1 : quatre écouteurs en ligne et au repos
+        # pèsent zéro job ; les mêmes quatre unités avec un worker chacune en
+        # pèsent quatre (c'est le seuil `busy_max` de la fiche d'hôte qui
+        # décide, pas le nombre d'écouteurs)
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = os.path.join(tmp, "cg")
+            proc = os.path.join(tmp, "proc")
+            procs = [100 + n for n in range(1, 5)]
+
+            def run4(argv, **kw):
+                if argv[:2] == ["systemctl", "list-units"]:
+                    return Proc("".join("actions.runner.n%d.service loaded active running x\n" % n
+                                        for n in range(1, 5)))
+                if argv[:2] == ["systemctl", "show"]:
+                    return Proc("/system.slice/%s\n" % argv[2])
+                raise AssertionError(argv)
+
+            for n, pid in zip(range(1, 5), procs):
+                d = os.path.join(cg, "system.slice", "actions.runner.n%d.service" % n)
+                os.makedirs(d)
+                with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                    fh.write("%s\n" % pid)
+                p = os.path.join(proc, str(pid))
+                os.makedirs(p)
+                with open(os.path.join(p, "cmdline"), "wb") as fh:
+                    fh.write(b"/opt/actions-runner/bin/Runner.Listener\0run\0")
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run4,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 0)
+            for n, pid in zip(range(1, 5), [200 + n for n in range(1, 5)]):
+                p = os.path.join(proc, str(pid))
+                os.makedirs(p)
+                with open(os.path.join(p, "cmdline"), "wb") as fh:
+                    fh.write(b"/opt/actions-runner/bin/Runner.Worker\0spawnclient\0")
+                d = os.path.join(cg, "system.slice", "actions.runner.n%d.service" % n)
+                with open(os.path.join(d, "cgroup.procs"), "a") as fh:
+                    fh.write("%s\n" % pid)
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run4,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 4)
+
+
+    def test_busy_tasks_unreadable_cmdline_counts_the_unit(self):
+        # #1256 R1 delta B3 : un PID encore listé dont la ligne de commande
+        # n'est pas lisible (permissions, erreur transitoire) n'est pas une
+        # tâche exclue : l'unité compte, comme un cgroup illisible. Un PID
+        # vraiment disparu entre les deux lectures, lui, ne cache rien.
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = os.path.join(tmp, "cg")
+            proc = os.path.join(tmp, "proc")
+            d = os.path.join(cg, "system.slice", "actions.runner.x.service")
+            os.makedirs(d)
+
+            class Proc:
+                def __init__(self, out):
+                    self.returncode, self.stdout = 0, out
+
+            def run(argv, **kw):
+                if argv[:2] == ["systemctl", "list-units"]:
+                    return Proc("actions.runner.x.service loaded active running x\n")
+                if argv[:2] == ["systemctl", "show"]:
+                    return Proc("/system.slice/actions.runner.x.service\n")
+                raise AssertionError(argv)
+
+            # le PID 30 est encore là (son /proc/30 existe) mais sa cmdline
+            # est absente : inconnu -> l'unité compte, jamais zéro
+            with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                fh.write("30\n")
+            os.makedirs(os.path.join(proc, "30"))
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 1)
+
+            # le PID 31 a entièrement disparu entre les deux lectures : la
+            # tâche est terminée, pas cachée -> zéro job
+            with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                fh.write("31\n")
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 0)
 
     def test_disk_of_the_guest_work_path(self):
         # codex #211 r4: the guard measured no disk (sample() without a path),
@@ -1320,6 +1449,163 @@ class DrainStopTest(unittest.TestCase):
             ["stop", "ameesh-job-*.scope"],
             ["kill", "--signal=SIGKILL", "ameesh-guest-runner@*.service", "ameesh-job-*.scope"],
             ["stop", "ameesh-guest.slice"]])
+
+    def test_level_4_stops_the_guest_users_slice_too(self):
+        # R2 N2 (#1416) : le gestionnaire de l'utilisateur invité vit dans
+        # user-<uid>.slice (linger, `systemd-run --user`), hors de la slice
+        # invitée : un processus qu'un job y a laissé survit à l'arrêt de la
+        # slice seule. Le niveau 4 arrête donc aussi cette slice, et le
+        # gestionnaire arrêté est enregistré pour repartir avec l'invité.
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"),
+                    stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        stops = [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"]
+        self.assertIn(["ameesh-guest.slice"], stops)
+        self.assertIn(["user-998.slice"], stops)
+        self.assertEqual(sorted(enforcer.stopped["units"]),
+                         ["ameesh-guest-runner@1.service", "user@998.service"])
+
+    def test_a_stopped_user_manager_restarts_with_the_guest(self):
+        # R2 N2 : le gestionnaire relancé garde rootless Podman utilisable
+        # pour le job suivant ; un gestionnaire qui ne tournait pas n'est pas
+        # démarré pour autant.
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"),
+                    stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "show":
+                return mock.Mock(returncode=0, stdout=(
+                    "ActiveState=inactive\nInactiveEnterTimestampMonotonic=1000000\n"),
+                    stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        self.calls.clear()
+        enforcer.restart_stopped(2000.0)
+        starts = [c[3] for c in self.calls if len(c) > 3 and c[1] == "start"]
+        self.assertIn("user@998.service", starts)
+        self.assertIn("ameesh-guest-runner@1.service", starts)
+
+    def test_an_inactive_user_manager_is_not_stopped_nor_restarted(self):
+        # Seul ce que l'arrêt fait tomber revient : un gestionnaire déjà
+        # inactif n'est ni arrêté ni relancé (pas d'état créé par le garde).
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"),
+                    stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=3, stdout="inactive\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        self.assertIn(["user-998.slice"],
+                      [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"])
+        self.assertEqual(enforcer.stopped["units"],
+                         {"ameesh-guest-runner@1.service": 2000.0})
+
+    def test_level_4_stops_sessions_even_when_the_user_manager_is_inactive(self):
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"))
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=3 if argv[-1] == "user@998.service" else 0)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0], monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        self.assertIn(["systemctl", "stop", "user-998.slice"], self.calls)
+        self.assertNotIn("user@998.service", enforcer.stopped["units"])
+
+    def test_ci_only_host_uses_the_required_covering_agent_pattern(self):
+        # ci-runners.sh refuses prepare/enable/check unless agent_units covers
+        # ameesh-guest-ci@1.service (guard_covers); this is the admitted config.
+        self.cfg = dataclasses.replace(self.cfg, agent_units="ameesh-guest-*.service")
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                self.assertEqual(argv[-1], "ameesh-guest-*.service")
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-ci@1.service loaded active running guest\n"))
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0], monotonic=lambda: self.clock[0])
+        self.assertTrue(enforcer.stop_guest())
+        self.assertIn(["systemctl", "stop", "user-998.slice"], self.calls)
+        self.assertIn("ameesh-guest-ci@1.service", enforcer.stopped["units"])
+
+    def test_a_failed_user_manager_stop_is_retried_after_the_units_are_gone(self):
+        # R2 N2 : si l'arrêt de user-UID.slice échoue, le nouvel essai ne
+        # conclut pas au succès parce que les unités ont disparu : le
+        # gestionnaire dû est gardé et arrêté au tour suivant.
+        state = {"lists": 0, "stop": 0}
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                state["lists"] += 1
+                stdout = ("ameesh-guest-runner@1.service loaded active running guest\n"
+                          if state["lists"] == 1 else "")
+                return mock.Mock(returncode=0, stdout=stdout, stderr="")
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n", stderr="")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=0, stdout="active\n", stderr="")
+            if argv[1] == "stop" and argv[2] == "user-998.slice":
+                state["stop"] += 1
+                return mock.Mock(returncode=0 if state["stop"] > 1 else 1,
+                                 stdout="", stderr="busy")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0],
+                                  monotonic=lambda: self.clock[0])
+        self.at(enforcer, 2000.0)
+        self.assertFalse(enforcer.stop_guest())
+        self.assertNotIn("user@998.service", enforcer.stopped["units"])
+        self.at(enforcer, 2010.0)
+        self.assertTrue(enforcer.stop_guest())
+        stops = [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"]
+        self.assertEqual(stops.count(["user-998.slice"]), 2)
+        self.assertEqual(enforcer.stopped["units"],
+                         {"ameesh-guest-runner@1.service": 2000.0,
+                          "user@998.service": 2010.0})
 
     def test_acknowledged_drain_never_stops_the_guest(self):
         g = self.guard()

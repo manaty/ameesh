@@ -373,6 +373,16 @@ else:
             self.assertNotEqual(worker.host_yield, AgentWorker.HOST_SAFE_POINT)
             self.assertTrue(self.ctl.tick().drained)
 
+    def test_release_lease_without_resident_ne_leve_pas(self):
+        # Un worker construit sans `__init__` (chemin `--once`, tests de la
+        # porte) n'a pas d'attribut d'instance `resident` : le défaut de
+        # classe doit suffire pour `release_lease` -> `_close_resident`.
+        worker = self.foreground_worker()
+        self.assertNotIn("resident", worker.__dict__)
+        with mock.patch("ameesh.runner.registry.release") as release:
+            self.assertTrue(worker.release_lease())
+        release.assert_called_once_with(worker.db, worker.name, "once-runner", 7)
+
     def test_transitions_et_acquittements(self):
         a = _FauxWorker("a")
         self.runner.workers["a"] = a

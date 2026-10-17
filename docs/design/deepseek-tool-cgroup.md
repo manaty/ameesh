@@ -86,8 +86,11 @@ preload from retaining an unguarded constructor for nested workers.
 combination is refused explicitly because installing the guard first there
 would change the shared parent's environment. Existing memory options remain
 shared. No temporary shared-environment mutation or after-the-fact repair is
-used. Ordinary child Node **processes** still lose the guard: that accepted
-residual is separate from same-process worker threads.
+used. Ordinary child Node **processes** still lose the guard — including a
+**`dsh` launched as a tool command, or any nested dsh**, which can create
+native `dsh-subprocess-*.scope` units under `app.slice` again (the read-only
+check below reports them): that accepted residual is separate from
+same-process worker threads.
 
 Unavailable protection no longer stops the turn (#1460). A missing dsh package
 or provider, a changed or unreviewed provider (such as `dsh-subprocess-local`
@@ -106,6 +109,16 @@ preloads), classified `host_not_ready` by the headless runner. Review a
 provider upgrade and its regression results before changing the pin. A
 resident driver reports startup failure; its eventual runner integration must
 retain host-error handling.
+
+**Before enabling DeepSeek on a VM.** Check the `node` dsh resolves on its own
+PATH is **>= 22.15** (synchronous module hooks), and pin the dsh/provider
+version rather than letting it auto-update: an unreviewed upgrade is loaded
+unmodified (warning above), so tools may leave the runner cgroup. The same
+unguarded path applies when `AMEESH_DSH_BIN` points at a Node wrapper outside
+the `@deepseek-ai/dsh` package: the guard cannot resolve the package to verify
+it, warns `cannot locate the dsh package/provider …`, and dsh runs as
+installed — no longer an exit 127 since #1460, while the misuse refusals above
+still are.
 
 ## Cleanup limit and follow-up
 

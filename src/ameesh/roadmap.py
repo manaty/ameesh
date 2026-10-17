@@ -385,6 +385,8 @@ def real_milestones(item: dict, events: list[dict], actions: list[dict],
     started = next((e.get("created_ts") for e in events if dev.en_cours(e.get("state"))), None)
     out = {key: jalons.get(dev.jalon(key)) for key in ("demandee", "soumise", "verdict",
                                                        "livree")}
+    # #988 : un lot livré hors cible porte `delivered`, pas `merged`
+    out["livree"] = out["livree"] or jalons.get("delivered")
     out["debut"] = started
     out["verdict_kind"] = jalons.get("verdict_kind")
     return {k: (round(float(v), 3) if isinstance(v, (int, float)) and k != "verdict_kind"
@@ -412,8 +414,8 @@ def build_task(item: dict, real: dict, *, base: _dt.date, epic: str | None,
                commitments: list[dict], shown_state: str | None,
                now: float | None = None) -> dict:
     state = item.get("state")
-    delivered = dev.livree(state)
-    abandoned = dev.abandonnee(state)
+    delivered = dev.livree(state, item.get("close_reason"))
+    abandoned = dev.abandonnee(state, item.get("close_reason"))
     planned = {k: item.get("planned_" + k) for k in DATE_KEYS}
     done_day = _day_of(real.get("livree")) if delivered else None
     target_key = "delivery" if planned["delivery"] else ("end" if planned["end"] else None)
@@ -507,7 +509,8 @@ def build(db, *, now: float | None = None, project: str | None = None,
         rows = [r for r in rows if project in (r.get("app"), r.get("workstream"))]
     ids = [int(r["id"]) for r in rows]
     events: dict = {}
-    for ev in st.progress.lot_events(ids):
+    # #1647 : les jalons réels ne lisent que les transitions, jamais les notes.
+    for ev in st.progress.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
     actions: dict = {}
     for act in st.progress.lot_actions(ids):
@@ -994,7 +997,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--source", dest="source_ref", default=None,
                        help="source identifier or link (conversation, decision, message)")
     p_add.add_argument("--depends-on", dest="depends_on", action=UniqueAppend, default=[],
-                       help="dependency (task #N, commitment eN, lot Lxx); repeatable")
+                       help="dependency (task #N, commitment eN, lot Lxx); "
+                            "gate:<name> holds the lot (L368) until the due day; repeatable")
     p_add.add_argument("--depend-de", dest="depends_on", action=DeprecatedAlias,
                        canonical="--depends-on", append=True, default=argparse.SUPPRESS,
                        help=argparse.SUPPRESS)

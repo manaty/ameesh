@@ -42,6 +42,29 @@ does not reset activity on the waiting lot: if that lot has already been idle
 for six hours, its stale alert can return immediately. Removing a link is an
 explicit edit and records ordinary activity.
 
+Closing a blocker also wakes the waiting agents. When the closed lot is an
+explicit blocking prerequisite of a waiting lot and that lot has no other wait
+left (no other blocking edge, no open commitment, no future planned start —
+the `planned_wait` truth), `ameesh` deposits a durable `event` mail to the
+assignee of the waiting lot, linked to that lot. Only an explicit edge
+triggers a wake: a `depends_on` commitment (on a lot or a package) never
+triggers one by itself — it only holds a wake back while it points at an open
+lot. The existing runner delivers the mail (LISTEN/NOTIFY, no polling loop, no
+new session); an agent stopped by hand is not restarted — the message waits in
+its mailbox until it resumes.
+
+The wake is part of the closure itself: it is written in the same transaction
+as the state change, after it, under the dependency graph lock. So there is no
+window where the lot is merged but the wake is not yet written — if the mail
+cannot be written, the closure is rolled back and the next sweep or command
+retries both. Two concurrent closures (two blockers of the same dependent)
+serialise on that lock, so exactly one of them sees the last wait fall: no lost
+wake, no duplicate. A dependent with another open blocker is notified by the
+closure that closes its last one, and an unassigned lot gets no recipient.
+A closure that proves nothing (abandoned or superseded) says so in the mail:
+the wait is released, but the lot must be reassessed rather than treated as
+delivered.
+
 `work list/show --json` and `progress --json` expose a `dependencies` array
 with each blocker ID, current state, `blocking`, creation actor and timestamp.
 They also expose the common `planned_wait` result. Human-readable work output
@@ -51,7 +74,10 @@ prerequisites, including satisfied ones.
 Dependencies are read in groups without the view's project or rendering
 limit; a blocker outside the displayed window still suppresses `stale_lot`
 and its reminders. Links combine with existing open commitment dependencies.
-A future planned start takes precedence in the displayed `planned_wait`.
+A future planned start takes precedence in the displayed `planned_wait`, then
+a lot dependency; a dated external hold (`gate:<name>` in an open commitment,
+[PLANNED-WAITS.md](PLANNED-WAITS.md)) comes last and ends by itself at the end
+of its due day.
 
 A dependency controls inactivity alerts and the ready intake: a lot whose
 prerequisite is not delivered is excluded from the automatic take (L165) and

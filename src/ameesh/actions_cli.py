@@ -239,6 +239,38 @@ def _requester(args: argparse.Namespace, action: dict) -> str:
     return args.requested_by or ("agent:%s" % session if session else action["proposed_by"])
 
 
+def request_approval(cfg: Config, db: Db, action: dict, *, approver: str, requested_by: str,
+                     assume_duplicate: bool = False) -> dict:
+    """Files the approval request of `action` with ameesh-approve and records
+    it (action event and thread, with the link); the service's reply.
+
+    Shared by `ameesh action request` and `POST /api/v1/actions/{id}/
+    approval-request` (L87). It files a request and returns its link, nothing
+    else: the receipt is signed on ameesh-approve's origin and attached by
+    `fetch-receipt`. `actions.ActionError` (stored digest inconsistent) and
+    `approve_client.ApproveClientError` (service, configuration, mismatch)
+    pass through."""
+    # l'empreinte que le service fera signer, recalculée ici depuis l'action
+    expected = (actions.assume_duplicate_digest(action) if assume_duplicate
+                else actions.digest(action))
+    if actions.digest(action) != action["digest"]:
+        raise actions.ActionError(actions.INVALID, "stored digest of %s is inconsistent: "
+                                  "no request filed" % action["action_id"])
+    reply = approve_client.create_request(
+        cfg, action_id=action["action_id"], approver=approver,
+        requested_by=requested_by, assume_duplicate=assume_duplicate)
+    mismatch = [key for key, value in (
+        ("action_id", action["action_id"]), ("approver", approver),
+        ("assume_duplicate", bool(assume_duplicate)), ("digest", expected),
+        ("action_digest", action["digest"])) if reply.get(key) != value]
+    if mismatch:
+        raise approve_client.ApproveClientError(
+            "mismatch", "ameesh-approve answered for another request (%s): ignored"
+            % ", ".join(mismatch))
+    actions.record_approval_request(db, action, reply, by=requested_by)
+    return reply
+
+
 def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
@@ -252,24 +284,9 @@ def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
                 action, args.approver, assume_duplicate=args.assume_duplicate, ttl=args.ttl,
                 requested_by=requested_by))
             return 0
-        # l'empreinte que le service fera signer, recalculée ici depuis l'action
-        expected = (actions.assume_duplicate_digest(action) if args.assume_duplicate
-                    else actions.digest(action))
-        if actions.digest(action) != action["digest"]:
-            raise actions.ActionError(actions.INVALID, "stored digest of %s is inconsistent: "
-                                      "no request filed" % args.id)
-        reply = approve_client.create_request(
-            cfg, action_id=action["action_id"], approver=args.approver,
-            requested_by=requested_by, assume_duplicate=args.assume_duplicate)
-        mismatch = [key for key, value in (
-            ("action_id", action["action_id"]), ("approver", args.approver),
-            ("assume_duplicate", bool(args.assume_duplicate)), ("digest", expected),
-            ("action_digest", action["digest"])) if reply.get(key) != value]
-        if mismatch:
-            raise approve_client.ApproveClientError(
-                "mismatch", "ameesh-approve answered for another request (%s): ignored"
-                % ", ".join(mismatch))
-        actions.record_approval_request(db, action, reply, by=requested_by)
+        reply = request_approval(cfg, db, action, approver=args.approver,
+                                 requested_by=requested_by,
+                                 assume_duplicate=args.assume_duplicate)
     finally:
         db.close()
     if args.json:

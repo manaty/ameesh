@@ -23,6 +23,14 @@ never host sharing by path.
 | Postgres role | `deploy/sql/role-approve.sql` (§6): read-only access to what the service reads |
 | HTTPS on `H` | via a reverse proxy, or via the service's local TLS (§4) |
 
+The service is also distributed as a container image
+(`ghcr.io/manaty/ameesh-approve`), for hosts that do not install from the
+sources. Pin it **by digest**, never by a moving tag; publication, tags,
+rollback and the exact runtime contract are in
+[`docs/IMAGE-APPROVE.md`](../IMAGE-APPROVE.md). The rest of this guide applies
+to both installations: configuration, RP ID, database role and enrolment do
+not change.
+
 ## 2. Service configuration (strict profile)
 
 `~/.config/ameesh-approve/config.json` of the service user:

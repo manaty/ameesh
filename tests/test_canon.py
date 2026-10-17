@@ -1714,8 +1714,95 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         self.assertEqual({r["credential_id"] for r in self.rows()},
                          {self.alice2.credential_id, self.bruno.credential_id})
 
+    def test_ref_descendant_non_fusionne_ne_deplace_pas_le_checkout(self):
+        """#814 (R1/R2) : une révision descendante du dernier commit appliqué
+        mais non fusionnée, lue par --ref, est refusée AVANT toute mutation du
+        checkout : HEAD et fichiers restent sur la branche canonique."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        # un commit de feature descendant, sur une AUTRE branche locale : HEAD
+        # reste sur main, la révision n'est pas celle du checkout
+        git(self.clone, "checkout", "-q", "-b", "feature")
+        write(self.clone, "note-feature.md", "feature non revue\n")
+        commit_all(self.clone, "feature non revue", push=False)
+        git(self.clone, "checkout", "-q", "main")
+        arbre = git(self.clone, "status", "--porcelain")
+        before, journal = self.rows(), self.journal()
+        done = self.sync(ref="feature").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("not on the canonical branch", done.reason)
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.journal(), journal)
+        # le checkout n'a pas bougé : HEAD sur main, aucun fichier de la feature
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        self.assertEqual(git(self.clone, "status", "--porcelain"), arbre)
+        self.assertFalse(os.path.exists(os.path.join(self.clone, "note-feature.md")))
+
+    def test_canon_illisible_ne_deplace_pas_le_checkout(self):
+        """#814 (R2 cx2) : la source racine est ajoutée avant la lecture des
+        membres et des fiches ; une erreur ultérieure rend le canon illisible
+        sans vider `sources`. Rien n'a pu être vérifié : un `--ref` descendant
+        non fusionné ne doit pas avancer HEAD avant le refus CanonUnreadable —
+        registre, journal, HEAD et arbre inchangés."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        git(self.clone, "checkout", "-q", "-b", "feature")
+        write(self.clone, "note-feature.md", "feature non revue\n")
+        commit_all(self.clone, "feature non revue", push=False)
+        git(self.clone, "checkout", "-q", "main")
+        arbre = git(self.clone, "status", "--porcelain")
+        before, journal = self.rows(), self.journal()
+        with mock.patch.object(canon._Loader, "_read_fiches",
+                               side_effect=OSError(13, "permission denied")):
+            illisible = canon.load(self.clone, ref="feature")
+        self.assertTrue(illisible.sources)          # source Git conservée
+        self.assertFalse(illisible.readable)
+        with self.assertRaises(canon_sync.CanonUnreadable):
+            canon_sync.sync(self.db, illisible, "atelier", bootstrap_ref="main",
+                            trusted_ref="")
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.journal(), journal)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        self.assertEqual(git(self.clone, "status", "--porcelain"), arbre)
+        self.assertFalse(os.path.exists(os.path.join(self.clone, "note-feature.md")))
+
+    def test_canon_devenu_illisible_a_la_relecture_ne_deplace_pas_le_checkout(self):
+        """#814 (R2 cx2, delta auditeur) : lisible à l'entrée, le canon peut
+        devenir illisible à la relecture du rattrapage (fetch puis lecture en
+        échec). Le checkout ne suit pas une révision que rien n'a vérifiée : le
+        refus CanonUnreadable suit, HEAD et arbre restent sur la canonique."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        stale = canon.load(self.clone)              # lisible, origin/main = first
+        self.assertTrue(stale.readable and stale.sources)
+        # un autre chemin applique un commit de plus au journal : le clone
+        # principal ne connaît pas `second`, le rattrapage relit (fetch)
+        other = os.path.join(self.workspace, "autre-chemin")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        second = self.commit_members(other, alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        self.assertEqual(self.sync(other).authenticators.status, "synced")
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+        arbre = git(self.clone, "status", "--porcelain")
+        before = self.rows()
+        with mock.patch.object(canon._Loader, "_read_fiches",
+                               side_effect=OSError(13, "permission denied")):
+            with self.assertRaises(canon_sync.CanonUnreadable):
+                canon_sync.sync(self.db, stale, "atelier", bootstrap_ref="main",
+                                trusted_ref="")
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        self.assertEqual(git(self.clone, "status", "--porcelain"), arbre)
+        self.assertFalse(os.path.exists(os.path.join(self.clone, "note-feature.md")))
+
     def test_hote_en_retard_ne_reactive_rien(self):
-        """Deux hôtes, une base : celui qui n'a pas vu le retrait ne le défait pas."""
+        """Deux hôtes, une base : celui qui n'a pas vu le retrait ne le défait pas.
+
+        #814 : la passe de l'hôte B rattrape elle-même son clone (le journal est
+        global par canon) — et rien n'est réactivé : la révocation constatée par
+        l'hôte A reste acquise."""
         other = os.path.join(self.workspace, "hote-b")
         git(self.workspace, "clone", "-q", self.bare, other)
         self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
@@ -1723,17 +1810,118 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         self.assertEqual(self.sync(other).authenticators.result["added"],
                          ["human:alice/webauthn/%s" % self.alice.credential_id])
         # la seule passkey du registre est retirée par PR ; l'hôte A synchronise
-        self.commit_members(alice=member_fiche("alice", []))
+        second = self.commit_members(alice=member_fiche("alice", []))
         self.assertEqual(len(self.sync().authenticators.result["revoked"]), 1)
-        # l'hôte B, pas encore rafraîchi, lit l'ancien commit : refus, rien réactivé
+        # l'hôte B, pas encore rafraîchi, lit l'ancien commit : sa passe fetch,
+        # avance son checkout et suit — la passkey retirée n'est pas réactivée
+        done = self.sync(other).authenticators
+        self.assertEqual((done.status, done.result["added"]), ("synced", []))
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(git(other, "rev-parse", "origin/main"), second)
+        self.assertEqual(git(other, "rev-parse", "HEAD"), second)
+
+    def test_registre_en_avance_rattrape_le_clone(self):
+        """#814 : le journal des authentificateurs est global par canon ; un hôte
+        dont le clone n'a pas fetché lisait un commit antérieur au dernier
+        appliqué et refusait sans jamais pouvoir se rattraper. Sa passe fetch
+        d'elle-même, avance le checkout à la révision lue (fast-forward) et
+        applique."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        self.assertEqual(self.journal()[-1]["root_commit"], first)
+        # un autre chemin (un autre clone) applique un commit de plus au journal
+        other = os.path.join(self.workspace, "autre-chemin")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        second = self.commit_members(other, alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        self.assertEqual(self.sync(other).authenticators.result["added"],
+                         ["human:alice/webauthn/%s" % self.alice2.credential_id])
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+        # le clone principal n'a pas fetché : ni son origin/main ni son checkout
+        self.assertEqual(git(self.clone, "rev-parse", "origin/main"), first)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        done = self.sync().authenticators
+        self.assertEqual(done.status, "synced")
+        self.assertEqual(git(self.clone, "rev-parse", "origin/main"), second)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), second)
+        self.assertEqual(self.journal()[-1]["root_commit"], second)  # pas de ligne en plus
+
+    def test_floor_connu_sur_ref_de_suivi_perimee_rattrape_le_clone(self):
+        """#814 (R1 cx3) : le journal a appliqué B, B est DÉJÀ connu des objets
+        du clone (vu par une autre ref, un aperçu ou un fetch ciblé) mais son
+        `origin/main` est resté à A. Relire sans fetch retrouverait A et la
+        monotonie refuserait à chaque passe, sans jamais rattraper le clone :
+        le suivi distant est périmé, la passe fetch donc et rattrape le clone."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        self.assertEqual(self.journal()[-1]["root_commit"], first)
+        # un autre chemin (un autre clone) applique un commit de plus au journal
+        other = os.path.join(self.workspace, "autre-chemin")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        second = self.commit_members(other, alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        self.assertEqual(self.sync(other).authenticators.status, "synced")
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+        # le clone principal a vu B par un fetch ciblé : l'objet est connu, mais
+        # ni son origin/main ni son checkout n'ont bougé
+        git(self.clone, "fetch", "-q", "origin", second)
+        self.assertEqual(git(self.clone, "rev-parse", "origin/main"), first)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        done = self.sync().authenticators
+        self.assertEqual(done.status, "synced")
+        # le registre (global par canon) a déjà la passkey : la passe rattrape
+        # le clone sans rien réécrire
+        self.assertEqual({c for _, c in self.live()},
+                         {self.alice.credential_id, self.alice2.credential_id})
+        self.assertEqual(git(self.clone, "rev-parse", "origin/main"), second)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), second)
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+
+    def test_checkout_divergent_refuse_le_registre(self):
+        """#814 : quand le checkout du canon ne peut pas suivre la révision
+        appliquée (clone divergé, fast-forward impossible), sync refuse
+        d'écrire le registre des authentificateurs : registre et journal
+        inchangés, checkout intact."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        other = os.path.join(self.workspace, "autre-chemin")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        second = self.commit_members(other, alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        self.sync(other)
+        before = self.rows(include_revoked=True)
+        journal = self.journal()
+        # divergence locale dans le clone canon : HEAD ne contient pas `second`
+        git(self.clone, "reset", "-q", "--hard", first)
+        write(self.clone, "note.md", "local\n")
+        local = commit_all(self.clone, "local", push=False)
+        done = self.sync().authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("does not contain the applied revision", done.reason)
+        self.assertEqual(self.rows(include_revoked=True), before)
+        self.assertEqual(self.journal(), journal)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), local)
+
+    def test_hote_en_retard_sans_fetch_refuse_sans_rien_ecrire(self):
+        """#814 : quand le fetch ne peut pas apporter le dernier commit appliqué
+        (dépôt distant injoignable), la monotonie refuse toujours : registre et
+        journal inchangés, rien n'est réactivé."""
+        other = os.path.join(self.workspace, "hote-b")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        git(other, "fetch", "-q", "origin")
+        self.sync(other)
+        self.commit_members(alice=member_fiche("alice", []))
+        self.sync()
+        before = self.rows(include_revoked=True)
+        journal = self.journal()
+        git(other, "remote", "set-url", "origin",
+            os.path.join(self.workspace, "remotes", "absent.git"))
         done = self.sync(other).authenticators
         self.assertEqual(done.status, "refused")
         self.assertIn("canon behind", done.reason)
-        self.assertEqual(self.rows(), [])
-        # une fois rafraîchi, il suit
-        done = self.sync(other, fetch=True).authenticators
-        self.assertEqual((done.status, done.result["added"]), ("synced", []))
-        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.rows(include_revoked=True), before)
+        self.assertEqual(self.journal(), journal)
 
     def test_canon_lu_en_partie_ne_revoque_rien_pour_absence(self):
         self.commit_members(alice=member_fiche("alice", [self.alice.entry()]),

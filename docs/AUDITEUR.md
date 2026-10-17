@@ -704,7 +704,11 @@ retire, saute ou affaiblit un test ; une migration qui change un comportement.
      « bloqué » avec ses raisons ;
    * classe sensible : un autre agent du mesh, d'un autre fournisseur quand il
      y en a un, sollicité par `agent-mail send <relecteur> "…" --lot <lot>` ;
-     l'orchestrateur du projet le désigne s'il n'y a pas de relecteur attitré.
+     l'orchestrateur du projet le désigne s'il n'y a pas de relecteur attitré,
+     et le pose à l'entrée en revue : `ameesh work move <lot> qa --reviewer
+     <agent>`, ou pour un lot déjà en `qa` `ameesh work reviewer <lot> <agent>`
+     (#705) — l'attente et l'alerte `stale_lot` nomment alors ce relecteur
+     avant tout verdict.
 
    Le verdict est noté : `ameesh work milestone <lot> verdict ok --sha <sha>
    --actor <relecteur>`. Un verdict « bloqué » renvoie à l'étape 3, ou le
