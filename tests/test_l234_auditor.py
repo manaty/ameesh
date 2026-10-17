@@ -100,6 +100,7 @@ class AuditorTest(unittest.TestCase):
         work = types.SimpleNamespace(auto_takes_since=lambda *a: 0,
                                      count_builds=lambda *a: 0,   # §4 : agent sous le plafond
                                      unassigned_lots=lambda *a: [] if queue else [item],
+                                     review_proposals=lambda *a, **kw: [],
                                      backlog=lambda **kw: [item] if queue else [])
         st = types.SimpleNamespace(work=work, operations=types.SimpleNamespace(
             open_lots_activity=lambda *a: []),

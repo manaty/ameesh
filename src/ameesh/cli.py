@@ -995,7 +995,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # hooks rapides (PostToolUse) n'aient pas à rouvrir la base ; le
         # marqueur de boîte, lui, reste seul juge de ce qu'il y a à faire.
         fastmail.remember_liaison(cfg, name, tool, str(data.get("session_id") or ""),
-                                  pid=(binding.session or {}).get("pid"))
+                                  pid=(getattr(binding, "session", None) or {}).get("pid"))
     # L166 : sous bail, la session de l'agent est celle que l'exécuteur lit
     # dans le flux du harnais, jamais celle d'un hook. dsh déclenche les hooks
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
