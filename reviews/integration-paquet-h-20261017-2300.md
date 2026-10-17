@@ -1,6 +1,6 @@
 # Paquet integration/paquet-h-20261017-2300 — composition
 
-Base : `main` **`fde44e51c`** (release 1.11.6, coupure de 23:00 du 17/10, commit `[skip ci]` : `docs/versions/1.11.6.md` + `pyproject.toml`). La composition a d'abord été faite sur `734a0825b` (fusion de la PR #1690, paquet h-2000 ; parents `f8c8a4a08` × `f48593d8f`), puis la base a été mise à jour par un merge de `fde44e51c` après la coupure de release ; le diff de la PR ne porte que les 9 unités ci-dessous et ce manifeste.
+Base : `main` **`6e7115b47`** (main après la fusion de #1682 : #2292, parts psycopg à 6 et plafond du job à 45 min). La composition a d'abord été faite sur `734a0825b` (fusion de la PR #1690, paquet h-2000 ; parents `f8c8a4a08` × `f48593d8f`), puis la base a été mise à jour par un merge de `fde44e51c` (release 1.11.6, coupure de 23:00 du 17/10, commit `[skip ci]`). Pendant la première demande de gel, `main` a reçu #1682 (`6e7115b47`, 23:35Z) alors que la base de la PR était restée `fde44e51c` : le plan du run a refusé la composition déplacée et rien n'a été exécuté. La base est donc remise à jour par un merge de `6e7115b47` (aucun rebase, aucun conflit) ; le diff de la PR ne porte que les 9 unités ci-dessous et ce manifeste.
 
 Tête de composition (9 unités) : **`854ea1e2d40b`** ; la tête de branche au gel, qui
 porte ce manifeste, est le SHA exact communiqué au pilote et couvert par l'unique suite
@@ -42,8 +42,8 @@ prochain paquet par le pilote depuis 22:34Z.
 
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot et il
 porte le trailer `ameesh-work: #<lot>`. Aucun contenu nouveau : les 9 unités ajoutent
-**35 fichiers, +2033/−321** vs `734a0825b` ; avec ce manifeste, `fde44e51c..HEAD` fait
-**36 fichiers, +2130/−321**, dont la migration `0461_review_catch_up_acl.sql` et
+**35 fichiers, +2033/−321** vs `734a0825b` ; avec ce manifeste, `6e7115b47..HEAD` fait
+**36 fichiers, +2135/−321**, dont la migration `0461_review_catch_up_acl.sql` et
 `deploy/sql/role-executor.sql` (unité 2, SQL revisé deux familles), aucun `.github/**`.
 
 ## Conflits et résolution
@@ -57,7 +57,7 @@ automatique propre, sans commit de résolution. Aucune adaptation de contenu rel
 | lot | motif |
 |---|---|
 | #2265 / #2263 | tenus par le pilote : attendre sa convergence cx1/cx3 et son feu sur la tête retenue |
-| #2292 | verdict Codex encore dû ; correctif du plafond psycopg (6 parts / 45 min) |
+| #2292 | hors composition à la coupure (verdict dû) ; fusionné seul sur `main` par #1682 pendant la première demande de gel, donc porté par la base `6e7115b47` et non par une unité ; correctif CI seul (parts psycopg 6 / 45 min), aucun chevauchement avec les 36 fichiers du paquet |
 | #2296 | second avis Codex encore dû (palliatif #2297 en place) |
 | #2212 | second avis Codex encore dû |
 | #2273 | second avis cx2 encore dû |
@@ -71,8 +71,9 @@ automatique propre, sans commit de résolution. Aucune adaptation de contenu rel
 
 ## Preuves
 
-- `git diff --check` sur `fde44e51c..HEAD` : rc 0, aucun marqueur de conflit.
+- `git diff --check` sur `6e7115b47..HEAD` : rc 0, aucun marqueur de conflit.
 - Mise à jour de base après la coupure : merge `b0fc20ab1` de `fde44e51c` (release 1.11.6) dans la branche, rc 0, aucun conflit ; le différentiel des 9 unités est inchangé.
+- Remise à jour de base `fde44e51c` → `6e7115b47` : merge `90470fbf0` de `6e7115b47` (main après #1682) dans la branche, rc 0, aucun conflit (#2292 ne touche que `.github/**`, `scripts/test-plan.py`, `tests/test_l161f_plan.py`, hors des 36 fichiers du paquet) ; le différentiel des 9 unités reste inchangé.
 - Seconds parents et trailers `ameesh-work` : 9/9 vérifiés.
 - `scripts/paquet-inclusion.py --manifest <ce fichier> --head <tête> --expected
   2261,1448,2253,2122,2252,2279,2240,1702,2182` : à rejouer sur la tête finale avant le
@@ -85,11 +86,15 @@ automatique propre, sans commit de résolution. Aucune adaptation de contenu rel
 - **Une seule** suite complète sur la tête exacte du paquet : la branche
   `integration/paquet-h-20261017-2300` est poussée et la PR ouverte immédiatement pour
   que le portier `paquet.yml` constate la couverture ; s'il la constate, l'étiquette
-  `ci-full-<sha>` déclenche l'unique suite `tests.yml`. Aucune CI de lot, aucun second
-  lancement, aucun rebase.
+  `ci-full-<sha>` déclenche l'unique suite `tests.yml`. Aucune CI de lot, aucun rebase.
+  La première demande (tête `dba51c5e`, base `fde44e51c`) a été refusée au plan
+  (`the composition moved`, merge-ref sur `6e7115b47`) : rien n'a été exécuté. La
+  demande est refroidie sur la tête de la remise à jour, base `6e7115b47` ; une seule
+  suite effective, sur cette tête.
 - Le check requis `tests` doit être `success` avec des tests réellement exécutés (pas
-  `skipped`/absent, #2271). Si la part psycopg est coupée par le plafond de 30 min
-  (défaut #2292 encore ouvert), relancer les jobs en échec du même run, même tête.
+  `skipped`/absent, #2271). La base `6e7115b47` porte #2292 (parts psycopg 6, plafond
+  45 min) : le run du paquet en bénéficie. Si une part est tout de même coupée au
+  plafond, relancer les jobs en échec du même run, même tête.
 - Feu du pilote sur cette tête après `tests` vert (`gh pr merge --auto
   --match-head-commit <sha>`). Pendant la CI, `main` est réservée (§12) : aucune autre
   fusion n'y entre.
