@@ -275,6 +275,24 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
     reviewer = (last["actor"] if last else None) if verdict_current else designated
+    from .work_reviewers import designated as designated_reviewers
+    reviewers = designated_reviewers(item)
+    current = {v["actor"]: v for v in verdicts if _verdict_applies(v, last_frozen)}
+    pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
+               if item.get("reviewers") is not None else [])
+    # Every designated reviewer owes their own verdict on the frozen head.
+    # A later GO from another reviewer cannot erase a blocking verdict.
+    blocked = [v for v in current.values() if v["kind"] == "blocked"]
+    if item.get("reviewers") is not None and reviewers and blocked:
+        last = max(blocked, key=lambda v: v["at_ts"])
+        verdict_current = True
+    elif reviewers and pending:
+        verdict_current = False
+    elif item.get("reviewers") is not None and reviewers and current:
+        last = max(current.values(), key=lambda v: v["at_ts"])
+        verdict_current = True
+    if item.get("reviewers") is not None and reviewers:
+        reviewer = last["actor"] if verdict_current and last else designated
     # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
     # mécanique, canon §11 bis/#87) en marquant la colonne du relecteur
     # (`work.waive_review`) : l'attente passe alors à la fusion, sans faux
@@ -287,6 +305,8 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "verdict": last["at_ts"] if last else None,
         "verdict_kind": last["kind"] if last else None,
         "reviewer": reviewer,
+        "reviewers": reviewers,
+        "pending_reviewers": pending,
         "verdict_current": verdict_current,
         "verdict_required": verdict_required,
         "merged": merged,
@@ -404,6 +424,8 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         # le dit ; le jeton de la colonne ne sort pas dans la vue.
         "reviewer": (None if jalons["reviewer"] == work_mod.REVIEWER_NONE
                      else jalons["reviewer"]),
+        "reviewers": jalons["reviewers"],
+        "pending_reviewers": jalons["pending_reviewers"],
         "milestones": {k: _round(jalons[k])
                        for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
@@ -1073,7 +1095,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
         extra = []
         if lot["assignee"]:
             extra.append("author %s" % lot["assignee"])
-        if lot["reviewer"]:
+        if lot.get("reviewers"):
+            extra.append("reviewers %s" % ", ".join(lot["reviewers"]))
+        elif lot["reviewer"]:
             extra.append("reviewer %s" % lot["reviewer"])
         if lot["blocked_verdicts"] or lot["blocks"]:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))

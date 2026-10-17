@@ -406,8 +406,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                 # inversement (une alerte reçue pousse à assigner, ce qui
                 # entretient la liste des orchestrateurs par historique).
                 teams = {(alert.get("lot_team") or "").strip()} - {""}
-            if reviewer and str(reviewer) in by_name:
-                extra[str(reviewer)] = _verdict_due(alert)
+            # #2076 : plusieurs relecteurs désignés, chacun briefé pour son
+            # verdict ; #917 garde l'équipe du lot quand l'assigné est inconnu.
+            for name in str(reviewer or "").split(","):
+                name = name.strip()
+                if name in by_name:
+                    extra[name] = _verdict_due(alert)
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = _projects(by_name, alert.get("agent"))
