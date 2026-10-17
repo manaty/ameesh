@@ -377,6 +377,13 @@ def wake_note(cfg, db, name: str, row: dict) -> list[str]:
     ok, why, _note = registry.wake_status(db, cfg, name)
     if ok:
         return []
+    if row.get("operator_paused"):
+        # #2200 : la pause humaine a sa propre sortie ; « prochain canon sync »
+        # serait faux et ferait attendre un réveil qui n'arrivera pas seul.
+        return ["%s is under operator pause (%s): the message is stored, and no turn "
+                "opens until a human lifts the pause (ameesh resume %s --operator "
+                "--reason <reason>); if the request cannot wait, address another agent"
+                % (name, why, name)]
     return ["%s is not wakeable right now (%s): the message is stored, but no turn "
             "opens until it is claimable again (next canon sync on its host); if the "
             "request cannot wait, address another agent" % (name, why)]

@@ -178,9 +178,22 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
     else:
         since = row.get("status_since_ts") or row.get("updated_ts")
     reason = None
+    pause = progress.operator_pause_of(row)
     if state == "stopped":
         parts = [p for p in (_text(row.get("stop_reason")), _text(row.get("status_text"))) if p]
         reason = " — ".join(parts) or None
+    elif state == "paused" and pause is not None:
+        # #2200 : la pause opérateur se nomme (auteur, principal, raison) ;
+        # sans elle, `reason` restait nul alors que l'agent ne reprendra pas.
+        if pause.get("after_turn"):
+            head = "operator pause after this turn"
+        else:
+            head = "operator pause"
+        if pause.get("by"):
+            head += " by %s" % pause["by"]
+        if pause.get("for") and pause["for"] != pause.get("by"):
+            head += " for %s" % pause["for"]
+        reason = "%s — %s" % (head, _text(pause.get("reason"))) if pause.get("reason") else head
     elif state == "paused":
         reason = _text(row.get("status_text")) or None
     lot = _lot_of(row)
@@ -216,6 +229,9 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
         # #1070 : la pause budget, distincte du `state` « paused » d'un
         # `blocked` d'une autre cause
         "paused_on_budget": progress.paused_on_budget(row),
+        # #2200 : la même projection que `progress`/`ameesh show` ; `reason`
+        # au-dessus en dérive, pour que la vue ne perde pas la pause.
+        "operator_pause": pause,
         "reason": reason,
         "since_ts": round(float(since), 3) if since else None,
         "mode": row.get("mode") or "execute",
