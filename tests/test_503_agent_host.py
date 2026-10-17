@@ -129,9 +129,10 @@ elif sys.argv[1] == 'show':
     # #2184 R orchestrateur B1 : la pause expirée côté client aboutit côté
     # serveur juste après la relecture, qui l'a vue absente.
     tardive = state / ('pause-tardive-' + name)
-    if scenario == 'pause-expiree-tardive' and tardive.exists():
+    if scenario == 'pause-expiree-tardive' and tardive.exists() and (state / 'resume-seen').exists():
         motif.write_text(tardive.read_text()); pause.touch(); tardive.unlink()
 elif sys.argv[1] in ('pause', 'resume'):
+    if sys.argv[1] == 'resume': (state / 'resume-seen').touch()
     # #2152 : les gestes du drain, avec le « changed » que lit le script.
     name = sys.argv[2]
     args = sys.argv[3:]
