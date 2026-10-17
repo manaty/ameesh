@@ -70,10 +70,15 @@ class PriseDeLExecuteurTest(_Lots):
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
 
     def test_garde_fous_conserves(self):
-        # repos trop court (seuil de la file d'amélioration)
+        # #1677 (b) : le temps depuis le dernier tour ne borne plus la prise
+        # quand le relevé porte `actionable_lots` — un agent sans lot
+        # actionnable est au repos (même adaptation que test_l119_backlog).
         self.agent("a1", team="nexlink", since_s=60)
-        self.lot("trop tôt")
-        self.assertEqual(self.take({"a1"}, idle_s=2 * HEURE), [])
+        trop_tot = self.lot("trop tôt")
+        self.assertEqual([t["item"]["id"] for t in self.take({"a1"}, idle_s=2 * HEURE)],
+                         [trop_tot["id"]])
+        # zéro reste l'interrupteur qui désactive la prise
+        self.assertEqual(self.take({"a1"}, idle_s=0), [])
         # plafond de budget atteint pour cet agent
         self.agent("a2", team="nexlink", since_s=2 * HEURE)
         self.lot("sous plafond")
