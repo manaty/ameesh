@@ -122,7 +122,9 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
     if alert.get("lot_state") == "qa" and alert.get("waiting_for") == "fusion":
         return ("this lot is frozen with its verdict acquired: it is a candidate for its "
                 "merge packet/queue — no author action, do not nudge its assignee or "
-                "reassign it; the composer/pilot carries the merge")
+                "reassign it; the composer/pilot carries the merge and can declare the "
+                "planned landing that stops the reminders: ameesh work landing %d "
+                "--vehicle <vehicle lot> --until <YYYY-MM-DD>" % lot)
     if who:
         # #2016 : la commande porte le titulaire lu ici (`--if-holder`) : un
         # second agent parti du même brief est refusé si le lot a changé de
@@ -167,7 +169,9 @@ def _stale_lot(alert: dict) -> str:
     # #1261 le disait déjà « the alert stops while the wait is planned ».
     hold = ("if the lot is parked on another open lot, declare the dependency that stops "
             "the reminders (the alert stops while the wait is planned): "
-            "ameesh work dependencies %d --add <blocker>" % lot)
+            "ameesh work dependencies %d --add <blocker>; if a package vehicle is to "
+            "carry it, declare the landing: ameesh work landing %d --vehicle "
+            "<vehicle lot> --until <YYYY-MM-DD>" % (lot, lot))
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
@@ -298,8 +302,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné — ou du projet du lot quand aucun relecteur n'est
-    désigné (#705) —, ou **un seul** quand le lot n'a pas d'assigné
+    l'équipe de l'assigné (sinon celle du lot, #917) — ou du projet du lot
+    quand aucun relecteur n'est désigné (#705) —, ou **un seul** quand le lot
+    n'a pas d'assigné
     (#1026 : sans équipe, le brief partait à tous et deux orchestrateurs
     traitaient le même lot) ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
@@ -364,6 +369,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
             text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
             teams = _projects(by_name, alert.get("agent"))
+            if not teams:
+                # #917 : sans assigné connu, l'équipe du lot — sinon un lot
+                # ameesh réveillerait les orchestrateurs nexlink, et
+                # inversement (une alerte reçue pousse à assigner, ce qui
+                # entretient la liste des orchestrateurs par historique).
+                teams = {(alert.get("lot_team") or "").strip()} - {""}
             for name in str(reviewer or "").split(","):
                 name = name.strip()
                 if name in by_name:

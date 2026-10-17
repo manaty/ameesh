@@ -96,15 +96,28 @@ def annotate(cfg, db, alerts: list[dict], *, human: str | None = None) -> list[d
 
 
 def reconcile(db, current: list[dict], *, observed_ts: float, dry_run: bool = False,
-              observation_host: str | None = None) -> list[dict]:
+              observation_host: str | None = None,
+              unreadable: list[str] | tuple[str, ...] = ()) -> list[dict]:
     """Invalidate old observations; return the pre-invalidation rows too, so
-    a just-resolved acknowledged alert does not send a resolution message."""
+    a just-resolved acknowledged alert does not send a resolution message.
+
+    `unreadable` (#1901): alert families this pass could not read at all
+    (`exploitation.alerts`). An alert absent from an incomplete snapshot is
+    not resolved: the acknowledgements of the host gate stay valid until a
+    pass that observed it."""
+    from .mediated_executor import availability
+
     domain = storage.of(db).alert_acknowledgements
     rows = domain.live()
     levels = {key_of(a): severity(a) for a in current}
+    gate_unreadable = availability.GATE_FAMILY in unreadable
     if not dry_run:
         for row in rows:
             if row["observation_host"] is not None and row["observation_host"] != observation_host:
+                continue
+            # Le type de l'alerte n'est pas dans la ligne d'acquittement ; la
+            # porte d'hôte est la seule famille à renseigner l'hôte observé.
+            if gate_unreadable and row["observation_host"] is not None:
                 continue
             level = levels.get(row["alert_key"])
             if level != row["severity"]:

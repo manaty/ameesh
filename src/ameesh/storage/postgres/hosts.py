@@ -47,7 +47,9 @@ READING_COLUMNS = (
     # L159e6 (0361): the guard's last restart, decoded by `_reading`
     "guard_restart::text AS guard_restart, "
     # L159f (0069): host gate the executor obeys
-    "ameesh_host_gate_state(host, gate_state) AS gate_state, gate_seq, gate_reason"
+    "ameesh_host_gate_state(host, gate_state) AS gate_state, gate_seq, gate_reason, "
+    # #2022 (0455): processes and zombies, of the host and of the runner
+    "procs_total, procs_zombie, runner_id, runner_procs, runner_zombies"
 )
 
 #: L159d (and #246, L159f) columns written by `record`, in this order
@@ -57,6 +59,7 @@ MEASURE_COLUMNS = (
     "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
     "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
     "gate_state", "gate_seq", "gate_reason",
+    "procs_total", "procs_zombie", "runner_id", "runner_procs", "runner_zombies",
 )
 
 def _volumes_param(volumes) -> str | None:
@@ -212,6 +215,15 @@ class Hosts(interface.HostResources):
         rows = self.db.query(
             "SELECT DISTINCT ON (host) " + READING_COLUMNS + " FROM host_resources"
             + where + " ORDER BY host, sampled_at DESC, id DESC", tuple(params))
+        return [_reading(row) for row in rows]
+
+    def runners(self, host, since_s) -> list[dict]:
+        rows = self.db.query(
+            "SELECT * FROM (SELECT DISTINCT ON (runner_id) " + READING_COLUMNS
+            + " FROM host_resources WHERE host = %s AND runner_id IS NOT NULL"
+            " AND sampled_at >= now() - make_interval(secs => %s)"
+            " ORDER BY runner_id, sampled_at DESC, id DESC) AS last"
+            " ORDER BY runner_zombies DESC NULLS LAST, runner_id", (host, float(since_s)))
         return [_reading(row) for row in rows]
 
     def usage(self, host, since_s) -> dict:

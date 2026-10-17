@@ -2,6 +2,7 @@
 """L385 storage: explicit edges, atomic cycle checks and durable audit."""
 from __future__ import annotations
 
+import datetime
 import json
 import threading
 import time
@@ -189,7 +190,7 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_merging_the_blocker_wakes_the_assignee_once(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        done = work.merged(self.db, self.b, sha="a" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         [row] = self.inbox()
         self.assertEqual((row["kind"], self.mail_lot(row)), ("event", str(self.a)))
@@ -198,7 +199,7 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration de fusion ne réveille pas une seconde fois.
-        self.assertEqual(work.merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -344,7 +345,7 @@ class ReleasedWakeTest(PgTestCase):
             return real(db, sender, recipient, body, **kw)
 
         with mock.patch("ameesh.mail.send", side_effect=spy):
-            work.merged(self.db, self.b, sha="b" * 40, actor="git:main")
+            work.close_merged(self.db, self.b, sha="b" * 40, actor="git:main")
         self.assertEqual(seen, [("merged", "dev-a", "event", True)])
 
     def test_a_failed_wake_rolls_back_the_closure_and_a_retry_wakes_once(self):
@@ -358,17 +359,17 @@ class ReleasedWakeTest(PgTestCase):
         dependencies.add(self.db, self.a, self.b, actor="test")
         with mock.patch("ameesh.mail.send", side_effect=RuntimeError("mailbox down")):
             with self.assertRaises(RuntimeError):
-                work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+                work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(work.get(self.db, self.b)["state"], "intake")
         self.assertEqual(self.inbox(), [])
-        done = work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         self.assertEqual(work.get(self.db, self.b)["state"], "merged")
         [row] = self.inbox()
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration, une fois la fusion commise, ne double pas.
-        self.assertEqual(work.merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -405,7 +406,7 @@ class ReleasedWakeTest(PgTestCase):
                 db = D.connect(self.cfg)
                 try:
                     start.wait(timeout=5)
-                    results.append(work.merged(db, blocker, sha="e" * 40,
+                    results.append(work.close_merged(db, blocker, sha="e" * 40,
                                                actor="git:main")["result"])
                 except Exception as exc:  # noqa: BLE001 - remonté par le test
                     errors.append(exc)
@@ -460,7 +461,7 @@ class ReleasedWakeTest(PgTestCase):
         def closer():
             db = D.connect(self.cfg)
             try:
-                results.append(work.merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
+                results.append(work.close_merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
@@ -499,13 +500,115 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_the_cli_declaration_wakes_too(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        proc = self.mesh("work", "merged", str(self.b), "--sha", "d" * 40, "--actor", "test")
+        import os
+        from .test_merged_work_item_tracking import _git
+        repo = os.path.join(self.tmp, "declared-blocker")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "remote", "add", "origin", "git@github.com:manaty/ameesh.git")
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("manaty/ameesh#1", self.b))
+        _git(repo, "commit", "--allow-empty", "-qm", "ameesh-work: %d" % self.b)
+        sha = _git(repo, "rev-parse", "HEAD")
+        proc = self.mesh("work", "merged", str(self.b), "--sha", sha,
+                         "--repo", repo, "--actor", "test")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         [row] = self.inbox()
         self.assertEqual(self.mail_lot(row), str(self.a))
 
 
+class LandingTest(PgTestCase):
+    """#1945 : geste `ameesh work landing`, refus et journal, avant toute écriture."""
+
+    def setUp(self):
+        self.db.execute("TRUNCATE work_items CASCADE")
+        self.waiting = work.add(self.db, title="waiting", app="acme")["id"]
+        self.vehicle = work.add(self.db, title="vehicle", app="acme")["id"]
+        self.sha = "a" * 40
+        work.milestone(self.db, self.vehicle, "frozen", sha=self.sha, actor="test")
+
+    def cli(self, *args, ok=True):
+        proc = self.mesh("work", "landing", *args, "--actor", "test")
+        self.assertEqual(proc.returncode, 0 if ok else 1, proc.stdout + proc.stderr)
+        return proc
+
+    def test_declare_renew_clear_and_read_back(self):
+        until = "2026-10-18"
+        payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                      "--until", until, "--json").stdout)
+        self.assertTrue(payload["changed"])
+        self.assertEqual(payload["landing"]["vehicle_id"], self.vehicle)
+        self.assertEqual(payload["landing"]["until_on"], until)
+        self.assertEqual(payload["landing"]["pinned_sha"], self.sha)
+        self.assertTrue(payload["landing"]["open"])
+        self.assertEqual(payload["landing"]["created_by"], "test")
+        # rejouer remplace la déclaration : une seule ligne, un second journal
+        other = work.add(self.db, title="other vehicle", app="acme")["id"]
+        other_sha = "b" * 40
+        work.milestone(self.db, other, "frozen", sha=other_sha, actor="test")
+        payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(other),
+                                      "--until", "2026-10-20", "--json").stdout)
+        self.assertEqual(payload["landing"]["vehicle_id"], other)
+        self.assertEqual(payload["landing"]["pinned_sha"], other_sha)
+        self.assertEqual(len(storage.of(self.db).work_dependencies.landings_for([self.waiting])), 1)
+        notes = [e["note"] for e in work.events(self.db, self.waiting)
+                 if e["note"].startswith("Landing")]
+        self.assertEqual(notes, [
+            "Landing declared: vehicle #%d until 2026-10-20 (frozen %s)" % (other, other_sha[:12]),
+            "Landing declared: vehicle #%d until %s (frozen %s)" % (self.vehicle, until, self.sha[:12])])
+        text = self.mesh("work", "show", str(self.waiting))
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("landing on vehicle #%d" % other, text.stdout)
+        # le retrait est idempotent et journalisé une fois
+        self.assertTrue(json.loads(self.cli(str(self.waiting), "--clear", "--json").stdout)["changed"])
+        self.assertFalse(json.loads(self.cli(str(self.waiting), "--clear", "--json").stdout)["changed"])
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertIn("Landing cleared: vehicle #%d" % other,
+                      [e["note"] for e in work.events(self.db, self.waiting)])
+
+    def test_refusals_leave_no_row_and_no_journal(self):
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        self.assertIn("needs --vehicle and --until", self.cli(str(self.waiting), ok=False).stderr)
+        self.assertIn("itself", self.cli(str(self.waiting), "--vehicle", str(self.waiting),
+                                         "--until", until, ok=False).stderr)
+        self.assertIn("existing lots", self.cli(str(self.waiting), "--vehicle", "999999",
+                                                "--until", until, ok=False).stderr)
+        self.assertIn("not found", self.cli("999999", "--vehicle", str(self.vehicle),
+                                            "--until", until, ok=False).stderr)
+        self.assertIn("ISO day", self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                          "--until", "someday", ok=False).stderr)
+        # un véhicule sans gel ne peut pas être épinglé
+        unfrozen = work.add(self.db, title="unfrozen", app="acme")["id"]
+        self.assertIn("frozen head", self.cli(str(self.waiting), "--vehicle", str(unfrozen),
+                                              "--until", until, ok=False).stderr)
+        # un véhicule bloqué est refusé avant écriture
+        blocked = work.add(self.db, title="blocked vehicle", app="acme")["id"]
+        work.milestone(self.db, blocked, "frozen", sha="c" * 40, actor="test")
+        work.move(self.db, blocked, "blocked", actor="test")
+        self.assertIn("blocked", self.cli(str(self.waiting), "--vehicle", str(blocked),
+                                          "--until", until, ok=False).stderr)
+        work.close(self.db, self.vehicle, abandoned=True)
+        self.assertIn("must still be open", self.cli(str(self.waiting), "--vehicle",
+                                                     str(self.vehicle), "--until", until,
+                                                     ok=False).stderr)
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertEqual([e["note"] for e in work.events(self.db, self.waiting)
+                          if e["note"].startswith("Landing")], [])
+
+
 class ResolverTest(unittest.TestCase):
+    def test_invalid_landing_ids_days_and_empty_actor_are_refused_before_storage(self):
+        for item in (-1, 0, True, "1"):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, item, 2, until_on="2026-10-18", actor="test")
+        with self.assertRaises(work.WorkError):
+            dependencies.land(None, 1, 2, until_on="2026-10-18", actor="")
+        with self.assertRaises(work.WorkError):
+            dependencies.clear_landing(None, 1, actor="")
+        for day in (None, "", "someday", "2026-13-45"):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, 1, 2, until_on=day, actor="test")
+
     def test_direct_links_union_with_commitments_and_ignore_satisfied_edges(self):
         rows = [{"id": 1, "state": "build"}]
         edges = [{"work_item_id": 1, "blocker_id": 2, "blocking": True},

@@ -419,6 +419,12 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                                      responsible=package.get("responsible"),
                                      review_class=cls)
             detail = with_availability(detail, states, externals)
+            hold = holds.get(rid)
+            if hold and hold.get("what") == "landing" and detail and detail.get("what") == "merge":
+                # #1945 : un atterrissage déclaré est plus précis que le libellé
+                # générique « merge (executor not designated) » ; le registre
+                # nomme le véhicule, son étape, sa tête et l'échéance.
+                detail = dict(detail, who=None, label=work_dependencies.wait_label(hold))
             last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                                  messages.get(rid), events_ts=last_events.get(rid))
             project = projects.lot_project(row, agent_projects,
@@ -452,12 +458,12 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
                   cfg=None, review_class: dict | None = None) -> list[dict]:
     """Les lots ouverts inactifs depuis au moins `threshold_s` secondes.
 
-    Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
-    `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26), `waiting`
-    (`{what, who, label}`, L29) et `project` (#705 : le projet du lot, dont
-    l'orchestrateur est prévenu quand aucun relecteur n'est désigné).
-    `cfg`/`review_class` : le contexte de classe de revue (#1822), transmis à
-    `describe`.
+    Une ligne : id, title, state, assignee, `lot_team` (équipe du lot, L917),
+    `last_activity_ts`, `idle_s`, `waiting_for` (un mot de `WAITING_FOR` ou
+    None, forme L26), `waiting` (`{what, who, label}`, L29) et `project`
+    (#705 : le projet du lot, dont l'orchestrateur est prévenu quand aucun
+    relecteur n'est désigné). `cfg`/`review_class` : le contexte de classe de
+    revue (#1822), transmis à `describe`.
 
     `unreadable` (#1107) : l'erreur d'un lot illisible, rendu sans instant
     ni inactivité (`last_activity_ts`, `idle_s` à None) ; None sinon."""
@@ -497,6 +503,7 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "title": row.get("title"),
             "state": row.get("state"),
             "assignee": row.get("assignee") or None,
+            "lot_team": row.get("lot_team") or None,
             "last_activity_ts": float(row["last_activity_ts"]),
             "idle_s": int(now - float(row["last_activity_ts"])),
             "waiting_for": info["waiting_for"],

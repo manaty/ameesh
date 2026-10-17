@@ -179,7 +179,10 @@ class SelectedTurnRefusedTest(unittest.TestCase):
         worker = types.SimpleNamespace(
             runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
             _attach_pending=lambda: False, _session_lock=mock.Mock(),
-            resident=object(), state_dir=state_dir.name)
+            resident=object(), state_dir=state_dir.name,
+            # #2096 : `run_turn` rend la mémoire du tour dans son `finally` ;
+            # la doublure n'a pas d'allocateur, le rappel est inerte.
+            _release_turn_memory=lambda *a, **k: None)
         # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
         # la doublure porte la vraie logique de tour et une enveloppe inerte.
         worker._run_guarded_turn = types.MethodType(

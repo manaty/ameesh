@@ -44,6 +44,7 @@ class BriefsTest(unittest.TestCase):
         self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
         self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        self.assertIn("ameesh work landing 42 --vehicle", text)
         # #2016 : la réassignation proposée porte le titulaire lu (instantané) ;
         # un second agent parti du même brief sera refusé si le lot a changé de
         # main entre-temps.
@@ -80,6 +81,7 @@ class BriefsTest(unittest.TestCase):
                                    auditor_names=["auditeur"])["orch"]
         self.assertIn("candidate for its merge packet/queue", text)
         self.assertIn("do not nudge its assignee or reassign it", text)
+        self.assertIn("ameesh work landing 42 --vehicle", text)
         self.assertNotIn("ameesh mail send dev1", text)
         self.assertNotIn("ameesh work assign 42", text)
         self.assertIn("ameesh work merged 42 --sha", text)
@@ -135,6 +137,19 @@ class BriefsTest(unittest.TestCase):
         listing[0].update(lease_live=False)
         self.assertEqual(list(alert_briefs.briefs(alert, listing)), ["orch-b"])
         self.assertEqual(list(alert_briefs.briefs(dict(alert, lot=43), listing)),
+                         ["orch-b"])
+
+    def test_stale_lot_sans_assigne_suit_l_equipe_du_lot(self):
+        # #917 : sans assigné, le brief va aux orchestrateurs de l'équipe du lot,
+        # pas à ceux de toutes les équipes. L713 : l'auditeur ne reçoit plus les
+        # stale_lot par courrier, même sans assigné (il les lit à sa passe).
+        alert = dict(STALE, agent=None, lot_team="b")
+        briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
+        self.assertEqual(sorted(briefs), ["orch-b"])
+        alert = dict(STALE, lot_team="b")               # assigné sans équipe : le lot tranche
+        self.assertEqual(sorted(alert_briefs.briefs(alert, _listing(("orch", "a"),
+                                                                    ("orch-b", "b"),
+                                                                    ("dev1", "")))),
                          ["orch-b"])
 
     def test_plan_underused(self):

@@ -1451,6 +1451,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     if not branch:
         if lot not in implicits:
             implicits[lot] = implicit_branch(repo, lot)
+            # #2102 : une branche détachée explicitement n'est plus devinée
+            if implicits[lot] and work_mod.is_detached(st, lot, implicits[lot]):
+                implicits[lot] = None
         branch = implicits[lot]
         implicit = bool(branch)
     if off_target:
@@ -1490,6 +1493,11 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
             partial = (merge, "merge commit %s declares itself partial "
                        "(\"ameesh-work-partial: %d\"): lot kept open"
                        % (merge["sha"][:12], lot))
+    if not row.get("branch"):
+        # #2102 : le nom détaché n'est pas non plus une preuve implicite
+        # dans un titre de fusion (cible déclarée ou ref d'intégration).
+        citing = [m for m in citing if m["how"] != "lot-branch"
+                  or not work_mod.is_detached(st, lot, merge_branch(m["message"]))]
     reverted_cite = None
     if citing:
         # #1825 : une fusion citante annulée par un revert n'a rien livré —
@@ -1873,12 +1881,11 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 # #346 r2 : une pointe inchangée relevée avant la fusion
                 # partielle l'est de nouveau, puisqu'elle est encore là
                 if implicit:
-                    # L118b : la branche implicite devient celle du lot (journal)
-                    try:
-                        work_mod.set_branch(db, lot, branch, actor=actor or "git:%s" % target,
-                                            source="the merge sweep: lot/%d branch" % lot)
-                    except work_mod.WorkError:
-                        pass
+                    # L118b : la branche implicite devient celle du lot (journal) ;
+                    # #2102 : sauf détachement ou branche posés pendant le relevé
+                    work_mod.attach_implicit_branch(
+                        db, lot, branch, actor=actor or "git:%s" % target,
+                        source="the merge sweep: lot/%d branch" % lot)
                 st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
