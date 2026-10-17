@@ -18,6 +18,7 @@ existing freeze, review, generation and lease checks.
         "lease_ref": "ameesh-land/",
         "ci_required": true,
         "protected": ["main", "desktop-v*", "product-releases*", "refs/tags/*"],
+        "required_statuses": {"integration/**": "lot/"},
         "generated": [
           {
             "path": "backend/domains.json",
@@ -73,6 +74,20 @@ neutral or skipped; classic statuses must be successful. At least one check
 must exist. Missing, running, failed, unreadable or potentially truncated
 results refuse admission and eject a queued lot before landing.
 The branch's current green CI cannot vouch for a different frozen commit.
+
+`required_statuses` maps a branch glob to a commit status context prefix. A
+PR head, or a frozen commit, of a matching branch is green only when at least
+one classic commit status with that prefix is `success`; the other checks
+still apply. Only a commit status counts (a check run's name is free text),
+and an unknown branch gets every declared prefix. It applies wherever the PR
+rollup or the frozen commit is read: queue admission, landing, and
+`ameesh work merge-pr`. Bare branch names and their `origin/`, `refs/heads/`
+and `refs/remotes/origin/` aliases receive the same requirements.
+A head whose checks are all green but whose required
+status is not yet published reads `pending`, never green. Nexlink declares
+`{"integration/**": "lot/"}`: a package is validated by its `lot/<suite>`
+statuses, so a package bootstrapper that ends with `success` and `skipped`
+checks alone (a change set making no part due) cannot land it (#1748).
 Ambiguous project configurations for the same repository are refused at
 admission and landing, even from an exact configured checkout without origin.
 GitHub repository path case is normalized for admission and queue ownership,
