@@ -318,17 +318,23 @@ class ReadyTest(unittest.TestCase):
         self.assertIn("release", why)
 
     def test_pr_gates_need_a_green_ci_on_the_frozen_head(self):
+        # #2271 : la protection de la cible est lue à la forge ; ce témoin
+        # isole les autres portes de la PR avec une exigence vide.
         for ci in ("pending", "red"):
-            ok, why = fire.ready_pr(_status(ci=ci), target="main", project=None, frozen=A)
+            ok, why = fire.ready_pr(_status(ci=ci), target="main", project=None,
+                                    frozen=A, required=())
             self.assertFalse(ok)
             self.assertIn(ci, why)
-        ok, why = fire.ready_pr(_status(draft=True), target="main", project=None, frozen=A)
+        ok, why = fire.ready_pr(_status(draft=True), target="main", project=None,
+                                frozen=A, required=())
         self.assertFalse(ok)
         self.assertIn("draft", why)
-        ok, why = fire.ready_pr(_status(base="develop"), target="main", project=None, frozen=A)
+        ok, why = fire.ready_pr(_status(base="develop"), target="main", project=None,
+                                frozen=A, required=())
         self.assertFalse(ok)
         self.assertIn("targets", why)
-        ok, why = fire.ready_pr(_status(), target="main", project=None, frozen=A)
+        ok, why = fire.ready_pr(_status(), target="main", project=None,
+                                frozen=A, required=())
         self.assertTrue(ok, why)
 
 
