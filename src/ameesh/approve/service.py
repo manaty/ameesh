@@ -472,7 +472,8 @@ class ApproveService:
             raise ApproveError(400, "format", "host: host name expected")
         if provider not in LOGIN_PROVIDERS:
             raise ApproveError(400, "format", "provider: %s" % " or ".join(LOGIN_PROVIDERS))
-        if not isinstance(account, str) or not _ACCOUNT_RE.fullmatch(account):
+        if not isinstance(account, str) or (not account and provider != "gh") \
+                or (account and not _ACCOUNT_RE.fullmatch(account)):
             raise ApproveError(400, "format", "account: account name expected")
         if not isinstance(approver, str) or not _HUMAN_RE.fullmatch(approver):
             raise ApproveError(400, "format", "approver: \"human:<id>\" expected")

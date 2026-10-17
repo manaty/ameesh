@@ -17,10 +17,12 @@ import json
 import os
 import re
 import stat
+import tempfile
 import unittest
 from urllib.parse import urlsplit
 
 from ameesh import receipts
+from ameesh.approve.config import ApproveConfig
 from ameesh.approve.config import ApproveConfig, ApproveConfigError
 from ameesh.approve.service import ApproveService
 
@@ -78,6 +80,23 @@ class LoginReceiptFormTest(unittest.TestCase):
 
     def test_identifiants_vides_admis(self):
         self.assertEqual(receipts.check_request(self.request(account="", scope="")), "login")
+
+
+class LoginCreationContractTest(unittest.TestCase):
+    def test_compte_gh_vide_et_portee_texte_acceptes_par_le_service_et_le_recu(self):
+        with tempfile.TemporaryDirectory(prefix="l232d-contract-") as directory:
+            cfg = ApproveConfig(state_dir=directory, public_url="https://approve.example.test")
+            service = ApproveService(cfg, None, None, service_token="service", clock=lambda: 1000)
+            service._credentials = lambda _approver: ["credential"]
+            for fields in ({"account": "", "scope": ""},
+                           {"account": "alice@example.test", "scope": "read repository + profile"}):
+                with self.subTest(fields=fields):
+                    answer = service.create_login_request(dict(
+                        host="h", provider="gh", approver=ALICE, requested_by=AGENT,
+                        url=URL, code=CODE, **fields))
+                    record = service.store.get_login(answer["login_id"])
+                    self.assertEqual(receipts.check_request(
+                        dict(record["request"], decision="done")), "login")
 
 
 class LoginChallengeTest(ApproveBase):

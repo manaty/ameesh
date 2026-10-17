@@ -152,6 +152,9 @@ _HUMAN_RE = re.compile(r"^human:%s$" % _NAME)
 _MEMBER_RE = re.compile(r"^(human|agent):%s$" % _NAME)
 _ACTION_ID_RE = re.compile(r"^act_[0-9A-Za-z]{26}$")
 _LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
+_LOGIN_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+_LOGIN_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$")
+_LOGIN_SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+ -]{0,255}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_:.=-]{1,1024}$")
 _IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -478,11 +481,13 @@ def check_request(request) -> str:
             raise ReceiptError("request.login_id: \"lgn_\" + 26 characters expected")
         for name in ("host", "provider"):
             value = request[name]
-            if not isinstance(value, str) or not _IDENT_RE.fullmatch(value):
+            pattern = _LOGIN_HOST_RE if name == "host" else _IDENT_RE
+            if not isinstance(value, str) or not pattern.fullmatch(value):
                 raise ReceiptError("request.%s: enrolled identifier expected" % name)
         for name in ("account", "scope"):
             value = request[name]
-            if not isinstance(value, str) or (value and not _IDENT_RE.fullmatch(value)):
+            pattern = _LOGIN_ACCOUNT_RE if name == "account" else _LOGIN_SCOPE_RE
+            if not isinstance(value, str) or (value and not pattern.fullmatch(value)):
                 raise ReceiptError("request.%s: identifier expected (empty allowed)" % name)
     else:
         _check_standing(request["standing"], iat)

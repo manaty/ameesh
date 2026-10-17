@@ -13,6 +13,7 @@ import stat
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from ameesh import accounts as accounts_mod
 from ameesh import login
@@ -108,6 +109,18 @@ class ProfileTest(unittest.TestCase):
 
 
 class CommandTest(unittest.TestCase):
+    def test_version_sonde_le_meme_executable_que_la_connexion(self):
+        with mock.patch("subprocess.run", return_value=SimpleNamespace(
+                returncode=0, stdout="gh version 2.102.0\n", stderr="")) as run:
+            self.assertEqual(login_cli.pinned_version("gh")["version"], "2.102.0")
+        self.assertEqual(run.call_args.args[0], ["gh", "--version"])
+
+    def test_profil_cle_api_refuse_avant_la_connexion_oauth(self):
+        cfg = SimpleNamespace(accounts={"codex": [
+            {"name": "key", "type": "api_key_env", "key_env": "OPENAI_API_KEY"}]})
+        with self.assertRaises(login.LoginError):
+            login_cli.resolve_profile(cfg, "codex", "key", environ={})
+
     def test_harnais_inconnu_refuse(self):
         cfg = SimpleNamespace(accounts={})
         self.assertEqual(login_cli.cmd_accounts_login(cfg, args(harness="dsh")), 1)
@@ -115,6 +128,45 @@ class CommandTest(unittest.TestCase):
     def test_aucun_compte_declare_refuse(self):
         cfg = SimpleNamespace(accounts={})
         self.assertEqual(login_cli.cmd_accounts_login(cfg, args(harness="claude")), 1)
+
+
+class CommandCleanupTest(unittest.TestCase):
+    def test_arret_sur_absence_de_publication_erreur_ou_interruption(self):
+        for event in ("unpublished", "fetch_error", "publish_interrupt", "bad_receipt"):
+            with self.subTest(event=event):
+                cfg = SimpleNamespace(host="h")
+                sup = login.Supervisor(grace=0)
+                request = sup.registry.open(host="h", harness="codex", account="default")
+                if event != "unpublished":
+                    request.state = login.VIEWING
+                    request.login_id = "lgn_" + "a" * 26
+                proc = mock.Mock(pid=424242)
+                proc.poll.return_value = None
+                sup._procs[request.id] = proc
+                sup.begin = mock.Mock(return_value=request)
+                sup.wait = mock.Mock(side_effect=KeyboardInterrupt if event == "publish_interrupt" else None)
+                error = login.LoginError("failed", "synthetic failure")
+                with mock.patch.object(login_cli, "resolve_profile", return_value=mock.Mock(name="default")), \
+                        mock.patch.object(login_cli, "home_problems", return_value=[]), \
+                        mock.patch.object(login_cli, "pinned_version", return_value={"version": "0.159.3"}), \
+                        mock.patch("ameesh.db.open_db", return_value=mock.Mock()), \
+                        mock.patch.object(login, "Supervisor", return_value=sup), \
+                        mock.patch("ameesh.actions.policy_from_env", return_value=None), \
+                        mock.patch("ameesh.approve_client.fetch_login_receipt", side_effect=error
+                                   if event == "fetch_error" else None,
+                                   return_value=("signed", b"{}")), \
+                        mock.patch.object(login, "receipt_decision", side_effect=error), \
+                        mock.patch.object(login.os, "getpgid", return_value=proc.pid), \
+                        mock.patch.object(login.os, "killpg") as kill:
+                    def stopped(*_args):
+                        proc.poll.return_value = -15
+                    kill.side_effect = stopped
+                    try:
+                        login_cli._run(cfg, args(harness="codex", json=True))
+                    except (login.LoginError, KeyboardInterrupt):
+                        pass
+                    self.assertEqual(request.state, login.CANCELLED)
+                    self.assertIsNotNone(proc.poll())
 
 
 if __name__ == "__main__":

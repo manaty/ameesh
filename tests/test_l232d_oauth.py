@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from ameesh import login
 
@@ -196,6 +197,18 @@ class FakeCliTest(unittest.TestCase):
 
 
 class SupervisorTest(FakeCliTest):
+    def test_le_groupe_est_tue_meme_si_son_chef_est_deja_sorti(self):
+        sup = login.Supervisor(grace=0)
+        request = sup.registry.open(host="h", harness="codex", account="default")
+        proc = mock.Mock(pid=424242)
+        proc.poll.return_value = 0
+        sup._procs[request.id] = proc
+        with mock.patch.object(login.os, "getpgid", side_effect=ProcessLookupError), \
+                mock.patch.object(login.os, "killpg") as kill:
+            sup.finish(request.id, "cancel")
+        kill.assert_any_call(proc.pid, login.signal.SIGTERM)
+        kill.assert_any_call(proc.pid, login.signal.SIGKILL)
+
     def test_gh_publie_le_flux_prive_puis_done(self):
         self.cli("gh", "printf 'First copy your one-time code: WXYZ-9876\\n"
                        "Open this URL: https://github.com/login/device\\n'; sleep 30")

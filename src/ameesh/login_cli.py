@@ -18,6 +18,7 @@ import getpass
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 
@@ -77,6 +78,8 @@ def resolve_profile(cfg: Config, harness: str, name: str | None = None, *, envir
             raise _error("failed", "unknown account %r for %s" % (name, harness))
     else:
         profile = accounts_mod.primary_of(harness, items, environ) or items[0]
+    if profile.kind != "config_dir":
+        raise _error("failed", "OAuth login requires a config_dir account")
     return profile
 
 
@@ -112,8 +115,22 @@ def pinned_version(harness: str, *, probe=None) -> dict:
     """La version installée, refusée si absente ou hors épinglage (L120)."""
     from . import harness_versions
     from . import login as login_mod
-    result = (probe or harness_versions.probe)(harness)
     adapter = login_mod.ADAPTERS.get(harness)
+    if adapter is None:
+        raise _error("unsupported_version", "no login adapter for %r" % harness)
+    if probe is not None:
+        result = probe(harness)
+    else:
+        # La commande de connexion utilise argv[0], pas le binaire d'un
+        # descripteur (gh n'en a pas ; les surcharges d'un harnais divergent).
+        try:
+            answer = subprocess.run([adapter.argv[0], "--version"], capture_output=True,
+                                    text=True, stdin=subprocess.DEVNULL,
+                                    timeout=harness_versions.PROBE_TIMEOUT_S)
+            result = {"version": harness_versions.parse_version(answer.stdout or answer.stderr),
+                      "error": None if answer.returncode == 0 else "version probe failed"}
+        except (OSError, subprocess.SubprocessError) as exc:
+            result = {"version": None, "error": type(exc).__name__}
     version = result.get("version")
     if adapter is None or result.get("error") or not version:
         raise _error("unsupported_version",
@@ -140,10 +157,13 @@ def probe_health(cfg: Config, profile, harness: str, *, environ=None, run=None,
     if harness == "codex":
         return sentinel.probe_codex(profile, now, environ)
     if harness == "gh":
+        from . import login as login_mod
+        env = login_mod.login_env(login_mod.ADAPTERS["gh"], profile.home(environ), environ)
+        def probe_gh(argv, **kwargs):
+            return (run or sentinel._run)(argv, env=env, **kwargs)
         return sentinel.probe_cli("gh", ["gh", "auth", "status"],
-                                  "gh auth login -h github.com", run or sentinel._run,
-                                  sentinel.gh_store(environ),
-                                  sentinel.env_override(environ, sentinel.GH_TOKEN_VARS))
+                                  "gh auth login -h github.com", probe_gh,
+                                  sentinel.gh_store(env))
     return None
 
 
@@ -159,16 +179,20 @@ def health_report(db, cfg: Config, profile, request, *, environ=None, run=None,
     contrainte `credential_health_source_check` n'admet que
     `sentinel | turn | manual | relay` (trouvé par le témoin de bout en bout #366).
     """
-    from . import storage
+    from . import sentinel, storage
+    store = storage.of(db).credentials
+    current = (store.health(cfg.host, request.harness) or {}).get(request.account) or {}
     verdict = probe_health(cfg, profile, request.harness, environ=environ, run=run, now=now)
     if verdict is None:
         return ""
-    store = storage.of(db).credentials
-    current = (store.health(cfg.host, request.harness) or {}).get(request.account) or {}
-    store.report(cfg.host, request.harness, request.account, verdict.state,
+    if sentinel.kept_failure(current, verdict):
+        return "failing"
+    written = store.report(cfg.host, request.harness, request.account, verdict.state,
                  reason=verdict.text(), source="sentinel", expires_at=verdict.expires_at,
                  fingerprint=verdict.fingerprint,
                  expect_failures=int(current.get("failures") or 0))
+    if (written or {}).get("skipped"):
+        return "failing"
     return verdict.state
 
 
@@ -219,6 +243,7 @@ def _run(cfg: Config, args) -> int:
     scope = getattr(args, "scope", "") or ""
     wait = max(0.0, float(getattr(args, "wait", TTL_WAIT_S)))
     db = db_mod.open_db(cfg)
+    supervisor = None
     try:
         supervisor = login_mod.Supervisor(
             publish=login_mod.publisher(approve_client, cfg, approver=approver,
@@ -227,7 +252,8 @@ def _run(cfg: Config, args) -> int:
         request = supervisor.begin(
             host=cfg.host, harness=harness, account=profile.name,
             home=profile.home(environ), version=probe["version"], approver=approver,
-            requested_by=who, scope=scope, environ=environ)
+            requested_by=who, scope=scope, environ=environ,
+            cwd=os.path.expanduser("~") if harness == "gh" else None)
         supervisor.wait(request.id, timeout=min(PUBLISH_WAIT_S, wait))
         if request.state != login_mod.VIEWING:
             print("refused [%s]: the private challenge was not published"
@@ -256,5 +282,12 @@ def _run(cfg: Config, args) -> int:
         else:
             print(_line(request))
         return 0 if request.category == "healthy" else 1
+    except KeyboardInterrupt:
+        print("cancelled: stopping the login process", file=sys.stderr)
+        return 130
     finally:
-        db.close()
+        try:
+            if supervisor is not None:
+                supervisor.close()
+        finally:
+            db.close()

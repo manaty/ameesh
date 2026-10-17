@@ -480,6 +480,16 @@ class Supervisor:
             self._procs.pop(request_id, None)
             self._threads.pop(request_id, None)
 
+    def close(self) -> None:
+        """Arrête toutes nos connexions, même après un échec ou une interruption."""
+        with self._lock:
+            held = set(self._procs) | {r.id for r in self.registry.live()}
+        for request_id in held:
+            request = self.registry.get(request_id)
+            request.closing = True
+            self._terminate(request)
+            self.registry.finish(request, CANCELLED, "cancelled")
+
     # -- interne -----------------------------------------------------------
     def _read(self, request: Request, adapter: Adapter, proc, approver: str,
               requested_by: str, scope: str) -> None:
@@ -557,6 +567,8 @@ class Supervisor:
         if not re.fullmatch(r"lgn_[0-9a-z]{26}", login_id):
             self._fail(request, adapter, "failed", "challenge service answered an unreadable id")
             return
+        if request.closing or request.state not in LIVE:
+            return
         self.registry.touch(request, state=VIEWING, login_id=login_id, scope=scope)
         if link:
             self.registry.touch(request, link=link)
@@ -577,12 +589,10 @@ class Supervisor:
             proc = self._procs.get(request.id)
         if proc is None:
             return
-        pgid = None
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError, OSError):
-            pgid = None
-        if proc.poll() is None and pgid is not None:
+        # start_new_session=True : le groupe garde cet identifiant après la
+        # sortie du chef ; poll()/getpgid(chef) ne prouvent pas sa disparition.
+        pgid = proc.pid
+        if pgid is not None:
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
@@ -590,7 +600,7 @@ class Supervisor:
             deadline = time.monotonic() + max(0.0, self.grace)
             while proc.poll() is None and time.monotonic() < deadline:
                 self.sleep(POLL_S)
-            if proc.poll() is None and pgid is not None:
+            if pgid is not None:
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):

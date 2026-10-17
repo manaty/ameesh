@@ -18,10 +18,25 @@ from unittest import mock
 
 from ameesh import accounts as accounts_mod
 from ameesh import login_cli
+from ameesh import sentinel
 from ameesh import storage
 
 
 class ProbeHealthTest(unittest.TestCase):
+    def test_gh_sonde_sans_jeton_ambiant_dans_le_foyer_demande(self):
+        environ = {"GH_CONFIG_DIR": "/another", "GH_TOKEN": "canary", "GITHUB_TOKEN": "canary"}
+        profile = accounts_mod.Profile(harness="gh", name="", path=self.home, declared=True)
+        seen = {}
+        def run(_argv, **kwargs):
+            seen.update(kwargs.get("env") or {})
+            return 1, "not logged in"
+        with mock.patch("ameesh.sentinel.shutil.which", return_value="gh"):
+            verdict = login_cli.probe_health(self.cfg, profile, "gh", environ=environ, run=run)
+        self.assertNotIn("GH_TOKEN", seen)
+        self.assertNotIn("GITHUB_TOKEN", seen)
+        self.assertEqual(seen.get("GH_CONFIG_DIR"), self.home)
+        self.assertEqual(verdict.state, "failing")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="l232d-health-")
         self.addCleanup(self.temp.cleanup)
@@ -103,6 +118,31 @@ class _FakeCredentials:
 
 
 class HealthReportTest(unittest.TestCase):
+    def test_panne_pendant_la_sonde_ne_devient_pas_la_reference_du_cas(self):
+        def probe(*_args, **_kwargs):
+            self.credentials.failures += 1
+            return SimpleNamespace(state="healthy", text=lambda: "healthy",
+                                   expires_at=None, fingerprint="new")
+        with mock.patch.object(login_cli, "probe_health", side_effect=probe):
+            login_cli.health_report(self.store, self.cfg, None, self.request)
+        self.assertEqual(self.credentials.calls[0][-1]["expect_failures"], 3)
+
+    def test_une_ecriture_refusee_ne_rend_pas_healthy(self):
+        self.write_auth()
+        profile = accounts_mod.parse(self.cfg.accounts)["codex"][0]
+        with mock.patch.object(self.credentials, "report", return_value={"skipped": True}):
+            self.assertEqual(login_cli.health_report(
+                self.store, self.cfg, profile, self.request, environ={}), "failing")
+
+    def test_ancienne_credential_en_echec_reste_bloquee(self):
+        verdict = sentinel.Verdict("codex", "default", "healthy", "old", fingerprint="same")
+        with mock.patch.object(login_cli, "probe_health", return_value=verdict), \
+                mock.patch.object(self.credentials, "health", return_value={"default": {
+                    "state": "failing", "failing_fingerprint": "same", "failures": 3}}):
+            self.assertEqual(login_cli.health_report(
+                self.store, self.cfg, None, self.request), "failing")
+        self.assertEqual(self.credentials.calls, [])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="l232d-health-report-")
         self.addCleanup(self.temp.cleanup)
