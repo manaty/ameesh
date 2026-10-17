@@ -68,6 +68,11 @@ WITH unread AS (
     SELECT r.name, r.workstream, r.workstream AS chantier,
            r.team, r.projects, r.harness, r.host, r.provider, r.credential_mode,
            r.status, r.status_text, r.mode, r.stop_reason, r.responsible,
+           -- #2200 : la pause opérateur manquait à cette projection, qui
+           -- présentait donc l'agent « idle, reason null ».
+           r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+           r.operator_pause_for,
+           extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
            (r.lease_owner IS NOT NULL
             AND r.lease_expires_at > clock_timestamp()) AS lease_live,
            extract(epoch from p.created_at)::float8     AS turn_started_ts,

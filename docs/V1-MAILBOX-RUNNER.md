@@ -528,7 +528,9 @@ suite twice: `psql` driver, then `psycopg` driver in a local venv if
 installation is possible. Each run takes a throwaway `agent_mesh_test_*`
 database (#1992); when the connection profile only covers `agent_mesh`, the
 script derives a private `PGPASSFILE` for the bench's databases from the
-existing entry and removes it on exit (#2170).
+existing entry and removes it on exit (#2170). During the two runs that private
+profile is the only one libpq reads: the user's other profile entries are
+masked (wanted — the bench's databases share the entry's host, port and role).
 
 63 `unittest` tests (stdlib), a throwaway Postgres schema and a throwaway disk
 state per class: migrations, mailbox, notifications, leases (races with 2 and
