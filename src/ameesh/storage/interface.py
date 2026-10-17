@@ -2655,13 +2655,13 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def items(self, *, since_ts: float, limit: int,
-              done_states: Sequence[str]) -> list[dict]:
+              done_states: Sequence[str], project: str | None = None) -> list[dict]:
         """Les tâches de la feuille de route : ouvertes (état hors de
         `done_states`, fourni par l'appelant), ou datées, ou portant un
         engagement en cours, ou modifiées depuis `since_ts` — colonnes de `work_items` utiles à la
         frise (id, title, state, app, workstream, assignee, package_id,
         created_ts, updated_ts, closed_ts) et dates prévues ; `total` avant
-        la borne."""
+        la borne. Le filtre projet est appliqué avant la borne et le total."""
 
     @abc.abstractmethod
     def commitments(self, *, statuses: Sequence[str] | None = None,
@@ -2681,10 +2681,11 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def set_commitment(self, ident: int, *, current: Sequence[str],
-                       values: dict) -> dict | None:
+                       values: dict, expect: dict | None = None) -> dict | None:
         """Change un engagement (`status`, `due_on`, `note`…) s'il est dans
         l'un des statuts `current` ; None sinon (inconnu ou déjà changé).
-        Un statut `done` ou `cancelled` pose `closed_at`."""
+        Un statut `done` ou `cancelled` pose `closed_at`. Avec `expect`, les
+        champs éditables doivent être inchangés depuis leur lecture."""
 
 
 # --------------------------------------------------------------------------

@@ -327,6 +327,8 @@ class RoadmapPgTest(PgTestCase):
 
     def test_engagements_cli(self):
         lot = self._lot(assignee=None)
+        storage.of(self.db).packages.upsert({"id": "L95", "kind": "lot", "title": "Prerequisite",
+                                            "canon_ref": "test:plan/L95"})
         out = self.mesh("plan", "add", "Comptes séparés par organisation", "--pour",
                         "2026-10-12", "--lot", str(lot["id"]), "--source",
                         "conversation 2026-10-10", "--depend-de", "L95")
