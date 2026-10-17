@@ -596,8 +596,10 @@ class SupervisorClosureRaceTest(unittest.TestCase):
                 events.append("reap")
             return status
         proc.poll = logged_poll
-        self.enterContext(mock.patch.object(login, "PEEK_EXIT", False))
-        self.enterContext(mock.patch.object(login.os, "killpg", side_effect=logged_killpg))
+        for patcher in (mock.patch.object(login, "PEEK_EXIT", False),
+                        mock.patch.object(login.os, "killpg", side_effect=logged_killpg)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         return events
 
     def test_done_sans_waitid_tue_le_groupe_des_la_recolte(self):

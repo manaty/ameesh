@@ -130,8 +130,9 @@ only `sentinel | turn | manual | relay`, and the on-demand pass already writes
 
 ## Hardening after the pilot (lot #2178)
 
-The five non-blocking findings of the #366 security review are closed here;
-none changes the activation preconditions of #366.
+The five non-blocking findings of the #366 security review are addressed here,
+with the N1 fallback limitation below; none changes the activation preconditions
+of #366.
 
 - **Safe process-group cleanup (N1).** The supervisor observes the provider
   exit with `waitid(WNOWAIT)` and does **not** reap the leader before killing
@@ -139,6 +140,10 @@ none changes the activation preconditions of #366.
   `killpg` cannot target a recycled PID. A leader already reaped is never
   signalled; the cleanup is local only. A clean exit 0 stays a zombie until
   `done`/`cancel`/`close`, which then kills leftover children and reaps it.
+  Without `waitid(WNOWAIT)` (including macOS with Python before 3.13), the
+  fallback uses `proc.poll()` and immediately kills the remaining group.
+  This retains a theoretical PID reuse window between reaping and `killpg`;
+  N1 is not fully resolved on these platforms.
 - **No redundant remote closure (N4).** `Supervisor.close()` skips requests
   already terminal: no `close_login` call and no `technical closure` log line
   for a challenge already `healthy`/closed; only local references are dropped.
