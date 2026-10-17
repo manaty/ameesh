@@ -401,10 +401,14 @@ class LoginChallengeTest(LoginApiMixin, ApproveBase):
         state = self.acfg.state_dir
         private = os.path.join(state, "login-private", data["login_id"] + ".json")
         self.assertTrue(os.path.exists(private))
+        self.assertTrue(self.service.store.close_login(data["login_id"]))
+        closed = os.path.join(state, "login-closed", data["login_id"])
+        self.assertTrue(os.path.exists(closed + ".lock"))
         self.service.store.prune(self.clock() + receipts.DEFAULT_MAX_TTL + 10 * 86400)
         for path_ in (os.path.join(state, "login-requests", data["login_id"] + ".json"),
                       private,
-                      os.path.join(state, "login-views", data["login_id"])):
+                      os.path.join(state, "login-views", data["login_id"]),
+                      closed, closed + ".lock"):
             self.assertFalse(os.path.exists(path_), path_)
         self.assertEqual(self.page(path)[0], 404)
 

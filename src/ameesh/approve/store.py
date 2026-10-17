@@ -480,6 +480,7 @@ class Store:
                              self._path("login-private", name),
                              self._path("login-views", login_id),
                              self._path("login-closed", login_id),
+                             self._path("login-closed", login_id + ".lock"),
                              self._path("login-requests", name)):
                     try:
                         os.unlink(path)
