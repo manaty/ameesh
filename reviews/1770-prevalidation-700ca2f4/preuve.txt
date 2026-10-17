@@ -1,0 +1,47 @@
+#1770 — prévalidation refusée sur la tête candidate 9017b57b (base main 700ca2f4)
+mty-amh-impl-08 (auteur), 2026-10-17 ~01:5xZ
+
+## Tête candidate
+- 9017b57bc0bc0c0ad2f589802d8b1f995dd15802, branche publiée `remise/1770-rebase-main-700ca2f4`.
+- Re-ancrage de 5d8f7b01 (= candidat code sur cb77f899) sur main 700ca2f479f995c57790df3c1f459f66b5ef2923 :
+  cb77f899 est ancêtre de main, et main porte déjà le delta de test ac7a862ff88b (blob f824aabb, mesuré 18,802 s).
+- Conflits résolus en union : mechanics.py (packets de main + bloc prevalidation), contract.json
+  (main sans interface_total + refus `prevalidation` : 64 opérations, 370 refusées, interface 434),
+  docs/EXECUTEUR-MEDIEE.md (compteurs 370 / 434), témoin additif IDENTICAL ajusté (`packets`).
+- Diff vs main : 15 fichiers, +2793/-12. Tests ciblés : 117 OK
+  (test_1770_mechanics_prevalidation, test_1770_prevalidation, test_1770_prevalidation_cli,
+  test_1770_prevalidation_store, test_l107_executor_contract).
+
+## Carte (L161e)
+- Run 38985327391 (workflow_dispatch, headSha 700ca2f4) : 10/10 parts de mesure vertes
+  (mesure-psycopg-1..6, mesure-psql-1..4) + plan-mesure.
+- Le job `carte` du run a été annulé à son plafond `timeout-minutes: 15`
+  (démarré 00:51:27Z, annulé 01:06:47Z) : aucune carte d'artefact ni de cache n'a été publiée.
+- Carte assemblée localement avec la commande canonique du workflow
+  (`scripts/map.py merge --attendu … --plan plan-mesure/plan.json`, ~11 min, 01:32Z -> 01:43Z) :
+  `ameesh-carte/1`, commit 700ca2f479f9, 399 modules de test, 264 fichiers, 7482 blocs,
+  8474 processus mesurés en 10 parts.
+- 1 couverture illisible, écartée à la fusion : `mesure-psycopg-4/.coverage.ameesh-ci-3.pid3271010.XvyILdZx`
+  (0 octet, « écriture interrompue avant le schéma »). La carte est donc **partielle** (#1257 R1 B3).
+
+## Plan (L161f)
+- `scripts/test-plan.py plan --map carte.json.gz --base 700ca2f4 --event pull_request --base-ref main
+  --head-ref remise/1770-rebase-main-700ca2f4` -> head 9017b57b, **mode full**, `sure=false` :
+  « map measured with 1 ignored coverage file(s) (partial measure) ».
+
+## Prévalidation (commande du lot, sur le candidat)
+    ameesh work prevalidate 1770 --sha 9017b57bc0bc0c0ad2f589802d8b1f995dd15802 \
+      --plan plan-1770-pr.json --host ameesh-agents-1 \
+      --base 700ca2f479f995c57790df3c1f459f66b5ef2923 \
+      --canon-repo /home/ameesh/canon --canon-commit e86003737725ccc9aa5cca60288e980958ba91ca --json
+- Résultat : rc=1, `refus.json` joint — causes `["card-stale"]`, why « map measured with 1 ignored
+  coverage file(s) (partial measure) » (carte non utilisable, sélection non sûre, phase 2 non sûre).
+- **Aucun envoi VM, aucun run, aucun repli local, aucun faux vert** : le refus est prononcé avant
+  l'offload (prevalidation.py, selection() avant run_offload).
+
+## Suite
+- La carte partielle ne se répare pas (données de couverture perdues) : il faut une mesure complète
+  sur 700ca2f4. Le reste de la chaîne est prêt et prouvé.
+- Point d'infra relevé : le plafond `timeout-minutes: 15` du job `carte` est trop court pour
+  l'assemblage d'une carte de cette taille (annulé à 15m20s ; ~11 min localement à 100 % CPU) ;
+  un run dont les 10 parts sont vertes rend donc une carte partielle au lieu d'une carte.
