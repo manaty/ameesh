@@ -11,6 +11,7 @@
 // through the stream (`receipt.attached`).
 import { html, nothing } from "lit";
 import { ApiError, type Client } from "../api/client";
+import { languageOf } from "../i18n/index";
 import { ReadView, label, number, object, rows, type Row } from "./read-view";
 
 /** A fresh `Idempotency-Key` (the API's pattern: 8 to 128 of [A-Za-z0-9_-]). */
@@ -83,7 +84,14 @@ export class AmeeshDecisions extends ReadView {
   #action(row: Row) {
     const action = label(row.action_id);
     const amount = number(row.amount);
-    const money = amount === null ? "—" : `${label(amount)} ${label(row.currency)}`;
+    const currency = label(row.currency);
+    const format = /^[A-Z]{3}$/.test(currency) ? new Intl.NumberFormat(languageOf(this), {
+      style: "currency", currency, currencyDisplay: "code",
+    }) : null;
+    // Actions carry integer minor units; EUR 4200 means EUR 42.00, JPY 4200 means JPY 4200.
+    const money = amount === null ? "—" : format
+      ? format.format(amount / 10 ** (format.resolvedOptions().maximumFractionDigits ?? 2))
+      : this.t("decisions.minorAmount", { amount: label(amount) });
     const url = this.filed[action] || "";
     const failed = this.failed[action] || "";
     return html`<article>

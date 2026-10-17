@@ -103,6 +103,7 @@
   "budget.planValue": "Valeur des forfaits, 24 h (estimation non facturée)",
   "view.decisions": "Décisions",
   "decisions.approvals": "Actions à approuver",
+  "decisions.minorAmount": "{amount} unités mineures (sans devise)",
   "decisions.requests": "Demandes des agents",
   "decisions.waiting": "Lots en attente d’un humain",
   "decisions.unknown": "Issues inconnues à trancher",

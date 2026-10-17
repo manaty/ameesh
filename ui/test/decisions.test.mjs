@@ -38,7 +38,7 @@ test("the decisions screen shows the queue: approvals, requests, waiting lots an
   assert.match(text(el), /Actions to approve/);
   assert.match(text(el), new RegExp(ACTION));
   assert.match(text(el), /stripe · refund · money/);
-  assert.match(text(el), /4,?200 EUR|4200 EUR/);
+  assert.match(text(el), /EUR\s+42\.00/);
   assert.match(text(el), /Requests from agents/);
   assert.match(text(el), /Which <b>option<\/b>\?/);   // untrusted text stays literal
   assert.match(text(el), /Request #12/);
@@ -48,6 +48,27 @@ test("the decisions screen shows the queue: approvals, requests, waiting lots an
   assert.match(text(el), /agent:ada should file it/);
   assert.equal(el.shadowRoot.querySelector("b"), null);
   assert.deepEqual(await violations(), []);
+});
+
+test("action amounts use the currency's minor units in both languages", async () => {
+  const { client } = fixture();
+  const el = await mount(client);
+  for (const lang of ["en", "fr"]) {
+    document.documentElement.lang = lang;
+    for (const [currency, amount, expected] of [
+      ["EUR", 4200, 42], ["JPY", 4200, 4200], ["KWD", 4200, 4.2], ["EUR", 0, 0],
+    ]) {
+      el.data = { approvals: [{ action_id: ACTION, currency, amount }] };
+      await settle(el);
+      const formatted = new Intl.NumberFormat(lang, {
+        style: "currency", currency, currencyDisplay: "code",
+      }).format(expected);
+      assert.ok(text(el).includes(formatted.replace(/\s+/g, " ")), `${lang}: ${formatted}`);
+    }
+    el.data = { approvals: [{ action_id: ACTION, currency: null, amount: 4200 }] };
+    await settle(el);
+    assert.match(text(el), lang === "en" ? /4200 minor units/ : /4200 unités mineures/);
+  }
 });
 
 test("Approve files the request once, keeps the key on a retry, never approves", async () => {

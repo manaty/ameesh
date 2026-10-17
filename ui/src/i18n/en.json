@@ -103,6 +103,7 @@
   "budget.planValue": "Plan usage value, 24 h (unbilled estimate)",
   "view.decisions": "Decisions",
   "decisions.approvals": "Actions to approve",
+  "decisions.minorAmount": "{amount} minor units (no currency)",
   "decisions.requests": "Requests from agents",
   "decisions.waiting": "Lots waiting for a human",
   "decisions.unknown": "Unknown outcomes to settle",
