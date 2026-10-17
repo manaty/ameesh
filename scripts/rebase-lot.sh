@@ -190,10 +190,13 @@ if [ -f "$etat" ] && ! en_cours; then
   finaux=$(git log --format='%s' HEAD)
   marque=
   { IFS= read -r marque; } <"$etat" || :
+  echec=0
   if [ "$marque" != "$ETAT_MARQUE" ]; then
-    # État d'une autre version du lanceur : illisible ici, contrôle ignoré
-    # plutôt qu'un diagnostic inventé.
-    printf 'rebase-lot : état %s illisible, contrôle ignoré\n' "$marque" >&2
+    # État d'une autre version du lanceur : les sujets attendus sont
+    # illisibles ici, ce seul contrôle est ignoré plutôt qu'un diagnostic
+    # inventé. La plage rejouée reste connue par base_etat/lot_etat : les
+    # contrôles #1669 (préfixe du lot, marqueurs de conflit) s'appliquent.
+    printf 'rebase-lot : état %s illisible, contrôle des sujets ignoré\n' "$marque" >&2
     rm -f "$etat" "$base_etat" "$lot_etat"
   else
     # Les commits produits par ce rebasage : <destination>..HEAD. Sans
@@ -219,7 +222,6 @@ if [ -f "$etat" ] && ! en_cours; then
       fi
     done < <(tail -n +2 "$etat")
     rm -f "$etat" "$base_etat" "$lot_etat"
-    echec=0
     if [ -n "$abandonnes" ]; then
       printf 'rebase-lot : sujets « #… » absents — abandon volontaire (drop, skip ou commit vidé), pas une perte :\n%s' "$abandonnes" >&2
     fi
@@ -228,33 +230,35 @@ if [ -f "$etat" ] && ! en_cours; then
       printf "rebase-lot : contrôle « git log --format='%%s' » — un sujet a pu passer en corps.\n" >&2
       echec=1
     fi
-    if [ -n "$base" ]; then
-      if [ "$base" = root ]; then plage=(HEAD); else plage=("$base..HEAD"); fi
-      if [ -n "$lot" ]; then
-        hors=()
-        while IFS= read -r ligne; do
-          [ -n "$ligne" ] || continue
-          [[ ${ligne#* } =~ ^#${lot}([ :]|$) ]] || hors+=("$ligne")
-        done < <(git log --no-merges --format='%h %s' "${plage[@]}" -- || :)
-        if ((${#hors[@]})); then
-          printf 'rebase-lot : commits rejoués sans le préfixe « #%s » :\n' "$lot" >&2
-          printf '  %s\n' "${hors[@]}" >&2
-          echec=1
-        fi
-      fi
-      marqueurs=()
-      while IFS= read -r sha; do
-        [ -n "$sha" ] || continue
-        diff=$(git show --format= --no-color --no-ext-diff "$sha" -- || :)
-        grep -qE '^\+<{7}( |$)|\+>{7}( |$)|\+\|{7}( |$)' <<<"$diff" || continue
-        marqueurs+=("$sha")
-      done < <(git rev-list --no-merges "${plage[@]}" -- || :)
-      if ((${#marqueurs[@]})); then
-        printf 'rebase-lot : marqueurs de conflit committés dans :\n' >&2
-        printf '  %s\n' "${marqueurs[@]}" >&2
+  fi
+  # #1669 : indépendant du format de l'état (base/lot ont leurs propres
+  # fichiers) — un état d'une autre version ne doit pas sauter ces contrôles.
+  if [ -n "$base" ]; then
+    if [ "$base" = root ]; then plage=(HEAD); else plage=("$base..HEAD"); fi
+    if [ -n "$lot" ]; then
+      hors=()
+      while IFS= read -r ligne; do
+        [ -n "$ligne" ] || continue
+        [[ ${ligne#* } =~ ^#${lot}([ :]|$) ]] || hors+=("$ligne")
+      done < <(git log --no-merges --format='%h %s' "${plage[@]}" -- || :)
+      if ((${#hors[@]})); then
+        printf 'rebase-lot : commits rejoués sans le préfixe « #%s » :\n' "$lot" >&2
+        printf '  %s\n' "${hors[@]}" >&2
         echec=1
       fi
     fi
-    if ((echec)); then exit 4; fi
+    marqueurs=()
+    while IFS= read -r sha; do
+      [ -n "$sha" ] || continue
+      diff=$(git show --format= --no-color --no-ext-diff "$sha" -- || :)
+      grep -qE '^\+<{7}( |$)|\+>{7}( |$)|\+\|{7}( |$)' <<<"$diff" || continue
+      marqueurs+=("$sha")
+    done < <(git rev-list --no-merges "${plage[@]}" -- || :)
+    if ((${#marqueurs[@]})); then
+      printf 'rebase-lot : marqueurs de conflit committés dans :\n' >&2
+      printf '  %s\n' "${marqueurs[@]}" >&2
+      echec=1
+    fi
   fi
+  if ((echec)); then exit 4; fi
 fi
