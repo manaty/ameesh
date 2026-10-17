@@ -247,10 +247,39 @@ _DELAYS_SELECT = """
 """
 
 
+class _Refrozen(Exception):
+    """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
+
+
+def _lock_migration_writer(tx, item_id, proposed=None):
+    """Take repository locks before the lot and recheck its observed scope."""
+    before = tx.query('SELECT migration_repo FROM work_items WHERE id = %s', (int(item_id),))
+    if not before:
+        return False
+    previous = before[0]['migration_repo']
+    repositories = {repo for repo in (previous, proposed) if repo}
+    # A legacy reservation may move between repositories. Lock both old and
+    # new in canonical order, including release's OLD repository.
+    for repo in sorted(repositories):
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                   "current_schema() || ':migration-repo:' || %s, 0))", ('github.com/' + repo,))
+    after = tx.query('SELECT migration_repo FROM work_items WHERE id = %s FOR NO KEY UPDATE',
+                     (int(item_id),))
+    if not after:
+        return False
+    # A concurrent legacy reservation can change the repository while we
+    # wait. Abort rather than acquire a new repo lock after locking the lot.
+    if after[0]['migration_repo'] != previous:
+        raise DbError('lot migration repository changed; retry')
+    return True
+
+
 class WorkItems(interface.WorkItems):
 
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
                             % item_columns(self.db), (int(item_id),))
             if not rows:
@@ -583,19 +612,16 @@ class WorkItems(interface.WorkItems):
                   + ((REVIEWER_NONE, state) if waiver else ())
                   + (int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
-        if state not in ("merged", "promoted", "closed"):
-            rows = self.db.query(sql, params)
-            if not rows:
-                return None
-            self._event(int(item_id), state, note, actor)
-            return rows[0]
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(sql, params)
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), state, note, actor)
-            self._release_migration(tx, item_id, rows[0],
-                                    why="état %s" % state, actor=actor)
+            if state in ("merged", "promoted", "closed"):
+                self._release_migration(tx, item_id, rows[0],
+                                        why="état %s" % state, actor=actor)
             return rows[0]
 
     def designate_reviewer(self, item_id, reviewer, *, actor, remove=False,
@@ -1272,6 +1298,8 @@ class WorkItems(interface.WorkItems):
         journal ; le dernier commit vu est oublié si la branche change. None
         si le lot n'est plus ouvert."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 "UPDATE work_items SET"
                 "       branch_head = CASE WHEN branch IS DISTINCT FROM %%s"
@@ -1374,8 +1402,10 @@ class WorkItems(interface.WorkItems):
         elif number is None:
             value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
                      "               WHERE migration_repo = %s"
-                     "                 AND state NOT IN ('merged', 'promoted', 'closed')))")
-            params = (int(floor), repo)
+                     "                 AND state NOT IN ('merged', 'promoted', 'closed')),"
+                     " (SELECT coalesce(max(number), 0) + 1 FROM work_migration_reservations"
+                     " WHERE target_repo = %s AND status = 'reserved'))")
+            params = (int(floor), repo, "github.com/" + repo)
         else:
             value, params = "%s", (int(number),)
         # `release` libère aussi un lot déjà terminal (#956) ; les autres
@@ -1388,6 +1418,8 @@ class WorkItems(interface.WorkItems):
         while True:
             try:
                 with self.db.transaction() as tx:
+                    if not _lock_migration_writer(tx, item_id, None if release else repo):
+                        return None
                     if not release:
                         # #956 : une réservation héritée d'un lot terminal
                         # (prise avant ce correctif) ne tient plus le numéro :
@@ -1427,7 +1459,8 @@ class WorkItems(interface.WorkItems):
                     return rows[0]
             except DbError as exc:
                 if (number is not None or release
-                        or not is_unique_violation(exc, MIGRATION_INDEX)):
+                        or not (is_unique_violation(exc, MIGRATION_INDEX)
+                                or is_unique_violation(exc, "work_migration_reservations_active_idx"))):
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1991,41 +2024,46 @@ class WorkItems(interface.WorkItems):
         filtre est dans le SQL (#1922/N8).
         """
         number, repo = landed if landed else (None, None)
-        with self.db.transaction() as tx:
-            locked = tx.query(
-                "SELECT id FROM work_items WHERE id = %s AND state = %s AND "
-                + _UNPINNED + " FOR UPDATE",
-                (int(item_id), current))
-            if not locked:
-                return None
-            if frozen_id is not None:
-                latest = tx.query(
-                    "SELECT id FROM work_item_milestones"
-                    " WHERE work_item_id = %s AND kind = 'frozen'"
-                    " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
-                if not latest or int(latest[0]["id"]) != int(frozen_id):
+        try:
+            with self.db.transaction() as tx:
+                if not _lock_migration_writer(tx, item_id):
                     return None
-            rows = tx.query(
-                """
-                UPDATE work_items
-                   SET state = 'merged', updated_at = now(), closed_at = NULL,
-                       pr_ref = coalesce(%s, pr_ref),
-                       migration_landed = coalesce(%s, migration_landed),
-                       migration_landed_repo = coalesce(%s, migration_landed_repo)
-                 WHERE id = %s AND state = %s AND __UNPINNED__
-                RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", item_columns(self.db)).replace(
-                    "__UNPINNED__", _UNPINNED),
-                (pr_ref, number, repo, int(item_id), current))
-            if not rows:
-                return None
-            WorkItems(tx)._event(int(item_id), "merged", note, actor)
-            self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
-            tx.query(
-                "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
-                " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
-                (sha or "", actor or "", note or "", int(item_id)))
-            return rows[0]
+                locked = tx.query(
+                    "SELECT id FROM work_items WHERE id = %s AND state = %s AND "
+                    + _UNPINNED + " FOR UPDATE",
+                    (int(item_id), current))
+                if not locked:
+                    return None
+                if frozen_id is not None:
+                    latest = tx.query(
+                        "SELECT id FROM work_item_milestones"
+                        " WHERE work_item_id = %s AND kind = 'frozen'"
+                        " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+                    if not latest or int(latest[0]["id"]) != int(frozen_id):
+                        raise _Refrozen()
+                rows = tx.query(
+                    """
+                    UPDATE work_items
+                       SET state = 'merged', updated_at = now(), closed_at = NULL,
+                           pr_ref = coalesce(%s, pr_ref),
+                           migration_landed = coalesce(%s, migration_landed),
+                           migration_landed_repo = coalesce(%s, migration_landed_repo)
+                     WHERE id = %s AND state = %s AND __UNPINNED__
+                    RETURNING __COLUMNS__
+                    """.replace("__COLUMNS__", item_columns(self.db)).replace(
+                        "__UNPINNED__", _UNPINNED),
+                    (pr_ref, number, repo, int(item_id), current))
+                if not rows:
+                    return None
+                WorkItems(tx)._event(int(item_id), "merged", note, actor)
+                self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
+                tx.query(
+                    "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
+                    " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
+                    (sha or "", actor or "", note or "", int(item_id)))
+                return rows[0]
+        except _Refrozen:
+            return None
 
     def close(self, item_id, *, current, reason, superseded_by, sha="", actor, note) -> dict | None:
         """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
@@ -2034,6 +2072,8 @@ class WorkItems(interface.WorkItems):
         porte le `sha` de la tête relue. Un lot pinné sur une révision Process
         n'est jamais fermé ici : le filtre est dans le SQL (#1922/N8)."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 """
                 UPDATE work_items
