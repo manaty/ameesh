@@ -188,6 +188,28 @@ class AccountTailGaugeTest(Sandbox, unittest.TestCase):
         self.assertAlmostEqual(self.book().claude_gauges("primary", "primary")[0].used,
                                0.25)
 
+    def test_flux_sans_marqueur_non_date_par_la_mtime(self):
+        # #1720 : la mtime du journal (dernière écriture, tous événements
+        # confondus) ne date plus un flux sans marqueur — sinon ce relevé
+        # battrait à tort un widget plus frais (#1648). Il reste lu, non daté.
+        self.agent("legacy", "claude")
+        self.events("legacy", self.reading(0.25))
+        os.utime(os.path.join(self.state, "legacy", "events.jsonl"),
+                 (self.now + 3600, self.now + 3600))
+        gauges = self.book().claude_gauges("primary", "primary")
+        self.assertAlmostEqual(gauges[0].used, 0.25)
+        self.assertFalse(gauges[0].read_at)     # non daté, jamais la mtime
+
+    def test_un_evenement_qui_porte_sa_date_se_date_lui_meme(self):
+        # #1720 : quand l'événement porte lui-même une date (ts/timestamp),
+        # elle sert de read_at, même sur un flux sans marqueur.
+        self.agent("legacy", "claude")
+        event = self.reading(0.25)
+        event["ts"] = self.now - 42
+        self.events("legacy", event)
+        gauge = self.book().claude_gauges("primary", "primary")[0]
+        self.assertAlmostEqual(gauge.read_at, self.now - 42, delta=1)
+
     def test_unmarked_prefix_of_marked_stream_is_unknown(self):
         self.agent("long", "claude")
         self.events("long", self.reading(0.89), self.marker("secondary", self.now),
