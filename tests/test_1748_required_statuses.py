@@ -12,7 +12,7 @@ import json
 import types
 import unittest
 
-from ameesh import land, merge_pr, merge_queue, radar
+from ameesh import fire, land, merge_pr, merge_queue, radar
 
 from .test_l160g_nexlink import _Gh, _run
 
@@ -158,6 +158,30 @@ class MergePrTest(unittest.TestCase):
         # an unreadable head branch gets every declared prefix
         with self.assertRaises(merge_pr.MergePrError):
             merge_pr._pr_guards(dict(view, headRefName=""), 7, SHA, "develop", PROJECT)
+
+
+class FireTest(unittest.TestCase):
+    """#1374 (fire.ready_pr), arrived on main after the freeze: the pilot's
+    fire merges on the same gate."""
+
+    def test_fire_waits_for_the_lot_status(self):
+        project = radar.Project("nexlink", "/r", github="o/nexlink",
+                                required_statuses=(("integration/**", "lot/"),))
+        status = {"number": 7, "base": "develop", "draft": False, "ci": "green",
+                  "branch": "integration/paquet-9", "rollup": BOOTSTRAP_ONLY}
+        ok, why = fire.ready_pr(status, target="develop", project=project, frozen=SHA)
+        self.assertFalse(ok)
+        self.assertIn("lot/*", why)
+        ok, _ = fire.ready_pr(dict(status, rollup=BOOTSTRAP_ONLY + [_status("lot/x")]),
+                              target="develop", project=project, frozen=SHA)
+        self.assertTrue(ok)
+        # an unreadable head branch gets every declared prefix
+        ok, _ = fire.ready_pr(dict(status, branch=""), target="develop", project=project,
+                              frozen=SHA)
+        self.assertFalse(ok)
+        # no setting: unchanged
+        ok, _ = fire.ready_pr(status, target="develop", project=None, frozen=SHA)
+        self.assertTrue(ok)
 
 
 if __name__ == "__main__":
