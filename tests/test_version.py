@@ -8,6 +8,7 @@ import contextlib
 import io
 import os
 import re
+import tempfile
 import unittest
 from importlib import metadata
 from unittest import mock
@@ -51,8 +52,12 @@ class VersionTest(unittest.TestCase):
             self.assertEqual(text, "ameesh %s\n" % ameesh.version(), argv)
 
     def test_doctor_prints_version_first(self):
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write("{}\n")
+        self.addCleanup(os.unlink, fh.name)
         cfg = config_mod.load({"AMEESH_DSN": "postgresql://personne@127.0.0.1:1/rien",
-                               "AMEESH_CONFIG": os.path.join(ROOT, ".config-absente.json")})
+                               "AMEESH_CONFIG": fh.name})
         out = io.StringIO()
         with mock.patch.object(db_mod, "connect", side_effect=db_mod.Unavailable("test")), \
                 contextlib.redirect_stdout(out):

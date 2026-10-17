@@ -127,7 +127,8 @@ class DemandeTest(_Base):
         self.db.execute("UPDATE agent_registry SET responsible = NULL WHERE name = 'orch'")
         self.db.execute("UPDATE agent_registry SET responsible = %s WHERE name = 'dev1'",
                         ("human:carol",))
-        troisieme = work.add(self.db, title="troisième", assignee="dev1")
+        troisieme = work.add(self.db, title="troisième", assignee="dev1",
+                             force="test: second lot of dev1 not started (#540)")
         self.assertEqual(self.ask(lot=str(troisieme["id"]))["owner"], "human:carol")
         # 4. personne : tout humain du mesh
         self.db.execute("UPDATE agent_registry SET responsible = NULL")
@@ -246,6 +247,8 @@ class ReponseTest(_Base):
         self.assertEqual((rows[0]["sender"], rows[0]["kind"], rows[0]["work_item_id"],
                           rows[0]["delivered_at"]), (ALICE, "reply", str(self.lot["id"]), None))
         self.assertEqual(rows[0]["payload"]["decision_answer"]["option"], "a")
+        # #795 : la réponse de l'owner est urgente — elle préempte le tour
+        self.assertTrue(rows[0]["payload"]["urgent"])
         self.assertIn("Decision #1 — answer from owner human:alice (cli)", rows[0]["body"])
         self.assertIn('Exact text: "a"', rows[0]["body"])
         self.assertEqual(decisions.pending(self.db), [])

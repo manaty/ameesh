@@ -36,6 +36,9 @@ class AuditReportingTest(unittest.TestCase):
     def finding(self):
         store = mock.Mock()
         store.audit_evidence.return_value = [missing()]
+        # Pas de règle require_qa dans cette politique : le constat reste celui
+        # de la preuve d'exécution (L244 ajoute les constats QA à part).
+        store.policy.return_value = None
         return it.audit(store, "acme")[0]
 
     def test_no_active_modules_and_unknown_module_do_not_run_it(self):

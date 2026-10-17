@@ -5,6 +5,7 @@ watch recorded in the database (0362) and shown in `ameesh projects`."""
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import stat
 import subprocess
@@ -17,7 +18,7 @@ from unittest import mock
 from ameesh import db as db_mod
 from ameesh import fil, projects, storage, watch
 
-from .support import PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase
 
 
 class TextTest(unittest.TestCase):
@@ -38,6 +39,18 @@ class TextTest(unittest.TestCase):
         # every deployment, the owner keeps production
         for words in ("Merge first", "PREPARED in full", "rollback", "owner's decisions"):
             self.assertIn(words, text)
+        # the working rules of the canon (home#71, §§3/6/11 bis/12): integration
+        # by packages, review before CI and no CI per lot between cuts, sober
+        # proofs — carried by the injected text because the Process card is
+        # truncated in the brief
+        for words in ("packages", "30 min at most", "Review before CI",
+                      "frozen head", "cancelled", "Sober proofs",
+                      "a proof is a link", "sha256", "merge-tree", "3 lines"):
+            self.assertIn(words, text)
+        # #1676 : le paquet est celui de la coupure, avec tous les lots prêts —
+        # plus la promesse « about ten lots » que le §11 bis a remplacée
+        self.assertIn("next cut's single package", text)
+        self.assertNotIn("about ten lots", text)
         self.assertIsNone(fil.unreadable_reason(text))
 
     def test_units(self):
@@ -85,7 +98,7 @@ class TextTest(unittest.TestCase):
         for line in pinned.splitlines():
             name, _, value = line.partition("=")
             timer_env[name] = value.strip('"')
-        cfg = config_mod.load(env=dict(timer_env, AMEESH_CONFIG="/nonexistent"))
+        cfg = config_mod.load(env=dict(timer_env, AMEESH_CONFIG=EMPTY_CONFIG))
         self.assertEqual((cfg.dsn, cfg.host), ("postgresql://b/db", "vm-b"))
 
     def test_linger(self):
@@ -377,6 +390,285 @@ class WatchTest(PgTestCase):
         self.assertIn("watch: every 30m on laptop, never sent", text)
         narrow = "\n".join(projects.format_lines(view, 50, show_inactive=True))
         self.assertIn("watch: every 30m on laptop", narrow)
+
+
+class WakeTest(PgTestCase):
+    """#1020: the one-shot wake carries the identity of its agent BY
+    CONSTRUCTION, and the witness reads the installed unit back."""
+
+    def setUp(self) -> None:
+        self.register("w121", "claude")
+        self.units = tempfile.mkdtemp(prefix="ameesh-1020-")
+        self.addCleanup(shutil.rmtree, self.units, True)
+        self.env = {watch.UNIT_DIR_ENV: self.units, "PATH": "/usr/bin:/bin",
+                    "AMEESH_DSN": "postgres://u:secret@db/x", "AMEESH_HOST": "laptop"}
+        self.here = dataclasses.replace(self.cfg, host="laptop")
+        patcher = mock.patch.object(watch.platform, "is_linux", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.calls: list = []
+        self.unit_env = 'PATH=/usr/bin:/bin AGENT_MAIL_NAME=w121'
+        self.exec_start = ("{ path=/usr/bin/env ; "
+                           "argv[]=/usr/bin/env AGENT_MAIL_NAME=w121 "
+                           "/home/u/.local/bin/ameesh watch fire --agent w121 "
+                           "--wake deadline ; ignore_errors=no ; status=0/0 }")
+        self.timer_state = "active"
+
+    def run_(self, argv, **kw):
+        self.calls.append(argv[2:])
+        if argv[2:4] == ["show", "-p"]:
+            prop = argv[4]
+            if prop == "Environment":
+                return mock.Mock(returncode=0, stdout=self.unit_env, stderr="")
+            if prop == "ExecStart":
+                return mock.Mock(returncode=0, stdout=self.exec_start, stderr="")
+            if prop == "ActiveState":
+                return mock.Mock(returncode=0, stdout=self.timer_state + "\n", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def run_for(self, agent: str):
+        """The systemd answers of the identity witness for a wake of `agent`
+        (`run_` answers for w121, the default agent of these tests)."""
+        def run_(argv, **kw):
+            self.calls.append(argv[2:])
+            if argv[2:4] == ["show", "-p"]:
+                if argv[4] == "Environment":
+                    return mock.Mock(returncode=0, stdout="PATH=/usr/bin:/bin %s=%s"
+                                     % (watch.IDENTITY_ENV, agent), stderr="")
+                if argv[4] == "ExecStart":
+                    return mock.Mock(returncode=0, stdout="argv[]=/usr/bin/env %s=%s …"
+                                     % (watch.IDENTITY_ENV, agent), stderr="")
+                if argv[4] == "ActiveState":
+                    return mock.Mock(returncode=0, stdout=self.timer_state + "\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        return run_
+
+    def arm(self, message="REVEIL #1020 : verifier le temoin", **kw):
+        return watch.arm(self.here, self.db, "w121", "deadline", 1800, message,
+                         run=self.run_, env=self.env, actor="human:owner", **kw)
+
+    def register_more(self, name: str):
+        """`PgTestCase.register` after `setUp`: the `self.env` dict handed to
+        `watch.arm` shadows the `env()` method the CLI runner calls."""
+        env = self.env
+        del self.env
+        try:
+            return self.register(name, "claude")
+        finally:
+            self.env = env
+
+    def test_the_unit_declares_and_applies_the_identity(self):
+        found = watch.wake_units("w121", "deadline", 1800,
+                                 "/home/u/.local/bin/ameesh", "/usr/bin:/bin", "/units")
+        self.assertEqual(sorted(found),
+                         ["ameesh-wake-4-w121-deadline.service",
+                          "ameesh-wake-4-w121-deadline.timer"])
+        service = found["ameesh-wake-4-w121-deadline.service"]
+        # declared, and applied on the exec line: systemd's EnvironmentFile
+        # overrides Environment=, so env(1) is what the child really carries
+        self.assertIn('Environment="AGENT_MAIL_NAME=w121"', service)
+        self.assertIn('ExecStart="%s" "AGENT_MAIL_NAME=w121" '
+                      '"/home/u/.local/bin/ameesh" watch fire '
+                      '--agent w121 --wake deadline' % watch._env_binary(), service)
+        # the environment files come before the exec line that pins the identity
+        self.assertLess(service.index("EnvironmentFile=-%h/.config/ameesh/env"),
+                        service.index('ExecStart='))
+        self.assertLess(service.index("EnvironmentFile=-/units/ameesh-wake-4-w121-deadline.env"),
+                        service.index('ExecStart='))
+        self.assertIn("Restart=on-failure", service)   # a failed firing retries
+        timer = found["ameesh-wake-4-w121-deadline.timer"]
+        self.assertIn("OnCalendar=", timer)
+        self.assertNotIn("OnActiveSec=", timer)
+        self.assertIn("AccuracySec=1s\n", timer)
+        self.assertNotIn("OnUnitActiveSec", timer)     # one shot, not a period
+
+    def test_parse_wake_delay(self):
+        self.assertEqual(watch.parse_wake_delay("45m", None), 2700)
+        self.assertEqual(watch.parse_wake_delay("2h", None), 7200)
+        self.assertEqual(watch.parse_wake_delay(None, "2026-10-13T20:00:00Z",
+                                                now=1791918000.0), 3600)
+        for argv in [("45m", "2026-10-13T20:00:00Z"), (None, None),
+                     ("5", None), (None, "2026-10-13T20:00:00")]:
+            with self.assertRaises(watch.WatchError, msg=argv):
+                watch.parse_wake_delay(argv[0], argv[1], now=1791918000.0)
+
+    def test_arm_fire_and_the_identity_witness(self):
+        text = self.arm()
+        self.assertIn("AGENT_MAIL_NAME=w121 pinned", text)
+        self.assertEqual(sorted(os.listdir(self.units)),
+                         ["ameesh-wake-4-w121-deadline.env",
+                          "ameesh-wake-4-w121-deadline.service",
+                          "ameesh-wake-4-w121-deadline.timer",
+                          "ameesh-wake-4-w121-deadline.wake.json"])
+        state = os.path.join(self.units, "ameesh-wake-4-w121-deadline.wake.json")
+        self.assertEqual(stat.S_IMODE(os.stat(state).st_mode), 0o600)
+        with open(state, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["message"], "REVEIL #1020 : verifier le temoin")
+        self.assertIn(["daemon-reload"], self.calls)
+        self.assertIn(["start", "ameesh-wake-4-w121-deadline.timer"], self.calls)
+        # the identity is read back from systemd, not trusted: declared, and
+        # applied on the exec line (the one an environment file cannot take)
+        self.assertIn(["show", "-p", "Environment", "--value",
+                       "ameesh-wake-4-w121-deadline.service"], self.calls)
+        self.assertIn(["show", "-p", "ExecStart", "--value",
+                       "ameesh-wake-4-w121-deadline.service"], self.calls)
+        # a firing without the identity is refused by the witness: this is the
+        # failure that muted the seven watches
+        with self.assertRaisesRegex(watch.WatchError, "AGENT_MAIL_NAME"):
+            watch.fire(self.here, self.db, "w121", "deadline", run=self.run_,
+                       env={watch.UNIT_DIR_ENV: self.units})
+        # with it, the message is delivered to the agent, from the agent
+        with mock.patch.object(watch.fil, "record") as thread:
+            self.assertEqual(watch.fire(self.here, self.db, "w121", "deadline",
+                                        run=self.run_,
+                                        env={"AGENT_MAIL_NAME": "w121",
+                                             watch.UNIT_DIR_ENV: self.units}),
+                             "wake deadline fired: message sent to w121")
+        [message] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                     if m["sender"] == "w121"]
+        self.assertEqual(message["body"], "REVEIL #1020 : verifier le temoin")
+        self.assertEqual(thread.call_args.kwargs["meta"],
+                         {"action": "wake", "wake": "deadline", "host": "laptop",
+                          "audit": "watch"})
+        self.assertEqual(thread.call_args.kwargs["mailbox_ids"], [int(message["id"])])
+        # fired once: the wake is removed
+        self.assertEqual(os.listdir(self.units), [])
+
+    def test_a_wake_never_takes_the_files_of_a_watch(self):
+        # lot #1039: `ameesh-watch-<agent>-<slug>` was exactly the name of the
+        # periodic watch of an agent called `<agent>-<slug>`: arming the wake
+        # stopped that watch's timer, overwrote its units and its pinned env,
+        # and the firing removed them — the watch was lost while its
+        # agent_watches row still showed it active.
+        self.register_more("x")
+        self.register_more("x-deadline")
+        for name, text in watch.units("x-deadline", 1800, "/home/u/.local/bin/ameesh",
+                                      "/usr/bin:/bin", self.units).items():
+            with open(os.path.join(self.units, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        with open(os.path.join(self.units, watch.env_name("x-deadline")), "w",
+                  encoding="utf-8") as fh:
+            fh.write('AMEESH_HOST="laptop"\n')
+
+        def watch_files():
+            return {name: open(os.path.join(self.units, name), encoding="utf-8").read()
+                    for name in sorted(os.listdir(self.units))
+                    if name.startswith(watch.UNIT_PREFIX)}
+        before = watch_files()
+        self.assertEqual(sorted(before), ["ameesh-watch-x-deadline.env",
+                                          "ameesh-watch-x-deadline.service",
+                                          "ameesh-watch-x-deadline.timer"])
+        with mock.patch.object(watch.fil, "record"):
+            watch.arm(self.here, self.db, "x", "deadline", 1800, "REVEIL x",
+                      run=self.run_for("x"), env=self.env, actor="human:owner")
+        self.assertEqual(watch_files(), before)          # the watch is untouched
+        with mock.patch.object(watch.fil, "record"):
+            watch.fire(self.here, self.db, "x", "deadline", run=self.run_for("x"),
+                       env={"AGENT_MAIL_NAME": "x", watch.UNIT_DIR_ENV: self.units})
+        # the firing takes its own wake away, never the watch of `x-deadline`
+        self.assertEqual(watch_files(), before)
+
+    def test_two_wakes_whose_flat_names_would_meet_stay_distinct(self):
+        # lot #1039: (a, b-c) and (a-b, c) flatten to the same `a-b-c`; the
+        # second wake would overwrite the units, the pinned env and the message
+        # of the first (and one of the two messages would be lost). The length
+        # of the agent keeps the two pairs apart.
+        self.register_more("a")
+        self.register_more("a-b")
+        self.assertEqual(watch.wake_name("a", "b-c", "timer"), "ameesh-wake-1-a-b-c.timer")
+        self.assertEqual(watch.wake_name("a-b", "c", "timer"), "ameesh-wake-3-a-b-c.timer")
+
+        def names(agent, slug):
+            return {watch.wake_name(agent, slug, suffix)
+                    for suffix in ("service", "timer", "wake.json")} \
+                | {watch.wake_env_name(agent, slug)}
+        self.assertEqual(names("a", "b-c") & names("a-b", "c"), set())
+
+        for agent, slug in (("a", "b-c"), ("a-b", "c")):
+            with mock.patch.object(watch.fil, "record"):
+                watch.arm(self.here, self.db, agent, slug, 1800, "REVEIL %s" % agent,
+                          run=self.run_for(agent), env=self.env, actor="human:owner")
+        self.assertEqual(sorted(name for name in os.listdir(self.units)
+                                if name.endswith(".wake.json")),
+                         ["ameesh-wake-1-a-b-c.wake.json",
+                          "ameesh-wake-3-a-b-c.wake.json"])
+        # each firing sends its own message and removes only its own wake
+        for agent, slug in (("a", "b-c"), ("a-b", "c")):
+            with mock.patch.object(watch.fil, "record"):
+                watch.fire(self.here, self.db, agent, slug, run=self.run_for(agent),
+                           env={"AGENT_MAIL_NAME": agent,
+                                watch.UNIT_DIR_ENV: self.units})
+        self.assertEqual(os.listdir(self.units), [])
+        for agent in ("a", "a-b"):
+            [message] = [m for m in storage.of(self.db).mailbox.unread(agent, 200)
+                         if m["sender"] == agent]
+            self.assertEqual(message["body"], "REVEIL %s" % agent)
+
+    def test_arm_refuses_a_unit_that_does_not_carry_the_identity(self):
+        self.unit_env = "PATH=/usr/bin:/bin"     # what a hand-made unit shows
+        with self.assertRaisesRegex(watch.WatchError, "does not carry"):
+            self.arm()
+        self.assertEqual(os.listdir(self.units), [])            # nothing left armed
+        self.assertIn(["stop", "ameesh-wake-4-w121-deadline.timer"], self.calls)
+
+    def test_arm_refuses_a_unit_whose_exec_does_not_apply_the_identity(self):
+        # the declaration alone is not enough: an EnvironmentFile overrides
+        # Environment= (systemd), so a host file could take the identity away
+        # from the child — the witness must read the pinned exec line.
+        self.exec_start = ("{ path=/home/u/.local/bin/ameesh ; "
+                           "argv[]=/home/u/.local/bin/ameesh watch fire --agent w121 "
+                           "--wake deadline ; ignore_errors=no ; status=0/0 }")
+        with self.assertRaisesRegex(watch.WatchError, "does not apply"):
+            self.arm()
+        self.assertEqual(os.listdir(self.units), [])
+        self.assertIn(["stop", "ameesh-wake-4-w121-deadline.timer"], self.calls)
+
+    def test_arm_refuses_a_timer_that_is_not_active(self):
+        self.timer_state = "inactive"
+        with self.assertRaisesRegex(watch.WatchError, "timer is 'inactive'"):
+            self.arm()
+        self.assertEqual(os.listdir(self.units), [])
+
+    def test_cancel(self):
+        self.arm()
+        self.calls.clear()
+        self.assertEqual(watch.disarm(self.here, self.db, "w121", "deadline",
+                                      run=self.run_, env=self.env,
+                                      actor="human:owner"),
+                         "wake deadline of w121 cancelled by human:owner")
+        self.assertEqual(os.listdir(self.units), [])
+        with self.assertRaisesRegex(watch.WatchError, "no wake deadline of w121"):
+            watch.disarm(self.here, self.db, "w121", "deadline", run=self.run_,
+                         env=self.env, actor="human:owner")
+
+    def test_refusals(self):
+        with self.assertRaises(watch.WatchError):
+            watch.arm(self.here, self.db, "nobody", "deadline", 1800, "m",
+                      run=self.run_, env=self.env, actor="human:owner")
+        for slug in ("", "Deadline", "a b", "-"):
+            with self.assertRaises(watch.WatchError, msg=slug):
+                watch.arm(self.here, self.db, "w121", slug, 1800, "m",
+                          run=self.run_, env=self.env, actor="human:owner")
+        with self.assertRaises(watch.WatchError):
+            self.arm(message="   ")
+
+    def test_who_arms_the_wake_of_another_agent(self):
+        # the rule of `watch enable`: an agent arms its own wake
+        from ameesh import assignments, identity
+        def as_(name, orchestrator=False):
+            return mock.patch.multiple(
+                identity, resolve_binding=mock.Mock(return_value=SimpleNamespace(name=name))), \
+                mock.patch.object(assignments, "is_orchestrator", return_value=orchestrator)
+        who, role = as_("dev9")
+        with who, role, self.assertRaisesRegex(watch.WatchError, "only its own watch"):
+            watch.arm(self.here, self.db, "w121", "deadline", 1800, "m",
+                      run=self.run_, env=self.env)
+        self.assertEqual((os.listdir(self.units), self.calls), ([], []))
+        who, role = as_("mesh-design", orchestrator=True)
+        with who, role:
+            watch.arm(self.here, self.db, "w121", "deadline", 1800, "m",
+                      run=self.run_, env=self.env)
+        self.assertEqual(len(os.listdir(self.units)), 4)
 
 
 if __name__ == "__main__":

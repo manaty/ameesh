@@ -85,6 +85,10 @@ def _row(row: dict) -> dict:
     return row
 
 
+def _iso_day(value) -> str | None:
+    return str(value)[:10] if value else None
+
+
 def _set_clause(dates: dict) -> tuple[list[str], list]:
     sets, params = [], []
     for key, column in _DATE_KEYS.items():
@@ -96,15 +100,22 @@ def _set_clause(dates: dict) -> tuple[list[str], list]:
 
 class Roadmap(interface.Roadmap):
 
-    def plan_item(self, item_id, dates, *, source, actor) -> dict | None:
+    def plan_item(self, item_id, dates, *, source, actor, expect=None) -> dict | None:
         sets, params = _set_clause(dates)
         sets += ["planned_source = coalesce(%s, planned_source)", "planned_by = %s",
                  "planned_at = now()"]
         params += [source, actor or ""]
+        where, keys = "id = %s", [int(item_id)]
+        if expect is not None:          # #740: unchanged since it was read
+            where += (" AND planned_start IS NOT DISTINCT FROM %s::date"
+                      " AND planned_end IS NOT DISTINCT FROM %s::date"
+                      " AND planned_source IS NOT DISTINCT FROM %s")
+            keys += [_iso_day(expect.get("planned_start")),
+                     _iso_day(expect.get("planned_end")), expect.get("planned_source")]
         rows = self.db.query(
-            "UPDATE work_items SET %s WHERE id = %%s RETURNING %s" % (
-                ", ".join(sets), _PLAN_COLUMNS),
-            tuple(params) + (int(item_id),))
+            "UPDATE work_items SET %s WHERE %s RETURNING %s" % (
+                ", ".join(sets), where, _PLAN_COLUMNS),
+            tuple(params) + tuple(keys))
         if not rows:
             return None
         rows[0]["id"] = int(rows[0]["id"])

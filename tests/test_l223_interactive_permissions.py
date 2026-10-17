@@ -21,7 +21,7 @@ import unittest
 from unittest import mock
 
 from ameesh import adapters, harness_cli, harnesses, registry
-from ameesh.runner import run_attach
+from ameesh.runner import agent_incarnation, run_attach
 
 from .support import FAKEBIN, PgTestCase
 
@@ -439,6 +439,44 @@ class AttachPermissionTest(PgTestCase):
         self.assertEqual(argv[:2], ["--permission-mode", "auto"])
         self.assertNotIn("bypassPermissions", argv)
         self.assertIn("another registration", err)
+
+    def test_permission_mode_binds_to_the_registration_the_claim_claimed(self):
+        # L719 (#685 follow-up P3): the mode is verified against the row that
+        # `attach_claim` actually claimed, not the read that preceded it —
+        # deleting and recreating the agent in that window must not inherit the
+        # bypass; the incarnation comes from under the claim's row lock.
+        proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("bypassPermissions", self._attach())
+        cwd = os.path.join(self.tmp, "work", "perm")
+        real_get = registry.get
+
+        def get_then_recreate(db, name):
+            stale = real_get(db, name)
+            if name == "perm":
+                self.db.execute("delete from agent_registry where name = %s", ("perm",))
+                self.register("perm", "claude", cwd=cwd)
+            return stale
+
+        with mock.patch.object(registry, "get", side_effect=get_then_recreate):
+            argv, err = self._attach_capturing_stderr()
+        self.assertEqual(argv[:2], ["--permission-mode", "auto"])
+        self.assertNotIn("bypassPermissions", argv)
+        self.assertIn("another registration", err)
+        # the claimed registration is the new one: a mode set for it applies
+        proc = self.mesh("set", "perm", "permission_mode=plan")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._attach()[:2], ["--permission-mode", "plan"])
+
+    def test_attach_claim_returns_the_claimed_identity(self):
+        # L719: attach_claim hands back the harness and the incarnation it
+        # claimed (read under its own row lock) so attach can bind the mode to
+        # the registration it really took, not to an earlier read
+        agent = registry.get(self.db, "perm")
+        lease = registry.attach_claim(self.db, "perm", "attach:identity", 30)
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease["harness"], "claude")
+        self.assertEqual("%.6f" % lease["created_ts"], agent_incarnation(agent))
 
     def test_revocation_failure_is_visible_and_inert(self):
         # L685 review r2 P2: with a non-writable state directory the unlink

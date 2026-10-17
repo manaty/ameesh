@@ -260,7 +260,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("applies to a task", proc.stderr)
         work.move(self.db, lot["id"], "build")
-        work.merged(self.db, lot["id"], sha="abcdef1")
+        work.close_merged(self.db, lot["id"], sha="abcdef1")
         with self.assertRaises(estimates.EstimateError):
             estimates.set_estimate(self.db, lot["id"], "1h")
 
@@ -287,7 +287,7 @@ class EstimatesPgTest(PgTestCase):
         création est antidatée avant le début (`estimated_before`)."""
         if work.get(self.db, lot_id)["state"] == "intake":
             work.move(self.db, lot_id, "build")
-        work.merged(self.db, lot_id, sha="abcdef1")
+        work.close_merged(self.db, lot_id, sha="abcdef1")
         self.db.execute(
             "UPDATE work_items SET started_at = now() - make_interval(mins => %s)"
             " WHERE id = %s", (int(started_min_ago), int(lot_id)))
@@ -338,6 +338,29 @@ class EstimatesPgTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("BY ESTIMATE AUTHOR", proc.stdout)
 
+    def test_lot_livre_hors_cible_compte_comme_livre(self):
+        """#988 : un lot clos `delivered` entre dans les écarts (jalon
+        `delivered`), pas dans les exclus."""
+        lot = work.add(self.db, title="rapport hors cible", actor="orch",
+                       estimate="2h", app="p")
+        work.move(self.db, lot["id"], "build", actor="dev1")
+        self.db.execute("UPDATE work_items SET started_at = now() - interval '90 minutes'"
+                        " WHERE id = %s", (lot["id"],))
+        # l'estimation posée à la création précède le début antidaté : pas tardive
+        self.db.execute("UPDATE work_item_estimates SET at = now() - interval '2 hours'"
+                        " WHERE work_item_id = %s", (lot["id"],))
+        work.close(self.db, lot["id"], delivered=True, sha="abcdef1234567890", actor="dev1")
+        rep = estimates.report(self.db, app="p")
+        self.assertEqual(rep["delivered"], 1)
+        self.assertEqual(rep["overall"]["lots"], 1)
+        self.assertEqual(rep["lots"][0]["actual_minutes"], 90.0)
+        self.assertEqual(rep["excluded"]["no_start"], 0)
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("closed   : delivered outside the target (head abcdef123456)",
+                      proc.stdout)
+        self.assertIn("actual 1 h 30", proc.stdout)
+
     def test_projects_colonne_duree(self):
         lot = work.add(self.db, title="Vue", assignee="dev1", estimate="1h")
         estimates.mark_started(self.db, "dev1", [lot["id"]])
@@ -357,7 +380,7 @@ class EstimatesPgTest(PgTestCase):
         proc = self.cli("send", "dev1", "Nouveau travail.", "--from", "orch", "--new-lot",
                         "Sans durée", env=env)
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("message not dropped", proc.stderr)
+        self.assertIn("message not delivered", proc.stderr)
         self.assertIn("estimate required", proc.stderr)
         self.assertEqual(work.list_items(self.db), [])
         proc = self.cli("send", "dev1", "Nouveau travail.", "--from", "orch", "--new-lot",

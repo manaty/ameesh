@@ -54,6 +54,39 @@ class SettingsTest(unittest.TestCase):
         cfg = dataclasses.make_dataclass("Cfg", [("github", dict)])(github={})
         self.assertEqual(plan_github.settings_of(cfg), plan_github.Settings())
 
+    def test_workflows_declares(self):
+        """#1110 : les workflows suivis d'un dépôt se déclarent par projet."""
+        settings = plan_github.parse_settings({"projects": {"app": {
+            "repo": PRIVATE,
+            "workflows": [".github/workflows/backend-suite.yml", "sql-invariant.yaml",
+                          "backend-suite.yml"]}}})
+        self.assertEqual(settings.workflows_for(PRIVATE),
+                         ("backend-suite.yml", "sql-invariant.yaml"))
+        self.assertEqual(settings.workflows_for(PRIVATE.upper()), settings.workflows_for(PRIVATE))
+        self.assertIsNone(settings.workflows_for(PUBLIC))
+        self.assertIsNone(settings.workflows_for(""))
+        # forme courte : aucune liste déclarée, le veilleur découvre
+        self.assertIsNone(plan_github.parse_settings(SETTINGS).workflows_for(PUBLIC))
+
+    def test_base_declaree(self):
+        """#1483 : la base d'un dépôt, quand ce n'est pas main (Nexlink :
+        develop), se déclare par projet."""
+        settings = plan_github.parse_settings({"projects": {"app": {
+            "repo": PRIVATE, "base": "develop"}}})
+        self.assertEqual(settings.bases_for(PRIVATE), ("develop",))
+        self.assertEqual(settings.bases_for(PRIVATE.upper()), ("develop",))
+        self.assertEqual(settings.all_bases(), ("develop",))
+        self.assertIsNone(settings.bases_for(PUBLIC))
+        self.assertIsNone(settings.bases_for(""))
+        # une liste, sans doublon, dans l'ordre de déclaration
+        settings = plan_github.parse_settings({"projects": {
+            "app": {"repo": PRIVATE, "base": ["main", "develop", "develop"]},
+            "web": {"repo": PUBLIC, "base": "release/1"}}})
+        self.assertEqual(settings.bases_for(PRIVATE), ("main", "develop"))
+        self.assertEqual(settings.all_bases(), ("main", "develop", "release/1"))
+        # forme courte : aucune base déclarée, le défaut du veilleur s'applique
+        self.assertIsNone(plan_github.parse_settings(SETTINGS).bases_for(PUBLIC))
+
     def test_refus(self):
         for raw, needle in (
             ([], "JSON object"),
@@ -68,6 +101,15 @@ class SettingsTest(unittest.TestCase):
             ({"exclude_terms": "Globex"}, "list"),
             ({"exclude_terms": [""]}, "list"),
             ({"host": 3}, "host name"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": []}}}, "non-empty"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": "tests.yml"}}}, "non-empty"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": [""]}}}, "workflow file name"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": ["tests.exe"]}}},
+             "not a workflow file name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": []}}}, "branch name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": 7}}}, "branch name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": "de velop"}}}, "branch name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": [""]}}}, "branch name"),
         ):
             with self.subTest(raw=raw):
                 with self.assertRaises(plan_github.SettingsError) as ctx:
@@ -214,6 +256,11 @@ class LotViewTest(unittest.TestCase):
                              issue_of=lambda n: 40 if n == 13 else None)
         self.assertEqual(replaced.closing,
                          "Work item 12 superseded by work item 13 (#40): issue closed by ameesh.")
+        # #988 : livré hors cible = terminé (completed), pas « non prévu »
+        delivered = self.view(True, state="closed", close_reason="delivered")
+        self.assertEqual((delivered.state, delivered.state_reason), ("closed", "completed"))
+        self.assertEqual(delivered.closing,
+                         "Work item 12 delivered outside the target: issue closed by ameesh.")
         self.assertIsNone(self.view(True).closing)
 
     def test_projet_d_un_lot(self):

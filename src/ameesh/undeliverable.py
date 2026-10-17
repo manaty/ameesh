@@ -28,9 +28,15 @@ Les parades, appelées par `ameesh mail send|forward`, `ameesh alerts` /
 * `forward` : `ameesh mail forward <ancien> <nouveau>` re-livre le courrier en
   attente d'une boîte morte à un agent vivant, expéditeur et date d'origine
   gardés, renvoi noté ; l'original n'est plus en attente.
+* `sweep` (L976) : le ménage de l'exécuteur re-livre le courrier d'un agent
+  arrêté dont le successeur est connu, et expire au-delà de
+  `mail_dead_letter_days` celui dont personne ne lit la boîte (arrêté sans
+  successeur, nom absent du registre), avec une trace au fil : l'alerte
+  `mail_undeliverable` peut ainsi se vider sans geste humain. `ameesh mail
+  sweep` fait le même passage à la main.
 
 Le SQL est dans le stockage (`storage.of(db).mailbox` : `dead_letters`,
-`forward`).
+`forward`, `expire_dead_letters`).
 """
 from __future__ import annotations
 
@@ -38,10 +44,13 @@ import os
 import time
 
 from . import db as db_mod
-from . import fil, registry, storage
+from . import fastmail, fil, registry, storage
 
 #: `mail_undeliverable` : courrier en attente depuis 15 min
 DEFAULT_THRESHOLD_S = 900.0
+#: L976 : rétention du courrier en souffrance avant expiration, en jours
+#: (`cfg.mail_dead_letter_days`, 0 = aucune expiration)
+DEFAULT_DEAD_LETTER_DAYS = 7
 #: noms proches proposés au plus
 MAX_SUGGESTIONS = 5
 #: orchestrateurs déclarés (comme `ameesh alerts --orchestrators`)
@@ -53,6 +62,13 @@ REASONS = ("arrete", "inconnu")
 class Refused(Exception):
     """Envoi ou renvoi refusé : rien n'est déposé ; le texte dit pourquoi et
     quoi faire."""
+
+
+class RefusedOld(Refused):
+    """Renvoi refusé à cause de l'ancien destinataire — relancé sous le verrou
+    (« X is not stopped ») : sa boîte est de nouveau lue, aucun successeur n'y
+    changera rien (#1615/N2). Le balayage quitte alors la boucle des
+    successeurs au lieu de répéter le même refus pour chacun."""
 
 
 # --------------------------------------------------------------------------
@@ -211,23 +227,34 @@ def stop_facts(row: dict, now: float | None = None) -> str:
     return "; ".join(parts)
 
 
-def successor(db, row: dict | None, *, bindings: list | None = None) -> str | None:
-    """L'agent qui a repris le travail d'un agent arrêté, s'il est connu : celui
-    auquel sa dernière session est désormais liée (`ameesh mail bind`, L41)."""
+def successor(db, row: dict | None, *, bindings: list | None = None) -> list[str]:
+    """Les agents qui ont repris le travail d'un agent arrêté, s'il en est
+    connu : ceux auxquels sa dernière session est désormais liée (`ameesh mail
+    bind`, L41).
+
+    #1615/N3 : une liste, la liaison la plus récente d'abord (`listing` rend
+    les liaisons récentes d'abord) — et non une chaîne triée alphabétiquement
+    que chaque appelant redécoupait. Un agent lié plusieurs fois ne figure
+    qu'une fois, à la place de sa liaison la plus récente."""
     session = (row or {}).get("session_id")
     if not session:
-        return None
+        return []
     if bindings is None:
         try:
             bindings = storage.of(db).session_bindings.listing()
         except db_mod.SchemaMissing:
             raise
         except db_mod.DbError:
-            return None
-    heirs = sorted({b["agent"] for b in bindings
-                    if b.get("session_id") == session and b.get("agent") != row["name"]
-                    and not b.get("revoked_ts")})
-    return ", ".join(heirs) or None
+            return []
+    heirs: list[str] = []
+    for binding in bindings:
+        agent = binding.get("agent")
+        if not agent or binding.get("session_id") != session or agent == row["name"] \
+                or binding.get("revoked_ts"):
+            continue
+        if agent not in heirs:
+            heirs.append(agent)
+    return heirs
 
 
 # --------------------------------------------------------------------------
@@ -266,10 +293,10 @@ def stopped_recipient_text(db, row: dict, now: float | None = None) -> str:
     repris, et les deux gestes possibles."""
     name = row["name"]
     lines = ["%s is stopped (%s): nobody reads its mailbox." % (name, stop_facts(row, now))]
-    heir = successor(db, row)
-    if heir:
+    heirs = successor(db, row)
+    if heirs:
         lines.append("its work was taken over by %s (its last session is bound to it): "
-                     "agent-mail send %s \"…\"" % (heir, heir.split(", ")[0]))
+                     "agent-mail send %s \"…\"" % (", ".join(heirs), heirs[0]))
     lines.append("to drop it anyway (read when it resumes): --queue; to restart it: "
                  "ameesh resume %s" % name)
     return "\n  ".join(lines)
@@ -293,9 +320,9 @@ def stopped_sender_text(cfg, db, row: dict, *, explicit: bool, binding=None,
     name = row["name"]
     lines = ["sender %s is stopped (%s): replies would go to a mailbox that "
              "nobody reads." % (name, stop_facts(row, now))]
-    heir = successor(db, row)
-    if heir:
-        lines.append("its work was taken over by %s" % heir)
+    heirs = successor(db, row)
+    if heirs:
+        lines.append("its work was taken over by %s" % ", ".join(heirs))
     if binding is None:
         binding = identity.resolve_binding(cfg, db)
     if explicit and binding.ok and binding.name != name:
@@ -335,6 +362,26 @@ def registry_rows(db, names: list[str]) -> dict:
         return {name: directory.get(name) for name in names}
 
 
+def wake_note(cfg, db, name: str, row: dict) -> list[str]:
+    """#858 : avertissement d'un destinataire inscrit mais NON réveillable à
+    l'instant (profil divergé en attente du prochain canon sync, responsable
+    manquant, éphémère échu…). Le message est déposé quand même — c'est lui le
+    réveil durable : il ouvrira un tour dès que l'agent redeviendra réclamable
+    (la passe de l'exécuteur relit `claimable` en continu). Rend `[]` quand un
+    réveil est possible, ou quand aucun n'est attendu : une identité `externe`
+    (session humaine) est lue à son prochain tour, et un destinataire arrêté
+    est déjà refusé ou averti par l'appelant. Le répertoire réduit du contrat
+    1.1 (pas de `mode`) ne permet pas de juger : on n'avertit pas."""
+    if "mode" not in row or (row.get("mode") or "execute") == "externe":
+        return []
+    ok, why, _note = registry.wake_status(db, cfg, name)
+    if ok:
+        return []
+    return ["%s is not wakeable right now (%s): the message is stored, but no turn "
+            "opens until it is claimable again (next canon sync on its host); if the "
+            "request cannot wait, address another agent" % (name, why)]
+
+
 def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
                explicit: bool = False, binding=None, now: float | None = None) -> list[str]:
     """Contrôle d'un envoi `agent-mail send`, AVANT tout dépôt (base seulement).
@@ -342,9 +389,11 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     Lève `Refused` (rien n'est déposé, aucun agent créé) : identité
     d'expéditeur arrêtée ; destinataire absent du registre ; destinataire
     arrêté sans `queue`. Rend les avertissements à dire (destinataire arrêté
-    avec `queue`). `explicit` : l'expéditeur vient de `--from` ; `binding` :
-    l'identité déjà résolue de la session, s'il y en a une. « all » ne
-    contrôle que l'expéditeur (la diffusion écarte elle-même les arrêtés)."""
+    avec `queue` ; #858 : destinataire inscrit mais non réveillable à
+    l'instant — le message part quand même, le réveil attend). `explicit` :
+    l'expéditeur vient de `--from` ; `binding` : l'identité déjà résolue de la
+    session, s'il y en a une. « all » ne contrôle que l'expéditeur (la
+    diffusion écarte elle-même les arrêtés)."""
     names = [sender] if dest in ("all", sender) else [sender, dest]
     rows = registry_rows(db, names)
     row = rows.get(sender)
@@ -357,7 +406,7 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     if row is None:
         raise Refused(unknown_text(cfg, db, dest, sender=sender))
     if row.get("status") != "stopped":
-        return []
+        return wake_note(cfg, db, dest, row)
     if not queue:
         raise Refused(stopped_recipient_text(db, row, now))
     return ["%s is stopped (%s): message queued until it resumes (ameesh resume %s) "
@@ -430,13 +479,9 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
             if row.get("status") != "stopped":
                 continue                  # relancé entre les deux lectures
             if bindings is None:
-                try:
-                    bindings = storage.of(db).session_bindings.listing()
-                except db_mod.SchemaMissing:
-                    raise
-                except db_mod.DbError:
-                    bindings = []
-            heir = successor(db, row, bindings=bindings)
+                bindings = _bindings(db)
+            heirs = successor(db, row, bindings=bindings)
+            heir_text = ", ".join(heirs)
             teams = {team_of(row)}
             reason = "arrete"
             responsible = row.get("responsible") or None
@@ -444,11 +489,12 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
                       "read them — from %s. Re-deliver: ameesh mail forward %s %s; or restart "
                       "the agent: ameesh resume %s"
                       % (group["count"], age, name, stop_facts(row, now), _senders(group),
-                         name, heir.split(", ")[0] if heir else "<live agent>", name))
-            if heir:
-                detail += " (work taken over by %s)" % heir
-            extra.update(stop_reason=row.get("stop_reason") or None, successor=heir,
-                         host=row.get("host") or None)
+                         name, heirs[0] if heirs else "<live agent>", name))
+            if heirs:
+                detail += " (work taken over by %s)" % heir_text
+            detail += _retention_note(cfg)
+            extra.update(stop_reason=row.get("stop_reason") or None,
+                         successor=heir_text or None, host=row.get("host") or None)
         else:
             teams = {team_of(r) for r in senders if r}
             reason = "inconnu"
@@ -463,6 +509,7 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
                       % (group["count"], age, name, _senders(group),
                          "Close names: %s. " % ", ".join(n for n, _why in near) if near else "",
                          name))
+            detail += _retention_note(cfg)
             extra.update(suggestions=[n for n, _why in near])
         orchestras = team_orchestrators(listing, known, {t for t in teams if t},
                                         exclude=(name,))
@@ -511,6 +558,24 @@ def orchestrator_briefs(alert: dict) -> dict:
 # renvoi (`ameesh mail forward <ancien> <nouveau>`)
 # --------------------------------------------------------------------------
 
+def _refus_du_stockage(db, old: str, text: str) -> Refused:
+    """Classe le refus du stockage pendant un renvoi (#1615/N2).
+
+    `RefusedOld` quand l'ancien destinataire est relancé : le refus porte sur
+    lui (sa boîte est de nouveau lue), et le balayage doit quitter la boucle
+    des successeurs. `Refused` sinon (successeur inconnu, ou arrêté). Une
+    course reste possible — l'ancien arrêté juste après la relecture — et le
+    refus est alors classé comme celui du successeur ; l'essai suivant
+    retombe sur le refus de l'ancien."""
+    try:
+        row = registry.get(db, old)
+    except db_mod.DbError:
+        return Refused(text)
+    if row is not None and row.get("status") != "stopped":
+        return RefusedOld(text)
+    return Refused(text)
+
+
 def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
             now: float | None = None) -> dict:
     """Re-livre à `new` le courrier en attente de `old`, une boîte morte.
@@ -520,16 +585,23 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     Chaque message garde son expéditeur, sa date, sa nature et son lot ; la
     copie porte `meta.forwarded_from` (montré au destinataire), l'original
     passe remis avec `meta.forwarded` ; le renvoi est écrit dans le fil.
-    `dry_run` : ce qui serait renvoyé, rien n'est écrit. Lève `Refused`."""
+    `dry_run` : ce qui serait renvoyé, rien n'est écrit. Lève `Refused`.
+
+    L976 (relecture codex3, B1) : le statut de `old` et `new` est relu sous
+    verrou du registre DANS la transaction qui copie ; une relance de l'un ou
+    un arrêt de l'autre, committé entre la lecture et la copie, lève `Refused`
+    au lieu de copier le courrier d'un vivant vers un mort."""
     if old == new:
         raise Refused("old and new recipient are the same (%s)" % old)
     old_row, new_row = db_mod.batched(db, lambda d: [registry.get(d, old),
                                                      registry.get(d, new)])
     if old_row is not None and old_row.get("status") != "stopped":
-        raise Refused("%s is not stopped (status %s): its mailbox is read, its mail will "
-                      "be delivered to it. To empty it to another agent, stop it first "
-                      "(agent-runner stop %s), then forward."
-                      % (old, old_row.get("status") or "?", old))
+        # #1615/N2 : le refus porte sur l'ancien, pas sur le successeur —
+        # `RefusedOld` le dit pour que le balayage n'essaie pas les suivants.
+        raise RefusedOld("%s is not stopped (status %s): its mailbox is read, its mail will "
+                         "be delivered to it. To empty it to another agent, stop it first "
+                         "(agent-runner stop %s), then forward."
+                         % (old, old_row.get("status") or "?", old))
     if new_row is None:
         raise Refused(unknown_text(cfg, db, new))
     if new_row.get("status") == "stopped":
@@ -543,8 +615,22 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
                               "kind": r.get("kind"), "created_ts": r.get("created_ts")}
                              for r in rows],
                 "forwarded": []}
-    moved = storage.of(db).mailbox.forward(old, new, actor)
+    try:
+        moved = storage.of(db).mailbox.forward(old, new, actor)
+    except storage.MailboxRefused as exc:
+        # L976 (relecture codex3, B1) : le statut de `old`/`new` est relu sous
+        # verrou dans la transaction qui copie — une relance ou un arrêt
+        # concurrent gagne ici, jamais entre la lecture et la copie.
+        # #1615/N2 : le refus du stockage ne dit pas lequel des deux a gagné ;
+        # une relecture de l'ancien le dit (relancé → `RefusedOld`), sans quoi
+        # le balayage réessaierait le même refus sur chaque successeur.
+        raise _refus_du_stockage(db, old, str(exc)) from None
     if moved:
+        # #1689 (N1) : les copies sont déposées dans la boîte du nouveau
+        # destinataire sans passer par `mail.send` ; son chemin rapide doit les
+        # voir sans attendre le TTL. Un destinataire d'un autre hôte n'a pas de
+        # marqueur ici : `bump` ne crée rien.
+        fastmail.bump(cfg, new)
         project = fil.project_for(cfg, team_of(new_row), team_of(old_row))
         fil.record(
             cfg, db, sender=actor, recipients=[new],
@@ -558,3 +644,167 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
                   "copies": [int(r["new_id"]) for r in moved]})
     return {"old": old, "new": new, "old_state": state, "dry_run": False,
             "messages": [], "forwarded": moved}
+
+
+# --------------------------------------------------------------------------
+# balayage (`ameesh mail sweep`, ménage de l'exécuteur) — L976
+# --------------------------------------------------------------------------
+
+def _bindings(db) -> list:
+    """Les liaisons de session, une fois : []; un schéma absent remonte."""
+    try:
+        return storage.of(db).session_bindings.listing()
+    except db_mod.SchemaMissing:
+        raise
+    except db_mod.DbError:
+        return []
+
+
+def _retention_days(cfg, days) -> int:
+    days = (getattr(cfg, "mail_dead_letter_days", DEFAULT_DEAD_LETTER_DAYS)
+            if days is None else days)
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        raise ValueError("mail retention must be a whole number of days, >= 0")
+    if days < 0:
+        raise ValueError("mail retention must be a whole number of days, >= 0")
+    return days
+
+
+def _retention_note(cfg) -> str:
+    """Ce que l'alerte dit du balayage automatique, si la rétention est active."""
+    try:
+        days = _retention_days(cfg, None)
+    except ValueError:
+        return ""
+    return ("; expires automatically after %d day(s) without a live successor "
+            "(ameesh mail sweep)" % days) if days > 0 else ""
+
+
+def _trace_expiry(cfg, db, name, row, expired, days, actor) -> None:
+    """Trace d'une expiration, au fil du projet du mort (ou de l'inconnu)."""
+    senders: dict = {}
+    for message in expired:
+        sender = message.get("sender") or "?"
+        senders[sender] = senders.get(sender, 0) + 1
+    fil.record(
+        cfg, db, sender=actor, recipients=[name],
+        text=("Expired %d undeliverable message(s) addressed to %s, pending for more than "
+              "%d day(s): %s; nobody read them. From %s. The messages stay in the mailbox, "
+              "marked expired."
+              % (len(expired), name, days,
+                 "the agent is stopped" if row is not None
+                 else "the name is not in the registry",
+                 ", ".join("%s (%d)" % kv for kv in sorted(senders.items(),
+                                                           key=lambda kv: (-kv[1], kv[0]))))),
+        project=fil.project_for(cfg, team_of(row)),
+        meta={"audit": "expire", "recipient": name, "days": days,
+              "messages": [int(m["id"]) for m in expired]})
+
+
+def sweep(cfg, db, *, days=None, now=None, dry_run=False, actor="ameesh:mail-sweep") -> dict:
+    """L976 : re-livre ou expire le courrier en souffrance, sans geste humain.
+
+    Destinataires visés : ceux de `dead_letters` (agent arrêté, ou nom absent
+    du registre) — personne ne lit leur boîte.
+
+    * un agent arrêté dont le successeur est connu (`successor` : la session de
+      l'arrêté est liée à un agent vivant) : le courrier lui est re-livré
+      (`forward`, tracé au fil), quel que soit son âge ; #1396/N3 : les
+      successeurs sont essayés dans l'ordre, un premier arrêté ne fait plus
+      expirer le courrier quand un suivant est vivant ; si tous sont arrêtés,
+      chaque refus est noté et le courrier suit la rétention ci-dessous au lieu
+      d'attendre indéfiniment ; #1615/N3 : liaison la plus récente d'abord ;
+      #1615/N2 : un refus portant sur l'ancien (relancé sous le verrou) quitte
+      la boucle après une seule entrée, et rien n'est expiré — sa boîte est de
+      nouveau lue ;
+    * sinon, le courrier attendu depuis plus de `days` jours
+      (`mail_dead_letter_days`, 0 = aucune expiration) est expiré
+      (`mailbox.expire_dead_letters` : remis, `meta.expired`), et le fil porte
+      la trace — l'alerte `mail_undeliverable` peut alors se vider sans
+      intervention humaine.
+
+    `dry_run` : ce qui serait fait, rien n'est écrit. Rend `{days, cutoff,
+    dry_run, forwarded, expired, refused}` ; les listes disent le
+    destinataire, le nombre et les ids. Une boîte relancée entre la lecture et
+    l'écriture garde son courrier (le stockage revérifie sous verrou)."""
+    days = _retention_days(cfg, days)
+    now = time.time() if now is None else float(now)
+    cutoff = now - days * 86400.0 if days > 0 else None
+    mail = storage.of(db).mailbox
+    groups = sorted(by_recipient(mail.dead_letters()), key=lambda g: g["recipient"])
+    rows = registry_rows(db, [g["recipient"] for g in groups]) if groups else {}
+    bindings: list | None = None
+    report = {"days": days, "cutoff": cutoff, "dry_run": bool(dry_run),
+              "forwarded": [], "expired": [], "refused": []}
+    for group in groups:
+        name = group["recipient"]
+        row = rows.get(name)
+        if row is not None and row.get("status") != "stopped":
+            continue                  # relancé entre les deux lectures : sa boîte est lue
+        heirs: list[str] = []
+        if row is not None:
+            if bindings is None:
+                bindings = _bindings(db)
+            # #1615/N3 : la liste des successeurs, liaison la plus récente d'abord
+            heirs = successor(db, row, bindings=bindings)
+        # #1396/N3 : tous les successeurs sont essayés dans l'ordre ; un premier
+        # successeur arrêté ne fait plus expirer le courrier quand un suivant est
+        # vivant. Chaque refus reste au rapport, et le balayage ne s'arrête qu'une
+        # fois le courrier remis (ou tous les successeurs refusés).
+        # #1615/N2 : un refus qui porte sur l'ancien (relancé sous le verrou)
+        # quitte la boucle — le répéter pour chaque successeur ne dit rien de
+        # plus — et le courrier n'est pas expiré : sa boîte est de nouveau lue.
+        forwarded = False
+        ancien_relance = False
+        for target in heirs:
+            try:
+                moved = forward(cfg, db, name, target, actor=actor, now=now, dry_run=dry_run)
+            except RefusedOld as exc:
+                # `old_relaunched` : le courrier sera lu par l'ancien, ce refus
+                # n'est pas un échec du balayage (`cli._sweep_failed`).
+                report["refused"].append({"old": name, "new": target, "reason": str(exc),
+                                          "old_relaunched": True})
+                ancien_relance = True
+                break
+            except Refused as exc:
+                # successeur lui-même mort : on essaie le suivant ; si tous
+                # refusent, le courrier suit la rétention ci-dessous plutôt
+                # que d'attendre indéfiniment
+                report["refused"].append({"old": name, "new": target, "reason": str(exc)})
+                continue
+            if dry_run:
+                count = len(moved["messages"])
+                action = {"old": name, "new": target, "count": count, "dry_run": True,
+                          "messages": [int(m["id"]) for m in moved["messages"]]}
+            else:
+                count = len(moved["forwarded"])
+                action = {"old": name, "new": target, "count": count,
+                          "messages": [int(r["original_id"]) for r in moved["forwarded"]],
+                          "senders": sorted({r.get("sender") for r in moved["forwarded"]
+                                             if r.get("sender")})}
+            if count:
+                report["forwarded"].append(action)
+                forwarded = True
+            # rien à renvoyer (déjà remis entre-temps) : inutile d'essayer les autres
+            break
+        if forwarded or ancien_relance:
+            continue
+        due = cutoff is not None and group["oldest_ts"] is not None \
+            and float(group["oldest_ts"]) <= cutoff
+        if not due:
+            continue
+        expired = mail.expire_dead_letters(name, {"at": now, "days": days, "by": actor},
+                                           cutoff, dry_run=dry_run)
+        if not expired:
+            continue                  # relancé, réservé ou déjà remis entre-temps
+        action = {"recipient": name, "count": len(expired),
+                  "oldest_ts": group["oldest_ts"], "unknown": bool(group["unknown"]),
+                  "messages": [int(m["id"]) for m in expired]}
+        if dry_run:
+            report["expired"].append(dict(action, dry_run=True))
+            continue
+        report["expired"].append(action)
+        _trace_expiry(cfg, db, name, row, expired, days, actor)
+    return report

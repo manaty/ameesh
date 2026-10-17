@@ -1,0 +1,494 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#1469 (issue #1101) — shared daily USD envelope per provider billing account.
+
+The seven acceptance tests of the issue: one envelope for every agent and
+host; atomic admission under concurrency, providers independent; settlement
+once, uncertain outcomes kept; calendar day in Europe/Paris with DST and
+midnight; identity independent of key, profile name and host; no bypass by a
+critical agent or failover; recovery, audited limit changes, visible pause.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import threading
+from unittest import mock
+
+from ameesh import account_budget, accounts, registry, storage
+from ameesh.runner import AgentWorker, Runner
+
+from .support import PgTestCase
+
+OPENAI = "openai-manaty"
+DEEPSEEK = "deepseek-manaty"
+
+
+def _profile(billing, name="k1", harness="deepseek", reserve=2.0):
+    return accounts.Profile(harness=harness, name=name, kind="api_key_env", env="K",
+                            key_env="K", billing_account=billing, reserve_usd=reserve)
+
+
+class AccountBudgetTest(PgTestCase):
+
+    def setUp(self) -> None:
+        super().setUp()
+        for table in ("turn_costs", "account_reservations", "account_budgets",
+                      "budget_events", "spend_pending"):
+            self.db.execute("DELETE FROM %s" % table)
+        self.api = storage.of(self.db).budgets
+        self.api.account_put(OPENAI, 100.0, actor="human:t")
+        self.api.account_put(DEEPSEEK, 100.0, actor="human:t")
+
+    def _spend(self, agent, usd, *, billing=None, harness="deepseek", at="now()", key=None,
+               db=None):
+        (db or self.db).execute(
+            "INSERT INTO turn_costs (agent, harness, model, usd, billing_account, spend_key,"
+            " recorded_at) VALUES (%s, %s, 'm', %s, %s, %s, " + at + ")",
+            (agent, harness, usd, billing, key))
+
+    _n = 0
+
+    def _key(self, agent):
+        AccountBudgetTest._n += 1
+        return "%s:%d:1.0" % (agent, AccountBudgetTest._n)
+
+    def _usage(self, account, at=None):
+        return self.api.account_usage(account, at=at)[0]
+
+    def _turn(self, db, agent, profile, cost, *, uncertain=False):
+        """One full turn: reservation, ledger row, settlement."""
+        key = self._key(agent)
+        self.assertEqual(account_budget.reserve(db, agent, profile, key), "")
+        self._spend(agent, cost, key=key)  # the ledger row, untagged, as CostBook.record writes it
+        account_budget.settle(db, key, state="kept" if uncertain else "settled")
+        return key
+
+    # 1 ---------------------------------------------------------------------
+    def test_1_un_compte_partage_entre_hotes_un_agent_de_plus_n_ajoute_rien(self):
+        host_b = self.connect()
+        try:
+            self._turn(self.db, "a1", _profile(OPENAI, "cle-hote-a", "codex"), 40.0)
+            self._turn(host_b, "a2", _profile(OPENAI, "cle-hote-b", "codex"), 50.0)
+            u = self._usage(OPENAI)
+            self.assertAlmostEqual(u["settled"], 90.0)
+            # a third agent gets no allowance of its own: 90 + 2 > 100 is refused at 8.5
+            self._spend("a1", 8.5, billing=OPENAI)
+            raison = account_budget.reserve(host_b, "a3", _profile(OPENAI, "k3", "codex"),
+                                            self._key("a3"))
+            self.assertIn("account openai-manaty 98.50/100.00 $", raison)
+        finally:
+            host_b.close()
+
+    # 2 ---------------------------------------------------------------------
+    def test_2_admissions_concurrentes_pres_du_plafond(self):
+        self._spend("x", 90.0, billing=OPENAI)
+        results = []
+        conns = [self.connect() for _ in range(8)]
+        try:
+            barrier = threading.Barrier(len(conns))
+
+            def go(i, db):
+                barrier.wait()
+                results.append(account_budget.reserve(db, "c%d" % i, _profile(OPENAI),
+                                                      "c%d:0:1.0" % i))
+
+            threads = [threading.Thread(target=go, args=(i, c)) for i, c in enumerate(conns)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(60)
+        finally:
+            for c in conns:
+                c.close()
+        self.assertEqual(sum(1 for r in results if r == ""), 5)   # 90 + 5 × 2 = 100
+        u = self._usage(OPENAI)
+        self.assertAlmostEqual(u["reserved"], 10.0)
+        self.assertLessEqual(u["settled"] + u["reserved"], 100.0)
+        # the other provider is untouched
+        d = self._usage(DEEPSEEK)
+        self.assertEqual((d["settled"], d["reserved"]), (0.0, 0.0))
+        self.assertEqual(account_budget.reserve(self.db, "d1", _profile(DEEPSEEK),
+                                                        self._key("d1")), "")
+
+    # 3 ---------------------------------------------------------------------
+    def test_3_reglement_unique_et_issue_incertaine_conservee(self):
+        codex_api = _profile(OPENAI, "codex-api", "codex")
+        key = self._turn(self.db, "a1", codex_api, 1.5)
+        # a duplicate settlement changes nothing: counted once
+        account_budget.settle(self.db, key)
+        self.assertIsNone(account_budget.settle(self.db, "inconnue"))
+        self.assertAlmostEqual(self._usage(OPENAI)["settled"], 1.5)
+        # uncertain outcome: the 2 $ reservation stays counted with the cost
+        self._turn(self.db, "a1", codex_api, 0.5, uncertain=True)
+        u = self._usage(OPENAI)
+        self.assertAlmostEqual((u["settled"], u["kept"]), (2.0, 2.0))
+        # crash: an open reservation is never released by the next turn, it is kept
+        self.assertEqual(account_budget.reserve(self.db, "a2", codex_api, self._key("a2")), "")
+        self.assertEqual(account_budget.reserve(self.db, "a2", codex_api, self._key("a2")), "")
+        u = self._usage(OPENAI)
+        self.assertAlmostEqual((u["reserved"], u["kept"]), (2.0, 4.0))
+
+    def test_3b_reprise_concurrente_chaque_tour_regle_son_compte(self):
+        """Codex B2: an old worker and its takeover settle their own turns."""
+        old = self._key("a1")
+        self.assertEqual(account_budget.reserve(self.db, "a1", _profile(OPENAI), old), "")
+        new = self._key("a1")   # takeover: the old open reservation becomes kept
+        self.assertEqual(account_budget.reserve(self.db, "a1", _profile(DEEPSEEK), new), "")
+        self._spend("a1", 40.0, key=old)
+        account_budget.settle(self.db, old, state="kept")
+        self._spend("a1", 20.0, key=new)
+        account_budget.settle(self.db, new)
+        o, d = self._usage(OPENAI), self._usage(DEEPSEEK)
+        self.assertAlmostEqual((o["settled"], o["kept"], o["reserved"]), (40.0, 2.0, 0.0))
+        self.assertAlmostEqual((d["settled"], d["kept"], d["reserved"]), (20.0, 0.0, 0.0))
+
+    # 4 ---------------------------------------------------------------------
+    def test_4_jour_calendaire_paris_dst_et_minuit(self):
+        # 25 Oct 2026: back to winter time in Paris, a 25 h day, same cap
+        u = self._usage(OPENAI, at="2026-10-25 12:00:00+01")
+        self.assertEqual(u["period"], "2026-10-25")
+        self.assertEqual(u["reset_ts"] - u["day_start_ts"], 25 * 3600)
+        self.assertEqual(u["usd"], 100.0)
+        # 23:30 Paris (21:30 UTC in summer) belongs to the day, 00:10 to the next one
+        self._spend("a1", 7.0, billing=OPENAI, at="'2026-10-14 23:30:00+02'")
+        self._spend("a1", 3.0, billing=OPENAI, at="'2026-10-15 00:10:00+02'")
+        self.assertAlmostEqual(self._usage(OPENAI, at="2026-10-14 22:00:00+00")["settled"],
+                               3.0)  # 22:00 UTC = 00:00 Paris on the 15th: only the 3 $
+        self.assertAlmostEqual(self._usage(OPENAI, at="2026-10-14 21:00:00+00")["settled"],
+                               7.0)
+        self.assertAlmostEqual(self._usage(OPENAI, at="2026-10-15 10:00:00+02")["settled"],
+                               3.0)
+        # a reservation taken before midnight keeps counting while it is open
+        self.db.execute("INSERT INTO account_reservations (billing_account, agent, usd, period,"
+                        " spend_key, created_at) VALUES (%s, 'a9', 2, current_date - 1,"
+                        " 'a9:0:1.0', now() - interval '1 day')", (OPENAI,))
+        self.assertAlmostEqual(self._usage(OPENAI)["reserved"], 2.0)
+        account_budget.settle(self.db, "a9:0:1.0")
+        self.assertAlmostEqual(self._usage(OPENAI)["reserved"], 0.0)
+
+    # 5 ---------------------------------------------------------------------
+    def test_5_recreation_rotation_alias_migration_meme_historique(self):
+        self._turn(self.db, "a1", _profile(DEEPSEEK, "cle-2025"), 10.0)
+        registry_db = self.connect()   # another host, a new key, another profile name
+        try:
+            self._turn(registry_db, "a1", _profile(DEEPSEEK, "cle-2026-rotation"), 5.0)
+            self._turn(registry_db, "a1-recree", _profile(DEEPSEEK, "alias"), 1.0)
+        finally:
+            registry_db.close()
+        self.assertAlmostEqual(self._usage(DEEPSEEK)["settled"], 16.0)
+        parse = accounts.parse({"deepseek": [
+            {"name": "k1", "type": "api_key_env", "key_env": "A", "billing_account": DEEPSEEK},
+            {"name": "k2", "type": "api_key_env", "key_env": "B", "billing_account": DEEPSEEK,
+             "reserve_usd": 0.5}]})["deepseek"]
+        self.assertEqual({p.billing_account for p in parse}, {DEEPSEEK})
+        self.assertEqual(parse[1].reserve_usd, 0.5)
+        with self.assertRaises(accounts.AccountError):
+            accounts.parse({"deepseek": [{"name": "k", "type": "api_key_env", "key_env": "A",
+                                          "billing_account": "Pas Valide"}]})
+
+    # 6 ---------------------------------------------------------------------
+    def test_6_ni_critique_ni_repli_ne_contournent_l_enveloppe(self):
+        self._spend("x", 99.0, billing=DEEPSEEK)
+        cfg = dataclasses.replace(
+            self.cfg, budget_usd_per_hour=1000.0, budget_check_interval=0.0,
+            critical_agents=("crit",), critical_fallback_harnesses=(),
+            accounts={"deepseek": [{"name": "k1", "type": "api_key_env", "key_env": "DSK",
+                                    "billing_account": DEEPSEEK,
+                                    "check_credentials": False}]})
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "crit")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("crit", "deepseek", cwd=cwd)
+        lease = registry.claim(self.db, "crit", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "crit"), lease)
+        try:
+            with mock.patch.dict(os.environ, {"DSK": "sk-test"}):
+                self.assertFalse(worker.budget_ok())
+            ligne = registry.get(self.db, "crit")
+            self.assertEqual(ligne["status"], "blocked")
+            self.assertIn("account deepseek-manaty 99.00/100.00 $", ligne["status_text"])
+            # the other provider keeps its own room
+            self.assertEqual(account_budget.reserve(self.db, "o1", _profile(OPENAI),
+                                                            self._key("o1")), "")
+        finally:
+            worker.watchdog_stop.set()
+
+    # 7 ---------------------------------------------------------------------
+    def test_7_cli_audit_liberation_et_etat_visible(self):
+        env = self.env(AMEESH_HUMANS="chef", USER="chef")
+        proc = self.mesh("budget", "set", "--account", OPENAI, "--per-day", "100",
+                         env=self.env(AGENT_MAIL_NAME="malin"))
+        self.assertEqual(proc.returncode, 1)
+        proc = self.mesh("budget", "set", "--account", OPENAI, "--per-day", "120",
+                         "--tz", "Europe/Paris", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("100.00 $ → 120.00 $", proc.stdout)
+        ev = self.api.events(1)[0]
+        self.assertEqual((ev["scope"], ev["old_usd"], ev["new_usd"], ev["actor"]),
+                         ("account:" + OPENAI, 100.0, 120.0, "human:chef"))
+        self._turn(self.db, "a1", _profile(OPENAI), 1.0, uncertain=True)
+        kept = self.api.account_kept(OPENAI)[0]
+        proc = self.mesh("budget", "--json", env=env)
+        data = json.loads(proc.stdout)
+        row = {a["billing_account"]: a for a in data["accounts"]}[OPENAI]
+        self.assertEqual((row["usd"], row["settled"], row["kept"], row["remaining"]),
+                         (120.0, 1.0, 2.0, 117.0))
+        proc = self.mesh("budget", env=env)
+        self.assertIn("openai-manaty", proc.stdout)
+        self.assertIn("Europe/Paris, reset", proc.stdout)
+        proc = self.mesh("budget", "release", str(kept["id"]), env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertAlmostEqual(self._usage(OPENAI)["kept"], 0.0)
+        proc = self.mesh("budget", "unset", "--account", OPENAI, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([r["billing_account"] for r in self.api.account_usage()], [DEEPSEEK])
+
+    # runner: reservation at launch, settlement at the end of the turn --------
+    def test_tour_reel_reserve_puis_regle_et_refuse_a_epuisement(self):
+        from .support import FAKEBIN
+        cfg = dataclasses.replace(self.cfg, budget_check_interval=0.0, accounts={"claude": [{
+            "name": "k1", "type": "api_key_env", "key_env": "K",
+            "billing_account": OPENAI, "check_credentials": False}]})
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "e2e")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("e2e", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "e2e", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "e2e"), lease)
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log, "K": "sk-test"}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                worker._account = _profile(OPENAI, harness="claude")
+                self.assertTrue(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
+                rows = self.db.query("select billing_account from turn_costs"
+                                     " where agent = 'e2e'")
+                self.assertEqual([r["billing_account"] for r in rows], [OPENAI])
+                states = [r["state"] for r in self.db.query(
+                    "select state from account_reservations where agent = 'e2e'")]
+                self.assertEqual(states, ["settled"])
+                self._spend("x", 99.5, billing=OPENAI)
+                worker._account = _profile(OPENAI, harness="claude")
+                self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
+                self.assertEqual(self.db.query("select count(*)::int as n from turn_costs"
+                                               " where agent = 'e2e'")[0]["n"], 1)
+                ligne = registry.get(self.db, "e2e")
+                self.assertIn("budget : account openai-manaty", ligne["status_text"])
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_resume_de_bascule_reserve_le_compte_reel_du_tour(self):
+        from .support import FAKEBIN
+        cfg = dataclasses.replace(self.cfg, budget_check_interval=0.0, accounts={"claude": [{
+            "name": "k1", "type": "api_key_env", "key_env": "K",
+            "billing_account": OPENAI, "check_credentials": False}]})
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "rotation")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("rotation", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "rotation", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "rotation"), lease)
+        # Le prochain compte a de la marge ; le résumé utilise encore l'ancien,
+        # épuisé. Il doit être refusé avant tout lancement du harnais.
+        self._spend("x", 99.0, billing=OPENAI)
+        worker._account = _profile(DEEPSEEK, harness="claude")
+        worker._account_override = _profile(OPENAI, harness="claude")
+        try:
+            with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN, "K": "sk-test"}):
+                self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
+            self.assertEqual(self._usage(DEEPSEEK)["reserved"], 0.0)
+            self.assertEqual(self.db.query(
+                "select count(*)::int as n from turn_costs where agent = 'rotation'"
+            )[0]["n"], 0)
+            self.assertIn("budget : account openai-manaty", registry.get(
+                self.db, "rotation")["status_text"])
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_echec_du_reglement_garde_le_marqueur_pour_reparation(self):
+        from ameesh import db as db_mod
+        from .support import FAKEBIN
+        cfg = dataclasses.replace(self.cfg, accounts={"claude": [{
+            "name": "k1", "type": "api_key_env", "key_env": "K",
+            "billing_account": OPENAI, "check_credentials": False}]})
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "repair")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("repair", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "repair", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "repair"), lease)
+        worker._account = _profile(OPENAI, harness="claude")
+        try:
+            with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN, "K": "sk-test"}), mock.patch(
+                    "ameesh.account_budget.settle", side_effect=db_mod.DbError("settlement failed")):
+                worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []})
+            self.assertIsNotNone(worker._compta_en_attente())
+            self.assertTrue(worker._compta_en_echec)
+            worker._compta_repare()
+            self.assertIsNone(worker._compta_en_attente())
+            self.assertFalse(worker._compta_en_echec)
+            rows = self.db.query("select billing_account from turn_costs where agent = 'repair'")
+            self.assertEqual([r["billing_account"] for r in rows], [OPENAI])
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_ancien_worker_ne_regle_pas_le_marqueur_du_remplacant(self):
+        """B2 runner (cx1) : la clé de règlement reste celle du lancement."""
+        import types
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "takeover")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("takeover", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "takeover", runner.runner_id, 3600)
+        old = AgentWorker(runner, registry.get(self.db, "takeover"), lease)
+        try:
+            self.assertTrue(old._compta_marque(0, "old", "m"))
+            marker = registry.pending_spend_get(self.db, "takeover")
+            old_key = old._spend_key(0, marker["created_ts"])
+            self.assertEqual(account_budget.reserve(
+                self.db, "takeover", _profile(OPENAI), old_key), "")
+            # the replacement repaired the old marker, then launched its turn
+            self.assertTrue(registry.pending_spend_put(self.db, "takeover", 1, "new", "m"))
+            marker = registry.pending_spend_get(self.db, "takeover")
+            new_key = old._spend_key(1, marker["created_ts"])
+            self.assertEqual(account_budget.reserve(
+                self.db, "takeover", _profile(DEEPSEEK), new_key), "")
+
+            def record(*args, **kwargs):
+                self._spend("takeover", 40.0, key=kwargs["key"])
+                return types.SimpleNamespace(reread_tokens=0, session=None)
+            # the old worker ends late, after the lease was taken over
+            old.lease_lost.set()
+            with mock.patch("ameesh.cost.CostBook") as book:
+                book.return_value.record.side_effect = record
+                old._compta_termine(incertain=True)
+            observed = (self._usage(OPENAI)["settled"],
+                        self._usage(DEEPSEEK)["settled"],
+                        registry.pending_spend_get(self.db, "takeover") is not None)
+            self.assertEqual(observed, (40.0, 0.0, True))
+        finally:
+            old.watchdog_stop.set()
+
+    def test_capture_marqueur_atomique(self):
+        """A takeover between marker write/read cannot change the owned key."""
+        import types
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "capture")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("capture", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "capture", runner.runner_id, 3600)
+        old = AgentWorker(runner, registry.get(self.db, "capture"), lease)
+        get = registry.pending_spend_get
+        replaced = []
+        def takeover(*args):
+            replaced.append(True)
+            # Replacement starts after put committed but before the old worker's get.
+            registry.pending_spend_put(self.db, "capture", 1, "new", "m")
+            marker = get(self.db, "capture")
+            self.assertEqual(account_budget.reserve(self.db, "capture", _profile(DEEPSEEK),
+                old._spend_key(1, marker["created_ts"])), "")
+            return marker
+        try:
+            with mock.patch("ameesh.storage.postgres.registry.PendingSpend.put_get",
+                            return_value=None):
+                self.assertFalse(old._compta_marque(0, "old", "m"))
+                self.assertIsNone(old._compta_travail)
+            with mock.patch("ameesh.registry.pending_spend_get", side_effect=takeover):
+                self.assertTrue(old._compta_marque(0, "old", "m"))
+            own = old._compta_travail
+            if not replaced:
+                takeover()
+            self.assertEqual(account_budget.reserve(self.db, "capture", _profile(OPENAI),
+                old._spend_key(0, own["created_ts"])), "")
+            def record(*args, **kwargs):
+                self._spend("capture", 40., key=kwargs["key"])
+                return types.SimpleNamespace(reread_tokens=0, session=None)
+            old.lease_lost.set()
+            with mock.patch("ameesh.cost.CostBook") as book:
+                book.return_value.record.side_effect = record
+                old._compta_termine(incertain=True)
+            self.assertEqual((self._usage(OPENAI)["settled"], self._usage(DEEPSEEK)["settled"],
+                get(self.db, "capture") is not None), (40., 0., True))
+        finally:
+            old.watchdog_stop.set()
+
+    def test_fils_d_un_meme_executeur_partagent_le_pilote(self):
+        """Review (bureau): the workers of one runner share ONE driver
+        (`runner.db`). With psycopg, two interleaved `transaction()` blocks
+        nested (savepoint), both commits failed ("wrong nesting level") and
+        the session stayed inside an open transaction, holding the account
+        lock. Admission stays exact and every settlement goes through (one
+        per turn, with or without a reservation)."""
+        self._spend("x", 90.0, billing=OPENAI)
+        shared = self.connect()
+        results, errors = [], []
+        try:
+            barrier = threading.Barrier(8)
+
+            def go(i):
+                barrier.wait()
+                try:
+                    results.append(account_budget.reserve(
+                        shared, "s%d" % i, _profile(OPENAI), "s%d:0:1.0" % i))
+                    account_budget.settle(shared, "libre%d:0:1.0" % i)
+                except Exception as exc:  # noqa: BLE001 - reported below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=go, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(60)
+        finally:
+            shared.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(1 for r in results if r == ""), 5, results)
+        # committed, seen from another session
+        self.assertAlmostEqual(self._usage(OPENAI)["reserved"], 10.0)
+
+    def test_remise_dite_dans_la_zone_du_compte(self):
+        """Review (bureau): a host in UTC still says the reset is at 00:00 in
+        the account's zone, in the pause reason and in `ameesh budget`."""
+        import time
+        row = self._usage(OPENAI, at="2026-07-14 12:00:00+02")
+        try:
+            with mock.patch.dict(os.environ, {"TZ": "UTC"}):
+                time.tzset()
+                self.assertTrue(account_budget.exhausted_reason(OPENAI, row).endswith(
+                    " until 00:00"), account_budget.exhausted_reason(OPENAI, row))
+                self.assertEqual(account_budget.moment(row["reset_ts"], row["tz"]),
+                                 "2026-07-15 00:00")
+        finally:
+            time.tzset()
+
+    def test_instruction_d_un_autre_fil_hors_de_la_transaction(self):
+        """Review (dev7): on the shared driver, a plain write from another
+        thread entered the open `transaction()` block and was lost with its
+        ROLLBACK (an accounting marker, a ledger row). It now waits for the
+        block to end, then commits on its own."""
+        shared = self.connect()
+        self.db.execute("CREATE TABLE sonde_1469 (v int)")
+        inside, written = threading.Event(), threading.Event()
+
+        def ecrit():
+            inside.wait(10)
+            shared.execute("INSERT INTO sonde_1469 VALUES (1)")
+            written.set()
+
+        b = threading.Thread(target=ecrit)
+        b.start()
+        try:
+            with self.assertRaises(RuntimeError):
+                with shared.transaction():
+                    shared.query("SELECT 1 AS x")
+                    inside.set()
+                    # before the fix the write lands here at once; with it, it waits
+                    written.wait(2)
+                    raise RuntimeError("rollback")
+            b.join(10)
+            self.assertTrue(written.is_set())
+            self.assertEqual(self.db.query("SELECT count(*) AS n FROM sonde_1469")[0]["n"], 1)
+        finally:
+            b.join(10)
+            shared.close()
+            self.db.execute("DROP TABLE sonde_1469")

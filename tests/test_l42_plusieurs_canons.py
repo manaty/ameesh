@@ -391,9 +391,11 @@ class CliTest(_DeuxCanons):
 class ConfigurationTest(_TmpMixin, unittest.TestCase):
     def load(self, config: dict | None = None, **env) -> config_mod.Config:
         path = os.path.join(self.make_tmp(), "config.json")
-        if config is not None:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(config, fh)
+        # #1127 : un chemin nommé explicitement doit exister. Le fichier est
+        # donc toujours écrit, vide quand le test ne pose aucune clé : le banc
+        # ne se sert plus d'un chemin absent comme sentinelle « aucune config ».
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(config if config is not None else {}, fh)
         return config_mod.load(dict(env, AMEESH_CONFIG=path))
 
     def test_canons_du_fichier(self):

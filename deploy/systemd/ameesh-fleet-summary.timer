@@ -1,0 +1,13 @@
+# #2022 — the fleet summary every morning (one host of the mesh only).
+# Install: cp ameesh-fleet-summary.{service,timer} ~/.config/systemd/user/ &&
+#          systemctl --user enable --now ameesh-fleet-summary.timer
+[Unit]
+Description=ameesh daily fleet summary (#2022)
+
+[Timer]
+OnCalendar=*-*-* 08:00
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -163,21 +163,56 @@ def _date(text: str | None) -> _dt.date | None:
 _UNSET = object()
 
 
-def _hand_source(current: dict, dates: dict, source: str | None, actor: str) -> str | None:
-    """The source of a date set by hand on a task (#704).
+_AUTHORITY = ("only a human, an orchestrator or a design agent may: a person at a "
+              "terminal passes --actor human:<id>, an agent asks the orchestrator")
+
+
+def _day(value) -> str | None:
+    return str(value)[:10] if value else None
+
+
+def _hand_source(db, current: dict, dates: dict, source: str | None,
+                 actor: str) -> tuple[str | None, str | None]:
+    """The source of a date set by hand on a task (#704), and a warning when
+    that date stays unprotected (#740).
 
     Without `--source`, the stored source is kept as it is. When the planner
     (`work schedule --apply`) dated the task, that source is the planner's, and
     its next pass would overwrite the date set by hand: the date then records
-    who set it. A source written by a person stays. Only the start and the
-    end count: the planner never writes the delivery date."""
-    from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
+    who set it, if the start or the end really changes (set or cleared;
+    resubmitting the current dates pins nothing) and if the actor may pin a
+    date: a human, an orchestrator or a design agent (`work.pin_authority`).
+    Another agent's date is written and stays the planner's, with a warning.
+    A source the caller passes is a claim on the dates too: one that takes
+    them from the planner or gives them back, or that writes or replaces a
+    "set by" marker, needs the same authority; without it the stored source
+    stays, with a warning. Only the start and the end count: the planner
+    never writes the delivery date."""
+    from .lot_schedule import MARKER, SOURCE  # lot_schedule imports work, not this module
 
-    if source is not None or (dates.get("start") is None and dates.get("end") is None):
-        return source
-    if str(current.get("planned_source") or "").startswith(SOURCE):
-        return "set by %s" % (actor or "hand")
-    return source
+    stored = str(current.get("planned_source") or "")
+    cfg = getattr(db, "cfg", None)
+    warnings = []
+    if source is not None and source != stored and (
+            source.startswith(SOURCE) != stored.startswith(SOURCE)
+            or source.startswith(MARKER) or stored.startswith(MARKER)):
+        if work_mod.pin_authority(cfg, db, actor) is None:
+            warnings.append("source %r not recorded: it would change who owns the dates, "
+                            "and %s may not (%s)" % (source, actor or "this session",
+                                                     _AUTHORITY))
+            source = None
+    if source is not None or not stored.startswith(SOURCE):
+        return source, "; ".join(warnings) or None
+    if not any(key in dates and _day(dates[key]) != _day(current.get("planned_" + key))
+               for key in ("start", "end")):
+        return None, "; ".join(warnings) or None
+    who = work_mod.pin_authority(cfg, db, actor)
+    if who is None:
+        warnings.append("date not protected: %s may not pin it (%s), so the next work "
+                        "schedule --apply may move it" % (actor or "this session",
+                                                          _AUTHORITY))
+        return None, "; ".join(warnings)
+    return MARKER + who, "; ".join(warnings) or None
 
 
 def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str | None = None,
@@ -195,15 +230,25 @@ def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str |
     text = str(target).strip().lstrip("#")
     st = storage.of(db)
     if text.isdigit():
-        current = (st.roadmap.item_plans([int(text)]) or [None])[0]
-        if current is None:
-            raise RoadmapError("task %s not found" % text)
-        _check_order(dict(current, **{"planned_" + k: v for k, v in dates.items()}))
-        source = _hand_source(current, dates, source, actor)
-        row = st.roadmap.plan_item(int(text), dates, source=source, actor=actor)
-        if row is None:
-            raise RoadmapError("task %s not found" % text)
-        return {"target": int(text), "kind": "task", "plan": row}
+        # #740: the row is written only as it was read (a schedule applied in
+        # between would leave its source on the date set here): read again
+        for _attempt in range(3):
+            current = (st.roadmap.item_plans([int(text)]) or [None])[0]
+            if current is None:
+                raise RoadmapError("task %s not found" % text)
+            _check_order(dict(current, **{"planned_" + k: v for k, v in dates.items()}))
+            hand, warning = _hand_source(db, current, dates, source, actor)
+            row = st.roadmap.plan_item(int(text), dates, source=hand, actor=actor,
+                                       expect=current)
+            if row is not None:
+                break
+        else:
+            raise RoadmapError("task %s changed while it was being planned: run it again"
+                               % text)
+        out = {"target": int(text), "kind": "task", "plan": row}
+        if warning:
+            out["warning"] = warning
+        return out
     package = st.packages.get(text)
     if package is None:
         raise RoadmapError("neither a task nor a WorkPackage: %r (a task: its number; a "
@@ -340,6 +385,8 @@ def real_milestones(item: dict, events: list[dict], actions: list[dict],
     started = next((e.get("created_ts") for e in events if dev.en_cours(e.get("state"))), None)
     out = {key: jalons.get(dev.jalon(key)) for key in ("demandee", "soumise", "verdict",
                                                        "livree")}
+    # #988 : un lot livré hors cible porte `delivered`, pas `merged`
+    out["livree"] = out["livree"] or jalons.get("delivered")
     out["debut"] = started
     out["verdict_kind"] = jalons.get("verdict_kind")
     return {k: (round(float(v), 3) if isinstance(v, (int, float)) and k != "verdict_kind"
@@ -367,8 +414,8 @@ def build_task(item: dict, real: dict, *, base: _dt.date, epic: str | None,
                commitments: list[dict], shown_state: str | None,
                now: float | None = None) -> dict:
     state = item.get("state")
-    delivered = dev.livree(state)
-    abandoned = dev.abandonnee(state)
+    delivered = dev.livree(state, item.get("close_reason"))
+    abandoned = dev.abandonnee(state, item.get("close_reason"))
     planned = {k: item.get("planned_" + k) for k in DATE_KEYS}
     done_day = _day_of(real.get("livree")) if delivered else None
     target_key = "delivery" if planned["delivery"] else ("end" if planned["end"] else None)
@@ -462,7 +509,8 @@ def build(db, *, now: float | None = None, project: str | None = None,
         rows = [r for r in rows if project in (r.get("app"), r.get("workstream"))]
     ids = [int(r["id"]) for r in rows]
     events: dict = {}
-    for ev in st.progress.lot_events(ids):
+    # #1647 : les jalons réels ne lisent que les transitions, jamais les notes.
+    for ev in st.progress.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
     actions: dict = {}
     for act in st.progress.lot_actions(ids):
@@ -949,7 +997,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--source", dest="source_ref", default=None,
                        help="source identifier or link (conversation, decision, message)")
     p_add.add_argument("--depends-on", dest="depends_on", action=UniqueAppend, default=[],
-                       help="dependency (task #N, commitment eN, lot Lxx); repeatable")
+                       help="dependency (task #N, commitment eN, lot Lxx); "
+                            "gate:<name> holds the lot (L368) until the due day; repeatable")
     p_add.add_argument("--depend-de", dest="depends_on", action=DeprecatedAlias,
                        canonical="--depends-on", append=True, default=argparse.SUPPRESS,
                        help=argparse.SUPPRESS)

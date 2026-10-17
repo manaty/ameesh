@@ -84,7 +84,7 @@ action…).
 | `roadmap` | the roadmap (schema `ameesh-roadmap/1`), `null` with `--no-gantt` |
 | `versions` | published versions and next releases per product (L160f), `null` with `--no-versions` |
 | `lots[]` | id, title, `state` (`active`, `review`, `blocked`, `approved`, `merged`), raw `work_state`, `milestones` `{requested, frozen, verdict, merged}`, `verdict`, `blocked_verdicts`, `blocks`, `assignee`, `reviewer`, `qa_loops`, budget, linked `actions`, `waiting_for` (what and whom it waits for, L29), `stale`, `epic`, plan entry |
-| `agents[]` | name, harness, model, `effort`, `state` (`working`, `idle`, `paused`, `stopped`), `since_ts`, current `turn` `{started_ts, duration_s, label, task}`, turns, unread, lease |
+| `agents[]` | name, harness, model, `effort`, `state` (`working`, `idle`, `paused`, `stopped`), `since_ts`, current `turn` `{started_ts, duration_s, label, task}`, turns, unread, lease, `paused_on_budget` (`true` for a budget/pace pause, `false` for another `blocked` cause; #1070) |
 | `epics[]`, `milestones[]` | lots grouped by plan epic with progress, and the canon's `WorkPackage` milestones; nothing is invented |
 | `actions[]` | actions changed in the window or not terminal |
 | `budget` | `spend` `{window, 1h, 24h}`, `by_agent`, subscription gauges `plans`, `hourly_cap_usd`, `paid_harnesses`, `limits` |

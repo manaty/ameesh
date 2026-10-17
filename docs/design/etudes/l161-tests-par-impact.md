@@ -358,10 +358,11 @@ They are triggered as soon as a migration, `db.py` or `deploy/sql` changes.
 | Event | Change | What runs |
 |---|---|---|
 | push to main, `release/**`, tag, manual | everything | full suite, both drivers, impacted first; **never skipped, never cancelled** by the next push |
-| PR | documentation only: files under `docs/`, `site/`, `examples/` or `*.md` outside the package | only the tests that read these files: declared until the map exists (`test_l33_chatbot` for `docs/design` and `site/docs`, `test_canon` for `examples/canon`), measured afterwards; under a minute |
-| PR | version only: only the `version =` line of `pyproject.toml` | `test_version` and package build (`pip wheel . --no-deps`), under a minute |
+| PR | documentation only, lot branch: files under `docs/`, `site/`, `examples/` or `*.md` outside the package | only the tests that read these files: declared until the map exists (`test_l33_chatbot` for `docs/design` and `site/docs`, `test_canon` for `examples/canon`), measured afterwards; under a minute |
+| PR | version only, lot branch: only the `version =` line of `pyproject.toml` | `test_version` and package build (`pip wheel . --no-deps`), under a minute |
 | PR | test foundation or CI (`tests/support.py`, `tests/fakebin/`, `scripts/test-parts.py`, `.github/`, `pyproject.toml` dependencies), file unknown to the map, stale map | everything, impacted first |
-| PR | code, general case | **phase 1**: impacted first, then the rest; **phase 2**, if the review justifies it: impacted only on PRs, the rest on main |
+| PR, source or target `release/**` or the integration branch | any change (release PR) | full suite, both drivers, no version/documentation lane and no psql pilot list — including in the fallback plan (canon §3) |
+| PR, lot branch | code, general case | **phase 1**: impacted first, then the rest; **phase 2**: impacted only on lot PRs, the rest on main — **applied since 14/10/2026** (owner decision, canon §3, lot #1211: impacted plus the contract list, full suite on main, `release/**` and the package integration branch, and on release PRs) |
 
 **Nexlink.** There, the push to `agent/**` stands in for the PR, and
 `develop` for main. Proposed exception, for the owner to decide: on the
@@ -382,6 +383,24 @@ Phase 2 only comes if:
 * leaks stay below 1 per 50 PRs for two weeks;
 * and the selection is "safe": map less than 24 h old, no modified block
   unknown to the map, no foundation file.
+
+The owner applied it ahead of that review on 14/10/2026 (canon §3, lot
+#1211), after the CI queue passed 100 pending runs; the two conditions above
+remain the safety net, applied per run by `scripts/test-plan.py`
+(`lot_selection`, `phase2_safe`) rather than once for all: any doubt gives
+the full suite — including a file **removed** outside documentation, since
+the map knows only the readers it measured (`--no-renames`: a rename is a
+removal plus an addition) — and the contract list
+(`tests/parts/toujours.txt`) always runs on a lot branch. A **release PR**
+(source or target under `release/**` or the integration branch) never takes
+the selection, the version/documentation lanes or the psql pilot list: it
+keeps the full suite under both drivers, in the plan as in its fallback. A
+**configuration**
+file follows its measured readers, like any data file; only `pyproject.toml`
+beyond its `version` line and `.github/**`, the configuration the tests
+themselves run under, force the full suite (test infrastructure). The leak
+count keeps its value: it measures what the selection misses on the runs
+where the full suite does run.
 
 A failure on main then goes to the agent of the merged lot (section 3).
 

@@ -15,12 +15,16 @@ CONFIG_ROOT = "/etc/ameesh-it-proof"
 MAX_REQUEST = 65536
 
 
-def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60):
+def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60, identity=None):
     runner_path = shutil.which(runner) if runner else None
     if runner and runner_path is None:
         raise ValueError("runner executable not found")
     payload = dict(project=project, lot=int(lot), artifact=str(Path(artifact).absolute()),
                    runner=runner_path, arguments=list(arguments), timeout=timeout)
+    # R2 #420 (B3) : l'agent demandeur, lié à son exécuteur, accompagne la
+    # demande ; le helper vérifie le bail et signe la preuve en son nom.
+    if identity:
+        payload.update(identity)
     try:
         result = subprocess.run(["sudo", "-n", HELPER],
                                 input=json.dumps(payload), capture_output=True, text=True,
@@ -37,10 +41,12 @@ def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60):
     return response["milestone"]
 
 
-def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_root=None,
+def produce(db, payload, *, invoker, execution_user, allowed_runners=(), snapshot_root=None,
             snapshot_limits=None):
     from . import item, prove
-    if not isinstance(payload, dict) or set(payload) != {
+    from ..storage import ModuleStore
+    identity_keys = {"agent", "runner_id", "lease_epoch"}
+    if not isinstance(payload, dict) or set(payload) - identity_keys != {
             "project", "lot", "artifact", "runner", "arguments", "timeout"}:
         raise ValueError("proof requests accept execution inputs only, never evidence")
     if not isinstance(payload["artifact"], str) or not Path(payload["artifact"]).is_absolute():
@@ -58,10 +64,34 @@ def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_
     row = item(db, payload["lot"])
     if (row.get("app") or row.get("workstream") or "") != payload["project"]:
         raise ValueError("proof helper project does not own this lot")
-    return prove(db, payload["lot"], payload["artifact"], actor=actor,
+    # R2 #420 (B3) : une preuve attribuable — l'agent lié à son exécuteur. Un
+    # projet gardé par `require_qa` l'exige ; sinon l'ancien `uid:<SUDO_UID>`
+    # reste permis.
+    agent = str(payload.get("agent") or "").strip()
+    identity = None
+    if agent:
+        epoch = payload.get("lease_epoch")
+        if (not str(payload.get("runner_id") or "").strip()
+                or not isinstance(epoch, int) or isinstance(epoch, bool)):
+            raise ValueError("proof identity: runner_id and lease_epoch are required with agent")
+        rows = db.query("SELECT lease_owner, lease_epoch FROM ameesh_module_agent(%s)", (agent,))
+        if not rows:
+            raise ValueError("proof identity: agent %r is not registered" % agent)
+        if (rows[0]["lease_owner"] != payload["runner_id"]
+                or int(rows[0]["lease_epoch"] or 0) != epoch):
+            raise ValueError("proof identity: agent %r is not bound to runner %r"
+                             % (agent, payload["runner_id"]))
+        identity = {"agent": agent, "runner_id": payload["runner_id"], "lease_epoch": epoch}
+    policy = ModuleStore(db).policy(payload["project"], "it")
+    gated = any((rule or {}).get("evidence_kind") == "qa"
+                for rule in (policy or {}).get("rules") or [])
+    if gated and not agent:
+        raise ValueError("this project requires QA: the proof must name the runner-bound agent")
+    return prove(db, payload["lot"], payload["artifact"], actor=agent or invoker,
                  runner=payload["runner"], arguments=payload["arguments"],
-                 timeout=float(payload["timeout"]), execution_user=execution_user, snapshot_root=snapshot_root,
-                 snapshot_limits=snapshot_limits)
+                 timeout=float(payload["timeout"]), execution_user=execution_user,
+                 snapshot_root=snapshot_root, snapshot_limits=snapshot_limits,
+                 identity=identity, invoker=invoker)
 
 
 def private_path(path, *, directory=False):
@@ -109,7 +139,7 @@ def main():
             "FROM pg_roles r WHERE r.rolname = current_user")
         if not rows or rows[0]["unsafe"] or not rows[0]["writer"]:
             raise ValueError("helper requires the isolated nonadministrative IT proof database role")
-        result = produce(db, payload, actor="uid:%s" % os.environ.get("SUDO_UID", "0"),
+        result = produce(db, payload, invoker="uid:%s" % os.environ.get("SUDO_UID", "0"),
                          execution_user=execution_user, allowed_runners=settings.get("runners", []),
                          snapshot_root=snapshot_root, snapshot_limits=settings.get("snapshot_limits"))
         print(json.dumps({"milestone": result}, default=str))

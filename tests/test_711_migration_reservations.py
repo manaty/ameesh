@@ -87,6 +87,11 @@ class ScopedReservationsTest(PgTestCase):
         work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
         work.reserve_migration(self.db, self.b['id'], 401, repo=self.repo)
         work.close(self.db, self.b['id'], abandoned=True, actor='dev')
+        # #956 : la clôture libère la réservation et efface la projection ;
+        # une base antérieure à 0419, elle, gardait `migration` sur le lot
+        # fermé — c'est cette ligne ancienne que la reprise doit rejouer.
+        self.db.execute('UPDATE work_items SET migration = 401 WHERE id = %s',
+                        (self.b['id'],))
         self.db.execute('TRUNCATE work_migration_reservations RESTART IDENTITY')
         migration = next(m for m in migrations.discover() if m.name == 'migration_reservation_slots')
         self.assertEqual(migrations.non_additive(migration), [])
@@ -383,12 +388,14 @@ class ScopedReservationsTest(PgTestCase):
     def test_release_and_named_allocation_lock_repository_before_lot(self):
         self._legacy_writer_concurrent_with_named(
             lambda api: api.reserve_migration(self.a['id'], None, None, 1, release=True,
-                                              note='release %(number)s', actor='dev'))
+                                              note='release %(number)s', actor='dev',
+                                              issue_ref=None))
 
     def test_repository_move_and_named_allocation_lock_old_repository_before_lot(self):
         self._legacy_writer_concurrent_with_named(
             lambda api: api.reserve_migration(self.a['id'], 'manaty/other', 400, 1,
-                                              note='move %(number)s', actor='dev'))
+                                              note='move %(number)s', actor='dev',
+                                              issue_ref=self.a['issue_ref']))
         self.assertEqual(work.get(self.db, self.a['id'])['migration_repo'], 'manaty/other')
 
     def test_repository_changed_after_observation_aborts_writer_without_new_lock(self):
@@ -420,7 +427,8 @@ class ScopedReservationsTest(PgTestCase):
         try:
             self.assertTrue(observed.wait(timeout=5))
             storage.of(self.db).work.reserve_migration(self.a['id'], 'manaty/other', 400, 1,
-                                                       note='move %(number)s', actor='dev')
+                                                       note='move %(number)s', actor='dev',
+                                                       issue_ref=self.a['issue_ref'])
         finally:
             moved.set()
             thread.join(timeout=10)

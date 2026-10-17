@@ -24,7 +24,7 @@ from ameesh import adapters, cli, exploitation, mail, registry, storage
 from ameesh import config as config_mod
 from ameesh.runner import AgentWorker, Runner
 
-from .support import PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase
 
 
 def _ligne(kind: str = "notify", payload: dict | None = None, body: str = "texte") -> dict:
@@ -86,7 +86,7 @@ class AccuseDeReceptionTest(unittest.TestCase):
 
 class ReglageParDefautTest(unittest.TestCase):
     def test_defaut_et_environnement(self):
-        base = {"AMEESH_CONFIG": "/nulle-part.json"}
+        base = {"AMEESH_CONFIG": EMPTY_CONFIG}
         self.assertEqual(config_mod.load(env=base).mail_batch, 90.0)
         self.assertEqual(config_mod.load(env=dict(base, AMEESH_MAIL_BATCH="45")).mail_batch,
                          45.0)
@@ -304,7 +304,7 @@ class EnvoiTest(_Base):
         self.assertIn("acknowledgement", proc.stdout)
         self.assertTrue(self._payload("orch").get("ack"))
         proc = self._envoi("orch", "ok")  # une réponse, peut-être un feu vert
-        self.assertEqual(proc.stdout.strip(), "dropped for: orch")
+        self.assertEqual(proc.stdout.strip(), "delivered to orch")
         self.assertEqual(self._payload("orch"), {})
         proc = self._envoi("orch", "J'ai lu ta note sur le lot 12", "--ack")
         self.assertTrue(self._payload("orch").get("ack"))
