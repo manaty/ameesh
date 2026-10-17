@@ -1144,13 +1144,27 @@ class AgentWorker(threading.Thread):
         encore valide (marges de 0,16 s mesurées sous charge, #2139). Passé ce
         point la tranche vaut 0 : l'appelant renouvelle immédiatement, avec le
         temps restant comme budget d'appel.
+
+        #2172 : dans une panne, sous `Reprise.MINIMUM` de marge, viser la
+        moitié du temps restant : attendre toute la marge planifiait l'essai
+        à l'échéance même, où `renew()` le refuse (`deadline_passed`) — le
+        dernier essai utile était perdu. Le plancher de 50 ms évite le
+        martèlement quand la marge s'épuise.
         """
         pas = (self.runner.lease_ttl / 3.0) if self.runner.lease_ttl > 0 else 3.0
         if getattr(self, "renew_failures", 0):
             # Un échec ne repousse pas le bail : la tranche nulle ne doit pas
             # marteler la base. Réessayer au délai court de L72, sans jamais
             # attendre au-delà de l'échéance connue.
-            return self.wait_timeout(max(0.0, min(float(cap), pas, Reprise.MINIMUM)))
+            delai = max(0.0, min(float(cap), pas, Reprise.MINIMUM))
+            if self.lease_deadline > 0:
+                reste = max(0.0, self.lease_deadline - time.time())
+                if 0.0 < reste < Reprise.MINIMUM:
+                    # #2172 : viser la mi-marge restante, avec un plancher de
+                    # 50 ms, pour que l'essai suivant ait un budget d'appel
+                    # avant l'échéance au lieu de tomber dessus.
+                    delai = min(delai, max(0.05, reste / 2.0))
+            return self.wait_timeout(delai)
         if self.lease_deadline > 0:
             reste = self.lease_deadline - time.time() - pas
             pas = min(pas, max(0.0, reste))
