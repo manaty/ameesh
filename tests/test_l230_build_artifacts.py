@@ -596,6 +596,12 @@ class OrphanGuardsTest(unittest.TestCase):
             for label, branch, owner, state, recent in (
                 ("other-active", "lot/7-x", "other", "build", False),
                 ("other-closed", "lot/7-x", "other", "closed", False),
+                ("other-open-candidate", "review/other-6-7", "other",
+                 {7: "closed", 6: "build"}, False),
+                ("other-unknown-candidate", "review/other-6-7", "other",
+                 {7: "closed", 6: None}, False),
+                ("other-closed-candidates", "review/other-6-7", "other",
+                 {7: "closed", 6: "merged"}, False),
                 ("unknown", "lot/7-x", None, None, False),
                 ("unreadable", "lot/7-x", None, RuntimeError("offline"), False),
                 ("named-directory", "", "other", "build", False),
@@ -619,6 +625,9 @@ class OrphanGuardsTest(unittest.TestCase):
                                        if owner else None)
                     if isinstance(state, Exception):
                         lookup.side_effect = state
+                    elif isinstance(state, dict):
+                        lookup.side_effect = lambda ident: dict(
+                            assignee=owner, state=state.get(ident))
                     store = SimpleNamespace(work=SimpleNamespace(get=lookup),
                         housekeeping=SimpleNamespace(worktrees=mock.Mock(return_value=[row])))
                     git = dict(exists=True, clean=True, pushed=True, integrated=False,
@@ -636,7 +645,8 @@ class OrphanGuardsTest(unittest.TestCase):
                     # #2174: another agent's ENDED lot follows the orphan
                     # rule; its open, unknown or unreadable lot proves nothing
                     self.assertEqual(plan[0]["action"] == "retrait",
-                                     label in ("orphan", "own-closed", "other-closed"), plan)
+                                     label in ("orphan", "own-closed", "other-closed",
+                                               "other-closed-candidates"), plan)
                     if recent:
                         outcome, freed, reason, built = menage._remove_kept_worktree(
                             path, root, "", artifacts=None, allow=(),

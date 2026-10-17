@@ -2695,13 +2695,17 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         foreign = lot is None and named is not None
         if foreign:
             try:
-                state = _lot_state(db, named)
+                # #1694: review branches can cite several candidates. One
+                # ended lot proves nothing about the others still served.
+                states = [_lot_state(db, ident) for ident in
+                          (cited_lots(row.get("branch") or "") or [named])]
             except Exception:  # registre illisible : rien n'est prouvé
-                state = None
-            if state not in LOT_ENDED:
+                states = [None]
+            if any(state not in LOT_ENDED for state in states):
                 plan.append(dict(base, action="garde",
                                  detail="named lot #%s not attributable" % named))
                 continue
+            state = states[0]
             lot = str(named)
             base["lot"] = lot
         else:
