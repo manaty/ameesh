@@ -178,6 +178,9 @@ class Progress(interface.Progress):
             SELECT r.name, r.workstream, r.workstream AS chantier,
                    r.team, r.harness, r.host, r.model, r.provider,
                    r.credential_mode, r.status, r.status_text, r.current_prompt,
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+                   r.operator_pause_for,
+                   extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    r.turns, r.lease_owner, r.mode, r.stop_reason, r.responsible,
                    (r.lease_owner IS NOT NULL AND r.lease_expires_at > now()) AS lease_live,
@@ -194,8 +197,14 @@ class Progress(interface.Progress):
         """
         params: tuple = ()
         if project:
-            sql += " WHERE r.workstream = %s OR r.team = %s"
-            params = (project, project)
+            # L243 : l'agent appartient à tous ses projets — `projects` déclaré
+            # (0388), sinon son équipe, sinon son `workstream`
+            sql += (" WHERE %s = any(coalesce(r.projects,"
+                    " case when coalesce(btrim(r.team), '') <> '' then array[btrim(r.team)]"
+                    "      when coalesce(btrim(r.workstream), '') <> ''"
+                    "           then array[btrim(r.workstream)]"
+                    "      else array[]::text[] end))")
+            params = (project,)
         sql += " ORDER BY r.name"
         return self.db.query(sql, params)
 

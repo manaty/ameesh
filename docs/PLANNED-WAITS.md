@@ -20,6 +20,24 @@ A lot is stale when it is open and inactive beyond the configured threshold
   existing plan dependency sources.
 - A direct prerequisite declared with `ameesh work dependencies <id> --add <blocker>`
   names another open execution lot ([L385](WORK-DEPENDENCIES.md)).
+
+- An **open** commitment associated with the lot names an external gate in
+  `depends_on`: `gate:<name>` (or `external:<name>`). The gate is not an
+  ameesh lot, so nothing else can release the hold; the commitment's due day
+  is what ends it (the day counts in full, as for `engagement_overdue`, and
+  the ordinary inactivity rule applies again the next day). Closing,
+  cancelling or completing the commitment releases the lot immediately.
+
+  ```sh
+  ameesh plan add "hold until the liquichain window" --lot 768 \
+      --due 2026-10-15 --depends-on gate:liquichain-window
+  ```
+
+  The hold stays visible in the plan view. `ameesh plan cancel <id>` releases
+  the lot at once; renewing it means cancelling and adding a new dated
+  commitment (a later due day pushes the hold). A hold whose date cannot be
+  read does not suppress the alert: a hold always ends.
+
 - An explicit **hold**: a journal note whose text begins with `hold:` (for
   example `ameesh work note <id> "hold: operator window"`), written by a
   **pilot** — a human actor (`human:<id>`) or an orchestrator/design agent
@@ -72,7 +90,13 @@ or:
 {"what": "dependency", "lots": [123, 124]}
 ```
 
-or:
+or, for a dated external hold:
+
+```json
+{"what": "hold", "gate": "liquichain-window", "until": "2026-10-15", "commitment": 42}
+```
+
+or, for an explicit pilot hold:
 
 ```json
 {"what": "hold", "by": "mesh-design", "since": 1760544000.0}
@@ -87,5 +111,6 @@ blockers outside the current project or progress window.
 
 Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
-by a planned date, commitment/plan dependency, direct prerequisite link or an
-explicit `hold:` note. This preserves alerts for unexplained waits.
+by a planned date, commitment/plan dependency, direct prerequisite link, a
+dated external hold or an explicit `hold:` note. This preserves alerts for
+unexplained waits.

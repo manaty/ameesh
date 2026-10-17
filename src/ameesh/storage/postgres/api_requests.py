@@ -2,10 +2,13 @@
 """Postgres driver: the `Idempotency-Key` of the API's actions (L87,
 migration 0440).
 
-`reserve` is ONE transaction: purge of the expired rows, then an insert that
-does nothing on conflict. Two requests with the same key order themselves on
-the primary key: the second waits for the first's commit, finds its row and
-reads it back. The response is read as text and decoded here, the same way
+`reserve` purges the expired rows in a transaction of its own, which never
+waits (`skip locked`), then reserves in ONE transaction: an insert that does
+nothing on conflict, and the read-back. Two requests with the same key order
+themselves on the primary key: the second waits for the first's commit, finds
+its row and reads it back. The reservation holds one row lock only, and the
+purge waits on none, so concurrent reservations cannot form a lock cycle
+(#1497 N3). The response is read as text and decoded here, the same way
 under both database drivers.
 """
 from __future__ import annotations
@@ -19,9 +22,11 @@ class ApiRequests(interface.ApiRequests):
 
     def reserve(self, human, key, fingerprint, *, retention_s) -> dict | None:
         with self.db.transaction() as tx:
-            tx.execute("delete from api_idempotency"
-                       " where created_at < now() - make_interval(secs => %s)",
-                       (int(retention_s),))
+            tx.execute("delete from api_idempotency where (human, key) in ("
+                       " select human, key from api_idempotency"
+                       " where created_at < now() - make_interval(secs => %s)"
+                       " for update skip locked)", (int(retention_s),))
+        with self.db.transaction() as tx:
             if tx.query("insert into api_idempotency (human, key, fingerprint)"
                         " values (%s, %s, %s) on conflict (human, key) do nothing"
                         " returning key", (human, key, fingerprint)):

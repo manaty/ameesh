@@ -997,7 +997,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--source", dest="source_ref", default=None,
                        help="source identifier or link (conversation, decision, message)")
     p_add.add_argument("--depends-on", dest="depends_on", action=UniqueAppend, default=[],
-                       help="dependency (task #N, commitment eN, lot Lxx); repeatable")
+                       help="dependency (task #N, commitment eN, lot Lxx); "
+                            "gate:<name> holds the lot (L368) until the due day; repeatable")
     p_add.add_argument("--depend-de", dest="depends_on", action=DeprecatedAlias,
                        canonical="--depends-on", append=True, default=argparse.SUPPRESS,
                        help=argparse.SUPPRESS)

@@ -51,6 +51,9 @@ class Binding:
     #: L41 (0030) : la liaison de session (ligne `session_bindings`) si
     #: source == "session"
     session: dict | None = None
+    #: #811 : les projets de l'agent, quand la lecture du bail les a ramenés
+    #: (`projects`, `team`, `chantier`) ; None si le backend ne les porte pas.
+    projects: tuple[str, ...] | None = None
 
     @property
     def bound_to_lease(self) -> bool:
@@ -103,6 +106,18 @@ def legacy_name(cwd: str | None, cfg: Config) -> str:
     return base[:64] or "racine"
 
 
+def _projects_of(row: dict | None) -> tuple[str, ...] | None:
+    """#811 : les projets de l'agent quand le bail les a ramenés.
+
+    `None` si la ligne ne porte aucun des faits attendus (`projects`, `team`,
+    `chantier`) : un backend médié peut ne rendre que le bail, et l'appelant
+    doit alors relire le registre comme avant."""
+    if not row or not any(key in row for key in ("projects", "team", "chantier")):
+        return None
+    from . import projects  # import tardif : identité ne dépend pas du registre
+    return tuple(projects.agent_projects(row))
+
+
 def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
                     session_id: str | None = None) -> Binding:
     """L'identité de cette session : explicite, et liée au bail si le runner l'a posée.
@@ -130,9 +145,9 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
             return Binding(name=name, source="runner", runner_id=runner_id,
                            reason="unreadable AMEESH_LEASE_EPOCH")
         from . import registry  # import tardif : identity ne dépend pas de la base
-        ok, reason = registry.lease_matches(db, name, runner_id, epoch)
+        ok, reason, row = registry.lease_agent(db, name, runner_id, epoch)
         return Binding(name=name, source="runner", runner_id=runner_id, epoch=epoch,
-                       ok=ok, reason=reason)
+                       ok=ok, reason=reason, projects=_projects_of(row))
     return Binding(name=name, source="explicit", ok=True)
 
 
