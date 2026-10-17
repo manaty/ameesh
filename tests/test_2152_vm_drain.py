@@ -52,6 +52,18 @@ with (state / 'poste.log').open('a') as f:
 action = sys.argv[1] if len(sys.argv) > 1 else ''
 name = sys.argv[2] if len(sys.argv) > 2 else ''
 pause = state / ('pause-' + name)
+motif = state / ('motif-' + name)
+
+
+def opt(flag):
+    args = sys.argv[3:]
+    return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+
+
+if action == 'resume' and sys.argv[2:] == ['--help']:
+    # #2152 : le script ne draine que si la reprise conditionnelle existe.
+    print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
+    sys.exit(0)
 if action == 'show':
     paused = pause.exists()
     # #2152 : l'agent enchaîne les tours tant qu'il n'est pas drainé ; drainé,
@@ -62,13 +74,26 @@ if action == 'show':
                       'lease_owner': 'runner-dev9@mesh',
                       'lease_epoch': 9 if (state / 'restart-dev9').exists() else 7,
                       'lease_expires_ts': time.time() + 300,
-                      'operator_paused': paused}))
+                      'operator_paused': paused,
+                      'operator_pause_reason': (motif.read_text() if motif.exists() else None)}))
 elif action == 'pause':
+    motif.write_text(opt('--reason') or '')
     pause.touch()
-    print(json.dumps({'agent': name, 'operator_paused': True, 'changed': True}))
+    print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': True,
+                      'changed': True, 'event_id': 1}))
 elif action == 'resume':
-    pause.unlink(missing_ok=True)
-    print('resumed')
+    attendu = opt('--expect-reason')
+    raison = motif.read_text() if motif.exists() else ''
+    if pause.exists() and attendu is not None and raison == attendu:
+        pause.unlink()
+        motif.unlink(missing_ok=True)
+        print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': False,
+                          'changed': True, 'event_id': 2}))
+    else:
+        # Reprise conditionnelle sans effet : rien n'est levé (R1 B1).
+        print(json.dumps({'agent': name, 'mode': 'execute',
+                          'operator_paused': pause.exists(), 'changed': False,
+                          'event_id': None}))
 sys.exit(0)
 '''
 
@@ -115,8 +140,13 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         journal = self.poste()
         self.assertIn('pause dev9', journal)
-        self.assertIn('--reason drain de déploiement #2152 (vm.sh redemarrer sur 10.77.0.2)', journal)
-        self.assertIn('resume dev9 --operator', journal)
+        self.assertIn('--reason drain de déploiement #2152 (vm.sh redemarrer sur 10.77.0.2)',
+                      journal)
+        # #2152 / R1 B1 : la levée est conditionnée au motif exact de la pose.
+        pose = [l for l in journal.splitlines() if l.startswith('pause dev9')][0]
+        reprise = [l for l in journal.splitlines() if l.startswith('resume dev9')][0]
+        motif = pose.split('--reason ', 1)[1]
+        self.assertIn('--expect-reason ' + motif, reprise)
         self.assertIn('drain posé', p.stdout)
         self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
         self.assertIn('reprise prouvée (operator_paused=false)', p.stdout)
@@ -127,6 +157,7 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
     def test_foreign_pause_is_not_lifted(self):
         self.env['DRAIN_ATTENTE'] = '1'
         (self.state / 'pause-dev9').touch()
+        (self.state / 'motif-dev9').write_text('pause humaine etrangere')
         p = self.run_vm()
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn('pause dev9', self.poste())

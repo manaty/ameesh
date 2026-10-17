@@ -215,11 +215,18 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
-                       actor: str, principal: str) -> dict | None:
+                       actor: str, principal: str,
+                       expect_reason: str | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
         External agents are returned unchanged. Not exposed to executors.
+
+        `expect_reason` (#2152) : ne lève que la pause dont la raison est
+        exactement celle-là. La comparaison et la levée restent dans la même
+        instruction, sous le verrou de ligne : une pause étrangère posée entre
+        la lecture et la reprise n'est jamais levée. Refusé pour POSER une
+        pause (`paused=True`).
         """
 
     @abc.abstractmethod

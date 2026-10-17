@@ -40,7 +40,20 @@ redémarrée dès que l'agent est hors tour, puis la pause est levée et la
 reprise du bail prouvée. Le mesh journalise la pose et la levée
 (`operator_pause_events`) ; une pause déjà posée par un autre acteur n'est
 ni doublée ni levée, et aucune pause posée par le script ne survit à sa
-sortie. Il relit le placement avant chaque redémarrage :
+sortie. La levée est **conditionnelle** : le motif exact de la pause posée
+(unique, avec son jeton) est son identité, et `ameesh resume --operator
+--expect-reason` ne lève que cette pause-là — la comparaison et la levée se
+font dans la même instruction SQL (migration 0458), donc une pause étrangère
+posée entre la lecture et la reprise n'est jamais levée. Si la réponse de la
+pause se perd (SSH coupé, JSON illisible), le script réconcilie par l'état
+réel : motif identique, le drain continue ; sinon il ne redémarre ni ne lève
+rien et s'arrête en le disant. Pose et levée sont des gestes d'opérateur : le
+CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh` doit
+être lancé hors session d'agent ; sinon la pause est refusée et le
+redémarrage de cet agent s'arrête sans interrompre aucun tour. Un CLI de
+cible antérieur à #2152 (sans `--expect-reason`) n'est jamais utilisé pour
+drainer : le script attend comme avant plutôt que de laisser une pause
+orpheline. Il relit le placement avant chaque redémarrage :
 un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
 pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
 est rechargée sur le nouveau code (#1633), sans quoi elle servirait la

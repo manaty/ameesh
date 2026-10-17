@@ -53,6 +53,11 @@ assert os.environ.get('DBUS_SESSION_BUS_ADDRESS') == 'unix:path=/run/user/1001/b
 assert os.environ.get('AMEESH_DSN') == json.loads((state / 'expected-env.json').read_text())['AMEESH_DSN']
 assert os.environ.get('AMEESH_SCHEMA') == 'test_runner_schema'
 scenario = (state / 'scenario').read_text()
+if sys.argv[1:] == ['resume', '--help']:
+    # #2152 / R1 B2 : le script ne draine que si la reprise conditionnelle
+    # existe côté cible (--expect-reason).
+    print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
+    sys.exit(0)
 if sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error': sys.exit(1)
     if scenario == 'bad-json': print('not json'); sys.exit(0)
@@ -61,6 +66,14 @@ elif sys.argv[1] == 'show':
     name = sys.argv[2]
     row = next(a for a in json.loads((state / 'agents.json').read_text()) if a['name'] == name)
     row = dict(row, lease_owner='runner-' + name + '@host-agents', lease_epoch=7, lease_expires_ts=time.time()+300)
+    pause = state / ('pause-' + name)
+    motif = state / ('motif-' + name)
+    # R1 B1 : après notre pose et avant notre reprise, le monde extérieur lève
+    # notre drain puis pose une NOUVELLE pause (humaine, étrangère).
+    if scenario == 'drain-remplace' and motif.exists() and '#2152' in motif.read_text() \
+            and not (state / 'remplace-fait').exists():
+        motif.write_text('pause humaine etrangere')
+        (state / 'remplace-fait').touch()
     if scenario == 'expired': row['lease_expires_ts'] = time.time()-1
     if scenario == 'no-lease': row['lease_owner'] = None
     if scenario == 'foreign-owner': row['lease_owner'] = 'another-runner'
@@ -71,13 +84,17 @@ elif sys.argv[1] == 'show':
     # #2152 : un agent qui enchaîne les tours ne rend la main qu'une fois
     # drainé ; « chaines-toujours » ne la rend jamais.
     if name == 'dev9' and scenario in ('chaines', 'chaines-pause-error',
-                                       'chaines-resume-error', 'pause-concurrente') \
-            and not (state / 'pause-dev9').exists():
+                                       'chaines-resume-error', 'pause-concurrente',
+                                       'drain-remplace', 'pause-reponse-perdue',
+                                       'pause-coupee', 'pause-perdue-sans-pose',
+                                       'drain-refuse-identite') \
+            and not pause.exists():
         row['status'] = 'running'
     if name == 'dev9' and scenario == 'chaines-toujours':
         row['status'] = 'running'
-    if (state / ('pause-' + name)).exists():
+    if pause.exists():
         row['operator_paused'] = True
+        row['operator_pause_reason'] = motif.read_text() if motif.exists() else ''
     if (state / ('restart-' + name)).exists():
         row['lease_epoch'] = 9 if scenario != 'stale-lease' else 7
         if scenario == 'moved': row['host'] = 'elsewhere'
@@ -88,21 +105,53 @@ elif sys.argv[1] in ('pause', 'resume'):
     # #2152 : les gestes du drain, avec le « changed » que lit le script.
     name = sys.argv[2]
     args = sys.argv[3:]
+    pause = state / ('pause-' + name)
+    motif = state / ('motif-' + name)
     with (state / 'operateur.log').open('a') as f:
         f.write('%s %s %s\n' % (sys.argv[1], name, ' '.join(args)))
     if '--reason' not in args: sys.exit(2)
     if sys.argv[1] == 'pause':
         if scenario == 'chaines-pause-error': sys.exit(1)
-        (state / ('pause-' + name)).touch()
-        change = scenario != 'pause-concurrente'
+        if scenario == 'drain-refuse-identite':
+            # Geste d'opérateur refusé : vm.sh tourne dans une session liée à
+            # un agent (bad_actor), le CLI refuse AVANT toute mutation.
+            print('ameesh operator pause: bad_actor: an agent session cannot act '
+                  'as the local human', file=sys.stderr)
+            sys.exit(1)
+        if scenario == 'pause-perdue-sans-pose':
+            # R1 B2 : réponse perdue, la pose n'a PAS abouti.
+            print('{bad-json')
+            sys.exit(0)
+        motif.write_text(args[args.index('--reason') + 1])
+        pause.touch()
+        if scenario == 'pause-concurrente':
+            # Posée entre notre lecture et notre pause : elle n'est pas de nous.
+            motif.write_text('pause humaine etrangere')
+            change = False
+        elif scenario == 'pause-reponse-perdue':
+            # R1 B2 : la pose a abouti, mais la réponse est illisible.
+            print('{bad-json')
+            sys.exit(0)
+        elif scenario == 'pause-coupee':
+            # R1 B2 : la pose a abouti, puis le lien SSH tombe (rc ≠ 0).
+            sys.exit(1)
+        else:
+            change = True
         print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': True,
                           'changed': change, 'event_id': 1}))
     else:
         if '--operator' not in args: sys.exit(2)
         if scenario == 'chaines-resume-error': sys.exit(1)
-        (state / ('pause-' + name)).unlink(missing_ok=True)
-        print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': False,
-                          'changed': True, 'event_id': 2}))
+        attendu = args[args.index('--expect-reason') + 1] if '--expect-reason' in args else None
+        raison = motif.read_text() if motif.exists() else ''
+        if pause.exists() and (attendu is None or raison == attendu):
+            pause.unlink(); motif.unlink(missing_ok=True)
+            print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': False,
+                              'changed': True, 'event_id': 2}))
+        else:
+            print(json.dumps({'agent': name, 'mode': 'execute',
+                              'operator_paused': pause.exists(), 'changed': False,
+                              'event_id': None}))
 elif sys.argv[1] == 'doctor':
     print('doctor ok')
 else: sys.exit(2)
@@ -284,12 +333,75 @@ class AgentHostTest(unittest.TestCase):
         # Le motif de la pause nomme le drain (journalisé par le mesh).
         self.assertIn('drain de déploiement #2152', journal)
         self.assertIn('--reason', journal)
+        # #2152 / R1 B1 : la levée est conditionnée au motif exact de la pose.
+        pose = [l for l in journal.splitlines() if l.startswith('pause dev9')][0]
+        reprise = [l for l in journal.splitlines() if l.startswith('resume dev9')][0]
+        motif = pose.split('--reason ', 1)[1]
+        self.assertIn('--expect-reason ' + motif, reprise)
         # Posé avant le redémarrage, et redémarré seulement hors tour.
         self.assertLess(p.stdout.index('drain posé'), p.stdout.index('dev9 : redémarré'))
         self.assertIn('dev9 : redémarré (était idle)', p.stdout)
         self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
         self.assertIn('reprise prouvée (operator_paused=false)', p.stdout)
         self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_foreign_pause_replacing_the_drain_is_not_lifted(self):
+        """R1 B1 : notre drain est levé de l'extérieur puis une NOUVELLE pause
+        étrangère est posée ; la reprise conditionnelle ne lève que la nôtre."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='drain-remplace')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('pause dev9', self.operateur())
+        self.assertIn('--expect-reason', self.operateur())
+        self.assertTrue((self.state / 'remplace-fait').exists())
+        # La pause étrangère est toujours là, intacte.
+        self.assertTrue((self.state / 'pause-dev9').exists())
+        self.assertEqual((self.state / 'motif-dev9').read_text(), 'pause humaine etrangere')
+        self.assertIn('pause étrangère laissée en place', p.stderr)
+        self.assertIn('dev9 : redémarré', p.stdout)
+
+    def test_lost_pause_answer_is_reconciled_by_the_real_state(self):
+        """R1 B2 : la pose a abouti mais la réponse est illisible ; l'état réel
+        (motif identique) la confirme et le drain continue."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='pause-reponse-perdue')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('réponse de pause illisible', p.stderr)
+        self.assertIn("drain posé (confirmé par l'état réel)", p.stdout)
+        self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_cut_pause_answer_after_commit_is_reconciled(self):
+        """R1 B2 : la pose aboutit puis le lien tombe (rc ≠ 0) ; même
+        réconciliation, la pause trouvée est bien la nôtre."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='pause-coupee')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("drain posé (confirmé par l'état réel)", p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_lost_pause_answer_without_our_pause_stops_safely(self):
+        """R1 B2 : réponse illisible et aucune pause à nous ; rien n'est levé
+        ni redémarré, et le script s'arrête en le disant."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='pause-perdue-sans-pose')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("n'est pas celle de ce drain", p.stderr)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+
+    def test_operator_gesture_refused_in_an_agent_session_stops_safely(self):
+        """Périmètre annoncé : le drain est un geste d'opérateur. Un refus
+        bad_actor (vm.sh lancé dans une session liée à un agent) n'interrompt
+        aucun tour et ne laisse aucune pause."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='drain-refuse-identite')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('bad_actor', p.stderr)
+        self.assertIn('pose du drain refusée', p.stderr)
+        self.assertIn("n'est pas celle de ce drain", p.stderr)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
 
     def test_drain_refused_stops_without_restarting_the_agent(self):
         self.env['DRAIN_ATTENTE'] = '1'
