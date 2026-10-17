@@ -83,10 +83,11 @@ ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
 # #1969 : le helper de bascule atomique est copié depuis le poste, pour que
 # l'installation et le retour emploient la même version quel que soit le
 # commit déployé (l'ancien code n'a pas forcément le fichier).
-BASCULE_VM=/tmp/ameesh-bascule-$$.py
+# Exécuté en root : jamais dans /tmp (partagé), mais sous /root, privé.
+BASCULE_VM=/root/.cache/ameesh/bascule-$$.py
 envoyer_bascule_vm() {
   [ -r "$ICI/bascule.py" ] || { echo "bascule.py introuvable : $ICI/bascule.py" >&2; return 1; }
-  ssh_vm "cat > $BASCULE_VM" < "$ICI/bascule.py"
+  ssh_vm "umask 077; mkdir -p ${BASCULE_VM%/*} && cat > $BASCULE_VM" < "$ICI/bascule.py"
 }
 BASCULE_AGENTS=/home/ameesh/.local/state/ameesh/mise-a-jour/bascule-$$.py
 envoyer_bascule_agents() {
@@ -840,6 +841,7 @@ installer() {
     test \"\$(git -C $SRC rev-parse HEAD)\" = '$sha'
     python3 $BASCULE_VM preparer --venv $VENV --src $SRC --version ${sha:0:7}
     python3 $BASCULE_VM activer --venv $VENV --version ${sha:0:7} --precedent \$(cut -c1-7 $PRECEDENT)
+    rm -f $BASCULE_VM
     $VENV/bin/python -c 'import psycopg, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \": modules L70 et L62 présents\")'"
   echo "installé. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
@@ -923,6 +925,7 @@ retour() {
   envoyer_bascule_vm
   ssh_vm "set -e; test -s $PRECEDENT
     python3 $BASCULE_VM retour --venv $VENV
+    rm -f $BASCULE_VM
     git -C $SRC checkout -q --detach \"\$(cat $PRECEDENT)\"
     echo \"code : \$(git -C $SRC rev-parse --short HEAD)\""
   echo "base inchangée : les migrations passées avant l'installation sont additives, l'ancien code les ignore"

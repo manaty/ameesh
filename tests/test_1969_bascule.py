@@ -304,6 +304,24 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual(0, activer(self.venv, "v2"))
         self.assertEqual((0, "v2"), lire(self.venv))
 
+    def test_controles_acceptent_le_shebang_python3_de_pip(self):
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        ameesh = cible / "bin" / "ameesh"
+
+        def controler(shebang):
+            ameesh.write_text(shebang + "\nimport sys\n")
+            with mock.patch.object(bascule, "_run"):
+                bascule._controles(str(cible))
+
+        for nom in ("python", "python3", "python3.14"):
+            controler("#!%s" % (cible / "bin" / nom))
+        for faux in ("#!%s" % (self.venv / "bin" / "python3"),
+                     "#!/usr/bin/python3",
+                     "#!%s" % (cible / "bin" / "pythonx")):
+            with self.assertRaises(RuntimeError):
+                controler(faux)
+
     def test_activer_refuse_un_venv_non_prepare(self):
         faux_venv(self.base, "v1")
         os.rename(self.base / "venv-v1", self.venv)

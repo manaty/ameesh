@@ -166,7 +166,10 @@ def _controles(directory):
     _run([ameesh, "--version"], stdout=subprocess.DEVNULL)
     with open(ameesh, "rb") as handle:
         shebang = handle.readline().decode("utf-8", "replace").strip()
-    if shebang != "#!%s" % python:
+    # pip écrit le shebang de l'interpréteur qui l'exécute : `bin/python3`
+    # (ou `bin/python3.X`) dans un venv réel, jamais `bin/python` seul ; on
+    # exige seulement l'interpréteur de CE venv.
+    if not re.fullmatch(re.escape("#!" + python) + r"(?:[0-9]+(?:\.[0-9]+)*)?", shebang):
         raise RuntimeError("shebang inattendu dans %s : %r" % (ameesh, shebang))
 
 
