@@ -531,6 +531,22 @@ class SupervisorTest(FakeCliTest):
 
 
 class SupervisorClosureRaceTest(unittest.TestCase):
+    def test_sortie_fournisseur_non_nulle_invalide_le_defi_une_fois(self):
+        invalidated = []
+        sup = login.Supervisor(invalidate=lambda request: invalidated.append(request.login_id))
+        request = sup.registry.open(host="h", harness="gh", account="a")
+        remote_id = "lgn_" + "a" * 26
+        sup.registry.published(request, remote_id, close_token="x" * 43)
+        proc = mock.Mock(returncode=1)
+        sup._threads[request.id] = mock.Mock()
+
+        sup._settle(request, proc)
+        self.assertEqual((request.state, request.category),
+                         (login.FAILED, "provider_refused"))
+        self.assertEqual(invalidated, [remote_id])
+        sup.close()
+        self.assertEqual(invalidated, [remote_id])
+
     def test_publication_revenue_apres_annulation_est_invalidee(self):
         invalidated = []
         sup = login.Supervisor(invalidate=lambda request: invalidated.append(request.login_id))

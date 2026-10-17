@@ -645,8 +645,8 @@ class Supervisor:
         if status is None or request.closing:
             return
         if status != 0 and request.state == VIEWING:
-            self._terminate(request)
-            self.registry.finish(request, FAILED, "provider_refused")
+            self._fail(request, ADAPTERS[request.harness], "provider_refused",
+                       "provider login failed")
 
     def _settle_done(self, request: Request) -> bool:
         """Attend la FIN FOURNISSEUR (sortie propre du CLI), bornée.
