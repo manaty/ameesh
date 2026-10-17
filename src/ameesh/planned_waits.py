@@ -155,7 +155,8 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         # remplace que l'attente de fusion ; sorti de qa (build, blocked,
         # waiting_human), le signal revient.
         landing = landing_by_item.get(ident)
-        if not landing or row.get("state") != "qa":
+        if (not landing or row.get("state") != "qa"
+                or landing.get("admitted") is False):
             continue
         vehicle = int(landing["vehicle_id"])
         open_vehicle = landing.get("open")
@@ -190,6 +191,43 @@ def latest_freeze(rows):
         return None
     return max(freezes, key=lambda r: (float(r.get("at_ts") or 0),
                                        int(r.get("id") or 0)))
+
+
+def _admitted(st, rows, landings):
+    """#2171 N3 (revue) : l'admission se relit sur le LOT, pas seulement au geste.
+
+    Le chemin groupé ne doit pas parquer un lot qui a perdu son gel ou son
+    verdict acquis depuis la déclaration (nouveau gel sans verdict, retour en
+    `qa` après un build) : même vérité que `progress._jalons_de_lot`, donc le
+    signal stale revient comme dans `progress`. Trois lectures groupées, pour
+    les seuls lots déclarés."""
+    if not landings:
+        return []
+    from . import progress
+    ids = sorted({int(l["work_item_id"]) for l in landings})
+    by_id = {int(r["id"]): r for r in rows}
+    transitions, actions, declared = {}, {}, {}
+    for row in st.progress.lot_transitions(ids):
+        transitions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_actions(ids):
+        actions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_milestones(ids):
+        declared.setdefault(int(row["work_item_id"]), []).append(row)
+    out = []
+    for landing in landings:
+        ident = int(landing["work_item_id"])
+        item = by_id.get(ident)
+        if item is None:
+            out.append(landing)
+            continue
+        jalons = progress._jalons_de_lot(
+            item, transitions.get(ident, []), actions.get(ident, []),
+            declared.get(ident, []))
+        admitted = (jalons.get("last_frozen") is not None
+                    and jalons.get("verdict_kind") == "ok"
+                    and bool(jalons.get("verdict_current")))
+        out.append(dict(landing, admitted=admitted))
+    return out
 
 
 def _with_heads(st, landings):
@@ -228,6 +266,7 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     if open_items is None:
         open_items = st.operations.open_lots_activity(None) if any(
             c.get("depends_on") for c in commitments) else []
-    landings = _with_heads(st, st.work_dependencies.landings_for([int(r["id"]) for r in rows]))
+    landings = _with_heads(st, _admitted(
+        st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
     return resolve(rows, dates, commitments, packages, open_items, now=now,
                    dependencies=dependencies, landings=landings)

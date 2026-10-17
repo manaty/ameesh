@@ -410,3 +410,38 @@ class PgTest(PgTestCase):
                          [r["id"] for r in stagnation.stagnant_lots(self.db, now=end_until - 1)])
         self.assertIn(waiting["id"],
                       [r["id"] for r in stagnation.stagnant_lots(self.db, now=end_until)])
+
+    def test_landing_lot_losing_its_verdict_or_freeze_gets_the_signal_back(self):
+        """#2171 N3 (revue cx1) : la lecture groupée relit l'admission du lot.
+
+        Un nouveau gel du lot admis, sans verdict, le laisse en `qa` mais défait
+        son admission : `planned_waits.read` (donc stagnation et progress) rend
+        le signal, comme `progress.verdict_current`."""
+        waiting = work.add(self.db, title="carried while qa", app="acme")
+        work.move(self.db, waiting["id"], "build", actor="test")
+        work.move(self.db, waiting["id"], "qa", actor="test")
+        head = "c" * 40
+        work.milestone(self.db, waiting["id"], "frozen", sha=head, actor="test")
+        work.milestone(self.db, waiting["id"], "verdict", verdict="ok", sha=head,
+                       actor="reviewer")
+        self.old(waiting)
+        vehicle = work.add(self.db, title="package vehicle", app="acme")
+        work.milestone(self.db, vehicle["id"], "frozen", sha="e" * 40, actor="test")
+        until = (datetime.date.fromtimestamp(self.now)
+                 + datetime.timedelta(days=2)).isoformat()
+        work_dependencies.land(self.db, waiting["id"], vehicle["id"],
+                               until_on=until, actor="pilot")
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        # nouveau gel du LOT admis, sans verdict : il reste qa, le signal revient
+        work.milestone(self.db, waiting["id"], "frozen", sha="d" * 40, actor="test")
+        self.old(waiting)
+        item = work.get(self.db, waiting["id"])
+        self.assertEqual(item["state"], "qa")
+        self.assertIsNone(W.read(self.db, [item], now=self.now).get(waiting["id"]))
+        self.assertIsNone(plan.annotate(self.db, [item], now=self.now)[0]["planned_wait"])
+        self.assertIn(waiting["id"],
+                      [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # le verdict ok de l'ancienne tête ne vaut pas pour le nouveau gel
+        self.assertFalse(progress._jalons_de_lot(
+            item, [], [], storage.of(self.db).progress.lot_milestones([waiting["id"]])
+        ).get("verdict_current"))

@@ -47,6 +47,9 @@ A lot is stale when it is open and inactive beyond the configured threshold
   lot still in build, or still waiting for its review, cannot be parked. If it
   later leaves `qa` (rework, blocked, waiting for a human), the declared
   landing stops deferring the alert — it only replaces the merge wait. The
+  grouped read re-checks this admission on every pass, with the same truth as
+  `progress`: a new freeze of the waiting lot without an acquired verdict, or
+  a lost freeze/verdict, gives the signal back even if the lot stays `qa`. The
   deadline is a short, finite day: `--until`
   must be today or later and at most `AMEESH_LANDING_MAX_DAYS` ahead
   (an operating bound, 90 days by default, like `AMEESH_STALE_AFTER`),
