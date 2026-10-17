@@ -386,19 +386,23 @@ class GcTests(_Base):
         done = deps.link_package(pkg, self.cache, installer=FakeInstaller())
         entry = deps.entry_of(deps.nm_root(self.cache), done["key"])
         later = time.time() + 10 * 24 * 3600
-        self.assertEqual(deps.gc_node_modules(self.cache, now=later), [])   # linked
+        self.assertEqual(deps.gc_node_modules(self.cache, now=later,
+                                              holders=lambda _p: []), [])   # linked
         os.unlink(os.path.join(pkg, "node_modules"))
-        self.assertEqual(deps.gc_node_modules(self.cache), [])              # not idle yet
-        plan = deps.gc_node_modules(self.cache, now=later, dry_run=True)
+        self.assertEqual(deps.gc_node_modules(self.cache,
+                                              holders=lambda _p: []), [])   # not idle yet
+        plan = deps.gc_node_modules(self.cache, now=later, dry_run=True,
+                                    holders=lambda _p: [])
         self.assertEqual([p["action"] for p in plan], ["would-delete"])
         self.assertTrue(os.path.isdir(entry))
         held = deps._lock(os.path.join(deps.nm_root(self.cache), done["key"] + ".lock"),
                           wait=0)
         try:
-            self.assertEqual(deps.gc_node_modules(self.cache, now=later), [])  # filling
+            self.assertEqual(deps.gc_node_modules(self.cache, now=later,
+                                                  holders=lambda _p: []), [])  # filling
         finally:
             held.close()
-        lines = deps.gc_node_modules(self.cache, now=later)
+        lines = deps.gc_node_modules(self.cache, now=later, holders=lambda _p: [])
         self.assertEqual([(line["kind"], line["action"]) for line in lines],
                          [("deps", "deleted")])
         self.assertFalse(os.path.lexists(entry))
@@ -408,8 +412,9 @@ class GcTests(_Base):
         partial = os.path.join(root, "f" * 64, "app", "node_modules", "x")
         os.makedirs(partial)
         os.chmod(os.path.dirname(partial), 0o555)
-        self.assertEqual(deps.gc_node_modules(self.cache), [])
-        lines = deps.gc_node_modules(self.cache, now=time.time() + 2 * 3600)
+        self.assertEqual(deps.gc_node_modules(self.cache, holders=lambda _p: []), [])
+        lines = deps.gc_node_modules(self.cache, now=time.time() + 2 * 3600,
+                                     holders=lambda _p: [])
         self.assertEqual([line["detail"] for line in lines], ["partial fill (no .complete.json)"])
         # the lock file stays: a waiting filler and a new one lock the same inode
         self.assertEqual(os.listdir(root), ["f" * 64 + ".lock"])

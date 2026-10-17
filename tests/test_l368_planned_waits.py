@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 from ameesh import (mesh_cli, plan, planned_waits as W, progress, roadmap,
-                    stagnation, storage, work)
+                    stagnation, storage, work, work_dependencies)
 from ameesh import work_dependencies as D
 from ameesh.storage import interface as SI
 from ameesh.storage.postgres.progress import Progress
@@ -77,6 +77,59 @@ class UnitTest(unittest.TestCase):
             {1: {"what": "scheduled", "start": "2026-10-13", "package": "epic"}})
         self.assertEqual(W.resolve(self.rows, {1: {"planned_start": "2026-10-12"}}, [],
                                     packages, [], now=self.now), {})
+
+    def test_external_gate_holds_until_the_end_of_the_due_day(self):
+        commitment = {"id": 7, "status": "open", "work_item_id": 1, "due_on": "2026-10-13",
+                      "depends_on": ["gate:liquichain-window"]}
+        expected = {1: {"what": "hold", "gate": "liquichain-window", "until": "2026-10-13",
+                        "commitment": 7}}
+        self.assertEqual(self.resolve(commitments=[commitment]), expected)
+        for alias in ("external:liquichain-window", "GATE:liquichain-window"):
+            self.assertEqual(self.resolve(commitments=[dict(commitment, depends_on=[alias])]),
+                             expected)
+        end = plan.day_start_ts("2026-10-14")
+        self.assertEqual(self.resolve(commitments=[commitment], now=end - 1), expected)
+        self.assertEqual(self.resolve(commitments=[commitment], now=end), {})
+
+    def test_external_gate_on_a_package_holds_its_descendants(self):
+        commitment = {"id": 8, "status": "open", "package_id": "epic", "due_on": "2026-10-13",
+                      "depends_on": ["gate:epic-window"]}
+        self.assertEqual(self.resolve(commitments=[commitment]),
+                         {1: {"what": "hold", "gate": "epic-window", "until": "2026-10-13",
+                              "commitment": 8}})
+        rows = [{"id": 4, "state": "build", "package_id": "other"}]
+        self.assertEqual(self.resolve(commitments=[commitment], rows=rows), {})
+
+    def test_unrepresentable_hold_end_does_not_break_other_waits(self):
+        rows = [{"id": 1, "state": "build"}, {"id": 2, "state": "build"}]
+        commitments = [
+            {"status": "open", "work_item_id": 1, "due_on": "9999-12-31",
+             "depends_on": ["gate:out-of-range"]},
+            {"status": "open", "work_item_id": 2, "due_on": "2026-10-13",
+             "depends_on": ["gate:valid"]},
+        ]
+        self.assertEqual(self.resolve(rows=rows, commitments=commitments),
+                         {2: {"what": "hold", "gate": "valid", "until": "2026-10-13"}})
+
+    def test_malformed_finished_or_undated_gate_does_not_suppress(self):
+        base = {"id": 7, "status": "open", "work_item_id": 1, "due_on": "2026-10-13"}
+        for reference in ("gate:", "gate", "external", "gate liquichain", "hold:liquichain",
+                          "after the window", None):
+            with self.subTest(reference=reference):
+                self.assertEqual(self.resolve(commitments=[dict(base, depends_on=[reference])]), {})
+        for status in ("proposed", "done", "cancelled"):
+            self.assertEqual(self.resolve(commitments=[dict(base, status=status,
+                                                            depends_on=["gate:x"])]), {})
+        for due in (None, "", "someday"):
+            self.assertEqual(self.resolve(commitments=[dict(base, due_on=due,
+                                                            depends_on=["gate:x"])]), {})
+        self.assertEqual(self.resolve(commitments=[dict(base, due_on="2026-10-11",
+                                                        depends_on=["gate:x"])]), {})
+        # a lot dependency stays a dependency, and wins over a gate on the same lot
+        both = dict(base, depends_on=["gate:x", "#2"])
+        self.assertEqual(self.resolve(commitments=[both], items=[{"id": 2, "state": "build"}]),
+                         {1: {"what": "dependency", "lots": [2]}})
+
 
     def test_explicit_hold_is_a_planned_wait_until_lifted_or_moved(self):
         """#1664 : `hold:` tient le lot (alerte stale éteinte) ; une note
@@ -317,6 +370,34 @@ class PgTest(PgTestCase):
         rows = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)
         self.assertEqual(rows[0]["planned_wait"]["lots"], [blocker["id"]])
         self.assertIsNone(rows[0]["stale"])
+
+    def test_external_hold_defers_stagnation_and_ends_at_its_due_day(self):
+        waiting = self.item("blocked by an external gate")
+        due = (datetime.date.fromtimestamp(self.now)
+               + datetime.timedelta(days=1)).isoformat()
+        commitment = roadmap.add_commitment(
+            self.db, "hold until the liquichain window", due=due, lot=waiting["id"],
+            depends_on=["gate:liquichain-window"])
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
+        self.assertEqual(row["planned_wait"],
+                         {"what": "hold", "gate": "liquichain-window", "until": due,
+                          "commitment": commitment["id"]})
+        self.assertIsNone(row["stale"])
+        self.assertEqual(work_dependencies.wait_label(row["planned_wait"]),
+                         "external hold until %s (liquichain-window)" % due)
+        snap = progress.snapshot(self.db, self.cfg, project="acme", now=self.now, gantt=False)
+        self.assertIsNone(next(r for r in snap["lots"] if r["id"] == waiting["id"])["stale"])
+        # the due day counts in full: the ordinary rule applies again the next day
+        after = plan.day_start_ts(
+            (datetime.date.fromtimestamp(self.now) + datetime.timedelta(days=2)).isoformat())
+        self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=after)],
+                         [waiting["id"]])
+        # cancelling the commitment releases the lot immediately
+        storage.of(self.db).roadmap.set_commitment(
+            commitment["id"], values={"status": "cancelled"}, current=["open"])
+        self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)],
+                         [waiting["id"]])
 
     def test_hold_note_suppresses_stagnation_until_lifted_or_moved(self):
         """#1664 : une note `hold:` d'un pilote éteint la relance 6 h et ses vues

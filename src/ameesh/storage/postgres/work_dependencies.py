@@ -5,7 +5,79 @@ from __future__ import annotations
 from ..work_dependencies import WorkDependencies as Contract
 
 _DONE = ("merged", "promoted", "closed")
+_DONE_SQL = "('merged', 'promoted', 'closed')"
 _LOCK = "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':work_dependencies', 0))"
+
+#: #1922 : un lot pinné sur une révision Process ne bouge que par le registre
+#: (`process_registry`), qui vérifie la garde serveur avant d'écrire. Les
+#: écritures historiques d'état filtrent donc la colonne DANS le SQL : une
+#: adoption concurrente (qui garde l'état) ne laisse plus passer un move
+#: legacy entre la lecture et l'UPDATE (N8 de la relecture Claude). La lecture
+#: par `to_jsonb` rend `''` sur une base d'avant 0452, sans casser.
+_UNPINNED = "coalesce(to_jsonb(work_items)->>'workflow_ref', '') = ''"
+
+
+def _last_milestone(alias: str, kind: str, column: str) -> str:
+    """La `column` du dernier jalon `kind` de ce lot (NULL s'il n'y en a pas)."""
+    return ("(SELECT m.%s FROM work_item_milestones m"
+            "  WHERE m.work_item_id = %s.id AND m.kind = '%s'"
+            "  ORDER BY m.at DESC, m.id DESC LIMIT 1)" % (column, alias, kind))
+
+
+def last_freeze_sha(alias: str) -> str:
+    """Le sha nommé par le dernier gel (`''` quand il n'en nomme aucun)."""
+    return _last_milestone(alias, "frozen", "sha")
+
+
+#: #1677 B1 : le verdict n'est retenu que s'il NOMME le dernier gel — la règle
+#: de `progress._verdict_applies` et de `merge_queue` (un ok d'une tête
+#: jamais regelée ne vaut plus). Le préfixe est admis (`progress._same_commit`,
+#: casse ignorée) ; quand un sha manque d'un côté, on retombe sur les instants.
+def current_verdict(alias: str) -> str:
+    """SQL : le verdict RETENU d'un lot (`ok`/`blocked`/NULL), c'est-à-dire le
+    dernier verdict s'il porte sur le dernier gel — un lot regelé après un `ok`
+    repasse en relecture, un lot regelé après un `blocked` n'attend plus de
+    correction. NULL quand le verdict ne porte pas sur le dernier gel (ou
+    qu'il n'y en a pas).
+
+    Seul point de lecture de cette règle : les lots actionnables du relevé et
+    les propositions de relecture s'y appuient, pour qu'un lot ne soit jamais
+    relu sur un verdict périmé (#1677 B1). La prise (L165) ne s'en sert plus :
+    depuis #2252, seule une fusion satisfait une dépendance."""
+    return (
+        "(SELECT CASE"
+        "   WHEN v.verdict IS NULL THEN NULL"
+        "   WHEN f.sha IS NULL THEN v.verdict"
+        "   WHEN btrim(v.sha) <> '' AND btrim(f.sha) <> '' THEN"
+        "        CASE WHEN lower(btrim(v.sha)) = lower(btrim(f.sha))"
+        "               OR starts_with(lower(btrim(v.sha)), lower(btrim(f.sha)))"
+        "               OR starts_with(lower(btrim(f.sha)), lower(btrim(v.sha)))"
+        "             THEN v.verdict END"
+        "   WHEN v.at >= f.at THEN v.verdict END"
+        "   FROM (SELECT m.verdict, m.sha, m.at FROM work_item_milestones m"
+        "          WHERE m.work_item_id = %s.id AND m.kind = 'verdict'"
+        "          ORDER BY m.at DESC, m.id DESC LIMIT 1) v"
+        "   LEFT JOIN LATERAL (SELECT m.sha, m.at FROM work_item_milestones m"
+        "          WHERE m.work_item_id = %s.id AND m.kind = 'frozen'"
+        "          ORDER BY m.at DESC, m.id DESC LIMIT 1) f ON true)"
+        % (alias, alias))
+
+
+def not_blocking(alias: str) -> str:
+    """#2252 : prédicat SQL « ce lot ne bloque plus » — il est FUSIONNÉ
+    (`merged`/`promoted`/`closed`). Un lot en `qa`, même à verdict courant
+    favorable et à tête relue, ne libère plus ses dépendants.
+
+    #1677 avait admis le `qa` à verdict courant favorable comme satisfait, le
+    dépendant s'empilant sur la tête gelée. Le 17/10, #661 a reçu un `ok` à
+    13:45:52, #667 a été pris à 13:45:57, puis #661 a reçu un `blocked` à
+    13:46:07 : l'agent s'est retrouvé sur une base qui venait de changer. La
+    règle voulue par #2252 est celle de `work show` et de « planned: waiting
+    on lots » — une dépendance n'est satisfaite que fusionnée —, pour qu'aucun
+    lot ne soit pris sur une base instable. L'inverse exact du `blocking` rendu
+    par `for_items` et lu par la prise (`unassigned_lots`, `assign ready_only`).
+    """
+    return "(%s.state IN %s)" % (alias, _DONE_SQL)
 
 
 class WorkDependencies(Contract):
@@ -73,7 +145,42 @@ class WorkDependencies(Contract):
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
                    w.state AS blocker_state,
-                   w.state NOT IN ('merged', 'promoted', 'closed') AS blocking
+                   w.branch AS blocker_branch,
+                   (SELECT m.sha FROM work_item_milestones m
+                     WHERE m.work_item_id = w.id AND m.kind = 'frozen'
+                     ORDER BY m.at DESC, m.id DESC LIMIT 1) AS blocker_frozen_sha,
+                   NOT """ + not_blocking("w") + """ AS blocking
             FROM work_item_dependencies d JOIN work_items w ON w.id = d.blocker_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
+
+    def release_unassigned(self, item_ids, *, actor):
+        """#1668 : un dépendant NON ASSIGNÉ dont la dernière attente vient de
+        tomber repasse `blocked` → `intake` dans la transaction de fermeture.
+
+        Sans ce geste, `lot_sessions.actionable` (qui ne lit que `intake` et
+        `build`) ne le voit pas : il reste invisible au self-service jusqu'à ce
+        qu'une alerte stale le fasse rouvrir à la main, jusqu'à 14 h plus tard.
+        Les lots assignés ne bougent pas : le courrier de réveil (L385) porte
+        le geste à leur agent, qui peut juger la suite. Appelé dans la
+        transaction qui ferme le bloqueur, sous son verrou de graphe : la
+        réouverture est committée avec la fermeture, ou pas du tout.
+        Un lot retenu par le registre Process (`workflow_ref` non nul) n'est
+        jamais rouvert ici : sa retenue (`blocked`) ne tombe que par une
+        commande `release` du registre, vérifiée par C (#1922/B4).
+        Rend les identifiants rouverts."""
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return []
+        rows = self.db.query(
+            "UPDATE work_items SET state = 'intake', updated_at = clock_timestamp()"
+            " WHERE id IN (" + ", ".join(["%s"] * len(ids)) + ")"
+            " AND state = 'blocked' AND assignee IS NULL"
+            " AND " + _UNPINNED + " RETURNING id", tuple(ids))
+        for row in rows:
+            self.db.execute(
+                "INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
+                " VALUES (%s, 'intake', %s, %s, clock_timestamp())",
+                (int(row["id"]),
+                 "Dependency released: back to intake (no assignee, #1668)", actor or ""))
+        return [int(row["id"]) for row in rows]

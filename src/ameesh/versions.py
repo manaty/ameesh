@@ -296,18 +296,26 @@ class Reader:
     chemin) : un cache servi n'est jamais dit frais. Un échec est gardé
     `fail_ttl` secondes ; si le chemin avait déjà été lu, sa valeur
     précédente reste servie, marquée périmée (`stale(chemin)`), jamais une
-    page vide à cause d'une panne passagère."""
+    page vide à cause d'une panne passagère. `cache_dir` (l'état de l'hôte)
+    adosse le lecteur au cache partagé (#848) : deux exécutions successives
+    ne repayent pas la même lecture, et un quota épuisé ne fait pas boucler.
+    Le transport partagé dit ce qu'il a servi (`last_read`) : une valeur
+    sortie du cache garde sa date d'origine, et un cache servi par quota
+    épuisé arrive marqué `stale` (R1 #848, B2)."""
 
     def __init__(self, api=None, *, ttl: float = CACHE_S, clock=time.monotonic,
                  wall=time.time, timeout: float = READ_TIMEOUT,
-                 allow_gh: bool = True, fail_ttl: float = FAIL_S):
+                 allow_gh: bool = True, fail_ttl: float = FAIL_S,
+                 cache_dir=None):
         self._api = api
+        self._client = None
         self._ttl = float(ttl)
         self._clock = clock
         self._wall = wall
         self._timeout = float(timeout)
         self._allow_gh = bool(allow_gh)
         self._fail_ttl = float(fail_ttl)
+        self._cache_dir = cache_dir
         self._cache: dict = {}
         self._stamps: dict = {}
         self._failures: dict = {}
@@ -334,19 +342,26 @@ class Reader:
 
     def _call(self, path: str):
         if self._api is None:
-            client = plan_github.client(timeout=self._timeout, allow_gh=self._allow_gh)
+            client = plan_github.client(timeout=self._timeout, allow_gh=self._allow_gh,
+                                        cache_dir=self._cache_dir)
             if client is None:
                 raise plan_github.GithubError(
                     "no GitHub token (%s) and no local gh"
                     % ", ".join(plan_github.TOKEN_VARS))
+            self._client = client
             self._api = client.get
-        return self._api(path)
+        value = self._api(path)
+        meta = getattr(self._client, "last_read", None) if self._client is not None else None
+        return value, meta
 
     def get(self, path: str):
         """Le JSON d'un chemin, gardé `ttl` secondes ; lève GithubError.
 
         Un échec est gardé `fail_ttl` secondes ; les données précédentes du
-        chemin, si elles existent, restent servies et marquées périmées."""
+        chemin, si elles existent, restent servies et marquées périmées.
+        Le transport partagé dit ce qu'il a servi (`last_read`) : une valeur
+        sortie du cache par quota épuisé arrive `stale`, avec sa date
+        d'origine — jamais stampée « maintenant » (R1 #848, B2)."""
         now = self._clock()
         hit = self._cache.get(path)
         if hit is not None and now - hit[1] < self._ttl:
@@ -358,18 +373,21 @@ class Reader:
                 return hit[0]
             raise failure[0]
         try:
-            value = self._call(path)
+            value, meta = self._call(path)
         except plan_github.GithubError as exc:
             self._failures[path] = (exc, now)
             if hit is not None:
                 self._stale.add(path)       # données précédentes, périmées
                 return hit[0]
             raise
-        stamp = self._wall()
+        stamp = self._wall() if meta is None else float(meta.read_ts)
         self._cache[path] = (value, now, stamp)
         self._stamps[path] = stamp
         self._failures.pop(path, None)
-        self._stale.discard(path)
+        if meta is not None and meta.stale:
+            self._stale.add(path)           # servi du cache, quota épuisé
+        else:
+            self._stale.discard(path)
         self._read_ts = stamp if self._read_ts is None else max(self._read_ts, stamp)
         return value
 

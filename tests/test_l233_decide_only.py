@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import unittest
 from unittest import mock
 
@@ -119,14 +118,16 @@ class WaitingHumanTest(_Base):
         self.db.execute("UPDATE agent_mailbox SET delivered_at = now() WHERE kind = 'request'")
         first = self._without_question()
         self.assertEqual(len(first), 1)
-        time.sleep(1.1)
         work.note(self.db, self.lot["id"], "still thinking", actor="dev1")
         again = self._without_question()
+        # la note ne change ni l'épisode ni son `since` (instant de la base) :
+        # la clé reste la même sans attendre la seconde suivante, et l'égalité
+        # exacte du `since` rend l'assertion sensible à un recalcul
+        self.assertEqual(again[0]["since"], first[0]["since"])
         self.assertEqual([notify.key_of(a) for a in again], [notify.key_of(first[0])])
         # a new waiting episode is a new alert
         self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s",
                         (self.lot["id"],))
-        time.sleep(1.1)
         work.note(self.db, self.lot["id"], "back to build", actor="dev1")
         hold_for_owner(self.db, self.lot["id"], requester="orch")
         self.db.execute("UPDATE agent_mailbox SET delivered_at = now() WHERE kind = 'request'")
