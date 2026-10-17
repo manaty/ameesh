@@ -1036,9 +1036,11 @@ The `installer` step follows the same practice.
    exists**. On the server, as local superuser, over SSH. A missing
    role is not created: that is a separate decision.
 6. `poste.sh redemarrer`: each active `ameesh-runner-agent@<p>` is
-   restarted **one by one**, as soon as `ameesh show <p>` no longer says `running`.
-   A persona in a long turn does not block the others: the script goes back
-   over the list (at most `ATTENTE_MAX`, 2 h). Then `ameesh-notify`, then the
+   restarted **one by one**: the unit is stopped first (SIGTERM closes
+   admission; the turn in progress drains, bounded by `TimeoutStopSec`), the
+   safe point is proven (`ActiveState=inactive` and `MainPID=0`), then it is
+   started. No idle window is awaited: a persona in a long turn no longer
+   blocks or starves the update. Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
    A unit that does not stay active stops the script. So does a runner that
    held its persona's lease before the restart and does not take it again

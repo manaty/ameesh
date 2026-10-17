@@ -42,6 +42,8 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from .platform import exited_child_status
+
 #: échéance maximale d'un défi, alignée sur le service (`LOGIN_MAX_TTL`)
 TTL_S = 900.0
 #: délai entre SIGTERM et SIGKILL du groupe de processus
@@ -55,6 +57,8 @@ PUBLISH_CLOSE_S = 30.0
 CAPTURE_MAX = 64 * 1024
 #: pas d'attente des boucles de surveillance
 POLL_S = 0.05
+#: waitid(WNOWAIT) observe la sortie du chef sans le récolter (N1)
+PEEK_EXIT = all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID"))
 
 STARTING = "starting"
 VIEWING = "viewing"
@@ -74,6 +78,9 @@ CATEGORIES = ("already_pending", "unsupported_version", "flow_unrecognized",
               "expired", "cancelled", "provider_refused", "healthy", "failed")
 
 _CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz"
+#: capacité de clôture d'un défi : 256 bits en base64url (même forme que les
+#: jetons de lien du service) ; sans elle, le jeton global ne ferme pas le défi
+_CLOSE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 _URL_RE = re.compile(r"https://[^\s<>\"'`\\]+")
 #: ce que les CLI disent d'un refus fournisseur (repris de `sentinel`)
 _REFUSED_RE = re.compile(
@@ -182,8 +189,9 @@ def check_extra(adapter: Adapter, extra=()) -> tuple:
 
 #: variables de compte héritées qu'une connexion ne doit jamais voir
 _DROP_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
-             "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-             "OPENAI_API_KEY", "CODEX_API_KEY", "SSH_ASKPASS", "BROWSER")
+             "GH_HOST", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+             "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY",
+             "SSH_ASKPASS", "BROWSER")
 #: dossier de configuration du CLI, par harnais
 _HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "gh": "GH_CONFIG_DIR"}
 
@@ -277,6 +285,9 @@ class Request:
     #: échéance SIGNÉE, portée par le service : lie le reçu à cette demande
     service_exp: int = 0
     link: str = field(default="", repr=False)
+    #: capacité de clôture de CE défi, remise par le service à sa création :
+    #: le jeton global ne suffit plus à fermer le défi d'un autre gardien (N3)
+    close_token: str = field(default="", repr=False, compare=False)
     #: une décision est en cours : la fin du processus ne doit plus rien clore
     closing: bool = field(default=False, repr=False, compare=False)
 
@@ -360,7 +371,8 @@ class Registry:
 
     def touch(self, request: Request, **fields) -> Request:
         """Met à jour des champs autorisés (`state`, `login_id`, `link`, `pid`)."""
-        allowed = {"state", "category", "pid", "login_id", "link", "scope", "service_exp"}
+        allowed = {"state", "category", "pid", "login_id", "link", "scope",
+                   "service_exp", "close_token"}
         unknown = sorted(set(fields) - allowed)
         if unknown:
             raise LoginError("format", "unknown field(s): %s" % ", ".join(unknown))
@@ -370,9 +382,17 @@ class Registry:
         return request
 
     def published(self, request: Request, login_id: str, **fields) -> bool:
-        """Retient l'id distant même si l'annulation a gagné la publication."""
+        """Retient l'id distant même si l'annulation a gagné la publication.
+
+        La capacité de clôture est retenue elle aussi, même quand la demande
+        est déjà close : c'est elle qui permet d'invalider le défi publié
+        trop tard (N3).
+        """
         with self._lock:
             request.login_id = login_id
+            close_token = fields.get("close_token")
+            if isinstance(close_token, str) and close_token:
+                request.close_token = close_token
             if request.closing or request.state not in LIVE:
                 return False
             self.touch(request, state=VIEWING, **fields)
@@ -525,11 +545,23 @@ class Supervisor:
             self._threads.pop(request_id, None)
 
     def close(self) -> None:
-        """Arrête toutes nos connexions, même après un échec ou une interruption."""
+        """Arrête toutes nos connexions, même après un échec ou une interruption.
+
+        Une demande DÉJÀ close n'est plus invalidée au service (N4) : le lien
+        n'existe plus, l'appel HTTP et son journal « technical closure » sont
+        inutiles. Seules ses références locales sont nettoyées ; une demande
+        encore vivante est invalidée, tuée et close ici.
+        """
         with self._lock:
             held = set(self._procs) | set(self._threads) | {r.id for r in self.registry.live()}
         for request_id in held:
             request = self.registry.get(request_id)
+            if request is None:
+                continue
+            if request.state in TERMINAL:
+                self._terminate(request)   # local seulement, aucun geste distant
+                self.forget(request_id)
+                continue
             request.closing = True
             self._invalidate(request)
             self._terminate(request)
@@ -537,8 +569,38 @@ class Supervisor:
             thread = self._threads.get(request_id)
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=PUBLISH_CLOSE_S)
+            self.forget(request_id)
 
     # -- interne -----------------------------------------------------------
+    def _leader_status(self, proc) -> int | None:
+        """Code de sortie du chef, observé SANS le récolter (None s'il vit).
+
+        Le zombie garde son PID — donc l'identifiant du groupe de session —
+        jusqu'à `_terminate` : le `killpg` de nettoyage ne peut pas viser un
+        PID recyclé par le noyau (N1). Un chef déjà récolté rend son code
+        (`returncode`), mais `_terminate` refuse alors tout signal.
+
+        Sans waitid(WNOWAIT) (`PEEK_EXIT` faux), N1 est perdu : le repli
+        `proc.poll()` récolte le chef et tue aussitôt son groupe. Reste une
+        fenêtre de quelques instructions où un groupe déjà vide verrait son
+        pgid recyclé (rebouclage complet des PID).
+        """
+        with self._lock:
+            if proc.returncode is not None:
+                return proc.returncode
+            if PEEK_EXIT:
+                return exited_child_status(proc.pid)
+            # Sans waitid(WNOWAIT) (macOS avant Python 3.13), seule la récolte
+            # observe la sortie : le groupe est tué dans la foulée, tant que ses
+            # membres empêchent la réattribution du pgid (POSIX) ; `_terminate`
+            # ne le signale plus ensuite.
+            status = proc.poll()
+            if status is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            return status
     def _read(self, request: Request, adapter: Adapter, proc, approver: str,
               requested_by: str, scope: str) -> None:
         captured: list[bytes] = []
@@ -588,13 +650,22 @@ class Supervisor:
         self._fail(request, adapter, category, message)
 
     def _settle(self, request: Request, proc) -> None:
-        """Le CLI s'est terminé après publication : un code non nul est un refus."""
-        try:
-            code = proc.wait(timeout=1.0)
-        except Exception:
+        """Le CLI s'est terminé après publication : un code non nul est un refus.
+
+        La sortie est observée sans récolter le chef (N1). Une sortie 0 le
+        laisse zombie pour la décision `done`, qui doit encore la prouver ;
+        une décision en cours (`closing`) possède déjà son propre nettoyage.
+        """
+        deadline = time.monotonic() + 1.0
+        status = self._leader_status(proc)
+        while status is None and not request.closing and time.monotonic() < deadline:
+            self.sleep(POLL_S)
+            status = self._leader_status(proc)
+        if status is None or request.closing:
             return
-        if code and request.state == VIEWING and not request.closing:
-            self.registry.finish(request, FAILED, "provider_refused")
+        if status != 0 and request.state == VIEWING:
+            self._fail(request, ADAPTERS[request.harness], "provider_refused",
+                       "provider login failed")
 
     def _settle_done(self, request: Request) -> bool:
         """Attend la FIN FOURNISSEUR (sortie propre du CLI), bornée.
@@ -602,20 +673,21 @@ class Supervisor:
         Rend True seulement si le processus s'est terminé de lui-même avec le
         code 0 ; sinon (sortie non nulle, processus tué/interrompu ou toujours
         vivant à l'échéance) tue le groupe et rend False : une santé observée
-        ensuite ne prouverait pas cette tentative.
+        ensuite ne prouverait pas cette tentative. La sortie est observée
+        sans récolter le chef, puis `_terminate` tue le groupe et le récolte
+        (N1) : aucun PID recyclé n'est signalé.
         """
         with self._lock:
             proc = self._procs.get(request.id)
         if proc is None:
             return False
         deadline = time.monotonic() + max(0.0, self.settle)
-        while proc.poll() is None and time.monotonic() < deadline:
+        status = self._leader_status(proc)
+        while status is None and time.monotonic() < deadline:
             self.sleep(POLL_S)
-        if proc.poll() == 0:  # sortie naturelle réussie, même à l'échéance
-            self._terminate(request)  # le chef sorti peut laisser des enfants
-            return True
+            status = self._leader_status(proc)
         self._terminate(request)
-        return False
+        return status == 0
 
     def _publish(self, request: Request, adapter: Adapter, flow: Flow,
                  approver: str, requested_by: str, scope: str) -> None:
@@ -637,7 +709,10 @@ class Supervisor:
         if not re.fullmatch(r"lgn_[0-9a-z]{26}", login_id):
             self._fail(request, adapter, "failed", "challenge service answered an unreadable id")
             return
-        fields = {"scope": scope, "link": link}
+        close_token = str(answer.get("close_token") or "")
+        if not _CLOSE_TOKEN_RE.fullmatch(close_token):
+            close_token = ""       # service antérieur : clôture distante impossible
+        fields = {"scope": scope, "link": link, "close_token": close_token}
         exp = answer.get("exp")
         if isinstance(exp, int) and not isinstance(exp, bool) and exp > 0:
             fields["service_exp"] = exp
@@ -670,29 +745,35 @@ class Supervisor:
     def _terminate(self, request: Request) -> None:
         with self._lock:
             proc = self._procs.get(request.id)
-        if proc is None:
-            return
-        # start_new_session=True : le groupe garde cet identifiant après la
-        # sortie du chef ; poll()/getpgid(chef) ne prouvent pas sa disparition.
-        pgid = proc.pid
-        if pgid is not None:
+            if proc is None:
+                return
+            if proc.returncode is not None:
+                # Chef déjà récolté : son PID peut être réutilisé. On ne
+                # signale jamais un groupe sur la seule foi d'un PID ; les
+                # chemins de sortie observent la sortie SANS récolter (N1).
+                self._procs.pop(request.id, None)
+                return
+            # start_new_session=True : le groupe garde cet identifiant après la
+            # sortie du chef, tant que son zombie n'est pas récolté.
+            pgid = proc.pid
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
             deadline = time.monotonic() + max(0.0, self.grace)
-            while proc.poll() is None and time.monotonic() < deadline:
+            status = self._leader_status(proc)
+            while status is None and time.monotonic() < deadline:
                 self.sleep(POLL_S)
-            if pgid is not None:
+                status = self._leader_status(proc)
+            if proc.returncode is None:  # récolté par le repli : déjà tué
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
-        try:
-            proc.wait(timeout=1.0)
-        except Exception:
-            pass
-        with self._lock:
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
             self._procs.pop(request.id, None)
 
 

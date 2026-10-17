@@ -104,6 +104,10 @@ scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.
 export PYTHONPATH=src
 # Aucun secret n'est codé dans le dépôt : le mot de passe du banc vient de
 # PGPASSWORD ou de ~/.pgpass (mode 600) ; sinon donnez le DSN complet.
+# scripts/test.sh crée des bases jetables (agent_mesh_test_*, #1992) : il
+# dérive du profil une entrée éphémère (0600, supprimée à la sortie) pour les
+# bases du banc (#2170) ; une entrée 127.0.0.1:55432:*:agent_mesh couvre aussi
+# le banc si vous préférez.
 export AMEESH_DSN=postgresql://agent_mesh@127.0.0.1:55432/agent_mesh
 
 python3 -m ameesh migrate       # versioned migrations, idempotent
@@ -463,7 +467,7 @@ src/ameesh/
   identity.py     v0 alias/name resolution (shared aliases.tsv)
 tests/            unittest suite, fakebin/ fake harnesses and gh, webauthn_soft.py and
                   banc_v1.py (software passkey and canon PR: tests and demo only)
-scripts/          pg-up.sh, test.sh, demo-v1.sh
+scripts/          pg-up.sh, pgpass-banc.py, test.sh, demo-v1.sh
 ```
 
 ## License

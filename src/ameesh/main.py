@@ -113,6 +113,10 @@
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
+  ameesh provenance record --commit SHA | intent | created | install | show
+        #1465 : preuve exacte d'origine (acteur, session, tour, harnais) d'un
+        commit ou d'un jalon — le hook `pre-commit` atteste le commit qui vient,
+        le hook `post-commit` constate l'objet né puis écrit la preuve ;
   ameesh receipt verify       approval receipts (spec §8);
   ameesh release open|check|reason <lot>   release perimeter and validation;
   ameesh restart <agent> --brief FILE|-   fresh session on a brief;
@@ -327,6 +331,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "provenance":
+        # #1465 : preuve exacte d'origine d'un commit ou d'un jalon
+        from . import review_provenance
+        return review_provenance.main(rest)
     if command == "decide":
         # L124 : demandes de décision au propriétaire, et ses réponses
         from . import decisions

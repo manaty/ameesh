@@ -884,17 +884,30 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
-    def events_noted(self, prefix, since_ts) -> list[dict]:
+    def events_noted(self, prefix, since_ts, *, ids=None) -> list[dict]:
         pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        params = [pattern, float(since_ts)]
+        # #2162 : borne la lecture aux éléments candidats (index
+        # work_item_events_item_idx) — sans `ids`, le journal entier reste lu.
+        # Aucune fenêtre temporelle : une note ancienne d'un candidat compte.
+        borne = ""
+        if ids is not None:
+            ids = [int(item_id) for item_id in ids]
+            if not ids:
+                return []
+            borne = (" AND e.work_item_id IN"
+                     " (SELECT jsonb_array_elements_text(%s::jsonb)::bigint)")
+            params.append(json.dumps(ids))
         return self.db.query(
             """
             SELECT e.id, e.work_item_id, e.state, e.note, e.actor, w.assignee,
                    extract(epoch from e.created_at)::float8 as created_ts
               FROM work_item_events e JOIN work_items w ON w.id = e.work_item_id
              WHERE e.note LIKE %s AND e.created_at >= to_timestamp(%s)
+            """ + borne + """
              ORDER BY e.id
             """,
-            (pattern, float(since_ts)),
+            tuple(params),
         )
 
     def milestones(self, item_id, limit) -> list[dict]:
@@ -910,7 +923,7 @@ class WorkItems(interface.WorkItems):
         )
 
     def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
-                      on_frozen=None, after_commit=None) -> dict:
+                      on_frozen=None, after_commit=None, proof=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
         s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
 
@@ -928,7 +941,11 @@ class WorkItems(interface.WorkItems):
         publierait le fil avant le commit externe — un rollback laisserait des
         traces sans gel ni marque (revue codex cx2, B2). Sans callback ni
         liste, rien ne change : le gel branché par défaut ne désigne personne.
-        Un `on_frozen` sur un autre kind est refusé."""
+        Un `on_frozen` sur un autre kind est refusé.
+
+        `proof` (facultatif, #1465) : quand il porte un sha complet, sa ligne de
+        provenance est écrite dans la MÊME transaction — le fait et sa preuve
+        naissent ensemble, ou pas du tout. Indépendant du callback de gel."""
         if on_frozen is not None and kind != "frozen":
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
@@ -945,6 +962,14 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if proof and proof.get("sha"):
+                tx.execute(
+                    "INSERT INTO provenance_receipts"
+                    "       (subject, sha, actor, session, turn, harness, work_item_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (subject) DO NOTHING",
+                    ("milestone:%d" % int(milestone["id"]), proof["sha"], proof["actor"],
+                     proof["session"], proof["turn"], proof["harness"], int(item_id)))
             if kind == "frozen" and has_reviewer(self.db):
                 WorkItems(tx)._lapse_waiver(int(item_id), milestone, actor)
             if on_frozen is not None:

@@ -159,6 +159,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 from __future__ import annotations
 
 from .conversations import Conversations
+from .provenance import Provenance
 from .work_dependencies import WorkDependencies
 
 import abc
@@ -1725,9 +1726,16 @@ class WorkItems(Domain):
         """Journal du lot, du plus récent au plus ancien."""
 
     @abc.abstractmethod
-    def events_noted(self, prefix: str, since_ts: float) -> list[dict]:
-        """L317c : les lignes de journal, tous lots, dont la note commence par
-        `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
+    def events_noted(self, prefix: str, since_ts: float, *,
+                     ids: Sequence[int] | None = None) -> list[dict]:
+        """L317c : les lignes de journal dont la note commence par `prefix`,
+        écrites depuis `since_ts` (les plus anciennes d'abord).
+
+        `ids` borne la lecture à ces éléments (#2162, `backlog._DirNotes`) :
+        sans lui, tous les lots ; avec lui, l'historique des lots clos n'est
+        pas lu. Le filtre porte sur les ids, jamais sur une fenêtre
+        temporelle : une note ancienne d'un élément candidat reste lue, donc
+        dédupliquée exactement."""
 
     @abc.abstractmethod
     def milestones(self, item_id: int, limit: int) -> list[dict]:
@@ -1736,14 +1744,21 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
                       verdict: str | None, note: str, on_frozen=None,
-                      after_commit: list | None = None) -> dict:
+                      after_commit: list | None = None,
+                      proof: dict | None = None) -> dict:
         """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
 
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
         transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
         `after_commit` reçoit les écritures de fil différées, que **l'appelant**
         vide après le commit qu'il tient (un `with` imbriqué ne commite pas).
-        Absents, rien ne change."""
+        Absents, rien ne change.
+
+        `proof` (facultatif, #1465) : l'identité exacte du tour qui déclare
+        (`actor`, `session`, `turn`, `harness`, `sha` complet), écrite DANS LA
+        MÊME TRANSACTION que le jalon sous le sujet `milestone:<id>`. Absent,
+        le jalon s'écrit sans preuve : l'origine reste inconnue, jamais
+        devinée. Les deux options sont indépendantes et se composent."""
 
     @abc.abstractmethod
     def delays(self, limit: int, *, ids: Sequence[int] | None = None) -> list[dict]:
@@ -3685,6 +3700,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    provenance: Provenance
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
