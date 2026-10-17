@@ -67,8 +67,9 @@ REF_PREFIX = "refs/ameesh/resolutions/"
 #: fallback for hosts that refuse refs outside `refs/heads`
 BRANCH_PREFIX = "ameesh/resolve/"
 TRAILER = "ameesh-resolution"
-# v2 learns both merge directions; first-parent-only caches must be retrained.
-TRAINING_CACHE = "ameesh-rr-v2"
+# v3 keeps both merge directions and retrains the checkout -m preimages that
+# v2 (#2136) could cache before #2165 fixed the Python trainer.
+TRAINING_CACHE = "ameesh-rr-v3"
 #: worktrees of open resolutions, under the repository's common directory
 WORKTREE_DIR = "ameesh-resolve"
 #: where git ships `rerere-train.sh`, relative to `git --exec-path` or absolute
@@ -794,7 +795,7 @@ class Replayer:
     """The radar's private clone of a project. Objects come from the agents'
     repository (`--shared`); merges are replayed in the clone's worktree.
     Each resolution commit gets its own `rr-cache`, trained once and kept
-    under `.git/ameesh-rr-v2/<commit>`: a replay sees the pair's resolution
+    under `.git/ameesh-rr-v3/<commit>`: a replay sees the pair's resolution
     only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto") -> None:
@@ -822,8 +823,7 @@ class Replayer:
         return os.path.join(self.path, ".git", "rr-cache")
 
     def _store(self, sha: str = "") -> str:
-        # v2 cache: retrains legacy first-parent and checkout -m preimages
-        # (#2136, #2165).
+        # Retrain legacy first-parent caches and v2 checkout -m preimages.
         return os.path.join(self.path, ".git", TRAINING_CACHE, sha)
 
     def trained(self) -> list[str]:

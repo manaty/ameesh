@@ -604,6 +604,21 @@ class ReviewTest(_Base):
         # The old port may already have cached this SHA without the matching
         # preimage. An upgrade must relearn it instead of keeping it stale.
         os.makedirs(os.path.join(rp.path, ".git", "ameesh-rr", r))
+        # #2136 already used v2, but still trained checkout -m preimages.
+        # Seed that historical cache too: #2165 must not reuse it on upgrade.
+        _git(rp.path, "checkout", "-q", "-f", "--detach", a)
+        merge = resolutions._run(
+            rp.path, "-c", "rerere.enabled=true", "merge", "-q",
+            "--no-ff", "--no-commit", b, env_extra=git_env())
+        self.assertEqual(merge.returncode, 1)
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere", "forget", ".")
+        _git(rp.path, "checkout", "-m", "--", "f.json")
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere")
+        _git(rp.path, "checkout", r, "--", ".")
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere")
+        shutil.copytree(os.path.join(rp.path, ".git", "rr-cache"),
+                        os.path.join(rp.path, ".git", "ameesh-rr-v2", r))
+        _git(rp.path, "reset", "-q", "--hard")
         self.assertEqual(rp.prime([r]), [])
         got = rp.replay(a, b, r)
         self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
