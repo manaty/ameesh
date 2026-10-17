@@ -110,6 +110,52 @@ class SendMailTest(unittest.TestCase):
         self.assertEqual(sorted(s["to"] for s in out if s["key"] == "pair:1-2"),
                          ["a1", "a2"])
 
+    def _pass(self, report):
+        self.sent = []
+        return radar.send_mail(self.cfg, None, PROJECT, report, ci=None)
+
+    def test_flapping_conflict_is_not_sent_again(self):
+        # #2238: the pair leaves a pass (its resolution replays as prepared)
+        # while both lots stay on the radar, then comes back on the same
+        # inputs: no new notice.
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        first = self._pass(report)
+        self.assertEqual(sorted(s["to"] for s in first if s["key"] == "pair:1-2"),
+                         ["a1", "a2"])
+        prepared = copy.deepcopy(report)
+        for pair in prepared["pairs"]:
+            if pair["lots"] == [1, 2]:
+                pair["state"] = "prepared"
+        for _ in range(3):
+            self.assertEqual(self._pass(prepared), [])
+            self.assertTrue(radar.read_notified(self.cfg, "ameesh")["pair:1-2"]["dormant"])
+            self.assertEqual(self._pass(report), [])
+        # the same conflict on another head of lot 2 is news again
+        moved = copy.deepcopy(report)
+        for pair in moved["pairs"]:
+            if pair["lots"] == [1, 2]:
+                pair["tips"] = [pair["tips"][0], "f" * 40]
+        self._pass(prepared)
+        self.assertEqual(sorted(s["to"] for s in self._pass(moved) if s["key"] == "pair:1-2"),
+                         ["a1", "a2"])
+
+    def test_flapping_stale_resolution_is_not_sent_again(self):
+        # #2238: the same alternation between `stale` and `conflict` (#711 x #2184)
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        stale = copy.deepcopy(report)
+        for pair in stale["pairs"]:
+            if pair["lots"] == [1, 2]:
+                pair.update(state="stale", resolution={"by": 1, "commit": "c" * 40,
+                                                       "remaining": ["x.py"]})
+        self.assertEqual([s["key"] for s in self._pass(stale) if s["key"].endswith("1-2")],
+                         ["stale:1-2"])
+        self._pass(report)
+        for _ in range(3):
+            self.assertEqual([s for s in self._pass(stale) if s["key"].endswith("1-2")], [])
+            self.assertEqual([s for s in self._pass(report) if s["key"].endswith("1-2")], [])
+
     def test_failed_send_is_retried(self):
         report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
         with mock.patch.object(mail, "send", side_effect=RuntimeError("base")):
