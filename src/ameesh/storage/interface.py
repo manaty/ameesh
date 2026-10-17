@@ -216,11 +216,18 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
-                       actor: str, principal: str) -> dict | None:
+                       actor: str, principal: str,
+                       expect_reason: str | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
         External agents are returned unchanged. Not exposed to executors.
+
+        `expect_reason` (#2152) : ne lève que la pause dont la raison est
+        exactement celle-là. La comparaison et la levée restent dans la même
+        instruction, sous le verrou de ligne : une pause étrangère posée entre
+        la lecture et la reprise n'est jamais levée. Refusé pour POSER une
+        pause (`paused=True`).
         """
 
     @abc.abstractmethod
@@ -1422,6 +1429,14 @@ class WorkItems(Domain):
         cible, avec une ligne de journal, seulement s'il n'a pas de branche et
         qu'aucune ligne de son journal ne commence par `detached_prefix`
         (détachement), vérifiés sous le verrou de la ligne du lot ; None sinon."""
+
+    @abc.abstractmethod
+    def detach_branch(self, item_id: int, expected: str | None, *, note: str,
+                      actor: str) -> dict | None:
+        """#2102 : retire la branche (et la cible, le dernier commit vu) d'un
+        lot ouvert, avec une ligne de journal, seulement si sa branche est
+        encore `expected` (None : aucune), vérifié sous le verrou de la ligne
+        du lot ; None sinon (lot fermé, ou branche changée entre-temps)."""
 
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
@@ -2681,13 +2696,13 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def items(self, *, since_ts: float, limit: int,
-              done_states: Sequence[str]) -> list[dict]:
+              done_states: Sequence[str], project: str | None = None) -> list[dict]:
         """Les tâches de la feuille de route : ouvertes (état hors de
         `done_states`, fourni par l'appelant), ou datées, ou portant un
         engagement en cours, ou modifiées depuis `since_ts` — colonnes de `work_items` utiles à la
         frise (id, title, state, app, workstream, assignee, package_id,
         created_ts, updated_ts, closed_ts) et dates prévues ; `total` avant
-        la borne."""
+        la borne. Le filtre projet est appliqué avant la borne et le total."""
 
     @abc.abstractmethod
     def commitments(self, *, statuses: Sequence[str] | None = None,
@@ -2707,10 +2722,11 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def set_commitment(self, ident: int, *, current: Sequence[str],
-                       values: dict) -> dict | None:
+                       values: dict, expect: dict | None = None) -> dict | None:
         """Change un engagement (`status`, `due_on`, `note`…) s'il est dans
         l'un des statuts `current` ; None sinon (inconnu ou déjà changé).
-        Un statut `done` ou `cancelled` pose `closed_at`."""
+        Un statut `done` ou `cancelled` pose `closed_at`. Avec `expect`, les
+        champs éditables doivent être inchangés depuis leur lecture."""
 
 
 # --------------------------------------------------------------------------
