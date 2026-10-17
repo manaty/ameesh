@@ -12,7 +12,7 @@ import subprocess
 import time
 from unittest import mock
 
-from ameesh import mail, registry, storage, work
+from ameesh import db as db_mod, mail, registry, storage, work
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -76,6 +76,27 @@ class StockageTest(_Base):
         self.assertEqual(self.origine("a1"), ("claude", "/w", "sess-a"))
         lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a1")}
         self.assertEqual(lignes, {a: None, b: "sess-b"})
+
+    def test_mise_de_cote_sans_lot_actif(self):
+        """#2055 : `to_lot=None` met la session active de côté pour son lot et
+        ne rend active aucune session (`session_work_item` NULL) — le tour
+        suivant part dans une session sans lot."""
+        runner, lease = self.bail("a10")
+        a = work.add(self.db, title="A", assignee="a10", force=_FORCE)["id"]
+        epoch = lease["lease_epoch"]
+        storage.of(self.db).operations.set_session_work_item("a10", runner.runner_id, epoch,
+                                                             str(a))
+        registry.set_session(self.db, "a10", "sess-a", "compte", harness="claude", cwd="/w")
+        out = self.st.switch("a10", runner.runner_id, epoch, to_lot=None,
+                             harness="claude", account="compte", cwd="/w",
+                             current="sess-a")
+        self.assertEqual(out, {"resumed": None, "parked": "sess-a", "discarded": None,
+                               "discard_reason": None})
+        agent = registry.get(self.db, "a10")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, None))
+        self.assertEqual(self.origine("a10"), (None, None, None))
+        lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a10")}
+        self.assertEqual(lignes, {a: "sess-a"})
 
     def test_compte_harnais_ou_dossier_differents_ecartent_la_session(self):
         runner, lease = self.bail("a2")
@@ -527,6 +548,85 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_la_mise_de_cote_refusee_differe_le_tour(self):
+        worker = self._worker("w15")
+        self.addCleanup(worker.watchdog_stop.set)
+        b = work.add(self.db, title="B", assignee="w15", force=_FORCE)["id"]
+        self.tour(worker, b, "commence B", session="sess-B")
+        a = work.add(self.db, title="A", assignee="w15", force=_FORCE)["id"]
+        work.close(self.db, a, abandoned=True, actor="test")
+        for failure in (None, db_mod.DbError("base indisponible")):
+            with self.subTest(failure=failure), mock.patch.object(
+                    type(self.st), "switch", return_value=None, side_effect=failure):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
+                                              "ids": [], "lot": str(a)})
+                self.assertTrue(spec.get("lot_switch_failed"))
+                self.assertFalse(worker._run_turn(spec))
+                self.assertEqual(worker.current_session(), "sess-B")
+
+    def test_le_tour_d_un_lot_fini_ne_partage_pas_la_session_d_un_autre_lot(self):
+        """#2055 (P3 de la relecture de #1898) : quand le tour porte sur un lot
+        FINI A alors que la session active est celle d'un AUTRE lot B encore
+        ouvert, la session de B est mise de côté pour lui (reprise au prochain
+        tour sur B) et le tour de A part dans une session sans lot : une session
+        n'est jamais partagée entre lots (#794), même fini."""
+        worker = self._worker("w14")
+        try:
+            b = work.add(self.db, title="B", assignee="w14", force=_FORCE)["id"]
+            work.move(self.db, b, "build")
+            self.tour(worker, b, "commence B", session="sess-B")
+            a = work.add(self.db, title="A", assignee="w14", force=_FORCE)["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            argv = self.tour(worker, b, "retour sur B", session="sess-B2")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
+            self.assertEqual(registry.get(self.db, "w14")["session_id"], "sess-B")
+            work.close(self.db, a, abandoned=True, actor="test")
+            with mock.patch("ameesh.runner.os.unlink", side_effect=PermissionError("read-only")):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
+                                              "ids": [], "lot": str(a)})
+                self.assertIsNone(worker.current_session(), "le fichier resté est périmé")
+                recree = AgentWorker(Runner(self.cfg, self.db, once=True),
+                                     registry.get(self.db, "w14"),
+                                     {"lease_epoch": worker.epoch})
+                self.assertIsNone(recree.current_session(), "oubli durable après redémarrage")
+            self.assertEqual(spec["lot"], str(a))
+            self.assertTrue(spec.get("lot_finished"))
+            agent = registry.get(self.db, "w14")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, None),
+                             "la session de B est mise de côté, aucune n'est active")
+            self.assertEqual(worker.read_session_file(), "sess-B",
+                             "le refus de suppression a laissé le fichier de B")
+            self.assertIsNone(worker.current_session())
+            lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("w14")}
+            self.assertEqual(lignes.get(b), "sess-B", "la session de B est gardée pour B")
+            self.assertNotIn("dedicated to lot", worker.resume_summary or "",
+                             "aucune session dédiée au lot fini n'est rouverte")
+            # le tour du lot fini part sans lot, jamais dans la session de B.
+            with self._env("sess-A2"):
+                self.assertTrue(worker.run_turn(spec))
+            argv = self.turns()[-1]["argv"]
+            self.assertNotIn("--resume", argv, "la session de B n'est pas partagée")
+            agent = registry.get(self.db, "w14")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-A2", None))
+            with mock.patch.object(worker, "_switch_lot", return_value=False):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de B",
+                                              "ids": [], "lot": str(b)})
+                self.assertTrue(spec.get("lot_switch_failed"))
+            with mock.patch.object(type(self.st), "listing", side_effect=db_mod.DbError("base")):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de B",
+                                              "ids": [], "lot": str(b)})
+                self.assertTrue(spec.get("lot_switch_failed"))
+            # le tour suivant sur B reprend SA session, mise de côté.
+            argv = self.tour(worker, b, "suite de B")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
+            agent = registry.get(self.db, "w14")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-B", str(b)))
+        finally:
+            worker.watchdog_stop.set()
+
     def test_un_fichier_local_non_retire_ne_ressuscite_pas_la_session(self):
         """P2 bloquant (contrôle bureau + R1 Codex du 14/10) : si le fichier
         local ne peut pas être retiré (`unlink` refuse, PermissionError),
@@ -709,6 +809,34 @@ class BriefDeLotTest(_Base):
         self.assertNotIn("un message pour un autre lot", text)
         self.assertNotIn("Previous session", text)
         self.assertNotIn("Work items assigned to you", text)
+
+    def test_brief_ne_dit_pas_put_aside_quand_rien_n_est_garde(self):
+        """#2242 : `_switch_lot` peut ne rien garder (lot courant fini ou
+        réassigné) ; le brief d'une session neuve ne doit alors pas annoncer
+        que sa session est de côté."""
+        from ameesh import reprise
+        runner, lease = self.bail("b2")
+        worker = AgentWorker(runner, registry.get(self.db, "b2"), lease)
+        a = work.add(self.db, title="Le lot du brief", assignee="b2")["id"]
+        try:
+            with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
+                worker._lot_brief(str(a), "999", {"parked": None})
+            consigne = brief.call_args.kwargs["consigne"]
+            self.assertNotIn("is put aside and will be resumed", consigne)
+            self.assertIn("no session of lot #999 was put aside", consigne)
+            self.assertNotIn("it is finished or no longer assigned", consigne)
+            with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
+                worker._lot_brief(str(a), "999", {"parked": "sess-999"})
+            consigne = brief.call_args.kwargs["consigne"]
+            self.assertIn("the one of lot #999 is put aside", consigne)
+            self.assertNotIn("no session of lot #999 was put aside", consigne)
+            with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
+                worker._lot_brief(str(a), "", {})
+            consigne = brief.call_args.kwargs["consigne"]
+            self.assertIn("no session was put aside", consigne)
+            self.assertNotIn("lot # was put aside", consigne)
+        finally:
+            worker.watchdog_stop.set()
 
     def test_branche_qui_commence_par_un_tiret_n_est_pas_une_option_git(self):
         """N2 (revue Claude du 14/10) : `branch`/`branch_target` viennent de la
