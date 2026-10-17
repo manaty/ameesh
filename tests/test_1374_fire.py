@@ -296,6 +296,38 @@ class ReviewGateTest(unittest.TestCase):
         self.assertFalse(blocked["ok"], "une dispense ne lève jamais une correction due")
         self.assertIn("blocked verdict", blocked["why"])
 
+    def test_a_stale_waiver_row_does_not_cover_a_new_freeze(self):
+        # #2281/B1 cx1 : la ligne passée à la porte peut être antérieure au
+        # gel ; le stockage a périmé la dispense en base mais la copie la
+        # porte encore. La porte relit la marque après les jalons : un gel B
+        # sans avis reste refusé, même avec une ligne A en main.
+        stale = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        fresh = {"id": 9, "assignee": "author", "reviewer": "", "reviewers": []}
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh):
+            out = self.gate(_marks(_mark("frozen", B)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            frozen=B, item=stale)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["waived"])
+        self.assertIn("no review verdict ok", out["why"])
+
+    def test_the_waiver_actor_comes_from_the_lot_journal(self):
+        # #2281/N1 cx1 : `work.get` ne rend pas les événements ; en usage réel
+        # la note de file doit citer le pilote, lu dans la table du journal.
+        fresh = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        ops = mock.Mock()
+        ops.work.events_noted.return_value = [
+            {"note": "verdict not required: no re-verdict due (#1979)",
+             "actor": "pilote-x"}]
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh), \
+                mock.patch.object(merge_queue.storage, "of", return_value=ops):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"id": 9, "assignee": "author",
+                                  "reviewer": work.REVIEWER_NONE})
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["waived_by"], "pilote-x")
+
 
 class ReadyTest(unittest.TestCase):
     """Les portes du feu : verdicts d'abord (sans PR), puis PR/CI."""

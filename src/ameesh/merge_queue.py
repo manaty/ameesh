@@ -202,6 +202,59 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
                   key=_mark_order)
 
 
+def _waiver(db, item) -> tuple:
+    """#2281/B1 : la dispense de re-verdict lue **à la porte**, après les jalons.
+
+    `item` peut être une ligne lue avant les jalons : si un gel d'une autre
+    tête a été committé entre-temps, le stockage a effacé la marque
+    (`_lapse_waiver`) mais cette copie la porte encore. La porte relit donc la
+    ligne ici — l'appelant a déjà lu les jalons qu'il nous passe — et une
+    dispense périmée ne couvre jamais la nouvelle tête. Une relecture
+    impossible ne prouve rien : la dispense est alors tenue pour absente.
+
+    N1 : l'auteur du geste se lit au **journal du lot** (`work.get` ne rend pas
+    les événements), pour que la note de file nomme le pilote en usage réel.
+
+    Rend `(waived, waived_by, row)` ; `row` est la ligne fraîche quand elle a
+    pu être relue.
+    """
+    row = item or {}
+    lot = row.get("id")
+    waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+              or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    if waived and lot is not None:
+        # Seule une ligne qui *réclame* la dispense peut périmer dans le
+        # mauvais sens : relire la base après les jalons ferme la course. Une
+        # ligne sans dispense ne peut qu'être plus stricte, rien à relire.
+        try:
+            fresh = work.get(db, int(lot))
+        except Exception:  # noqa: BLE001 - lecture impossible : aucune preuve
+            fresh = None
+        if fresh is None:
+            row = dict(row, reviewer="", reviewers=[])
+        else:
+            row = fresh
+        waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+                  or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    waived_by = ""
+    if waived and lot is not None:
+        try:
+            events = storage.of(db).work.events_noted(
+                "verdict not required", 0.0, ids=[int(lot)])
+        except Exception:  # noqa: BLE001 - journal illisible : nom générique
+            events = []
+        for event in events:
+            actor = str(event.get("actor") or "").strip()
+            if actor:
+                waived_by = actor
+    if not waived_by:
+        for event in row.get("events") or ():
+            if str(event.get("note") or "").startswith("verdict not required"):
+                waived_by = str(event.get("actor") or "").strip()
+                break
+    return waived, waived_by, row
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
@@ -224,8 +277,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     #1979 : le pilote peut marquer « verdict non requis » (`work.reviewer
     --no-verdict`, colonne `reviewer = -none`, geste d'autorité journalisé) ;
     la marque lève alors l'exigence d'avis **de cette tête gelée** — le
-    stockage la périme à un nouveau gel (`_lapse_waiver`). Un verdict bloquant
-    courant, lui, n'est jamais levé par la dispense : la correction reste due.
+    stockage la périme à un nouveau gel (`_lapse_waiver`). #2281 : la marque
+    est relue à la porte, **après** les jalons, pour qu'une ligne lue avant un
+    gel ne couvre jamais la nouvelle tête. Un verdict bloquant courant, lui,
+    n'est jamais levé par la dispense : la correction reste due.
 
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
     author_family, on_freeze}` ; ne lève jamais.
@@ -234,21 +289,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     frozen = str(frozen or "").strip().lower()
-    row = item or {}
-    author = str(row.get("assignee") or "").strip()
     # #1979/#2281 : la dispense de re-verdict du pilote (`-none`) lève la
     # porte, comme elle lève l'attente dans `progress` ; elle ne survit pas à
     # un nouveau gel (stockage `_lapse_waiver`) et ne lève jamais un blocage.
-    waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
-              or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
-    waived_by = ""
-    if waived:
-        # Le journal du lot nomme l'auteur du geste (corrector : humain,
-        # orchestrateur ou conception) ; la note de file le cite.
-        for event in row.get("events") or ():
-            if str(event.get("note") or "").startswith("verdict not required"):
-                waived_by = str(event.get("actor") or "").strip()
-                break
+    # La marque est relue après les jalons (`_waiver`) pour ne pas appliquer
+    # une copie antérieure au gel.
+    waived, waived_by, row = _waiver(db, item)
+    author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
            "blocked": [], "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "on_freeze": 0}
