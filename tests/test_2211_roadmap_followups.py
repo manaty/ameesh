@@ -6,10 +6,42 @@ import json
 import os
 from pathlib import Path
 import stat
+import tempfile
 import unittest
+from unittest import mock
 
 from .support import PgTestCase
 from ameesh import roadmap, roadmap_edit as edit, storage
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX file permissions")
+class AtomicExportModeTest(unittest.TestCase):
+    def test_private_content_stays_private_before_replacement(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-2211-mode-") as scratch:
+            target = Path(scratch) / "private.json"
+            target.write_text("old", encoding="utf-8")
+            target.chmod(0o600)
+            link = Path(scratch) / "link.json"
+            link.symlink_to(target.name)
+            for destination in (target, link):
+                with self.subTest(destination=destination.name):
+                    observed = []
+
+                    def inspect(fd):
+                        observed.append(stat.S_IMODE(os.fstat(fd).st_mode))
+                        temporary = next(Path(scratch).glob("private.json.*.tmp"))
+                        self.assertEqual(temporary.read_text(encoding="utf-8"), "private")
+
+                    previous = os.umask(0o022)
+                    try:
+                        with mock.patch.object(roadmap.os, "fsync", side_effect=inspect):
+                            roadmap._write_atomic(str(destination), "private")
+                    finally:
+                        os.umask(previous)
+                    self.assertEqual(observed, [0o600])
+                    self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                    self.assertEqual(target.read_text(encoding="utf-8"), "private")
+                    self.assertTrue(link.is_symlink())
 
 
 class RoadmapFollowupsPgTest(PgTestCase):

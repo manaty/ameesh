@@ -50,6 +50,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import sys
 import textwrap
 import time
@@ -1133,14 +1134,17 @@ def _write_atomic(filename: str, text: str) -> None:
         target = Path(os.path.realpath(target))
     tmp = None
     try:
-        # ``mkstemp`` forces 0600; a new export must honour the umask like an
-        # ordinary file. ``os.open(..., 0o666)`` lets the kernel apply it, and
-        # O_EXCL keeps the temporary name private.
+        # New exports honour the umask. Replacements inherit the target's
+        # permissions from creation, before any private content is written.
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            mode = 0o666
         fd = None
         for _ in range(16):
             candidate = str(target.parent / ("%s.%s.tmp" % (target.name, secrets.token_hex(8))))
             try:
-                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
             except FileExistsError:
                 continue
             tmp = candidate
