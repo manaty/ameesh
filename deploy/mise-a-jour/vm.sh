@@ -103,6 +103,22 @@ DRAIN_ATTENTE=${DRAIN_ATTENTE:-300}
 DRAIN_APPEL_DELAI=${DRAIN_APPEL_DELAI:-60}
 [[ $DRAIN_APPEL_DELAI =~ ^[0-9]+$ ]] && [ "$DRAIN_APPEL_DELAI" -gt 0 ] \
   || { echo "DRAIN_APPEL_DELAI invalide : « $DRAIN_APPEL_DELAI » (secondes attendues)" >&2; exit 2; }
+# #2184/R3 : une pose distante peut créer son unité après le stop et la
+# dernière lecture du client ; seule une échéance absolue, comparée par la
+# base sous le verrou de ligne, refuse une pose tardive. DRAIN_ECHEANCE est la
+# fenêtre laissée à une pose normale (epoch local + cette durée) ;
+# DRAIN_BORNE_INSTRUCTION couvre le statement_timeout de la base (30 s par
+# défaut, réglable) et DRAIN_DERIVE la dérive d'horloge entre les hôtes (NTP).
+# L'attente de nettoyage ne s'applique qu'aux poses incertaines.
+DRAIN_ECHEANCE=${DRAIN_ECHEANCE:-15}
+DRAIN_BORNE_INSTRUCTION=${DRAIN_BORNE_INSTRUCTION:-30}
+DRAIN_DERIVE=${DRAIN_DERIVE:-5}
+for _d in DRAIN_ECHEANCE DRAIN_BORNE_INSTRUCTION DRAIN_DERIVE; do
+  _v=${!_d}
+  [[ $_v =~ ^[0-9]+$ ]] && [ "$_v" -gt 0 ] \
+    || { echo "$_d invalide : « $_v » (secondes attendues)" >&2; exit 2; }
+done
+unset _d _v
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
@@ -382,6 +398,11 @@ horloge() {
     printf '%s' "$SECONDS"
   fi
 }
+# #2184/R3 : échéance absolue remise à la base. En test, `date` est injecté et
+# suit HORLOGE_FICHIER ; en production, l'epoch du poste (hôtes NTP).
+horloge_epoque() {
+  date +%s
+}
 drain_lieu() {
   if [ "$MODE" = agents ]; then printf 'agents %s sur %s' "$ACTION" "$HOTE_AGENTS"
   else printf '%s sur %s' "$ACTION" "$VM"; fi
@@ -419,18 +440,33 @@ print(serve.owner(config.load()))' 2>/dev/null) || h=
   [[ $h =~ ^human:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$ ]] || return 1
   printf '%s' "$h"
 }
-drain_supporte() {  # le CLI de la cible connaît la reprise conditionnelle
+drain_supporte() {  # le CLI de la cible connaît la reprise conditionnelle ET l'échéance
   local aide
   if [ "$MODE" = agents ]; then aide=$(ameesh_agents_drain resume --help 2>&1) || return 1
   else aide=$(ameesh_local_drain resume --help 2>&1) || return 1; fi
-  grep -q -- '--expect-reason' <<<"$aide"
+  grep -q -- '--expect-reason' <<<"$aide" || return 1
+  # #2184/R3 : sans --not-after côté cible, la pose n'a pas de barrière ; on
+  # désactive le drain plutôt que de poser une pause sans échéance.
+  if [ "$MODE" = agents ]; then aide=$(ameesh_agents_drain pause --help 2>&1) || return 1
+  else aide=$(ameesh_local_drain pause --help 2>&1) || return 1; fi
+  grep -q -- '--not-after' <<<"$aide"
 }
-pause_operateur() {  # $1 persona, $2 motif, $3 unité de la pose (mode agents) ; --json : « changed » dit si la pause est nôtre
-  local unite=${3:-}
+pause_operateur() {  # $1 persona, $2 motif, $3 unité (agents), $4 échéance epoch ; --json : « changed »
+  local unite=${3:-} echeance=${4:-}
   if [ "$MODE" = agents ]; then
-    DRAIN_UNITE="$unite" ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
+    if [ -n "$echeance" ]; then
+      DRAIN_UNITE="$unite" ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" \
+        --not-after "$echeance" --json
+    else
+      DRAIN_UNITE="$unite" ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
+    fi
   else
-    ameesh_local_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
+    if [ -n "$echeance" ]; then
+      ameesh_local_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" \
+        --not-after "$echeance" --json
+    else
+      ameesh_local_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
+    fi
   fi
 }
 # #2184/B1 : ordonne l'arrêt de la commande distante de pause avant toute
@@ -485,12 +521,36 @@ r = json.load(sys.stdin)
 print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))'
   fi
 }
+# Une entrée de DRAINS : persona<TAB>motif<TAB>échéance locale<TAB>incertain.
+# L'échéance n'est attendue que si la pose est incertaine (timeout, réponse
+# illisible, lien coupé) ; une pose confirmée n'a pas de second écrivain.
 drain_motif_de() {  # $1 persona → motif exact si ce drain est le nôtre (rc 1 sinon)
-  local e
+  local e p m ech inc
   for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
-    if [ "${e%%$'\t'*}" = "$1" ]; then printf '%s' "${e#*$'\t'}"; return 0; fi
+    IFS=$'\t' read -r p m ech inc <<<"$e"
+    if [ "$p" = "$1" ]; then printf '%s' "$m"; return 0; fi
   done
   return 1
+}
+drain_echeance_incertaine_de() {  # $1 persona → échéance locale si la pose est incertaine
+  local e p m ech inc
+  for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+    IFS=$'\t' read -r p m ech inc <<<"$e"
+    if [ "$p" = "$1" ] && [ "$inc" = 1 ]; then printf '%s' "$ech"; return 0; fi
+  done
+  return 1
+}
+drain_marque_certaine() {  # $1 persona : la pose a été confirmée
+  local e p m ech inc reste=()
+  for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+    IFS=$'\t' read -r p m ech inc <<<"$e"
+    if [ "$p" = "$1" ]; then reste+=("$p"$'\t'"$m"$'\t'"$ech"$'\t'0)
+    else reste+=("$e"); fi
+  done
+  DRAINS=(${reste[@]+"${reste[@]}"})
+}
+attendre_echeance() {  # $1 échéance sur l'horloge du drain
+  while [ "$(horloge)" -lt "$1" ]; do sleep 15; done
 }
 drain_retire() {  # $1 persona : notre drain n'est plus en place
   local e reste=()
@@ -522,9 +582,15 @@ pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état r
   pause_etat <<<"$ligne"
 }
 poser_drain() {  # $1 persona, $2 secondes déjà attendues
-  local motif sortie change etat pose raison rc=0 unite ancien
+  local motif sortie change etat pose raison rc=0 unite ancien refusal
+  local echeance_abs echeance_locale
   motif=$(drain_motif "$(drain_jeton)")
   unite=$(unite_drain "$motif")
+  # #2184/R3 : la pose porte une échéance absolue, comparée par la base sous
+  # le verrou. Le nettoyage attend l'échéance locale (fenêtre + borne
+  # d'instruction + dérive) avant de lire et de lever.
+  echeance_abs=$(( $(horloge_epoque) + DRAIN_ECHEANCE ))
+  echeance_locale=$(( $(horloge) + DRAIN_ECHEANCE + DRAIN_BORNE_INSTRUCTION + DRAIN_DERIVE ))
   # R1 B2 : le motif courant remplace l'ancien — après une levée humaine, un
   # re-drain ne doit pas garder une entrée périmée que drain_motif_de lirait
   # en premier à la sortie (et laisserait la pause vivante orpheline).
@@ -537,14 +603,23 @@ poser_drain() {  # $1 persona, $2 secondes déjà attendues
   drain_retire "$1"
   # Track the intent before the call: both its reply and the reconciliation
   # read can fail after commit. EXIT still attempts the conditional cleanup.
-  DRAINS+=("$1"$'\t'"$motif")
+  DRAINS+=("$1"$'\t'"$motif"$'\t'"$echeance_locale"$'\t'1)
   echo "$1 : en tour depuis ${2}s — pose d'une pause opérateur (drain #2152)"
-  sortie=$(pause_operateur "$1" "$motif" "$unite") || rc=$?
+  sortie=$(pause_operateur "$1" "$motif" "$unite" "$echeance_abs") || rc=$?
   if [ "$rc" = 0 ]; then
     if change=$(json_champ changed <<<"$sortie") && [ -n "$change" ]; then
       if [ "$change" = 1 ]; then
+        drain_marque_certaine "$1"
         echo "$1 : drain posé — le tour en cours se termine, aucun tour interrompu ; redémarrage dès qu'il est hors tour"
         return 0
+      fi
+      refusal=$(json_champ refusal <<<"$sortie")
+      if [ "$refusal" = not_after ]; then
+        # #2184/R3 : la base a refusé la pose tardive ; aucune pause n'existe,
+        # aucune attente n'est utile.
+        drain_retire "$1"
+        echo "$1 : pose de pause refusée par l'échéance (not_after) — aucun drain, aucune attente" >&2
+        return 1
       fi
       # Posée entre notre lecture et la nôtre : elle n'est pas de ce script,
       # il ne la lèvera pas (on ne lève que la pause qu'on a posée).
@@ -563,6 +638,9 @@ poser_drain() {  # $1 persona, $2 secondes déjà attendues
   fi
   IFS='|' read -r pose raison <<<"$etat"
   if [ "$pose" = 1 ] && [ "$raison" = "$motif" ]; then
+    # La pause est là : la pose a commité, aucun écrivain tardif du même
+    # drain n'est possible (unité unique déjà exécutée) — pas d'attente.
+    drain_marque_certaine "$1"
     echo "$1 : drain posé (confirmé par l'état réel) — le tour en cours se termine, aucun tour interrompu"
     return 0
   fi
@@ -577,11 +655,18 @@ poser_drain() {  # $1 persona, $2 secondes déjà attendues
   return 1
 }
 lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
-  local motif sortie change etat pose raison
+  local motif sortie change etat pose raison echeance
   motif=$(drain_motif_de "$1") || return 0
-  # #2184/B1 : la pose a peut-être expiré côté client et être encore en file
-  # sur la VM. L'arrêt ordonné de son unité précède la reprise : unité en file
-  # = annulée, unité déjà commitée = la reprise conditionnelle la lève.
+  # #2184/R3 : une pose incertaine peut encore être en cours d'exécution
+  # (unité créée en retard). On attend l'échéance + la borne d'instruction +
+  # la dérive avant de lire : au-delà, la base refuse toute pose tardive, et
+  # cette lecture devient probante.
+  if echeance=$(drain_echeance_incertaine_de "$1"); then
+    echo "$1 : pose incertaine — attente de l'échéance avant relecture (barrière base)" >&2
+    attendre_echeance "$echeance"
+  fi
+  # #2184/B1 : l'arrêt de l'unité reste un meilleur effort (annule une unité
+  # encore en file) ; il ne sert plus de preuve — la barrière SQL tranche.
   if ! arreter_unite_drain "$(unite_drain "$motif")"; then
     echo "$1 : arrêt de l'unité de pause non prouvé — pause éventuelle à vérifier : « ameesh show $1 »" >&2
     return 1
@@ -675,10 +760,11 @@ redemarrer_agents() {
   noms=$(agents_du_registre avec-arretes) || return 1
   mapfile -t restantes <<<"$noms"
   # R1 B2 : ne jamais poser une pause qu'on ne saurait pas lever. Un CLI de
-  # cible antérieur à #2152 ne connaît pas --expect-reason : on attend comme
-  # avant plutôt que de laisser un drain orphelin.
+  # cible antérieur à #2152 ne connaît pas --expect-reason, et un CLI sans
+  # --not-after (#2184/R3) ne peut pas porter la barrière d'échéance : on
+  # attend comme avant plutôt que de laisser un drain orphelin.
   if [ "$DRAIN_ATTENTE" -gt 0 ] && ! drain_supporte; then
-    echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --expect-reason (installer le code #2152 avant de redémarrer) — attente sans drain" >&2
+    echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --expect-reason et --not-after (installer le code #2184/R3 avant de redémarrer) — attente sans drain" >&2
     DRAIN_ATTENTE=0
   fi
   # #2184/N6 : l'acteur d'audit est l'opérateur du poste, pas le compte de la
@@ -1302,9 +1388,11 @@ redemarrer() {
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
   # R1 B1 : un CLI (ou une base) antérieur à 0458 ne saurait pas lever la
-  # pause conditionnelle ; ne jamais poser un drain qu'on ne saurait pas lever.
+  # pause conditionnelle, et sans --not-after (#2184/R3) il ne peut pas porter
+  # la barrière d'échéance ; ne jamais poser un drain qu'on ne saurait pas
+  # lever ni borner.
   if [ "$DRAIN_ATTENTE" -gt 0 ] && ! drain_supporte; then
-    echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --expect-reason (installer le code #2152 avant de redémarrer) — attente sans drain" >&2
+    echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --expect-reason et --not-after (installer le code #2184/R3 avant de redémarrer) — attente sans drain" >&2
     DRAIN_ATTENTE=0
   fi
   # #2184/N6 : même en mode serveur, l'acteur consigné est l'opérateur qui

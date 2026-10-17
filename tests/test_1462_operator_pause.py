@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -197,6 +198,95 @@ class PauseTest(PgTestCase):
             self.db.query("SELECT * FROM ameesh_operator_resume_if(%s, %s, %s, %s, %s)",
                           ("worker", "reprise", "human:alice", "human:alice", " "))
 
+    def test_pause_with_a_future_deadline_is_applied(self):
+        """#2184/R3 : une pose avant son échéance passe normalement."""
+        out = self.change(not_after=time.time() + 60)
+        self.assertTrue(out["changed"])
+        self.assertIsNone(out["refusal"])
+        self.assertTrue(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual([e["paused"] for e in self.events()], [True])
+
+    def test_pause_after_its_deadline_is_refused_without_event(self):
+        """#2184/R3 B1 : au-delà de l'échéance absolue, la base refuse la
+        pose (changed=false, refusal=not_after) et n'écrit aucun événement."""
+        out = self.change(not_after=time.time() - 1)
+        self.assertEqual((out["changed"], out["operator_paused"], out["refusal"]),
+                         (False, False, "not_after"))
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual(self.events(), [])
+
+    def test_pause_deadline_is_checked_after_the_row_lock(self):
+        """#2184/R3 (mesh-design) : l'échéance est lue APRÈS le
+        SELECT ... FOR UPDATE, sous le verrou tenu jusqu'à l'écriture. Une
+        pose commencée avant l'échéance mais qui attend un verrou externe
+        au-delà est refusée, sans événement."""
+        started = threading.Event()
+        deadline = time.time() + 1.5
+        result = {}
+
+        def pose():
+            db = self.connect()
+            try:
+                result["started_at"] = time.time()
+                started.set()
+                return agent_pause.change(
+                    db, "worker", paused=True, reason="maintenance",
+                    actor="human:alice", not_after=deadline)
+            finally:
+                db.close()
+
+        holder = self.connect()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                with holder.transaction() as tx:
+                    tx.query("SELECT 1 FROM agent_registry WHERE name = %s FOR UPDATE",
+                             ("worker",))
+                    future = pool.submit(pose)
+                    self.assertTrue(started.wait(timeout=10))
+                    # La pose est engagée avant l'échéance ; on rend le verrou
+                    # seulement après, pour que le contrôle post-verrou tranche.
+                    time.sleep(max(0.0, deadline - time.time()) + 0.3)
+                out = future.result(timeout=20)
+        finally:
+            holder.close()
+        self.assertLess(result["started_at"], deadline)
+        self.assertEqual((out["changed"], out["operator_paused"], out["refusal"]),
+                         (False, False, "not_after"))
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual(self.events(), [])
+
+    def test_pause_deadline_is_validated(self):
+        for value in (0, -1, float("inf"), True):
+            with self.subTest(value=value), self.assertRaises(agent_pause.PauseRefused):
+                self.change(not_after=value)
+        with self.assertRaises(agent_pause.PauseRefused):
+            agent_pause.change(self.db, "worker", paused=False, reason="done",
+                               actor="human:alice", not_after=time.time() + 60)
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual(self.events(), [])
+
+    def test_deadline_sql_entrypoint_has_no_public_execution_or_definer(self):
+        row = self.db.query(
+            "SELECT prosecdef, EXISTS (SELECT 1 FROM aclexplode(proacl) a "
+            "WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') AS public_exec "
+            "FROM pg_proc WHERE proname = 'ameesh_operator_pause_before' "
+            "AND pronamespace = %s::regnamespace", (self.schema,))[0]
+        self.assertEqual(row, {"prosecdef": False, "public_exec": False})
+        # Sans échéance, l'appel direct est refusé par la fonction elle-même.
+        with self.assertRaises(Exception):
+            self.db.query("SELECT * FROM ameesh_operator_pause_before"
+                          "(%s, %s, %s, %s, %s, NULL)",
+                          ("worker", True, "maintenance", "human:alice", "human:alice"))
+        # Une échéance passée est refusée sans écriture ni événement.
+        rows = self.db.query(
+            "SELECT * FROM ameesh_operator_pause_before"
+            "(%s, %s, %s, %s, %s, to_timestamp(%s))",
+            ("worker", True, "maintenance", "human:alice", "human:alice",
+             time.time() - 1))
+        self.assertEqual((rows[0]["changed"], rows[0]["refusal"]), (False, "not_after"))
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual(self.events(), [])
+
     def test_operator_resume_wakes_the_runner_after_commit(self):
         name = self.schema
         registry.upsert(self.db, name, harness="deepseek", host=self.cfg.host)
@@ -299,6 +389,26 @@ class PauseTest(PgTestCase):
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(len(self.events()), 2)
         self.assertIsNone(registry.get(self.db, "worker")["pending_prompt"])
+
+    def test_cli_pause_after_its_deadline_reports_the_refusal(self):
+        """#2184/R3 : le CLI dit le refus d'échéance et rend le JSON que le
+        drain lit (changed=false, refusal=not_after)."""
+        out = self.mesh("pause", "worker", "--human", "human:alice",
+                        "--reason", "maintenance", "--not-after",
+                        str(time.time() - 1), "--json")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        data = json.loads(out.stdout)
+        self.assertEqual((data["changed"], data["refusal"]), (False, "not_after"))
+        self.assertIn("refused (not_after)", out.stderr)
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        self.assertEqual(self.events(), [])
+        # En texte, le refus remplace le compte rendu habituel.
+        out = self.mesh("pause", "worker", "--human", "human:alice",
+                        "--reason", "maintenance", "--not-after",
+                        str(time.time() - 1))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.stdout.strip(), "")
+        self.assertIn("refused (not_after)", out.stderr)
 
     def test_cli_conditional_resume_keeps_a_foreign_pause(self):
         """#2152 / R1 B1 : `resume --operator --expect-reason` ne lève que la

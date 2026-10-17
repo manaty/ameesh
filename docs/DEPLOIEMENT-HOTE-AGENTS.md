@@ -55,9 +55,14 @@ CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh` doit
 être lancé hors session d'agent ; sinon la pause est refusée pour cet agent,
 qui est attendu sans drain, et les autres agents du balayage continuent
 (#2184/N2). Un CLI de
-cible antérieur à #2152 (sans `--expect-reason`) n'est jamais utilisé pour
-drainer : le script attend comme avant plutôt que de laisser une pause
-orpheline. Les appels de drain sont bornés (`DRAIN_APPEL_DELAI`, 60 s) et
+cible antérieur à #2152 (sans `--expect-reason`) ou à #2184/R3 (sans
+`--not-after`) n'est jamais utilisé pour drainer : le script attend comme
+avant plutôt que de laisser une pause orpheline. La pose porte une échéance
+absolue (`--not-after`) comparée par la base sous le verrou de ligne ; une
+commande distante retardée est refusée (`refusal=not_after`). Pour une pose
+incertaine, le script attend l'échéance, la borne d'instruction et la dérive
+d'horloge avant de relire et de reprendre. Les appels de drain sont bornés
+(`DRAIN_APPEL_DELAI`, 60 s) et
 couverts par un keepalive SSH ; la levée est retentée une fois à la sortie,
 et une pause qui n'a pas pu être levée est nommée pour une reprise manuelle.
 Il relit le placement et le mode avant chaque redémarrage :

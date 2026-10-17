@@ -1566,6 +1566,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pause.add_argument("agent")
     p_pause.add_argument("--reason", required=True)
     p_pause.add_argument("--human", default=None, help="local human (same as ameesh serve)")
+    p_pause.add_argument("--not-after", type=float, default=None, metavar="EPOCH",
+                         help="deadline (epoch) after which the database refuses "
+                              "the pause; set by the drain before a remote call")
     p_pause.add_argument("--json", action="store_true")
     from . import agent_pause
     p_pause.set_defaults(func=lambda cfg, args: agent_pause.cmd_cli(cfg, args, paused=True))
