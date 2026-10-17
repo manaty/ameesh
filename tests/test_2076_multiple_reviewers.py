@@ -226,3 +226,71 @@ class MultipleReviewersTest(PgTestCase):
         self.designate("first", remove=True)
         self.db.execute(migration)
         self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
+
+    # -- #2084/N1-N2 : journaliser tout changement, jamais un retrait sans effet
+
+    def notes(self):
+        return [e["note"] for e in work.events(self.db, self.lot["id"])]
+
+    def test_assigning_a_missing_lot_is_a_noop(self):
+        self.assertIsNone(storage.of(self.db).work.assign(
+            -1, "first", current=None, note="missing lot", actor="chief"))
+
+    def test_removing_an_undesignated_name_writes_no_journal_line(self):
+        self.designate("first")
+        before = self.notes()
+        updated = work.get(self.db, self.lot["id"])["updated_ts"]
+        proc = self.mesh("work", "reviewer", str(self.lot["id"]), "ghost", "--remove",
+                         "--actor", "chief",
+                         env=self.env(AMEESH_ALERT_ORCHESTRATORS="chief"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("was not designated: nothing removed", proc.stdout)
+        self.assertEqual(self.notes(), before)
+        row = work.get(self.db, self.lot["id"])
+        self.assertEqual(row["reviewers"], ["first"])
+        self.assertEqual(row["updated_ts"], updated)
+
+    def test_removing_all_without_a_designation_writes_no_journal_line(self):
+        before = self.notes()
+        updated = work.get(self.db, self.lot["id"])["updated_ts"]
+        proc = self.mesh("work", "reviewer", str(self.lot["id"]), "--remove",
+                         "--actor", "chief",
+                         env=self.env(AMEESH_ALERT_ORCHESTRATORS="chief"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("no reviewer designation to remove", proc.stdout)
+        self.assertEqual(self.notes(), before)
+        self.assertEqual(work.get(self.db, self.lot["id"])["updated_ts"], updated)
+
+    def test_assignment_to_a_non_last_reviewer_names_the_removal(self):
+        self.designate("first")
+        self.designate("second")
+        work.assign(self.db, self.lot["id"], "first", actor="chief", cfg=self.cfg)
+        row = work.get(self.db, self.lot["id"])
+        self.assertEqual(row["reviewers"], ["second"])
+        notes = self.notes()
+        self.assertIn("reviewer first cleared (they now hold the lot)", notes)
+        assigned = [n for n in notes if n.startswith("assigned to first")]
+        self.assertTrue(assigned, notes)
+        self.assertNotIn("cleared", assigned[0])
+
+    def test_delegation_to_a_non_last_reviewer_names_the_removal(self):
+        self.designate("first")
+        self.designate("second")
+        out = work.delegate(self.db, self.lot["id"], "first", within=1800,
+                            actor="author", cfg=self.cfg)
+        self.assertEqual(out["item"]["reviewers"], ["second"])
+        self.assertIn("reviewer first cleared (they now hold the lot)", self.notes())
+
+    def test_delegation_return_to_a_non_last_reviewer_names_the_removal(self):
+        self.designate("first")
+        self.designate("second")
+        out = work.delegate(self.db, self.lot["id"], "first", within=1800,
+                            actor="author", cfg=self.cfg)
+        self.designate("author")
+        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"],
+                         ["second", "author"])
+        done = work.expire_delegations(self.db,
+                                       now=out["delegation"]["due_ts"] + 1)
+        self.assertEqual([d["outcome"] for d in done], ["rendue"])
+        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
+        self.assertIn("reviewer author cleared (they now hold the lot)", self.notes())
