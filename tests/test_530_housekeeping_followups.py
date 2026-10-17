@@ -281,13 +281,17 @@ class EpisodeTest(PgTestCase):
         many = [os.path.join(tmp, "many", "f%d" % i) for i in range(6)]
         for path in many:
             _write(path)
+        # l'horloge est menée (`now`), pas attendue : la deuxième passe a un
+        # autre instant, donc si `since` était recalculé l'assertion le verrait
+        first_now = time.time()
         with mock.patch.object(menage, "WALK_LIMIT", 3):
-            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t",
+                            now=first_now)
         first = self._alerts("tmp_unscanned")
         self.assertEqual(len(first), 1)
-        time.sleep(1.1)                    # a later `at_ts`, the same episode
         with mock.patch.object(menage, "WALK_LIMIT", 3):
-            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t",
+                            now=first_now + 2.0)
         second = self._alerts("tmp_unscanned")
         self.assertEqual(len(second), 1)
         self.assertEqual(second[0]["since"], first[0]["since"])

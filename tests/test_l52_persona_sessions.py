@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import sys
-import types
 import unittest
 from unittest import mock
 
@@ -226,36 +225,44 @@ class SessionHistoryTest(PgTestCase):
 class HookHistoryFilterTest(unittest.TestCase):
     def run_hook(self, *, leased=False, agent_id=None):
         backend = mock.Mock(kind="pg")
-        binding = types.SimpleNamespace(ok=True, name="checker", bound_to_lease=leased,
-                                        runner_id="r", epoch=1, source="session")
+        # #1719 : le double suit le contrat reel de `identity.Binding` — dont
+        # `session`, lu par cmd_hook depuis #1604 ; `bound_to_lease` y est une
+        # propriete, elle vient donc de `source` et non d'un champ pose a la main.
+        binding = cli.identity.Binding(ok=True, name="checker", runner_id="r", epoch=1,
+                                       source="runner" if leased else "session")
         payload = {"hook_event_name": "Other", "session_id": "child-or-main", "cwd": "/w"}
         if agent_id is not None:
             payload["agent_id"] = agent_id
         with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
                 mock.patch.object(cli.backend_mod, "open_backend", return_value=(backend, None)), \
                 mock.patch.object(cli.identity, "resolve_binding", return_value=binding), \
+                mock.patch.object(cli.fastmail, "remember_liaison") as remember, \
                 mock.patch.object(cli, "_register_due", return_value=True), \
                 mock.patch.object(cli, "_register_done"), \
                 mock.patch.object(cli, "set_title"), \
                 mock.patch.object(registry, "record_session_history") as record:
             self.assertEqual(cli.cmd_hook(mock.sentinel.cfg, "deepseek"), 0)
-            return backend, record
+            return backend, record, remember
 
     def test_external_main_hook_records_after_registration(self):
-        backend, record = self.run_hook()
+        backend, record, remember = self.run_hook()
         backend.register.assert_called_once_with("checker", "deepseek", "/w", "child-or-main",
                                                 leased=False)
         record.assert_called_once_with(backend.db, "checker", "child-or-main")
+        remember.assert_called_once_with(mock.sentinel.cfg, "checker", "deepseek",
+                                         "child-or-main", pid=None)
 
     def test_leased_child_hook_cannot_record_session_id(self):
-        backend, record = self.run_hook(leased=True)
+        backend, record, remember = self.run_hook(leased=True)
         backend.register.assert_called_once_with("checker", "deepseek", "/w", None, leased=True)
         record.assert_not_called()
+        remember.assert_not_called()
 
     def test_explicit_subagent_hook_writes_nothing(self):
-        backend, record = self.run_hook(agent_id="child")
+        backend, record, remember = self.run_hook(agent_id="child")
         backend.register.assert_not_called()
         record.assert_not_called()
+        remember.assert_not_called()
 
 
 class NonBlockingHistoryTest(unittest.TestCase):

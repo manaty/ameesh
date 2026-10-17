@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 from ameesh import chat, config as config_mod, conversation as conversation_mod
-from ameesh import mail, registry
+from ameesh import db as db_mod, mail, registry
 
 from .support import PgTestCase
 
@@ -91,6 +91,23 @@ class ViewTest(unittest.TestCase):
              "ts": 1000, "meta": {"status": "completed"}},
         ], now=1000)
         self.assertIn("réponse finale", text)
+
+    def test_identical_text_entries_of_one_turn_are_printed_once(self):
+        text = self.render([
+            {"kind": "text", "text": "réponse", "author": "agent:a", "turn": "t1", "ts": 1000},
+            {"kind": "text", "text": "réponse", "author": "agent:a", "turn": "t1", "ts": 1001},
+            {"kind": "text", "text": " suite", "author": "agent:a", "turn": "t1", "ts": 1002},
+            {"kind": "text", "text": "réponse", "author": "agent:a", "turn": "t2", "ts": 1003},
+        ], now=1003)
+        self.assertEqual(text.count("réponse"), 2)     # une fois dans t1, une fois dans t2
+        self.assertIn(" suite", text)                  # la suite distincte reste visible
+
+    def test_identical_text_from_another_author_is_kept(self):
+        text = self.render([
+            {"kind": "text", "text": "ok", "author": "agent:a", "turn": "t1", "ts": 1000},
+            {"kind": "text", "text": "ok", "author": "agent:b", "turn": "t1", "ts": 1001},
+        ], now=1001)
+        self.assertEqual(text.count("ok"), 2)          # le tour est par auteur, pas par numéro
 
     def test_other_turns_and_kinds_are_visible(self):
         text = self.render([
@@ -274,6 +291,28 @@ class ClientTest(unittest.TestCase):
         text = client.view.out.getvalue()
         self.assertIn("un", text)
         self.assertIn("deux", text)
+
+    def test_loop_survives_a_database_cut_on_state_refresh(self):
+        class _Eof:
+            """Laisse passer deux tours de boucle avant de rendre la main."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def is_set(self):
+                self.calls += 1
+                return self.calls > 2
+
+            def set(self):
+                pass
+
+        client = self.client(lines=[], subscribe=lambda: _FakeSubscription(
+            [{"channel": config_mod.CHANNEL_LEASE}]))
+        client._eof = _Eof()
+        with mock.patch.object(chat, "state_lines",
+                               side_effect=db_mod.DbError("connexion perdue")):
+            self.assertEqual(client.loop(0), 0)
+        self.assertIn("state unavailable", client.view.out.getvalue())
 
 
 # ==========================================================================

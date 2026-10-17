@@ -36,12 +36,18 @@ concurrency:
   group: paquet-${{ github.ref }}
   cancel-in-progress: true
 
-# la suite appelée publie ses flux (checks: write, L161c) et le portier lit
-# les PR (pull-requests: read) ; lui-même n'écrit aucun check.
+# la suite appelée publie ses flux (checks: write, L161c), relit l'état
+# terminal de ses jobs (actions: read, #856) et le portier lit les PR
+# (pull-requests: read) ; lui-même n'écrit aucun check. Un appelant qui
+# déclare `permissions:` reçoit `none` pour toute portée qu'il n'énumère pas :
+# un droit manquant fait refuser le fichier avant tout job (startup_failure,
+# zéro job, aucun log, #2134), donc cette liste doit couvrir tout ce que
+# tests.yml demande.
 permissions:
   contents: read
   pull-requests: read
   checks: write
+  actions: read
 
 jobs:
   # décide si une PR ouverte couvre exactement cette tête ; ne regarde que des
@@ -76,6 +82,11 @@ jobs:
   # poussée plus récente a remplacé ce portier), la suite ne part pas : une
   # tête dépassée n'a plus de décision à porter et ne doit pas consommer un
   # runner.
+  # les droits passés au reusable sont ceux de ce job : son bloc
+  # `permissions:` s'il en déclare un, sinon celui du workflow ci-dessus, qui
+  # couvre tout ce que tests.yml demande (contents, pull-requests, actions,
+  # checks). En retirer un rendrait le fichier invalide, sans job ni log
+  # (témoin tests/test_2134_portier_permissions.py).
   suite:
     name: suite complète du paquet
     needs: couverture

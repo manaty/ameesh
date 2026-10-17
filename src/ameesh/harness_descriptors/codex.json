@@ -29,7 +29,8 @@
     "hooks": {
       "mail": {
         "command": ["agent-mail", "hook", "codex"],
-        "events": ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"]
+        "events": ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"],
+        "file": "hooks.json"
       }
     },
     "cost": {"source": "stream", "gauges": "sessions", "paid_per_token": false},

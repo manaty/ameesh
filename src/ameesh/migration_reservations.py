@@ -126,7 +126,8 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
                 if holder and int(holder["id"]) != lot:
                     raise work.WorkError("migration %s of %s already held by lot #%s" % (number, slug, holder["id"]))
                 state = "existing" if current is not None else "reserve"
-            result.append(dict(row, lot=lot, action=state))
+            result.append(dict(row, lot=lot, action=state,
+                               issue_ref=item.get("issue_ref") if lot is not None else None))
         return result
 
     if not apply:
@@ -141,7 +142,7 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
             if row["action"] == "existing":
                 continue
             storage.of(tx).work.reserve_migration(
-                row["lot"], slug, row["number"], 0, actor=actor,
+                row["lot"], slug, row["number"], 0, actor=actor, issue_ref=row["issue_ref"],
                 note="legacy RESERVATIONS.md import: migration %(number)s reserved (" + slug + ")")
             row["action"] = "reserved"
         return result

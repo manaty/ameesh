@@ -395,7 +395,17 @@ class Contract:
     #: {domaine: [méthodes]} : opérations de l'interface refusées à dessein
     refused: Mapping[str, tuple]
     refused_reasons: Mapping[str, str]
-    interface_total: int
+
+    @property
+    def interface_total(self) -> int:
+        """Le nombre d'opérations de l'interface classées, admises ou refusées.
+
+        #1517 : dérivé, jamais stocké. Le compteur que chaque lot ajoutant une
+        méthode d'interface incrémentait dans `contract.json` était une même
+        ligne disputée par tous ces lots, donc un conflit garanti à chaque
+        composition de paquet ; la garantie (toute l'interface est classée)
+        reste tenue par le test du contrat (`test_l107_executor_contract`)."""
+        return len(self.operations) + sum(len(m) for m in self.refused.values())
 
     def get(self, name: str) -> Operation:
         """L'opération admise, sinon `NotSupportedRemotely`."""
@@ -501,8 +511,7 @@ def parse(data: Mapping) -> Contract:
     ref = data["refused"]
     return Contract(version=data["version"], prefix=data["prefix"], operations=ops,
                     refused={k: tuple(v) for k, v in ref["operations"].items()},
-                    refused_reasons=dict(ref["reasons"]),
-                    interface_total=ref["interface_total"])
+                    refused_reasons=dict(ref["reasons"]))
 
 
 @lru_cache(maxsize=1)
@@ -529,8 +538,9 @@ _TYPES = {
 
 def conforms(value: Any, schema: Mapping) -> bool:
     """`value` respecte-t-il `schema` ? Mots-clés : type (chaîne ou liste),
-    items, additionalProperties, anyOf, $ref (`ameesh-exec-events/1` :
-    accepté tel quel, la valeur n'est jamais transportée par /op)."""
+    items, properties/required (objets déclarés, #1482), additionalProperties,
+    anyOf, $ref (`ameesh-exec-events/1` : accepté tel quel, la valeur n'est
+    jamais transportée par /op)."""
     if "$ref" in schema:
         return True
     if "anyOf" in schema:
@@ -542,6 +552,14 @@ def conforms(value: Any, schema: Mapping) -> bool:
             return False
     if isinstance(value, (list, tuple)) and "items" in schema:
         return all(conforms(v, schema["items"]) for v in value)
-    if isinstance(value, Mapping) and isinstance(schema.get("additionalProperties"), Mapping):
-        return all(conforms(v, schema["additionalProperties"]) for v in value.values())
+    if isinstance(value, Mapping):
+        declared = schema.get("properties")
+        if isinstance(declared, Mapping):
+            if any(name not in value for name in schema.get("required") or ()):
+                return False
+            if any(k in value and not conforms(value[k], sub)
+                   for k, sub in declared.items()):
+                return False
+        if isinstance(schema.get("additionalProperties"), Mapping):
+            return all(conforms(v, schema["additionalProperties"]) for v in value.values())
     return True

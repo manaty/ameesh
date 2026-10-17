@@ -6,4 +6,7 @@ After=postgresql.service
 [Service]
 Type=oneshot
 User=ameesh
+# #1305 : les dumps ne doivent jamais être lisibles par un autre compte, même
+# si le script perdait son umask.
+UMask=0077
 ExecStart=/usr/local/sbin/ameesh-sauvegarder-base
