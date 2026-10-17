@@ -265,6 +265,11 @@ def _slo_breach(alert: dict) -> str:
     holder = " --if-holder %s" % who if who else ""
     waiting = alert.get("waiting") or {}
     what = waiting.get("what") if isinstance(waiting, dict) else None
+    if alert.get("step") != "verdict_merge":
+        # The targets move to the pilot on `verdict_merge` only
+        # (`exploitation._slo_targets`): the brief follows them, so a text
+        # addressed to the pilot never reaches the assignee.
+        what = None
     if what in ("merge", "merge-approval", "merge-outcome"):
         if level >= 3:
             move = ("bureau or auditor: the lot waits for its merge vehicle/package — "

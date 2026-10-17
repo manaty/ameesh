@@ -250,6 +250,17 @@ class AttentePorteurTest(_Base):
             self.assertEqual(len(self.slo()), 1)
 
 
+    def test_unblock_outside_verdict_merge_keeps_the_assignee_text(self):
+        # The brief follows `_slo_targets`: outside `verdict_merge` the targets
+        # stay the assignee's, so the text is not the pilot's.
+        alert = {"lot": self.lot["id"], "level": 1, "step": "signal_assigned",
+                 "waiting": {"what": "unblock"}, "agent": "dev1",
+                 "value": 5400, "threshold": 3600}
+        text = alert_briefs._slo_breach(alert)
+        self.assertIn("assignee: act on it", text)
+        self.assertNotIn("do not reassign its holder", text)
+
+
 class NotifyLivreTest(_Base):
     """B1 (#1035 R1) : la livraison RÉELLE par le Notifier — un P1 atteint le
     propriétaire même si son type est hors `notify.types`, un dépassement
