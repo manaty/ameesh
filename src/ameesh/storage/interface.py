@@ -3189,9 +3189,10 @@ class Housekeeping(Domain):
 
     @abc.abstractmethod
     def worktrees(self, host: str | None, statuses: Sequence[str] | None = None,
-                  limit: int = 500) -> list[dict]:
+                  limit: int | None = 500) -> list[dict]:
         """Worktrees suivis (de l'hôte, des statuts donnés), les plus anciens
-        d'abord ; instants en `created_ts`, `checked_ts`, `ended_ts`."""
+        d'abord ; instants en `created_ts`, `checked_ts`, `ended_ts`.
+        `limit=None` : tous (#2174, le ménage de l'hôte)."""
 
     @abc.abstractmethod
     def set_worktree_status(self, worktree_id: int, status: str, detail: str) -> dict | None:

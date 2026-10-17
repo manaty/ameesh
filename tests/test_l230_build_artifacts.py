@@ -620,7 +620,7 @@ class OrphanGuardsTest(unittest.TestCase):
                     if isinstance(state, Exception):
                         lookup.side_effect = state
                     store = SimpleNamespace(work=SimpleNamespace(get=lookup),
-                        housekeeping=SimpleNamespace(worktrees=lambda *args: [row]))
+                        housekeeping=SimpleNamespace(worktrees=mock.Mock(return_value=[row])))
                     git = dict(exists=True, clean=True, pushed=True, integrated=False,
                                locked=False, submodules="", gitdir="", reason="not integrated")
                     with mock.patch.object(menage.storage, "of", return_value=store), \
@@ -631,8 +631,12 @@ class OrphanGuardsTest(unittest.TestCase):
                         entries, plan = menage._worktree_pass(None, "pc", dry_run=True,
                                                              protected=set(), now=now)
                     self.assertEqual(entries, [])
+                    # #2174: the pass reads every tracked worktree, uncapped
+                    self.assertIsNone(store.housekeeping.worktrees.call_args.kwargs["limit"])
+                    # #2174: another agent's ENDED lot follows the orphan
+                    # rule; its open, unknown or unreadable lot proves nothing
                     self.assertEqual(plan[0]["action"] == "retrait",
-                                     label in ("orphan", "own-closed"), plan)
+                                     label in ("orphan", "own-closed", "other-closed"), plan)
                     if recent:
                         outcome, freed, reason, built = menage._remove_kept_worktree(
                             path, root, "", artifacts=None, allow=(),
