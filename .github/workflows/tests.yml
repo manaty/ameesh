@@ -18,9 +18,11 @@
 #               plafond de 30 min sous saturation) ; la suite complète, en
 #               9 parts (#1692 : 6 → 9, parts de ~30 min sous saturation), sur
 #               push vers main ou release/**, sur une PR de
-#               release (sans liste pilote), à la main (workflow_dispatch) et
-#               sur l'appel du portier de paquet (workflow_call).
-# Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#               release (sans liste pilote), à la main (workflow_dispatch, hors
+#               tête de PR ouverte, #1635) et sur l'appel du portier de paquet
+#               (workflow_call).
+# Le job final « tests » agrège les parts : c'est le nom de vérification stable
+# hors lancement manuel, qui publie « tests (dispatch) » (#1635).
 #
 # §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
 # `pull_request` de sa PR porte le check requis `tests` ; le portier
@@ -101,10 +103,12 @@
 # #856 — un runner arrêté (saturation #747) tue le publisher et l'étape
 # `close` : le check restait `in_progress` pour toujours. Le job `tests`
 # (indépendant des publishers) conclut les orphelins en relisant l'état
-# terminal réel du job et de l'exécution (`ci-flow.py sweep`, par le
-# `details_url` ou, à défaut, par le `check_suite`) : `cancelled`, jamais
-# `success` sans ligne `fin`, et aucun check actif n'est touché. D'où
-# `actions: read` et `checks: write` sur le job `tests`.
+# terminal réel du job et de l'exécution (`ci-flow.py sweep`, par
+# l'`external_id` du check #1393, sinon par le `details_url` ou, à défaut, par
+# le `check_suite`) : `cancelled`, jamais `success` sans ligne `fin`, et aucun
+# check actif n'est touché. D'où `actions: read` et `checks: write` sur le job
+# `tests`. #1393 : le balayage est borné (`timeout 120`, `--max-duration 100`)
+# sous le plafond de 5 min du job — il ne change jamais le verdict requis.
 name: tests
 
 on:
@@ -184,6 +188,10 @@ jobs:
     name: plan
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    # #1635 : dispatch-guard.py lit les PR ouvertes
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       # #833 : sur une poussée, le diff va du commit d'avant la poussée
       # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
@@ -209,12 +217,37 @@ jobs:
       # another one, so it is the reference the parts check against.
       plan_sha256: ${{ steps.plan_digest.outputs.sha256 }}
     steps:
+      # #1635 : un lancement à la main publie le check requis `tests` sur le
+      # commit lancé (check lié au commit, pas à l'évènement) ; sur la tête
+      # d'une PR ouverte, il satisferait le check de cette PR sans merge-ref ni
+      # porte de gel. La référence est contrôlée avant tout checkout (main,
+      # release/**, integration/**, validation/**), puis
+      # scripts/dispatch-guard.py refuse un commit qui est la tête d'une PR
+      # ouverte. Un refus fait échouer `plan` : `tests` rougit sans tests. La
+      # référence passe par l'environnement, jamais interpolée (#1237).
+      - name: lancement à la main (main, release/**, integration/**, validation/** — #1635)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          case "$DISPATCH_REF" in
+            refs/heads/main|refs/heads/release/?*|refs/heads/integration/?*|refs/heads/validation/?*)
+              echo "workflow_dispatch on $DISPATCH_REF: branch admitted" ;;
+            *)
+              echo "::error::workflow_dispatch on '$DISPATCH_REF': only main, release/**, integration/** and validation/** may be run by hand (#1635); a lot branch gets its CI through its pull request, nothing run"
+              exit 1 ;;
+          esac
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # the map commit, and whether it is an ancestor
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: lancement à la main sur la tête d'une PR ouverte (#1635)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/dispatch-guard.py
       # the most recent map of main (a PR reads the caches of its base branch)
       - uses: actions/cache/restore@v4
         with:
@@ -712,7 +745,9 @@ jobs:
   # never a required check.
   bilan:
     name: bilan des impactés
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    # #876 : « always() » seul recrée le job après l'annulation de l'exécution
+    # (il reste queued des heures, puis la conclut en rouge) ; !cancelled() le saute.
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
     # Union #1256 x #1468 : le pool prioritaire d'abord, puis l'hôte prêté
     # quand un prêt est armé, puis la flotte ordinaire. `bilan` est hors de la
@@ -774,7 +809,14 @@ jobs:
   # #748 : la part « autre système de fichiers », quand elle tourne — release
   # ou exécution à la main — compte comme les autres)
   tests:
-    name: tests
+    # Une PR peut être ouverte sur ce SHA après la garde ou la fin du run :
+    # un dispatch ne doit jamais publier le contexte requis de cette PR.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'tests (dispatch)' || 'tests' }}
+    # #876 : seul check requis ; `always() && !cancelled()` le ferait passer
+    # skipped sur une exécution annulée, et GitHub compte un job sauté comme un
+    # succès — la PR redeviendrait fusionnable sans aucun test. Il garde donc
+    # `always()` (une exécution annulée le conclut en rouge) ; l'attente en file
+    # de cet agrégat après annulation est la saturation des runners (lot #828).
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
@@ -821,15 +863,20 @@ jobs:
       # #856 : réconciliation indépendante du publisher — un runner arrêté
       # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
       # restait in_progress pour toujours. On relit l'état terminal réel du job
-      # et de l'exécution qui l'ont publié (par le `details_url`, sinon par le
-      # `check_suite` : GitHub laisse l'URL par défaut sur ces checks) ; jamais
-      # `success` sans ligne `fin`, aucun check dont l'exécution est encore
-      # active, ni d'une autre tête, n'est touché.
+      # et de l'exécution qui l'ont publié (par l'`external_id` du check #1393,
+      # sinon par le `details_url`, sinon par le `check_suite` : GitHub laisse
+      # l'URL par défaut sur ces checks) ; jamais `success` sans ligne `fin`,
+      # aucun check dont l'exécution est encore active, ni d'une autre tête,
+      # n'est touché.
       # `continue-on-error` : cette réconciliation ne change jamais le verdict
       # requis « tests » (comme la publication, elle n'est pas une cause d'échec).
       # `if: always()` : un bilan rouge (une part requise tombée) ne doit pas
       # sauter le checkout — sinon `sweep`, lancé en `always()`, n'a plus son
       # script et aucun check orphelin n'est conclu.
+      # #1393 : `timeout 120` et `--max-duration 100` bornent le balayage (les
+      # appels GitHub peuvent durer 20 s) sous le plafond de 5 min du job : un
+      # balayage lent ne peut pas faire expirer le job et rougir « tests » ; il
+      # s'arrête entre deux checks et les restants sont vus au passage suivant.
       - uses: actions/checkout@v4
         if: always()
         continue-on-error: true
@@ -838,4 +885,4 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci-flow.py sweep
+        run: timeout 120 python3 scripts/ci-flow.py sweep --max-duration 100

@@ -382,13 +382,28 @@ def _text(value: Any) -> str:
 
 
 def _as_int(value: Any) -> int:
+    """Un entier sur, jamais une exception : -1 pour toute autre forme.
+
+    ``str.isdigit`` est plus large que ``int`` : ``²`` le passe et ``int`` le
+    refuse, et ``--3`` le passait par ``lstrip("-")`` alors que ``int`` le
+    refuse aussi. Ces formes rendent -1 comme les autres entrees non entieres
+    (post-fusion #1937) : une reference malformee doit produire un refus nomme
+    (`evidence-invalid`), jamais une exception non attrapee.
+    """
     if isinstance(value, bool):
         return -1
     if isinstance(value, int):
         return value
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value)
-    return -1
+    if not isinstance(value, str):
+        return -1
+    text = value.strip()
+    digits = text[1:] if text.startswith("-") else text
+    if not digits.isdigit():
+        return -1
+    try:
+        return int(text)
+    except ValueError:
+        return -1
 
 
 def _present(value: Any) -> bool:

@@ -4,6 +4,9 @@
 
 The runtime/source tree digests and host-key proof are enrollment prerequisites,
 not assertions established by this renderer. No credential value is accepted.
+Protected enrollment documents (the probe `turn.json`) may enter the same
+reviewed inventory: their destinations and modes are fixed here, their contents
+are canonical JSON and their digests bind the signed question like every file.
 """
 import base64
 import hashlib
@@ -42,21 +45,67 @@ DIRECTORIES={
     # reviewed layout, never to an ad hoc directory outside the signed plan.
     '/var/lib/ameesh-release-bootstrap':0o700,
 }
+#: Protected enrollment documents an operator may add to the reviewed bootstrap
+#: inventory, with their exact fixed mode. A caller never chooses a destination.
+TURN_DOCUMENT='/etc/ameesh-release/turn.json'
+ENROLLMENT_DOCUMENTS={TURN_DOCUMENT:0o600}
+ENROLLMENT_LIMIT=8192
 
 
 class DelegationError(ValueError):
     pass
 
 
+ACCESS = frozenset({'host', 'machine_id', 'controller_source', 'controller_key',
+                    'host_key_sha256', 'runtime_tree_sha256', 'source_tree_sha256'})
+
+
+def enrollment_documents(enrollment):
+    """Exact canonical JSON enrollment documents at their fixed destinations.
+
+    The content must be the compact sorted JSON of one object: two byte
+    sequences of the same document are not interchangeable, since the signed
+    question binds their digest.
+    """
+    if enrollment is None:
+        return {}
+    if not isinstance(enrollment,dict):
+        raise DelegationError('exact enrollment documents required')
+    documents={}
+    for path,content in enrollment.items():
+        if path not in ENROLLMENT_DOCUMENTS:
+            raise DelegationError('unknown enrollment document')
+        try:
+            value=json.loads(content)
+        except (TypeError,ValueError):
+            raise DelegationError('enrollment document is not JSON') from None
+        if (not isinstance(content,str) or not isinstance(value,dict)
+                or content!=json.dumps(value,sort_keys=True,separators=(',',':'))
+                or len(content.encode())>ENROLLMENT_LIMIT):
+            raise DelegationError('canonical enrollment document required')
+        documents[path]=content
+    return documents
+
+
 def validate(plan):
-    fields = {'host', 'machine_id', 'controller_source', 'controller_key',
-              'host_key_sha256', 'runtime_tree_sha256', 'source_tree_sha256', 'policy'}
-    if not isinstance(plan, dict) or set(plan) != fields:
+    if not isinstance(plan, dict) or set(plan) != ACCESS | {'policy'}:
         raise DelegationError('invalid delegation plan')
     try:
         restart.validate_policy(plan['policy'])
         if plan['host'] != plan['policy']['host']:
             raise DelegationError('delegation host mismatch')
+        validate_access(plan)
+    except DelegationError:
+        raise
+    except Exception:
+        raise DelegationError('invalid delegation enrollment') from None
+
+
+def validate_access(plan):
+    """Host identity, pinned artifacts, controller source and key (any delegation)."""
+    try:
+        if not isinstance(plan['host'], str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', plan['host']):
+            raise DelegationError('invalid enrolled host')
         if not isinstance(plan['machine_id'], str) or not re.fullmatch(r'[0-9a-f]{32}', plan['machine_id']):
             raise DelegationError('exact machine identity required')
         for name in ('host_key_sha256','runtime_tree_sha256','source_tree_sha256'):
@@ -80,13 +129,18 @@ def validate(plan):
         raise DelegationError('invalid delegation enrollment') from None
 
 
-def render(plan, *, account_ids=None,previous_files=None):
-    """Return exact install/revoke inventory; this function has no host effects."""
-    plan = json.loads(json.dumps(plan))
-    validate(plan)
+def validate_account_ids(account_ids):
     if account_ids is not None and (not isinstance(account_ids,dict) or set(account_ids)!={'uid','gid'}
             or any(type(account_ids[name]) is not int or not 100<=account_ids[name]<=60000 for name in ('uid','gid'))):
         raise DelegationError('exact account numeric identity required')
+
+
+def access_files(plan, *, account, wrapper, dispatcher, keys_file, sshd_file):
+    """Forced-command wrapper, sudoers, key and sshd Match for one SSH account.
+
+    The account reaches exactly one root dispatcher, with no argument, remote
+    command, forwarding or TTY. Returns {path: (mode, content)}.
+    """
     forced = '''#!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-only
 set -eu
@@ -94,38 +148,40 @@ if [ "$#" -ne 0 ] || [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
     printf '%s\\n' '{"error":"host_action_unavailable"}'
     exit 1
 fi
-exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+RUNTIME+' -I -B '+DISPATCHER+'\n'
+exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+RUNTIME+' -I -B '+dispatcher+'\n'
     sudo = ('# SPDX-License-Identifier: AGPL-3.0-only\n'
-            'Defaults:ameesh-release env_reset,!setenv\n'
-            'Defaults:ameesh-release secure_path="/usr/bin:/bin"\n'
-            'ameesh-release ALL=(root) NOPASSWD: '+RUNTIME+' -I -B '+DISPATCHER+'\n')
-    keys = ('restrict,from="'+plan['controller_source']+'",command="'+WRAPPER+'" '
+            'Defaults:'+account+' env_reset,!setenv\n'
+            'Defaults:'+account+' secure_path="/usr/bin:/bin"\n'
+            +account+' ALL=(root) NOPASSWD: '+RUNTIME+' -I -B '+dispatcher+'\n')
+    keys = ('restrict,from="'+plan['controller_source']+'",command="'+wrapper+'" '
             +plan['controller_key']+'\n')
     sshd = ('# SPDX-License-Identifier: AGPL-3.0-only\n'
-            'Match User ameesh-release\n'
-            '    AuthorizedKeysFile /etc/ameesh-release/authorized_keys\n'
+            'Match User '+account+'\n'
+            '    AuthorizedKeysFile '+keys_file+'\n'
             '    AuthorizedKeysCommand none\n'
             '    AuthenticationMethods publickey\n'
             '    PasswordAuthentication no\n'
             '    KbdInteractiveAuthentication no\n'
-            '    ForceCommand '+WRAPPER+'\n'
+            '    ForceCommand '+wrapper+'\n'
             '    DisableForwarding yes\n'
             '    PermitTTY no\n'
             '    PermitUserRC no\n'
             '    MaxSessions 1\n'
             'Match all\n')
-    files = {}
-    for path, mode, content in (
-            (WRAPPER,0o755,forced),
-            ('/etc/sudoers.d/ameesh-release',0o440,sudo),
+    return {wrapper:(0o755,forced),
+            '/etc/sudoers.d/'+account:(0o440,sudo),
             # sshd reads keys with the account's privileges. Public key data
             # is readable; root ownership prevents the account changing it.
-            ('/etc/ameesh-release/authorized_keys',0o644,keys),
-            ('/etc/ssh/sshd_config.d/60-ameesh-release.conf',0o600,sshd)):
-        files[path] = dict(owner='root',group='root',mode=mode,content=content,
-                          sha256=hashlib.sha256(content.encode()).hexdigest())
-    files['/etc/systemd/system/ameesh-release-controller.service']=dict(owner='root',group='root',mode=0o644,
-        content=unit.UNIT,sha256=hashlib.sha256(unit.UNIT.encode()).hexdigest())
+            keys_file:(0o644,keys),
+            sshd_file:(0o600,sshd)}
+
+
+def root_file(mode, content):
+    return dict(owner='root',group='root',mode=mode,content=content,
+                sha256=hashlib.sha256(content.encode()).hexdigest())
+
+
+def validate_previous(previous_files, files):
     if previous_files is None:
         previous_files={path:None for path in files}
     if not isinstance(previous_files,dict) or set(previous_files)!=set(files):
@@ -135,6 +191,23 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+
                 or not isinstance(info['sha256'],str) or not re.fullmatch(r'[0-9a-f]{64}',info['sha256'])
                 or type(info['mode']) is not int or not 0<=info['mode']<=0o777 or info['mode'] & 0o022):
             raise DelegationError('exact protected previous file required')
+    return previous_files
+
+
+def render(plan, *, account_ids=None,previous_files=None,enrollment=None):
+    """Return exact install/revoke inventory; this function has no host effects."""
+    plan = json.loads(json.dumps(plan))
+    validate(plan)
+    enrollment = enrollment_documents(enrollment)
+    validate_account_ids(account_ids)
+    files = {path:root_file(mode,content) for path,(mode,content) in access_files(plan,
+             account='ameesh-release',wrapper=WRAPPER,dispatcher=DISPATCHER,
+             keys_file='/etc/ameesh-release/authorized_keys',
+             sshd_file='/etc/ssh/sshd_config.d/60-ameesh-release.conf').items()}
+    files['/etc/systemd/system/ameesh-release-controller.service']=root_file(0o644,unit.UNIT)
+    for path,content in enrollment.items():
+        files[path]=root_file(ENROLLMENT_DOCUMENTS[path],content)
+    previous_files = validate_previous(previous_files, files)
     review = dict(version=1,host=plan['host'],machine_id=plan['machine_id'],
             plan=plan,policy_id=restart.policy_id(plan['policy']),files=files,previous_files=previous_files,
             directories=dict(DIRECTORIES),services=dict(ssh_reload='sshd.service',controller='ameesh-release-controller.service'),
@@ -152,9 +225,9 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+
                 'Administrator enables only after independent controller service and complete adapter are enrolled.'
             ],
             revoke=dict(remove_only_matching_sha256={path:item['sha256'] for path,item in files.items()},
-                        preserve=['runtime','helper sources','database','enrollment','operations',
-                                  'controller journal','helper journal','live release fences'],
-                        action='Administrator restores only signed previous-file snapshots, or removes newly created files, while current contents match this exact delegation. Revoke the controller key first and verify effective SSH configuration. Changed files require a separate reviewed diff.'))
+                        preserve=['runtime','helper sources','database','administrator enrollment',
+                                  'operations','controller journal','helper journal','live release fences'],
+                        action='Administrator restores only signed previous-file snapshots, or removes newly created files (including this inventory\'s probe enrollment document, which a later bootstrap re-enrolls), while current contents match this exact delegation. Revoke the controller key first and verify effective SSH configuration. Changed files require a separate reviewed diff.'))
     if account_ids is not None:
         review['account'].update(account_ids)
     return dict(review, digest=restart.protocol.identity(review))
@@ -165,7 +238,13 @@ def question(bundle):
     if not isinstance(bundle,dict) or 'digest' not in bundle:
         raise DelegationError('review bundle required')
     numeric = {key:bundle['account'][key] for key in ('uid','gid') if key in bundle['account']}
-    expected = render(bundle['plan'],account_ids=numeric or None,previous_files=bundle.get('previous_files'))
+    try:
+        enrollment = {path:bundle['files'][path]['content']
+                      for path in ENROLLMENT_DOCUMENTS if path in bundle['files']}
+    except (KeyError,TypeError):
+        raise DelegationError('review bundle changed') from None
+    expected = render(bundle['plan'],account_ids=numeric or None,
+                      previous_files=bundle.get('previous_files'),enrollment=enrollment or None)
     if restart.protocol.identity(bundle) != restart.protocol.identity(expected):
         raise DelegationError('review bundle changed')
     return ('Approve prepared root SSH/sudo delegation on '+bundle['host']+

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import stat
 import subprocess
 import tempfile
@@ -46,14 +47,21 @@ def private_json(path):
 
 
 def check_curl():
+    """`--aws-sigv4` needs curl 7.75; the response size is bounded below.
+
+    Debian 12 ships curl 7.88. curl only aborts an oversize transfer on its own
+    (--max-filesize) when the length is known, and that for 8.4+; the child
+    therefore carries its own kernel RLIMIT_FSIZE, which bounds the response on
+    disk whatever the provider sends.
+    """
     try:
         result = subprocess.run(['/usr/bin/curl', '--version'],
                                 env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 check=True, text=True, timeout=10)
         match = re.match(r'curl (\d+)\.(\d+)\.(\d+)', result.stdout)
-        if not match or tuple(map(int, match.groups())) < (8, 4, 0):
-            raise StorageError('curl 8.4 or newer required for bounded transfers')
+        if not match or tuple(map(int, match.groups())) < (7, 75, 0):
+            raise StorageError('curl 7.75 or newer required for signed transfers')
     except (OSError, subprocess.SubprocessError):
         raise StorageError('retention transport unavailable') from None
 
@@ -139,8 +147,14 @@ class VersionRetention:
                     'aws:amz:' + self.settings['region'] + ':s3', '--request', method,
                     '--dump-header', str(headers), '--output', str(body),
                     '--write-out', '%{http_code}', url]
+            # The kernel bound is what makes an unknown-length transfer safe on
+            # curl < 8.4: no file the child writes can pass this size.
+            limit = self.max_bytes + 65537
+            def bound_child():
+                resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
             try:
                 result = subprocess.run(args, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+                                        preexec_fn=bound_child,
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                         check=True, text=True, timeout=130)
             except (OSError, subprocess.SubprocessError):

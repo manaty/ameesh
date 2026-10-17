@@ -5,6 +5,12 @@ Slice A (#1918): the strict `process_workflow` compiler. Slice C: finite
 verifiers and installed types. This document publishes the **seam** C plugs
 into and the invariants B guarantees.
 
+Slice A accepts several **distinct targets under one guard from the same
+stage** — the reference card has `draft -> backlog` and `draft -> sprint`
+under `planning`. The command carries `to_stage`, and the registry checks the
+exact `(to_stage, guard)` edge from `from_stage`; only an exact duplicate
+`(from, to, guard)` is refused (`edge-duplicate`).
+
 ## What B adds to the repository
 
 * additive migration `0452_process_workflow_registry`:
@@ -219,3 +225,115 @@ The mediated read of the guard is guarded by `tests/test_l109_mediated_mode.py`
 make no raw SELECT — the VM session would only send `work.get`, never
 `work.move`. The module is declared in `tests/parts/pilote-psql.txt`
 (transactions, locks, concurrency: both drivers' behaviour).
+
+## Slice D: opt-in projection of a pinned lot onto its single issue (#2130)
+
+Slice D is **opt-in** and concerns only lots pinned to a Process revision
+(`workflow_ref` non-empty). Outside the opt-in — no admitted mapping for the
+project, or an unpinned lot — the L126 projection is unchanged, bit for bit.
+
+**Authoritative source.** For a pinned lot, the issue state, its board labels
+and the closing comment follow the pinned revision: `workflow_ref` +
+`workflow_stage` + `workflow_version`, read through the **admitted, compiled
+artifact**. `work_items.state` (the current core, or a hold) is never the
+projection source of a pinned lot. A hold (`blocked`, `waiting_human`) keeps the
+stage; since the row does not carry the pre-hold core (`_pre_hold_core`), the
+core comes from the artifact (`stage.core`).
+
+**Mapping (data only).** The opt-in is the `github.process` key of the host
+configuration:
+
+```json
+"process": {"<project>": {"ref": "canon@<sha>:<path>", "version": 3,
+                          "document": {"schema": "process-workflow/1", "...": "..."},
+                          "labels": {"<stage>": "<board label>"}}}
+```
+
+The document is compiled by `process_workflow.compile_workflow(document,
+ref=…, version=…)`; its `(ref, version)` are the ones lots must carry, and
+`labels` must cover exactly the artifact's stages. A project may admit a list of
+mappings (a transfer admits two revisions at once). Unknown keys, a missing
+`ref`/`version`, an empty mapping, a duplicate `(ref, version)` or an incomplete
+label map raise `SettingsError`, as does a project that is not declared in
+`github.projects`; the projection stops with the message, as it does today for
+an invalid `github` key. No executable expression and no import path ever come
+from the document; `compile_workflow` proves the document is well formed, not
+where it came from — the admitted `ref` and the label map are data the host
+configuration owns.
+
+**Issue state.** The artifact's `projection` classifies cores: `issue_open` →
+`open` (so `merged` — staging and preprod — stays **open**), `issue_completed` →
+`closed/completed`, `issue_not_planned` → `closed/not_planned`. Two native
+exceptions are read from the lot's own facts:
+
+* a core `closed` with `close_reason=delivered` (#988) is `completed`: a real
+  delivery outside the target, not an abandonment;
+* a pinned lot closed by the native path (`work close`: the row is `closed`
+  while the stage's core is not) keeps its stage and its board label, and the
+  **native reason decides** — `delivered` → `completed`, `abandoned`/
+  `superseded` → `not_planned`. An absent or unknown reason refuses
+  (`projection-classification`) instead of guessing.
+
+**Refusals (fail-closed, no legacy fallback).** A pinned lot is never projected
+through `lot_issue_state`. The lot is left untouched — no issue created, no
+field written, no closure comment — and reported once with a stable code:
+
+| code | cause |
+|---|---|
+| `projection-unmapped` | no admitted mapping for the lot's `(ref, version)` |
+| `projection-stage-missing` | pinned lot without `workflow_stage` |
+| `projection-stage-undeclared` | stage absent from the admitted artifact |
+| `projection-core-mismatch` | `work_items.state` (a core outside a hold) diverges from the artifact's core for the stage |
+| `projection-classification` | core classified nowhere, or native `closed` without a usable `close_reason` |
+| `projection-label-missing` | no admitted label for the stage |
+| `projection-ambiguous` | the configuration admits `(ref, version)` twice (load time) |
+
+A refusal writes nothing at all: not even the native `issue_ref` adoption of an
+issue found by its marker (`_remember_ref` is skipped for a refused lot), and a
+`--dry-run` pass is read-only. It is distinct from a title refusal and from the
+`self.skip` cache: a corrected mapping, revision or stage is picked up on the
+next pass without touching the work item's title.
+
+**Managed labels.** The admitted mappings' labels join the managed label set of
+their project (the union of every admitted revision, so a transfer's old board
+label is replaced by the new one instead of lingering as a foreign label).
+`_own_labels`, `_fields`, the fingerprints, `_three_way`, `_restamp` and
+`_foreign_labels` use that set; every other label, and every human edit, stays
+untouched, and a lot outside the opt-in keeps the historical `ameesh`/
+`ameesh:*` fingerprints.
+
+**Issue already closed.** When the projection wants `closed` and the issue is
+already closed, a divergent `state_reason` (a legacy close for the wrong reason)
+is corrected without adding a comment: state and reason stay coherent.
+
+**Reused unchanged.** Adoption (`issue_ref`, `ameesh:work=` marker), one issue
+per lot, compare-and-set `_remember_ref` and duplicate detection, shared read
+quota, unknown-outcome reconciliation (the marker records what ameesh last
+wrote), the three-way merge that keeps human edits, and the content guard. No
+receipt `evidence` and no private payload enters the issue. `issue_feed` carries
+the three workflow columns (and its filter keeps a pinned `merged` lot in the
+flow), and `work.get` carries them too: `project_lots` uses it for older lots
+found by their marker, so a healthy pinned orphan is not misread as
+`projection-stage-missing`. Both reads use `to_jsonb`, with a pre-0452 database
+returning `''`/NULL/0 — no column probe.
+
+**Condition.** The consumer stops its own issue writer on the opted-in project
+(the sidecar is not a qualified writer, 6211681303): native is the single
+writer. This slice does not activate the writer.
+
+**Witnesses** (`tests/test_2130_d_projection.py`, both drivers): unpinned lot
+unchanged; `implementation`, `staging`, `preprod_passed` → open; `done` →
+closed/completed; `stopped` → closed/not_planned, `delivered` → completed;
+native close outside the stage: `delivered` → completed, `abandoned`/
+`superseded` → not_planned, absent/unknown reason → named refusal; `blocked`
+hold on `review` → open with the `review` label; pinned lot without mapping →
+named refusal, no write, and an issue the legacy rule would have closed stays
+intact; a refusal does not adopt (`issue_ref` stays empty, no GitHub write);
+undeclared stage / divergent core / missing label → named refusals; a pinned
+`merged` lot without an issue gets an open one, a pinned `done` lot without an
+issue gets none; an issue closed for the wrong reason by the legacy is
+corrected; human title/body/foreign labels kept, no private evidence in the
+body; convergence after a GitHub write error; two admitted revisions and a
+transfer replaces the old board label; the `Projector` passes the mapping;
+`work.get` and `issue_feed` carry the three fields, including pre-0452
+(''/NULL/0); ambiguous configuration → `SettingsError`.

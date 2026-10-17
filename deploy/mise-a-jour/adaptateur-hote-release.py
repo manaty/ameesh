@@ -396,7 +396,14 @@ class HostFactory:
                     card=self.card, system=self.system,
                     turn=pilot.HealthTurn(self.db, enrollment=self.turn_enrollment,
                         host=self.enrollment['host'], system=pilot.TurnRunner()))
-        except Exception:
+        except Exception as exc:
+            # Une absence de parseur libpq (pilote psql) est un refus NOMMÉ,
+            # fail-closed : la cible ne peut pas être vérifiée, l'hôte n'est
+            # pas admis, et le motif reste lisible au lieu d'« unavailable ».
+            refusal = getattr(module_value, 'LibpqParserUnavailable', None)
+            if isinstance(refusal, type) and isinstance(exc, refusal):
+                raise FactoryError('pinned host capability refused: %s: %s'
+                                   % (name, exc)) from None
             raise FactoryError('pinned host capability unavailable: ' + name) from None
         if not callable(getattr(value, 'perform', None)):
             raise FactoryError('pinned host capability incomplete: ' + name)

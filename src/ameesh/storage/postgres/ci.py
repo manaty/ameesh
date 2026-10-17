@@ -11,6 +11,7 @@ from .. import interface
 RUN_COLUMNS = """
     repo, run_id, head_sha, branch, event, base, work_item_id, status, superseded_by, url,
     workflow,
+    run_attempt,
     extract(epoch from first_seen_at)::float8 AS first_seen_ts,
     extract(epoch from concluded_at)::float8 AS concluded_ts,
     extract(epoch from created_at)::float8 AS created_ts,
@@ -19,8 +20,8 @@ RUN_COLUMNS = """
 """
 
 FAILURE_COLUMNS = """
-    repo, run_id, part, test, module, status, inherited, excerpt, replay, duration_s,
-    extract(epoch from failed_at)::float8 AS failed_ts, message_id
+    repo, run_id, run_attempt, part, test, module, status, inherited, excerpt, replay,
+    duration_s, extract(epoch from failed_at)::float8 AS failed_ts, message_id
 """
 
 
@@ -37,12 +38,12 @@ class CiResults(interface.CiResults):
         return rows[0] if rows else None
 
     def open_run(self, repo, run_id, *, head_sha, branch, event, base, work_item_id,
-                 url, workflow="", created_at=None) -> dict:
+                 url, workflow="", created_at=None, run_attempt=1) -> dict:
         rows = self.db.query(
             """
             INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id,
-                                 url, workflow, created_at)
-            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s::timestamptz)
+                                 url, workflow, created_at, run_attempt)
+            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s::timestamptz, %%s)
             ON CONFLICT (repo, run_id) DO UPDATE
                SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id),
                    workflow = coalesce(nullif(excluded.workflow, ''), ci_runs.workflow)
@@ -50,7 +51,7 @@ class CiResults(interface.CiResults):
             """ % RUN_COLUMNS,
             (repo, int(run_id), head_sha, branch, event or "", base or "main",
              int(work_item_id) if work_item_id is not None else None, url,
-             workflow or "", created_at or None))
+             workflow or "", created_at or None, int(run_attempt)))
         return rows[0]
 
     def mark_started(self, repo, run_ids) -> None:
@@ -60,10 +61,30 @@ class CiResults(interface.CiResults):
             "UPDATE ci_runs SET started_at = now() WHERE repo = %%s AND run_id IN (%s)"
             " AND started_at IS NULL" % _ints(run_ids), (repo,))
 
-    def queued(self) -> list[dict]:
-        return self.db.query(
-            "SELECT %s FROM ci_runs WHERE status = 'running' AND started_at IS NULL"
-            " ORDER BY coalesce(created_at, first_seen_at), run_id" % RUN_COLUMNS)
+    def reopen_run(self, repo, run_id, *, run_attempt) -> dict | None:
+        # #901 : GitHub dit l'exécution de nouveau `queued`/`in_progress` avec
+        # le même run_id : c'est une relance. La tête a pu bouger depuis (une
+        # relance d'exécution périmée ne doit pas ressusciter une ligne
+        # remplacée) : dans ce cas rien n'est rouvert. L'attempt doit avoir
+        # augmenté : une liste API en retard (#828) redit en cours une
+        # exécution conclue au même attempt sans relance, la rouvrir
+        # renverrait son verdict à chaque passe.
+        rows = self.db.query(
+            """
+            UPDATE ci_runs r
+               SET status = 'running', concluded_at = NULL, superseded_by = NULL,
+                   run_attempt = %%s, urgent_message_id = NULL, verdict_message_id = NULL
+             WHERE r.repo = %%s AND r.run_id = %%s
+               AND r.status <> 'superseded'
+               AND r.run_attempt < %%s
+               AND NOT EXISTS (
+                   SELECT 1 FROM ci_runs n
+                    WHERE n.repo = r.repo AND n.branch = r.branch
+                      AND n.run_id > r.run_id AND n.head_sha <> r.head_sha)
+            RETURNING %s
+            """ % RUN_COLUMNS,
+            (int(run_attempt), repo, int(run_id), int(run_attempt)))
+        return rows[0] if rows else None
 
     def running(self, repo) -> list[dict]:
         return self.db.query(
@@ -109,49 +130,77 @@ class CiResults(interface.CiResults):
                         % column, (int(message_id), repo, int(run_id)))
 
     def failures(self, repo, run_id) -> list[dict]:
+        # l'attempt courant seulement : un échec de l'attempt précédent qui
+        # n'a pas été re-vu à la relance n'est plus imputé à l'exécution (#901)
         return self.db.query(
-            "SELECT %s FROM ci_test_failures WHERE repo = %%s AND run_id = %%s"
+            "SELECT %s FROM ci_test_failures"
+            " WHERE repo = %%s AND run_id = %%s"
+            "   AND run_attempt = (SELECT run_attempt FROM ci_runs"
+            "                       WHERE repo = %%s AND run_id = %%s)"
             " ORDER BY failed_at NULLS LAST, part, test" % FAILURE_COLUMNS,
-            (repo, int(run_id)))
+            (repo, int(run_id), repo, int(run_id)))
 
-    def add_failure(self, repo, run_id, *, part, test, module, status, inherited,
+    def add_failure(self, repo, run_id, *, run_attempt, part, test, module, status, inherited,
                     excerpt, replay, duration_s, failed_at) -> bool:
+        # `run_attempt < excluded` : un événement d'un attempt antérieur (le
+        # check run de l'attempt précédent, pas encore republié par la relance)
+        # ne réécrit jamais une ligne de l'attempt courant — le témoin ne
+        # recule pas (#901).
         rows = self.db.query(
             """
             INSERT INTO ci_test_failures
-                (repo, run_id, part, test, module, status, inherited, excerpt, replay,
-                 duration_s, failed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)
-            ON CONFLICT (repo, run_id, part, test) DO NOTHING
+                (repo, run_id, run_attempt, part, test, module, status, inherited, excerpt,
+                 replay, duration_s, failed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)
+            ON CONFLICT (repo, run_id, part, test) DO UPDATE
+               SET run_attempt = excluded.run_attempt, module = excluded.module,
+                   status = excluded.status, inherited = excluded.inherited,
+                   excerpt = excluded.excerpt, replay = excluded.replay,
+                   duration_s = excluded.duration_s, failed_at = excluded.failed_at,
+                   message_id = NULL, recorded_at = now()
+             WHERE ci_test_failures.run_attempt < excluded.run_attempt
             RETURNING test
             """,
-            (repo, int(run_id), part or "", test, module or "", status or "echec",
-             bool(inherited), excerpt or "", replay or "", duration_s, failed_at or None))
+            (repo, int(run_id), int(run_attempt), part or "", test, module or "",
+             status or "echec", bool(inherited), excerpt or "", replay or "", duration_s,
+             failed_at or None))
         return bool(rows)
 
-    def set_failure_message(self, repo, run_id, tests, message_id) -> None:
+    def set_failure_message(self, repo, run_id, run_attempt, tests, message_id) -> None:
         if not tests:
             return
         for part, test in tests:
             self.db.execute(
                 "UPDATE ci_test_failures SET message_id = %s"
-                " WHERE repo = %s AND run_id = %s AND part = %s AND test = %s",
-                (int(message_id), repo, int(run_id), part, test))
+                " WHERE repo = %s AND run_id = %s AND run_attempt = %s AND part = %s"
+                " AND test = %s",
+                (int(message_id), repo, int(run_id), int(run_attempt), part, test))
 
     def base_failures(self, repo, branch, *, workflow="") -> dict:
         # strictement la même suite : les lignes antérieures à la migration
         # 0433, toutes de `tests.yml`, y sont nommées (#1110, R1 P2-2)
+        # #1683 : la référence est la tête la plus récemment poussée, pas
+        # l'exécution conclue le plus récemment — une exécution lente d'une
+        # tête plus ancienne ne redevient pas la base. Pour chaque tête, sa
+        # première observation, annulations comprises (un réessai ne la
+        # rajeunit pas), mais le résultat de sa dernière exécution conclue.
         rows = self.db.query(
             """
-            WITH last AS (
-                SELECT run_id, head_sha FROM ci_runs
-                 WHERE repo = %s AND branch = %s AND status IN ('success', 'failure')
-                   AND workflow = %s
-                 ORDER BY concluded_at DESC, run_id DESC LIMIT 1
+            WITH runs AS (
+                SELECT run_id, head_sha, run_attempt, status, concluded_at,
+                       min(coalesce(created_at, first_seen_at))
+                           OVER (PARTITION BY head_sha) AS seen_at
+                  FROM ci_runs
+                 WHERE repo = %s AND branch = %s AND workflow = %s
+            ), last AS (
+                SELECT run_id, head_sha, run_attempt FROM runs
+                 WHERE status IN ('success', 'failure')
+                 ORDER BY seen_at DESC, concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f
                 ON f.repo = %s AND f.run_id = last.run_id
+               AND f.run_attempt = last.run_attempt
             """, (repo, branch, workflow or "", repo))
         if not rows:
             return {}
@@ -313,30 +362,11 @@ class CiResults(interface.CiResults):
             (float(now), int(calls), int(runs), int(covered), bool(complete),
              reason, repo))
 
-    def guard_runs(self, repo) -> dict:
-        """Le cache des relevés par exécution : `{(run_id, attempt): {...}}`."""
-        rows = self.db.query(
-            """
-            SELECT run_id, attempt, status, queued, oldest_id, oldest_at, runners
-              FROM ci_guard_run
-             WHERE repo = %s
-            """, (repo,))
-        out: dict = {}
-        for row in rows:
-            runners = row.get("runners")
-            if isinstance(runners, str):
-                try:
-                    runners = json.loads(runners or "{}")
-                except ValueError:
-                    runners = {}
-            out[(int(row["run_id"]), int(row["attempt"]))] = dict(
-                row, runners=dict(runners or {}))
-        return out
-
     def observe_guard_run(self, repo, *, run_id, attempt, status, queued,
                           oldest_id, oldest_at, runners) -> None:
-        """Écrit le relevé d'une exécution : seules les exécutions restées
-        `queued` (aucun job commencé) sont réutilisées sans nouvel appel."""
+        """Écrit le relevé d'une exécution (#845) : trace de la fenêtre en
+        cours, sans relecture — depuis le retrait du lecteur (B1), chaque
+        relevé relit toutes les exécutions au lieu de réutiliser ce cache."""
         self.db.execute(
             """
             INSERT INTO ci_guard_run AS r

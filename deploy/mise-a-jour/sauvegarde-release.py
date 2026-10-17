@@ -107,6 +107,16 @@ class RecoveryError(ValueError):
     pass
 
 
+class LibpqParserUnavailable(RecoveryError):
+    """Le parseur de DSN libpq (`psycopg.conninfo`) est absent.
+
+    Refus nommé et fail-closed : sans lui la cible effective de la sauvegarde
+    ne peut pas être recoupée avec la base de la release. Aucune cible non
+    vérifiée n'est acceptée, et le pilote `psql` (qui n'installe pas psycopg)
+    n'est pas une raison d'accepter : il refuse nommément.
+    """
+
+
 def configuration(document):
     """Exact administrator enrollment; credential values are never inlined."""
     if not isinstance(document, dict) or set(document) != CONFIG_FIELDS:
@@ -193,6 +203,34 @@ def protected_document(path, *, limit=65536):
         return None
 
 
+def database_target(dsn):
+    """Parse the effective libpq target, allowing distinct backup credentials.
+
+    Use libpq's precedence for query parameters and repeated keywords. Service
+    references are refused because their external routing is not pinned here.
+    Without the libpq parser the target cannot be verified: a named refusal
+    (`LibpqParserUnavailable`), never an accepted value.
+    """
+    if not isinstance(dsn, str) or not dsn or '\x00' in dsn:
+        return None
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+    except ImportError:
+        raise LibpqParserUnavailable(
+            'libpq parser unavailable: psycopg is required to verify the target') from None
+    try:
+        parameters = conninfo_to_dict(dsn)
+    except Exception:
+        return None
+    name = parameters.get('dbname')
+    if (not name or name.startswith(('postgresql://', 'postgres://'))
+            or parameters.get('service') or os.environ.get('PGSERVICE')):
+        return None
+    return (parameters.get('host', os.environ.get('PGHOST', '')),
+            parameters.get('hostaddr', os.environ.get('PGHOSTADDR', '')),
+            parameters.get('port', os.environ.get('PGPORT', '5432')), name)
+
+
 class RecoverySet:
     """One host's verified pre-migration recovery sets, registered by operation."""
 
@@ -204,6 +242,18 @@ class RecoverySet:
         self.root = private_directory(root, 'recovery state')
         self.retention = private_directory(retention, 'recovery retention')
         self.config = configuration(config)
+        # The backup is the pre-migration image of the very database the
+        # `migrate` action opens, and its inventory names the very schema the
+        # migrations write: an enrollment that points elsewhere would pin a
+        # recovery set of another database (or of another schema) as this
+        # release's only rollback evidence.
+        schema = getattr(getattr(db, 'cfg', None), 'schema', None)
+        if not isinstance(schema, str) or not schema or '\x00' in schema:
+            raise RecoveryError('release schema unavailable')
+        source = database_target(getattr(getattr(db, 'cfg', None), 'dsn', None))
+        if source is None or source != database_target(self.config['dsn']):
+            raise RecoveryError('backup source does not match the release database')
+        self.schema = schema
         self.clock = clock
 
     # -- controller contract ------------------------------------------------
@@ -305,7 +355,7 @@ class RecoverySet:
             return False
         with self._config_file(self.config['dsn']) as config:
             try:
-                backup.snapshot_dump(config, archive, inventory_path)
+                backup.snapshot_dump(config, archive, inventory_path, schema=self.schema)
             except backup.BackupError:
                 return False
         expected = self._read_inventory(inventory_path)

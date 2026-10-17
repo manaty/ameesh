@@ -8,8 +8,11 @@ references; subprocess arguments contain a password-free conninfo and private
 passfile/configuration paths.
 
 `dump --config CONFIG --output ARCHIVE` finalizes a non-empty archive only
-after `pg_restore --list` succeeds. Directories are `0700`, archives and
-short-lived credential files are `0600`. Existing artifacts are retained;
+after `pg_restore --list` succeeds. The parent directory is created `0700`, and
+a directory this process already owns is tightened to `0700`; a shared
+directory (another owner, world-writable or sticky, such as `/tmp`) is refused
+as it is, never narrowed under its other users. Archives and short-lived
+credential files are `0600`. Existing artifacts are retained;
 publication refuses replacement. Catalogue readability alone does not establish
 restorability.
 
@@ -28,12 +31,25 @@ The inventory is published only after the archive succeeds and contains no
 connection credentials. Source configurations that store their mesh in another
 schema must name that schema explicitly.
 
+`source_bytes` is mandatory and bounded (K2): the inventory's key set is exact,
+and a document that lacks it — an inventory written before the K2 bound — is
+refused by the controller instead of being restored on a declared or guessed
+size. There is no operator-supplied size and no fallback: a pair that cannot
+prove its uncompressed bound is recreated from the live source
+(`snapshot-dump`, a re-dump) before any copy, and the restore-capacity
+admission keeps its bound over that exact value. L232b is not deployed, so no
+inventory predating the bound exists in production.
+
 `verify-restore --config RESTORE_CONFIG --file ARCHIVE --expected INVENTORY`
 uses the separately approved restore identity. It verifies the archive digest,
 creates a new randomly named `ameesh_verify_*` database, restores with
 `--exit-on-error`, checks migration checksums and expected row counts, and
-removes that database. It never targets an existing database for restoration
-or deletion. Failed restore, comparison or cleanup produces no verified proof.
+removes that database. A private marker names that database before it is
+created, so a verification killed before its cleanup is reaped by the next
+one: no cleartext copy survives without a name. It never targets an existing
+database for restoration or deletion; only the exact `ameesh_verify_*` names
+carried by its own private markers are dropped. Failed restore, comparison or
+cleanup produces no verified proof.
 The restore identity therefore needs permission to create its disposable
 database; runner credentials are not a substitute for that capability.
 
@@ -196,9 +212,13 @@ The backend performs no enrollment, bucket-versioning change or privilege grant.
 
 Credentials use short-lived `0600` curl configuration files under private owned
 on-disk staging. Explicit capacity and object-size budgets, bounded deadlines
-and curl 8.4+ are required; its
+and curl 7.75+ (the `--aws-sigv4` floor; Debian 12 ships 7.88) are required. The
 [maximum-size option](https://curl.se/docs/manpage.html#--max-filesize)
-can then stop a transfer with initially unknown length. The controller must
+stops a transfer whose length is known in advance; for a response of unknown
+length the curl child carries its own kernel `RLIMIT_FSIZE`, so no response can
+be written past a bounded size whatever the provider sends (curl only enforces
+`--max-filesize` on unknown lengths from 8.4, which the enrolled hosts do not
+ship). The controller must
 reserve concurrent staging capacity; the backend's free-space check is not that
 reservation. Errors contain categories, never raw provider diagnostics.
 Only a provider object/version-not-found response proves absence; missing bucket,

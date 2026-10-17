@@ -139,6 +139,15 @@ class _Witness(PgTestCase):
                                 require_responsible=False))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # #1286 : la preuve git de la fusion déclarée (dépôt du lot, ascendance
+        # dans la cible, message citant le lot) a son propre témoin
+        # (`test_1286_declared_merge_proof`) ; ces classes portent sur
+        # l'ouverture de la relecture après fusion, pas sur git — la preuve est
+        # neutralisée comme dans `test_l317` et `test_l56`.
+        proof = mock.patch.object(work, "_declared_merge_commit",
+                                  side_effect=lambda item, sha, **kw: sha)
+        proof.start()
+        self.addCleanup(proof.stop)
         self.repo = os.path.join(self.tmp, "depot")
         os.makedirs(self.repo)
         _git(self.repo, "init", "-q", "-b", "main")

@@ -3,7 +3,10 @@
 ouvre l'éditeur — git prend cette ligne pour un commentaire et la retire, le
 corps devient le sujet. `scripts/rebase-lot.sh` passe core.commentChar=';' à
 chaque invocation de git rebase (--continue compris) et contrôle les sujets
-après coup. Banc hors ligne : dépôts git jetables, aucun réseau, aucune base."""
+après coup. #1669 : le même lanceur contrôle l'historique rejoué — chaque
+commit d'une branche `lot/<id>…` garde un sujet « #<id> … » (bisect rattachable
+au lot) et aucun commit rejoué n'introduit de marqueur de conflit. Banc hors
+ligne : dépôts git jetables, aucun réseau, aucune base."""
 from __future__ import annotations
 
 import os
@@ -94,6 +97,105 @@ class RebaseSujetTest(unittest.TestCase):
         proc = self._lancer("bash", LANCEUR, "--skip")
         self.assertEqual(proc.returncode, 4, proc.stderr)
         self.assertIn("#900 sujet du lot", proc.stderr)
+
+
+class HistoriqueBrancheTest(unittest.TestCase):
+    """#1669 : après un rebasage réussi, le lanceur contrôle la plage rejouée —
+    préfixe « #<lot> » sur chaque commit d'une branche `lot/<id>…`, et aucun
+    marqueur de conflit committé (un bisect reste exploitable)."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="ameesh-1669-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.depot = os.path.join(self.base, "depot")
+        os.makedirs(self.depot)
+        _git(self.depot, "init", "-q", "-b", "main")
+        _git(self.depot, "config", "user.name", "t")
+        _git(self.depot, "config", "user.email", "t@t")
+        self._commit("base.txt", "base\n", "base")
+
+    def _ecrire(self, nom: str, contenu: str) -> None:
+        with open(os.path.join(self.depot, nom), "w") as fh:
+            fh.write(contenu)
+
+    def _commit(self, nom: str, contenu: str, sujet: str) -> None:
+        self._ecrire(nom, contenu)
+        _git(self.depot, "add", nom)
+        _git(self.depot, "commit", "-qm", sujet)
+
+    def _avance_main(self) -> None:
+        _git(self.depot, "checkout", "-q", "main")
+        self._commit("main.txt", "main\n", "main avance")
+
+    def _lancer(self, *commande: str) -> subprocess.CompletedProcess:
+        env = dict(GIT_ENV, GIT_EDITOR="true")
+        return subprocess.run(list(commande), cwd=self.depot, capture_output=True,
+                              text=True, env=env)
+
+    def test_sujet_sans_prefixe_du_lot_signale(self) -> None:
+        """Un commit rejoué de `lot/<id>…` sans sujet « #<id> … » : sortie 4."""
+        _git(self.depot, "checkout", "-qb", "lot/1476-essai")
+        self._commit("lot.txt", "lot\n", "sujet sans prefixe")
+        self._avance_main()
+        _git(self.depot, "checkout", "-q", "lot/1476-essai")
+        proc = self._lancer("bash", LANCEUR, "main")
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        self.assertIn("sans le préfixe « #1476 »", proc.stderr)
+        self.assertIn("sujet sans prefixe", proc.stderr)
+
+    def test_prefixe_du_lot_conserve_passe(self) -> None:
+        """Le même rebasage avec un sujet « #1476 … » : aucun constat."""
+        _git(self.depot, "checkout", "-qb", "lot/1476-essai")
+        self._commit("lot.txt", "lot\n", "#1476 : sujet du lot")
+        self._avance_main()
+        _git(self.depot, "checkout", "-q", "lot/1476-essai")
+        proc = self._lancer("bash", LANCEUR, "main")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("rebase-lot :", proc.stderr)
+
+    def test_marqueur_de_conflit_au_commit_intermediaire_signale(self) -> None:
+        """Un marqueur committé dans un commit rejoué (pas le dernier) : 4."""
+        _git(self.depot, "checkout", "-qb", "lot/1476-essai")
+        self._commit("lot.txt", "a\n<<<<<<< HEAD\nb\n>>>>>>> autre\n",
+                     "#1476 : resolution ratee")
+        self._commit("suite.txt", "suite\n", "#1476 : suite du lot")
+        self._avance_main()
+        _git(self.depot, "checkout", "-q", "lot/1476-essai")
+        proc = self._lancer("bash", LANCEUR, "main")
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        self.assertIn("marqueurs de conflit committés", proc.stderr)
+        self.assertIn("resolution ratee", _git(self.depot, "log", "--format=%s",
+                                               "-1", "HEAD~1").stdout)
+
+    def test_onto_change_la_borne_de_la_plage(self) -> None:
+        """`--onto main base` : la plage part de la destination (main), pas de
+        l'ancien upstream — le commit « main avance » n'est pas contrôlé."""
+        base = _git(self.depot, "rev-parse", "HEAD").stdout.strip()
+        _git(self.depot, "checkout", "-q", "main")
+        self._commit("main.txt", "main\n", "main avance")
+        _git(self.depot, "checkout", "-q", "-b", "lot/1476-essai", base)
+        self._commit("lot.txt", "lot\n", "#1476 : sujet du lot")
+        proc = self._lancer("bash", LANCEUR, "--onto", "main", base, "lot/1476-essai")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_root_onto_exclut_la_destination(self) -> None:
+        """--root rejoue tous les commits du lot, sans contrôler ceux de --onto."""
+        _git(self.depot, "checkout", "--orphan", "lot/1476-essai")
+        _git(self.depot, "rm", "-rf", ".")
+        self._commit("lot.txt", "lot\n", "#1476 : racine du lot")
+        proc = self._lancer("bash", LANCEUR, "--root", "--onto", "main")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("rebase-lot :", proc.stderr)
+
+    def test_base_et_branche_hors_lot_non_controlees(self) -> None:
+        """Un marqueur committé sur la base, et une branche qui n'est pas
+        `lot/<id>…` : la plage rejouée seule est contrôlée (aucun faux positif)."""
+        _git(self.depot, "checkout", "-q", "main")
+        self._commit("main.txt", "<<<<<<< HEAD\n", "main avance")
+        _git(self.depot, "checkout", "-qb", "agent/truc")
+        self._commit("a.txt", "a\n", "sujet libre sans prefixe")
+        proc = self._lancer("bash", LANCEUR, "main")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

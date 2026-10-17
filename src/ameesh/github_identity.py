@@ -189,7 +189,6 @@ def sanitize_argv(argv):
                 # groupe de booléens pour gh, dont le dernier peut prendre
                 # l'argument suivant) : booléen ou non, on ne sait pas, plus
                 # rien n'est consigné
-                # booléen ou non, on ne sait pas : plus rien n'est consigné
                 out.append("[option]")
                 out.extend("[valeur]" for _ in argv[i + 1:])
                 break

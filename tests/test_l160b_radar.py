@@ -150,6 +150,60 @@ class ScanTest(unittest.TestCase):
         self.assertIn(5, against)
         self.assertEqual(report["migrations"], [])     # sonde non déclarée
 
+    def test_pair_uses_target_attributes_when_only_one_tip_has_them(self):
+        # #1610 : un lot antérieur aux attributs et un lot plus récent se
+        # composent selon la cible, quel que soit leur ordre d'énumération.
+        repo = os.path.join(self.tmp, "transition")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "liste.txt", "a\nc\ne\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "base")
+        _git(repo, "checkout", "-qb", "lot/1-a")
+        _write(repo, "liste.txt", "a\nb\nc\ne\n")
+        _git(repo, "commit", "-qam", "ancien lot")
+        _git(repo, "checkout", "-q", "main")
+        _write(repo, ".gitattributes", "liste.txt merge=union\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "attributs cible")
+        _git(repo, "checkout", "-qb", "lot/2-b")
+        _write(repo, "liste.txt", "a\nbb\nc\ne\n")
+        _git(repo, "commit", "-qam", "nouveau lot")
+        _git(repo, "checkout", "-q", "--detach", "main~1")
+        before = _git(repo, "count-objects", "-v")
+        for lots in (LOTS[:2], list(reversed(LOTS[:2]))):
+            with self.subTest(order=[lot["id"] for lot in lots]):
+                report = radar.scan(repo, lots, default_target="main")
+                self.assertEqual([p["state"] for p in report["pairs"]], ["overlap"])
+                self.assertTrue(all(p["state"] == "clean"
+                                    for p in report["against_target"]))
+        self.assertEqual(_git(repo, "count-objects", "-v"), before)
+
+    def test_pair_cache_tracks_target_attributes_without_moving_tips(self):
+        repo = os.path.join(self.tmp, "attributes-cache")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "liste.txt", "a\nc\ne\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "base")
+        for name, entry in (("lot/1-a", "b"), ("lot/2-b", "bb")):
+            _git(repo, "checkout", "-qb", name, "main")
+            _write(repo, "liste.txt", "a\n%s\nc\ne\n" % entry)
+            _git(repo, "commit", "-qam", name)
+        _git(repo, "checkout", "-q", "main")
+        cache = radar.Cache()
+        first = radar.scan(repo, LOTS[:2], default_target="main", cache=cache)
+        self.assertEqual(first["pairs"][0]["state"], "conflict")
+        _write(repo, ".gitattributes", "liste.txt merge=union\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "attributs cible")
+        second = radar.scan(repo, LOTS[:2], default_target="main", cache=cache)
+        self.assertEqual(second["pairs"][0]["state"], "overlap")
+        self.assertEqual(first["pairs"][0]["tips"], second["pairs"][0]["tips"])
+        _git(repo, "revert", "--no-edit", "HEAD")
+        third = radar.scan(repo, LOTS[:2], default_target="main", cache=cache)
+        self.assertEqual(third["pairs"][0]["state"], "conflict")
+
     def test_cache_skips_unchanged_pairs(self):
         cache = radar.Cache()
         radar.scan(self.repo, LOTS, cache=cache)

@@ -132,7 +132,13 @@ La suite dépend de la cause (#1402) :
   l'exécuteur sans opérateur ; aucun lancement n'a lieu tant qu'elle reste
   périmée. Une porte observée fraîche après l'échéance, même `stopped`,
   ne rouvre pas la fenêtre. Passé le délai, il sort 0 et seul l'opérateur le redémarre :
-  une garde durablement absente reste visible, unité inactive.
+  une garde durablement absente reste visible, unité inactive. Le délai
+  se mesure à l'horloge monotone : un saut de l'heure murale ne l'allonge
+  ni ne le raccourcit (#1971). Pendant la fenêtre, l'unité est active sans
+  conteneur ; le journal le dit à l'entrée (`guard gate stale, executor
+  stopped; resuming if the guard renews within 600s`), au retour de la
+  porte (`guard gate fresh again`) et à l'échéance (`guard gate still
+  stale after 600s, exiting`) (#1972).
 - signal : le superviseur sort 0, et seul l'opérateur le redémarre. Avant
   son premier lancement, une porte périmée le fait seulement attendre : au
   démarrage de la VM, le garde n'a pas encore forcément renouvelé un

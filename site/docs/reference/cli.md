@@ -111,6 +111,9 @@ gets an `event`, without being woken) and a `send all` announcement without
 agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
              [--dry-run] [--max-turns N] [--lease-ttl S] [--poll S]
              [--idle-nudge S] [--migrate]
+             [--take-idle S] [--take-max-per-hour N]
+             [--take-lot-idle S] [--take-lot-max-per-hour N] [--take-interval S]
+             [--balance-hours H] [--balance-min USD] [--balance-window S]
 agent-runner register <name> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXT]
              [--session ID] [--chantier C] [--model M] [--budget USD]
 agent-runner stop <name>
@@ -129,6 +132,20 @@ agent-runner stop <name>
 | `--poll` | fallback poll interval in seconds (default 5) |
 | `--idle-nudge` | nudge after N seconds of inactivity (default 1200) |
 | `--migrate` | apply migrations before starting |
+| `--take-idle` | take a backlog item for an idle agent after S seconds (default 1800; 0 turns it off) |
+| `--take-max-per-hour` | backlog takes per rolling hour, for the whole mesh (default 2) |
+| `--take-lot-idle` | take the best unassigned lot of an idle agent's team after S seconds (default 900; 0 turns it off) |
+| `--take-lot-max-per-hour` | team lots taken per rolling hour, for the whole mesh (default 6) |
+| `--take-interval` | seconds between two takes by this runner (default 60; 0 turns the runner's take off) |
+| `--balance-hours`, `--balance-min`, `--balance-window` | thresholds of the `balance_low` alert (runway in hours, USD floor, averaging window), the same as `ameesh alerts`; a pay-per-token agent never takes under that alert |
+
+Since #804 the runner triggers the take itself, for the agents it serves, on
+the host where they run: the same `backlog.auto_take` and the same safeguards
+as `ameesh notify` (idle, budget, hosts on hold, `balance_low`, hourly caps
+counted in the database), with the same `AMEESH_TAKE_*` settings. The remaining
+place is re-read before each take, so simultaneous passes no longer consume
+the same place. Distribution no longer depends on a central notifier;
+`ameesh notify` keeps its own take where it runs.
 
 `register` registers an agent in the registry; `stop` marks it stopped (no new
 lease; the current turn finishes).
