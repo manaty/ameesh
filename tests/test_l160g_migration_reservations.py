@@ -94,13 +94,15 @@ class ReservationImportTest(PgTestCase):
 
     def test_collision_and_existing_lot_reservation_not_overwritten(self):
         other = self.lot("Other", 3)
-        storage.of(self.db).work.reserve_migration(other, self.slug, 324, 0,
-                                                  actor="orch", note="reserved %(number)s")
+        storage.of(self.db).work.reserve_migration(
+            other, self.slug, 324, 0, actor="orch", note="reserved %(number)s",
+            issue_ref=work.get(self.db, other)["issue_ref"])
         with self.assertRaisesRegex(work.WorkError, "already held"):
             self.run_import(apply=True)
         self.assertIsNone(work.get(self.db, self.a)["migration"])
-        storage.of(self.db).work.reserve_migration(self.a, self.slug, 327, 0,
-                                                  actor="orch", note="reserved %(number)s")
+        storage.of(self.db).work.reserve_migration(
+            self.a, self.slug, 327, 0, actor="orch", note="reserved %(number)s",
+            issue_ref=work.get(self.db, self.a)["issue_ref"])
         with self.assertRaisesRegex(work.WorkError, "different reservation"):
             self.run_import(apply=True)
         self.assertEqual(work.get(self.db, self.a)["migration"], 327)
@@ -116,7 +118,8 @@ class ReservationImportTest(PgTestCase):
             if item_id == self.b and not raced:
                 raced.append(True)
                 original(WorkItems(conn), other, self.slug, 324, 0,
-                         actor="other", note="concurrent %(number)s")
+                         actor="other", note="concurrent %(number)s",
+                         issue_ref="%s#3" % self.slug)
             return original(registry, item_id, *args, **kwargs)
 
         with mock.patch.object(WorkItems, "reserve_migration", new=race):
@@ -126,6 +129,27 @@ class ReservationImportTest(PgTestCase):
         self.assertIsNone(work.get(self.db, self.a)["migration"])
         self.assertIsNone(work.get(self.db, self.b)["migration"])
         self.assertEqual(work.get(self.db, other)["migration"], 324)
+
+    def test_probe_ignores_a_migration_already_landed_by_a_terminal_lot(self):
+        # #2146 : une branche qui porte les migrations d'une autre ligne (coupe
+        # release/* sur develop, cible main) les hérite ; un numéro déjà atterri
+        # (L1567) n'est pas une réservation manquante.
+        landed = self.lot("Landed", 9)
+        self.db.execute("UPDATE work_items SET state = 'merged', updated_at = now()"
+                        " WHERE id = %s", (landed,))
+        self.assertIsNotNone(storage.of(self.db).work.record_landed_migration(
+            landed, 500, self.slug, note="landed 500 (témoin)", actor="orch"))
+        branch = {"work_item": self.a, "target": "main", "added": [
+            "supabase/migrations/500_own_page.sql",
+            "supabase/migrations/510_unreserved.sql"]}
+        found = reservations.probe(self.db, self.project, [branch])
+        self.assertEqual([r["number"] for r in found], ["510"])
+        self.assertIsNone(found[0]["holder"])
+        # le même numéro n'est pas « atterri » dans un autre dépôt : il reste dû
+        other_project = radar.Project("other", "/r", migrations="supabase/migrations",
+                                      github="acme/other")
+        self.assertEqual([r["number"] for r in reservations.probe(
+            self.db, other_project, [branch])], ["500", "510"])
 
     def test_probe_checks_owner_and_repository_and_reports_new_files_only(self):
         self.run_import(apply=True)

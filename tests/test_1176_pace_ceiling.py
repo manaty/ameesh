@@ -452,6 +452,29 @@ class LimitsAndEvaluationTest(_Sandbox):
             self.profile, _reading([gauge], cost.Overage(False, True)), gauge, NOW).value,
             0.90)
 
+    def test_the_raise_hour_waits_for_the_pace_to_catch_up(self):
+        """#1506 : l'heure annoncée est la plus tardive du relèvement et du
+        rattrapage, pas le seul début du relèvement.
+
+        Fenêtre de 7 j écoulée à 60 %, 85 % utilisés, plafond 90 % relevé à
+        98 % dans les 48 dernières heures, réserve de 10 points : sous le
+        plafond de base le rythme ne rattrape jamais (85 % ≥ 90 % − 10 pts) ;
+        sous le plafond relevé il rattrape à 25,2 h de la remise à zéro. Le
+        début du relèvement (48 h avant la remise à zéro) annonçait une pause
+        de 19,2 h que l'usage ne tenait pas encore.
+        """
+        self._setup(pace_ceiling_end_hours=48)
+        gauge = _gauge(0.85, before_reset=0.4 * WEEK, key="codex-10080min",
+                       window=WEEK, harness="codex")
+        ev = accounts.evaluate(self._book(gauge), self.profile, self.items, NOW,
+                               reserve=True)
+        self.assertFalse(ev.ok)
+        ceiling = ev.ceilings["codex-10080min"]
+        self.assertAlmostEqual(ceiling.value, 0.90)
+        self.assertAlmostEqual(ceiling.from_ts, gauge.resets_at - 48 * HOUR)
+        self.assertAlmostEqual(ev.until, gauge.resets_at - 25.2 * HOUR)
+        self.assertLess(ev.until, gauge.resets_at)
+
 
 class ReportTest(_Sandbox):
     """`accounts list` montre le plafond effectif et sa raison (#1176)."""

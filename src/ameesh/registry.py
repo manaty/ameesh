@@ -124,8 +124,10 @@ def live_harness(row: dict | None) -> str:
     lequel la session tourne (L242b : harnais emprunté). Sans session ouverte
     — origine inconnue — le harnais déclaré reste le seul connu.
 
-    C'est ce que lit la porte §2 « autre famille de modèle » : la famille de
-    celui qui a réellement produit le travail, pas l'étiquette déclarée."""
+    C'est le harnais de la session courante. La porte §2 « autre famille de
+    modèle » ne l'utilise plus telle quelle : #1053/#1777 relit les tours du
+    gel (`review_lot._author_at_freeze`), qui seuls prouvent une famille
+    historique ; ce lecteur reste l'API du registre pour l'état courant."""
     row = row or {}
     return str(row.get("session_harness") or row.get("harness") or "")
 
@@ -139,6 +141,11 @@ def overview(db: Db) -> list[dict]:
     réclamation liée au canon est remplie).
     """
     return storage.of(db).agents.overview()
+
+
+def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> None:
+    """Preuve de vie du runner, indépendante du bail (#508)."""
+    storage.of(db).agents.runner_seen(host, owner, names)
 
 
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
@@ -165,6 +172,29 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
         name, owner, ttl_seconds, require_responsible=_responsible_required(db))
 
 
+def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+    """Bail vivant et détenu par ce runner, AVEC la ligne lue au passage.
+
+    #811 : le hook a besoin des projets de l'agent (mono/multi) pour son
+    budget de remise (L61) ; la lecture du bail les ramène déjà (`state` porte
+    `projects`, `team`, `chantier`), le troisième élément évite une seconde
+    lecture du registre. `None` quand le backend ne les porte pas.
+    """
+    row = storage.of(db).leases.state(name)
+    if row is None:
+        return False, "agent %s not in the registry" % name, None
+    if row.get("status") == "stopped":
+        return False, "agent stopped", row
+    if (row.get("lease_owner") or "") != owner:
+        return False, "lease held by %s" % (row.get("lease_owner") or "nobody"), row
+    if int(row.get("lease_epoch") or 0) != int(epoch):
+        return (False, "epoch %s in the registry, %s in the session"
+                % (row.get("lease_epoch"), epoch), row)
+    if not row.get("live"):
+        return False, "lease expired", row
+    return True, "", row
+
+
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
     """Le bail est-il vivant et détenu par ce runner à cet epoch ?
 
@@ -172,17 +202,18 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     une session dont le bail a expiré ou a changé de main ne peut plus
     consommer le courrier de l'agent.
     """
-    _name, ok, reason = lease_binding(db, name, owner, epoch)
+    _name, ok, reason, _row = lease_binding(db, name, owner, epoch)
     return ok, reason
 
 
-def lease_binding(db: Db, name: str, owner: str, epoch: int) -> tuple[str, bool, str]:
-    """Canonical name and current lease verdict in one database round trip."""
+def lease_binding(db: Db, name: str, owner: str,
+                  epoch: int) -> tuple[str, bool, str, dict | None]:
+    """Canonical name, current lease verdict and the row, in one round trip."""
     from .agent_names import resolve
     row = storage.of(db).leases.state(name)
     primary = resolve(name, db=db, row=row, operation="registry.lease_matches") if row else name
     ok, reason = _lease_matches_row(row, primary, owner, epoch)
-    return primary, ok, reason
+    return primary, ok, reason, row
 
 
 def _lease_matches_row(row, name, owner, epoch):
@@ -325,6 +356,22 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.clear_session")
     return storage.of(db).leases.clear_session(name, owner, epoch)
+
+
+def adopt_session_origin(db: Db, name: str, session_id: str, lot: str, owner: str,
+                         epoch: int, *, harness: str | None = None,
+                         cwd: str | None = None) -> bool:
+    """#1900 B1 : note l'origine d'une session sans origine, **fencé**.
+
+    Sous verrou de ligne et bail vivant (owner, epoch, échéance recontrôlée
+    après l'attente), et seulement si la ligne porte encore `session_id` et
+    `lot` : une session remplacée entre-temps (rotation, remplaçant, autre lot)
+    n'est jamais réécrite. N'écrit que l'origine, le dossier et le harnais.
+    Renvoie False si le bail n'est plus le nôtre, s'il a expiré pendant
+    l'attente du verrou, ou si la session/le lot ont changé.
+    """
+    return storage.of(db).leases.adopt_session_origin(
+        name, owner, epoch, session_id, lot, harness=harness, cwd=cwd)
 
 
 def record_session_history(db: Db, name: str, session_id: str,

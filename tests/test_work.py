@@ -119,7 +119,8 @@ class WorkTest(PgTestCase):
         def get_puis_attendre(db, item_id):
             row = vrai_get(db, item_id)
             lectures.append(item_id)
-            lus.wait(timeout=10)  # les deux appels tiennent le même état
+            if len(lectures) <= 2:
+                lus.wait(timeout=10)  # les deux lectures d'entrée tiennent le même état
             return row
 
         def bouger(index: int, db, state: str) -> None:
@@ -141,8 +142,12 @@ class WorkTest(PgTestCase):
                 self.assertFalse(any(thread.is_alive() for thread in threads))
                 # le témoin garde son sens : si `move` cesse de lire par
                 # `work.get`, la barrière ne sert plus et le test redevient
-                # une course d'ordonnancement — on le dit ici, pas en flaky
-                self.assertEqual(len(lectures), 2, "les deux move doivent lire par work.get")
+                # une course d'ordonnancement — on le dit ici, pas en flaky.
+                # 3 lectures : une par move, plus la relecture du perdant
+                # (#1922/N14), qui distingue l'adoption concurrente du lot
+                # (workflow_ref) du simple changement d'état avant de rendre
+                # son refus.
+                self.assertEqual(len(lectures), 3, "les deux move doivent lire par work.get")
         finally:
             db1.close()
             db2.close()

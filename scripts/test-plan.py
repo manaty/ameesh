@@ -4,7 +4,7 @@
 
     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
                               [--base SHA] [--ref REF]
-                              [--base-ref B] [--head-ref H]
+                              [--base-ref B] [--head-ref H] [--mode auto|lot|full]
                               [--github-output F] [--summary F] [--annotations]
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
@@ -39,6 +39,15 @@ P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
 driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
 matrix.
 
+**Lot CI requested at freeze (#1343).** `--mode lot` is the `ci-lot-<sha>`
+request of a frozen lot (canon §3: review first, one CI on the frozen head,
+posed as a `pull_request: labeled` label). It runs the same impacted +
+contract selection, with the same doubt-falls-back-to-full rule, and it never
+takes the version-only (L157) or documentation-only (L161a) lane, so a green
+required check on the frozen head always means tests ran. `--mode full` is the
+`ci-full-<sha>` request (release, package, explicit full): the whole suite,
+both drivers, and no lane that skips the tests either.
+
 **Release pull requests keep the full suite (canon §3).** A pull request
 whose source or target is `release/**` or the package integration branch
 (§12) is a release PR: like the `push` to those branches, it runs the full
@@ -61,8 +70,9 @@ version number never takes the lane: L157 is a pull-request rule.
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
-missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
+missing, unreadable, older than 48 h, not an ancestor of HEAD, or built on
+unreadable measure artefacts (`measure.artefacts_incomplets`, #1690/#1716):
+the order falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
 default) and the plan is marked unsure. A file the map cannot judge (Python
 outside `src/ameesh`, a non-documentation file no test reads, a syntax
 error) uses the textual heuristic for that file and marks the plan unsure;
@@ -359,6 +369,88 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _getattr_member(node: ast.Call) -> tuple[str, str] | None:
+    """`getattr(<name>, '<constant>', ...)` lu statiquement : le couple
+    (porteur, membre), ou `None` (forme dynamique, argument manquant). Le
+    défaut éventuel est sans effet ici : `sys.exit`/`os._exit` existent
+    toujours, donc l'appel termine quel que soit le défaut. Le porteur peut
+    être affecté par walrus (`getattr((s := sys), 'exit')`, #1906) : on
+    déballe `ast.NamedExpr` avant le test de nom."""
+    if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
+        return None
+    if len(node.args) < 2:
+        return None
+    owner, attr = node.args[0], node.args[1]
+    if isinstance(owner, ast.NamedExpr):
+        owner = owner.value
+    if (isinstance(owner, ast.Name) and isinstance(attr, ast.Constant)
+            and isinstance(attr.value, str)):
+        return owner.id, attr.value
+    return None
+
+
+def _is_exit_func(node: ast.expr, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether an expression designates a known import-time termination: a
+    bound name, `sys.exit`/`os._exit`, or their static `getattr` read (#1878)
+    (aliases of `sys`, `os` and of the imported names included). Le porteur
+    peut être affecté par walrus (`(s := sys).exit(1)`, #1906)."""
+    if isinstance(node, ast.NamedExpr):
+        # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
+        return _is_exit_func(node.value, exit_names, sys_names, os_names)
+    if isinstance(node, ast.Name):
+        return node.id in exit_names
+    if isinstance(node, ast.Attribute):
+        owner = node.value.value if isinstance(node.value, ast.NamedExpr) else node.value
+        if isinstance(owner, ast.Name):
+            if node.attr == "exit":
+                return owner.id in sys_names
+            if node.attr == "_exit":
+                return owner.id in os_names
+        return False
+    if isinstance(node, ast.Call):
+        read = _getattr_member(node)
+        if read is None:
+            return False
+        owner, attr = read
+        return ((attr == "exit" and owner in sys_names)
+                or (attr == "_exit" and owner in os_names))
+    return False
+
+
+def _is_exit_call(node: ast.Call, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether a call is a known import-time termination: the builtins
+    `exit()`/`quit()`, `sys.exit()`/`os._exit()` (aliases of `sys`, `os` and of
+    the imported names included)."""
+    return _is_exit_func(node.func, exit_names, sys_names, os_names)
+
+
+def _may_terminate(node: ast.AST, names: set[str], exit_names: set[str],
+                   sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether running this statement may end the import: a reachable `raise`,
+    a false `assert`, or an exit call (#1627).
+
+    Deliberately conservative — a `raise` caught by an enclosing `try` still
+    counts (a proof lost, never a false proof) — and the body of an
+    `if TYPE_CHECKING:` / `if False:` is dead, as in `_never_runs`. A function
+    or lambda body runs later, not at import, so it terminates nothing here."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Raise):
+        return True
+    if isinstance(node, ast.Assert):
+        return _never_runs(node.test, names)
+    if isinstance(node, ast.Call) and _is_exit_call(node, exit_names, sys_names, os_names):
+        return True
+    if isinstance(node, ast.If) and _never_runs(node.test, names):
+        children: list[ast.AST] = list(node.orelse)  # seul le `else` s'exécute
+    else:
+        children = list(ast.iter_child_nodes(node))
+    return any(_may_terminate(child, names, exit_names, sys_names, os_names)
+               for child in children)
+
+
 class _RuntimeImports(ast.NodeVisitor):
     """The import statements that may run, and those the module certainly runs
     when it is imported.
@@ -373,7 +465,12 @@ class _RuntimeImports(ast.NodeVisitor):
     An unconditional module-level `raise` or `sys.exit` also leaves every
     later import without proof, while keeping its possible selection edge.
     A lazy or conditional import alone is a possible load, never a proof
-    (relecture Codex, B2 résiduel)."""
+    (relecture Codex, B2 résiduel). A reachable termination — a guarded
+    `raise`, an `except` that exits, `exit()`/`sys.exit()`/`os._exit()`, a
+    false `assert` — stops the proofs too: the imports after it may never run
+    (#1627). A name bound to such a callable by assignment or by a star import
+    (`e = sys.exit`, `from os import *` then `_exit()`) terminates as well, the
+    binding being followed conservatively (#1860)."""
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
@@ -382,10 +479,22 @@ class _RuntimeImports(ast.NodeVisitor):
         self._deferred = 0  # inside a function or lambda body: not run at import
         self._guarded = 0   # inside a condition, a loop or a try: may not run
         self._terminated = False  # module execution cannot reach later imports
+        # #1627 : une terminaison atteignable arrête les preuves du corps
+        # (module ou classe) : les imports suivants restent possibles seulement.
+        self._exit_names = {"exit", "quit"}  # builtins, `from sys import exit`
+        self._sys_names = {"sys"}            # `sys.exit`, alias compris
+        self._os_names = {"os"}              # `os._exit`, alias compris
 
     def _visit_function(self, node: ast.AST) -> None:
+        # Décorateurs, valeurs par défaut et annotations s'évaluent à la
+        # définition, donc à l'import : seul le corps est différé (#1474).
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for child in ast.iter_child_nodes(node):
+            if not any(child is statement for statement in body):
+                self.visit(child)
         self._deferred += 1
-        self.generic_visit(node)
+        for child in body:
+            self.visit(child)
         self._deferred -= 1
 
     visit_FunctionDef = _visit_function
@@ -413,11 +522,66 @@ class _RuntimeImports(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         self.generic_visit(node)
-        func = node.func
-        if (not self._deferred and not self._guarded
-                and isinstance(func, ast.Attribute) and func.attr == "exit"
-                and isinstance(func.value, ast.Name) and func.value.id == "sys"):
+        if not self._deferred and _is_exit_call(
+                node, self._exit_names, self._sys_names, self._os_names):
             self._terminated = True
+
+    def _target_names(self, target: ast.expr) -> list[str]:
+        """Les noms qu'une cible d'affectation lie vraiment : `e`, `e, f`,
+        `(e, *f)`. Un abonnement ou un attribut (`d[k]`, `obj.handler`) ne
+        rebaptise aucun nom et n'en lie aucun."""
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Starred):
+            return self._target_names(target.value)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [name for element in target.elts
+                    for name in self._target_names(element)]
+        return []
+
+    def _learn_exit_names(self, target: ast.expr, value: ast.expr | None) -> None:
+        """Un nom affecté d'une sortie connue en devient une (#1860) :
+        `e = sys.exit` puis `e()`. Un nom affecté d'un module `sys`/`os`
+        devient un de ses alias (#1878) : `s = sys` puis `s.exit()`. Les
+        ensembles ne rétrécissent jamais — une réaffectation peut être
+        conditionnelle (#1474) : une preuve perdue n'est jamais une fausse
+        preuve. Une cible multiple lisible est suivie élément par élément ;
+        toute autre forme est gardée entière dès que la valeur mentionne une
+        sortie ou un de ces modules (conservateur)."""
+        if value is None:
+            return
+        if (isinstance(target, (ast.Tuple, ast.List))
+                and isinstance(value, (ast.Tuple, ast.List))
+                and len(target.elts) == len(value.elts)):
+            for sub_target, sub_value in zip(target.elts, value.elts):
+                self._learn_exit_names(sub_target, sub_value)
+            return
+        names = self._target_names(target)
+        if not names:
+            return
+        mentioned = [node.id for node in ast.walk(value)
+                     if isinstance(node, ast.Name)]
+        if any(name in self._sys_names for name in mentioned):
+            self._sys_names.update(names)
+        if any(name in self._os_names for name in mentioned):
+            self._os_names.update(names)
+        if any(_is_exit_func(node, self._exit_names, self._sys_names,
+                             self._os_names)
+               for node in ast.walk(value)):
+            self._exit_names.update(names)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        for target in node.targets:
+            self._learn_exit_names(target, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
 
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
@@ -427,15 +591,54 @@ class _RuntimeImports(ast.NodeVisitor):
             return
         self._visit_guarded(node)
 
+    def _visit_body(self, body: list[ast.stmt]) -> None:
+        """The body of a module or a class runs at import, in order: a
+        reachable termination cuts the proofs that follow it (#1627)."""
+        for child in body:
+            self.visit(child)
+            if not self._deferred and not self._terminated and _may_terminate(
+                    child, self.names, self._exit_names, self._sys_names, self._os_names):
+                self._terminated = True
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._visit_body(node.body)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # Ces expressions s'évaluent avant le corps : une sortie y interdit
+        # aussi de certifier les imports du corps, pas seulement ceux d'après.
+        for expression in (*node.decorator_list, *node.bases,
+                           *(keyword.value for keyword in node.keywords)):
+            self.visit(expression)
+        self._visit_body(node.body)
+
     def _record(self, node: ast.stmt) -> None:
         self.imports.append(node)
         if not self._deferred and not self._guarded and not self._terminated:
             self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "sys":
+                self._sys_names.add(alias.asname or "sys")
+            elif alias.name == "os":
+                self._os_names.add(alias.asname or "os")
         self._record(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        if module == "sys":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "exit")
+        elif module == "os":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "_exit")
+        if any(alias.name == "*" for alias in node.names):
+            # #1860 : `from os import *` lie `_exit` au corps du module (les
+            # builtins `exit`/`quit` et `from sys import *` sont déjà couverts).
+            if module == "os":
+                self._exit_names.add("_exit")
+            elif module == "sys":
+                self._exit_names.add("exit")
         self._record(node)
 
 
@@ -602,6 +805,19 @@ def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
         return f"map older than {MAX_AGE_H} h ({age:.0f} h)", age
     if not card.get("commit") or not is_ancestor(card["commit"], head, repo):
         return f"map commit {str(card.get('commit'))[:12]} is not an ancestor of {head}", age
+    # #1716 : #1690 écarte un artefact de mesure illisible et le nomme dans
+    # `artefacts_incomplets`, mais la carte reste amputée des tests que cet
+    # artefact portait : un bloc peut ressortir couvert par le seul artefact
+    # lisible, et la sélection se réduire à l'insu du plan. La carte entière
+    # est suspecte — on ne sait pas quels blocs l'artefact perdu couvrait —
+    # donc ordre complet, comme pour toute carte inutilisable.
+    incomplets = (card.get("measure") or card.get("mesure") or {}).get(
+        "artefacts_incomplets") or []
+    if incomplets:
+        fichiers = ", ".join(str(i.get("fichier", "?")) for i in incomplets[:3]
+                             if isinstance(i, dict))
+        return (f"map with {len(incomplets)} unreadable measure artefact(s)"
+                + (f" ({fichiers})" if fichiers else "")), age
     return "", age
 
 
@@ -614,7 +830,7 @@ def is_foundation(path: str) -> bool:
 
 
 def read_list(path: pathlib.Path, known: list[str], required: bool = False) -> list[str]:
-    """`parts.read_list`, whose SystemExit (stale or unsorted entry) becomes a
+    """`parts.read_list`, whose SystemExit (stale entry) becomes a
     ValueError: `main` catches it and falls back to the full suite."""
     if not path.exists() and not required:
         return []
@@ -1174,19 +1390,23 @@ def release_pr(base_ref: str | None = None, head_ref: str | None = None) -> str:
     return ""
 
 
-def lot_selection(event: str, state: dict, modules: list[str],
+def lot_selection(lot: bool, state: dict, modules: list[str],
                   classes: dict[str, tuple[str, str]],
                   release: str = "") -> tuple[list[str] | None, str]:
-    """Modules a lot branch runs (L1211): impacted plus contract.
+    """Modules a lot CI runs (L1211, canon §3): impacted plus contract.
 
-    `None` means the full suite: an event other than a pull request, a
-    release pull request (`release`, `release_pr`), or any doubt the plan
-    cannot decide through — no usable map, a selection that is not safe
-    (stale map, unmeasured blocks no test is guaranteed to load, test
-    infrastructure, a removed file), an empty contract list. The reason goes
-    to the summary.
+    `lot` is true for a pull request whose source and target are lot branches
+    *and* for the CI dispatched at freeze (`--mode lot`, #1343): both run the
+    impacted modules and the contract, one part per driver.
+
+    `None` means the full suite: a branch that is not a lot (`main`,
+    `release/**`, the package integration branch), a release pull request
+    (`release`, `release_pr`), or any doubt the plan cannot decide through —
+    no usable map, a selection that is not safe (stale map, unmeasured blocks
+    no test is guaranteed to load, test infrastructure, a removed file), an
+    empty contract list. The reason goes to the summary.
     """
-    if event != "pull_request":
+    if not lot:
         return None, "main, release/** and the integration branch run the full suite"
     if release:
         return None, release
@@ -1412,17 +1632,48 @@ def doc_readers(classes: dict, card: dict,
 def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
               head: str = "HEAD", repo: pathlib.Path = REPO,
               base: str = "HEAD^1", ref: str = "",
-              base_ref: str | None = None, head_ref: str | None = None) -> dict:
+              base_ref: str | None = None, head_ref: str | None = None,
+              mode: str = "auto") -> dict:
+    """The plan of one run; `mode` says which CI this is (canon §3).
+
+    `auto` (default): inferred from the event, as before — a pull request
+    whose source and target are lot branches runs impacted + contract, a
+    release pull request and every `push` run the full suite. `lot`: the CI
+    requested at freeze (#1343, the `ci-lot-<sha>` label): impacted + contract,
+    never the version-only or documentation-only lane, so a green `tests` on
+    the frozen head always means the tests ran. `full`: the whole suite, for a
+    release or an explicit `--full` request (#1343, `ci-full-<sha>`), never a
+    lane that skips the tests either.
+    """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
     release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
+    if mode == "lot":
+        #: #1343 : une demande de lot sur `release/**` ou `integration/**` ne
+        #: prend jamais la sélection impactés+contrat — ces branches gardent la
+        #: suite complète, même si le déclencheur s'est trompé de cible (la
+        #: commande refuse déjà `ci-lot` sur ces refs ; le plan reste sûr).
+        release = release or release_pr(None, _branch(ref))
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
-            "tested": _rev(head, repo), "release": release,
+            "tested": _rev(head, repo), "release": release, "mode": mode,
             "refs": {"base": base_ref, "head": head_ref},
             **nature(event, base=base, head=head, repo=repo, ref=ref)}
+    if mode in ("lot", "full"):
+        #: canon §3 (#1343) : une demande de gel (ci-lot ou ci-full) ne prend
+        #: jamais une voie qui saute les tests — le contrat tourne au minimum,
+        #: donc un check `tests` vert sur la tête gelée a bien exécuté des
+        #: tests. Les voies version seule (L157) et documentation seule (L161a)
+        #: restent des voies de poussée ; ici elles sont éteintes, y compris
+        #: dans le doute.
+        plan["version_only"] = plan["docs_only"] = False
+        #: `nature` répond « not a pull request » sur un ancien dispatch : la
+        #: raison de la demande est le gel, pas l'événement ; une cible
+        #: release/** la remplacera plus bas.
+        plan["why"] = ("lot CI at freeze: impacted + contract" if mode == "lot"
+                       else "full CI request: whole suite")
     plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
                          docs_only=bool(plan["docs_only"] and not release)))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
@@ -1455,25 +1706,27 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         plan["why"] = release
     skip = plan["version_only"] or plan["docs_only"]
     pr = event == "pull_request"
-    #: L1211 : la sélection impactés+contrat est réservée aux PR de lot ; une
-    #: PR de release garde la suite complète, y compris dans le repli.
-    lot_pr = pr and not release
+    #: L1211/canon §3 : la sélection impactés+contrat est celle d'un lot — une
+    #: PR de lot (mode `auto`) ou la CI dispatchée au gel (mode `lot`, #1343) ;
+    #: une PR de release et une CI `full` gardent la suite complète, y compris
+    #: dans le repli.
+    lot = (mode == "lot" or (mode == "auto" and pr)) and not release
     #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
     #: tout doute rend la suite complète (lot_selection). La sélection se
     #: contente d'une part par pilote tant que l'estimation le permet.
     selection, why = ((None, "") if skip
-                      else lot_selection(event, plan, modules, classes, release))
+                      else lot_selection(lot, plan, modules, classes, release))
     chosen_set = None if selection is None else set(selection)
     contract = [m for m in plan.get("contract", []) if m in modules]
     plan["parts"] = {}
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
-        if driver == "psql" and lot_pr:
+        if driver == "psql" and lot:
             selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
                                        always)
         if chosen_set is not None:
             selected = [m for m in selected if m in chosen_set]
-        n = n_pr if lot_pr else n_other
+        n = n_pr if lot else n_other
         if chosen_set is not None:
             n = min(n, lot_part_count(driver, selected, card))
         plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
@@ -1483,7 +1736,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     ran = sorted({m for ps in plan["parts"].values() for p in ps for m in p["modules"]})
     plan["selection"] = {
         "mode": "skipped" if skip else ("impacted" if chosen_set is not None else "full"),
-        "why": plan["why"] if skip else why,
+        "why": plan["why"] if skip else (release or why),
         "modules": len(every), "impacted": len(chosen), "contract": len(contract),
         "selected": len(ran), "skipped": len(every) - len(ran),
         "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
@@ -1499,19 +1752,29 @@ def _rev(rev: str, repo: pathlib.Path) -> str:
 
 
 def fallback_plan(event: str, error: str, base_ref: str | None = None,
-                  head_ref: str | None = None) -> dict:
-    """The plan when planning itself failed: full suite, alphabetical order."""
+                  head_ref: str | None = None, mode: str = "auto",
+                  ref: str = "") -> dict:
+    """The plan when planning itself failed: full suite, alphabetical order.
+
+    The lot shape of `mode` is kept: a lot CI that cannot plan still runs the
+    full suite on both drivers, with the lot part counts and the psql pilot
+    list — never fewer parts than the impacted selection would have had.
+    """
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
     release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
+    if mode == "lot":
+        #: #1343 : le repli d'un dispatch de lot garde la règle release/**.
+        release = release or release_pr(None, _branch(ref))
     pr = event == "pull_request"
     #: L1211 : le repli d'une PR de release garde les deux pilotes complets,
-    #: jamais la liste pilote psql d'une PR de lot.
-    lot_pr = pr and not release
+    #: jamais la liste pilote psql d'un lot ; le repli d'un lot (PR ou CI au
+    #: gel, #1343) garde sa forme de lot.
+    lot = (mode == "lot" or (mode == "auto" and pr)) and not release
     why = "planning failed" + (f"; {release}" if release else "")
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
-            "version_only": False, "docs_only": False, "why": why,
+            "version_only": False, "docs_only": False, "why": why, "mode": mode,
             "release": release, "refs": {"base": base_ref, "head": head_ref},
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
@@ -1520,11 +1783,11 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
-        n = n_pr if lot_pr else n_other
+        n = n_pr if lot else n_other
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
-             "pilot_list": driver == "psql" and lot_pr, "estimate_s": 0}
+             "pilot_list": driver == "psql" and lot, "estimate_s": 0}
             for i in range(1, n + 1)]
     plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
                          "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
@@ -1575,7 +1838,9 @@ def summary(plan: dict) -> str:
                  f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
                  f" s of ~{sel['total_estimate_s']:.0f} s (psycopg)")
     if sel.get("mode") == "impacted":
-        lines.append(f"* lot branch (L1211): impacted + {sel['contract']} contract module(s), "
+        where = ("lot CI at freeze (#1343, canon §3)" if plan.get("mode") == "lot"
+                 else "lot branch (L1211)")
+        lines.append(f"* {where}: impacted + {sel['contract']} contract module(s), "
                      f"{sel['selected']} module(s) run, {sel['skipped']} left to main, "
                      f"release/** and the integration branch")
     elif sel.get("mode") == "skipped":
@@ -1741,6 +2006,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="target branch of a pull request (default: $GITHUB_BASE_REF)")
     p.add_argument("--head-ref", default=None,
                    help="source branch of a pull request (default: $GITHUB_HEAD_REF)")
+    p.add_argument("--mode", choices=("auto", "lot", "full"), default="auto",
+                   help="auto (event), lot (ci-lot freeze request: impacted + "
+                        "contract, #1343) or full (ci-full request: whole suite)")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",
@@ -1768,17 +2036,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "couverture":
         return couverture(args)
+    if args.command == "plan" and args.mode == "lot" and args.base in ("", "HEAD^1"):
+        #: #1343 : sans la base du gel (merge-base avec la cible), la sélection
+        #: porterait sur le dernier commit de la branche et manquerait des
+        #: modules du lot — un vert trop large. On refuse plutôt que de deviner.
+        print("plan: --mode lot requires --base (the merge-base with the target), "
+              "not %r" % args.base, file=sys.stderr)
+        return 2
+
     if args.command == "plan":
         card, why = _load_map(args.map)
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:
             plan = make_plan(args.event, card, base=args.base, ref=args.ref,
-                             base_ref=args.base_ref, head_ref=args.head_ref)
+                             base_ref=args.base_ref, head_ref=args.head_ref,
+                             mode=args.mode)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
             plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
-                                 base_ref=args.base_ref, head_ref=args.head_ref)
+                                 base_ref=args.base_ref, head_ref=args.head_ref,
+                                 mode=args.mode, ref=args.ref)
         pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
                                           + "\n", encoding="utf-8")
         if args.github_output:

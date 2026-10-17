@@ -21,7 +21,7 @@ import shutil
 import tempfile
 import unittest
 
-from ameesh import plan_github, radar
+from ameesh import merge_queue, plan_github, radar
 
 from .test_l160b_radar import _git
 from .test_l160g_nexlink import _Gh
@@ -276,6 +276,35 @@ class FullSuiteReaderTest(unittest.TestCase):
                                 gh=_gh([dict(_row(), createdAt=None)]))
         with self.assertRaises(plan_github.GithubError):
             radar.full_suite_ci(self.project, "a" * 40, gh=_gh([_row()] * 100))
+
+
+class RequiredFullCiTest(unittest.TestCase):
+    """#886 (P3, R2 mty-amh-qa-01 sur PR manaty/ameesh#633) : la porte de la
+    suite complète ne prend pas une **déclaration manquante** pour une panne
+    gh — le message nomme `radar.projects.<p>.full_suite` et ne renvoie pas à
+    « once gh works », qui masquait la configuration à réparer."""
+
+    def test_a_missing_declaration_is_named_without_gh(self):
+        project = radar.Project("a", "/r", github="o/ameesh")  # aucune full_suite
+        with self.assertRaises(merge_queue.QueueError) as caught:
+            merge_queue.required_full_ci(project, "a" * 40, lot=886)
+        text = str(caught.exception)
+        self.assertIn("radar.projects.a.full_suite", text)
+        self.assertNotIn("once gh works", text)
+
+    def test_an_unreadable_declared_suite_still_names_gh(self):
+        # contraste : une suite déclarée mais illisible garde le message de
+        # lecture impossible — le repli « once gh works » n'est pas perdu.
+        project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF,))
+
+        def boom(sha):
+            raise plan_github.GithubError("gh down")
+
+        with self.assertRaises(merge_queue.QueueError) as caught:
+            merge_queue.required_full_ci(project, "a" * 40, full_ci=boom, lot=886)
+        text = str(caught.exception)
+        self.assertIn("cannot read the full-suite", text)
+        self.assertIn("once gh works", text)
 
 
 if __name__ == "__main__":  # pragma: no cover

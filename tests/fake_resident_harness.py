@@ -27,8 +27,11 @@ the answer to `turn/steer` waits for the next `turn/interrupt`, then refuses.
 Environment: `FAKE_RESIDENT_LOG` (JSONL trace of argv and of what was
 received), `FAKE_CLAUDE_QUEUE=1` (an input written during a turn is not
 injected: it opens the next harness turn, as when it arrives just after the
-last tool call), `FAKE_CODEX_STEER_REFUSE=1` (`turn/steer` always refused),
-`FAKE_START_DELAY` (seconds before answering `initialize`).
+last tool call), `FAKE_CLAUDE_PUSH_AFTER` (seconds after an `initialize`
+answer before the harness pushes its `system/commands_changed` event, as the
+real CLI does asynchronously — #1337), `FAKE_CODEX_STEER_REFUSE=1`
+(`turn/steer` always refused), `FAKE_START_DELAY` (seconds before answering
+`initialize`).
 """
 from __future__ import annotations
 
@@ -91,6 +94,31 @@ class Claude:
         out({"type": "control_response", "response": {
             "subtype": "success", "request_id": message.get("request_id"),
             "response": {"still_queued": []}}})
+        self.push_after_initialize(request)
+
+    def push_after_initialize(self, request: dict) -> None:
+        """#1337 : the CLI pushes `system/commands_changed` asynchronously
+        after an `initialize` answer (observed on 2.1.296: ~1.4 s later, well
+        after the drain that precedes the next turn's send). The delay makes
+        the push land in a turn that is already running."""
+        if request.get("subtype") != "initialize":
+            return
+        try:
+            delay = float(os.environ.get("FAKE_CLAUDE_PUSH_AFTER", "0") or 0)
+        except ValueError:
+            return
+        if delay <= 0:
+            return
+        timer = threading.Timer(delay, self.push)
+        timer.daemon = True
+        timer.start()
+
+    def push(self) -> None:
+        """One fire-and-forget push of the harness, outside any turn."""
+        out({"type": "system", "subtype": "commands_changed", "session_id": self.session,
+             "uuid": "push-%d" % time.monotonic_ns(),
+             "commands": [{"name": "probe-push", "description": "fake"}]})
+        trace({"push": "commands_changed"})
 
     def replay(self, message: dict) -> str:
         out(dict(message, session_id=self.session, isReplay=True))
@@ -128,11 +156,37 @@ class Claude:
             elif message.get("type") == "control_response":
                 trace({"control_response": message.get("response")})
 
+    def call_usage(self) -> dict:
+        """Usage of a model call. `FAKE_CLAUDE_CONTEXT` sets the context the
+        harness reports (input + cache read + cache creation), for the L81
+        compaction thresholds; without it the historical 10+200+30."""
+        total = os.environ.get("FAKE_CLAUDE_CONTEXT")
+        if total:
+            return {"input_tokens": int(total), "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0, "output_tokens": 7}
+        return {"input_tokens": 10, "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 30, "output_tokens": 7}
+
+    def compact(self) -> None:
+        """L81 (étude §6.2): the boundary a native `/compact` produces —
+        `pre_tokens`/`post_tokens`, unless `FAKE_COMPACT_SKIP=1` (a harness
+        that reports none) or `FAKE_COMPACT_POST` forces the after."""
+        if os.environ.get("FAKE_COMPACT_SKIP") == "1":
+            return
+        pre = int(os.environ.get("FAKE_COMPACT_PRE")
+                  or os.environ.get("FAKE_CLAUDE_CONTEXT") or "240")
+        post = int(os.environ.get("FAKE_COMPACT_POST") or max(pre // 5, 1))
+        out({"type": "system", "subtype": "compact_boundary", "session_id": self.session,
+             "compact_metadata": {"trigger": "manual", "pre_tokens": pre,
+                                  "post_tokens": post}})
+
     def turn(self, first: dict) -> None:
         out({"type": "system", "subtype": "init", "session_id": self.session,
              "model": "fake-model"})
         texts = [self.replay(first)]
         trace({"user": texts[0]})
+        if texts[0].strip() == "/compact":
+            self.compact()
         if "ORPHAN" in texts[0]:
             orphan(keep_input="ORPHAN_IN" in texts[0])
         if "FLOOD" in texts[0]:
@@ -180,25 +234,28 @@ class Claude:
             out({"type": "user", "session_id": self.session, "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}})
         self.cost = round(self.cost + 0.01, 6)
-        usage = {"input_tokens": 10, "cache_read_input_tokens": 200,
-                 "cache_creation_input_tokens": 30, "output_tokens": 7}
+        usage = self.call_usage()
+        extra = {}
+        window = os.environ.get("FAKE_CLAUDE_WINDOW")
+        if window:
+            extra["modelUsage"] = {"fake-model": {"contextWindow": int(window)}}
         if interrupted:
             out({"type": "result", "subtype": "error_during_execution", "is_error": True,
                  "result": None, "session_id": self.session, "total_cost_usd": self.cost,
-                 "usage": usage})
+                 "usage": usage, **extra})
             return
         answer = "\n".join("ECHO:%s" % t for t in texts)
         out({"type": "assistant", "session_id": self.session, "message": {
             "id": "msg-final", "content": [{"type": "text", "text": answer}],
-            "usage": {"input_tokens": 10, "cache_read_input_tokens": 200,
-                      "cache_creation_input_tokens": 30, "output_tokens": 7}}})
+            "usage": usage}})
         if "ERROR" in texts[0]:
             out({"type": "result", "subtype": "error_during_execution", "is_error": True,
                  "errors": ["boom"], "session_id": self.session,
-                 "total_cost_usd": self.cost, "usage": usage})
+                 "total_cost_usd": self.cost, "usage": usage, **extra})
             return
         out({"type": "result", "subtype": "success", "is_error": False, "result": answer,
-             "session_id": self.session, "total_cost_usd": self.cost, "usage": usage})
+             "session_id": self.session, "total_cost_usd": self.cost, "usage": usage,
+             **extra})
 
 
 class Codex:
