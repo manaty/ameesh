@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import json
+
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
@@ -43,6 +45,43 @@ def _marks(values) -> str:
 
 
 class Operations(interface.Operations):
+
+    def publish_peek(self, name, owner, epoch, payload) -> bool:
+        from ...agent_peek import sanitise
+        # Lock first, then check real time in a fresh statement: expired
+        # runners cannot publish after waiting behind a lease replacement.
+        with self.db.transaction() as tx:
+            tx.query("SELECT name FROM agent_registry WHERE name = %s FOR UPDATE", (name,))
+            rows = tx.query("""
+                INSERT INTO agent_peek (agent, host, lease_epoch, payload)
+                SELECT name, host, lease_epoch, %s::jsonb FROM agent_registry
+                WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+                  AND lease_expires_at > clock_timestamp()
+                ON CONFLICT (agent) DO UPDATE SET host = EXCLUDED.host,
+                  lease_epoch = EXCLUDED.lease_epoch, captured_at = clock_timestamp(),
+                  payload = EXCLUDED.payload RETURNING agent
+                """, (json.dumps(sanitise(payload), ensure_ascii=False), name, owner, int(epoch)))
+        return bool(rows)
+
+    def read_peek(self, name, human):
+        # An unavailable snapshot is explicit; metadata still describes the
+        # authorised agent. Old host/lease observations are never reused.
+        rows = self.db.query("""
+            SELECT r.host, r.status, r.status_text,
+                   w.id AS lot_id, w.title AS lot_title, w.state AS lot_state,
+                   extract(epoch FROM p.captured_at)::float8 AS captured_ts, p.payload
+            FROM agent_registry r
+            LEFT JOIN agent_peek p ON p.agent = r.name AND p.host = r.host
+                                     AND p.lease_epoch = r.lease_epoch
+            LEFT JOIN LATERAL (
+                SELECT id, title, state FROM work_items
+                WHERE assignee = r.name AND state NOT IN ('merged','promoted','closed')
+                ORDER BY (id::text = r.session_work_item) DESC NULLS LAST,
+                         (state = 'build') DESC, updated_at DESC, id DESC LIMIT 1
+            ) w ON true
+            WHERE r.name = %s AND r.responsible = %s
+            """, (name, human))
+        return rows[0] if rows else None
 
     # -- réglages ------------------------------------------------------------
     def set_settings(self, name, values) -> bool:
