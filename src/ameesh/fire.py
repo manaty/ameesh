@@ -703,15 +703,73 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
     return tuple(dict.fromkeys(pairs))
 
 
+def _ruleset_required(slug: str | None, target: str, *, gh) -> tuple:
+    """Les checks requis de `target` par les rulesets du dépôt et de
+    l'organisation (#2287), lus à la forge (`rules/branches/<cible>`), sous la
+    même forme `(contexte, app_id)` que la protection classique : l'
+    `integration_id` d'une règle `required_status_checks` est l'application
+    imposée, `None` sans fournisseur. La forge ne rend que les règles actives
+    (un ruleset en `evaluate` ou désactivé ne bloque pas la fusion), y compris
+    pour une branche qui n'existe pas encore.
+
+    Aucune règle est une réponse (aucun check requis) ; toute lecture
+    impossible ou malformée lève `land.LandError`, comme pour la protection."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the rulesets of %s "
+                             "cannot be read" % (target or "the target"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the rulesets of %s cannot be read"
+                             % target)
+    path = "repos/%s/rules/branches/%s" % (slug, quote(target, safe=""))
+    proc = gh(["api", "--paginate", "--slurp", path + "?per_page=100"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise land.LandError("gh api %s: %s"
+                             % (path, detail or "exit %d" % proc.returncode))
+    # `--slurp` rend une liste de pages, chacune une liste de règles :
+    # `land._json` n'accepte qu'une liste d'objets.
+    pages = land._json(proc, "gh api %s" % path, object)
+    if not isinstance(pages, list):
+        raise land.LandError("gh api %s: malformed response" % path)
+    pairs = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise land.LandError("gh api %s: malformed response" % path)
+        for rule in page:
+            if not isinstance(rule, dict) or not isinstance(rule.get("type"), str):
+                raise land.LandError("gh api %s: malformed rule" % path)
+            if rule["type"] != "required_status_checks":
+                continue
+            params = rule.get("parameters")
+            checks = params.get("required_status_checks") \
+                if isinstance(params, dict) else None
+            if not isinstance(checks, list):
+                raise land.LandError("gh api %s: malformed required_status_checks rule"
+                                     % path)
+            for check in checks:
+                if not isinstance(check, dict) or not isinstance(check.get("context"), str) \
+                        or not check["context"].strip():
+                    raise land.LandError("gh api %s: invalid required check" % path)
+                app_id = check.get("integration_id")
+                if app_id is not None and (isinstance(app_id, bool)
+                                           or not isinstance(app_id, int) or app_id <= 0):
+                    raise land.LandError("gh api %s: invalid required check integration_id"
+                                         % path)
+                pairs.append((check["context"], app_id))
+    return tuple(dict.fromkeys(pairs))
+
+
 def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     """Les checks requis de la branche cible, sous la forme `(contexte,
-    app_id)` : la protection lue à la forge, complétée par la déclaration
-    `radar.projects.<p>.required_checks` (des noms, sans application imposée).
+    app_id)` : la protection classique et les rulesets lus à la forge (#2287 :
+    un check requis par un ruleset bloque la fusion comme un autre), complétés
+    par la déclaration `radar.projects.<p>.required_checks` (des noms, sans
+    application imposée).
 
-    Quand la protection ne peut pas être lue (jeton sans droits, forge
-    muette), la déclaration du projet la remplace ; sans déclaration, la
-    lecture refuse. La déclaration ne peut jamais retirer un check que la
-    forge exige : elle s'ajoute. Les noms sont exacts de bout en bout :
+    Quand la protection ou les rulesets ne peuvent pas être lus (jeton sans
+    droits, forge muette), la déclaration du projet les remplace ; sans
+    déclaration, la lecture refuse. La déclaration ne peut jamais retirer un
+    check que la forge exige : elle s'ajoute. Les noms sont exacts de bout en bout :
     la déclaration `tests ` ne vaut pas le contexte `tests`."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
@@ -721,7 +779,8 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
             return declared
         raise land.LandError("no target branch known: its required checks cannot be read")
     try:
-        forged = _protection_required(slug, target, gh=gh)
+        forged = _protection_required(slug, target, gh=gh) \
+            + _ruleset_required(slug, target, gh=gh)
     except land.LandError:
         if declared:
             return declared

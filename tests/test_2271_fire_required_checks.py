@@ -69,14 +69,17 @@ def _run(name, app_id=15368, conclusion="success", status="completed", sha=SHA):
 
 
 class FakeGh:
-    """Le peu de `gh` que le feu lit : la PR, la protection de la cible et les
-    check runs de la tête (leur source)."""
+    """Le peu de `gh` que le feu lit : la PR, la protection de la cible, ses
+    rulesets (#2287, aucun par défaut) et les check runs de la tête (leur
+    source)."""
 
     def __init__(self, *, rows=(), protection=PROTECTED, error="", check_runs=(),
-                 check_error=""):
+                 check_error="", rules=(), rules_error=""):
         self.rows = list(rows)
         self.protection = protection
         self.error = error
+        self.rules = list(rules)
+        self.rules_error = rules_error
         self.check_runs = list(check_runs)
         self.check_error = check_error
         self.calls = []
@@ -91,6 +94,12 @@ class FakeGh:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr=self.error)
             return types.SimpleNamespace(returncode=0,
                                          stdout=json.dumps(self.protection), stderr="")
+        if any("/rules/branches/" in arg for arg in argv):
+            if self.rules_error:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr=self.rules_error)
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps([self.rules]),
+                                         stderr="")
         path = next((arg for arg in argv if "/check-runs" in arg), "")
         if path:
             if self.check_error:
