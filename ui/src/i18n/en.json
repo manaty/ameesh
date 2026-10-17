@@ -113,6 +113,8 @@
   "decisions.filing": "Filing…",
   "decisions.filed": "Request filed:",
   "decisions.open": "open the approval page",
+  "decisions.renew": "File a new request",
+  "decisions.expired": "The filed link has expired; file a new request.",
   "decisions.failed": "The request was not filed ({code}).",
   "decisions.request": "Request #{id}",
   "decisions.answerHint": "Answer with `ameesh decide {id} <option>`.",
