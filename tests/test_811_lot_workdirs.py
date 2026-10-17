@@ -318,6 +318,98 @@ class RoutingTest(sessions._Base):
         self.assertNotIn('--resume', argv)
         self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self._cwd('beta-new'))
 
+    def test_originless_session_same_lot_primary_root_is_adopted(self):
+        """#1900 N1 : session d'avant 0384 (origine inconnue) sur son propre
+        lot, dans le dossier de l'agent : la bascule forcée vers ce même lot
+        la perdrait ; elle est adoptée (origine notée) et le tour la reprend."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        argv = self.tour(self.worker, self.a, 'A after deployment', session='session-A')
+        self.assertEqual(argv[argv.index('--resume') + 1], 'session-A')
+        row = registry.get(self.db, 'worker')
+        self.assertEqual((row['session_origin'], row['session_cwd']),
+                         ('session-A', self.primary))
+
+    def test_originless_session_secondary_root_starts_a_new_session(self):
+        """#1900 N1 (frontière) : au dossier secondaire, la session d'origine
+        inconnue ne peut pas être reprise (elle a été ouverte dans le dossier
+        de l'agent) ; le tour repart neuf, comportement conservé."""
+        self.tour(self.worker, self.b, 'start B', session='session-B')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        argv = self.tour(self.worker, self.b, 'B after deployment', session='session-B2')
+        self.assertNotIn('--resume', argv)
+        self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self.secondary)
+
+    def test_adoption_refuse_bail_perdu_et_session_remplacee(self):
+        """#1900 B1 : un remplaçant a réclamé l'agent (epoch suivant) et noté sa
+        session ; le worker dépassé, dont l'instantané porte encore la sienne,
+        ne la réécrit pas en adoptant."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        self.assertTrue(registry.release(self.db, 'worker', self.worker.runner.runner_id,
+                                        self.worker.epoch))
+        remplacant = registry.claim(self.db, 'worker', 'runner-remplacant', 3600)
+        self.assertIsNotNone(remplacant)
+        registry.set_session(self.db, 'worker', 'session-remplacante', None,
+                            harness='claude', cwd=self.primary)
+        self.assertFalse(self.worker._adopt_originless_session('session-A', self.primary))
+        row = registry.get(self.db, 'worker')
+        self.assertEqual(row['session_id'], 'session-remplacante')
+        # l'origine du remplaçant, pas celle du worker dépassé
+        self.assertEqual(row['session_origin'], 'session-remplacante')
+
+    def test_adoption_refuse_session_remplacee_sous_notre_bail(self):
+        """#1900 B1 : même sous notre bail vivant, une session remplacée entre
+        l'instantané du worker et l'adoption n'est jamais réécrite."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        registry.set_session(self.db, 'worker', 'session-remplacante', None,
+                            harness='claude', cwd=self.primary)
+        self.assertFalse(self.worker._adopt_originless_session('session-A', self.primary))
+        row = registry.get(self.db, 'worker')
+        self.assertEqual(row['session_id'], 'session-remplacante')
+        # l'origine du remplaçant, pas celle du worker dépassé
+        self.assertEqual(row['session_origin'], 'session-remplacante')
+
+    def test_adoption_attendant_le_verrou_au_dela_de_l_echeance_refuse(self):
+        """#1900 B1 : l'échéance du bail est recontrôlée APRÈS l'attente du
+        verrou — une adoption bloquée au-delà de l'échéance refuse et ne touche
+        rien."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute(
+            "UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL,"
+            " lease_expires_at = clock_timestamp() + interval '0.4 second'"
+            " WHERE name = 'worker'")
+        verrou = self.connect()
+        self.addCleanup(verrou.close)
+        pret = threading.Event()
+
+        def tenir():
+            with verrou.transaction() as tx:
+                tx.query("SELECT 1 FROM agent_registry WHERE name = 'worker' FOR UPDATE")
+                pret.set()
+                time.sleep(1.0)      # détient le verrou au-delà de l'échéance
+
+        fil = threading.Thread(target=tenir, daemon=True)
+        fil.start()
+        self.assertTrue(pret.wait(10))
+        resultat = []
+        adoptant = threading.Thread(
+            target=lambda: resultat.append(
+                self.worker._adopt_originless_session('session-A', self.primary)),
+            daemon=True)
+        adoptant.start()
+        fil.join(10)
+        adoptant.join(10)
+        self.assertEqual(resultat, [False])
+        row = registry.get(self.db, 'worker')
+        self.assertIsNone(row['session_origin'])
+        self.assertEqual(row['session_id'], 'session-A')
+
 
 class PickupTest(consumers.PriseMultiProjetsTest):
     """Existing primary-only tests still cover hosts without secondary roots."""
@@ -348,6 +440,32 @@ class PickupTest(consumers.PriseMultiProjetsTest):
         self.assertEqual(len(reasons), 1)
         self.assertIn('Host work root', reasons[0])
 
+    def test_missing_dir_note_is_deduced_from_one_bounded_read_per_pass(self):
+        """#1900 N2 : la note L243-4 déjà écrite se déduit d'une lecture
+        bornée des notes (une par passe d'auto_take), plus des 100 derniers
+        événements du lot relus à chaque passe."""
+        self.multi()
+        item = self.lot('secondary', app='nexlink')
+        from ameesh.storage.postgres import work as work_store
+        lues = []
+        vrai = work_store.WorkItems.events_noted
+
+        def notes(store, prefix, since_ts):
+            lues.append(prefix)
+            return vrai(store, prefix, since_ts)
+
+        def interdit(*args, **kwargs):
+            raise AssertionError('work.events relu par lot à chaque passe')
+
+        with mock.patch.object(work_store.WorkItems, 'events_noted', notes), \
+                mock.patch.object(work, 'events', interdit):
+            self.assertEqual(self.take(), [])
+            self.assertEqual(self.take(), [])
+        self.assertEqual(lues, [backlog.DIRECTORY_NOTE_PREFIX] * 2)
+        raisons = [e['note'] for e in work.events(self.db, item['id'])
+                   if (e.get('note') or '').startswith('L243-4:')]
+        self.assertEqual(len(raisons), 1)
+
     def test_two_agents_note_the_refusal_once(self):
         """#1538 : le refus de dossier se note une fois par ÉLÉMENT, pas une
         fois par (agent, élément) — deux agents et deux passages ne laissent
@@ -363,19 +481,29 @@ class PickupTest(consumers.PriseMultiProjetsTest):
         self.assertEqual(len(reasons), 1)
         self.assertIn('Host work root', reasons[0])
 
-    def test_journal_is_read_once_per_element_in_a_pass(self):
-        """#1538 : le journal d'un élément refusé n'est plus relu pour chaque
-        couple (agent, élément) du même passage : deux agents butent sur le
-        même lot, le journal n'est lu qu'une fois."""
+    def test_notes_are_read_once_per_pass_not_per_element(self):
+        """#1538 + #1900 N2 : deux agents butent sur le même lot dans la même
+        passe ; le journal n'est lu ni par couple (agent, élément) ni par
+        élément, mais une seule fois par le relevé borné des notes."""
         self.multi('m1')
         self.multi('m2')
         self.lot('secondary', app='nexlink')
-        with mock.patch('ameesh.lot_workdir.problem',
-                        wraps=lot_workdir.problem) as problem, \
-                mock.patch('ameesh.work.events', wraps=work.events) as events:
+        from ameesh.storage.postgres import work as work_store
+        lues = []
+        vrai = work_store.WorkItems.events_noted
+
+        def notes(store, prefix, since_ts):
+            lues.append(prefix)
+            return vrai(store, prefix, since_ts)
+
+        with mock.patch.object(work_store.WorkItems, 'events_noted', notes), \
+                mock.patch('ameesh.lot_workdir.problem',
+                           wraps=lot_workdir.problem) as problem, \
+                mock.patch.object(work, 'events', wraps=work.events) as events:
             self.assertEqual(self.take(), [])
         self.assertEqual(problem.call_count, 2)   # m1 puis m2 ont été évalués
-        self.assertEqual(events.call_count, 1)    # une seule lecture du journal
+        self.assertEqual(len(lues), 1)            # une seule lecture bornée
+        self.assertEqual(events.call_count, 0)    # aucun journal par élément
 
     def test_dry_run_missing_policy_does_not_write_reason(self):
         self.multi()

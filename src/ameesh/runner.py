@@ -201,6 +201,10 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
 LIVE_REVIEW_START_SLACK_S = 300.0
+#: #1425 (N5) : `measurement_actor` relit les canons ; le balayage des arrêts
+#: délibérés tourne à chaque passe — on espace cette lecture d'une fenêtre,
+#: l'auditeur nommé (`auditeur`) restant résolu sans canon.
+MEASURE_CANONS_TTL_S = 300.0
 #: L85 : rétention du journal d'événements, au plus une fois par heure
 EVENTS_PRUNE_EVERY_S = 3600.0
 #: #2096 : bornes de l'affichage gardé pour un tour de résumé (repli d'un flux
@@ -2242,6 +2246,46 @@ class AgentWorker(threading.Thread):
                 if out.get("discarded") else ""),
             meta={"action": "session-lot", "de": courant, "vers": lot,
                   "session": out.get("parked") or "", "reprise": repris or ""})
+        return True
+
+    def _adopt_originless_session(self, session: str, cwd: str) -> bool:
+        """#1900 N1 : adopter une session d'avant 0384 (origine inconnue).
+
+        Un agent multi-projet dont la session courante n'a ni origine ni
+        dossier connus (`session_origin`/`session_cwd` nuls) est basculé de
+        force vers SON lot par `_run_turn` ; quand le lot est le projet
+        primaire — donc le dossier de l'agent, seul dossier où une session
+        d'avant 0384 a pu être ouverte — la bascule ne fait que perdre la
+        session (`courant == to_lot`, rien à mettre de côté). On note son
+        origine au registre : le tour la reprend et les bascules suivantes la
+        mettent de côté normalement.
+
+        Rend False quand l'écriture échoue : l'appelant garde la bascule
+        forcée, comportement d'avant le correctif."""
+        harnais = (self.agent.get("session_harness")
+                   or self.agent.get("harness") or self.turn_harness())
+        # #1900 B1 : écriture fencée (verrou de ligne, bail vivant, échéance
+        # recontrôlée après l'attente, session ET lot inchangés). Une session
+        # remplacée entre l'instantané et l'adoption — rotation, remplaçant,
+        # autre lot — n'est jamais réécrite ; l'appelant garde alors la bascule
+        # forcée, comportement d'avant le correctif.
+        lot = str(self.agent.get("session_work_item") or "")
+        try:
+            adopte = registry.adopt_session_origin(
+                self.db, self.name, session, lot,
+                self.runner.runner_id, self.epoch,
+                harness=harnais, cwd=cwd)
+        except db_mod.DbError as exc:
+            log_async("[%s] originless session %s not adopted (%s)"
+                      % (self.name, session, exc))
+            return False
+        if not adopte:
+            log_async("[%s] originless session %s not adopted: "
+                      "lease or session changed" % (self.name, session))
+            return False
+        self.agent = registry.get(self.db, self.name) or self.agent
+        log_async("[%s] originless session %s adopted for lot %s (origin %s)"
+                  % (self.name, session, self.agent.get("session_work_item"), cwd))
         return True
 
     def _lot_brief(self, lot: str, courant: str, out: dict) -> str | None:
@@ -4996,8 +5040,18 @@ class AgentWorker(threading.Thread):
                 and (self.agent.get("session_origin") != session or not origin
                      or os.path.realpath(origin) != os.path.realpath(cwd))):
             lot = self._workdir_lot
-            if not lot or not self._switch_lot(str(self.agent.get("session_work_item") or ""),
-                                               str(lot)):
+            # #1900 N1 : origine inconnue (session d'avant 0384), sur SON lot
+            # et dans le dossier de l'agent — le seul où elle a pu être
+            # ouverte : adopter plutôt que perdre par une bascule vers le même
+            # lot. Au dossier secondaire, la bascule reste (on ne peut pas
+            # reprendre la session ailleurs).
+            adopted = (not origin and lot
+                       and str(lot) == str(self.agent.get("session_work_item") or "")
+                       and self.agent.get("cwd")
+                       and os.path.realpath(cwd) == os.path.realpath(self.agent["cwd"])
+                       and self._adopt_originless_session(session, cwd))
+            if not adopted and (not lot or not self._switch_lot(
+                    str(self.agent.get("session_work_item") or ""), str(lot))):
                 return False
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
@@ -6961,6 +7015,85 @@ class Runner:
                 take.get("agent"), (take.get("item") or {}).get("id"), take.get("kind")))
         return taken
 
+    def release_stopped_lots_once(self) -> list[dict]:
+        """#753 : un agent arrêté ne garde pas ses lots. À chaque passe qui
+        atteint la reprise — après les gardes secteur/drainage/code périmé
+        (#1425, N2) —, les lots ouverts d'un agent `stopped` retournent à la
+        file d'équipe, et ses lots promus dont la mesure reste à refaire vont à
+        l'auditeur.
+
+        Seuls les arrêts DÉLIBÉRÉS (`stop_reason` dans
+        `work.RELEASABLE_STOP_REASONS`) dessaisissent : un arrêt automatique et
+        réversible (`erreur` de `stop_after_failures`, `retire_du_canon` que
+        `canon.revive` annule, bail expiré) laisse l'agent reprendre ses lots —
+        sinon une panne fournisseur viderait en rafale tous ses lots (R2
+        Claude, B1). La transaction de `release_agent` revérifie elle-même
+        l'état du registre (`stopped_with`, N3). Ne dépend d'aucun agent : tout
+        exécuteur vivant le fait ; idempotent. Une erreur de base n'est pas
+        fatale à la passe ; `--dry-run` dit ce qui serait fait sans écrire."""
+        from . import work as work_mod
+
+        if getattr(self, "mediated", False):
+            return []  # L109 : le registre est tenu par le serveur
+        try:
+            agents = registry.overview(self.db)
+        except db_mod.DbError as exc:
+            message = "stopped agents not swept (%s)" % exc
+            if message != getattr(self, "_stopped_lots_error", None):
+                log_async(message)
+            self._stopped_lots_error = message
+            return []
+        self._stopped_lots_error = None
+        # #1425 (N5) : ne payer la résolution de l'auditeur (lecture des canons)
+        # que s'il y a un arrêt délibéré à dessaisir ; le balayage tourne à
+        # chaque passe.
+        stopped = [a for a in agents if a.get("status") == "stopped"
+                   and a.get("stop_reason") in work_mod.RELEASABLE_STOP_REASONS]
+        if not stopped:
+            return []
+        cache = getattr(self, "_measure_canons_cache", None)
+        now = time.time()
+        if cache is None or cache[0] <= now:
+            cache = (now + MEASURE_CANONS_TTL_S,
+                     work_mod.configured_canons(getattr(self, "cfg", None)))
+            self._measure_canons_cache = cache
+        measure_actor = work_mod.measurement_actor(
+            self.db, self.cfg, listing=agents, canons=cache[1])
+        measure_reason = ("promoted lot whose measurement is still to be redone: "
+                          "handed to %s (#753)" % measure_actor) if measure_actor else ""
+        out: list[dict] = []
+        # B1 (R2 Claude) : un arrêt automatique et réversible — `erreur` de
+        # `stop_after_failures`, `retire_du_canon` que `canon.revive` annule,
+        # bail expiré — ne dessaisit pas : l'agent relancé retrouve ses lots.
+        # Seul un arrêt délibéré (manuel) les rend.
+        for agent in stopped:
+            try:
+                done = work_mod.release_lots(
+                    self.db, agent["name"],
+                    reason="agent stopped: returned to the team queue (#753)",
+                    actor="runner %s" % self.runner_id,
+                    measure_actor=measure_actor, measure_reason=measure_reason,
+                    dry_run=self.dry_run,
+                    stopped_with=work_mod.RELEASABLE_STOP_REASONS)
+            except db_mod.DbError as exc:
+                message = "stopped lots of %s not released (%s)" % (agent["name"], exc)
+                if message != getattr(self, "_stopped_lots_error", None):
+                    log_async(message)
+                self._stopped_lots_error = message
+                continue
+            for row in done:
+                to = row.get("assigned_to")
+                if to:
+                    log_async("lot #%s handed to %s (%s stopped, measurement to redo)%s"
+                              % (row["id"], to, agent["name"],
+                                 " [dry-run]" if row.get("dry_run") else ""))
+                else:
+                    log_async("lot #%s returned to the team queue (%s stopped)%s"
+                              % (row["id"], agent["name"],
+                                 " [dry-run]" if row.get("dry_run") else ""))
+            out.extend(done)
+        return out
+
     def sweep(self) -> None:
         self.report_liveness()
         self.expire_delegations_once()
@@ -6999,6 +7132,12 @@ class Runner:
             self._note_gate_wait("host gate: %s%s" % (
                 gate.describe(), "; ack not written: " + error if error else ""))
             return  # host gate closed: registry diagnosis without taking a lease
+        # #1425 (N2) : le dessaisissement des arrêts délibérés vient APRÈS les
+        # gardes (secteur, drainage, code périmé, porte) : sous l'une d'elles
+        # l'exécuteur n'agit pas sur la file, et un runner périmé ne dessaisit
+        # pas avec une logique ancienne. Il précède la reprise des agents : la
+        # file est à jour avant les nouvelles prises.
+        self.release_stopped_lots_once()
         # #804 : la prise au repos est déclenchée ici, par l'exécuteur de
         # l'hôte, et non par un `ameesh notify` central (mêmes garde-fous).
         # Avant la réclamation : le lot pris et son courrier partent dans la
@@ -9196,6 +9335,25 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     # `stopped_with_mail` (l'humain sait qu'il l'a arrêté)
     registry.set_status(db, args[0], "stopped", status_text="stopped by hand",
                         stop_reason="manuel")
+    # #753 : un agent arrêté ne garde pas ses lots — ses lots ouverts
+    # retournent à la file d'équipe (assignee = NULL, journal avec la raison),
+    # et ses lots promus dont la mesure reste à refaire vont à l'auditeur.
+    # `stopped_with` referme la course avec une reprise simultanée (B1/N3).
+    from . import work as work_mod
+    measure_actor = work_mod.measurement_actor(db, cfg)
+    returned = work_mod.release_lots(
+        db, args[0],
+        reason="stopped by hand: returned to the team queue (#753)",
+        actor="stop", measure_actor=measure_actor,
+        measure_reason=("promoted lot whose measurement is still to be redone: "
+                        "handed to %s (#753)" % measure_actor) if measure_actor else "",
+        stopped_with=work_mod.RELEASABLE_STOP_REASONS)
+    for row in returned:
+        to = row.get("assigned_to")
+        if to:
+            log("lot #%s handed to %s (measurement to redo)" % (row["id"], to))
+        else:
+            log("lot #%s returned to the team queue" % row["id"])
     log("agent %s marked stopped" % args[0])
     return 0
 

@@ -2664,7 +2664,10 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     plan: list[dict] = []
     running = set(running or ())
     store = storage.of(db).housekeeping
-    for row in store.worktrees(host, ("active", "kept")):
+    # #2174: every tracked worktree — with the 500 oldest stuck, a capped
+    # read never reached the newer ones (17/10: 822 on agents-1, 789 on
+    # agents-2, 1 309 on the workstation)
+    for row in store.worktrees(host, ("active", "kept"), limit=None):
         path, lot = row["path"], row.get("lot")
         if (row.get("detail") or "").startswith((UNATTRIBUTED, UNATTRIBUTED_LEGACY)):
             # #1665 : la branche (ou, à défaut, le dossier) d'un worktree
@@ -2684,20 +2687,37 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             continue
         named = cited_lot(row.get("branch") or "") or named_lot(
             os.path.basename(os.path.normpath(path)), row.get("agent") or "")
-        if lot is None and named is not None:
-            # A named lot that cannot be attributed is not an orphan: the
-            # lot may be open, belong to another agent, or be unreadable.
-            plan.append(dict(base, action="garde", detail="named lot #%s not attributable"
-                             % named))
-            continue
-        state = _lot_state(db, lot) if lot else None
+        # #2174: a named lot that cannot be attributed (another agent's: a
+        # review copy, a reassigned lot) follows the orphan rule once that lot
+        # has ended — 24 h idle, clean and pushed; open, unknown or unreadable,
+        # it proves nothing and the worktree stays (agents-1, 17/10: 205 of
+        # 221 such copies named a merged or closed lot, kept forever).
+        foreign = lot is None and named is not None
+        if foreign:
+            try:
+                # #1694: review branches can cite several candidates. One
+                # ended lot proves nothing about the others still served.
+                states = [_lot_state(db, ident) for ident in
+                          (cited_lots(row.get("branch") or "") or [named])]
+            except Exception:  # registre illisible : rien n'est prouvé
+                states = [None]
+            if any(state not in LOT_ENDED for state in states):
+                plan.append(dict(base, action="garde",
+                                 detail="named lot #%s not attributable" % named))
+                continue
+            state = states[0]
+            lot = str(named)
+            base["lot"] = lot
+        else:
+            state = _lot_state(db, lot) if lot else None
         ended = state in LOT_ENDED
         orphan = lot is None
         if not ended and not orphan:
             plan.append(dict(base, action="attend",
                              detail="lot %s" % (state or "unknown")))
             continue
-        why = ("lot #%s %s" % (lot, state)) if ended else \
+        why = ("lot #%s %s%s" % (lot, state, " (assigned to another agent)" if foreign
+                                 else "")) if ended else \
             "no lot named by the branch or the directory (orphan)"
         target = _real(path)
         if any(_under(_real(cwd), target) for cwd in protected):
@@ -2709,11 +2729,11 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             continue
         moments = [float(row.get("created_ts") or now), _mtime(path)]
         youngest = max(m for m in moments if m is not None)
-        floor = ORPHAN_WORKTREE_IDLE_S if orphan else WORKTREE_MIN_AGE_S
+        floor = ORPHAN_WORKTREE_IDLE_S if orphan or foreign else WORKTREE_MIN_AGE_S
         if now - youngest < floor:
             plan.append(dict(base, action="attend",
                              detail="%s; created or modified less than %s ago" % (
-                                 why, "24 h" if orphan else "an hour")))
+                                 why, "24 h" if orphan or foreign else "an hour")))
             continue
         # #2167: holders (including unreadable processes) can retain the
         # whole host's worktrees; do not pay for Git before that decision.
@@ -2733,6 +2753,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if st["locked"]:
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
+        if foreign and not st["pushed"]:
+            plan.append(dict(base, action="garde", detail="%s; commits not pushed" % why))
+            continue
+        if worktree_in_use(path, allow=allow):
+            plan.append(dict(base, action="attend",
+                             detail="%s; a process is working in it" % why))
+            continue
         detail = "%s: kept — %s" % (why, st["reason"])
         # L230: a worktree kept although its lot is merged goes once kept
         # (same reason) for more than a day, if clean and its HEAD is on the
@@ -2740,7 +2767,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # #1665: an orphan (or a lot that ended without integration) follows
         # the same end after ORPHAN_WORKTREE_IDLE_S of inactivity, clean and
         # pushed; the branch stays too.
-        grace = (state in LOT_MERGED and row["status"] == "kept"
+        # Foreign copies always need 24 h of source/git inactivity, even
+        # when the same integration failure has kept them for a day.
+        grace = (not foreign and state in LOT_MERGED and row["status"] == "kept"
                  and row.get("detail") == detail
                  and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
         abandoned = (ended or orphan) and now - youngest >= ORPHAN_WORKTREE_IDLE_S
@@ -2939,7 +2968,7 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
     the tracked ones), their build artifacts deleted once idle; in a thread
     at the lowest priority, one worktree at a time."""
     rules = build_artifacts.rules_of(policy.artifacts)
-    tracked = storage.of(db).housekeeping.worktrees(host, ("active", "kept"))
+    tracked = storage.of(db).housekeeping.worktrees(host, ("active", "kept"), limit=None)
     owner = {_real(row["path"]): row["agent"] for row in tracked}
     agents = sorted(cwd_of.items(), key=lambda item: -len(item[1]))
 

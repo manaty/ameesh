@@ -142,6 +142,25 @@ class ConfigTest(unittest.TestCase):
         self.assertIsNone(notify.normalize_human("agent:robot"))
         self.assertIsNone(notify.normalize_human(""))
 
+    def test_canal_app_de_l_interface(self):
+        """L90 : `app` route les alertes vers l'interface embarquée, qui les
+        lit par le flux ; aucun transport, aucun secret, aucune option."""
+        ncfg = notify.parse_config({"routes": {"human:ada": ["app"]}})
+        canal = ncfg.channels_for("human:ada")[0]
+        self.assertEqual((canal.name, canal.kind), ("app", "app"))
+        # un canal nommé librement, typé app
+        ncfg = notify.parse_config({"default": ["bureau"],
+                                    "channels": {"bureau": {"type": "app"}}})
+        self.assertEqual(ncfg.channels["bureau"].kind, "app")
+        # le test de canal le compte comme joignable (rien à pousser)
+        self.assertEqual(notify.send_test(ncfg, "human:ada", "hote"), [("bureau", None)])
+        # aucune option de transport n'est acceptée sur ce canal
+        for raw in ({"channels": {"app": {"url": "https://exemple"}}},
+                    {"channels": {"app": {"topic": "t"}}},
+                    {"channels": {"app": {"webhook_env": "X"}}}):
+            with self.subTest(raw=raw), self.assertRaises(notify.NotifyConfigError):
+                notify.parse_config({"default": ["app"], **raw})
+
     def test_config_de_l_hote(self):
         from ameesh import config as config_mod
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,6 +231,12 @@ class CanauxTest(_Http, unittest.TestCase):
             notify.Sender(env=env).send(notify.Channel("desktop", "desktop"), self.msg)
         self.assertIn("notify-send not found", str(ctx.exception))
         self.assertTrue(ctx.exception.permanent)
+        self.assertEqual(_desktop_log(self.log), [])
+
+    def test_app_ne_pousse_rien(self):
+        """L90 : le canal `app` ne fait aucun envoi (le flux porte l'alerte) :
+        il réussit sans binaire, sans réseau, sans jeton."""
+        notify.Sender(env={}).send(notify.Channel("app", "app"), self.msg)
         self.assertEqual(_desktop_log(self.log), [])
 
     def test_ntfy_jeton_par_env_et_fichier(self):
@@ -337,6 +362,16 @@ class AcheminementTest(_Base):
         # personne : (None, None)
         router = notify.Router(self.cfg, self.db, self.ncfg())
         self.assertEqual(router.resolve(_alert(agent="sans-resp")), (None, None))
+
+    def test_route_app_sans_poussee(self):
+        """L90 : une alerte routée vers l'application est livrée (le flux la
+        porte), sans notification de bureau ni requête HTTP."""
+        notifier = self.notifier(self.ncfg(default=["app"]))
+        records = self.passe(notifier, [_alert(responsible="human:proprio")])
+        self.assertEqual([(r["delivery"], r["channels"]) for r in records
+                          if r["event"] == "raised"],
+                         [("envoyee", {"app": "ok"})])
+        self.assertEqual(_desktop_log(self.desk), [])
 
     def test_responsable_de_l_hote(self):
         mixin = _TmpMixin()
