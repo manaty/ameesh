@@ -13,19 +13,22 @@
 #     du registre lue sur la VM. Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
 #
 #   verifier     contrôles, rien n'est modifié
-#   installer    code REF dans /opt/ameesh/src (détaché), installé dans
-#                /opt/ameesh/venv (dépendance psycopg comprise) ; refuse tant
-#                que la base du mesh n'a pas toutes les migrations de REF
+#   installer    code REF dans /opt/ameesh/src (détaché), venv versionné
+#                préparé à l'écart (dépendance psycopg comprise) puis bascule
+#                atomique du venv (#1969) ; refuse tant que la base du mesh
+#                n'a pas toutes les migrations de REF
 #   redemarrer   ameesh-runner@<persona>, une par une, chacune hors tour ;
 #                refuse tant que les migrations du code installé manquent
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
-#   retour       réinstalle le commit d'avant et redémarre
+#   retour       bascule en arrière vers le venv précédent conservé, puis
+#                redémarre
 #
 #   En mode agents, installer et retour travaillent dans le layout du compte
 #   ameesh (~/.local/share/ameesh : clone src, instantanés src-<sha7> jamais
 #   écrasés, previous-sha, venv), avec les mêmes gardes de migrations ; le
 #   redémarrage reste hors tour sous bail. L'installation ne redémarre
-#   personne, le retour réinstalle l'ancien code puis redémarre et contrôle.
+#   personne, le retour bascule en arrière vers le venv précédent conservé
+#   puis redémarre et contrôle.
 #   Avant toute mutation, l'identité effective du compte runner (son
 #   EnvironmentFile) doit être celle de HOTE_AGENTS, et un journal de
 #   récupération retient le code quitté : une installation inachevée ferme la
@@ -38,7 +41,8 @@
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57) : VM (adresse WireGuard), PERSONAS_VM (personas servies
-# par le serveur). Aucun secret n'est lu ni affiché.
+# par le serveur ; liste vide admise, un hôte sans exécutant). Aucun secret
+# n'est lu ni affiché.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -60,7 +64,10 @@ if [ "$MODE" = agents ]; then
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
   [[ $HOTE_AGENTS =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "HOTE_AGENTS invalide" >&2; exit 2; }
 else
-  : "${VM:?VM manquant dans $BASCULE_ENV}" "${PERSONAS_VM:?PERSONAS_VM manquant dans $BASCULE_ENV}"
+  # #1928 : PERSONAS_VM défini mais vide est une configuration valide (hôte
+  # sans exécutant, ce que staging.sh écrit) ; les boucles serveur savent être
+  # vides. Seule une variable absente est refusée.
+  : "${VM:?VM manquant dans $BASCULE_ENV}" "${PERSONAS_VM?PERSONAS_VM manquant dans $BASCULE_ENV}"
 fi
 
 ICI="$(cd "$(dirname "$0")" && pwd)"
@@ -77,6 +84,24 @@ mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
+# #1969 : le helper de bascule atomique est copié depuis le poste, pour que
+# l'installation et le retour emploient la même version quel que soit le
+# commit déployé (l'ancien code n'a pas forcément le fichier).
+# Exécuté en root : jamais dans /tmp (partagé), mais sous /root, privé.
+BASCULE_VM=/root/.cache/ameesh/bascule-$$.py
+envoyer_bascule_vm() {
+  [ -r "$ICI/bascule.py" ] || { echo "bascule.py introuvable : $ICI/bascule.py" >&2; return 1; }
+  ssh_vm "umask 077; mkdir -p ${BASCULE_VM%/*} && cat > $BASCULE_VM" < "$ICI/bascule.py"
+}
+BASCULE_AGENTS=/home/ameesh/.local/state/ameesh/mise-a-jour/bascule-$$.py
+envoyer_bascule_agents() {
+  local b64
+  [ -r "$ICI/bascule.py" ] || { echo "bascule.py introuvable : $ICI/bascule.py" >&2; return 1; }
+  b64=$(base64 -w0 "$ICI/bascule.py") || return 1
+  utilisateur_agents bash -c "mkdir -p /home/ameesh/.local/state/ameesh/mise-a-jour
+    printf %s '$b64' | base64 -d > $BASCULE_AGENTS
+    chmod 600 $BASCULE_AGENTS"
+}
 # Versions de migration du commit $1 (clone du serveur) absentes de la base
 # du mesh, une par ligne ; rien si toutes sont passées.
 migrations_absentes() {
@@ -162,11 +187,15 @@ utilisateur_agents() {
 }
 commande_agents() {
   # Use the runner's systemd EnvironmentFile parser, including literal $/#.
+  # `systemd-run -p` does not expand the `%h` specifier (a transient unit's
+  # properties are not specifier-expanded): it would refuse
+  # `EnvironmentFile=%h/...` as "not absolute" (#1133). Expand $HOME in the
+  # shell, where it is the ameesh home set by `utilisateur_agents`.
   utilisateur_agents bash -c 'set -euo pipefail
     test -r "$HOME/.config/ameesh/env" \
       || { echo "runner environment file unreadable: $HOME/.config/ameesh/env" >&2; exit 1; }
     exec systemd-run --user --pipe --wait --quiet \
-      -p EnvironmentFile=%h/.config/ameesh/env -- "$@"' -- "$@"
+      -p EnvironmentFile="$HOME/.config/ameesh/env" -- "$@"' -- "$@"
 }
 ameesh_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"; }
 python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/python "$@"; }
@@ -211,15 +240,21 @@ proprietaire_de() {
 # Lecture sur l'hôte, jamais depuis PERSONAS_VM ni les unités déjà actives :
 # une unité manquante doit être contrôlée elle aussi. Ignorer et nommer les
 # noms invalides ; ne pas transformer un registre vide en succès.
+# `avec-arretes` inclut les personas arrêtées du registre : le redémarrage de
+# déploiement doit recharger leur unité si elle tourne encore (#1633), là où le
+# contrôleur ne les attend pas (aucun bail d'une persona arrêtée).
 agents_du_registre() {
-  local noms
+  local arretes=${1:-} noms
   noms=$(ameesh_agents list --json | python3 -c 'import json,re,sys
 rows = json.load(sys.stdin)
+avec_arretes = sys.argv[2:] == ["avec-arretes"]
 # Même règle que ameesh.config.NAME_RE (config.py:48), utilisée par
 # registry._check_name : 1 à 64 caractères, lettres/chiffres puis . _ -.
 names = set()
 for r in rows:
-    if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute" or r.get("status") == "stopped":
+    if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
+        continue
+    if r.get("status") == "stopped" and not avec_arretes:
         continue
     name = r.get("name")
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
@@ -228,7 +263,7 @@ for r in rows:
     names.add(name)
 names = sorted(names)
 if not names: sys.exit("aucun agent à mener sur " + sys.argv[1])
-print("\n".join(names))' "$HOTE_AGENTS") || return 1
+print("\n".join(names))' "$HOTE_AGENTS" "$arretes") || return 1
   printf '%s\n' "$noms"
 }
 
@@ -239,7 +274,8 @@ echec_agent() {
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes suivantes debut=$SECONDS
   local non_verifiees=()
-  noms=$(agents_du_registre) || return 1
+  # #1633 : inclure les personas arrêtées pour recharger leur unité active.
+  noms=$(agents_du_registre avec-arretes) || return 1
   mapfile -t restantes <<<"$noms"
   etape "exécuteurs de $HOTE_AGENTS (${#restantes[@]}), un par un hors tour"
   while [ "${#restantes[@]}" -gt 0 ]; do
@@ -249,11 +285,26 @@ redemarrer_agents() {
       # de toucher une unité que cet hôte ne doit plus mener.
       st=$(ameesh_agents show "$p" --json | python3 -c 'import json,sys
 r=json.load(sys.stdin)
-if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute" or r.get("status") == "stopped":
+if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
     print("skip")
 else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
-      if [ "$st" = skip ]; then echo "$p : placement modifié ou arrêté, ignoré"; continue; fi
+      if [ "$st" = skip ]; then echo "$p : placement modifié, ignoré"; continue; fi
       if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
+      # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
+      # réactive pas. #1633 : son unité encore active est seulement rechargée
+      # sur le nouveau code, sans bail ni tour ; une unité déjà arrêtée n'est
+      # pas relancée.
+      if [ "$st" = stopped ]; then
+        if utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")"; then
+          utilisateur_agents systemctl --user restart "$(unite_agents "$p")" \
+            && utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
+            || { echec_agent "$p" "unité d'une persona arrêtée : ne redémarre pas"; return 1; }
+          echo "$p : arrêté dans le registre — unité redémarrée pour charger le nouveau code, aucun tour"
+        else
+          echo "$p : arrêté dans le registre — unité déjà arrêtée, rien à recharger"
+        fi
+        continue
+      fi
       ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
         || { echec_agent "$p" "registre, heure de base ou ExecStart illisible, aucun restart"; return 1; }
       avant=$(bail_epoque <<<"$ligne")
@@ -292,10 +343,17 @@ else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
 # effective du compte runner et le journal de récupération sont vérifiés avant
 # toute mutation. Détail : docs/DEPLOIEMENT-HOTE-AGENTS.md.
 
-installe_agents() {  # code réellement installé (direct_url.json -> src-<sha7>)
+installe_agents() {  # code réellement installé (direct_url.json du venv VIVANT)
   utilisateur_agents bash -c 'set -euo pipefail
-    V=/home/ameesh/.local/share/ameesh/venv
-    for d in "$V"/lib/python*/site-packages/ameesh-*.dist-info; do
+    P=/home/ameesh/.local/share/ameesh; V=$P/venv; L=$V
+    # #1969 : le venv stable porte les lanceurs ; les métadonnées du code servi
+    # sont celles du venv versionné vivant (lien venv-courant), pas du lib
+    # d’origine conservé pour les processus déjà lancés.
+    if [ -L "$P/venv-courant" ]; then
+      C=$(readlink "$P/venv-courant")
+      case $C in /*) L=$C;; *) L=$P/$C;; esac
+    fi
+    for d in "$L"/lib/python*/site-packages/ameesh-*.dist-info; do
       [ -r "$d/direct_url.json" ] || continue
       python3 -c "import json,sys
 u = json.load(open(sys.argv[1])).get(\"url\", \"\")
@@ -535,14 +593,18 @@ assurer_instantane_agents() {  # $1 : sha40 ; instantané exact, créé ou véri
     echo "instantané src-${sha:0:7} refusé ($etat) : le contenu ne correspond pas au commit ; le retirer à la main (aucun écrasement automatique)" >&2
     return 1; }
 }
-# Réinstallation depuis l'instantané $1 : paquet puis dépendances, même
-# chemin pour installer et retour.
+# Réinstallation depuis l'instantané $1 : venv versionné préparé à l'écart
+# puis bascule atomique (#1969). $2 (facultatif) : version quittée, adoptée
+# sans pip à la première conversion. Le retour, lui, ne passe pas par ici : il
+# rebascule le lien vers le venv conservé (`retour_agents`).
 reinstaller_agents() {
+  local court=${1:0:7} precedent=${2:0:7}
+  envoyer_bascule_agents || return 1
   utilisateur_agents bash -c "set -euo pipefail
     P=/home/ameesh/.local/share/ameesh; V=\$P/venv
-    \$V/bin/pip install -q --force-reinstall --no-deps \$P/src-${1:0:7}
-    \$V/bin/pip install -q \$P/src-${1:0:7}
-    \$V/bin/python -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
+    python3 $BASCULE_AGENTS preparer --venv \"\$V\" --src \"\$P/src-$court\" --version $court
+    python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court ${precedent:+--precedent $precedent}
+    \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
 }
 releve_agents() {  # identité et pièces du bon hôte, avant tout geste
   local installe clone previous
@@ -671,7 +733,7 @@ installer_agents() {
     exit 1
   fi
   etape "installation dans le venv (depuis src-$court)"
-  if ! reinstaller_agents "$sha"; then
+  if ! reinstaller_agents "$sha" "$complet"; then
     echo "installation inachevée : « $0 agents retour » revient à ${complet:0:9} (journal conservé)" >&2
     exit 1
   fi
@@ -730,9 +792,13 @@ retour_agents() {
     echo "checkout de ${complet:0:9} inachevé : relancer « $0 agents retour »" >&2
     exit 1
   fi
-  etape "réinstallation dans le venv (depuis src-$court)"
-  if ! reinstaller_agents "$complet"; then
-    echo "réinstallation inachevée : relancer « $0 agents retour »" >&2
+  etape "retour par la bascule, sans pip (venv versionné conservé)"
+  if ! envoyer_bascule_agents \
+     || ! utilisateur_agents bash -c "set -euo pipefail
+        P=/home/ameesh/.local/share/ameesh; V=\$P/venv
+        python3 $BASCULE_AGENTS retour --venv \"\$V\"
+        \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"retour\", ameesh.__file__)'"; then
+    echo "retour par la bascule inachevé : relancer « $0 agents retour »" >&2
     exit 1
   fi
   # succès : le code installé devient la cible idempotente du retour, et le
@@ -772,12 +838,14 @@ installer() {
   # nouveau code n'y entre qu'une fois la base migrée (10/10, L151)
   etape "migrations de ${sha:0:9} passées sur la base du mesh"
   exiger_migrations "$sha" installer
-  etape "extraction et installation dans $VENV"
+  etape "préparation isolée puis bascule dans $VENV (#1969)"
+  envoyer_bascule_vm
   ssh_vm "set -e
     git -C $SRC checkout -q --detach '$sha'
     test \"\$(git -C $SRC rev-parse HEAD)\" = '$sha'
-    $VENV/bin/pip install -q --force-reinstall --no-deps $SRC
-    $VENV/bin/pip install -q $SRC
+    python3 $BASCULE_VM preparer --venv $VENV --src $SRC --version ${sha:0:7}
+    python3 $BASCULE_VM activer --venv $VENV --version ${sha:0:7} --precedent \$(cut -c1-7 $PRECEDENT)
+    rm -f $BASCULE_VM
     $VENV/bin/python -c 'import psycopg, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \": modules L70 et L62 présents\")'"
   echo "installé. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
@@ -797,6 +865,20 @@ redemarrer() {
     suivantes=()
     for p in "${restantes[@]}"; do
       st=$(statut "$p")
+      # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
+      # réactive pas.
+      # #1633 : son unité encore active est seulement rechargée sur le nouveau
+      # code, sans bail ni tour ; une unité déjà arrêtée n'est pas relancée.
+      if [ "$st" = stopped ]; then
+        if ssh_vm "systemctl is-active --quiet ameesh-runner@$p"; then
+          ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
+            || { echo "$p : unité d'une persona arrêtée, ne redémarre pas — journalctl -u ameesh-runner@$p -n 50" >&2; exit 1; }
+          echo "$p : arrêté dans le registre — unité redémarrée pour charger le nouveau code, aucun tour"
+        else
+          echo "$p : arrêté dans le registre — unité déjà arrêtée, rien à recharger"
+        fi
+        continue
+      fi
       if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
       # #502: only a runner that held its lease must take it again (bail.sh)
       ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
@@ -843,10 +925,12 @@ controler() {
 }
 
 retour() {
-  etape "retour au commit d'avant"
+  etape "retour au commit d'avant, par la bascule (sans pip)"
+  envoyer_bascule_vm
   ssh_vm "set -e; test -s $PRECEDENT
+    python3 $BASCULE_VM retour --venv $VENV
+    rm -f $BASCULE_VM
     git -C $SRC checkout -q --detach \"\$(cat $PRECEDENT)\"
-    $VENV/bin/pip install -q --force-reinstall --no-deps $SRC
     echo \"code : \$(git -C $SRC rev-parse --short HEAD)\""
   echo "base inchangée : les migrations passées avant l'installation sont additives, l'ancien code les ignore"
   redemarrer

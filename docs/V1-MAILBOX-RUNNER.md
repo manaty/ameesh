@@ -203,7 +203,11 @@ local files). The lease is the only authorization to run.
   that hangs (lock, slow query) is cancelled by the server; the `psql` driver
   adds a client delay (the same + 5 s) that abandons the subprocess if the
   server no longer responds at all. Migrations, for their part, lift the timeout for
-  the duration of their transaction (`SET LOCAL statement_timeout = 0`).
+  the duration of their transaction (`SET LOCAL statement_timeout = 0`) and bound their
+  wait for a table lock (`SET LOCAL lock_timeout = 5 s`; a migration that must wait
+  longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
+  lock fails in seconds and stays pending, instead of holding every reader and writer
+  of the table behind it.
 * **Robust heartbeat** — a database outage during a turn does not leave the
   harness running without a lease: the heartbeat counts failures
   (`max(3, ttl/3)` second interval), and stops the process as soon as the
@@ -307,11 +311,16 @@ test (three messages → three notifications) caught the bug.
   renewed as long as the session lives, the harness is killed if the lease is lost, and
   the lease is returned on exit.
 * **Priority interrupt (0018, R19)**: an undelivered message marked
-  `payload.urgent` from an **authorized sender** (`AMEESH_INTERRUPT_SENDERS`
-  without canon; the "interrupt" capability of a canon card will be added) stops the
+  `payload.urgent` from an **authorized sender** stops the
   running turn (brief SIGTERM then SIGKILL), puts the turn's prompt back as
   pending, and `pick()` serves the priority message **first** on the next turn,
-  on the same session. An urgent message from an unauthorized sender interrupts nothing
+  on the same session. Authorized senders (#795): the owner (`human:*`) always;
+  `ameesh` only for an event **verified in the database** (the end of CI of one
+  of the agent's work items — the run is recorded, the lot is assigned to the
+  agent, and the mail is the one CI posted for that run), so an imitated
+  `--from ameesh` does not interrupt; agents declared in
+  `AMEESH_INTERRUPT_SENDERS` (the "interrupt" capability of a canon card will be
+  added). An urgent message from an unauthorized sender interrupts nothing
   (this is logged): it is delivered like a message — since L125, without
   waiting for the batching window; the thread keeps a record of
   the interruption and its reason.
@@ -388,6 +397,20 @@ Hooks produce the **same JSON** as v0 (including the `Stop` decision
 and the cap of 3 nudges, counted locally in
 `~/.local/state/agent-mesh/hooks/<nom>.stops`): a test compares the output of the
 v0 script and that of v1 for the four events.
+
+**Fast path of the hooks and the status line (#1604).** The `agent-mail`
+console script goes through `ameesh.entry`, which serves `statusline` and
+`hook <harness>` without importing `ameesh.cli` (database, psycopg). A local
+mailbox marker (`<state_dir>/mail/<agent>.json`) records the outcome of the
+last COMPLETE read: a `PostToolUse` hook skips the database only when the
+marker is fresh (`AMEESH_HOOK_FAST_TTL`, 15 s by default) and says there is
+nothing to deliver. `Stop`, `SessionStart` and `UserPromptSubmit` always go
+through the database; a local send (`send`, `forward`, `sweep`) invalidates the
+recipient's marker; the status line is cached for a few seconds
+(`AMEESH_STATUSLINE_TTL`, 5 s). The fast path delivers no mail and writes no
+registry: it cannot confuse an identity or a session, at worst it delays a
+delivery, which the next complete pass (at the latest the `Stop` hook) catches
+up.
 
 **Identity tied to the lease, never to the directory (mesh-design incident of 2026-10-09).**
 A session only has an identity if `AGENT_MAIL_NAME` is set; if

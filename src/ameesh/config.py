@@ -40,6 +40,8 @@ import re
 import socket
 from dataclasses import dataclass, field, replace
 
+from . import dsn as dsn_mod
+
 #: DSN du banc local, **sans mot de passe** : le secret vient de PGPASSWORD ou
 #: de ~/.pgpass, ou d'un DSN complet dans AMEESH_DSN / le fichier de config.
 DEFAULT_DSN = "postgresql://agent_mesh@127.0.0.1:55432/agent_mesh"
@@ -186,6 +188,7 @@ class Config:
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
+    runner_liveness_interval: float = 60.0  # #508 : écriture groupée, au moins 60 s
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
@@ -299,6 +302,8 @@ class Config:
     #: withdrawal deadline when a `draining` state gives none (seconds); 0 =
     #: the offer's `drain_seconds` on a lending host, 90 otherwise
     host_gate_drain: float = 0.0
+    #: L159i: require the Linux guard heartbeat in a mediated VM's file gate.
+    host_gate_lending: bool = False
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -553,6 +558,9 @@ def load(env: dict | None = None) -> Config:
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
+        runner_liveness_interval=max(60.0, _as_float(
+            pick("AMEESH_RUNNER_LIVENESS_INTERVAL", "AGENT_MESH_RUNNER_LIVENESS_INTERVAL"),
+            cfg.runner_liveness_interval)),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
         mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
@@ -708,6 +716,8 @@ def load(env: dict | None = None) -> Config:
                                     default=cfg.host_gate_fallback) or "").strip().lower(),
         host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
                                     False, "AMEESH_HOST_MEDIATED")),
+        host_gate_lending=bool(_as_bool(pick("AMEESH_HOST_GATE_LENDING", default=cfg.host_gate_lending),
+                                       False, "AMEESH_HOST_GATE_LENDING")),
         host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
                                         int(cfg.host_gate_drain))),
     )
@@ -766,19 +776,26 @@ def _canons_from_file(raw: dict, where: str) -> dict:
             "extra_canons": tuple(entries[1:])}
 
 
+#: ce qu'un DSN affichable montre à la place de son mot de passe (L537)
+MASKED_PASSWORD = "password=***"
+
+
 def mask_dsn(dsn: str) -> str:
-    """DSN affichable : le mot de passe n'apparaît jamais dans un journal."""
-    if "://" in dsn:
-        head, rest = dsn.split("://", 1)
-        if "@" in rest:
-            creds, tail = rest.rsplit("@", 1)
-            user = creds.split(":", 1)[0]
-            return "%s://%s:***@%s" % (head, user, tail)
-        return dsn
-    out = []
-    for token in dsn.split():
-        if token.startswith("password="):
-            out.append("password=***")
-        else:
-            out.append(token)
-    return " ".join(out)
+    """DSN affichable : le mot de passe n'apparaît jamais dans un journal.
+
+    Le DSN sans son mot de passe est celui d'`ameesh.dsn.split_password`, qui
+    suit les règles de libpq : mot de passe de l'userinfo, paramètre
+    `password` de la requête, couples clé/valeur (blancs autour du `=`, valeurs
+    citées, échappements), dernière entrée gagnante. `MASKED_PASSWORD` marque
+    qu'il y en avait un ; un DSN que libpq refuserait s'affiche `<invalid DSN>`,
+    jamais cité. L'environnement (PGSERVICE) ne compte pas : on ne lit que le
+    DSN."""
+    try:
+        password, rest = dsn_mod.split_password(dsn, {})
+    except dsn_mod.DsnError:
+        return "<invalid DSN>"
+    if not password:
+        return rest
+    if rest.startswith(("postgresql://", "postgres://")):
+        return rest + ("&" if "?" in rest else "?") + MASKED_PASSWORD
+    return ("%s %s" % (rest, MASKED_PASSWORD)) if rest else MASKED_PASSWORD

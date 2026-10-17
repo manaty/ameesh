@@ -27,6 +27,7 @@ from ameesh.storage import interface as SI
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN_DIR = os.path.join(REPO, "tests", "golden", "mediated_executor")
+CONTRACT_FILE = os.path.join(REPO, "src", "ameesh", "mediated_executor", "contract.json")
 HINTS = typing.get_type_hints(SI.Storage)
 
 
@@ -55,6 +56,15 @@ def _schema(ann: str) -> dict:
             "dict": "object", "None": "null"}
     if ann in base:
         return {"type": base[ann]}
+    # #1482 : un TypedDict de l'interface déclare les champs de l'objet
+    cls = getattr(SI, ann, None)
+    if cls is not None and typing.is_typeddict(cls):
+        props = {}
+        for name, hint in cls.__annotations__.items():
+            if not isinstance(hint, str):        # TypedDict garde des ForwardRef
+                hint = getattr(hint, "__forward_arg__", None) or str(hint)
+            props[name] = _schema(hint)
+        return {"type": "object", "properties": props, "required": list(props)}
     m = re.fullmatch(r"(?:Sequence|list)\[(.+)\]", ann)
     if m:
         return {"type": "array", "items": _schema(m.group(1))}
@@ -93,8 +103,10 @@ class TableTest(unittest.TestCase):
     def test_comptes(self):
         ops = self.c.operations.values()
         # contrat 1.2 : expiration médiée des fils (#499, threads.recount)
-        self.assertEqual(len(self.c.operations), 65)
-        self.assertEqual(sum(o.write for o in ops), 40)
+        # contrat 1.1 : + operations.assigned_open_lots (lot du tour, #476)
+        #              + agents.runner_seen (preuve de vie, #508)
+        self.assertEqual(len(self.c.operations), 66)
+        self.assertEqual(sum(o.write for o in ops), 41)
         self.assertEqual(sum(not o.write for o in ops), 25)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
@@ -133,6 +145,11 @@ class TableTest(unittest.TestCase):
         self.assertFalse(admitted & refused)
         self.assertEqual(admitted | refused, _interface_ops())
         self.assertEqual(self.c.interface_total, len(_interface_ops()))
+        # #1517 : le total est dérivé ; un compteur réintroduit dans la table
+        # (résolution de fusion qui l'aurait gardé) redeviendrait la ligne que
+        # tous les lots se disputent.
+        with open(CONTRACT_FILE, encoding="utf-8") as fh:
+            self.assertNotIn("interface_total", json.load(fh)["refused"])
         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
 
     def test_les_compteurs_du_doc_suivent_le_contrat(self):
@@ -205,6 +222,23 @@ class EnveloppesTest(unittest.TestCase):
         self.assertEqual(covered, expected)
         ev = _golden("events.json")
         self.assertTrue(ev["sse"]["events"])
+
+    def test_objet_declare_par_proprietes(self):
+        # #1482-N1 : le schéma de `last` déclare ses champs et les applique
+        op = self.c.get("threads.recount")
+        last = next(p for p in op.params if p.name == "last")
+        self.assertEqual(last.schema["properties"]["entry_id"], {"type": "string"})
+        self.assertEqual(last.schema["required"],
+                         ["entry_id", "author", "excerpt", "ts", "mailbox_id"])
+        good = {"entry_id": "a#1", "author": "agent:a", "excerpt": "x", "ts": 1.5,
+                "mailbox_id": None}
+        self.assertTrue(C.conforms(good, last.schema))
+        self.assertTrue(C.conforms(None, last.schema))
+        for bad in ({k: v for k, v in good.items() if k != "ts"},   # champ requis absent
+                    dict(good, ts="hier"),                          # type faux
+                    dict(good, mailbox_id="12")):                   # type faux
+            with self.subTest(bad=bad):
+                self.assertFalse(C.conforms(bad, last.schema))
 
     def test_dores_conformes(self):
         for case in _op_cases():

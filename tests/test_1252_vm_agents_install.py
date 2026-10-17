@@ -52,7 +52,13 @@ command = command.replace('@@VMTMP@@', str(vmtmp))
 command = command.replace('$HOME/.config/ameesh/env', str(vmhome / '.config/ameesh/env'))
 with (state / 'ssh.log').open('a') as f:
     f.write(command.replace('\n', ' ') + '\n')
-sys.exit(subprocess.call(['bash', '-c', command], env=dict(os.environ, FAKE_REMOTE='1')))
+# Le poste doit voir le chemin de la VM (/tmp), pas le TMPDIR physique du
+# harnais : celui-ci peut contenir des caractères refusés côté distant (~).
+result = subprocess.run(['bash', '-c', command],
+                        env=dict(os.environ, FAKE_REMOTE='1'),
+                        stdout=subprocess.PIPE, text=True)
+sys.stdout.write(result.stdout.replace(str(vmtmp), '/tmp'))
+sys.exit(result.returncode)
 '''
 
 SCP = r'''#!/usr/bin/env python3
@@ -101,6 +107,9 @@ elif 'show' in args:
         print('{ path=/bin/runner ; argv[]=/bin/runner run --runner-id '
               'runner-' + unit.split('@')[1].removesuffix('.service') + '@host-agents ; }')
 elif 'is-active' in args:
+    # le marqueur ne vise que l'unité du runner : les autres restent actives
+    if (state / 'unit-inactive').exists() and 'ameesh-runner' in unit:
+        sys.exit(3)
     print('active')
 '''
 
@@ -112,8 +121,9 @@ import json, os, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
+# #1133 : chemin absolu, systemd-run n'étend pas %h
 assert args[:7] == ['--user', '--pipe', '--wait', '--quiet', '-p',
-                    'EnvironmentFile=%h/.config/ameesh/env', '--'], args
+                    'EnvironmentFile=%s/.config/ameesh/env' % os.environ['HOME'], '--'], args
 with (state / 'systemd-run.log').open('a') as f:
     f.write(' '.join(args) + '\n')
 env = dict(os.environ, **json.loads((state / 'expected-env.json').read_text()))
@@ -127,7 +137,10 @@ state = Path(os.environ['FAKE_STATE'])
 assert os.environ.get('FAKE_REMOTE') == '1', 'registry must be read on the host'
 scenario = (state / 'scenario').read_text().strip()
 agents = json.loads((state / 'agents.json').read_text())
-if sys.argv[1:] == ['list', '--json']:
+if sys.argv[1:] in (['--version'], ['version']):
+    # #1969 : le contrôle d'avant bascule interroge le point d'entrée.
+    print('ameesh 1.9.0 (fake)')
+elif sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error':
         sys.exit(1)
     print(json.dumps(agents))
@@ -179,13 +192,50 @@ with log.open('a') as f:
 fail_at = int((state / 'pip-fail-at').read_text()) if (state / 'pip-fail-at').exists() else 0
 if fail_at and len(log.read_text().splitlines()) >= fail_at:
     sys.exit('pip failure (test)')
-# Un pip réussi publie direct_url.json sur la source installée : le venv pointe
-# alors l'instantané même si l'installation s'arrête au pip suivant.
-info = (Path(os.environ['FAKE_VM_HOME'])
-        / '.local/share/ameesh/venv/lib/python3.11/site-packages/ameesh-1.9.0.dist-info')
+# Un pip réussi publie direct_url.json sur la source installée : le venv qui le
+# porte pointe alors l'instantané même si l'installation s'arrête au pip suivant.
+# #1969 : le pip d'un venv versionné écrit dans CE venv (son propre chemin),
+# pas dans le venv vivant qui ne reçoit plus jamais de pip.
+info = (Path(sys.argv[0]).resolve().parents[1]
+        / 'lib/python3.11/site-packages/ameesh-1.9.0.dist-info')
 if info.is_dir():
     (info / 'direct_url.json').write_text(json.dumps(
         {'url': Path(sys.argv[-1]).resolve().as_uri()}))
+'''
+
+# #1969 : le helper de bascule crée un venv versionné (`python3 -m venv`). Sous
+# ce banc, `python3` est ce stub : il fabrique un venv factice dont le python
+# répond aux sondes de base (DB_PYTHON), le pip est celui du harnais
+# (journalisé) et `ameesh` reste le stub du registre — avec les shebangs du venv
+# versionné, pour que la bascule n'assèche aucune commande. Toute autre
+# invocation va au vrai python (c'est lui qui exécute le helper).
+PYTHON3 = r'''#!@@SHEBANG@@
+import os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if argv[:2] == ['-m', 'venv'] and len(argv) >= 3:
+    dest = Path(argv[2])
+    (dest / 'bin').mkdir(parents=True)
+    (dest / 'lib/python3.11/site-packages/ameesh-1.9.0.dist-info').mkdir(parents=True)
+    python = dest / 'bin/python'
+    # `bin/python` : les sondes `-c` du harnais (DB_PYTHON) ; sinon il exécute le
+    # script reçu (c'est ce que fait le shebang `#!<venv>/bin/python` d'ameesh).
+    python.write_text('#!/usr/bin/env python3\n'
+                      'import os, sys\n'
+                      "if sys.argv[1:2] == ['-c']:\n"
+                      '    exec(compile(%r, %r, %r))\n'
+                      'else:\n'
+                      '    os.execv(%r, [%r] + sys.argv[1:])\n'
+                      % (@@DBPY@@, 'db-python', 'exec', @@PY@@, @@PY@@))
+    python.chmod(0o755)
+    pip = dest / 'bin/pip'
+    pip.write_text(@@PIP@@)
+    pip.chmod(0o755)
+    ameesh = dest / 'bin/ameesh'
+    ameesh.write_text(@@AMEESH@@.replace('#!/usr/bin/env python3', '#!%s' % python, 1))
+    ameesh.chmod(0o755)
+    sys.exit(0)
+os.execv(@@PY@@, [@@PY@@] + argv)
 '''
 
 
@@ -193,7 +243,8 @@ class VmAgentsHarness(unittest.TestCase):
     maxDiff = None
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1252-')
+        # Exerce aussi la séparation des chemins locaux/distants sur tout hôte.
+        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1252-~')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.state = self.root / 'state'
@@ -222,7 +273,13 @@ class VmAgentsHarness(unittest.TestCase):
         # a missing fake command would fail the test rather than reach the host.
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        (self.bin / 'python3').symlink_to(sys.executable)
+        (self.bin / 'python3').write_text(
+            PYTHON3.replace('@@SHEBANG@@', sys.executable)
+                   .replace('@@PIP@@', repr(PIP))
+                   .replace('@@DBPY@@', repr(DB_PYTHON))
+                   .replace('@@AMEESH@@', repr(AMEESH))
+                   .replace('@@PY@@', repr(sys.executable)))
+        (self.bin / 'python3').chmod(0o755)
         for name, text in [('ssh', SSH), ('scp', SCP), ('runuser', RUNUSER), ('id', ID),
                            ('systemctl', SYSTEMCTL), ('journalctl', JOURNALCTL),
                            ('sleep', SLEEP), ('systemd-run', SYSTEMD_RUN),
@@ -236,6 +293,10 @@ class VmAgentsHarness(unittest.TestCase):
         (self.venv / 'bin/python').chmod(0o755)
         (self.venv / 'bin/pip').chmod(0o755)
         (self.venv / 'bin/ameesh').chmod(0o755)
+        # #1969 : un venv réel porte son pyvenv.cfg ; la première conversion
+        # l'adopte (lib réutilisée) sans pip et exige cette pièce.
+        (self.venv / 'pyvenv.cfg').write_text(
+            'home = %s\n' % os.path.dirname(sys.executable))
         self.workhome = self.root / 'home'
         self.workhome.mkdir()
         config = self.root / 'bascule.env'
@@ -280,6 +341,10 @@ class VmAgentsHarness(unittest.TestCase):
         # (union composée) — le banc le copie à côté, comme bail.sh.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/paquet-git.sh',
                      self.origin / 'deploy/mise-a-jour/paquet-git.sh')
+        # #1969 : le helper de bascule est copié du poste vers la VM ; le banc
+        # l'installe dans son dépôt d'origine comme les autres pièces.
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/bascule.py',
+                     self.origin / 'deploy/mise-a-jour/bascule.py')
         shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
         (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
         (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')
@@ -331,7 +396,15 @@ class VmAgentsHarness(unittest.TestCase):
         return log.read_text().splitlines() if log.exists() else []
 
     def installed_url(self):
-        info = (self.venv / 'lib/python3.11/site-packages'
+        # #1969 : le venv stable porte les lanceurs ; le code servi est celui du
+        # venv versionné vivant (lien venv-courant), pas le lib d'origine
+        # conservé pour les processus déjà lancés.
+        vivant = self.venv
+        courant = self.parts / 'venv-courant'
+        if courant.is_symlink():
+            cible = os.readlink(courant)
+            vivant = Path(cible) if cible.startswith('/') else self.parts / cible
+        info = (vivant / 'lib/python3.11/site-packages'
                 / 'ameesh-1.9.0.dist-info/direct_url.json')
         return json.loads(info.read_text())['url']
 
@@ -381,6 +454,34 @@ class VmAgentsInstallTest(VmAgentsHarness):
         p = self.run_vm('installer', self.target)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertFalse((self.state / 'systemctl.log').exists())
+
+    def test_a_stopped_persona_active_unit_is_reloaded_into_the_new_code(self):
+        # #1131/#1633 : la persona arrêtée par le propriétaire n'est pas
+        # réactivée (aucun bail exigé, aucun tour), mais son unité encore
+        # active recharge le nouveau code — sinon une reprise ultérieure
+        # repartait sur l'ancienne version.
+        (self.state / 'agents.json').write_text(json.dumps([
+            dict(name='dev9', host='host-agents', mode='execute', status='idle'),
+            dict(name='old1', host='host-agents', mode='execute', status='stopped')]))
+        p = self.run_vm('redemarrer')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('restart ameesh-runner-agent@old1.service',
+                      (self.state / 'systemctl.log').read_text())
+        self.assertIn('old1 : arrêté dans le registre', p.stdout)
+        self.assertIn('nouveau code', p.stdout)
+        self.assertNotIn('old1 : redémarré (était', p.stdout)
+
+    def test_a_stopped_persona_inactive_unit_is_not_started(self):
+        # #1633 : unité déjà arrêtée — aucune relance : elle chargera le
+        # nouveau code à son démarrage.
+        (self.state / 'agents.json').write_text(json.dumps([
+            dict(name='old1', host='host-agents', mode='execute', status='stopped')]))
+        (self.state / 'unit-inactive').touch()
+        p = self.run_vm('redemarrer')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('restart ameesh-runner-agent@old1.service',
+                         (self.state / 'systemctl.log').read_text())
+        self.assertIn('déjà arrêtée', p.stdout)
 
     def test_install_refuses_when_previous_code_is_untraceable(self):
         self._src_containing_only(self.target)
@@ -710,9 +811,10 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(self.pip_calls(), [])
 
     def test_relaunching_install_keeps_the_original_recovery_target(self):
-        # A→B, le premier pip réussit puis le second échoue : le journal vaut A,
-        # mais direct_url.json pointe déjà B. Relancer installer ne doit pas
-        # prendre B pour cible de récupération ni écraser le journal.
+        # A→B, la préparation échoue : #1969 laisse la version ACTIVE intacte
+        # (direct_url.json pointe encore A, plus de pip dans le venv vivant).
+        # Relancer installer ne doit pas prendre B pour cible de récupération ni
+        # écraser le journal.
         plus_ancien = self.plus_ancien
         (self.parts / 'previous-sha').write_text(plus_ancien + '\n')
         (self.state / 'pip-fail-at').write_text('2\n')
@@ -720,7 +822,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(len(self.pip_calls()), 2)
         self.assertEqual(self.installed_url(),
-                         (self.parts / ('src-' + self.target[:7])).as_uri())
+                         (self.parts / ('src-' + self.old[:7])).as_uri())
         q = self.run_vm('installer', self.target)
         self.assertNotEqual(q.returncode, 0)
         self.assertIn('installation inachevée', q.stderr)
@@ -737,13 +839,14 @@ class VmAgentsInstallTest(VmAgentsHarness):
             self.assertNotIn('src-' + self.target[:7], call)
 
     def test_relaunching_first_install_keeps_the_recovery_journal(self):
-        # Même cas sans previous-sha : le journal seul porte la récupération.
+        # Même cas sans previous-sha : le journal seul porte la récupération, et
+        # la version active reste intacte après l'échec de préparation (#1969).
         (self.parts / 'previous-sha').unlink()
         (self.state / 'pip-fail-at').write_text('2\n')
         p = self.run_vm('installer', self.target)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(self.installed_url(),
-                         (self.parts / ('src-' + self.target[:7])).as_uri())
+                         (self.parts / ('src-' + self.old[:7])).as_uri())
         q = self.run_vm('installer', self.target)
         self.assertNotEqual(q.returncode, 0)
         self.assertEqual(len(self.pip_calls()), 2)
