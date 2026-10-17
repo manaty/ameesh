@@ -1277,6 +1277,18 @@ def radar_project(cfg, repo: str):
     return matching[0] if matching else None
 
 
+def declared_projects(cfg) -> dict:
+    """Declared radar projects; an agent without a radar profile keeps its
+    disposable clone, while an incompatible declared profile is refused.
+    Restores the qualified #1467 union d9a80c1a7 after #2120 transport.
+    """
+    from . import radar
+    try:
+        return dict(radar.settings_of(cfg).projects)
+    except radar.SettingsError as exc:
+        raise QueueError("cannot read repository landing conditions: %s" % exc) from exc
+
+
 def writer_project(cfg, repo: str, app: str = "", project=None):
     """The project identity a single-lot writer shares with the train (#1703).
 
@@ -1323,6 +1335,13 @@ def run(cfg, db, args) -> int:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
             project = radar_project(cfg, repo)
+            if (project is None and declared_projects(cfg)
+                    and plan_git._out(repo, "remote", "get-url", "origin")):
+                raise QueueError(
+                    "no radar project matches repository %s (source %s) in the loaded "
+                    "configuration: select the profile declaring radar.projects for this "
+                    "repository, including its land/protected conditions; --repo selects "
+                    "a local checkout, not a configuration profile" % (repo, source_of(repo)))
             clone, scratch = working_clone(cfg, repo, project)
             try:
                 row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
