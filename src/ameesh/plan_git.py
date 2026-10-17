@@ -1430,8 +1430,9 @@ def _hash_ref_doubt(repo: str, lot: int, row: dict, branch: str | None, target: 
     """#2260 : une citation `#<id>` dans le titre d'une fusion tient-elle ?
     None si oui ; sinon, en clair, les têtes du lot restées hors de `target`.
 
-    Preuve : le dernier gel ou la dernière tête vue en avance (`branch_head`)
-    est entré dans la cible (`probe` : ancêtre, patch-id, squash). Démenti,
+    Preuve : le dernier gel ou, sans gel, la dernière tête vue en avance
+    (`branch_head`) est entré dans la cible (`probe` : ancêtre, patch-id,
+    squash). Une ancienne tête livrée ne prouve pas un nouveau gel. Démenti,
     sans cette preuve : l'un d'eux n'y est pas, ou la branche du lot y a
     encore du travail absent (une PR ouverte non fusionnée, Nexlink #598).
     Un lot sans gel, sans tête vue ni branche en avance n'a rien qui démente
@@ -1440,7 +1441,7 @@ def _hash_ref_doubt(repo: str, lot: int, row: dict, branch: str | None, target: 
     if freeze_sha:
         heads.append(("the last freeze", freeze_sha))
     seen = (row.get("branch_head") or "").strip()
-    if seen and seen != freeze_sha:
+    if seen and not freeze_sha:
         heads.append(("the last head seen", seen))
     for _label, sha in heads:
         if probe(repo, sha, target, lot=lot)["merged"]:
@@ -1663,6 +1664,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
                      how=cited["how"], ref=cited["sha"],
                      detail=_citation(cited, lot, target),
                      note=_citation(cited, lot, target, sha=False))
+        if cited["how"] == "#id" and freeze and freeze.get("id") is not None:
+            # #2260 : le gel qui prouve la citation doit encore être le dernier.
+            found["frozen_id"] = int(freeze["id"])
     elif content is not None:
         found = content
     elif reverted is not None:

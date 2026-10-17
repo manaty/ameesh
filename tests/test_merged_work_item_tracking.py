@@ -26,7 +26,7 @@ import unittest
 from unittest import mock
 
 from ameesh import (assignments, exploitation, mail, plan_git, projects, registry,
-                    sous_utilisation, work)
+                    sous_utilisation, storage, work)
 
 from .support import PgTestCase, hold_for_owner
 
@@ -496,6 +496,43 @@ class MergeSweepTest(_Base):
         report = self.sync()
         self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "#id"))
         self.assertEqual(self.merged_milestone(n)["sha"], sha)
+
+    def test_diese_ancienne_tete_livree_ne_prouve_pas_le_nouveau_gel(self):
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        n = self.lot()["id"]
+        ancien = self.merge("feature/ancien", "ancienne livraison")
+        branch = "agent/nouveau-gel"
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("nouveau-gel")
+        nouveau = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        work.set_branch(self.db, n, branch, "develop", actor="orch")
+        storage.of(self.db).work.set_branch_head(n, branch, ancien)
+        work.milestone(self.db, n, "frozen", sha=nouveau, actor="ouvrier")
+        self.merge("feature/citation", "paquet : #%d" % n)
+        entry = self.sync()["results"][0]
+        self.assertEqual((entry["result"], entry["how"]), ("open", "unproven"))
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_diese_regel_concurrent_ne_ferme_pas(self):
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        n = self.lot()["id"]
+        livre = self.merge("feature/livre", "livraison : #%d" % n)
+        work.milestone(self.db, n, "frozen", sha=livre, actor="ouvrier")
+        _git(self.repo, "checkout", "-q", "-b", "agent/regel", "develop")
+        self.commit("regel")
+        nouveau = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        close = work.close_merged
+
+        def regeler(db, lot, **kw):
+            work.milestone(db, lot, "frozen", sha=nouveau, actor="ouvrier")
+            return close(db, lot, **kw)
+
+        with mock.patch.object(work, "close_merged", side_effect=regeler):
+            entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "refrozen")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
 
     def test_branche_implicite_en_avance_rapide(self):
         lot = self.lot()
