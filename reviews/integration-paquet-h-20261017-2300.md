@@ -1,8 +1,6 @@
 # Paquet integration/paquet-h-20261017-2300 — composition
 
-Base : `main` **`734a0825b`** (fusion de la PR #1690, paquet h-2000 ; parents
-`f8c8a4a08` × `f48593d8f`). La branche est composée directement sur cette base ; le diff
-de la PR ne porte que les 9 unités ci-dessous et ce manifeste.
+Base : `main` **`fde44e51c`** (release 1.11.6, coupure de 23:00 du 17/10, commit `[skip ci]` : `docs/versions/1.11.6.md` + `pyproject.toml`). La composition a d'abord été faite sur `734a0825b` (fusion de la PR #1690, paquet h-2000 ; parents `f8c8a4a08` × `f48593d8f`), puis la base a été mise à jour par un merge de `fde44e51c` après la coupure de release ; le diff de la PR ne porte que les 9 unités ci-dessous et ce manifeste.
 
 Tête de composition (9 unités) : **`854ea1e2d40b`** ; la tête de branche au gel, qui
 porte ce manifeste, est le SHA exact communiqué au pilote et couvert par l'unique suite
@@ -72,7 +70,8 @@ automatique propre, sans commit de résolution. Aucune adaptation de contenu rel
 
 ## Preuves
 
-- `git diff --check` sur `734a0825b..HEAD` : rc 0, aucun marqueur de conflit.
+- `git diff --check` sur `fde44e51c..HEAD` : rc 0, aucun marqueur de conflit.
+- Mise à jour de base après la coupure : merge `b0fc20ab1` de `fde44e51c` (release 1.11.6) dans la branche, rc 0, aucun conflit ; le différentiel des 9 unités est inchangé.
 - Seconds parents et trailers `ameesh-work` : 9/9 vérifiés.
 - `scripts/paquet-inclusion.py --manifest <ce fichier> --head <tête> --expected
   2261,1448,2253,2122,2252,2279,2240,1702,2182` : à rejouer sur la tête finale avant le
