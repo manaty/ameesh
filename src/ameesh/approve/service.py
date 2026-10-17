@@ -625,6 +625,12 @@ class ApproveService:
         requise AVANT tout affichage) ; `done` / `cancel` signent le reçu."""
         decision = self._assertion(body, ("view",) + LOGIN_FINAL_DECISIONS)
         record = self._live_login(token)
+        with self.store.login_transition(record["login_id"]):
+            # Une clôture peut avoir gagné depuis la première lecture.
+            record = self._live_login(token)
+            return self._login_submit(record, body, decision)
+
+    def _login_submit(self, record: dict, body, decision: str) -> dict:
         if decision == "done" and not self.store.login_viewed(record["login_id"]):
             raise ApproveError(409, "not_viewed",
                                "open the private view before signing done")

@@ -49,6 +49,8 @@ TERMINATE_GRACE_S = 5.0
 #: borne d'attente de la fin fournisseur (sortie propre du CLI) sur `done` :
 #: la santé n'est sondée qu'après une sortie 0, jamais après un SIGTERM
 PROVIDER_END_S = 30.0
+#: laisse revenir la publication HTTP (client : 15 s) pour clore son défi
+PUBLISH_CLOSE_S = 30.0
 #: sortie privée gardée en mémoire, jamais écrite sur disque
 CAPTURE_MAX = 64 * 1024
 #: pas d'attente des boucles de surveillance
@@ -367,6 +369,15 @@ class Registry:
                 setattr(request, name, value)
         return request
 
+    def published(self, request: Request, login_id: str, **fields) -> bool:
+        """Retient l'id distant même si l'annulation a gagné la publication."""
+        with self._lock:
+            request.login_id = login_id
+            if request.closing or request.state not in LIVE:
+                return False
+            self.touch(request, state=VIEWING, **fields)
+            return True
+
 
 class Supervisor:
     """Pilote un adaptateur : démarrage, flux privé, décision, santé.
@@ -516,13 +527,16 @@ class Supervisor:
     def close(self) -> None:
         """Arrête toutes nos connexions, même après un échec ou une interruption."""
         with self._lock:
-            held = set(self._procs) | {r.id for r in self.registry.live()}
+            held = set(self._procs) | set(self._threads) | {r.id for r in self.registry.live()}
         for request_id in held:
             request = self.registry.get(request_id)
             request.closing = True
             self._invalidate(request)
             self._terminate(request)
             self.registry.finish(request, CANCELLED, "cancelled")
+            thread = self._threads.get(request_id)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=PUBLISH_CLOSE_S)
 
     # -- interne -----------------------------------------------------------
     def _read(self, request: Request, adapter: Adapter, proc, approver: str,
@@ -598,8 +612,7 @@ class Supervisor:
         while proc.poll() is None and time.monotonic() < deadline:
             self.sleep(POLL_S)
         if proc.poll() == 0:  # sortie naturelle réussie, même à l'échéance
-            with self._lock:
-                self._procs.pop(request.id, None)
+            self._terminate(request)  # le chef sorti peut laisser des enfants
             return True
         self._terminate(request)
         return False
@@ -624,14 +637,12 @@ class Supervisor:
         if not re.fullmatch(r"lgn_[0-9a-z]{26}", login_id):
             self._fail(request, adapter, "failed", "challenge service answered an unreadable id")
             return
-        if request.closing or request.state not in LIVE:
-            return
-        self.registry.touch(request, state=VIEWING, login_id=login_id, scope=scope)
-        if link:
-            self.registry.touch(request, link=link)
+        fields = {"scope": scope, "link": link}
         exp = answer.get("exp")
         if isinstance(exp, int) and not isinstance(exp, bool) and exp > 0:
-            self.registry.touch(request, service_exp=exp)
+            fields["service_exp"] = exp
+        if not self.registry.published(request, login_id, **fields):
+            self._invalidate(request)
 
     def _fail(self, request: Request, adapter: Adapter, category: str,
               message: str) -> None:

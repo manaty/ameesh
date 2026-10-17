@@ -22,12 +22,13 @@ import stat
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from ameesh import receipts
 from ameesh.approve.config import ApproveConfig
 from ameesh.approve.config import ApproveConfig, ApproveConfigError
-from ameesh.approve.service import ApproveService
+from ameesh.approve.service import ApproveError, ApproveService
 from ameesh.approve.store import Store
 
 from .test_approve import AGENT, ALICE, ApproveBase
@@ -588,3 +589,58 @@ class LoginReservationRaceTest(unittest.TestCase):
         winner = results.index(True)
         self.assertTrue(stores[winner % 2].release_login(record(winner)))
         self.assertTrue(stores[(winner + 1) % 2].reserve_login(record(winner + 1), now=now))
+
+
+class LoginClosureRaceTest(unittest.TestCase):
+    """Ordres concurrents imposés, sans réseau, base ni attente d'horloge."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="l232d-close-race-")
+        self.addCleanup(directory.cleanup)
+        self.service = ApproveService(ApproveConfig(
+            state_dir=directory.name, public_url="https://approve.example.test"),
+            None, None, service_token="fake", clock=lambda: 1000)
+        self.service._credentials = lambda _approver: ["fake-credential"]
+        self.body = dict(host="h", provider="gh", account="a", approver=ALICE,
+                         requested_by=AGENT, url=URL, code=CODE)
+
+    def test_assertion_chargee_avant_cloture_ne_cree_pas_de_recu_apres(self):
+        service = self.service
+        first = service.create_login_request(self.body)
+        login_id = first["login_id"]
+        token = urlsplit(first["link"]).path.rsplit("/", 1)[1]
+        service.store.mark_login_viewed(login_id)
+        service._assertion = lambda _body, _decisions: "done"
+        service._login_receipt = lambda record, _body, decision: (
+            {"request": dict(record["request"], decision=decision)},
+            SimpleNamespace(ok=True, approver=ALICE))
+        live = service._live_login
+        successor = []
+
+        def close_after_read(value):
+            record = live(value)
+            service.close_login(login_id)
+            successor.append(service.create_login_request(self.body))
+            service._live_login = live
+            return record
+
+        service._live_login = close_after_read
+        with self.assertRaises(ApproveError) as caught:
+            service.login_submit(token, {})
+        self.assertEqual((caught.exception.status, caught.exception.code), (410, "closed"))
+        self.assertFalse(service.store.has_login_receipt(login_id))
+        self.assertEqual(service.login_receipt(login_id)[0], 410)
+        self.assertEqual(service.login_receipt(successor[0]["login_id"])[0], 202)
+
+    def test_cloture_tardive_ancienne_ne_libere_pas_le_successeur(self):
+        service = self.service
+        first = service.create_login_request(self.body)
+        service.close_login(first["login_id"])
+        successor = service.create_login_request(self.body)
+        service.close_login(first["login_id"])
+        with self.assertRaises(ApproveError) as caught:
+            service.create_login_request(self.body)
+        self.assertEqual((caught.exception.status, caught.exception.code),
+                         (409, "already_pending"))
+        self.assertEqual(service.login_receipt(successor["login_id"])[0], 202)
+        self.assertIsNotNone(service.store.login_private(successor["login_id"]))

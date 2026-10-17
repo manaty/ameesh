@@ -503,6 +503,37 @@ class SupervisorTest(FakeCliTest):
         self.assertEqual((done.state, done.category), (login.CANCELLED, "cancelled"))
 
 
+class SupervisorClosureRaceTest(unittest.TestCase):
+    def test_publication_revenue_apres_annulation_est_invalidee(self):
+        invalidated = []
+        sup = login.Supervisor(invalidate=lambda request: invalidated.append(request.login_id))
+        request = sup.registry.open(host="h", harness="gh", account="a")
+        remote_id = "lgn_" + "a" * 26
+
+        def publish(_payload):
+            sup.finish(request.id, "cancel")
+            return {"login_id": remote_id, "link": "https://approve.example/login/fake"}
+
+        sup.publish = publish
+        sup._publish(request, login.ADAPTERS["gh"], login.Flow(url="https://github.com/login/device",
+                     code="FAKE-1234"), "human:alice", "agent:test", "")
+        self.assertEqual((request.state, request.category), (login.CANCELLED, "cancelled"))
+        self.assertEqual(invalidated, [remote_id])
+        self.assertEqual(request.link, "")
+
+    def test_done_nettoie_le_groupe_apres_sortie_reussie_du_chef(self):
+        sup = login.Supervisor(health=lambda _request: "healthy", grace=0)
+        request = sup.registry.open(host="h", harness="gh", account="a")
+        proc = mock.Mock(pid=424242)
+        proc.poll.return_value = 0
+        sup._procs[request.id] = proc
+        with mock.patch.object(login.os, "killpg") as kill:
+            done = sup.finish(request.id, "done")
+        self.assertEqual(done.category, "healthy")
+        kill.assert_any_call(proc.pid, login.signal.SIGTERM)
+        kill.assert_any_call(proc.pid, login.signal.SIGKILL)
+
+
 class ReceiptTest(unittest.TestCase):
     @staticmethod
     def request(**overrides):

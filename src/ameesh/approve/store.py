@@ -361,6 +361,15 @@ class Store:
             except FileNotFoundError:
                 return False
 
+    def login_transition(self, login_id: str):
+        """Sérialise assertion et clôture sur un verrou stable du défi.
+
+        Distinct du verrou du tuple : écrire un reçu libère ce dernier.
+        """
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            raise ValueError("login_id invalide")
+        return self._login_live_lock(self._path("login-closed", login_id))
+
     def close_login(self, login_id: str) -> bool:
         """Clôture TECHNIQUE : marque clos, efface le privé, libère la place.
 
@@ -372,9 +381,10 @@ class Store:
         record = self.get_login(login_id)
         if record is None:
             return False
-        written = self._write(self._path("login-closed", login_id), b"1", exclusive=True)
-        self.drop_login_private(login_id)
-        self.release_login(record)
+        with self.login_transition(login_id):
+            written = self._write(self._path("login-closed", login_id), b"1", exclusive=True)
+            self.drop_login_private(login_id)
+            self.release_login(record)
         return written
 
     def login_closed(self, login_id: str) -> bool:
