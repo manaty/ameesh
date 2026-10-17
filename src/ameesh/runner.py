@@ -7749,7 +7749,7 @@ class Runner:
                        if worker.is_alive() and getattr(worker, "proc", None) is not None}
         return en_tour | self.background.agents()
 
-    def housekeeping_once(self) -> dict | None:
+    def housekeeping_once(self, *, min_interval_s: float = 0.0) -> dict | None:
         """Un passage de ménage (L73) ; ne lève jamais.
 
         Les caches partagés ne sont évincés que si aucun tour de cet hôte ne
@@ -7761,7 +7761,7 @@ class Runner:
         if not lock.acquire(blocking=False):
             return None
         try:
-            return self._housekeeping_pass()
+            return self._housekeeping_pass(min_interval_s=min_interval_s)
         finally:
             lock.release()
 
@@ -7795,7 +7795,7 @@ class Runner:
         threading.Thread(target=passage, daemon=True, name="menage-tmpfs").start()
         return True
 
-    def _housekeeping_pass(self) -> dict | None:
+    def _housekeeping_pass(self, *, min_interval_s: float = 0.0) -> dict | None:
         from . import menage as menage_mod
         from . import build_artifacts
         from . import resources as resources_mod
@@ -7812,6 +7812,7 @@ class Runner:
                 self.cfg, db, self.housekeeping_policy(), host=self.host,
                 actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
                 runtime=self.container_runtime(),
+                min_interval_s=min_interval_s,
                 # L230: the worktrees are walked at most every few hours
                 artifact_scan=build_artifacts.due(time.time()))
             self.expire_threads_once(db)
@@ -8123,7 +8124,8 @@ class Runner:
 
     def start_housekeeping_poll(self) -> None:
         """Passage périodique du ménage (`AMEESH_HOUSEKEEPING_INTERVAL`, défaut
-        600 s ; 0 = aucun). En mode `--once`, aucun passage périodique."""
+        600 s ; 0 = aucun). Premier passage décalé entre exécuteurs ; cadence
+        partagée par hôte. En mode `--once`, aucun passage périodique."""
         interval = max(0.0, float(getattr(self.cfg, "housekeeping_interval", 0) or 0))
         if getattr(self, "mediated", False) and not self.once:
             self._start_thread_expiry_notice()
@@ -8131,8 +8133,12 @@ class Runner:
             return  # exécuteur médié : pas de base, pas de ménage local (contrat 1.1)
 
         def boucle() -> None:
-            while not self.stop.wait(max(30.0, interval)):
-                self.housekeeping_once()
+            import random
+            period = max(30.0, interval)
+            delay = period + random.uniform(0.0, period)
+            while not self.stop.wait(delay):
+                self.housekeeping_once(min_interval_s=period)
+                delay = period
 
         threading.Thread(target=boucle, daemon=True, name="menage").start()
 
