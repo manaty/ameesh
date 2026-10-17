@@ -810,6 +810,34 @@ class BriefDeLotTest(_Base):
         self.assertNotIn("Previous session", text)
         self.assertNotIn("Work items assigned to you", text)
 
+    def test_brief_ne_dit_pas_put_aside_quand_rien_n_est_garde(self):
+        """#2242 : `_switch_lot` peut ne rien garder (lot courant fini ou
+        réassigné) ; le brief d'une session neuve ne doit alors pas annoncer
+        que sa session est de côté."""
+        from ameesh import reprise
+        runner, lease = self.bail("b2")
+        worker = AgentWorker(runner, registry.get(self.db, "b2"), lease)
+        a = work.add(self.db, title="Le lot du brief", assignee="b2")["id"]
+        try:
+            with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
+                worker._lot_brief(str(a), "999", {"parked": None})
+            consigne = brief.call_args.kwargs["consigne"]
+            self.assertNotIn("is put aside and will be resumed", consigne)
+            self.assertIn("no session of lot #999 was put aside", consigne)
+            self.assertNotIn("it is finished or no longer assigned", consigne)
+            with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
+                worker._lot_brief(str(a), "999", {"parked": "sess-999"})
+            consigne = brief.call_args.kwargs["consigne"]
+            self.assertIn("the one of lot #999 is put aside", consigne)
+            self.assertNotIn("no session of lot #999 was put aside", consigne)
+            with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
+                worker._lot_brief(str(a), "", {})
+            consigne = brief.call_args.kwargs["consigne"]
+            self.assertIn("no session was put aside", consigne)
+            self.assertNotIn("lot # was put aside", consigne)
+        finally:
+            worker.watchdog_stop.set()
+
     def test_branche_qui_commence_par_un_tiret_n_est_pas_une_option_git(self):
         """N2 (revue Claude du 14/10) : `branch`/`branch_target` viennent de la
         base (`work.set_branch` les valide, mais la colonne peut être écrite

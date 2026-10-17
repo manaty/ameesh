@@ -2429,19 +2429,33 @@ class AgentWorker(threading.Thread):
             from . import reprise, work as work_mod
             item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
             branche = (item or {}).get("branch")
-            # #2055 : sans lot courant (reprise d'une session mise de côté hors
-            # bascule), il n'y a pas d'autre lot à citer.
-            autres = (" Your other lots keep their own sessions (the one of lot #%s is "
-                      "put aside and will be resumed when feedback arrives on it): work "
-                      "only on lot #%s here, in its own worktree and branch." % (courant, lot)
-                      if courant else
-                      " Work only on lot #%s here, in its own worktree and branch." % lot)
+            # #2055 : sans session active, aucun autre lot à citer ; #2242 :
+            # ne dire « put aside » que si la bascule a réellement gardé une
+            # session, et jamais avec un numéro de lot vide.
+            if courant:
+                aside = ("the one of lot #%s is put aside and will be resumed when "
+                         "feedback arrives on it" % courant
+                         if out.get("parked") else
+                         "no session of lot #%s was put aside" % courant)
+                autres = (" Your other lots keep their own sessions (%s): work only "
+                          "on lot #%s here, in its own worktree and branch."
+                          % (aside, lot))
+                consigne = ("This session is dedicated to lot #%s%s.%s This turn's "
+                            "instruction follows this brief."
+                            % (lot, " (branch %s)" % branche if branche else "",
+                               autres))
+            else:
+                constat = ("a session was put aside" if out.get("parked")
+                           else "no session was put aside")
+                consigne = ("This session is dedicated to lot #%s%s: %s. Work only "
+                            "on lot #%s here, in its own worktree and branch. This "
+                            "turn's instruction follows this brief."
+                            % (lot, " (branch %s)" % branche if branche else "",
+                               constat, lot))
             return reprise.lot_brief(
                 self.cfg, self.db, self.agent, lot,
                 reason="new session dedicated to lot #%s" % lot,
-                consigne="This session is dedicated to lot #%s%s.%s This turn's "
-                         "instruction follows this brief." % (
-                             lot, " (branch %s)" % branche if branche else "", autres))
+                consigne=consigne)
         except Exception as exc:  # un brief manquant n'empêche pas la bascule
             log_async("[%s] lot brief unavailable (%s)" % (self.name, exc))
             return None
