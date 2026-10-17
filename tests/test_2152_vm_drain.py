@@ -68,6 +68,15 @@ if action == 'resume' and sys.argv[2:] == ['--help']:
     else:
         print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
     sys.exit(0)
+if action == 'pause' and sys.argv[2:] == ['--help']:
+    # #2184/R3 : sans --not-after, la pose ne porte pas de barrière ; le
+    # script doit refuser de drainer. Le drapeau simule un CLI antérieur.
+    if (state / 'sans-not-after').exists():
+        print('usage: ameesh pause AGENT --reason R [--human H] [--json]')
+    else:
+        print('usage: ameesh pause AGENT --reason R [--human H] '
+              '[--not-after EPOCH] [--json]')
+    sys.exit(0)
 if action == 'show':
     paused = pause.exists()
     # #2152 : l'agent enchaîne les tours tant qu'il n'est pas drainé ; drainé,
@@ -158,7 +167,7 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         # #2152 / R1 B1 : la levée est conditionnée au motif exact de la pose.
         pose = [l for l in journal.splitlines() if l.startswith('pause dev9')][0]
         reprise = [l for l in journal.splitlines() if l.startswith('resume dev9')][0]
-        motif = pose.split('--reason ', 1)[1]
+        motif = pose.split('--reason ', 1)[1].split(' --human ', 1)[0]
         self.assertIn('--expect-reason ' + motif, reprise)
         self.assertIn('drain posé', p.stdout)
         self.assertIn('drain levé (redémarrage hors tour)', p.stdout)

@@ -45,7 +45,7 @@ assert sys.argv[1:4] == ['-u', 'ameesh', '--'], sys.argv
 os.execvp(sys.argv[4], sys.argv[4:])
 '''
 AMEESH = r'''#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, subprocess, sys, time
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 assert os.environ.get('FAKE_REMOTE') == '1', 'registry must be read on the host'
@@ -62,6 +62,14 @@ if sys.argv[1:] == ['resume', '--help']:
         print('usage: ameesh resume ... --operator --reason R')
     else:
         print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
+    sys.exit(0)
+if sys.argv[1:] == ['pause', '--help']:
+    # #2184/R3 : sans --not-after, la pose n'a pas de barrière ; le script
+    # désactive le drain plutôt que de poser sans échéance.
+    if (state / 'sans-not-after').exists():
+        print('usage: ameesh pause AGENT --reason R [--human H] [--json]')
+    else:
+        print('usage: ameesh pause AGENT --reason R [--not-after EPOCH] [--json]')
     sys.exit(0)
 if sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error': sys.exit(1)
@@ -126,11 +134,20 @@ elif sys.argv[1] == 'show':
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
-    # #2184 R orchestrateur B1 : la pause expirée côté client aboutit côté
-    # serveur juste après la relecture, qui l'a vue absente.
-    tardive = state / ('pause-tardive-' + name)
-    if scenario == 'pause-expiree-tardive' and tardive.exists() and (state / 'resume-seen').exists():
-        motif.write_text(tardive.read_text()); pause.touch(); tardive.unlink()
+    # #2184/R3 : un créateur tardif indépendant (systemd-run retardé) rejoue
+    # la pose APRÈS la relecture. La base doit la refuser au-delà de
+    # --not-after ; sinon la pause resterait orpheline. Aucun stop ne règle
+    # cette pose : le stub ne suppose plus la propriété qu'il faut prouver.
+    if scenario == 'pause-expiree-tardive' and (state / 'resume-seen').exists() \
+            and (state / ('motif-tardif-' + name)).exists() \
+            and not (state / 'createur-tardif-fait').exists():
+        (state / 'createur-tardif-fait').touch()
+        echeance = (state / ('echeance-' + name)).read_text().strip()
+        subprocess.run(
+            [sys.argv[0], 'pause', name,
+             '--reason', (state / ('motif-tardif-' + name)).read_text(),
+             '--not-after', echeance, '--json'],
+            env=dict(os.environ), capture_output=True, text=True)
 elif sys.argv[1] in ('pause', 'resume'):
     if sys.argv[1] == 'resume': (state / 'resume-seen').touch()
     # #2152 : les gestes du drain, avec le « changed » que lit le script.
@@ -142,6 +159,21 @@ elif sys.argv[1] in ('pause', 'resume'):
         f.write('%s %s %s\n' % (sys.argv[1], name, ' '.join(args)))
     if '--reason' not in args: sys.exit(2)
     if sys.argv[1] == 'pause':
+        # #2184/R3 : la base refuse une pose au-delà de --not-after. Le banc
+        # compare à l'horloge injectée (HORLOGE_FICHIER) quand elle est posée.
+        echeance = None
+        if '--not-after' in args:
+            echeance = float(args[args.index('--not-after') + 1])
+        hf = os.environ.get('HORLOGE_FICHIER')
+        maintenant = float(Path(hf).read_text()) if hf and Path(hf).exists() else time.time()
+        if echeance is not None and maintenant >= echeance:
+            with (state / 'refus-tardif.log').open('a') as f:
+                f.write('%s not_after\n' % name)
+            print(json.dumps({'agent': name, 'mode': 'execute',
+                              'operator_paused': pause.exists(),
+                              'changed': False, 'event_id': None,
+                              'refusal': 'not_after'}))
+            sys.exit(0)
         if scenario == 'chaines-pause-error': sys.exit(1)
         if scenario == 'drain-refuse-identite':
             # Geste d'opérateur refusé : vm.sh tourne dans une session liée à
@@ -151,7 +183,10 @@ elif sys.argv[1] in ('pause', 'resume'):
             sys.exit(1)
         if scenario == 'pause-expiree-tardive':
             # Timeout de l'appel (rc 124) : la pose n'est pas encore commitée.
-            (state / ('pause-tardive-' + name)).write_text(args[args.index('--reason') + 1])
+            # Le créateur tardif rejouera cette commande avec la même échéance.
+            (state / ('motif-tardif-' + name)).write_text(args[args.index('--reason') + 1])
+            if echeance is not None:
+                (state / ('echeance-' + name)).write_text(str(echeance))
             sys.exit(124)
         if scenario == 'pause-perdue-sans-pose':
             # R1 B2 : réponse perdue, la pose n'a PAS abouti.
@@ -203,15 +238,8 @@ unit = args[-1]
 with (state / 'units.log').open('a') as f: f.write(' '.join(args) + '\n')
 scenario = (state / 'scenario').read_text()
 if 'stop' in args:
-    # #2184/B1 : l'arrêt ordonné de l'unité de pause. Dans le pire cas la
-    # pause a commité juste avant l'arrêt : on la matérialise pour que la
-    # reprise conditionnelle la lève. L'autre cas (unité encore en file) est
-    # l'annulation, couvert par la variante sans fichier tardif.
-    for tardive in state.glob('pause-tardive-*'):
-        name = tardive.name.removeprefix('pause-tardive-')
-        (state / ('pause-' + name)).touch()
-        (state / ('motif-' + name)).write_text(tardive.read_text())
-        tardive.unlink()
+    # #2184/R3 : le stop n'est plus une preuve. Le banc ne matérialise plus
+    # les poses tardives ici : un créateur indépendant les rejoue après coup.
     sys.exit(0)
 if 'restart' in args:
     if scenario == 'restart-error': sys.exit(1)
@@ -278,6 +306,16 @@ SLEEP = ('#!/bin/sh\n'
          'fi\n'
          'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
 
+#: #2184/R3 : l'échéance absolue remise à la base suit l'horloge injectée,
+#: comme le faux CLI qui la compare. Sans fichier d'horloge, date réelle.
+DATE = ('#!/bin/sh\n'
+        'if [ -n "${HORLOGE_FICHIER:-}" ] && [ -r "$HORLOGE_FICHIER" ] '
+        '&& [ "$1" = +%%s ]; then\n'
+        '  cat "$HORLOGE_FICHIER"\n'
+        '  exit 0\n'
+        'fi\n'
+        'exec %s "$@"\n') % (shutil.which('date') or '/bin/date')
+
 
 class AgentHostTest(unittest.TestCase):
     def setUp(self):
@@ -294,7 +332,7 @@ class AgentHostTest(unittest.TestCase):
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
                              ('systemctl', SYSTEMCTL), ('systemd-run', SYSTEMD_RUN), ('db-python', DB_PYTHON), ('sleep', SLEEP),
-                             ('id', '#!/bin/sh\necho 1001\n'),
+                             ('date', DATE), ('id', '#!/bin/sh\necho 1001\n'),
                              ('journalctl', '#!/bin/sh\nexit 0\n')]:
             path = self.bin / name; path.write_text(source); path.chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), BASCULE_ENV=str(self.config),
@@ -408,7 +446,7 @@ class AgentHostTest(unittest.TestCase):
         # #2152 / R1 B1 : la levée est conditionnée au motif exact de la pose.
         pose = [l for l in journal.splitlines() if l.startswith('pause dev9')][0]
         reprise = [l for l in journal.splitlines() if l.startswith('resume dev9')][0]
-        motif = pose.split('--reason ', 1)[1]
+        motif = pose.split('--reason ', 1)[1].split(' --human ', 1)[0]
         self.assertIn('--expect-reason ' + motif, reprise)
         # Posé avant le redémarrage, et redémarré seulement hors tour.
         self.assertLess(p.stdout.index('drain posé'), p.stdout.index('dev9 : redémarré'))
@@ -481,25 +519,73 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('resume dev9 --operator', self.operateur())
         self.assertIn('--expect-reason', self.operateur())
 
-    def test_timed_out_pause_committed_late_is_still_lifted(self):
-        """#2184 R orchestrateur B1 : un appel pause expiré (rc 124) peut
-        aboutir après la relecture ; l'unité est arrêtée de façon ordonnée
-        avant la reprise, qui lève la pause si elle a commité."""
+    def test_timed_out_pause_cannot_commit_after_the_deadline(self):
+        """#2184/R3 B1 : un appel pause expiré (rc 124) peut encore créer son
+        unité après le stop et la dernière lecture. Le créateur tardif rejoue
+        la pose APRÈS la reprise : la barrière d'échéance côté base la refuse,
+        sans événement ni pause orpheline. Le stop reste un meilleur effort."""
         self.env['DRAIN_ATTENTE'] = '1'
         self.env['ATTENTE_MAX'] = '2'
         (self.state / 'horloge').write_text('0')
         self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='pause-expiree-tardive')
         self.assertNotEqual(p.returncode, 0)
-        self.assertFalse((self.state / 'pause-tardive-dev9').exists())
+        # Le créateur tardif a bien exécuté sa pose après le nettoyage…
+        self.assertTrue((self.state / 'createur-tardif-fait').exists())
+        # … et la base l'a refusée : aucune pause, aucun événement.
+        self.assertEqual((self.state / 'refus-tardif.log').read_text().strip(),
+                         'dev9 not_after')
+        self.assertFalse((self.state / 'pause-dev9').exists())
         self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
-        # La pose porte un nom d'unité stable, et l'arrêt ordonné est émis
-        # avant la reprise : c'est lui qui ferme la fenêtre de commit tardif.
+        # La pose porte un nom d'unité stable ; son arrêt ordonné reste tenté
+        # avant la relecture, mais c'est l'échéance qui prouve l'absence de
+        # commit tardif.
         self.assertIn('--unit=ameesh-drain-', (self.state / 'systemd-run.log').read_text())
         self.assertIn('stop ameesh-drain-', self.units())
         self.assertIn('resume dev9 --operator', self.operateur())
         self.assertIn('--expect-reason', self.operateur())
+
+    def test_cli_without_not_after_never_poses_a_drain(self):
+        """#2184/R3 : un CLI cible sans --not-after ne peut pas porter la
+        barrière ; le drain est désactivé plutôt que posé sans échéance."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        (self.state / 'sans-not-after').touch()
+        p = self.run_vm(scenario='chaines')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('drain #2152 indisponible', p.stderr)
+        self.assertIn('--not-after', p.stderr)
+        self.assertIn('toujours en tour', p.stderr)
+        self.assertNotIn('pause dev9', self.operateur())
         self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_pause_creation_delayed_past_stop_unknown_is_not_orphaned(self):
+        """Stop d'une unité absente ne ferme pas une création encore retardée.
+
+        Le client a expiré avant que StartTransientUnit ait été traité. Le
+        stop reçoit 5 (unité inconnue), puis la pose peut encore aboutir après
+        la dernière lecture du cleanup, comme dans le témoin B1 initial.
+        Témoin de mesh-design (bac8a0d0), vert avec l'échéance côté base.
+        """
+        ctl = self.bin / 'systemctl'
+        ctl.write_text(ctl.read_text().replace(
+            "if 'stop' in args:\n",
+            "if 'stop' in args and scenario == 'pause-expiree-tardive':\n"
+            "    sys.exit(5)  # aucune unité enregistrée à cet instant\n"
+            "if 'stop' in args:\n", 1))
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        p = self.run_vm(scenario='pause-expiree-tardive')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('stop ameesh-drain-', self.units())
+        self.assertIn('resume dev9 --operator', self.operateur())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertFalse((self.state / 'pause-dev9').exists(),
+                         'une création tardive après stop=5 laisse une pause orpheline')
 
     def test_operator_gesture_refused_in_an_agent_session_stops_safely(self):
         """Périmètre annoncé : le drain est un geste d'opérateur. Un refus
