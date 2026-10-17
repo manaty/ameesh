@@ -2,6 +2,8 @@
 """Host housekeeping is shared by runners; retained paths need no Git scan."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -51,10 +53,39 @@ class HostPassTest(unittest.TestCase):
         with mock.patch.object(housekeeping, "_run_pass", return_value={}) as run:
             self.passage(now=1000, min_interval_s=600)
             skipped = self.passage(now=1001, min_interval_s=600)
+            self.assertEqual(skipped["status"], "skipped")
             self.assertIn("already ran", skipped["skipped"][0])
             run.assert_called_once()
             self.passage(now=1600, min_interval_s=600)
         self.assertEqual(run.call_count, 2)
+
+    def test_a_skipped_pass_prints_skipped_never_executed_or_dry_run(self):
+        """#2173: the host lock skipped the pass, so nothing ran and nothing
+        is "nothing to do" — the concurrent pass is doing the work."""
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                seen = {}
+
+                def during_first(*args, **kwargs):
+                    report = self.passage(dry_run=dry_run)
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        housekeeping.print_report(report)
+                    seen["report"], seen["text"] = report, out.getvalue()
+                    return {"entries": []}
+
+                with mock.patch.object(housekeeping, "_run_pass",
+                                       side_effect=during_first):
+                    self.passage()
+                self.assertEqual(seen["report"]["status"], "skipped")
+                self.assertEqual(seen["report"]["skipped"],
+                                 ["another housekeeping pass is running on this host"])
+                self.assertEqual(
+                    seen["text"],
+                    "housekeeping of pc — skipped — another housekeeping pass is "
+                    "running on this host\n")
+                for lie in ("executed", "nothing to do", "DRY RUN"):
+                    self.assertNotIn(lie, seen["text"])
 
     def test_pass_exclusion_is_visible_in_another_process(self):
         script = """

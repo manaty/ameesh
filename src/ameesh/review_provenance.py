@@ -197,13 +197,16 @@ def resolve_commit(value, *, cwd: str | None = None) -> str | None:
 
     Rend None quand `git` ne résout pas — jamais une supposition : la preuve
     exige le commit complet, et une abréviation ambiguë ou inconnue laisse
-    l'origine inconnue."""
+    l'origine inconnue. `--end-of-options` borne la valeur : même si elle
+    commence par `-`, elle reste une révision, jamais une option de `git`
+    (N2 de la relecture Claude de #1465)."""
     text = str(value or "").strip()
     if not text:
         return None
     try:
         run = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", text + "^{commit}"],
+            ["git", "rev-parse", "--verify", "--quiet", "--end-of-options",
+             text + "^{commit}"],
             capture_output=True, text=True, cwd=cwd or os.getcwd(), timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -478,17 +481,26 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
                            cwd: str | None = None) -> dict | None:
     """L'identité exacte du tour courant, ou None si le fait n'y est pas déclaré.
 
-    None couvre trois cas, tous « origine inconnue » : pas de tour managé
+    None couvre quatre cas, tous « origine inconnue » : pas de tour managé
     (`AMEESH_TURN_ID` absent), pas de session vivante au registre pour l'acteur,
-    ou un `sha` déclaré que le dépôt ne résout pas. Un jalon hors tour s'écrit
-    donc sans preuve — jamais avec une preuve devinée."""
+    un `sha` déclaré qui n'est pas une abréviation hexadécimale (`HEAD`, nom de
+    branche), ou un `sha` hexadécimal que le dépôt ne résout pas. Un jalon hors
+    tour — ou dont le `sha` n'est pas un commit lisible — s'écrit donc sans
+    preuve, jamais avec une preuve que `receipt_for_milestone` devrait ensuite
+    refuser à jamais (N1 de la relecture Claude de #1465)."""
     try:
         ident = capture(actor=actor)
         ident["session"] = live_session(db, ident["actor"], harness=ident["harness"])
     except ProvenanceError:
         return None
-    declared = str(sha or "").strip()
+    declared = str(sha or "").strip().lower()
     if declared:
+        # La preuve porte le commit COMPLET, mais le fait (`work_item_milestones`)
+        # garde le sha DÉCLARÉ : `receipt_for_milestone` les compare et refuse
+        # une valeur non hexadécimale. On n'écrit donc aucune preuve pour un nom
+        # symbolique — le jalon reste lisible, son origine inconnue.
+        if not ABBREV.fullmatch(declared):
+            return None
         full = resolve_commit(declared, cwd=cwd)
         if full is None:
             return None
@@ -601,6 +613,13 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
 #: `pre-commit` atteste le commit qui vient (identité du tour, HEAD et arbre de
 #: départ) ; `post-commit` constate le fait de création de l'objet né, puis
 #: écrit la preuve en consommant les deux.
+#:
+#: Chaque hook porte une ligne de signature EXACTE : `_install_one` ne reconnaît
+#: un hook comme le nôtre que sur cette ligne entière (ou sur un contenu
+#: identique), jamais sur la seule mention « ameesh #1465 » — un hook étranger
+#: qui la cite ne doit pas être écrasé (N4 de la relecture Claude de #1465).
+PRE_COMMIT_MARK = "# ameesh #1465 — attestation de creation du commit, avant qu'il naisse."
+POST_COMMIT_MARK = "# ameesh #1465 — fait de creation de l'objet ne, puis preuve d'origine."
 PRE_COMMIT_HOOK = """#!/bin/sh
 # ameesh #1465 — attestation de creation du commit, avant qu'il naisse.
 # Ne bloque jamais un commit : hors tour manage ou sans ameesh, sort 0.
@@ -621,19 +640,33 @@ exit 0
 """
 
 
-def _install_one(path: str, content: str) -> dict:
-    """Pose un hook ; un hook ÉTRANGER n'est jamais écrasé."""
+def _install_one(path: str, content: str, marker: str) -> dict:
+    """Pose un hook ; un hook ÉTRANGER n'est jamais écrasé.
+
+    Un hook est le nôtre s'il est identique au contenu courant, ou s'il porte
+    la ligne de signature `marker` à l'identique (les hooks d'une version
+    antérieure la portent déjà : la mise à jour reste possible). Une simple
+    sous-chaîne « ameesh #1465 » ne suffit pas."""
     name = os.path.basename(path)
     if os.path.exists(path):
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            current = fh.read()
-        if current != content and "ameesh #1465" not in current:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                current = fh.read()
+        except OSError as exc:
+            return {"path": path, "installed": False,
+                    "reason": "cannot read the existing %s hook: %s" % (name, exc)}
+        if current != content and marker not in {
+                line.strip() for line in current.splitlines()}:
             return {"path": path, "installed": False,
                     "reason": "a foreign %s hook is already installed" % name}
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    os.chmod(path, 0o755)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(path, 0o755)
+    except OSError as exc:
+        return {"path": path, "installed": False,
+                "reason": "cannot install the %s hook: %s" % (name, exc)}
     return {"path": path, "installed": True, "reason": "installed"}
 
 
@@ -644,17 +677,30 @@ def install_hook(repo: str) -> dict:
     ÉTRANGER n'est jamais écrasé — on le signale, l'agent décide. `installed`
     n'est vrai que si les DEUX hooks sont les nôtres : une preuve exacte a
     besoin de l'attestation de création et de son écriture. Rend
-    `{"path", "installed", "reason", "hooks"}`."""
-    common = _git(repo, "rev-parse", "--git-common-dir")
-    if not common:
+    `{"path", "installed", "reason", "hooks"}`.
+
+    Le répertoire est celui que Git utilise réellement (`git rev-parse
+    --git-path hooks`), donc `core.hooksPath` est suivi : poser les hooks dans
+    `<git-common-dir>/hooks` quand `core.hooksPath` pointe ailleurs les rendrait
+    muets tout en annonçant `installed=True` (N3 de la relecture Claude de
+    #1465)."""
+    repo = os.path.abspath(repo)
+    hooks = _git(repo, "rev-parse", "--path-format=absolute",
+                 "--git-path", "hooks")
+    if not hooks:
+        # git < 2.31 ne connaît pas --path-format : le chemin peut être relatif
+        # au dépôt.
+        hooks = _git(repo, "rev-parse", "--git-path", "hooks")
+        if hooks and not os.path.isabs(hooks):
+            hooks = os.path.join(repo, hooks)
+    if not hooks:
         return {"path": "", "installed": False, "hooks": {},
                 "reason": "not a git repository: %s" % (repo,)}
-    if not os.path.isabs(common):
-        common = os.path.join(repo, common)
-    hooks = os.path.join(common, "hooks")
-    out = {name: _install_one(os.path.join(hooks, name), content)
-           for name, content in (("pre-commit", PRE_COMMIT_HOOK),
-                                 ("post-commit", HOOK))}
+    out = {}
+    for name, content, marker in (
+            ("pre-commit", PRE_COMMIT_HOOK, PRE_COMMIT_MARK),
+            ("post-commit", HOOK, POST_COMMIT_MARK)):
+        out[name] = _install_one(os.path.join(hooks, name), content, marker)
     blocked = [name for name, row in out.items() if not row["installed"]]
     return {
         "path": out["post-commit"]["path"],
@@ -710,9 +756,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(json.dumps(out))
         elif out["installed"]:
-            print("post-commit hook installed: %s" % out["path"])
+            print("provenance hooks installed: pre-commit %s, post-commit %s"
+                  % (out["hooks"]["pre-commit"]["path"],
+                     out["hooks"]["post-commit"]["path"]))
         else:
-            print("post-commit hook NOT installed: %s" % out["reason"], file=sys.stderr)
+            print("provenance hooks NOT installed: %s" % out["reason"],
+                  file=sys.stderr)
         return 0 if out["installed"] else 1
     if args.command == "intent":
         # aucune base requise : le hook `pre-commit` atteste, `post-commit` écrit

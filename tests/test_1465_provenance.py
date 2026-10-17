@@ -7,6 +7,7 @@ au fait, l'absence qui rend `unknown`, la divergence refusée, l'ajout seul.
 """
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
@@ -61,6 +62,45 @@ class ContractTest(unittest.TestCase):
         env["AMEESH_HARNESS"] = "claude"
         with self.assertRaises(prov.ProvenanceError):
             prov.capture(env)  # pas d'acteur
+
+
+    def test_resolve_commit_keeps_options_out_of_git(self):
+        """N2 : `--end-of-options` borne la valeur, même si elle commence par '-'."""
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append(list(argv))
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        with mock.patch.object(prov.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(prov.resolve_commit("--help", cwd="/tmp"))
+        self.assertEqual(seen[0], [
+            "git", "rev-parse", "--verify", "--quiet", "--end-of-options",
+            "--help^{commit}"])
+
+    def test_resolve_commit_resolves_head_and_abbreviations(self):
+        repo = tempfile.mkdtemp(prefix="ameesh-1465-resolve-")
+        try:
+            subprocess.run(["git", "init", "-q", repo], check=True,
+                           capture_output=True)
+            env = dict(os.environ, GIT_AUTHOR_NAME="a",
+                       GIT_AUTHOR_EMAIL="a@ameesh.invalid",
+                       GIT_COMMITTER_NAME="a",
+                       GIT_COMMITTER_EMAIL="a@ameesh.invalid")
+            with open(os.path.join(repo, "f"), "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+            subprocess.run(["git", "add", "f"], cwd=repo, check=True,
+                           capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "un"], cwd=repo, check=True,
+                           capture_output=True, env=env)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
+                                           text=True).strip()
+            self.assertEqual(prov.resolve_commit("HEAD", cwd=repo), head)
+            self.assertEqual(prov.resolve_commit(head[:12], cwd=repo), head)
+            self.assertIsNone(prov.resolve_commit("--help", cwd=repo))
+            self.assertIsNone(prov.resolve_commit("-n", cwd=repo))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
 
 
     def test_intent_outside_a_turn_writes_nothing(self):
@@ -193,6 +233,27 @@ class PgProvenanceTest(PgTestCase):
         self.assertEqual(recu["milestone"], {
             "id": mark["id"], "actor": mark["actor"], "at_ts": mark["at_ts"],
             "sha": mark["sha"], "verdict": mark["verdict"]})
+
+    def test_milestone_with_a_symbolic_sha_gets_no_proof(self):
+        """N1 : un --sha non hexadécimal n'écrit pas de preuve que le reçu refuserait.
+
+        Le fait garde le sha DÉCLARÉ (`main`, `HEAD`) ; une preuve écrite avec
+        le commit résolu serait incohérente avec ce fait, et
+        `receipt_for_milestone` lèverait `ProvenanceError` à jamais."""
+        storage.of(self.db).agents.upsert_unleased(
+            "mty-amh-impl-07", chantier=None, harness="deepseek", host="h",
+            cwd="/tmp", session_id="s-1")
+        env = {"AGENT_MAIL_NAME": "mty-amh-impl-07", "AMEESH_TURN_ID": "t" * 32,
+               "AMEESH_HARNESS": "deepseek"}
+        for declared in ("main", "HEAD", "v1.2.3"):
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(prov, "resolve_commit",
+                                      return_value=SHA1) as resolve:
+                mark = work.milestone(self.db, int(self.lot["id"]), "frozen",
+                                      sha=declared, actor="mty-amh-impl-07")
+            self.assertEqual(mark["sha"], declared)
+            resolve.assert_not_called()
+            self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))
 
     def test_milestone_outside_a_turn_stays_unknown(self):
         """Hors tour managé, le jalon s'écrit, l'origine reste inconnue."""
@@ -448,6 +509,56 @@ class HookInstallTest(unittest.TestCase):
         self.assertIn("pre-commit", refused["reason"])
         with open(pre, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), foreign)
+
+    def test_a_foreign_hook_that_only_cites_1465_is_kept(self):
+        """N4 : la sous-chaîne « ameesh #1465 » ne fait pas de nous l'auteur."""
+        out = prov.install_hook(self.tmp)
+        self.assertTrue(out["installed"], out)
+        foreign = ("#!/bin/sh\n"
+                   "# ce hook cite ameesh #1465 mais ce n'est pas le notre\n"
+                   "echo autre\n")
+        with open(out["path"], "w", encoding="utf-8") as fh:
+            fh.write(foreign)
+        refused = prov.install_hook(self.tmp)
+        self.assertFalse(refused["installed"], refused)
+        self.assertIn("foreign", refused["reason"])
+        with open(out["path"], encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), foreign)
+
+    def test_core_hooks_path_is_followed(self):
+        """N3 : les hooks vont là où Git les cherche, pas dans <common-dir>/hooks."""
+        subprocess.run(["git", "config", "core.hooksPath", ".hooks"],
+                       cwd=self.tmp, check=True, capture_output=True)
+        out = prov.install_hook(self.tmp)
+        self.assertTrue(out["installed"], out)
+        for name in ("pre-commit", "post-commit"):
+            self.assertEqual(out["hooks"][name]["path"],
+                             os.path.join(self.tmp, ".hooks", name))
+            self.assertTrue(os.path.exists(os.path.join(self.tmp, ".hooks", name)))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, ".git", "hooks", "post-commit")))
+
+    def test_an_absolute_core_hooks_path_is_followed(self):
+        other = tempfile.mkdtemp(prefix="ameesh-1465-hookspath-")
+        try:
+            subprocess.run(["git", "config", "core.hooksPath", other],
+                           cwd=self.tmp, check=True, capture_output=True)
+            out = prov.install_hook(self.tmp)
+            self.assertTrue(out["installed"], out)
+            self.assertEqual(out["path"], os.path.join(other, "post-commit"))
+            self.assertTrue(os.path.exists(os.path.join(other, "pre-commit")))
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_install_message_names_both_hooks(self):
+        """N7 : `provenance install` pose deux hooks, le message doit le dire."""
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as captured:
+            code = prov.main(["install", "--repo", self.tmp])
+        self.assertEqual(code, 0)
+        text = captured.getvalue()
+        self.assertIn("pre-commit", text)
+        self.assertIn("post-commit", text)
+        self.assertNotIn("post-commit hook installed", text)
 
     def test_runner_installs_the_hook_pair_and_skips_mediated_sessions(self):
         from ameesh import runner as runner_mod

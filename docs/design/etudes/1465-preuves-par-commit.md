@@ -113,3 +113,27 @@ Reste avant gel : faire relire
 les deux familles requises (SQL sensible, canon §2). L'historique **antérieur**
 à la migration restera `unknown` : c'est le prix d'une preuve honnête, et le
 train #1467 devra qualifier des commits enregistrés.
+
+## 5. Durcissement après la relecture Claude (lot #1534)
+
+#1465 fusionné, les N de la relecture Claude sont traités sans rouvrir la tête
+gelée :
+
+- un jalon dont le `sha` déclaré n'est pas une abréviation hexadécimale
+  (`HEAD`, nom de branche) n'écrit plus de preuve — le fait garde son sha, et
+  `receipt_for_milestone` n'a plus de couple preuve/fait incohérent à refuser
+  pour toujours ;
+- les valeurs passées à `git rev-parse` sont bornées par `--end-of-options` :
+  une valeur qui commence par `-` reste une révision, jamais une option ;
+- les hooks suivent `core.hooksPath` (`git rev-parse --git-path hooks`) : ils
+  sont posés là où Git les exécute, pas dans `<git-common-dir>/hooks` ;
+- un hook étranger n'est plus reconnu sur la seule mention `ameesh #1465` mais
+  sur la ligne de signature exacte de chaque hook (ou un contenu identique) ;
+- `ameesh provenance install` nomme la paire de hooks qu'il pose ;
+- le gabarit de relecture couvre la correction d'un B par le relecteur, le
+  retour à l'auteur au-delà de ~50 lignes ou pour un changement de conception,
+  la seconde famille qui relit avec la correction et la preuve d'origine des
+  commits du correcteur.
+
+La route du défaut non bloquant vers le backlog (N5) était déjà alignée par
+#1391 avant ce lot.
