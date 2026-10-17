@@ -149,6 +149,23 @@ class DeclaredCriticalScopeTest(ReviewPolicyFixture, unittest.TestCase):
                 self.assertIs(klass["files"][0].get("critical"), True)
                 self.assertEqual(merge_queue.required_verdicts(klass), 2)
 
+    def test_markdown_exemption_keeps_highest_file_class_across_canons(self):
+        path = "deploy/README.md"
+        budget = "src/ameesh/budget.py"
+        prose_sensitive = self.canon([
+            {"paths": ["deploy/**"], "class": "sensitive"}], "prose")
+        budget_sensitive = self.canon([
+            {"paths": [budget], "class": "sensitive"}], "budget")
+        for canons in ([budget_sensitive, prose_sensitive],
+                       [prose_sensitive, budget_sensitive]):
+            with self.subTest(order=[c.root for c in canons]):
+                klass = self.classify([path, budget], canons=canons)
+                entry = next(e for e in klass["files"] if e["path"] == path)
+                self.assertEqual(entry["class"], "sensitive")
+                self.assertEqual(merge_queue.required_verdicts(klass), 2)
+                self.assertFalse(self.gate(klass, "codex")["ok"])
+                self.assertTrue(self.gate(klass, "codex", "claude")["ok"])
+
     def test_invalid_critical_declaration_fails_closed(self):
         for value, cls in (("true", "sensitive"), (1, "sensitive"),
                            (None, "sensitive"), (True, "light"), (True, "normal")):
