@@ -411,6 +411,16 @@ class MergeSweepTest(_Base):
         self.assertEqual(report[n]["result"], "open")
         self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
 
+    def test_diese_parenthese_nie_ne_ferme_pas_le_lot(self):
+        # R Codex #2259 : la parenthèse ne sépare pas « sans » du lot exclu.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("feature/paquet-sans-parenthese", "Merge sans (#%d)" % n)
+        self.sync()
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
+
     # --- L118b : la fusion d'une branche lot/<id>-… ferme le lot -----------
 
     def test_fusion_github_d_une_branche_lot_ferme_le_lot(self):
@@ -753,10 +763,11 @@ class MergeSweepTest(_Base):
             "Merge PR#9, depot#9, ##9, #9a, &#93;": {},
             # #2259 : une mention niée ne désigne pas le lot. Le titre du
             # commit 84c68e9d4 (Nexlink, paquet 52 v2) fermait #598 alors que
-            # sa PR restait ouverte et sa tête hors de develop.
+            # sa PR restait ouverte et sa tête hors de develop. Le courrier
+            # cité dans la parenthèse du retrait ne prouve pas une livraison.
             "paquet 52 v2 : montage #2221 (cd8b0483a) sur develop e5b4f300a — "
             "recomposition sans #598 ni correctif .github (décision pilote (c), "
-            "courrier #97932) [skip ci]": {2221: "#id", 97932: "#id"},
+            "courrier #97932) [skip ci]": {2221: "#id"},
             "Merge sans #12": {},
             "Merge retiré #12": {},
             "Merge hors #12": {},
@@ -764,6 +775,11 @@ class MergeSweepTest(_Base):
             "Revert #12": {},
             "Merge sans #12 / #13 livré": {13: "#id"},
             "Merge sans #12, puis #12 livré": {12: "#id"},
+            "Merge sans (#12)": {},
+            "Merge without (#12, (#13)), #14 livré": {14: "#id"},
+            "Merge #14 (sans #12)": {14: "#id"},
+            "Merge (#12) retiré": {},
+            "Merge exclues #12": {},
             "Merge x\n\nameesh-work: #12\n  ameesh-work: 13": {12: "ameesh-work",
                                                                13: "ameesh-work"},
             "Merge x\n\nvoir ameesh-work: 14 plus tard": {},

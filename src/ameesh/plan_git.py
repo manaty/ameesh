@@ -863,7 +863,7 @@ CLAUSE_SPLIT_RE = re.compile(r"[;/|—–]|\s+-\s+|\(|\)|,")
 #: alors que sa PR était ouverte et sa tête hors de la cible. Même prudence
 #: pour « retiré », « hors », « without », « revert », « exclu ».
 NEGATED_REF_RE = re.compile(
-    r"\b(?:sans|ni|hors|retir[ée]e?s?|exclu[es]?|exclu[ea]nt|without|reverts?|reverted)\b",
+    r"\b(?:sans|ni|hors|retir[ée]e?s?|exclue?s?|exclu[ea]nt|without|reverts?|reverted)\b",
     re.IGNORECASE)
 #: clé de configuration git du dépôt : comment ses commits de fusion citent un
 #: lot en plus de `ameesh-work:` — `hash` : `#<id>` dans le titre
@@ -1124,14 +1124,32 @@ def negated_hash_positions(title: str) -> set[int]:
     positions (et non les numéros) laissent compter une citation positive du
     même lot dans une autre proposition.
     """
+    # R Codex #2259 : une négation extérieure vaut aussi pour un groupe
+    # (« sans (#12) », « (#12) retiré »), tandis que « #14 (sans #12) » garde
+    # #14. Les niveaux sont traités sans récursion, même si le titre imbrique
+    # beaucoup de parenthèses ; chaque groupe masque ses mots au parent.
+    title = title or ""
+    levels = [{"begin": 0, "end": len(title), "children": []}]
+    stack = [levels[0]]
+    for pos, char in enumerate(title):
+        if char == "(":
+            group = {"begin": pos + 1, "end": len(title), "children": []}
+            stack[-1]["children"].append(group)
+            levels.append(group)
+            stack.append(group)
+        elif char == ")" and len(stack) > 1:
+            stack.pop()["end"] = pos
     negated: set[int] = set()
-    spans = _title_clauses(title)
-    for match in HASH_REF_RE.finditer(title or ""):
-        for begin, end in spans:
-            if begin <= match.start() < end:
-                if NEGATED_REF_RE.search((title or "")[begin:end]):
-                    negated.add(match.start())
-                break
+    for level in levels:
+        begin, end = level["begin"], level["end"]
+        text = title[begin:end]
+        for child in level["children"]:
+            left, right = child["begin"] - 1 - begin, min(child["end"] + 1, end) - begin
+            text = text[:left] + " " * (right - left) + text[right:]
+        for left, right in _title_clauses(text):
+            if NEGATED_REF_RE.search(text[left:right]):
+                negated.update(m.start() for m in HASH_REF_RE.finditer(
+                    title, begin + left, begin + right))
     return negated
 
 
