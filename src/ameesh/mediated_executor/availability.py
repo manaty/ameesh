@@ -202,10 +202,10 @@ def default_path(cfg) -> str:
     return os.path.join(cfg.state_dir, "exec", "availability.json")
 
 
-def _deadline(row: Mapping) -> float:
+def _deadline(row: Mapping, body: Mapping) -> float:
     gate = row.get("gate") or {}
     deadline = gate.get("drain_deadline_ts")
-    if (row.get("body") or {}).get("state") == "stopped":
+    if body.get("state") == "stopped":
         return float(row.get("since_ts") or 0.0)
     if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
         return float(deadline)
@@ -214,17 +214,30 @@ def _deadline(row: Mapping) -> float:
 
 def alerts(rows: Iterable[Mapping], *, now: float | None = None,
            held: Mapping[str, Iterable[str]] | None = None,
-           unavailable_after_s: float = DEFAULT_UNAVAILABLE_ALERT_S) -> list[dict]:
+           unavailable_after_s: float = DEFAULT_UNAVAILABLE_ALERT_S,
+           errors: list | None = None) -> list[dict]:
     """Alertes au format d'`exploitation` (`ameesh-alert/1`). `held` : agents
     dont l'hôte détient encore le bail, par hôte (la base fait foi) ; à
-    défaut, l'acquittement enregistré."""
+    défaut, l'acquittement enregistré.
+
+    #2129 : une ligne dont `body` n'est pas un objet n'est pas une
+    observation. Elle est sautée et nommée dans `errors` quand une liste est
+    fournie — la passe des autres hôtes continue, la famille n'est plus dite
+    lue pour autant (`local_alerts` la marque non lue)."""
     from .. import exploitation
 
     now = time.time() if now is None else float(now)
     out: list[dict] = []
     for row in rows:
         host = row.get("host")
-        body = row.get("body") or {}
+        body = row.get("body")
+        if body is None:
+            body = {}
+        if not isinstance(body, Mapping):
+            if errors is not None:
+                errors.append("hôte %s : corps d'état non objet (%s)"
+                              % (host or "?", type(body).__name__))
+            continue
         state = body.get("state")
         if not host or state not in STATES or state == "available":
             continue
@@ -243,7 +256,7 @@ def alerts(rows: Iterable[Mapping], *, now: float | None = None,
             detenus = sorted(held.get(host) or ())
         else:
             detenus = sorted((row.get("ack") or {}).get("held") or ())
-        deadline = _deadline(row)
+        deadline = _deadline(row, body)
         if detenus and now >= deadline + OVERDUE_GRACE_S:
             out.append(exploitation._alert(
                 "host_drain_overdue", None, deadline, int(now - deadline), OVERDUE_GRACE_S,
@@ -263,7 +276,11 @@ def local_alerts(cfg, listing: list[dict], now: float | None = None,
     à `unreadable` quand une liste est fournie.
 
     #2127 : `errors` reçoit le message de la lecture en échec, pour que
-    `exploitation._gate_alerts` dise la porte non lue (`host_gate_unreadable`)."""
+    `exploitation._gate_alerts` dise la porte non lue (`host_gate_unreadable`).
+
+    #2129 : une ligne au `body` non objet ne fait pas tomber la passe ; la
+    famille est dite non lue (une ligne non observée ne résout rien) et le
+    message part dans `errors`."""
     path = default_path(cfg)
     try:
         os.stat(path)
@@ -280,4 +297,11 @@ def local_alerts(cfg, listing: list[dict], now: float | None = None,
     for row in listing:
         if row.get("lease_live") and row.get("host"):
             held.setdefault(row["host"], []).append(row["name"])
-    return alerts(rows, now=now, held=held)
+    malformees: list = []
+    out = alerts(rows, now=now, held=held, errors=malformees)
+    if malformees:
+        if unreadable is not None and GATE_FAMILY not in unreadable:
+            unreadable.append(GATE_FAMILY)
+        if errors is not None:
+            errors.extend(malformees)
+    return out

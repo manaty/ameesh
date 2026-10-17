@@ -1292,6 +1292,43 @@ in place. If REF adds a dependency that `ameesh migrate` needs,
 `migrer` fails at import: first install that dependency in the venv
 (`pip install <paquet>`), then resume at `migrer`.
 
+## Atomic venv switch (#1969)
+
+`poste.sh installer` and `vm.sh installer` (server and agents) no longer run
+`pip` in the **live** venv: they prepare a **versioned** venv next to it
+(`venv-<sha7>`, with its own pip, dependencies and controls), then switch in a
+single rename. A concurrent command (`agent-mail send`, `ameesh work`, a
+runner's import) therefore sees either the whole old code or the whole new
+code — never the incomplete state of the 16/10 incident
+(`ModuleNotFoundError ameesh.platform.process`, missing `ameesh`/code 127).
+Controls run **before** the switch: imports (`psycopg`, `ameesh`),
+`ameesh --version`, and the console script's shebang pointing at the
+versioned venv's Python.
+
+The live `venv` is **not** a venv that a switch rewrites under running
+processes: it holds stable **launchers** (`bin/python`, `bin/ameesh`, and a
+refusing `bin/pip`). Each launcher reads the `venv-courant` symlink at start
+and `exec`s the versioned venv's binary, so the interpreter sees a concrete
+path (`venv-<sha7>/lib/pythonX/site-packages`) — a process already running
+keeps importing from **its** version, whatever a later switch does (review
+B1 of 16/10: a process launched through a symlinked venv kept the symlink
+path and could mix old and new submodules).
+
+`activer` only replaces the `venv-courant` symlink (temp + `rename()`), so
+there is no window without a live version. The **first** conversion of a real
+venv does not move or rewrite it: its `lib/` is reused by link as the
+previous version `venv-<sha7>` (adopted without pip), only the Python interpreters in `bin/` and
+`bin/ameesh` become launchers — a running process imports from `lib/`, not
+from `bin/`. `retour` points the symlink back to the recorded previous
+version, **without pip**, including that first conversion (review B2: the
+agents' rollback used to re-run `preparer`/pip); it is idempotent, and a
+rollback before any switch is a no-op. A preparation failure removes its
+partial directory and leaves the active version untouched. `src-current` and
+`previous-sha` keep their meaning. The helper is
+`deploy/mise-a-jour/bascule.py` (`preparer`, `activer --precedent`, `retour`,
+`etat`), copied to the VM (server and agents) so that install and rollback use
+the same version whatever commit is deployed.
+
 ## Update to 1.10.0 (path B, mediated executor)
 
 1.10.0 brings path B, the mediated executor (L107 to L115,

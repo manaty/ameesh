@@ -240,6 +240,50 @@ class DelaiTest(unittest.TestCase):
         self.assertEqual([rate_limit.delay(n) for n in (1, 2, 3, 4, 5, 99)],
                          [60.0, 120.0, 300.0, 600.0, 600.0, 600.0])
 
+    def test_borne_de_reprise_atteignable_et_stable(self):
+        # #1592 : la borne de la reprise cadencée est atteinte dès le 4e
+        # palier et ne croît plus — un code classé passager ne se reprend pas
+        # sans fin à délai croissant.
+        delais = [rate_limit.delay(n) for n in range(1, 12)]
+        self.assertEqual(delais, sorted(delais), "le délai ne recule jamais")
+        self.assertEqual(delais[3], rate_limit.DELAYS[-1], "borne au 4e palier")
+        self.assertEqual(rate_limit.delay(10 ** 6), rate_limit.DELAYS[-1])
+        self.assertEqual(rate_limit.delay(0), rate_limit.DELAYS[0])
+
+
+class CodesDshTest(unittest.TestCase):
+    """#1592 : la source dsh des codes passagers est consignée.
+
+    Le descripteur `dsh-llm` (dsh 0.2.0-rc.2) retente lui-même TIMEOUT
+    (watchdog d'inactivité du flux) et TRANSPORT (réseau) par cinq essais ;
+    ameesh classe passagère la ligne `dsh: <CODE>:` qu'il émet après ces
+    essais (#1270) — TIMEOUT et TRANSPORT compris — et la reprend à délais
+    cadencés. Un code nu, sans la signature `dsh: <CODE>:`, n'est pas classé ;
+    `test_pannes_passageres_deepseek` couvre les autres formes réelles.
+    """
+
+    def test_codes_dsh_emis_apres_ses_reprises_sont_passagers(self):
+        for texte in ("dsh: TIMEOUT: DeepSeek Messages stream idle timeout",
+                      "dsh: TRANSPORT: Messages transport failed"):
+            with self.subTest(texte=texte):
+                self.assertEqual(rate_limit.classify(error=texte),
+                                 rate_limit.RATE_LIMITED)
+                self.assertEqual(rate_limit.classify(stderr_tail=texte),
+                                 rate_limit.RATE_LIMITED)
+
+    def test_codes_nus_sans_signature_dsh_ne_sont_pas_classes(self):
+        for texte in ("TIMEOUT", "TRANSPORT"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(error=texte))
+                self.assertIsNone(rate_limit.classify(stderr_tail=texte))
+
+    def test_signature_dsh_seule_ne_suffit_pas(self):
+        # seuls les codes passagers listés sont repris : la signature
+        # `dsh: <CODE>:` d'un autre code ne vaut pas panne passagère
+        self.assertEqual(rate_limit.classify(error="dsh: QUOTA: solde épuisé"),
+                         rate_limit.QUOTA)
+        self.assertIsNone(rate_limit.classify(error="dsh: AUTH: invalid key"))
+
 
 class EtatTest(unittest.TestCase):
     def test_aller_retour(self):
@@ -507,6 +551,37 @@ class TourDeRepriseTest(unittest.TestCase):
                 mock.patch("ameesh.runner.mail.unread", return_value=[]), \
                 mock.patch("ameesh.runner.account_turn.continuity", return_value=True):
             return w._pick()
+
+    def _peek(self, w):
+        """#1593: the wake decision alone (`peek`), without `pick`/`_pick`.
+
+        Registry and mail neutralised, nothing pending, idle nudge not due
+        (`nudged`): only the retry deadline can wake the worker here."""
+        with mock.patch("ameesh.runner.registry.get", return_value={"status": "blocked"}), \
+                mock.patch("ameesh.runner.mail.unread_active", return_value=[]):
+            return w.peek()
+
+    def test_peek_wakes_at_the_retry_deadline(self):
+        # #1593: direct witness of the wake by `peek()` on `retry_due`. A
+        # regression that drops the deadline from `peek()` leaves the `pick()`
+        # and `_pick()` cases above green: only this one sees it.
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() - 1)
+        self.assertTrue(w.retry_due())
+        self.assertFalse(w.idle_due())  # nothing else can wake it here
+        self.assertTrue(self._peek(w))
+
+    def test_peek_does_not_wake_before_the_deadline(self):
+        # Counter-witness: a deadline still ahead does not wake it…
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() + 60)
+        self.assertFalse(w.retry_due())
+        self.assertFalse(self._peek(w))
+
+    def test_peek_does_not_wake_on_an_exhausted_quota(self):
+        # …and an exhausted quota, even past its deadline, does not either
+        # (L48): `peek` follows `retry_due`, not the cadence alone.
+        w = self._worker(rate_limit.QUOTA, time.time() - 1)
+        self.assertFalse(w.retry_due())
+        self.assertFalse(self._peek(w))
 
     def test_echeance_passee_lance_un_tour_de_reprise(self):
         w = self._worker(rate_limit.RATE_LIMITED, time.time() - 1)
