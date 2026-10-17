@@ -231,13 +231,14 @@ scenario = (Path(os.environ['FAKE_STATE']) / 'scenario').read_text()
 print(time.time() + (60 if scenario == 'db-ahead' else 0))
 '''
 
-#: #2152 : le drain se décide sur l'horloge réelle (SECONDS de bash). Seule
-#: l'attente de la boucle de redémarrage (15 s) fait avancer le banc d'une
-#: demi-seconde ; les attentes de bail (5 s) restent instantanées.
+#: #2152 : le drain se décide sur l'horloge du script (SECONDS de bash) ; les
+#: bancs l'injectent par AMEESH_TEST_HORLOGE (#2187). Seule l'attente de la
+#: boucle de redémarrage (15 s) fait avancer le banc d'une demi-seconde ; les
+#: attentes de bail (5 s) restent instantanées.
 SLEEP = ('#!/bin/sh\n'
          'if [ "$1" = 15 ]; then\n'
-         '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
-         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
+         '  if [ -n "${AMEESH_TEST_HORLOGE:-}" ]; then\n'
+         '    echo "$(( $(cat "$AMEESH_TEST_HORLOGE") + 2 ))" > "$AMEESH_TEST_HORLOGE"\n'
          '  fi\n'
          '  exec %s 0.5\n'
          'fi\n'
@@ -451,7 +452,7 @@ class AgentHostTest(unittest.TestCase):
         self.env['DRAIN_ATTENTE'] = '1'
         self.env['ATTENTE_MAX'] = '5'
         (self.state / 'horloge').write_text('0')
-        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='chaines-toujours')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('toujours en tour', p.stderr)
@@ -466,7 +467,7 @@ class AgentHostTest(unittest.TestCase):
         self.env['DRAIN_ATTENTE'] = '1'
         self.env['ATTENTE_MAX'] = '10'
         (self.state / 'horloge').write_text('0')
-        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='chaines-relance')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('toujours en tour', p.stderr)

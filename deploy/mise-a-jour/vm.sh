@@ -87,6 +87,8 @@ VENV=/opt/ameesh/venv
 PRECEDENT=/opt/ameesh/precedent
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 ATTENTE_MAX=${ATTENTE_MAX:-7200}
+[[ $ATTENTE_MAX =~ ^[0-9]+$ ]] \
+  || { echo "ATTENTE_MAX invalide : « $ATTENTE_MAX » (secondes attendues)" >&2; exit 2; }
 # #2152 : au-delà de cette attente d'un agent en tour, le redémarrage pose
 # lui-même une pause opérateur courte (drain) au lieu d'attendre sans fin un
 # agent qui enchaîne les tours de continuation (57 min constatées les 16-17/10).
@@ -96,6 +98,11 @@ ATTENTE_MAX=${ATTENTE_MAX:-7200}
 DRAIN_ATTENTE=${DRAIN_ATTENTE:-300}
 [[ $DRAIN_ATTENTE =~ ^[0-9]+$ ]] \
   || { echo "DRAIN_ATTENTE invalide : « $DRAIN_ATTENTE » (secondes attendues)" >&2; exit 2; }
+# #2187 : l'échéance ATTENTE_MAX se lit sur l'horloge, injectable par les
+# bancs ; une horloge gelée ne doit pas rendre la boucle d'attente infinie.
+# Ce garde-fou compte les tours (chacun finit par une attente de 15 s), sans
+# lire l'horloge : à l'horloge normale, ATTENTE_MAX tombe bien avant lui.
+TOURS_MAX=$(( ATTENTE_MAX / 15 + 10 ))
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
@@ -313,13 +320,19 @@ echec_agent() {
 DRAINS=()  # entrées « persona<TAB>motif exact de la pause posée »
 # N4 : l'horloge du drain est injectable par les bancs (fichier de secondes),
 # pour ne pas dépendre d'un budget de temps réel ; en production, c'est
-# l'horloge monotone du shell.
+# l'horloge monotone du shell. #2187 : le crochet porte un nom explicitement
+# de test (AMEESH_TEST_HORLOGE), jamais une variable d'exploitation, et sa
+# valeur est validée ; un contenu absent ou illisible retombe sur $SECONDS.
 horloge() {
-  if [ -n "${HORLOGE_FICHIER:-}" ] && [ -r "$HORLOGE_FICHIER" ]; then
-    cat "$HORLOGE_FICHIER"
-  else
-    printf '%s' "$SECONDS"
+  local h
+  if [ -n "${AMEESH_TEST_HORLOGE:-}" ] && [ -r "$AMEESH_TEST_HORLOGE" ]; then
+    h=$(cat "$AMEESH_TEST_HORLOGE" 2>/dev/null) || h=
+    if [[ $h =~ ^[0-9]+$ ]]; then
+      printf '%s' "$h"
+      return 0
+    fi
   fi
+  printf '%s' "$SECONDS"
 }
 drain_lieu() {
   if [ "$MODE" = agents ]; then printf 'agents %s sur %s' "$ACTION" "$HOTE_AGENTS"
@@ -504,7 +517,7 @@ trap 'lever_drains || true' EXIT
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes suivantes debut=$(horloge)
-  local etat deja_pause ecoule
+  local etat deja_pause ecoule tours=0
   local -A debut_tour=()
   local non_verifiees=()
   # #1633 : inclure les personas arrêtées pour recharger leur unité active.
@@ -519,6 +532,7 @@ redemarrer_agents() {
   fi
   etape "exécuteurs de $HOTE_AGENTS (${#restantes[@]}), un par un hors tour"
   while [ "${#restantes[@]}" -gt 0 ]; do
+    tours=$((tours + 1))
     suivantes=()
     for p in "${restantes[@]}"; do
       # Le placement peut changer pendant l'attente d'un tour : relire avant
@@ -582,6 +596,10 @@ redemarrer_agents() {
     if [ "${#restantes[@]}" -gt 0 ]; then
       if [ $(( $(horloge) - debut )) -ge "$ATTENTE_MAX" ]; then
         echo "toujours en tour après ${ATTENTE_MAX}s : ${restantes[*]}" >&2; return 1
+      fi
+      if [ "$tours" -ge "$TOURS_MAX" ]; then
+        echo "toujours en tour après ${tours} tours de 15 s (horloge gelée ?) : ${restantes[*]}" >&2
+        return 1
       fi
       sleep 15
     fi
@@ -1111,7 +1129,7 @@ redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
   local restantes suivantes debut=$(horloge) st avant ligne heure tenu attendu
-  local etat deja_pause ecoule
+  local etat deja_pause ecoule tours=0
   local -A debut_tour=()
   non_verifiees=()
   # R1 B1 : un CLI (ou une base) antérieur à 0458 ne saurait pas lever la
@@ -1127,6 +1145,7 @@ redemarrer() {
   restantes=($PERSONAS_VM)
   etape "exécuteurs du serveur (${#restantes[@]}), un par un hors tour"
   while [ ${#restantes[@]} -gt 0 ]; do
+    tours=$((tours + 1))
     suivantes=()
     for p in "${restantes[@]}"; do
       etat=$(etat_agent "$p") \
@@ -1184,6 +1203,10 @@ redemarrer() {
     if [ ${#restantes[@]} -gt 0 ]; then
       if [ $(( $(horloge) - debut )) -gt "$ATTENTE_MAX" ]; then
         echo "toujours en tour après ${ATTENTE_MAX}s : ${restantes[*]} — à redémarrer à la main" >&2
+        exit 1
+      fi
+      if [ "$tours" -ge "$TOURS_MAX" ]; then
+        echo "toujours en tour après ${tours} tours de 15 s (horloge gelée ?) : ${restantes[*]} — à redémarrer à la main" >&2
         exit 1
       fi
       sleep 15

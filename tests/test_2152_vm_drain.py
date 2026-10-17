@@ -104,11 +104,12 @@ sys.exit(0)
 '''
 
 #: #2152 : seule l'attente de la boucle (15 s) avance l'horloge du banc ;
-#: N4 : quand HORLOGE_FICHIER est posé, elle avance de 2 s par attente.
+#: N4/#2187 : quand AMEESH_TEST_HORLOGE est posé, elle avance de 2 s par
+#: attente, sauf quand HORLOGE_GELEE simule une horloge figée.
 SLEEP = ('#!/bin/sh\n'
          'if [ "$1" = 15 ]; then\n'
-         '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
-         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
+         '  if [ -z "${HORLOGE_GELEE:-}" ] && [ -n "${AMEESH_TEST_HORLOGE:-}" ]; then\n'
+         '    echo "$(( $(cat "$AMEESH_TEST_HORLOGE") + 2 ))" > "$AMEESH_TEST_HORLOGE"\n'
          '  fi\n'
          '  exec %s 0.5\n'
          'fi\n'
@@ -174,7 +175,7 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.env['ATTENTE_MAX'] = '5'
         (self.state / 'sans-expect-reason').touch()
         (self.state / 'horloge').write_text('0')
-        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
         p = self.run_vm()
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('drain #2152 indisponible', p.stderr)
@@ -182,6 +183,35 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         journal = self.poste()
         self.assertNotIn('pause dev9', journal)
         self.assertNotIn('resume dev9 --operator', journal)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_old_clock_variable_is_ignored(self):
+        """#2187 : HORLOGE_FICHIER n'est plus un crochet d'horloge. Une
+        variable d'exploitation qui pointe un fichier figé ne gèle plus le
+        drain : la décision se prend sur l'horloge réelle ($SECONDS)."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '30'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('drain posé', p.stdout)
+        self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
+        self.assertEqual((self.state / 'horloge').read_text(), '0')
+
+    def test_frozen_test_clock_cannot_hang_the_wait(self):
+        """#2187 : même avec le crochet de test figé, l'attente de drain
+        s'arrête par la borne de tours, indépendante de l'horloge."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '5'
+        (self.state / 'horloge').write_text('0')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
+        self.env['HORLOGE_GELEE'] = '1'
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('toujours en tour', p.stderr)
+        self.assertIn('horloge gelée', p.stderr)
+        self.assertNotIn('pause dev9', self.poste())
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_foreign_pause_is_not_lifted(self):
