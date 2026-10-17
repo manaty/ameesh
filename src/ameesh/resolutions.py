@@ -67,6 +67,8 @@ REF_PREFIX = "refs/ameesh/resolutions/"
 #: fallback for hosts that refuse refs outside `refs/heads`
 BRANCH_PREFIX = "ameesh/resolve/"
 TRAILER = "ameesh-resolution"
+# v2 learns both merge directions; first-parent-only caches must be retrained.
+TRAINING_CACHE = "ameesh-rr-v2"
 #: worktrees of open resolutions, under the repository's common directory
 WORKTREE_DIR = "ameesh-resolve"
 #: where git ships `rerere-train.sh`, relative to `git --exec-path` or absolute
@@ -198,16 +200,73 @@ def rerere_train_script() -> str | None:
     return None
 
 
+def _parents(cwd: str, commit: str) -> list[str]:
+    return _text(_run(cwd, "rev-parse", commit + "^@")).split()
+
+
+def _learn(cwd: str, commit: str, first: str, others) -> bool:
+    """Plays the merge of `others` into `first` and records, in `rr-cache`, the
+    resolution the tree of `commit` carries when that merge conflicts. Returns
+    whether it learnt from a conflict (a clean merge has none to record).
+    Leaves `cwd` clean on a detached `first`; a failure is cleaned up by the
+    caller, which also restores the commit `cwd` was on.
+
+    The trial merge must render the conflicts itself: with the cache in place
+    it would replay a recorded resolution into the files, and `rerere` would
+    record that stale content as the new preimage (#2165). The cache is put
+    back before `forget`, which drops the pair's entries (`--overwrite`) while
+    the other pairs' entries survive."""
+    cache = _check(_run(cwd, "rev-parse", "--path-format=absolute", "--git-path",
+                        "rr-cache"), "rev-parse")
+    _check(_run(cwd, "checkout", "-q", "-f", "--detach", first), "checkout")
+    stash = "%s.learn-%d" % (cache, os.getpid())
+    hidden = os.path.isdir(cache) and not os.path.isdir(stash)
+    if hidden:
+        os.rename(cache, stash)
+    try:
+        merge = _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+                     "merge", "-q", "--no-ff", "--no-commit", *others)
+    finally:
+        if hidden and os.path.isdir(stash):
+            _restore_rr(cache, stash)
+    if merge.returncode == 0:
+        _run(cwd, "reset", "-q", "--hard")
+        return False
+    # `forget` exits 0 even when it did nothing (rerere off): the MERGE_RR
+    # gate below tells whether a conflict is left to learn from, exactly as
+    # `test -s "$GIT_DIR/MERGE_RR"` does in rerere-train.sh (#2165).
+    _run(cwd, "-c", "rerere.enabled=true", "rerere", "forget", ".")
+    if not _merge_rr(cwd):
+        _run(cwd, "reset", "-q", "--hard")
+        return False
+    # the preimage is the conflict the merge just rendered: never re-render it
+    # with `checkout -m`, whose markers ("ours"/"theirs") differ from the
+    # merge's ("HEAD"/branch) and miss at replay (#2165).
+    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
+    _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
+    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
+    _run(cwd, "reset", "-q", "--hard")
+    return True
+
+
 def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
     """Primes the `rr-cache` of the repository of worktree `cwd` from the
     merge commits `commits` (`--overwrite`: a replaced resolution wins),
     with `rerere-train.sh`, or the same loop in Python when the script is
-    not installed (`script=None` forces the port). The port follows the
-    script's loop and never re-renders the conflict with `checkout -m`
-    (#2165); unlike the script it hides the cache during the trial merge,
-    so `--overwrite` really replaces a resolution the merge would have
-    replayed from the cache. Leaves `cwd` clean, on the commit it was on.
-    Returns the commits it learnt from."""
+    not installed (`script=None` forces the port). Leaves `cwd` clean, on
+    the commit it was on. Returns the commits it learnt from.
+
+    #2136 : a merge is not symmetric — a `.gitattributes` a merge brings in
+    only drives that merge once it is checked out (so `merge=union` applies
+    on one side only), so the conflicted paths can differ in each direction.
+    The script and the loop only learn the first-parent direction; the other
+    is learnt here from the same commit, so a resolution prepared in one
+    direction replays in the landing direction of the queue.
+
+    #2165 : the Python port hides the cache during the trial merge, so
+    `--overwrite` really replaces a resolution the merge would have replayed
+    from the cache; it records the preimage the merge rendered, never one
+    re-rendered by `checkout -m`."""
     commits = [c for c in commits if c]
     if not commits:
         return []
@@ -216,60 +275,32 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
     os.makedirs(cache, exist_ok=True)
     if script == "auto":
         script = rerere_train_script()
-    if script:
-        head = _check(_run(cwd, "rev-parse", "HEAD"), "rev-parse")
-        proc = subprocess.run(["sh", script, "--overwrite", "--no-walk", *commits], cwd=cwd,
-                              capture_output=True, env=_git_env(),
-                              timeout=FETCH_TIMEOUT, check=False)
-        out = proc.stdout.decode("utf-8", "replace")
-        # the script returns to the branch it started on; make sure of it
-        _run(cwd, "checkout", "-q", "-f", "--detach", head)
-        learnt = re.findall(r"^Learning from ([0-9a-f]+)", out, re.M)
-        return [c for c in commits if any(c.startswith(short) for short in learnt)]
     head = _check(_run(cwd, "rev-parse", "HEAD"), "rev-parse")
     learnt = []
     try:
+        if script:
+            proc = subprocess.run(["sh", script, "--overwrite", "--no-walk", *commits],
+                                  cwd=cwd, capture_output=True, env=_git_env(),
+                                  timeout=FETCH_TIMEOUT, check=False)
+            out = proc.stdout.decode("utf-8", "replace")
+            found = re.findall(r"^Learning from ([0-9a-f]+)", out, re.M)
+            learnt = [c for c in commits if any(c.startswith(short) for short in found)]
+        else:
+            for commit in commits:
+                parents = _parents(cwd, commit)
+                if len(parents) < 2:
+                    continue
+                if _learn(cwd, commit, parents[0], parents[1:]):
+                    learnt.append(commit)
         for commit in commits:
-            parents = _text(_run(cwd, "rev-parse", commit + "^@")).split()
-            if len(parents) < 2:
-                continue
-            _check(_run(cwd, "checkout", "-q", "-f", "--detach", parents[0]), "checkout")
-            # the merge must render the conflicts itself: with the cache in place
-            # it would replay the recorded resolution into the files, and `rerere`
-            # would record that stale content as the new preimage (#2165). The
-            # cache is put back before `forget`, which drops the pair's entries
-            # (--overwrite) while the other pairs' entries survive.
-            stash = "%s.train-%d" % (cache, os.getpid())
-            hidden = os.path.isdir(cache) and not os.path.isdir(stash)
-            if hidden:
-                os.rename(cache, stash)
-            try:
-                merge = _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
-                             "merge", "-q", "--no-ff", "--no-commit", *parents[1:])
-            finally:
-                if hidden and os.path.isdir(stash):
-                    _restore_rr(cache, stash)
-            if merge.returncode == 0:
-                continue
-            # `forget` exits 0 even when it did nothing (rerere off): the MERGE_RR
-            # gate below tells whether a conflict is left to learn from, exactly
-            # as `test -s "$GIT_DIR/MERGE_RR"` does in rerere-train.sh (#2165)
-            _run(cwd, "-c", "rerere.enabled=true", "rerere", "forget", ".")
-            if not _merge_rr(cwd):
-                _run(cwd, "reset", "-q", "--hard")
-                continue
-            learnt.append(commit)
-            # the preimage is the conflict the merge just rendered: never
-            # re-render it with `checkout -m`, whose markers ("ours"/"theirs")
-            # differ from the merge's ("HEAD"/branch) and miss at replay (#2165)
-            _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
-            _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
-            _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
-            _run(cwd, "reset", "-q", "--hard")
+            parents = _parents(cwd, commit)
+            if len(parents) == 2 and _learn(cwd, commit, parents[1], [parents[0]]):
+                learnt.append(commit)
     finally:
         _run(cwd, "reset", "-q", "--hard")
         _run(cwd, "checkout", "-q", "-f", "--detach", head)
-    return learnt
+    seen = set(learnt)
+    return [c for c in commits if c in seen]
 
 
 # --------------------------------------------------------------------------
@@ -763,7 +794,7 @@ class Replayer:
     """The radar's private clone of a project. Objects come from the agents'
     repository (`--shared`); merges are replayed in the clone's worktree.
     Each resolution commit gets its own `rr-cache`, trained once and kept
-    under `.git/ameesh-rr/v2/<commit>`: a replay sees the pair's resolution
+    under `.git/ameesh-rr-v2/<commit>`: a replay sees the pair's resolution
     only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto") -> None:
@@ -791,9 +822,9 @@ class Replayer:
         return os.path.join(self.path, ".git", "rr-cache")
 
     def _store(self, sha: str = "") -> str:
-        # #2165: unversioned caches may hold the old checkout -m preimages;
-        # keep a new namespace so existing resolutions are learnt again.
-        return os.path.join(self.path, ".git", "ameesh-rr", "v2", sha)
+        # v2 cache: retrains legacy first-parent and checkout -m preimages
+        # (#2136, #2165).
+        return os.path.join(self.path, ".git", TRAINING_CACHE, sha)
 
     def trained(self) -> list[str]:
         try:
