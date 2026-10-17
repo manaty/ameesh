@@ -42,13 +42,13 @@ lot**.
 * L'attribution passe par la garde habituelle : un agent non réveillable est
   refusé et rien n'est déposé.
 
-## Un agent au repos prend lui-même un lot de son équipe (L165)
+## Un agent au repos prend lui-même un lot de ses projets (L165)
 
 Constat du 11/10 : 9 agents Nexlink sur 13 au repos, dont un sans lot depuis
 1 h 30, alors que 3 lots Nexlink n'avaient pas d'agent. Désormais, `ameesh
 notify` ne laisse plus un lot attendre l'orchestrateur : **un agent
 réveillable au repos sans lot depuis 15 min prend lui-même le lot non
-assigné le plus prioritaire de son équipe qu'il sait faire**, et
+assigné le plus prioritaire de ses projets qu'il sait faire**, et
 l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
 
 * Lots concernés : `intake`, sans assigné, créés il y a plus de 5 min. Un lot
@@ -58,9 +58,17 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   aujourd'hui attend sa date (exemple : un bilan à deux semaines).
 * Réserver un lot à une attribution explicite : capacité exigée `decision` ou
   `production`. Exiger un harnais : capacité `harness:<nom>`.
+* Projet du lot, clé de la prise : son application (`--app`), sinon son
+  équipe. L'agent le prend s'il figure parmi les projets déclarés de sa fiche
+  (`projects`, L243) ; hors du projet primaire, il faut en plus que son
+  dossier de travail pour ce projet soit prêt (#811), sinon le lot reste en
+  file et une note nominative le dit, sans doublon pour le même agent sur le
+  lot — chaque agent qui le tente peut poser la sienne tant que #1538 n'a pas
+  ramené la note à une par lot.
 * Équipe du lot : la sienne, sinon celle de sa fiche (ou de la fiche
-  parente), sinon son application (`--app`). Un lot sans équipe connue
-  attend l'orchestrateur.
+  parente), sinon son application. Elle ne choisit plus le preneur : elle
+  désigne les orchestrateurs prévenus et sert au personnel et aux alertes. Un
+  lot sans équipe connue attend l'orchestrateur.
 * Ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté. Un orchestrateur ne se sert pas lui-même.
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
@@ -75,7 +83,7 @@ Un agent ne garde qu'**un seul lot non démarré en attente** : un lot ouvert,
 assigné, sans début mesuré (aucun tour de son assigné dessus, jamais passé en
 `build` ou `qa`). Attribuer un autre lot non démarré à un agent qui en a déjà
 un ne le lui donne pas : **le lot va dans la file d'équipe** (sans assigné, en
-`intake`), où un agent au repos de l'équipe le prendra (L165 ci-dessus).
+`intake`), où un agent au repos du projet le prendra (L165 ci-dessus).
 
 * Concerne `ameesh work add --assignee`, `ameesh work assign`, `--lot` ou
   `--new-lot` d'`agent-mail send`, et la prise automatique (L119, L165) : un

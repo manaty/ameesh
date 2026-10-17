@@ -236,6 +236,12 @@ class Agents(Domain):
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
 
     @abc.abstractmethod
+    def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
+        """Une écriture groupée, à l'heure de la base, pour les personas execute
+        placées sur host, limitées par names si fourni. Aucun test de bail ou
+        d'éligibilité. Ne modifie ni placement, ni statut, ni last_seen."""
+
+    @abc.abstractmethod
     def note_unleased(self, name: str, host: str, error: str) -> bool:
         """Native runner's lease_not_taken diagnostic, only on its host and
         without a live lease, after taking the row lock. Keeps agent status.
@@ -650,13 +656,17 @@ class AlertAcknowledgements(Domain):
 
     @abc.abstractmethod
     def live(self) -> list[dict]:
-        """Active rows: id, alert_key, severity, observation_host, actor, principal,
-        acknowledged_ts."""
+        """Active rows: id, alert_key, severity, observation_host, perimeter,
+        actor, principal, acknowledged_ts."""
 
     @abc.abstractmethod
     def acknowledge(self, key: str, severity: str, actor: str, principal: str, *,
-                    observation_host: str | None = None) -> dict:
-        """Atomically acknowledge once per key/principal/severity; row + changed."""
+                    observation_host: str | None = None,
+                    perimeter: str | None = None) -> dict:
+        """Atomically acknowledge once per key/principal/severity; row + changed.
+
+        `perimeter` (#1473): canonical thresholds of the observation that
+        raised the alert; NULL when unknown (row predating the column)."""
 
     @abc.abstractmethod
     def invalidate(self, id: int, *, reason: str, observed_ts: float) -> bool:
@@ -2073,7 +2083,10 @@ class Canon(Domain):
         l'hôte (et les paquets sans canon) reçoivent l'identifiant `previous`.
         L44 : les actions aussi ('' → `previous`, puis `new_default` → '').
         L46 : les lignes (agents, éphémères compris, et paquets) du nouveau
-        canon par défaut `new_default` repassent à NULL."""
+        canon par défaut `new_default` repassent à NULL.
+        #1464 (N2 #793) : l'état recopié sous la clé `previous` emporte le
+        repère d'envoi `process_commit` — sans lui, les règles déjà poussées
+        repartent une fois (repli sur `last_good_commit`)."""
 
     @abc.abstractmethod
     def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:

@@ -144,7 +144,12 @@ class Canon(interface.Canon):
         L44 (0031) : le canon des actions (`actions.canon`, '' = canon par
         défaut) suit de même — '' passe à `previous`, puis `new_default` (id
         du nouveau canon par défaut) passe à '' : un reçu d'une action garde
-        les authentificateurs de son canon."""
+        les authentificateurs de son canon.
+
+        #1464 (N2 #793) : la copie emporte `process_commit`, le repère d'envoi
+        des règles Process. Sans lui, l'état recopié retombait sur
+        `last_good_commit`, plus ancien, et les règles déjà poussées
+        repartaient une fois."""
         # L46 (0036) : `actions.canon` est immuable sauf pendant CE rebase ; le
         # réglage ne vaut que pour la transaction de l'appelant (SET LOCAL),
         # que `adopt_default` ouvre.
@@ -179,10 +184,12 @@ class Canon(interface.Canon):
         self.db.query(
             """
             INSERT INTO canon_state
-                (host, canon, canon_id, status, root, source, last_good_commit, last_good_at,
-                 diagnostic, checked_at, auth_status, auth_diagnostic, auth_checked_at)
-            SELECT host, %s::text, %s::text, status, root, source, last_good_commit, last_good_at,
-                   diagnostic, checked_at, auth_status, auth_diagnostic, auth_checked_at
+                (host, canon, canon_id, status, root, source, last_good_commit,
+                 process_commit, last_good_at, diagnostic, checked_at, auth_status,
+                 auth_diagnostic, auth_checked_at)
+            SELECT host, %s::text, %s::text, status, root, source, last_good_commit,
+                   process_commit, last_good_at, diagnostic, checked_at, auth_status,
+                   auth_diagnostic, auth_checked_at
               FROM canon_state WHERE host = %s AND canon = ''
             ON CONFLICT (host, canon) DO NOTHING
             RETURNING host
