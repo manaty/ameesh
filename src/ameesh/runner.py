@@ -7097,12 +7097,16 @@ class Runner:
                     # une fois par incident, pas à chaque passe.
                     processes = getattr(report, "processes", None)
                     push_error = getattr(processes, "error", "") if processes else ""
-                    if push_error != getattr(self, "_process_push_error", ""):
-                        self._process_push_error = push_error
-                        if push_error:
-                            log_async("canon process rules%s: %s" % (
-                                " %s" % canon.id if len(loaded) > 1 else "",
-                                push_error))
+                    errors = getattr(self, "_process_push_errors", {})
+                    ident = getattr(canon, "id", "")
+                    previous_error = errors.pop(ident, "")
+                    if push_error:
+                        errors[ident] = push_error
+                    self._process_push_errors = errors
+                    if push_error and push_error != previous_error:
+                        log_async("canon process rules%s: %s" % (
+                            " %s" % canon.id if len(loaded) > 1 else "",
+                            push_error))
                 except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
                     ok = False
                     log_async("canon sync failed%s: %s" % (

@@ -85,6 +85,46 @@ def _canon_approuve(tmp: str, nom: str = "acme", contenu: str = "") -> str:
     return clone
 
 
+class ProcessRunnerLogTest(unittest.TestCase):
+    def test_les_incidents_sont_memorises_par_canon(self):
+        canons = [types.SimpleNamespace(id="a"), types.SimpleNamespace(id="b")]
+        fake = types.SimpleNamespace(cfg=object(), host="atelier")
+        errors = {"a": "repere absent", "b": ""}
+
+        def sync(_db, one, _host):
+            return types.SimpleNamespace(status=canon_sync.CANON_OK,
+                processes=canon_sync.ProcessSync(error=errors[one.id]))
+
+        with (mock.patch("ameesh.runner.canon_mod.configured", return_value=canons),
+              mock.patch("ameesh.runner.canon_mod.from_config",
+                         side_effect=lambda _cfg, entry=None: entry or canons[0]),
+              mock.patch("ameesh.runner.harnesses.stale_reason", return_value=""),
+              mock.patch("ameesh.scoped_db.ScopedDb"),
+              mock.patch("ameesh.runner.db_mod.require_schema"),
+              mock.patch("ameesh.runner.canon_sync.sync", side_effect=sync),
+              mock.patch("ameesh.runner.log_async") as journal):
+            for _ in range(2):
+                self.assertTrue(Runner.canon_sync_once(fake))
+            self.assertEqual(journal.call_args_list,
+                             [mock.call("canon process rules a: repere absent")])
+            # Le même diagnostic dans l'autre canon reste un incident distinct.
+            errors["b"] = errors["a"]
+            for _ in range(2):
+                self.assertTrue(Runner.canon_sync_once(fake))
+            self.assertEqual(journal.call_args_list[-1],
+                             mock.call("canon process rules b: repere absent"))
+            self.assertEqual(journal.call_count, 2)
+            # Une guérison réarme seulement le constat du canon concerné.
+            errors["a"] = ""
+            self.assertTrue(Runner.canon_sync_once(fake))
+            errors["a"] = "repere absent"
+            for _ in range(2):
+                self.assertTrue(Runner.canon_sync_once(fake))
+            self.assertEqual(journal.call_count, 3)
+            self.assertEqual(journal.call_args_list[-1],
+                             mock.call("canon process rules a: repere absent"))
+
+
 class ProcessLectureTest(_TmpMixin, unittest.TestCase):
     """(1) lecture et validation des fiches Process."""
 
