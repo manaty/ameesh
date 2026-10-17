@@ -602,6 +602,8 @@ class OrphanGuardsTest(unittest.TestCase):
                  {7: "closed", 6: None}, False),
                 ("other-closed-candidates", "review/other-6-7", "other",
                  {7: "closed", 6: "merged"}, False),
+                ("other-merged-kept", "lot/7-x", "other", "merged", False),
+                ("other-merged-kept-recent", "lot/7-x", "other", "merged", True),
                 ("unknown", "lot/7-x", None, None, False),
                 ("unreadable", "lot/7-x", None, RuntimeError("offline"), False),
                 ("named-directory", "", "other", "build", False),
@@ -621,6 +623,10 @@ class OrphanGuardsTest(unittest.TestCase):
                         os.utime(source, (now - 60, now - 60))
                     row = dict(id=1, path=path, agent="a1", lot=None, branch=branch,
                                detail=menage.UNATTRIBUTED, status="active", created_ts=now - 3 * 86400)
+                    if label.startswith("other-merged-kept"):
+                        row.update(status="kept", checked_ts=now - 2 * DAY,
+                                   detail="lot #7 merged (assigned to another agent): "
+                                          "kept — not integrated")
                     lookup = mock.Mock(return_value=dict(assignee=owner, state=state)
                                        if owner else None)
                     if isinstance(state, Exception):
@@ -646,7 +652,7 @@ class OrphanGuardsTest(unittest.TestCase):
                     # rule; its open, unknown or unreadable lot proves nothing
                     self.assertEqual(plan[0]["action"] == "retrait",
                                      label in ("orphan", "own-closed", "other-closed",
-                                               "other-closed-candidates"), plan)
+                                               "other-closed-candidates", "other-merged-kept"), plan)
                     if recent:
                         outcome, freed, reason, built = menage._remove_kept_worktree(
                             path, root, "", artifacts=None, allow=(),

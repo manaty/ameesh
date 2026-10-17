@@ -2758,7 +2758,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # #1665: an orphan (or a lot that ended without integration) follows
         # the same end after ORPHAN_WORKTREE_IDLE_S of inactivity, clean and
         # pushed; the branch stays too.
-        grace = (state in LOT_MERGED and row["status"] == "kept"
+        # Foreign copies always need 24 h of source/git inactivity, even
+        # when the same integration failure has kept them for a day.
+        grace = (not foreign and state in LOT_MERGED and row["status"] == "kept"
                  and row.get("detail") == detail
                  and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
         abandoned = (ended or orphan) and now - youngest >= ORPHAN_WORKTREE_IDLE_S
