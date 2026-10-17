@@ -27,6 +27,7 @@ from ameesh.storage import interface as SI
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN_DIR = os.path.join(REPO, "tests", "golden", "mediated_executor")
+CONTRACT_FILE = os.path.join(REPO, "src", "ameesh", "mediated_executor", "contract.json")
 HINTS = typing.get_type_hints(SI.Storage)
 
 
@@ -142,6 +143,11 @@ class TableTest(unittest.TestCase):
         self.assertFalse(admitted & refused)
         self.assertEqual(admitted | refused, _interface_ops())
         self.assertEqual(self.c.interface_total, len(_interface_ops()))
+        # #1517 : le total est dérivé ; un compteur réintroduit dans la table
+        # (résolution de fusion qui l'aurait gardé) redeviendrait la ligne que
+        # tous les lots se disputent.
+        with open(CONTRACT_FILE, encoding="utf-8") as fh:
+            self.assertNotIn("interface_total", json.load(fh)["refused"])
         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
 
     def test_les_compteurs_du_doc_suivent_le_contrat(self):

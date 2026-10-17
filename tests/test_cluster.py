@@ -63,6 +63,11 @@ SIGNATURES = {
     # L87b (0441) : journal des transitions de la pause opérateur.
     "operator_pause_events": {"id", "agent", "paused", "reason", "actor",
                               "principal", "created_at"},
+    # L87c (0444): native-operator acknowledgement audit. Preserve the
+    # migration's closed rights; this classification adds no GRANT.
+    "alert_acknowledgements": {"id", "alert_key", "severity", "observation_host",
+                               "actor", "principal", "acknowledged_at", "confirmed_at",
+                               "invalidated_at", "invalidation_reason"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }
@@ -98,9 +103,28 @@ FERMEES = {
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
     "agent_mesh_overview": {"roles"},
+    # #1883 (0451) : l'identité d'un compte est l'empreinte sha256 du dossier
+    # résolu qu'il lit — jamais le chemin. Le propriétaire est alerté du conflit
+    # par notify (`account_identity`) et le lot n'ouvre aucun accès distant
+    # (arbitrage pilote du 16/10) : la table reste fermée, aucun GRANT modifié.
+    "account_identities": {"host", "harness", "account", "identity",
+                           "first_seen", "last_seen"},
+    # #1922 (0452) : registre Process des workflows (révision/étape, reçus d'étape) —
+    # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
+    "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
+    "work_item_events": {"command_id", "evidence", "workflow_stage", "workflow_version"},
 }
-EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set()) | FERMEES.get(rel, set())
-           for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES)}
+#: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
+#: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
+HORS_CONTRAT = {
+    "host_release_operations": {"operation", "host", "manifest_digest", "created_at"},
+    "host_release_fences": {"operation", "probe", "created_at"},
+    "host_release_fence_receipts": {"action_id", "operation", "step", "receipt",
+                                    "completed_at"},
+}
+EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
+           | FERMEES.get(rel, set()) | HORS_CONTRAT.get(rel, set())
+           for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES) | set(HORS_CONTRAT)}
 
 
 def ecarts_de_classement(cols: dict[str, dict[str, bool]]) -> list[str]:
@@ -574,6 +598,16 @@ class SuperviseurRoleTest(PgTestCase):
         self.assertTrue(set(EXCLUES) <= set(cols), set(EXCLUES) - set(cols))
         ecarts = ecarts_de_classement(cols)
         self.assertEqual(ecarts, [], "colonnes ni accordées ni exclues (ou l'inverse)")
+
+    def test_le_superviseur_evalue_la_porte_de_release(self):
+        # L232b (0417) : `ameesh_host_gate_state` lit `host_release_fences.host` ;
+        # le périmètre d'opération et les reçus restent hors contrat.
+        lu = self.as_supervisor("SELECT ameesh_host_gate_state('synthetic-host', 'idle')")
+        self.assertEqual(lu.returncode, 0, lu.stderr)
+        self.assertEqual(lu.stdout.strip(), "idle")
+        refus = self.as_supervisor("SELECT operation FROM host_release_fences")
+        self.assertNotEqual(refus.returncode, 0)
+        self.assertIn("permission denied", refus.stderr.lower())
 
     def test_le_role_contenus_lit_exactement_les_contenus(self):
         for rel, cols in CONTENUS.items():
