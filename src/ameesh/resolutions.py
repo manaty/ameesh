@@ -763,7 +763,7 @@ class Replayer:
     """The radar's private clone of a project. Objects come from the agents'
     repository (`--shared`); merges are replayed in the clone's worktree.
     Each resolution commit gets its own `rr-cache`, trained once and kept
-    under `.git/ameesh-rr/<commit>`: a replay sees the pair's resolution
+    under `.git/ameesh-rr/v2/<commit>`: a replay sees the pair's resolution
     only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto") -> None:
@@ -791,7 +791,9 @@ class Replayer:
         return os.path.join(self.path, ".git", "rr-cache")
 
     def _store(self, sha: str = "") -> str:
-        return os.path.join(self.path, ".git", "ameesh-rr", sha)
+        # #2165: unversioned caches may hold the old checkout -m preimages;
+        # keep a new namespace so existing resolutions are learnt again.
+        return os.path.join(self.path, ".git", "ameesh-rr", "v2", sha)
 
     def trained(self) -> list[str]:
         try:

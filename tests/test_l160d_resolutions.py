@@ -20,7 +20,7 @@ from unittest import mock
 from ameesh import plan_git, radar, resolutions, storage, work
 
 from .support import PgTestCase
-from .test_l160b_radar import LOTS, MIG, _git, _write, make_repo
+from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
 
 #: the line both lots 1 and 2 changed, resolved
 RESOLVED = "UN-One\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n"
@@ -534,7 +534,9 @@ class ReviewTest(_Base):
         _git(repo, "commit", "-qam", "ours")
         wt = os.path.join(tmp, "wt")
         _git(repo, "worktree", "add", "-q", "--detach", wt, "main")
-        resolutions._run(wt, "merge", "-q", "--no-ff", "--no-commit", "theirs")
+        merge = resolutions._run(wt, "merge", "-q", "--no-ff", "--no-commit", "theirs",
+                                 env_extra=git_env())
+        self.assertEqual(merge.returncode, 1, merge.stderr.decode("utf-8", "replace"))
         _write(wt, "f.json", ours)
         _git(wt, "add", "f.json")
         _git(wt, "commit", "-qm", "R")
@@ -543,6 +545,9 @@ class ReviewTest(_Base):
         a, b = _git(repo, "rev-parse", "main"), _git(repo, "rev-parse", "theirs")
         rp = resolutions.Replayer(repo, os.path.join(tmp, "clone"), script=None)
         rp.ensure()
+        # The old port may already have cached this SHA without the matching
+        # preimage. An upgrade must relearn it instead of keeping it stale.
+        os.makedirs(os.path.join(rp.path, ".git", "ameesh-rr", r))
         self.assertEqual(rp.prime([r]), [])
         got = rp.replay(a, b, r)
         self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
