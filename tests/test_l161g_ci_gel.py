@@ -30,8 +30,9 @@ le verrou de la ligne du lot sérialise deux `ci run`.
 
 L'avis delta R1 sur `3ce572f7b` est tenu aussi : le gel et les derniers
 verdicts sont relus sous le verrou (`ci._revalidate`) — un `blocked` ou un
-nouveau gel commité pendant l'attente fait reculer la pose, les exceptions
-explicites (`--exception`, `--full`) gardant leur cours ; la phase critique
+nouveau gel commité pendant l'attente fait reculer la pose, seule l'exception
+explicite (`--exception … --reason …`) gardant son cours (`--full` reste
+soumis aux avis, #2214) ; la phase critique
 refait la décision check/mode/`--force` du plan (le `--force` d'un check requis
 rouge part) ; la marque d'un run rouge visible ne tient plus la clé (`after`) ;
 une réservation `full` couvre une demande `lot`, jamais l'inverse ; le chemin
@@ -429,12 +430,40 @@ class GelPlanTest(GelTestCase):
 
     def test_un_full_sur_pr_ordinaire_est_une_demande_ci_full(self):
         # #1343 : le mode est porté par l'étiquette (`ci-lot` / `ci-full`) ; un
-        # `--full --reason` sur une PR ordinaire est représentable et sans
-        # ambiguïté, il ne peut pas verdir un run lot.
-        self.jalons.append(jalon("frozen", sha=GEL))
+        # `--full --reason` sur une PR ordinaire, ses avis acquis, est
+        # représentable et sans ambiguïté, il ne peut pas verdir un run lot.
+        self.gele()
         decision = self.gel(Github(), full=True, reason="paquet §12")
         self.assertEqual((decision["action"], decision["mode"], decision["label"]),
                          ("request", "full", LABEL_FULL))
+
+    def test_un_full_ne_dispense_pas_des_avis_requis(self):
+        # #2214 : `--full` est un mode d'exécution, pas une relecture ; sans
+        # avis sur la tête il ne part pas, même sur une PR ordinaire.
+        api = Github()
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, full=True, reason="paquet §12")
+        self.assertIn("0 independent verdict(s)", str(caught.exception))
+        self.assertIn("--exception incident|unblock", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune demande sans les avis")
+
+    def test_un_full_ne_consomme_pas_un_avis_manquant(self):
+        # #2214, constat #2209 : `--avis 2 --full` avec un seul `ok` doit
+        # refuser, y compris sur une branche de paquet (integration/**).
+        self.gele()
+        api = Github(pulls=[pull(base_ref="integration/paquet")])
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, avis=2, full=True, reason="paquet §12")
+        self.assertIn("1 independent verdict(s)", str(caught.exception))
+
+    def test_un_full_sans_avis_passe_par_l_exception_marquee(self):
+        # Canon §3 : seul `--exception incident|unblock --reason …` suspend les
+        # avis, et le motif reste dans la trace.
+        self.jalons.append(jalon("frozen", sha=GEL))
+        decision = self.gel(Github(), full=True, reason="paquet §12",
+                            exception="unblock")
+        self.assertEqual((decision["action"], decision["exception"], decision["mode"]),
+                         ("request", "unblock", "full"))
 
     def test_un_vert_de_la_composition_ne_repose_pas(self):
         self.gele()
@@ -471,8 +500,8 @@ class GelPlanTest(GelTestCase):
 
     def test_un_vert_de_mode_lot_ne_fait_pas_un_full_deja_vert(self):
         # P1-3 : un run `lot` vert ne prouve pas la suite complète qu'un
-        # `--full` demande ; la demande part.
-        self.jalons.append(jalon("frozen", sha=GEL))
+        # `--full` demande ; la demande part (avis acquis, #2214).
+        self.gele()
         api = Github(runs=[label_run(7, mode="lot")])
         decision = self.gel(api, full=True, reason="paquet §12")
         self.assertEqual((decision["action"], decision["mode"]), ("request", "full"))
@@ -621,9 +650,14 @@ class GelPlanTest(GelTestCase):
         with self.assertRaises(ci.GelError):
             self.gel(Github(), exception="autre", reason="x")
 
-    def test_full_sans_avis_en_mode_full(self):
-        self.jalons.append(jalon("frozen", sha=GEL))
-        decision = self.gel(Github(), full=True, reason="paquet §12")
+    def test_full_sans_avis_refuse_meme_sans_gel(self):
+        # #2214 : le gel est facultatif en `--full` (la tête nommée), les avis
+        # non ; le refus porte sur les avis, pas sur le gel.
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(Github(), full=True, reason="paquet §12")
+        self.assertIn("0 independent verdict(s)", str(caught.exception))
+        decision = self.gel(Github(), full=True, reason="paquet §12",
+                            exception="unblock")
         self.assertEqual((decision["action"], decision["mode"]), ("request", "full"))
 
     def test_avis_hors_bornes_refuse(self):
@@ -1028,6 +1062,21 @@ class RequestTest(GelTestCase):
         self.assertEqual(self.marques("applied"), [])
         self.assertIn("blocked", notes[-1])
         self.assertEqual(len(self.marques("reserve")), 1)
+
+    def test_un_full_relit_les_avis_sous_le_verrou(self):
+        # #2214 : le mode `full` ne dispense pas de la relecture sous le verrou ;
+        # un `ok` retiré pendant l'attente annule la demande, comme en mode lot.
+        self.gele()
+        self.on_note = lambda text: self.jalons.append(
+            jalon("verdict", sha=GEL, actor="relecteur", verdict="blocked"))
+        full = argparse.Namespace(**{**vars(self.args), "full": True,
+                                     "reason": "paquet §12"})
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh, args=full)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertIn("blocked", notes[-1])
+        self.assertEqual(self.marques("applied"), [])
 
     def test_un_gel_deplace_sous_le_verrou_recule(self):
         # P1 delta : un nouveau gel enregistré entre le plan et le verrou

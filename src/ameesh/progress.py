@@ -275,6 +275,24 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
     reviewer = (last["actor"] if last else None) if verdict_current else designated
+    from .work_reviewers import designated as designated_reviewers
+    reviewers = designated_reviewers(item)
+    current = {v["actor"]: v for v in verdicts if _verdict_applies(v, last_frozen)}
+    pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
+               if item.get("reviewers") is not None else [])
+    # Every designated reviewer owes their own verdict on the frozen head.
+    # A later GO from another reviewer cannot erase a blocking verdict.
+    blocked = [v for v in current.values() if v["kind"] == "blocked"]
+    if item.get("reviewers") is not None and reviewers and blocked:
+        last = max(blocked, key=lambda v: v["at_ts"])
+        verdict_current = True
+    elif reviewers and pending:
+        verdict_current = False
+    elif item.get("reviewers") is not None and reviewers and current:
+        last = max(current.values(), key=lambda v: v["at_ts"])
+        verdict_current = True
+    if item.get("reviewers") is not None and reviewers:
+        reviewer = last["actor"] if verdict_current and last else designated
     # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
     # mécanique, canon §11 bis/#87) en marquant la colonne du relecteur
     # (`work.waive_review`) : l'attente passe alors à la fusion, sans faux
@@ -287,6 +305,8 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "verdict": last["at_ts"] if last else None,
         "verdict_kind": last["kind"] if last else None,
         "reviewer": reviewer,
+        "reviewers": reviewers,
+        "pending_reviewers": pending,
         "verdict_current": verdict_current,
         "verdict_required": verdict_required,
         "merged": merged,
@@ -404,6 +424,8 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         # le dit ; le jeton de la colonne ne sort pas dans la vue.
         "reviewer": (None if jalons["reviewer"] == work_mod.REVIEWER_NONE
                      else jalons["reviewer"]),
+        "reviewers": jalons["reviewers"],
+        "pending_reviewers": jalons["pending_reviewers"],
         "milestones": {k: _round(jalons[k])
                        for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
@@ -483,6 +505,26 @@ def agent_state(row: dict) -> str:
     return "idle"                       # idle, queued
 
 
+def operator_pause_of(row: dict) -> dict | None:
+    """#2200 : la pause opérateur d'une ligne, projetée une seule fois.
+
+    `ameesh show`, `ameesh projects`/`progress` et les alertes lisent la même
+    pause (raison, auteur, principal, début) : une projection partagée évite
+    que l'un l'affiche et que l'autre la perde en route. `after_turn` dit que
+    le tour en cours finit avant que la pause ne prenne effet (`running`,
+    comme `ameesh list` : le statut suffit, la lecture `show` n'a pas de
+    `lease_live`)."""
+    if not row.get("operator_paused"):
+        return None
+    return {
+        "reason": row.get("operator_pause_reason"),
+        "by": row.get("operator_pause_by"),
+        "for": row.get("operator_pause_for"),
+        "since_ts": _round(row.get("operator_pause_ts")),
+        "after_turn": row.get("status") == "running",
+    }
+
+
 def paused_on_budget(row: dict) -> bool:
     """#1070 : is the agent in a BUDGET pause? Delegates to `handoff.paused`
     (L233b), the single definition, so no second rule is kept here."""
@@ -547,13 +589,7 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
-        "operator_pause": ({
-            "reason": row.get("operator_pause_reason"),
-            "by": row.get("operator_pause_by"),
-            "for": row.get("operator_pause_for"),
-            "since_ts": _round(row.get("operator_pause_ts")),
-            "after_turn": state == "working",
-        } if row.get("operator_paused") else None),
+        "operator_pause": operator_pause_of(row),
     }
 
 
@@ -841,14 +877,19 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, items, now=now, packages=packages,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    # #1664 : le flux ciblé du stockage (transitions + notes hold/levée) ;
+    # jamais le journal entier ni le texte des notes ordinaires.
+    waits = planned_waits.read(
+        db, items, now=now, packages=packages,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(
+            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])),
                       events_ts=last_events.get(int(item["id"])), agent_states=states,
-                      planned_wait=holds.get(int(item["id"])),
+                      planned_wait=waits.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
@@ -1066,7 +1107,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
         extra = []
         if lot["assignee"]:
             extra.append("author %s" % lot["assignee"])
-        if lot["reviewer"]:
+        if lot.get("reviewers"):
+            extra.append("reviewers %s" % ", ".join(lot["reviewers"]))
+        elif lot["reviewer"]:
             extra.append("reviewer %s" % lot["reviewer"])
         if lot["blocked_verdicts"] or lot["blocks"]:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))
