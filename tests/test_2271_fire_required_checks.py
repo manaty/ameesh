@@ -12,15 +12,18 @@ configuration locale du projet le déclarait.
 Le feu lit désormais la protection de la branche cible à la forge, complétée
 par la déclaration `radar.projects.<p>.required_checks`, et exige chaque
 contexte requis **présent** sur la tête gelée et en `SUCCESS` — un check
-absent ou `SKIPPED` laisse la PR non prête. Témoins sans base : rollup du
-constat, check sauté, check absent, panne de lecture, déclaration.
+absent ou `SKIPPED` laisse la PR non prête. La protection peut imposer une
+application GitHub (`checks[].app_id`) : le feu lit alors la provenance des
+check runs de la tête exacte et refuse un homonyme d'une autre application,
+un statut de commit sans source, ou une source illisible (B1 de la relecture
+du 17/10). Témoins sans base : rollup du constat, check sauté, check absent,
+panne de lecture, déclaration, mauvais fournisseur.
 """
 from __future__ import annotations
 
 import json
 import types
 import unittest
-from unittest import mock
 
 from ameesh import fire, land, radar
 
@@ -56,13 +59,23 @@ def _status(rollup, **extra):
     return row
 
 
-class FakeGh:
-    """Le peu de `gh` que le feu lit : la PR et la protection de la cible."""
+def _run(name, app_id=15368, conclusion="success", status="completed", sha=SHA):
+    """Un check run de la tête, tel que le lit `commits/<sha>/check-runs`."""
+    return {"name": name, "status": status, "conclusion": conclusion,
+            "head_sha": sha, "app": {"id": app_id}}
 
-    def __init__(self, *, rows=(), protection=PROTECTED, error=""):
+
+class FakeGh:
+    """Le peu de `gh` que le feu lit : la PR, la protection de la cible et les
+    check runs de la tête (leur source)."""
+
+    def __init__(self, *, rows=(), protection=PROTECTED, error="", check_runs=(),
+                 check_error=""):
         self.rows = list(rows)
         self.protection = protection
         self.error = error
+        self.check_runs = list(check_runs)
+        self.check_error = check_error
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -75,6 +88,15 @@ class FakeGh:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr=self.error)
             return types.SimpleNamespace(returncode=0,
                                          stdout=json.dumps(self.protection), stderr="")
+        path = next((arg for arg in argv if "/check-runs" in arg), "")
+        if path:
+            if self.check_error:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr=self.check_error)
+            page = {"total_count": len(self.check_runs),
+                    "check_runs": self.check_runs}
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps([page]),
+                                         stderr="")
         return types.SimpleNamespace(returncode=1, stdout="",
                                      stderr="unexpected gh %s" % " ".join(argv))
 
@@ -91,8 +113,27 @@ class ProtectionTest(unittest.TestCase):
 
     def test_reads_the_required_contexts_from_the_forge(self):
         gh = FakeGh()
-        self.assertEqual(self._required(gh), ("tests",))
+        self.assertEqual(self._required(gh), (("tests", 15368),))
         self.assertTrue(any("/protection" in call[1] for call in gh.calls))
+
+    def test_the_protection_keeps_the_imposed_app(self):
+        # B1 : `main` impose `tests` à l'application Actions (15368) ; réduire
+        # le check à son nom accepterait un homonyme de n'importe qui.
+        self.assertEqual(fire._protection_required("manaty/ameesh", "main", gh=FakeGh()),
+                         (("tests", 15368),))
+
+    def test_a_legacy_context_imposes_no_app(self):
+        gh = FakeGh(protection={"required_status_checks": {
+            "contexts": ["tests"], "checks": []}})
+        self.assertEqual(self._required(gh), (("tests", None),))
+
+    def test_an_app_scoped_check_is_not_duplicated_as_an_unscoped_context(self):
+        # La forge renvoie `contexts` et `checks` pour la même exigence : le
+        # doublon sans application n'ajoute aucune garantie.
+        gh = FakeGh(protection={"required_status_checks": {
+            "contexts": ["tests", "coverage"],
+            "checks": [{"context": "tests", "app_id": 15368}]}})
+        self.assertEqual(self._required(gh), (("tests", 15368), ("coverage", None)))
 
     def test_no_protection_is_no_requirement_not_a_read_failure(self):
         gh = FakeGh(error="gh: Branch not protected (HTTP 404)")
@@ -111,12 +152,12 @@ class ProtectionTest(unittest.TestCase):
     def test_a_project_declaration_covers_an_unreadable_protection(self):
         gh = FakeGh(error="gh: Resource not accessible by integration (HTTP 403)")
         project = _project(required_checks=("coverage",))
-        self.assertEqual(self._required(gh, project=project), ("coverage",))
+        self.assertEqual(self._required(gh, project=project), (("coverage", None),))
 
     def test_the_declaration_completes_the_forge_never_weakens_it(self):
         project = _project(required_checks=("coverage",))
         self.assertEqual(self._required(FakeGh(), project=project),
-                         ("tests", "coverage"))
+                         (("tests", 15368), ("coverage", None)))
 
     def test_a_target_is_needed_to_read_the_protection(self):
         with self.assertRaises(land.LandError):
@@ -130,7 +171,11 @@ class ProtectionTest(unittest.TestCase):
     def test_malformed_protection_is_refused(self):
         for bad in ({"required_status_checks": {"contexts": "tests"}},
                     {"required_status_checks": {"checks": [{"app_id": 1}]}},
-                    {"required_status_checks": {"checks": ["tests"]}}):
+                    {"required_status_checks": {"checks": ["tests"]}},
+                    {"required_status_checks": {"checks": [
+                        {"context": "tests", "app_id": "15368"}]}},
+                    {"required_status_checks": {"checks": [
+                        {"context": "tests", "app_id": True}]}}):
             with self.subTest(bad=bad), self.assertRaises(land.LandError):
                 self._required(FakeGh(protection=bad))
 
@@ -139,9 +184,9 @@ class ReadyPrTest(unittest.TestCase):
     """Le constat, et chaque façon dont un check requis ne prouve pas sa tête."""
 
     def ready(self, rollup, *, project=None, gh=None, slug="manaty/ameesh",
-              required=None):
+              required=None, frozen=SHA):
         return fire.ready_pr(_status(rollup), target="main", project=project,
-                             frozen=SHA, required=required, slug=slug,
+                             frozen=frozen, required=required, slug=slug,
                              gh=gh if gh is not None else FakeGh())
 
     def test_the_incident_rollup_is_not_ready(self):
@@ -151,28 +196,85 @@ class ReadyPrTest(unittest.TestCase):
         self.assertIn("tests (absent)", why)
 
     def test_a_skipped_required_check_is_not_success(self):
-        ok, why = self.ready([_check("tests", "SKIPPED"), _check("couverture")])
+        gh = FakeGh(check_runs=[_run("tests", conclusion="skipped")])
+        ok, why = self.ready([_check("tests", "SKIPPED"), _check("couverture")], gh=gh)
         self.assertFalse(ok)
         self.assertIn("tests (SKIPPED)", why)
 
     def test_a_pending_required_check_is_not_ready(self):
-        ok, why = self.ready([_check("tests", None, "IN_PROGRESS")])
+        gh = FakeGh(check_runs=[_run("tests", conclusion=None, status="in_progress")])
+        ok, why = self.ready([_check("tests", None, "IN_PROGRESS")], gh=gh)
         self.assertFalse(ok)
         self.assertIn("tests (PENDING)", why)
 
     def test_a_successful_required_check_is_ready(self):
+        gh = FakeGh(check_runs=[_run("tests")])
         ok, why = self.ready([_check("tests"), _check("suite complète du paquet",
-                                                      "SKIPPED")])
+                                                      "SKIPPED")], gh=gh)
         self.assertTrue(ok, why)
 
-    def test_a_required_commit_status_counts(self):
-        ok, why = self.ready([_context("tests")])
+    def test_a_required_check_from_the_expected_app_is_ready(self):
+        # Le check run de la tête vient de l'application 15368 qu'impose la
+        # protection : la porte est franchie.
+        gh = FakeGh(check_runs=[_run("tests", app_id=15368)])
+        ok, why = self.ready([_check("tests")], gh=gh)
+        self.assertTrue(ok, why)
+
+    def test_a_required_check_from_another_app_is_not_ready(self):
+        # B1 : même nom, même `SUCCESS`, mais produit par une autre
+        # application : le fournisseur imposé n'est pas prouvé.
+        gh = FakeGh(check_runs=[_run("tests", app_id=99999)])
+        ok, why = self.ready([_check("tests")], gh=gh)
+        self.assertFalse(ok)
+        self.assertIn("tests (app 99999, expected 15368)", why)
+
+    def test_a_commit_status_cannot_prove_an_imposed_app(self):
+        # B1 : un statut de commit `tests` vert n'a pas de source
+        # d'application et ne satisfait pas une protection qui en impose une.
+        gh = FakeGh(check_runs=[])
+        ok, why = self.ready([_context("tests")], gh=gh)
+        self.assertFalse(ok)
+        self.assertIn("tests (source absent)", why)
+
+    def test_a_check_run_without_an_app_cannot_prove_the_imposed_app(self):
+        gh = FakeGh(check_runs=[{"name": "tests", "status": "completed",
+                                 "conclusion": "success", "head_sha": SHA,
+                                 "app": None}])
+        ok, why = self.ready([_check("tests")], gh=gh)
+        self.assertFalse(ok)
+        self.assertIn("tests (source absent)", why)
+
+    def test_an_unreadable_check_source_fails_closed(self):
+        gh = FakeGh(check_error="gh: Resource not accessible by integration (HTTP 403)")
+        ok, why = self.ready([_check("tests")], gh=gh)
+        self.assertFalse(ok)
+        self.assertIn("cannot be proven", why)
+
+    def test_a_required_commit_status_counts_without_an_imposed_app(self):
+        gh = FakeGh(protection={"required_status_checks": {
+            "contexts": ["tests"], "checks": []}})
+        ok, why = self.ready([_context("tests")], gh=gh)
         self.assertTrue(ok, why)
 
     def test_a_non_success_duplicate_of_the_required_name_blocks(self):
-        ok, why = self.ready([_check("tests"), _check("tests", "SKIPPED")])
+        gh = FakeGh(check_runs=[_run("tests"), _run("tests", conclusion="skipped")])
+        ok, why = self.ready([_check("tests"), _check("tests", "SKIPPED")], gh=gh)
         self.assertFalse(ok)
         self.assertIn("tests (SKIPPED)", why)
+
+    def test_a_pr_head_past_the_freeze_is_not_ready(self):
+        ok, why = self.ready([_check("tests")],
+                             gh=FakeGh(check_runs=[_run("tests")]),
+                             frozen="b" * 40)
+        self.assertFalse(ok)
+        self.assertIn("not the freeze", why)
+
+    def test_the_checks_are_read_on_the_frozen_head(self):
+        gh = FakeGh(check_runs=[_run("tests")])
+        self.ready([_check("tests")], gh=gh)
+        paths = [call for call in gh.calls if any("/check-runs" in arg for arg in call)]
+        self.assertEqual(len(paths), 1)
+        self.assertIn("/commits/%s/check-runs" % SHA, " ".join(paths[0]))
 
     def test_a_local_ci_required_off_does_not_weaken_the_forge(self):
         project = _project(ci_required=False)
@@ -198,6 +300,14 @@ class ReadyPrTest(unittest.TestCase):
         ok, why = self.ready(INCIDENT, required=())
         self.assertTrue(ok, why)
 
+    def test_an_explicit_name_still_accepts_any_provider(self):
+        # L'appelant qui passe des noms (pas de couple) n'impose pas
+        # d'application : le rollup suffit, sans lecture de provenance.
+        gh = FakeGh()
+        ok, why = self.ready([_check("tests")], required=("tests",), gh=gh)
+        self.assertTrue(ok, why)
+        self.assertFalse(any("/check-runs" in arg for call in gh.calls for arg in call))
+
 
 class PrStatusTest(unittest.TestCase):
     def test_pr_status_keeps_the_rollup_although_skipped_reads_green(self):
@@ -212,6 +322,50 @@ class PrStatusTest(unittest.TestCase):
         ok, _ = fire.ready_pr(status, target="main", project=None, frozen=SHA,
                               slug="manaty/ameesh", gh=gh)
         self.assertFalse(ok)
+
+
+class PagesGh:
+    """`gh api --paginate --slurp` : une liste de pages de check runs."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps(self.pages), stderr="")
+
+
+class HeadCheckRunsTest(unittest.TestCase):
+    """La provenance des checks se lit sur la tête exacte, toutes pages."""
+
+    def test_all_pages_of_check_runs_are_read(self):
+        gh = PagesGh([{"check_runs": [_run("couverture")]},
+                      {"check_runs": [_run("tests")]}])
+        runs = fire._head_check_runs("manaty/ameesh", SHA, gh=gh)
+        self.assertEqual([run["name"] for run in runs], ["couverture", "tests"])
+        self.assertEqual(runs[1]["app_id"], 15368)
+        self.assertIn("--paginate", gh.calls[0])
+        self.assertIn("--slurp", gh.calls[0])
+
+    def test_a_malformed_check_run_is_refused(self):
+        for bad in ([{"check_runs": [{"name": "tests", "app": {"id": "15368"}}]}],
+                    [{"check_runs": [{"status": "completed"}]}],
+                    [{"total_count": 1}]):
+            with self.subTest(bad=bad), self.assertRaises(land.LandError):
+                fire._head_check_runs("manaty/ameesh", SHA, gh=PagesGh(bad))
+
+    def test_a_check_run_of_another_head_is_refused(self):
+        gh = PagesGh([{"check_runs": [_run("tests", sha="b" * 40)]}])
+        with self.assertRaises(land.LandError):
+            fire._head_check_runs("manaty/ameesh", SHA, gh=gh)
+
+    def test_a_missing_reader_fails_closed(self):
+        for slug, sha, gh in (("", SHA, PagesGh([])),
+                              ("manaty/ameesh", SHA, None),
+                              ("manaty/ameesh", "", PagesGh([]))):
+            with self.subTest(slug=slug, sha=sha), self.assertRaises(land.LandError):
+                fire._head_check_runs(slug, sha, gh=gh)
 
 
 class SettingsTest(unittest.TestCase):

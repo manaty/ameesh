@@ -519,31 +519,126 @@ def _rollup_state(entry) -> str:
     return str(entry.get("conclusion") or "").upper()
 
 
-def _required_gap(required, rollup) -> list:
-    """Les checks requis que `rollup` ne prouve pas : absents, non conclus, ou
-    terminés autrement que `SUCCESS` (un `SKIPPED` ne prouve rien). Un même
-    nom porté par plusieurs entrées n'est vert que si toutes le sont : le
-    doute ne verdit pas la porte."""
-    names = (required,) if isinstance(required, str) else tuple(required or ())
-    gaps = []
-    for name in names:
-        states = [_rollup_state(entry) for entry in rollup or ()
-                  if _rollup_name(entry) == name]
-        if not states:
-            gaps.append("%s (absent)" % name)
+def _required_pairs(required) -> tuple:
+    """Les checks requis sous la forme `(contexte, app_id)` : un nom seul vaut
+    `(nom, None)` (aucune application imposée)."""
+    values = (required,) if isinstance(required, str) else tuple(required or ())
+    pairs = []
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            pairs.append((value.strip(), None))
             continue
-        bad = sorted({state or "?" for state in states if state != "SUCCESS"})
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            name, app_id = value
+            if isinstance(name, str) and name.strip() \
+                    and (app_id is None or (isinstance(app_id, int)
+                                            and not isinstance(app_id, bool)
+                                            and app_id > 0)):
+                pairs.append((name.strip(), app_id))
+                continue
+        raise land.LandError("invalid required check %r" % (value,))
+    return tuple(pairs)
+
+
+def _required_gap(required, rollup, provenance=None) -> list:
+    """Les checks requis que `rollup` et `provenance` ne prouvent pas.
+
+    `provenance` porte les check runs de la tête exacte avec leur application
+    source. Un couple `(contexte, app_id)` n'est vert que si un check run de
+    ce nom **et de cette application** est `SUCCESS` ; une entrée sans source
+    (statut de commit) ou d'une autre application ne prouve rien. Sans
+    application imposée (`app_id` à `None`), tout check ou statut du nom exigé
+    compte, et un même nom porté par plusieurs entrées n'est vert que si
+    toutes le sont : le doute ne verdit pas la porte."""
+    gaps = []
+    for name, app_id in _required_pairs(required):
+        if app_id is None:
+            states = [_rollup_state(entry) for entry in rollup or ()
+                      if _rollup_name(entry) == name]
+            if not states:
+                gaps.append("%s (absent)" % name)
+                continue
+            bad = sorted({state or "?" for state in states if state != "SUCCESS"})
+            if bad:
+                gaps.append("%s (%s)" % (name, ", ".join(bad)))
+            continue
+        runs = [entry for entry in provenance or ()
+                if _rollup_name(entry) == name and entry.get("app_id") == app_id]
+        if not runs:
+            providers = sorted({str(entry.get("app_id")) for entry in provenance or ()
+                                if _rollup_name(entry) == name
+                                and entry.get("app_id") is not None})
+            if providers:
+                gaps.append("%s (app %s, expected %d)"
+                            % (name, ", ".join(providers), app_id))
+            elif any(_rollup_name(entry) == name for entry in provenance or ()) \
+                    or any(_rollup_name(entry) == name for entry in rollup or ()):
+                gaps.append("%s (source absent)" % name)
+            else:
+                gaps.append("%s (absent)" % name)
+            continue
+        bad = sorted({_rollup_state(entry) or "?" for entry in runs
+                      if _rollup_state(entry) != "SUCCESS"})
         if bad:
             gaps.append("%s (%s)" % (name, ", ".join(bad)))
     return gaps
 
 
+def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
+    """Les check runs de la tête **exacte** `sha`, avec l'application qui les a
+    produits. `statusCheckRollup` ne porte pas cette source : elle se lit sur
+    le commit (`commits/<sha>/check-runs`). Une lecture impossible ou
+    malformée lève `land.LandError` : une source absente ne prouve rien."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the source of the checks "
+                             "of %s cannot be read" % (sha or "the head"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the source of the checks of %s "
+                             "cannot be read" % (sha or "the head"))
+    if not sha:
+        raise land.LandError("no frozen head: the source of the required checks "
+                             "cannot be read")
+    path = "repos/%s/commits/%s/check-runs" % (slug, quote(sha, safe=""))
+    proc = gh(["api", "--paginate", "--slurp", path + "?per_page=100"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise land.LandError("gh api %s: %s"
+                             % (path, detail or "exit %d" % proc.returncode))
+    pages = land._json(proc, "gh api %s" % path, list)
+    runs = []
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
+            raise land.LandError("gh api %s: malformed response" % path)
+        for run in page["check_runs"]:
+            if not isinstance(run, dict) or not isinstance(run.get("name"), str) \
+                    or not run["name"].strip():
+                raise land.LandError("gh api %s: malformed check run" % path)
+            head = _norm(run.get("head_sha"))
+            if head and head != _norm(sha):
+                raise land.LandError("gh api %s: a check run of %s is on %s"
+                                     % (path, run["name"].strip(), head))
+            app = run.get("app")
+            app_id = app.get("id") if isinstance(app, dict) else None
+            if app_id is not None and (isinstance(app_id, bool)
+                                       or not isinstance(app_id, int)):
+                raise land.LandError("gh api %s: malformed check run app" % path)
+            runs.append({"name": run["name"].strip(),
+                         "status": str(run.get("status") or ""),
+                         "conclusion": str(run.get("conclusion") or ""),
+                         "app_id": app_id})
+    return runs
+
+
 def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
-    """Les contextes requis par la protection classique de `target`, lus à la
-    forge. Un 404 « Branch not protected » est une réponse (aucun check
-    requis) ; toute autre lecture — droits, branche absente, réponse
-    malformée — lève `land.LandError` : l'absence de garde ne se suppose
-    jamais."""
+    """Les checks requis par la protection classique de `target`, lus à la
+    forge, sous la forme `(contexte, app_id)` : `app_id` est l'application
+    GitHub que la protection impose (`checks[].app_id`), `None` quand elle
+    n'impose aucun fournisseur (ancienne liste `contexts`). Perdre `app_id`
+    accepterait un check homonyme produit par n'importe qui.
+
+    Un 404 « Branch not protected » est une réponse (aucun check requis) ;
+    toute autre lecture — droits, branche absente, réponse malformée — lève
+    `land.LandError` : l'absence de garde ne se suppose jamais."""
     if not slug:
         raise land.LandError("no GitHub repository known: the required checks of %s "
                              "cannot be read" % (target or "the target"))
@@ -568,28 +663,39 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
     checks = required.get("checks") or ()
     if not isinstance(contexts, (list, tuple)) or not isinstance(checks, (list, tuple)):
         raise land.LandError("gh api %s: malformed required_status_checks" % path)
-    names = []
-    for context in contexts:
-        if not isinstance(context, str) or not context.strip():
-            raise land.LandError("gh api %s: invalid required context" % path)
-        names.append(context.strip())
+    pairs = []
+    scoped = set()
     for check in checks:
         if not isinstance(check, dict) or not isinstance(check.get("context"), str) \
                 or not check["context"].strip():
             raise land.LandError("gh api %s: invalid required check" % path)
-        names.append(check["context"].strip())
-    return tuple(dict.fromkeys(names))
+        app_id = check.get("app_id")
+        if app_id is not None and (isinstance(app_id, bool)
+                                   or not isinstance(app_id, int) or app_id <= 0):
+            raise land.LandError("gh api %s: invalid required check app_id" % path)
+        context = check["context"].strip()
+        pairs.append((context, app_id))
+        scoped.add(context)
+    for context in contexts:
+        if not isinstance(context, str) or not context.strip():
+            raise land.LandError("gh api %s: invalid required context" % path)
+        # `checks` porte la même liste avec l'application : ne pas la doubler
+        # d'une exigence sans fournisseur qui n'ajouterait aucune garantie.
+        if context.strip() not in scoped:
+            pairs.append((context.strip(), None))
+    return tuple(dict.fromkeys(pairs))
 
 
 def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
-    """Les checks requis de la branche cible : la protection lue à la forge,
-    complétée par la déclaration `radar.projects.<p>.required_checks`.
+    """Les checks requis de la branche cible, sous la forme `(contexte,
+    app_id)` : la protection lue à la forge, complétée par la déclaration
+    `radar.projects.<p>.required_checks` (des noms, sans application imposée).
 
     Quand la protection ne peut pas être lue (jeton sans droits, forge
     muette), la déclaration du projet la remplace ; sans déclaration, la
     lecture refuse. La déclaration ne peut jamais retirer un check que la
     forge exige : elle s'ajoute."""
-    declared = tuple(str(name).strip() for name in
+    declared = tuple((str(name).strip(), None) for name in
                      (getattr(project, "required_checks", ()) or ())
                      if str(name).strip())
     if not target:
@@ -612,6 +718,11 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
     sur cette tête (protection de la forge ou déclaration du projet), CI du
     commit gelé quand le projet l'exige (L160g).
 
+    La protection peut imposer une application GitHub pour un contexte
+    (`checks[].app_id`) : la provenance se lit alors sur la tête exacte, et un
+    check homonyme produit par une autre application — ou un statut de commit,
+    sans source — ne prouve rien. La tête de la PR doit être le gel.
+
     `required` remplace la lecture (tests, appelant qui l'a déjà faite) ;
     `slug`/`gh` la permettent. Sans l'un ou l'autre, la porte refuse : un
     check requis inconnu ne se suppose pas vert."""
@@ -620,6 +731,10 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
     if target and status.get("base") and status["base"] != target:
         return False, "PR #%s targets %s, not %s" % (status.get("number"), status["base"],
                                                      target)
+    head, frozen_head = _norm(status.get("head")), _norm(frozen)
+    if head and frozen_head and not same_commit(head, frozen_head):
+        return False, ("PR #%s is on %s, not the freeze %s"
+                       % (status.get("number"), head[:12], frozen_head[:12]))
     if status.get("ci") != "green":
         return False, "the CI of PR #%s is %s on the freeze %s" % (
             status.get("number"), status.get("ci"), frozen[:12])
@@ -629,7 +744,16 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         except land.LandError as exc:
             return False, ("the required checks of %s on the freeze %s cannot be proven: %s"
                            % (target or "the target", frozen[:12], exc))
-    gaps = _required_gap(required, status.get("rollup") or ())
+    pairs = _required_pairs(required)
+    provenance = None
+    if any(app_id is not None for _, app_id in pairs):
+        try:
+            provenance = _head_check_runs(slug, frozen_head, gh=gh)
+        except land.LandError as exc:
+            return False, ("the source of the required checks of %s on the freeze %s "
+                           "cannot be proven: %s"
+                           % (target or "the target", frozen[:12], exc))
+    gaps = _required_gap(pairs, status.get("rollup") or (), provenance)
     if gaps:
         return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
                        % (status.get("number"), target or "the target", frozen[:12],
