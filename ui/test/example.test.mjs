@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { fakeFetch, settle, ui, window } from "./dom.mjs";
 import { DEMO_TOKEN, MESH_ID, ORGANISATION, PROJECT, routeMap } from "../examples/acme-mesh/fixtures.mjs";
 import { mount } from "../examples/acme-mesh/mount.mjs";
@@ -140,6 +141,61 @@ test("example: the sandboxed preload is self-contained CommonJS", async () => {
   assert.match(source, /require\("electron"\)/);
   assert.doesNotMatch(source, /^\s*(?:import|export)\b/m);
   assert.doesNotMatch(source, /require\(["']\./);
+});
+
+test("example: the preload bridges the navigation channel to a bounded callback", async () => {
+  const source = await readFile(new URL("electron/preload.cjs", EXAMPLE), "utf8");
+  const channels = new Map();
+  const ipcRenderer = {
+    invoke: async () => null,
+    on: (channel, listener) => channels.set(channel, listener),
+  };
+  const exposed = {};
+  const contextBridge = {
+    exposeInMainWorld: (name, api) => { exposed[name] = api; },
+  };
+  const sandbox = {
+    require: (id) => {
+      if (id === "electron") return { contextBridge, ipcRenderer };
+      throw new Error("the preload required " + id);
+    },
+    module: { exports: {} },
+    exports: {},
+  };
+  runInNewContext(source, sandbox, { filename: "preload.cjs" });
+
+  const host = exposed.ameeshHost;
+  assert.equal(typeof host.onNavigate, "function");
+  assert.equal("ipcRenderer" in host, false);
+  const navigate = channels.get("ameesh:navigate");
+  assert.equal(typeof navigate, "function");
+
+  const seen = [];
+  const off = host.onNavigate((target) => seen.push(target));
+  navigate({}, { kind: "project", id: "acme" });
+  assert.deepEqual(seen, [{ kind: "project", id: "acme" }]);
+  off();
+  navigate({}, { kind: "project", id: "other" });
+  assert.equal(seen.length, 1, "the unsubscribe stops the callback");
+  assert.throws(() => host.onNavigate("not a function"), /onNavigate expects a function/);
+
+  const after = [];
+  host.onNavigate(() => { throw new Error("listener failure"); });
+  const offAfter = host.onNavigate((target) => after.push(target));
+  navigate({}, { kind: "agent", id: "ada" });
+  assert.deepEqual(after, [{ kind: "agent", id: "ada" }],
+    "a throwing listener does not break the channel");
+  offAfter();
+});
+
+test("docs: the token sheet is installed explicitly, not by an import side effect", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  const guide = await readFile(new URL("../../docs/ui/GUIDE-PAGE-WEB.md", import.meta.url), "utf8");
+  for (const text of [readme, guide]) {
+    assert.doesNotMatch(text, /^\s*import\s+["']@ameesh\/ui\/tokens["']/m);
+    assert.match(text, /tokensSheet\(\)/);
+  }
+  assert.match(guide, /ameesh-ui\.css/);
 });
 
 test("example: the guides the package README announces exist", async () => {

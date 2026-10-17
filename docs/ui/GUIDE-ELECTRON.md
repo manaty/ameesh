@@ -35,8 +35,8 @@ the elements. If the application instead displays the page served by
 // renderer.mjs
 import { connectHost } from "@ameesh/ui";
 const off = connectHost(window.ameeshHost, { root: document, mesh: "acme" });
-window.addEventListener("ameesh:navigate", (event) => router.go(event.detail));
-window.addEventListener("beforeunload", off);
+const offNavigate = window.ameeshHost.onNavigate((target) => router.go(target));
+window.addEventListener("beforeunload", () => { offNavigate(); off(); });
 ```
 
 The preload is the only crossing. A **sandboxed** preload cannot use ESM
@@ -50,12 +50,28 @@ stays ESM; the main process may be ESM on Electron ≥ 28.
 // preload.cjs — self-contained CommonJS, no import/export
 const { contextBridge, ipcRenderer } = require("electron");
 const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
+
+// `ameesh:open` answers on `ameesh:navigate`: one channel, callbacks only.
+const navigateListeners = new Set();
+ipcRenderer.on("ameesh:navigate", (_event, target) => {
+  for (const listener of [...navigateListeners]) {
+    try { listener(target); } catch { /* one listener must not break the channel */ }
+  }
+});
+
 contextBridge.exposeInMainWorld("ameeshHost", {
   getToken: (mesh) => invoke("ameesh:get-token", mesh),
   openApproval: (url) => invoke("ameesh:open-approval", url),
   notify: (alert) => invoke("ameesh:notify", alert),
   meshes: () => invoke("ameesh:meshes"),
   open: (target) => invoke("ameesh:open", target),
+  onNavigate: (listener) => {
+    if (typeof listener !== "function") throw new TypeError("onNavigate expects a function");
+    navigateListeners.add(listener);
+    return () => {
+      navigateListeners.delete(listener);
+    };
+  },
   theme: "auto",
   language: "en",
 });
@@ -64,6 +80,12 @@ contextBridge.exposeInMainWorld("ameeshHost", {
 Nothing else crosses: the page never sees `ipcRenderer`, no module, no
 bundler at preload time. Validate every value that comes back from the
 renderer (URLs especially).
+
+`onNavigate` is the **only** listener channel the preload exposes: it accepts a
+function, returns an unsubscribe, and a throwing callback cannot break the
+others. It is not part of the `@ameesh/ui` host contract — `connectHost` calls
+`open(target)`, and the application's router is what consumes the target the
+main process sends back.
 
 ## Window and partitions
 
@@ -99,6 +121,10 @@ ipcMain.handle("ameesh:open-approval", (_event, url) => {
 });
 ipcMain.handle("ameesh:notify", (_event, alert) =>
   new Notification({ title: alert.title ?? "ameesh", body: alert.text }).show());
+// Navigation stays the application's: the renderer's router listens.
+ipcMain.handle("ameesh:open", (_event, target) => {
+  win?.webContents.send("ameesh:navigate", target);
+});
 ```
 
 * **Sign-in**: authorization code + PKCE (RFC 8252) in the system browser, a
@@ -109,6 +135,10 @@ ipcMain.handle("ameesh:notify", (_event, alert) =>
   (`frame-ancestors 'none'`), so it is never embedded; it is not opened
   through a `BrowserWindow` either, or the human could not see their passkey
   origin.
+* **Navigation**: `ameesh:open` is the host contract's `open(target)`; the main
+  process echoes it on `ameesh:navigate`, which the preload bridges to
+  `onNavigate`. The application's router owns what a target means — the
+  components never navigate themselves.
 * **Alerts with the window closed**: the main process holds
   `GET /api/v1/events` with the mesh token and shows the notification itself
   (see `followAlerts` in the reference `main.mjs`). Reconnection,
@@ -140,6 +170,9 @@ or a custom protocol):
       no `webview`, `webSecurity` left on (`true`);
 - [ ] the preload is a self-contained CommonJS `.cjs` (`require("electron")`
       only; no `import`), and exposes the host contract and nothing else;
+- [ ] `open(target)` comes back through the preload's `onNavigate`; the
+      renderer never sees `ipcRenderer` and listens to no DOM event nothing
+      dispatches;
 - [ ] `openApproval` checks the origin and opens in the foreground;
 - [ ] tokens sealed by `safeStorage`, `0600`, one per mesh;
 - [ ] one partition per mesh; no storage shared between meshes;
