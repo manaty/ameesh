@@ -57,7 +57,7 @@ class HostConfigWitnessTest(unittest.TestCase):
            "assignee": "author", "app": "nexlink", "branch_target": "develop",
            "state": "qa"}
 
-    def _act(self, cfg, project, *, shared_rows=(), repo=None):
+    def _act(self, cfg, project, *, shared_rows=(), repo=None, status=None, dry_run=False):
         marks = _marks(_mark("frozen", A), _mark("fire", A))
         ops = mock.Mock()
         ops.queue.return_value = list(shared_rows)
@@ -71,7 +71,7 @@ class HostConfigWitnessTest(unittest.TestCase):
             patched["_repo_of"].return_value = repo
             patched["_slug"].return_value = "manaty/nexlink"
             patched["_project"].return_value = project
-            patched["_pr_status"].return_value = _status()
+            patched["_pr_status"].return_value = status if status is not None else _status()
             patched["_repo_info"].return_value = _info()
             patched["_target"].return_value = "develop"
             patched["ready_verdicts"].return_value = (True, "", {"class": "light"})
@@ -87,7 +87,7 @@ class HostConfigWitnessTest(unittest.TestCase):
             patched["_renew"].return_value = True
             patched["_target_lock"].return_value = (None, False)
             out = fire._act(cfg, None, self.ROW, marks, gh=lambda *a, **k: None,
-                            dry_run=False, repo=repo, cache={})
+                            dry_run=dry_run, repo=repo, cache={})
         return out, patched
 
     def _project(self, cfg):
@@ -156,11 +156,40 @@ class HostConfigWitnessTest(unittest.TestCase):
     def test_land_off_is_still_a_direct_merge(self):
         """Une déclaration positive `land: off` garde la fusion directe."""
         cfg = types.SimpleNamespace(radar={"projects": {"nexlink": {
-            "repo": "/srv/nexlink", "github": "manaty/nexlink", "target": "develop"}}})
+            "repo": "/srv/nexlink", "github": "manaty/nexlink", "target": "develop",
+            "land": "off"}}})
         out, calls = self._act(cfg, self._project(cfg))
         self.assertEqual(out["result"], "merged")
         calls["_merge_pr"].assert_called_once()
         calls["_queue"].assert_not_called()
+
+    def test_shared_queue_wins_over_missing_or_off_local_land(self):
+        for mode in ({}, {"land": "off"}):
+            with self.subTest(mode=mode):
+                cfg = types.SimpleNamespace(radar={"projects": {"nexlink": {
+                    "repo": "/srv/nexlink", "github": "manaty/nexlink", **mode}}})
+                out, calls = self._act(cfg, self._project(cfg), shared_rows=[self._queue_row()])
+                self.assertEqual(out["result"], "queued")
+                calls["_merge_pr"].assert_not_called()
+
+    def test_missing_land_without_queue_abstains(self):
+        cfg = types.SimpleNamespace(radar={"projects": {"nexlink": {
+            "repo": "/srv/nexlink", "github": "manaty/nexlink"}}})
+        out, calls = self._act(cfg, self._project(cfg))
+        self.assertEqual(out["result"], "no-land")
+        calls["_merge_pr"].assert_not_called()
+
+    def test_non_direct_paths_disarm_before_any_other_action(self):
+        for rows in ([], [self._queue_row()]):
+            for dry_run in (False, True):
+                with self.subTest(rows=bool(rows), dry_run=dry_run):
+                    out, calls = self._act(types.SimpleNamespace(radar={}), None,
+                                           shared_rows=rows, status=_status(armed=True),
+                                           dry_run=dry_run)
+                    self.assertEqual(out["result"], "would-disarm" if dry_run else "disarmed")
+                    self.assertEqual(calls["_disarm"].call_count, 0 if dry_run else 1)
+                    for name in ("_open_pr", "_merge_pr", "_queue"):
+                        calls[name].assert_not_called()
 
 
 class LandingPathTest(unittest.TestCase):
@@ -208,6 +237,14 @@ class LandingPathTest(unittest.TestCase):
             path, why = fire.landing_path(cfg, object(), None, None, "manaty/nexlink")
         self.assertEqual(path, "unknown")
         self.assertIn("cannot read", why)
+
+    def test_unreadable_shared_queue_cannot_authorize_direct_merge(self):
+        cfg = types.SimpleNamespace(radar={"projects": {"p": {
+            "repo": "/srv/p", "github": "acme/p", "land": "off"}}})
+        with mock.patch.object(fire.storage, "of", side_effect=RuntimeError("unavailable")):
+            path, _ = fire.landing_path(cfg, object(), fire._project(cfg, None, "acme/p"),
+                                        None, "acme/p")
+        self.assertEqual(path, "unknown")
 
 
 if __name__ == "__main__":

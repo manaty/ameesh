@@ -293,8 +293,8 @@ def _project(cfg, repo: str | None, slug: str | None):
     return None
 
 
-def _queue_declared(db, repo: str | None, slug: str | None) -> bool:
-    """Le dépôt a déjà une file dans l'état partagé (#2256).
+def _queue_declared(db, repo: str | None, slug: str | None) -> bool | None:
+    """Le dépôt a déjà une file dans l'état partagé (#2256), ou None si illisible.
 
     Les lignes `merge_queue` portent la source du dépôt (`merge_queue.source_of`)
     et sont communes à tous les hôtes : peu importe celui qui les a écrites,
@@ -316,8 +316,8 @@ def _queue_declared(db, repo: str | None, slug: str | None) -> bool:
         return False
     try:
         rows = storage.of(db).work.queue()
-    except Exception:  # noqa: BLE001 - un état partagé illisible ne prouve rien
-        return False
+    except Exception:  # noqa: BLE001 - illisible ne signifie pas absent
+        return None
     for row in rows or ():
         source = str(row.get("source") or "")
         if source and merge_queue.normalize_source(source) in sources:
@@ -334,8 +334,9 @@ def landing_path(cfg, db, project, repo: str | None, slug: str | None) -> tuple[
     `radar.projects.nexlink` et retombait sur `_merge_direct`, alors qu'un
     autre hôte déclarait sa file.
 
-    - `project` connu : `direct` si son `land` est explicitement `off`,
-      `queue` sinon (`local`, `pr`).
+    - `project` connu : `queue` pour `local`/`pr` ; `direct` exige `off`
+      explicitement déclaré et l'absence vérifiée de file partagée. Le défaut
+      `off` du parseur ne constitue pas une déclaration.
     - projet inconnu : `queue` si l'état partagé (`merge_queue`) porte déjà une
       ligne de ce dépôt ; `unknown` si l'hôte ne peut l'établir. Un hôte qui
       déclare d'autres projets radar mais aucun pour ce dépôt s'abstient : ses
@@ -344,30 +345,33 @@ def landing_path(cfg, db, project, repo: str | None, slug: str | None) -> tuple[
     - `unknown` interdit la fusion directe : le feu s'abstient et un hôte qui
       connaît le projet agit (le bail est rendu).
     """
-    if project is not None:
+    if project is not None and getattr(project, "land", "off") != "off":
         name = getattr(project, "name", "") or "?"
-        land = str(getattr(project, "land", "off") or "off")
-        if land == "off":
-            return "direct", "project %s declares land=off" % name
-        return "queue", "project %s declares land=%s" % (name, land)
+        return "queue", "project %s declares land=%s" % (name, project.land)
     try:
         declared = merge_queue.declared_projects(cfg)
     except merge_queue.QueueError as exc:
         return "unknown", "cannot read repository landing conditions: %s" % exc
-    if declared:
+    if declared and project is None:
         return "unknown", (
             "the loaded configuration declares radar.projects (%s) but none matches %s: "
             "select the profile declaring radar.projects for this repository, including its "
             "land/protected conditions (#1467/#2120); no direct merge from this host (#2256)"
             % (", ".join(sorted(declared)), slug or repo or "this lot"))
-    if _queue_declared(db, repo, slug):
+    queued = _queue_declared(db, repo, slug)
+    if queued:
         return "queue", (
             "the shared merge queue already holds %s: its landing path is the queue"
             % (slug or repo or "this repository"))
+    if project is not None and queued is False:
+        raw = (getattr(cfg, "radar", None) or {}).get("projects", {}).get(project.name, {})
+        if raw.get("land") == "off":
+            return "direct", ("project %s explicitly declares land=off without a shared queue"
+                              % project.name)
     return "unknown", (
-        "this host declares no landing mode for %s and the shared merge queue has no record "
-        "of it: refusing a direct merge (#2256); declare radar.projects on the host that holds "
-        "the repository, or queue the lot" % (slug or repo or "this lot"))
+        "this host has no explicit landing mode for %s or cannot establish the absence of "
+        "a shared queue: refusing a direct merge (#2256); declare radar.projects on the host "
+        "that holds the repository, or queue the lot" % (slug or repo or "this lot"))
 
 
 def _repo_info(slug: str, *, gh, cache: dict) -> dict:
@@ -961,6 +965,10 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     #    l'état partagé de sa file, jamais par la config de cet hôte. Sans
     #    déclaration ni file connue, le feu s'abstient — il ne fusionne jamais
     #    en direct par défaut.
+    if path != "direct" and status is not None and status.get("armed"):
+        return _not_ready(db, row, status, out,
+                          "landing path %s forbids GitHub auto-merge" % path,
+                          gh=gh, slug=slug, dry_run=dry_run, handle=handle)
     if path == "unknown":
         out.update(result="no-land", detail=landing_why)
         return out
