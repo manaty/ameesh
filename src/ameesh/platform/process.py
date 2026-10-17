@@ -54,6 +54,79 @@ def self_cgroup_paths() -> tuple[str, ...]:
     return tuple(row[2] for row in rows)
 
 
+def rss_bytes(pid: int | None = None) -> int | None:
+    """#2096 : RSS courant en octets (`VmRSS`), ou None si indisponible.
+
+    psutil d'abord (portable), `/proc` ensuite sous Linux. Ne lève jamais :
+    un appelant qui décide sur cette mesure traite None comme « inconnu »."""
+    target = os.getpid() if pid is None else int(pid)
+    ps = _psutil()
+    if ps is not None:
+        try:
+            return int(ps.Process(target).memory_info().rss)
+        except Exception:
+            pass
+    try:
+        with open(os.path.join(PROC, "self" if pid is None else str(target), "status"),
+                  encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    champs = line.split()
+                    return int(champs[1]) * 1024 if len(champs) >= 2 else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+#: #2107/#2108 : motifs de `trim_free_memory` — le journal doit distinguer
+#: « rien à rendre » d'une plateforme qui n'offre pas `malloc_trim`.
+TRIM_RETURNED = "returned"
+TRIM_NOTHING = "nothing"
+TRIM_UNSUPPORTED = "unsupported"
+TRIM_FAILED = "failed"
+
+#: libellés lisibles des motifs, pour le journal du runner
+TRIM_LABELS = {
+    TRIM_RETURNED: "returned to the kernel",
+    TRIM_NOTHING: "nothing to return (malloc_trim freed no page)",
+    TRIM_UNSUPPORTED: "not supported here (no malloc_trim)",
+    TRIM_FAILED: "trim failed",
+}
+
+
+def trim_free_memory() -> str:
+    """#2107/#2108 : motif du retour de mémoire libre à l'allocateur (glibc
+    `malloc_trim`) — `returned` (des pages sont rendues), `nothing` (l'appel
+    est offert mais aucune page n'était libre), `unsupported` (pas de
+    `malloc_trim` : musl, macOS, Windows), `failed` (l'appel a échoué).
+
+    Best-effort : ne lève jamais. Le libellé exact évite de diagnostiquer une
+    plateforme non prise en charge quand le trim a simplement rendu 0 page."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None)
+        trim = libc.malloc_trim
+    except Exception:  # OSError, AttributeError ; TypeError sous Windows (CDLL(None))
+        return TRIM_UNSUPPORTED
+    try:
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        return TRIM_RETURNED if trim(0) else TRIM_NOTHING
+    except Exception:
+        return TRIM_FAILED
+
+
+def release_free_memory() -> bool:
+    """Rend au noyau la mémoire libre de l'allocateur (glibc `malloc_trim`).
+
+    #2096 : l'allocateur garde le plafond d'allocation d'un pic (un gros tour)
+    alors que les objets sont morts ; sans ce retour, le RSS d'un exécuteur ne
+    redescend pas. Best-effort : False si l'allocateur ne l'offre pas (musl,
+    macOS), si l'appel échoue, ou s'il n'y avait rien à rendre — ne lève
+    jamais. `trim_free_memory` dit lequel de ces cas (#2107/#2108)."""
+    return trim_free_memory() == TRIM_RETURNED
+
+
 def _stat_fields(pid: int) -> list[str]:
     """Champs de /proc/<pid>/stat à partir du 3e (état). Le nom (champ 2) est
     entre parenthèses et peut en contenir : on coupe à la DERNIÈRE « ) »."""

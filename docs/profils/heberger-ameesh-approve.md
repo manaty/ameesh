@@ -94,6 +94,23 @@ The API remains authenticated by the token and refuses any browser
 Changing `approve_url` does **not** change trust: only the RP ID and origins
 determine it (§5).
 
+The **login API** (`POST /login-requests`, `GET /login-receipts/<id>`, L232d)
+is a separate switch: **closed by default** (`403 login_api_closed`) and, once
+opened in the JSON, served only to the holder of the DEDICATED token
+`login_token_file` (0600, `ameesh-approve gen-token --login`) — never to the
+team's service token, which every agent of the team can read. The login token
+belongs to the login supervisor/executor of the account, out of the agents'
+reach:
+
+```json
+{ "login_api": "open", "login_token_file": "/etc/ameesh-approve/login-token" }
+```
+
+It too is a written choice (no environment variable or option for
+`login_api`), and `login_token_file` must be a different file from
+`token_file`; the service refuses the configuration otherwise. The ameesh
+side reads `AMEESH_LOGIN_TOKEN_FILE`.
+
 ## 4. Exposing `H` over HTTPS
 
 ### 4.1 Behind a reverse proxy (default)
@@ -239,6 +256,8 @@ widen the RP ID to a parent to recycle the old passkeys.
 - [ ] `ameesh approve-check` returns 0 on each verifying workstation;
 - [ ] the API is open under `H` only if `api_via_public` is written, and the
       token is a `0600` file of the user concerned;
+- [ ] the login API is closed, or opened with the dedicated `login_token_file`
+      (0600, distinct from the service token) held outside the agents' reach;
 - [ ] in passthrough: certificate of `H` only, `0600` files of the service
       user, renewal by atomic rename;
 - [ ] the team's Postgres role applied without discrepancy; the service's

@@ -70,10 +70,15 @@ class PriseDeLExecuteurTest(_Lots):
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
 
     def test_garde_fous_conserves(self):
-        # repos trop court (seuil de la file d'amélioration)
+        # #1677 (b) : le temps depuis le dernier tour ne borne plus la prise
+        # quand le relevé porte `actionable_lots` — un agent sans lot
+        # actionnable est au repos (même adaptation que test_l119_backlog).
         self.agent("a1", team="nexlink", since_s=60)
-        self.lot("trop tôt")
-        self.assertEqual(self.take({"a1"}, idle_s=2 * HEURE), [])
+        trop_tot = self.lot("trop tôt")
+        self.assertEqual([t["item"]["id"] for t in self.take({"a1"}, idle_s=2 * HEURE)],
+                         [trop_tot["id"]])
+        # zéro reste l'interrupteur qui désactive la prise
+        self.assertEqual(self.take({"a1"}, idle_s=0), [])
         # plafond de budget atteint pour cet agent
         self.agent("a2", team="nexlink", since_s=2 * HEURE)
         self.lot("sous plafond")
@@ -209,25 +214,39 @@ class TakePassTest(_Lots):
         # #754 (owner, 13/10) : un agent au token ne prend jamais sous
         # `balance_low` ; l'exécuteur relit le solde avec les mêmes seuils que
         # les alertes, il ne se contente pas de la pression de l'hôte.
+        # #935 : le refus doit porter sur un candidat libre — deepseek2 est
+        # dans les workers, le relevé bas est le plus récent, et le témoin
+        # rougit si l'on retire l'alerte. Le budget est neutralisé ici : la
+        # baisse 100 → 5 déduit 95 $/h des relevés, au-dessus du plafond de
+        # 10 $/h, et masquerait la garde testée.
         self.db.execute("TRUNCATE provider_balances RESTART IDENTITY")
         self.agent("deepseek1", "deepseek", team="nexlink", since_s=2 * HEURE)
+        self.agent("deepseek2", "deepseek", team="nexlink", since_s=2 * HEURE)
         un = self.lot("un")
-        faux = _FauxRunner(self.db, self.cfg, self.settings(),
-                           {"deepseek1": _Worker()})
-        # solde au-dessus des seuils : la prise a lieu
+        faux = _FauxRunner(self.db, self.cfg,
+                           self.settings(budget_check=lambda agent: ""),
+                           {"deepseek1": _Worker(), "deepseek2": _Worker()})
+        # solde au-dessus des seuils : la prise a lieu — deepseek1, premier par
+        # ordre de nom à repos égal
         self.db.execute("INSERT INTO provider_balances (provider, currency, total,"
-                        " observed_at) VALUES ('deepseek', 'USD', 100, now())")
+                        " observed_at) VALUES ('deepseek', 'USD', 100,"
+                        " now() - interval '10 minutes')")
         self.assertEqual([(t["agent"], t["item"]["id"])
                           for t in runner.Runner.take_pass(faux)],
                          [("deepseek1", un["id"])])
-        # le solde passe sous le seuil : plus de prise au token
-        self.agent("deepseek2", "deepseek", team="nexlink", since_s=2 * HEURE)
+        # le solde passe sous le seuil, relevé plus récent que le précédent :
+        # plus de prise au token, y compris pour le candidat libre deepseek2
         deux = self.lot("deux")
         self.db.execute("INSERT INTO provider_balances (provider, currency, total,"
-                        " observed_at) VALUES ('deepseek', 'USD', 5,"
-                        " now() - interval '1 minute')")
+                        " observed_at) VALUES ('deepseek', 'USD', 5, now())")
         self.assertEqual(runner.Runner.take_pass(faux), [])
         self.assertIsNone(work.get(self.db, deux["id"])["assignee"])
+        # témoin rouge (#935) : sans l'alerte, le candidat libre prend le lot —
+        # c'est bien `balance_low`, et non un autre garde-fou, qui l'écartait
+        with mock.patch.object(runner, "local_balance_alerts", return_value=[]):
+            self.assertEqual([(t["agent"], t["item"]["id"])
+                              for t in runner.Runner.take_pass(faux)],
+                             [("deepseek2", deux["id"])])
 
     def test_solde_illisible_retient_le_token_sans_priver_le_forfait(self):
         # #804 R1 : solde illisible, on ne devine pas — l'agent au token est

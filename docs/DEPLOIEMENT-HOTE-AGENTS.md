@@ -32,7 +32,28 @@ deploy/mise-a-jour/vm.sh agents controler
 ```
 
 Le redémarrage attend la fin des tours, pendant au plus `ATTENTE_MAX`
-secondes (7200 par défaut). Il relit le placement avant chaque redémarrage :
+secondes (7200 par défaut). Après `DRAIN_ATTENTE` secondes (300 par défaut,
+0 pour désactiver) d'attente d'un même tour, il pose lui-même une pause
+opérateur courte et nommée (drain, #2152) : le tour en cours se termine —
+aucun tour n'est interrompu —, plus aucun ne commence, l'unité est
+redémarrée dès que l'agent est hors tour, puis la pause est levée et la
+reprise du bail prouvée. Le mesh journalise la pose et la levée
+(`operator_pause_events`) ; une pause déjà posée par un autre acteur n'est
+ni doublée ni levée, et aucune pause posée par le script ne survit à sa
+sortie. La levée est **conditionnelle** : le motif exact de la pause posée
+(unique, avec son jeton) est son identité, et `ameesh resume --operator
+--expect-reason` ne lève que cette pause-là — la comparaison et la levée se
+font dans la même instruction SQL (migration 0458), donc une pause étrangère
+posée entre la lecture et la reprise n'est jamais levée. Si la réponse de la
+pause se perd (SSH coupé, JSON illisible), le script réconcilie par l'état
+réel : motif identique, le drain continue ; sinon il ne redémarre ni ne lève
+rien et s'arrête en le disant. Pose et levée sont des gestes d'opérateur : le
+CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh` doit
+être lancé hors session d'agent ; sinon la pause est refusée et le
+redémarrage de cet agent s'arrête sans interrompre aucun tour. Un CLI de
+cible antérieur à #2152 (sans `--expect-reason`) n'est jamais utilisé pour
+drainer : le script attend comme avant plutôt que de laisser une pause
+orpheline. Il relit le placement avant chaque redémarrage :
 un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
 pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
 est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
@@ -146,8 +167,22 @@ La séquence de staging écrit chaque événement en JSONL (`date`, `hôte`, `é
 l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
 verdict, et pour une remise réelle le message de sonde, son destinataire,
 l’hôte de ce destinataire et son délai) : c’est la preuve structurée que le
-signal ci-dessous exige. Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, ou
-`auto` sans persona menée — ne prouve aucune remise.
+signal ci-dessous exige. L’événement porte aussi ce rapport comme objet
+`rapport`, et une notification d’échec le reprend en clair : un KO de sonde
+garde son message, son destinataire et son motif, jamais un simple « santé en
+échec » (#2190). Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, `auto` sans
+persona menée, ou toutes les personas menées occupées ou en pause opérateur —
+ne prouve aucune remise.
+
+La sonde ne vise qu’une persona **menée et libre** (bail vivant, pas en tour,
+pas en pause opérateur) : une persona occupée ne reçoit le courrier qu’à la fin
+de son tour, et une persona en pause garde `status` `idle` mais son exécuteur
+refuse le tour ; la sonde mesurerait leur file d’attente, pas la chaîne de
+l’hôte. Si aucune persona menée n’est libre, le verdict est `sans-sonde` et
+nomme les personas occupées ou en pause ; le délai de 300 s ne s’applique qu’à
+une remise partie vers une persona libre, et exige toujours la réponse outil et
+la fin propre du tour (#2190). Le courrier actif en attente chez une persona
+en pause n’est pas compté comme bloqué : son tour est refusé par construction.
 
 ## Signal « staging actif » (#1323)
 
@@ -166,23 +201,24 @@ séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
 concernés. Un échec, un retour automatique, une séquence partielle
 (`--hotes`), un journal d’une autre exécution ou une santé sans sonde de
 remise réelle (`--sans-sonde`, `SONDE_<HOTE>=jamais`, `auto` sans persona
-menée) n’émettent **aucun signal de réussite** : chaque événement de la
-fenêtre doit porter le commit visé, et le message de sonde est relu en base
+menée, ou toutes occupées ou en pause) n’émettent **aucun signal de réussite** :
+chaque événement de la fenêtre doit porter le commit visé, et le message de sonde est
+relu en base
 (expéditeur système, destinataire, hôte, commit, remise effective). Aucune
 clôture de lot n’est automatique : le rapporteur reprend lui-même sa
 vérification après déploiement.
 
 Un hôte **sans exécutant** (mode serveur, comme `manaty-mesh-1`) ne peut pas
 prouver sa chaîne par une remise locale : sa preuve est le `controler` vert
-plus une **sonde croisée**, remise à une persona menée d’un autre hôte
+plus une **sonde croisée**, remise à une persona menée et libre d’un autre hôte
 canonique **après son redémarrage** — la remise traverse alors sa base, le
 message étant déposé dans la base du serveur et relevé par l’exécuteur de
 l’autre hôte. `sante-courrier.py --serveur` produit cette sonde et nomme
 l’hôte destinataire (`hote_destinataire`) ; `actif.py` relit la remise en base
 et exige qu’elle soit postérieure au `redemarrer` de l’hôte mesuré. Un serveur
 qui porte des exécutants garde la règle locale : une santé `sans-sonde`
-(aucune persona menée) n’atteste rien, et une sonde croisée n’est acceptée que
-pour un hôte à zéro persona.
+(aucune persona menée libre) n’atteste rien, et une sonde croisée n’est
+acceptée que pour un hôte à zéro persona.
 
 L’émission est bornée et **idempotente** : un seul courrier par rapporteur et
 par commit, même si la séquence est relancée. La clé d’émission est écrite

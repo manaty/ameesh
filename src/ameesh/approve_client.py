@@ -4,6 +4,10 @@
     POST /requests        dépose une demande d'approbation ; rend le lien à
                           usage unique à ouvrir sur le téléphone
     GET  /receipts/<id>   le reçu signé (200), en attente (202), échu (410)
+    POST /login-requests  dépose un DÉFI DE CONNEXION (L232d) : l'URL et le code
+                          vont dans l'état privé du service, jamais dans la
+                          réponse ni dans le fil ; jeton de connexion dédié
+    GET  /login-receipts/<id>  le reçu du défi (200 | 202 | 410) ; jeton dédié
     GET  /health          la politique publiée par le service (RP ID,
                           origines, profil), sans jeton : `ameesh approve-check`
 
@@ -19,6 +23,15 @@ donne le nom `H` pour lequel le certificat est vérifié. Le jeton de service
 permet de DEMANDER une approbation, jamais d'en signer une ; il est lu dans
 un fichier régulier de l'utilisateur, en `0600` (même contrôle que le
 service : `approve.config.read_service_token`).
+
+L'API des défis de connexion (L232d) est FERMÉE par défaut et, ouverte
+(`login_api: "open"` dans le JSON du service), n'accepte QUE le jeton dédié
+`AMEESH_LOGIN_TOKEN_FILE` (`login_token_file`, 0600) — jamais le jeton de
+service de l'équipe, que tous ses agents lisent : sans cela, n'importe quel
+porteur du jeton pourrait déposer un code d'appareil généré ailleurs et le
+faire signer par l'humain sous l'hôte déclaré (avis sécurité dev4, B1). Le
+jeton de connexion se tient hors de portée des agents (superviseur/exécuteur
+du compte).
 
 Le jeton ne quitte ce module que dans l'en-tête `Authorization` d'une
 requête vers l'URL configurée — jamais affiché, journalisé, écrit dans un
@@ -49,6 +62,7 @@ from urllib.parse import urlsplit
 from .config import Config
 
 REQUEST_ID_RE = re.compile(r"^req_[0-9a-z]{26}$")
+LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
 _TLS_NAME_RE = re.compile(
     r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 TIMEOUT = 15.0
@@ -164,14 +178,30 @@ def _token(cfg: Config) -> str:
         raise ApproveClientError("config", str(exc)) from exc
 
 
+def _login_token(cfg: Config) -> str:
+    """Jeton DÉDIÉ de l'API des défis (L232d) : jamais le jeton d'équipe, que
+    tous les agents lisent. Tenu par le superviseur de connexion."""
+    from .approve.config import ApproveConfigError, read_login_token
+    if not getattr(cfg, "login_token_file", ""):
+        raise ApproveClientError("config", "AMEESH_LOGIN_TOKEN_FILE not configured (0600 file "
+                                           "holding the dedicated login token; the team service "
+                                           "token never opens a connection challenge)")
+    try:
+        return read_login_token(cfg.login_token_file)
+    except ApproveConfigError as exc:
+        raise ApproveClientError("config", str(exc)) from exc
+
+
 def _call(cfg: Config, method: str, path: str, body: dict | None = None, *,
-          authenticated: bool = True, url: str | None = None) -> tuple[int, bytes]:
+          authenticated: bool = True, url: str | None = None,
+          credential: str = "service") -> tuple[int, bytes]:
     base = endpoint(cfg.approve_url if url is None else url)
     name = tls_name(cfg, base)
     url = base + path
     headers = {"Accept": "application/json"}
     if authenticated:
-        headers["Authorization"] = "Bearer " + _token(cfg)
+        headers["Authorization"] = "Bearer " + (_login_token(cfg) if credential == "login"
+                                                else _token(cfg))
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -220,7 +250,8 @@ def _refusal(status: int, payload: bytes) -> ApproveClientError:
     return ApproveClientError(code, message, status)
 
 
-HEALTH_FIELDS = ("rp_id", "origins", "public_url", "profile", "level", "api_via_public", "tls")
+HEALTH_FIELDS = ("rp_id", "origins", "public_url", "profile", "level", "api_via_public",
+                 "login_api", "tls")
 
 
 def health(cfg: Config, *, url: str | None = None) -> dict:
@@ -265,3 +296,53 @@ def fetch_receipt(cfg: Config, request_id: str) -> tuple[str, bytes | dict]:
     if status == 410:
         return "expired", _json(payload)
     raise _refusal(status, payload)
+
+
+def create_login_request(cfg: Config, *, host: str, provider: str, account: str,
+                         approver: str, requested_by: str, url: str, code: str,
+                         scope: str = "", provider_exp: int | None = None) -> dict:
+    """`POST /login-requests` (L232d) : le service garde l'URL et le code en
+    privé (0600) et ne rend que le lien à faire signer par l'humain."""
+    body = {"host": host, "provider": provider, "account": account, "approver": approver,
+            "requested_by": requested_by, "url": url, "code": code}
+    if scope:
+        body["scope"] = scope
+    if provider_exp is not None:
+        body["provider_exp"] = provider_exp
+    status, payload = _call(cfg, "POST", "/login-requests", body, credential="login")
+    if status != 201:
+        raise _refusal(status, payload)
+    data = _json(payload)
+    if not LOGIN_ID_RE.fullmatch(str(data.get("login_id") or "")) \
+            or not isinstance(data.get("link"), str):
+        raise ApproveClientError("format", "unreadable response from ameesh-approve", status)
+    return data
+
+
+def fetch_login_receipt(cfg: Config, login_id: str) -> tuple[str, bytes | dict]:
+    """`GET /login-receipts/<id>` : ("signed", octets du reçu) | ("pending",
+    infos) | ("expired", infos). Toute autre réponse : ApproveClientError."""
+    if not LOGIN_ID_RE.fullmatch(login_id or ""):
+        raise ApproveClientError("format", "login id \"lgn_...\" expected")
+    status, payload = _call(cfg, "GET", "/login-receipts/" + login_id, credential="login")
+    if status == 200:
+        return "signed", payload
+    if status == 202:
+        return "pending", _json(payload)
+    if status == 410:
+        return "expired", _json(payload)
+    raise _refusal(status, payload)
+
+
+def close_login_request(cfg: Config, login_id: str) -> dict:
+    """`POST /login-close/<id>` (L232d) : clôture TECHNIQUE du défi demandée
+    par le superviseur (jeton dédié de l'API des défis). Le service efface
+    l'URL et le code, libère la réservation et refuse lien/assertion tardifs ;
+    il n'écrit jamais de reçu humain."""
+    if not LOGIN_ID_RE.fullmatch(login_id or ""):
+        raise ApproveClientError("format", "login id \"lgn_...\" expected")
+    status, payload = _call(cfg, "POST", "/login-close/" + login_id, {},
+                            credential="login")
+    if status != 200:
+        raise _refusal(status, payload)
+    return _json(payload)

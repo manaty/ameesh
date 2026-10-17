@@ -5,6 +5,12 @@ Slice A (#1918): the strict `process_workflow` compiler. Slice C: finite
 verifiers and installed types. This document publishes the **seam** C plugs
 into and the invariants B guarantees.
 
+Slice A accepts several **distinct targets under one guard from the same
+stage** — the reference card has `draft -> backlog` and `draft -> sprint`
+under `planning`. The command carries `to_stage`, and the registry checks the
+exact `(to_stage, guard)` edge from `from_stage`; only an exact duplicate
+`(from, to, guard)` is refused (`edge-duplicate`).
+
 ## What B adds to the repository
 
 * additive migration `0452_process_workflow_registry`:
@@ -167,6 +173,132 @@ sources = pr.read_sources(context)                # real collections, in the tx
     and slice A publishes no digest. If a later artifact publishes one, the
     seam must bind it.
 
+## Consumer admission matrix (#1915 C-admission)
+
+Contract: `manaty/ameesh#1379` (owner handoff 02:58Z, consumer qualification
+08:45Z). This section is **documentation only**: it publishes what the installed
+native seam decides today, what it refuses and which consumer-policy facts are
+still missing. It adds no verifier and no admission code. "Today" means: no production
+caller invokes `install_verifiers` or `apply_command` yet; the seam is
+reachable from the Python API and the tests only.
+
+Q1/Q2/Q3 below are a first **capability/refusal** deliverable. They do **not**
+qualify `planning`/`start_work` against the business contract: those two guards
+accept today on the lot title and on the assignee alone, and
+`capability_report()` lists them in `executable_guards` (installed, no declared
+source). "Executable" there means "callable", **not** "qualified": until the
+missing facts below are published, a consumer must treat them as not admitted
+(a refuse-by-default for these two guards is a possible later change, not made
+here).
+
+### Requirement / native source / refusal / missing
+
+| # | requirement (consumer contract) | native source read today | refusal today | still missing |
+|---|---|---|---|---|
+| 1a | `planning` **and** `start_work`: current spec approved | none: `_check_planning` reads only `title`; the locked row also carries `app`, `workstream`, `type`, `state`, `reviewer`, `workflow_*` | `evidence-missing` (no title); `type-unsupported` (type outside `INSTALLED_TYPES`) | "current spec": artifact/digest, approving actor, validity window — **consumer policy, not published** |
+| 1b | `planning`/`start_work`: budget | three native envelopes, none read by C: lot `work_items.budget_usd numeric(12,4)` (migration 0004, **not projected** by `_lock_lot`); account `account_budgets` (migration 0443, daily per billing account); agent `budget_usd` (canon declarative field, `canon_sync.DECLARATIVE`) | none: no native budget check | which envelope (lot vs agent vs account), threshold, period — **missing**. Shape matters: a lot field added to `_lock_lot` is a plain projection and **escapes** `source-unavailable` (an absent field reads as empty, not as a missing source); an account/agent envelope would be one more declared collection in `SOURCE_KEYS`, fail-closed when absent |
+| 1c | reviewed governance authority | no generic native object; only candidates: native decision request L233 (open requests only), module proof `work_module_milestones` (`schemas`/`rules`, `actor_role`, `separation_of_duties`), `reviewer` designation | nothing generic | source role/actor and review rule — **missing**; any acceptance would be invented |
+| 2 | `revision_transfer`: admission/transfer explicitly reviewed, bounded to lot/project/revision/actor, refused on absent or stale proof | reserved name `TRANSFER_VERIFIER = "revision_transfer"` (`process_registry`), called by `transfer_revision`; **not installed** by `install_verifiers` (14 guards + `hold`), **not published** by the code matrix (`RESERVED_VERIFIERS`) | `verifier-uninstalled` (B refuses before C); nothing else is possible today. `capability_report().refusal("revision_transfer")` answers `guard-unsupported` (the name is in neither the guard registry nor `RESERVED_VERIFIERS`), not `verifier-uninstalled` | proof binding: lot (`work_item_id`) and project (`app`/`workstream`) are native in the locked row (`_lock_lot`), the revision (`workflow_ref@version` vs milestone sha vs digest) and the reviewing actor are not bound to a proof; the proof's source, its staleness rule and the independence rule — **missing** |
+| 3 | `docs`, `investigation`, `governance-tracking`, `promotion`, `human_operation` admitted by an **active project module**, without bypassing the SQL guard | `INSTALLED_TYPES` carries the five (+ `bug`, `evolution`); completion is per type; SQL guard `ameesh_module_requirements` (migration 0363): `bug`/`evolution`/`improvement` stay admitted, any other type needs `project_modules.types` for the lot's project; modules are written only by canon sync | SQL `AMEESH_MODULE_RULE: work item type % has no active module in project %` (every write of the lot — insert, state change or any other update — and module-milestone insert; trigger of 0363, `ameesh_module_requirements` redefined by 0427); C `type-unsupported` | the active module is canon-declared: `extensions.ameesh.projects.<project>.modules` names **installed** descriptors only (`modules.installed()`), whose types must be disjoint within a project; no installed descriptor declares the five (`modules/it` declares `release`/`publication`), so the SQL guard refuses such a lot today: the module name and content are a **pilot decision**; `improvement` is admitted by the legacy SQL but absent from `INSTALLED_TYPES`, so C refuses its `advance` `type-unsupported` (`hold`/`release` do not check the type and pass) |
+| 4 | `observations` staging/preprod: reliable source absent, refusal kept | `observations` is declared in `SOURCE_COLLECTIONS` but absent from `SOURCE_KEYS`/`read_sources`: the snapshot never carries it | `source-unavailable` before the guard's own check, after the earlier refusals (see the order below), for `merged_and_staging_deployed`, `staging_pass`/`staging_failure`, `preprod_*`, `repair_started` | shape, attestation and freshness of the reliable source — **not designed, named missing**; nothing invented (no table edit, no client boolean) |
+
+### Refusals: two levels (B and C)
+
+The refusal codes live at two levels, and only B's reach a caller of
+`apply_command`:
+
+* **B (`apply_command`)** raises `RegistryRefusal` with its own code. For a
+  guard, it is `verifier-uninstalled` (no callable installed) or
+  `verifier-refused` (C answered `ok=False`); a refusal writes no journal and
+  no receipt (rollback). B carries only C's message (`process_registry._verify`):
+  C's code is **not** propagated.
+* **C (the verifier callable, `server_verifier`)** returns a `Verification`
+  whose `facts["code"]` is the precise code (`source-unavailable`,
+  `type-unsupported`, `evidence-missing`, …). It is observable only by calling
+  the callable (or `verify(command, snapshot)`) directly.
+
+So through B, `source-unavailable`, `type-unsupported` and `evidence-missing`
+are all `verifier-refused`; telling them apart needs C's callable. Propagating
+C's code through B is a **missing seam point**, named here, not added.
+
+C checks, in order: `stage-stale`, `terminal-reopening`, `hold-advance`,
+`guard-unsupported`, `type-unsupported`, `source-unavailable`, then the
+reference checks (`evidence-invalid`, `evidence-missing`) and the guard
+itself. For an `advance`, B refuses first, before calling C:
+`stage-mismatch`, `terminal-reopened`, `held`, `edge-undeclared`. For `hold`/`release`,
+C checks neither type nor guard sources (except `decisions` for
+`waiting_human`).
+
+* `verifier-uninstalled` (B) — B knows the guard name, no server callable is
+  installed for it; `revision_transfer` refuses this way today, before C runs;
+* `source-unavailable` (C) — a collection the guard declares is absent from
+  the snapshot; fail-closed, after the earlier refusals above;
+* `type-unsupported` (C) — the lot type is outside `INSTALLED_TYPES`; the SQL gate
+  (`AMEESH_MODULE_RULE`) is **separate** and applies at every write of the lot
+  (insert, state change, any other update), so the same lot can be refused by
+  either gate for different reasons
+  (`improvement`: SQL admits, C refuses; a type no module declares: SQL refuses).
+
+### Reserved names
+
+| name | installed by `install_verifiers` | in the code matrix | note |
+|---|---|---|---|
+| `hold` | yes | yes | `hold`/`release`; `waiting_human` additionally needs `decisions` |
+| `revision_transfer` | **no** | **no** (`RESERVED_VERIFIERS` = `("hold",)`; `capability_report().refusal` → `guard-unsupported`) | reserved and called by B; published here at **documentation** level only |
+
+### First deliverable admitted now (Q1/Q2/Q3)
+
+* **Q1** — describe the existing active-module mechanism (SQL guard + per-type
+  completion) and qualify it with discriminating SQL witnesses (no module: the
+  lot is refused at insert; a type an active module declares: admitted).
+  **No consumer module is invented here.**
+* **Q2** — document `revision_transfer` as absent (today
+  `verifier-uninstalled`). Publishing the name stays documentation for now; no
+  `install_verifier("revision_transfer", …)` is added without a published
+  contract (lot/project binding, identity of the reviewed revision and actor,
+  proof source, staleness rule, independence rule).
+* **Q3** — keep the fail-closed `observations` → `source-unavailable` refusal
+  and qualify it with a witness **on C's callable** (through B it is only
+  `verifier-refused`).
+
+`planning`/`start_work` stay on today's subset (title, assignee, installed
+type); the matrix publishes "not admitted" for the missing facts below.
+
+### Missing consumer-policy facts (named, with expected source)
+
+| # | fact | expected source |
+|---|---|---|
+| 1 | current approved spec (for `planning` and `start_work`): artifact/digest, approving actor, validity window | consumer policy |
+| 2 | budget: envelope (lot `budget_usd`, account `account_budgets`, agent `budget_usd`), threshold, period | consumer policy (+ a native declared collection, or a plain `_lock_lot` projection that escapes `source-unavailable`) |
+| 3 | governance: source role/actor and review rule | consumer policy / module rules |
+| 4 | transfer proof: binding to lot (`work_item_id`) and project (`app`/`workstream`, native), reviewed revision identity and reviewing actor, proof source, staleness rule, independence rule, refusal codes | consumer policy; codes published with the contract |
+| 5 | module declaring the five types (name, content) | pilot decision |
+| 6 | reliable observation source: shape, attestation, freshness | consumer policy |
+
+### Seam unchanged
+
+`process_registry.install_verifier(name, callable)` and `read_sources(context)`
+remain **the** generic seam: the source read happens inside the transaction,
+under the lot lock and after the authority check; the collections are declared
+(`SOURCE_KEYS`: `milestones`, `receipts`, `decisions`, `deliveries`); the
+verifier returns a `Verification`; no caller-supplied verifier and no client
+boolean. A field that needs more asks for **one more declared collection**,
+read in the same transaction; absent ⇒ `source-unavailable`, never a private
+SQL read by C.
+
+### Discriminating cases proposed for review (no code)
+
+Witnesses name the level they observe: **C** = the verifier callable
+(`facts["code"]`), **B** = `apply_command` (`RegistryRefusal.code`).
+
+| control | witness |
+|---|---|
+| `planning` | empty title → C `evidence-missing`, B `verifier-refused`; otherwise accepted, with spec/budget/governance **not** checked (the witness must show it) |
+| `start_work` | no assignee → C `evidence-missing`, B `verifier-refused` |
+| type | `docs` lot, no module → SQL `AMEESH_MODULE_RULE` at insert; `release` lot with the `it` module active → SQL admitted; `improvement` lot → SQL admitted, then `advance` C `type-unsupported` / B `verifier-refused`, while `hold`/`release` pass |
+| `revision_transfer` | no verifier → B `verifier-uninstalled`, `capability_report().refusal` → `guard-unsupported`; once a contract is published, with its codes: absent proof, proof for **another lot**, proof for **another project**, other revision, same actor (not independent), stale proof → each a distinct refusal code published with the contract (none exists today) |
+| `observations` | any staging/preprod advance → C `source-unavailable`, B `verifier-refused`, no effect (rollback); a well-formed command refuses identically |
+
 ## Proofs
 
 `tests/test_process_registry.py` (77 cases, two drivers — 2 skipped while
@@ -219,3 +351,115 @@ The mediated read of the guard is guarded by `tests/test_l109_mediated_mode.py`
 make no raw SELECT — the VM session would only send `work.get`, never
 `work.move`. The module is declared in `tests/parts/pilote-psql.txt`
 (transactions, locks, concurrency: both drivers' behaviour).
+
+## Slice D: opt-in projection of a pinned lot onto its single issue (#2130)
+
+Slice D is **opt-in** and concerns only lots pinned to a Process revision
+(`workflow_ref` non-empty). Outside the opt-in — no admitted mapping for the
+project, or an unpinned lot — the L126 projection is unchanged, bit for bit.
+
+**Authoritative source.** For a pinned lot, the issue state, its board labels
+and the closing comment follow the pinned revision: `workflow_ref` +
+`workflow_stage` + `workflow_version`, read through the **admitted, compiled
+artifact**. `work_items.state` (the current core, or a hold) is never the
+projection source of a pinned lot. A hold (`blocked`, `waiting_human`) keeps the
+stage; since the row does not carry the pre-hold core (`_pre_hold_core`), the
+core comes from the artifact (`stage.core`).
+
+**Mapping (data only).** The opt-in is the `github.process` key of the host
+configuration:
+
+```json
+"process": {"<project>": {"ref": "canon@<sha>:<path>", "version": 3,
+                          "document": {"schema": "process-workflow/1", "...": "..."},
+                          "labels": {"<stage>": "<board label>"}}}
+```
+
+The document is compiled by `process_workflow.compile_workflow(document,
+ref=…, version=…)`; its `(ref, version)` are the ones lots must carry, and
+`labels` must cover exactly the artifact's stages. A project may admit a list of
+mappings (a transfer admits two revisions at once). Unknown keys, a missing
+`ref`/`version`, an empty mapping, a duplicate `(ref, version)` or an incomplete
+label map raise `SettingsError`, as does a project that is not declared in
+`github.projects`; the projection stops with the message, as it does today for
+an invalid `github` key. No executable expression and no import path ever come
+from the document; `compile_workflow` proves the document is well formed, not
+where it came from — the admitted `ref` and the label map are data the host
+configuration owns.
+
+**Issue state.** The artifact's `projection` classifies cores: `issue_open` →
+`open` (so `merged` — staging and preprod — stays **open**), `issue_completed` →
+`closed/completed`, `issue_not_planned` → `closed/not_planned`. Two native
+exceptions are read from the lot's own facts:
+
+* a core `closed` with `close_reason=delivered` (#988) is `completed`: a real
+  delivery outside the target, not an abandonment;
+* a pinned lot closed by the native path (`work close`: the row is `closed`
+  while the stage's core is not) keeps its stage and its board label, and the
+  **native reason decides** — `delivered` → `completed`, `abandoned`/
+  `superseded` → `not_planned`. An absent or unknown reason refuses
+  (`projection-classification`) instead of guessing.
+
+**Refusals (fail-closed, no legacy fallback).** A pinned lot is never projected
+through `lot_issue_state`. The lot is left untouched — no issue created, no
+field written, no closure comment — and reported once with a stable code:
+
+| code | cause |
+|---|---|
+| `projection-unmapped` | no admitted mapping for the lot's `(ref, version)` |
+| `projection-stage-missing` | pinned lot without `workflow_stage` |
+| `projection-stage-undeclared` | stage absent from the admitted artifact |
+| `projection-core-mismatch` | `work_items.state` (a core outside a hold) diverges from the artifact's core for the stage |
+| `projection-classification` | core classified nowhere, or native `closed` without a usable `close_reason` |
+| `projection-label-missing` | no admitted label for the stage |
+| `projection-ambiguous` | the configuration admits `(ref, version)` twice (load time) |
+
+A refusal writes nothing at all: not even the native `issue_ref` adoption of an
+issue found by its marker (`_remember_ref` is skipped for a refused lot), and a
+`--dry-run` pass is read-only. It is distinct from a title refusal and from the
+`self.skip` cache: a corrected mapping, revision or stage is picked up on the
+next pass without touching the work item's title.
+
+**Managed labels.** The admitted mappings' labels join the managed label set of
+their project (the union of every admitted revision, so a transfer's old board
+label is replaced by the new one instead of lingering as a foreign label).
+`_own_labels`, `_fields`, the fingerprints, `_three_way`, `_restamp` and
+`_foreign_labels` use that set; every other label, and every human edit, stays
+untouched, and a lot outside the opt-in keeps the historical `ameesh`/
+`ameesh:*` fingerprints.
+
+**Issue already closed.** When the projection wants `closed` and the issue is
+already closed, a divergent `state_reason` (a legacy close for the wrong reason)
+is corrected without adding a comment: state and reason stay coherent.
+
+**Reused unchanged.** Adoption (`issue_ref`, `ameesh:work=` marker), one issue
+per lot, compare-and-set `_remember_ref` and duplicate detection, shared read
+quota, unknown-outcome reconciliation (the marker records what ameesh last
+wrote), the three-way merge that keeps human edits, and the content guard. No
+receipt `evidence` and no private payload enters the issue. `issue_feed` carries
+the three workflow columns (and its filter keeps a pinned `merged` lot in the
+flow), and `work.get` carries them too: `project_lots` uses it for older lots
+found by their marker, so a healthy pinned orphan is not misread as
+`projection-stage-missing`. Both reads use `to_jsonb`, with a pre-0452 database
+returning `''`/NULL/0 — no column probe.
+
+**Condition.** The consumer stops its own issue writer on the opted-in project
+(the sidecar is not a qualified writer, 6211681303): native is the single
+writer. This slice does not activate the writer.
+
+**Witnesses** (`tests/test_2130_d_projection.py`, both drivers): unpinned lot
+unchanged; `implementation`, `staging`, `preprod_passed` → open; `done` →
+closed/completed; `stopped` → closed/not_planned, `delivered` → completed;
+native close outside the stage: `delivered` → completed, `abandoned`/
+`superseded` → not_planned, absent/unknown reason → named refusal; `blocked`
+hold on `review` → open with the `review` label; pinned lot without mapping →
+named refusal, no write, and an issue the legacy rule would have closed stays
+intact; a refusal does not adopt (`issue_ref` stays empty, no GitHub write);
+undeclared stage / divergent core / missing label → named refusals; a pinned
+`merged` lot without an issue gets an open one, a pinned `done` lot without an
+issue gets none; an issue closed for the wrong reason by the legacy is
+corrected; human title/body/foreign labels kept, no private evidence in the
+body; convergence after a GitHub write error; two admitted revisions and a
+transfer replaces the old board label; the `Projector` passes the mapping;
+`work.get` and `issue_feed` carry the three fields, including pre-0452
+(''/NULL/0); ambiguous configuration → `SettingsError`.

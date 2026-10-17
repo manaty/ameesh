@@ -258,6 +258,20 @@ def recently_modified(path: str | None) -> bool:
         return False
 
 
+def recently_modified(path: str | None) -> bool:
+    """A recently written external journal may still have a live writer.
+
+    Some harnesses close their journal between writes. Wait a quiet minute
+    before adoption or unleased resumption, even when no open fd was found.
+    """
+    if not path:
+        return False
+    try:
+        return time.time() - os.stat(path).st_mtime < 60
+    except FileNotFoundError:
+        return False
+
+
 def session_cwd(harness: str, path: str) -> str | None:
     """Le dossier de travail noté dans le journal de session (Codex :
     `session_meta.payload.cwd` ; Claude : champ `cwd`), ou None."""
@@ -1231,7 +1245,8 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
 
 def _local_session(cfg: Config, row: dict) -> str | None:
     """La session à reprendre, même règle que l'exécuteur (`current_session`) :
-    le registre, sinon le fichier local s'il est postérieur au dernier oubli."""
+    le registre, sinon le fichier local s'il est postérieur au dernier oubli,
+    à la marge de dérive des horloges près (`SESSION_RESET_SKEW_S`, #1898 N4)."""
     if row.get("session_id"):
         return row["session_id"]
     if (row.get("host") or "") != (cfg.host or ""):
@@ -1241,8 +1256,10 @@ def _local_session(cfg: Config, row: dict) -> str | None:
         with open(path, encoding="utf-8") as fh:
             session = fh.read().strip() or None
         reset = row.get("session_reset_ts")
-        if session and reset and os.stat(path).st_mtime <= float(reset):
-            return None
+        if session and reset:
+            from .runner import SESSION_RESET_SKEW_S
+            if os.stat(path).st_mtime <= float(reset) + SESSION_RESET_SKEW_S:
+                return None
         return session
     except OSError:
         return None
@@ -1509,6 +1526,9 @@ def cmd_resume(cfg: Config, args) -> int:
                   file=sys.stderr)
             return 1
         return agent_pause.cmd_cli(cfg, args, paused=False)
+    if getattr(args, "expect_reason", None):
+        print("ameesh resume: --expect-reason requires --operator", file=sys.stderr)
+        return 1
     try:
         brief = _read_brief(args.brief)
     except OSError as exc:
@@ -1574,6 +1594,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_re.add_argument("--json", action="store_true")
     p_re.add_argument("--operator", action="store_true", help="lift only an operator pause")
     p_re.add_argument("--reason", default="", help="required with --operator")
+    p_re.add_argument("--expect-reason", default=None, metavar="TEXT",
+                      help="with --operator: lift only the pause whose reason is "
+                           "exactly TEXT, atomically (#2152)")
     p_re.add_argument("--human", default=None, help="local human for --operator")
     p_re.set_defaults(func=cmd_resume)
     return parser

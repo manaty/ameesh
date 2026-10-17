@@ -20,7 +20,7 @@ from unittest import mock
 from ameesh import plan_git, radar, resolutions, storage, work
 
 from .support import PgTestCase
-from .test_l160b_radar import LOTS, MIG, _git, _write, make_repo
+from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
 
 #: the line both lots 1 and 2 changed, resolved
 RESOLVED = "UN-One\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n"
@@ -33,18 +33,32 @@ def _commit_on(repo, branch, path, text, message):
     _git(repo, "checkout", "-q", "main")
 
 
+def _add_on(repo, branch, path, text, message):
+    """`_commit_on` for a path the branch does not have yet."""
+    _git(repo, "checkout", "-q", branch)
+    _write(repo, path, text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", message)
+    _git(repo, "checkout", "-q", "main")
+
+
 def _identity(repo):
     _git(repo, "config", "user.name", "t")
     _git(repo, "config", "user.email", "t@example.invalid")
 
 
-def _manual_resolution(repo, ours="lot/1-a", theirs="lot/2-b", text=RESOLVED):
-    """R(ours, theirs) made by hand in a scratch worktree; returns its sha."""
+def _manual_resolution(repo, ours="lot/1-a", theirs="lot/2-b", text=RESOLVED,
+                       attributes_tree=None):
+    """R(ours, theirs) made by hand in a scratch worktree; returns its sha.
+
+    `attributes_tree` makes the merge read `.gitattributes` from that tree,
+    as the target does (`attr.tree`, #2189)."""
     wt = os.path.join(os.path.dirname(repo), "wt-%s" % os.urandom(3).hex())
     _git(repo, "worktree", "add", "-q", "--detach", wt, ours)
+    attrs = ["-c", "attr.tree=%s" % attributes_tree] if attributes_tree else []
     try:
         try:
-            _git(wt, "merge", "-q", "--no-ff", "--no-commit", theirs)
+            _git(wt, *attrs, "merge", "-q", "--no-ff", "--no-commit", theirs)
             raise RuntimeError("the pair should conflict")
         except AssertionError:
             pass
@@ -182,6 +196,161 @@ class ReplayTest(_Base):
     def test_primed_by_python_port(self):
         self.check(None)
 
+    def asymmetric_pair(self):
+        """#2136: `.gitattributes` arrives with lot/1-a and drives the merge it
+        is part of — `tests/parts/*.txt merge=union` applies only when lot/1-a
+        is the first parent, so lot/2-b ← lot/1-a conflicts on the parts list
+        where lot/1-a ← lot/2-b unions it. The resolution commit is made in the
+        union direction, as the author's `work resolve` did on #2110/#753."""
+        path = "tests/parts/pilote-psql.txt"
+        _add_on(self.repo, "lot/1-a", ".gitattributes",
+                "tests/parts/*.txt merge=union\n", "union driver")
+        _add_on(self.repo, "lot/1-a", path, "l1\nfrom-a\n", "a adds a part")
+        _add_on(self.repo, "lot/2-b", path, "l1\nfrom-b\n", "b adds a part")
+        return _manual_resolution(self.repo)
+
+    def check_asymmetric(self, script):
+        sha = self.asymmetric_pair()
+        rp = self.replayer(script)
+        rp.ensure()
+        self.assertEqual(rp.prime([sha]), [])
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        # the direction the resolution was prepared in: the union driver applies
+        self.assertEqual(rp.replay(a, b, sha)["state"], "prepared")
+        # the landing direction (the queue merges the late lot into the earlier
+        # ones): no `.gitattributes` when the merge starts, so the parts list
+        # conflicts and only a resolution learnt in this direction covers it
+        got = rp.replay(b, a, sha)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+
+    @unittest.skipUnless(resolutions.rerere_train_script(), "rerere-train.sh not installed")
+    def test_asymmetric_pair_primed_by_rerere_train_sh(self):
+        self.check_asymmetric("auto")
+
+    def test_asymmetric_pair_primed_by_python_port(self):
+        self.check_asymmetric(None)
+
+    def test_asymmetric_pair_retrains_legacy_cache(self):
+        sha = self.asymmetric_pair()
+        rp = self.replayer(None)
+        rp.ensure()
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        # A radar that already saw this pair has a first-parent-only cache.
+        resolutions._learn(rp.path, sha, a, [b])
+        legacy = os.path.join(rp.path, ".git", "ameesh-rr", sha)
+        shutil.copytree(rp._rr_cache(), legacy)
+        self.assertEqual(rp.prime([sha]), [])
+        got = rp.replay(b, a, sha)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+
+    def test_target_attributes_retrain_when_they_change(self):
+        sha, target = self.union_on_both_sides()
+        rp = self.replayer(None)
+        rp.ensure()
+        self.assertEqual(rp.prime([sha], attributes_tree=target), [])
+        self.assertIn(sha, rp.trained(target))
+        # a target push that leaves `.gitattributes` alone keeps the cache
+        _commit_on(self.repo, "main", "other.py", "z\n", "target moves elsewhere")
+        moved = _git(self.repo, "rev-parse", "main")
+        self.assertIn(sha, rp.trained(moved))
+        # the target gains `merge=union`: another key, retrained before replay
+        _add_on(self.repo, "main", ".gitattributes",
+                "tests/parts/*.txt merge=union\n", "target unions parts")
+        changed = _git(self.repo, "rev-parse", "main")
+        self.assertNotIn(sha, rp.trained(changed))
+        self.assertEqual(rp.prime([sha], attributes_tree=changed), [])
+        self.assertIn(sha, rp.trained(changed))
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        got = rp.replay(a, b, sha, attributes_tree=changed)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+        self.assertEqual(got["files"], ["shared.py"])
+
+    def target_only_union(self):
+        """The target carries `merge=union` on the parts list, the lot
+        branches do not: the radar's `trial_merge` unions it (attributes read
+        from the target), so the replay must too, whichever tip is checked
+        out (#2189)."""
+        path = "tests/parts/pilote-psql.txt"
+        _add_on(self.repo, "main", ".gitattributes",
+                "tests/parts/*.txt merge=union\n", "target unions parts")
+        target = _git(self.repo, "rev-parse", "main")
+        _add_on(self.repo, "lot/1-a", path, "l1\nfrom-a\n", "a adds a part")
+        _add_on(self.repo, "lot/2-b", path, "l1\nfrom-b\n", "b adds a part")
+        return _manual_resolution(self.repo, attributes_tree=target), target
+
+    def test_moving_target_attributes_retrains_for_the_new_scope(self):
+        sha, target = self.target_only_union()
+        rp = self.replayer(None)
+        rp.ensure()
+        self.assertEqual(rp.prime([sha], attributes_tree=target), [])
+        # Same blob, different directory: the union no longer covers parts.
+        os.makedirs(os.path.join(self.repo, "scoped"))
+        _git(self.repo, "mv", ".gitattributes", "scoped/.gitattributes")
+        _git(self.repo, "commit", "-qm", "move attributes outside their scope")
+        moved = _git(self.repo, "rev-parse", "main")
+        self.assertNotIn(sha, rp.trained(moved))
+        self.assertEqual(rp.prime([sha], attributes_tree=moved), [])
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        got = rp.replay(a, b, sha, attributes_tree=moved)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+        self.assertIn("tests/parts/pilote-psql.txt", got["files"])
+
+    def check_target_attributes(self, script):
+        sha, target = self.target_only_union()
+        rp = self.replayer(script)
+        rp.ensure()
+        self.assertEqual(rp.prime([sha], attributes_tree=target), [])
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        for x, y in ((a, b), (b, a)):
+            got = rp.replay(x, y, sha, attributes_tree=target)
+            self.assertEqual((got["state"], got["files"], got["remaining"]),
+                             ("prepared", ["shared.py"], []))
+
+    @unittest.skipUnless(resolutions.rerere_train_script(), "rerere-train.sh not installed")
+    def test_target_attributes_primed_by_rerere_train_sh(self):
+        self.check_target_attributes("auto")
+
+    def test_target_attributes_primed_by_python_port(self):
+        self.check_target_attributes(None)
+
+    def union_on_both_sides(self):
+        """Both lot branches carry `merge=union`, the target does not: the
+        landing merge reads the target's attributes, so the parts list is in
+        conflict and the resolution must be learnt under those attributes."""
+        path = "tests/parts/pilote-psql.txt"
+        attrs = "tests/parts/*.txt merge=union\n"
+        _add_on(self.repo, "lot/1-a", ".gitattributes", attrs, "a unions parts")
+        _add_on(self.repo, "lot/2-b", ".gitattributes", attrs, "b unions parts")
+        _add_on(self.repo, "lot/1-a", path, "l1\nfrom-a\n", "a adds a part")
+        _add_on(self.repo, "lot/2-b", path, "l1\nfrom-b\n", "b adds a part")
+        # prepared in the union direction: only shared.py conflicted
+        return _manual_resolution(self.repo), _git(self.repo, "rev-parse", "main")
+
+    def test_target_attributes_add_the_conflict_the_branches_hide(self):
+        sha, target = self.union_on_both_sides()
+        rp = self.replayer(None)
+        rp.ensure()
+        self.assertEqual(rp.prime([sha], attributes_tree=target), [])
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        got = rp.replay(a, b, sha, attributes_tree=target)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+        self.assertIn("tests/parts/pilote-psql.txt", got["files"])
+
+    def test_target_attributes_retrain_the_legacy_cache(self):
+        sha, target = self.union_on_both_sides()
+        rp = self.replayer(None)
+        rp.ensure()
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        # a cache trained before #2189: the branches' union hides the parts
+        # conflict the target will see, so it is never learnt
+        resolutions._learn(rp.path, sha, a, [b])
+        shutil.copytree(rp._rr_cache(),
+                        os.path.join(rp.path, ".git", resolutions.TRAINING_CACHE, sha))
+        self.assertEqual(rp.prime([sha], attributes_tree=target), [])
+        got = rp.replay(a, b, sha, attributes_tree=target)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+        self.assertIn("tests/parts/pilote-psql.txt", got["files"])
+
     def test_resolution_from_another_host_is_fetched(self):
         bare = self.origin()
         sha = _manual_resolution(self.repo)
@@ -199,6 +368,20 @@ class ReplayTest(_Base):
 
 class AgentFlowTest(_Base):
     """`ameesh work resolve` on the agent's side."""
+
+    def test_open_resolution_uses_the_target_attributes(self):
+        # #2189: preparation reads the target's `.gitattributes`, like the
+        # radar's trial merge and the landing merge; a union carried by the
+        # target alone is not a conflict to resolve here.
+        path = "tests/parts/pilote-psql.txt"
+        _add_on(self.repo, "main", ".gitattributes",
+                "tests/parts/*.txt merge=union\n", "target unions parts")
+        _add_on(self.repo, "lot/1-a", path, "l1\nfrom-a\n", "a adds a part")
+        _add_on(self.repo, "lot/2-b", path, "l1\nfrom-b\n", "b adds a part")
+        out = resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        self.assertEqual((out["state"], out["files"], out["remaining"]),
+                         ("open", ["shared.py"], ["shared.py"]))
+        resolutions.abort_resolution(2, 1, repo=self.repo)
 
     def test_open_resolve_done(self):
         bare = self.origin()
@@ -493,7 +676,8 @@ class ReviewTest(_Base):
         return sha
 
     def test_i_modify_delete_conflict_still_learnt(self):
-        # codex, 2nd review (P2): checkout -m failed on the modify/delete path
+        # codex, 2nd review (P2): a modify/delete conflict is still learnt
+        # (`checkout -m` used to fail on that path, and is no longer needed)
         sha = self.modify_delete_resolution()
         rp = resolutions.Replayer(self.repo, os.path.join(self.tmp, "scratch"), script=None)
         rp.ensure()
@@ -506,6 +690,66 @@ class ReviewTest(_Base):
         self.assertNotIn("shared.py", got["remaining"])
         self.assertIn("other.py", got["files"])
 
+    def test_k_preimage_is_the_merge_render_not_a_checkout_m_rerender(self):
+        # #2165 (impl04, 17/10): `checkout -m` re-renders the conflict, and on
+        # this pair its render normalizes to another preimage (two hunks against
+        # one): the rr-cache entry then never matches at replay. Case reduced to
+        # three blobs from the pair #2032/#1349 (openapi-v1.json, schema.d.ts).
+        base = ('        },\n        "summary": "Message to an agent: its mailbox and '
+                'its thread (`agent-mail send`)"\n      }\n          }\n        },')
+        ours = "          }\n        },\n      }\n"
+        theirs = ('            "description": "database unavailable"\n        },\n'
+                  '        "summary": "Message to an agent: its mailbox and its thread '
+                  '(`agent-mail send`)"\n      }\n          },')
+        tmp = tempfile.mkdtemp(prefix="ameesh-l160d-2165-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "f.json", base)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "base")
+        _git(repo, "checkout", "-qb", "theirs")
+        _write(repo, "f.json", theirs)
+        _git(repo, "commit", "-qam", "theirs")
+        _git(repo, "checkout", "-q", "main")
+        _write(repo, "f.json", ours)
+        _git(repo, "commit", "-qam", "ours")
+        wt = os.path.join(tmp, "wt")
+        _git(repo, "worktree", "add", "-q", "--detach", wt, "main")
+        merge = resolutions._run(wt, "merge", "-q", "--no-ff", "--no-commit", "theirs",
+                                 env_extra=git_env())
+        self.assertEqual(merge.returncode, 1, merge.stderr.decode("utf-8", "replace"))
+        _write(wt, "f.json", ours)
+        _git(wt, "add", "f.json")
+        _git(wt, "commit", "-qm", "R")
+        r = _git(wt, "rev-parse", "HEAD")
+        _git(repo, "worktree", "remove", "--force", wt)
+        a, b = _git(repo, "rev-parse", "main"), _git(repo, "rev-parse", "theirs")
+        rp = resolutions.Replayer(repo, os.path.join(tmp, "clone"), script=None)
+        rp.ensure()
+        # The old port may already have cached this SHA without the matching
+        # preimage. An upgrade must relearn it instead of keeping it stale.
+        os.makedirs(os.path.join(rp.path, ".git", "ameesh-rr", r))
+        # #2136 already used v2, but still trained checkout -m preimages.
+        # Seed that historical cache too: #2165 must not reuse it on upgrade.
+        _git(rp.path, "checkout", "-q", "-f", "--detach", a)
+        merge = resolutions._run(
+            rp.path, "-c", "rerere.enabled=true", "merge", "-q",
+            "--no-ff", "--no-commit", b, env_extra=git_env())
+        self.assertEqual(merge.returncode, 1)
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere", "forget", ".")
+        _git(rp.path, "checkout", "-m", "--", "f.json")
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere")
+        _git(rp.path, "checkout", r, "--", ".")
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere")
+        shutil.copytree(os.path.join(rp.path, ".git", "rr-cache"),
+                        os.path.join(rp.path, ".git", "ameesh-rr-v2", r))
+        _git(rp.path, "reset", "-q", "--hard")
+        self.assertEqual(rp.prime([r]), [])
+        got = rp.replay(a, b, r)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+
     def test_i_failed_training_is_isolated_to_its_pair(self):
         # codex, 2nd review (P2): one failed training cut the replay of every pair
         r1 = _manual_resolution(self.repo)
@@ -513,10 +757,10 @@ class ReviewTest(_Base):
         rp.ensure()
         real = resolutions.train
 
-        def flaky(cwd, commits, *, script="auto"):
+        def flaky(cwd, commits, *, script="auto", attributes_tree=None):
             if commits == ["f" * 40]:
-                raise resolutions.GitError("git checkout -m: boom")
-            return real(cwd, commits, script=script)
+                raise resolutions.GitError("git rerere: boom")
+            return real(cwd, commits, script=script, attributes_tree=attributes_tree)
         with mock.patch.object(resolutions, "train", side_effect=flaky), \
                 mock.patch.object(rp, "has", return_value=True):
             self.assertEqual(rp.prime(["f" * 40, r1]), ["f" * 40])
@@ -544,6 +788,98 @@ class ReviewTest(_Base):
             rows, error = resolutions.of_lot_or_error(None, 2)
         self.assertEqual(rows, [])
         self.assertIn("work_resolutions", error)
+
+
+class IdempotentDoneTest(_Base):
+    """#2142 : `--done` relancé après l'enregistrement ne refait rien, il finit
+    le nettoyage et rend l'état `prepared`."""
+
+    def resolved(self):
+        path = resolutions.open_resolution(None, 2, 1, repo=self.repo)["path"]
+        _write(path, "shared.py", RESOLVED)
+        return path
+
+    def test_k_done_from_inside_the_worktree_cleans_it_up(self):
+        # signalement : `--done` lancé depuis le worktree de résolution ; le
+        # `git worktree prune` qui suit la suppression tournait dans le dossier
+        # disparu et git répondait « git not found », après l'enregistrement.
+        path = self.resolved()
+        done = resolutions.finish_resolution(None, 2, 1, repo=path, actor="a2")
+        self.assertEqual(done["state"], "prepared")
+        self.assertFalse(done["already"])
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".json"))
+        self.assertNotIn("ameesh-resolve", _git(self.repo, "worktree", "list"))
+        self.assertEqual(self.fake.rows[(2, 1)]["commit_sha"], done["commit"])
+
+    def test_l_done_after_a_failed_cleanup_finishes_it_without_redoing(self):
+        path = self.resolved()
+        real = resolutions._remove_worktree
+        calls = []
+
+        def failing_once(repo, p, *, force=True):
+            calls.append(p)
+            if len(calls) == 1:
+                raise resolutions.GitError("git not found")
+            return real(repo, p, force=force)
+
+        with mock.patch.object(resolutions, "_remove_worktree", side_effect=failing_once):
+            with self.assertRaises(resolutions.GitError):
+                resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        row = self.fake.rows[(2, 1)]
+        self.assertTrue(os.path.isdir(path))      # enregistré, mais pas nettoyé
+        pushed = []
+        done = resolutions.finish_resolution(
+            None, 2, 1, repo=self.repo, actor="a2",
+            push_fn=lambda *a, **k: pushed.append(a) or (None, "no origin remote"))
+        self.assertTrue(done["already"])
+        self.assertEqual(done["state"], "prepared")
+        self.assertEqual(done["commit"], row["commit_sha"])
+        self.assertEqual(pushed, [])              # ni repoussé ni réenregistré
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".json"))
+        self.assertNotIn("ameesh-resolve", _git(self.repo, "worktree", "list"))
+
+    def test_m_second_done_without_a_worktree_is_idempotent(self):
+        path = self.resolved()
+        first = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        second = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertTrue(second["already"])
+        self.assertEqual(second["commit"], first["commit"])
+        self.assertEqual(self.fake.rows[(2, 1)]["commit_sha"], first["commit"])
+        self.assertFalse(os.path.exists(path))
+
+    def test_m_ignored_files_message_gives_the_cleanup_command(self):
+        _git(self.repo, "checkout", "-q", "lot/2-b")
+        _write(self.repo, ".gitignore", "*.local\n")
+        _git(self.repo, "add", ".gitignore")
+        _git(self.repo, "commit", "-qm", "b ignores *.local")
+        _git(self.repo, "checkout", "-q", "main")
+        path = self.resolved()
+        _write(path, "notes.local", "kept\n")
+        with self.assertRaises(resolutions.ResolveError) as ctx:
+            resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertIn("notes.local", str(ctx.exception))
+        self.assertIn("git worktree remove -f -f %s" % path, str(ctx.exception))
+        self.assertTrue(os.path.isfile(os.path.join(path, "notes.local")))
+
+    def test_n_reopening_a_current_resolution_reports_prepared(self):
+        path = self.resolved()
+        done = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        out = resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        self.assertEqual(out["state"], "prepared")
+        self.assertEqual(out["commit"], done["commit"])
+        self.assertIsNone(out["path"])
+        self.assertFalse(os.path.exists(path))    # aucun worktree rouvert
+        self.assertNotIn("ameesh-resolve", _git(self.repo, "worktree", "list"))
+
+    def test_n_a_moved_tip_reopens_instead_of_prepared(self):
+        self.resolved()
+        resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        _commit_on(self.repo, "lot/2-b", "other.py", "z\n", "b elsewhere")
+        out = resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        self.assertEqual(out["state"], "open")
+        self.assertTrue(os.path.isdir(out["path"]))
 
 
 class RadarTest(_Base):
@@ -625,6 +961,52 @@ class RadarTest(_Base):
             radar.send_mail(self.cfg, None, self.project, report, ci=None)
         stale = [(to, p["radar"]["key"]) for to, p in sent if p["radar"]["kind"] == "stale"]
         self.assertEqual(stale, [("a2", "stale:1-2")])
+
+    def test_radar_replays_with_the_target_attributes(self):
+        # #2189: the replay reads `.gitattributes` from the target, like the
+        # radar's trial merge, and keeps its training cache apart.
+        path = "tests/parts/pilote-psql.txt"
+        _add_on(self.repo, "main", ".gitattributes",
+                "tests/parts/*.txt merge=union\n", "target unions parts")
+        target = _git(self.repo, "rev-parse", "main")
+        _add_on(self.repo, "lot/1-a", path, "l1\nfrom-a\n", "a adds a part")
+        _add_on(self.repo, "lot/2-b", path, "l1\nfrom-b\n", "b adds a part")
+        sha = _manual_resolution(self.repo, attributes_tree=target)
+        self.fake.record_resolution(1, 2, commit=sha, lot_tip="x", other_tip="y",
+                                    ref=None, files=["shared.py"], note="", actor="a1")
+        report = self.scan()
+        pair = self.pair(report)
+        self.assertEqual((pair["state"], pair["resolution"]["replay"]), ("prepared", "prepared"))
+        self.assertTrue(os.path.isdir(os.path.join(
+            radar.clone_dir(self.cfg, "p"), ".git",
+            resolutions.TRAINING_CACHE_TARGET, sha)))
+
+    def test_stale_mail_names_the_preparer_not_the_resolver(self):
+        # lot 1 is the pair's resolver (priority) but lot 2 prepared the
+        # resolution; the stale mail must wake lot 2 and tell it to redo its
+        # own direction (#2189).
+        self.lots[0]["priority"], self.lots[1]["priority"] = 3, 2
+        sha = _manual_resolution(self.repo, "lot/2-b", "lot/1-a",
+                                 text="autre\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n")
+        self.fake.record_resolution(2, 1, commit=sha, lot_tip="x", other_tip="y",
+                                    ref=None, files=["shared.py"], note="", actor="a2")
+        _commit_on(self.repo, "lot/1-a", "shared.py",
+                   "UNO\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n", "a changes the hunk")
+        report = self.scan()
+        pair = self.pair(report)
+        self.assertEqual((pair["state"], pair["resolver"]["lot"]), ("stale", 1))
+        stale = radar.conflicts_of(report)["stale:1-2"]
+        self.assertEqual(stale["lots"], [2])
+        branches = {b["work_item"]: b for b in report["branches"]}
+        text = radar.message_text(stale, 2, branches)
+        self.assertIn("`ameesh work resolve 2 --with 1`", text)
+        self.assertNotIn("`ameesh work resolve 1 --with 2`", text)
+        sent = []
+        from ameesh import mail
+        with mock.patch.object(mail, "send", side_effect=lambda db, s, to, body, **kw:
+                               sent.append((to, body)) or len(sent)):
+            radar.send_mail(self.cfg, None, self.project, report, ci=None)
+        self.assertEqual([to for to, _ in sent if "no longer covers" in _], ["a2"])
 
     def test_database_without_the_table(self):
         store = mock.Mock()

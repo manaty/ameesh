@@ -61,11 +61,6 @@ class CiResults(interface.CiResults):
             "UPDATE ci_runs SET started_at = now() WHERE repo = %%s AND run_id IN (%s)"
             " AND started_at IS NULL" % _ints(run_ids), (repo,))
 
-    def queued(self) -> list[dict]:
-        return self.db.query(
-            "SELECT %s FROM ci_runs WHERE status = 'running' AND started_at IS NULL"
-            " ORDER BY coalesce(created_at, first_seen_at), run_id" % RUN_COLUMNS)
-
     def reopen_run(self, repo, run_id, *, run_attempt) -> dict | None:
         # #901 : GitHub dit l'exécution de nouveau `queued`/`in_progress` avec
         # le même run_id : c'est une relance. La tête a pu bouger depuis (une
@@ -184,13 +179,23 @@ class CiResults(interface.CiResults):
     def base_failures(self, repo, branch, *, workflow="") -> dict:
         # strictement la même suite : les lignes antérieures à la migration
         # 0433, toutes de `tests.yml`, y sont nommées (#1110, R1 P2-2)
+        # #1683 : la référence est la tête la plus récemment poussée, pas
+        # l'exécution conclue le plus récemment — une exécution lente d'une
+        # tête plus ancienne ne redevient pas la base. Pour chaque tête, sa
+        # première observation, annulations comprises (un réessai ne la
+        # rajeunit pas), mais le résultat de sa dernière exécution conclue.
         rows = self.db.query(
             """
-            WITH last AS (
-                SELECT run_id, head_sha, run_attempt FROM ci_runs
-                 WHERE repo = %s AND branch = %s AND status IN ('success', 'failure')
-                   AND workflow = %s
-                 ORDER BY concluded_at DESC, run_id DESC LIMIT 1
+            WITH runs AS (
+                SELECT run_id, head_sha, run_attempt, status, concluded_at,
+                       min(coalesce(created_at, first_seen_at))
+                           OVER (PARTITION BY head_sha) AS seen_at
+                  FROM ci_runs
+                 WHERE repo = %s AND branch = %s AND workflow = %s
+            ), last AS (
+                SELECT run_id, head_sha, run_attempt FROM runs
+                 WHERE status IN ('success', 'failure')
+                 ORDER BY seen_at DESC, concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f
@@ -357,30 +362,11 @@ class CiResults(interface.CiResults):
             (float(now), int(calls), int(runs), int(covered), bool(complete),
              reason, repo))
 
-    def guard_runs(self, repo) -> dict:
-        """Le cache des relevés par exécution : `{(run_id, attempt): {...}}`."""
-        rows = self.db.query(
-            """
-            SELECT run_id, attempt, status, queued, oldest_id, oldest_at, runners
-              FROM ci_guard_run
-             WHERE repo = %s
-            """, (repo,))
-        out: dict = {}
-        for row in rows:
-            runners = row.get("runners")
-            if isinstance(runners, str):
-                try:
-                    runners = json.loads(runners or "{}")
-                except ValueError:
-                    runners = {}
-            out[(int(row["run_id"]), int(row["attempt"]))] = dict(
-                row, runners=dict(runners or {}))
-        return out
-
     def observe_guard_run(self, repo, *, run_id, attempt, status, queued,
                           oldest_id, oldest_at, runners) -> None:
-        """Écrit le relevé d'une exécution : seules les exécutions restées
-        `queued` (aucun job commencé) sont réutilisées sans nouvel appel."""
+        """Écrit le relevé d'une exécution (#845) : trace de la fenêtre en
+        cours, sans relecture — depuis le retrait du lecteur (B1), chaque
+        relevé relit toutes les exécutions au lieu de réutiliser ce cache."""
         self.db.execute(
             """
             INSERT INTO ci_guard_run AS r

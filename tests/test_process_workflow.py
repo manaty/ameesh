@@ -270,6 +270,20 @@ class GrapheTest(WorkflowTestCase):
         document["stages"].append({"status": "draft", "core": "build"})
         self.assertRefusal("stage-duplicate", self.compile, document)
 
+    def test_etape_avec_espaces_en_bord_refusee(self):
+        for status in (" draft", "draft ", "\tdraft"):
+            with self.subTest(status=status):
+                document = fixture()
+                document["stages"][0]["status"] = status
+                self.assertRefusal("stage-padded", self.compile, document)
+
+    def test_etape_dupliquee_a_la_casse_pres_refusee(self):
+        for status in ("Draft", "DRAFT", "dRaFt"):
+            with self.subTest(status=status):
+                document = fixture()
+                document["stages"].append({"status": status, "core": "build"})
+                self.assertRefusal("stage-case-duplicate", self.compile, document)
+
     def test_core_inconnu_refuse(self):
         for core in ("blocked", "waiting_human", "inconnu"):
             with self.subTest(core=core):
@@ -288,11 +302,24 @@ class GrapheTest(WorkflowTestCase):
                                         "guard": "planning"})
         self.assertRefusal("edge-duplicate", self.compile, document)
 
-    def test_arete_ambigue_refusee(self):
+    def test_cibles_distinctes_sous_une_meme_garde_acceptees(self):
+        """#1915/#1379 : la carte de référence a deux cibles sous `planning`.
+
+        `draft -> backlog` et `draft -> sprint` sont deux arêtes distinctes :
+        la commande porte `to_stage`, le registre vérifie le couple exact
+        (`to_stage`, `guard`) depuis `from_stage`. Seul le doublon exact est
+        refusé (test ci-dessus).
+        """
         document = fixture()
         document["transitions"].append({"from": "draft", "to": "sprint",
                                         "guard": "planning"})
-        self.assertRefusal("edge-ambiguous", self.compile, document)
+        artifact = self.compile(document)
+        self.assertEqual(
+            {"backlog", "sprint"},
+            {t.target for t in artifact.transitions_from("draft")
+             if t.guard == "planning"})
+        self.assertIn(("draft", "sprint", "planning"),
+                      [(t.source, t.target, t.guard) for t in artifact.transitions])
 
     def test_arete_vers_etape_non_declaree_refusee(self):
         document = fixture()
