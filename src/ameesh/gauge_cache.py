@@ -32,8 +32,8 @@ class GaugeCache:
             self._entries.pop(path, None)
             if len(readings) > self.max_accounts:
                 return
-            frozen = {account: (stamp, tuple(gauges))
-                      for account, (stamp, gauges) in readings.items()}
+            frozen = {account: (stamp, tuple(gauges), overage)
+                      for account, (stamp, gauges, overage) in readings.items()}
             self._entries[path] = (signature, frozen)
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)

@@ -550,6 +550,60 @@ class WorktreesTest(_Repo):
         self.assertEqual([os.path.realpath(w["path"]) for w in found], [os.path.realpath(wt)])
 
 
+class OrphanGuardsTest(unittest.TestCase):
+    def test_named_or_recent_worktree_is_kept(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-1665-") as root:
+            now = time.time() + 3 * 86400
+            for label, branch, owner, state, recent in (
+                ("other-active", "lot/7-x", "other", "build", False),
+                ("other-closed", "lot/7-x", "other", "closed", False),
+                ("unknown", "lot/7-x", None, None, False),
+                ("unreadable", "lot/7-x", None, RuntimeError("offline"), False),
+                ("named-directory", "", "other", "build", False),
+                ("recent-source", "scratch", None, None, True),
+                ("orphan", "scratch", None, None, False),
+                ("own-closed", "lot/7-x", "a1", "closed", False),
+                ("own-active", "lot/7-x", "a1", "build", False),
+                ("own-closed-recent", "lot/7-x", "a1", "closed", True),
+            ):
+                with self.subTest(label=label):
+                    path = os.path.join(root, "a1-7" if label == "named-directory" else label)
+                    os.makedirs(os.path.join(path, "src"))
+                    source = os.path.join(path, "src", "app.py")
+                    with open(source, "w") as out:
+                        out.write("value = 1\n")
+                    if recent:
+                        os.utime(source, (now - 60, now - 60))
+                    row = dict(id=1, path=path, agent="a1", lot=None, branch=branch,
+                               detail=menage.UNATTRIBUTED, status="active", created_ts=now - 3 * 86400)
+                    lookup = mock.Mock(return_value=dict(assignee=owner, state=state)
+                                       if owner else None)
+                    if isinstance(state, Exception):
+                        lookup.side_effect = state
+                    store = SimpleNamespace(work=SimpleNamespace(get=lookup),
+                        housekeeping=SimpleNamespace(worktrees=lambda *args: [row]))
+                    git = dict(exists=True, clean=True, pushed=True, integrated=False,
+                               locked=False, submodules="", gitdir="", reason="not integrated")
+                    with mock.patch.object(menage.storage, "of", return_value=store), \
+                            mock.patch.object(menage, "worktree_state", return_value=git), \
+                            mock.patch.object(menage, "worktree_in_use", return_value=False), \
+                            mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
+                            mock.patch.object(platform, "user_paths", return_value=platform.UserPaths()):
+                        entries, plan = menage._worktree_pass(None, "pc", dry_run=True,
+                                                             protected=set(), now=now)
+                    self.assertEqual(entries, [])
+                    self.assertEqual(plan[0]["action"] == "retrait",
+                                     label in ("orphan", "own-closed"), plan)
+                    if recent:
+                        outcome, freed, reason, built = menage._remove_kept_worktree(
+                            path, root, "", artifacts=None, allow=(),
+                            lock_path=os.path.join(root, "artifacts.lock"),
+                            journal_path=os.path.join(root, "artifacts.journal"),
+                            idle_before=now - DAY)
+                        self.assertEqual((outcome, freed, built), ("garde", 0, []))
+                        self.assertIn("active within 24 h", reason)
+
+
 class _Store:
     def __init__(self, rows, lots):
         self.rows, self.lots, self.statuses = rows, lots, []
@@ -578,7 +632,7 @@ class MergedKeptTest(_Repo):
         with mock.patch.object(menage.storage, "of", return_value=store), \
                 mock.patch.object(menage, "worktree_in_use", return_value=False):
             entries, plan = menage._worktree_pass(
-                None, "pc", dry_run=dry_run, include_lotless=False, protected=set(),
+                None, "pc", dry_run=dry_run, protected=set(),
                 now=time.time(), allow=allow,
                 lock_path=os.path.join(self.base, "state", "artifacts.lock"),
                 journal_path=self.journal_path)

@@ -147,6 +147,10 @@ jobs:
     name: carte
     needs: mesure
     if: always()
+    # supprimer les mesures du run (étape finale) ; le reste du workflow reste en lecture
+    permissions:
+      contents: read
+      actions: write
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
@@ -182,3 +186,18 @@ jobs:
         with:
           path: carte/carte.json.gz
           key: carte-${{ github.sha }}
+      # Quota d'artefacts de l'organisation, plein le 15/10 (2,4 Go de mesures
+      # gardées un jour) : les mesures ne servent qu'à ce job, on les supprime
+      # dès la carte faite. Seule la carte (30 jours) reste. Jamais bloquant.
+      - name: supprimer les mesures intermédiaires
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
+        run: |
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" "$API/runs/${{ github.run_id }}/artifacts?per_page=100" |
+            python3 -c 'import json,sys; [print(a["id"]) for a in json.load(sys.stdin).get("artifacts", []) if a["name"].startswith("mesure-")]' |
+            while read -r id; do
+              curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer $GH_TOKEN" "$API/artifacts/$id" && echo "mesure $id supprimée"
+            done

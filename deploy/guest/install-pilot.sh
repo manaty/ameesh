@@ -13,6 +13,8 @@
 #   sudo deploy/guest/install-pilot.sh --enable AGENT…       start guest runners
 #   sudo deploy/guest/install-pilot.sh --set-guard-mode enforce  the guard sets the caps
 #   sudo deploy/guest/install-pilot.sh --uninstall [--purge] rollback (study §4.3)
+#   sudo deploy/guest/install-pilot.sh --offload-only [options]  the guard alone,
+#                        for install.sh --gate file (b1, PILOT-ci-vm.md)
 #
 # Options:
 #   --dry-run            print every command and file, change nothing
@@ -47,6 +49,12 @@
 #   --dsh-from DIR       with --enable: the ~/.dsh whose hooks.json and
 #                        profiles/ the guest gets (default: the sudo user's)
 #   --check              report the state of everything installed
+#   --offload-only       mode b1 only (L159h, CI VM): the guard, its gate
+#                        and the guest's slice, without any guest runner,
+#                        agent or secrets file (no --agent, --path, --enable,
+#                        --disable); the guard admits no agent (max_agents 0)
+#                        and install.sh --gate file then obeys its gate.
+#                        Also with --check, which then expects no secrets
 #   --uninstall          rollback: drain, stop, remove units and files
 #   --purge              with --uninstall: also secrets, guard config,
 #                        venv, user and volume content this script created
@@ -107,6 +115,8 @@ ALLOW_ROOTFS=0
 ACCEPT_LARGER=0
 MODE=install
 PURGE=0
+OFFLOAD_ONLY=0
+MAX_AGENTS_GIVEN=0
 CANON=""
 declare -A REPOS=()
 DSH_FROM=""
@@ -124,7 +134,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --host) HOST=$2; shift 2 ;;
     --agent) AGENTS+=("$2"); shift 2 ;;
-    --max-agents) MAX_AGENTS=$2; shift 2 ;;
+    --max-agents) MAX_AGENTS=$2; MAX_AGENTS_GIVEN=1; shift 2 ;;
     --lend) LEND=$2; shift 2 ;;
     --root) ROOT=$2; shift 2 ;;
     --path) EXTRA_PATH+=("$2"); shift 2 ;;
@@ -139,6 +149,7 @@ while [ $# -gt 0 ]; do
       REPOS[${2%%=*}]=${2#*=}; shift 2 ;;
     --dsh-from) DSH_FROM=$2; shift 2 ;;
     --check) MODE=check; shift ;;
+    --offload-only) OFFLOAD_ONLY=1; shift ;;
     # the agents: every argument up to the next option
     --enable|--disable)
       MODE=${1#--}; shift
@@ -149,7 +160,15 @@ while [ $# -gt 0 ]; do
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
-[ ${#AGENTS[@]} -gt 0 ] || AGENTS=(deepseek6 deepseek1)
+if [ "$OFFLOAD_ONLY" = 1 ]; then
+  # b1 (L159h): offloaded jobs carry no secret; no agent is ever a guest here
+  [ ${#AGENTS[@]} = 0 ] && [ ${#EXTRA_PATH[@]} = 0 ] || die "--offload-only: no --agent nor --path"
+  case "$MODE" in enable|disable) die "--offload-only: no guest runner to --$MODE" ;; esac
+  [ "$MAX_AGENTS_GIVEN" = 0 ] || [ "$MAX_AGENTS" = 0 ] || die "--offload-only: the guard admits no agent (max_agents 0)"
+  MAX_AGENTS=0
+else
+  [ ${#AGENTS[@]} -gt 0 ] || AGENTS=(deepseek6 deepseek1)
+fi
 
 valid_name() { case "$1" in ''|*[!a-z0-9_-]*|-*) return 1 ;; esac; }
 valid_name "$HOST" || die "invalid --host $HOST"
@@ -728,6 +747,11 @@ if [ "$MODE" = check ]; then
   else ko "no user $GUEST"; fi
   for f in ameesh-guest.slice ameesh.slice.d/guest-weight.conf ameesh-guest-runner@.service \
            ameesh-guard.service; do
+    if [ "$OFFLOAD_ONLY" = 1 ] && [ "$f" = ameesh-guest-runner@.service ]; then
+      if [ -e "$(at "$UNITS/$f")" ]; then ko "$UNITS/$f present: a guest runner on a b1 host"
+      else ok "no $UNITS/$f (--offload-only)"; fi
+      continue
+    fi
     [ -f "$(at "$UNITS/$f")" ] && ok "$UNITS/$f" || ko "missing $UNITS/$f"
   done
   [ -x "$(at "$VENV")/bin/ameesh" ] \
@@ -748,6 +772,13 @@ print("%s gate state %s, level %s, seq %s%s" % ("ok  " if fresh else "FAIL", s.g
       s.get("level"), s.get("seq"), "" if fresh else " (stale)"))
 sys.exit(0 if fresh else 1)
 EOF
+  if [ "$OFFLOAD_ONLY" = 1 ]; then
+  # b1 (L159h): no secret at all on this host, no guest runner
+  for f in "$(at "$ETC")/guest.env" "$(at "$ETC")"/guest-*.env; do
+    if [ -e "$f" ]; then ko "${f#"$HOSTDIR"} present: a secrets file on a b1 host"; fi
+  done
+  for u in $(runner_units); do ko "$u present: a guest runner on a b1 host"; done
+  else
   for f in "$(at "$ETC")/guest.env" "$(at "$ETC")"/guest-*.env; do
     [ -e "$f" ] || continue
     perm=$(stat -c '%a %U:%G' "$f")
@@ -811,6 +842,7 @@ EOF
   for u in $(runner_units); do
     echo "     $u: $(systemctl is-enabled "$u" 2>/dev/null || true), $(systemctl is-active "$u" 2>/dev/null || true)"
   done
+  fi
   # #501: inspect live native runners without printing their environment.
   # Separate helper keeps this addition independent of pilot provisioning.
   if [ -z "$HOSTDIR" ]; then
@@ -1155,7 +1187,7 @@ print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
   || die "offer or volume refused"
 
 # PATH of the runners: the directory of the DeepSeek harness (`dsh`)
-if [ ${#EXTRA_PATH[@]} -eq 0 ] && dsh=$(command -v dsh 2>/dev/null); then
+if [ "$OFFLOAD_ONLY" = 0 ] && [ ${#EXTRA_PATH[@]} -eq 0 ] && dsh=$(command -v dsh 2>/dev/null); then
   case "$(dirname "$dsh")" in /usr/bin|/usr/local/bin|/bin) ;; *) EXTRA_PATH=("$(dirname "$dsh")") ;; esac
 fi
 
@@ -1221,9 +1253,11 @@ say "3. units, gate directories, guard"
 run install -m 0644 "$HERE/ameesh-guest.slice" "$UNITS/"
 run install -D -m 0644 "$HERE/ameesh.slice.d/guest-weight.conf" "$UNITS/ameesh.slice.d/guest-weight.conf"
 # the runner's unit, its volume being $ROOT (WorkingDirectory, HOME, TMPDIR,
-# PATH, ReadWritePaths, RequiresMountsFor)
-sed "s#/srv/ameesh-guest#$ROOT#g" "$HERE/ameesh-guest-runner@.service" \
-  | put "$UNITS/ameesh-guest-runner@.service" 0644 root:root
+# PATH, ReadWritePaths, RequiresMountsFor); none in --offload-only
+if [ "$OFFLOAD_ONLY" = 0 ]; then
+  sed "s#/srv/ameesh-guest#$ROOT#g" "$HERE/ameesh-guest-runner@.service" \
+    | put "$UNITS/ameesh-guest-runner@.service" 0644 root:root
+fi
 run install -m 0644 "$HERE/ameesh-guard.service" "$UNITS/"
 run install -m 0644 "$HERE/ameesh-gate.tmpfiles.conf" "$TMPFILES"
 if [ ${#EXTRA_PATH[@]} -gt 0 ]; then
@@ -1237,6 +1271,9 @@ fi
 put "$ETC/guard.json" 0644 root:root <<<"$guard_json"
 set_guard_mode "$GUARD_MODE"
 
+if [ "$OFFLOAD_ONLY" = 1 ]; then
+  say "4. secrets files: none (--offload-only, offloaded jobs carry no secret)"
+else
 say "4. secrets files (created empty, never overwritten)"
 secret() {
   local path=$1
@@ -1255,6 +1292,7 @@ for a in "${AGENTS[@]}"; do
 # GH_TOKEN=…
 EOF
 done
+fi
 
 run systemctl daemon-reload
 run systemd-tmpfiles --create "$TMPFILES"
@@ -1268,6 +1306,16 @@ fi
 run systemctl enable --now ameesh-guard.service
 
 say "done: the guard runs in $GUARD_MODE; no guest runner is started"
+if [ "$OFFLOAD_ONLY" = 1 ]; then
+  cat <<EOF
+Next (mode b1, L159h):
+  1. install.sh --gate file --key … --from … (the offloaded jobs obey this gate);
+  2. $0 --check --offload-only;
+  3. after a day of observation: $0 --offload-only --set-guard-mode enforce
+Rollback: install.sh --uninstall, then $0 --uninstall [--purge]
+EOF
+  exit 0
+fi
 cat <<EOF
 Next:
   1. fill $ETC/guest.env (AMEESH_DSN) and $ETC/guest-<agent>.env;

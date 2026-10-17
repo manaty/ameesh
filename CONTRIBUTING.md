@@ -40,6 +40,13 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
   vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
   jamais annulée par la fusion suivante.
+- **Release : la suite sur une autre classe de système de fichiers** (#748) :
+  la PR de release (branche `release/**` en tête ou en base) rejoue les parts
+  psycopg avec les racines temporaires sur l'autre classe que celle du runner
+  (tmpfs ↔ disque, lue à l'exécution) ; ce job compte alors dans le check
+  « tests ». Un test qui ne tient que sur la classe ordinaire s'y révèle : le
+  corriger à la source (horodatages, renommage entre périphériques, `TMPDIR`),
+  jamais en le relançant.
 - **Concurrence par hôte de la CI** (#899, pilote, 2026-10-13) : l'occupation
   d'un hôte de la flotte `ameesh-ci` est bornée par le nombre de runners de cet
   hôte, fixé par une mesure de capacité (CPU, RAM, disque, PSI ; lot #824), et
@@ -98,6 +105,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   nouveaux fichiers source.
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
+
+Les idées qui ne sont pas décidées vont dans le [sas d’explorations](docs/design/explorations/index.md) :
+un fichier par idée, `type: Exploration`, `status: exploration`, avec problème,
+intuitions et questions ouvertes. Ni lots proposés, ni dates, ni estimations,
+ni critère « fait » ; aucun lot, WorkPackage, backlog ou ligne de roadmap ne
+se déduit d’une exploration. Seule une décision explicite de l’owner,
+consignée dans `docs/design/decisions/`, permet la promotion en étude puis en
+lots. Les fiches de plan et de lot pointent vers l’étude décidée. La garde
+`tests.test_l1124_explorations` vérifie cette séparation dans le dépôt.
 
 ## Numérotation des versions
 

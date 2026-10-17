@@ -109,7 +109,7 @@ def db_builder(cfg, *, since: str, stale_after: float, gantt: bool,
     reader = None
     if versions:
         from . import versions as versions_mod
-        reader = versions_mod.Reader(allow_gh=False)
+        reader = versions_mod.Reader(allow_gh=False, cache_dir=cfg.state_dir)
 
     def build(project):
         db = db_mod.connect(ro)

@@ -91,15 +91,43 @@ def agent_project(row: dict) -> str | None:
             or _text(row.get("chantier")) or None)
 
 
-def lot_project(lot: dict, agent_projects: dict[str, str | None] | None = None,
+def agent_projects(row: dict) -> list[str]:
+    """L243 : les projets d'un agent. `projects` déclaré fait foi, même vide
+    (« la fiche n'en déclare aucun ») ; sinon son équipe, sinon son
+    `workstream` (0388) — le projet primaire reste le premier de la liste."""
+    declared = row.get("projects")
+    if declared is not None:
+        if isinstance(declared, str):      # un lecteur qui rend `{a,b}`
+            declared = [p for p in declared.strip("{}").split(",")]
+        return [p for p in (_text(value) for value in declared) if p]
+    for key in ("team", "workstream", "chantier"):
+        value = _text(row.get(key))
+        if value:
+            return [value]
+    return []
+
+
+def agent_project_label(row: dict) -> str | None:
+    """La colonne projet d'un agent : le projet primaire, puis `+N` quand il
+    en a d'autres (« ameesh+1 », L243, `mesh list`)."""
+    names = agent_projects(row)
+    if not names:
+        return None
+    return names[0] if len(names) == 1 else "%s+%d" % (names[0], len(names) - 1)
+
+
+def lot_project(lot: dict, primary_of: dict[str, str | None] | None = None,
                 package_team: str | None = None) -> str | None:
     """Le projet d'un lot : `app`, `workstream`, équipe de la fiche, projet de l'assigné.
+
+    `primary_of` (jamais `agent_projects` : la fonction du même nom serait
+    masquée par le paramètre) : nom d'agent → projet primaire.
 
     `package_team` (#705) : l'équipe de la fiche WorkPackage lue à part, quand
     l'appelant ne l'a pas recopiée dans `lot`."""
     return (_text(lot.get("app")) or _text(lot.get("workstream"))
             or _text(lot.get("package_team")) or _text(package_team)
-            or (agent_projects or {}).get(lot.get("assignee") or "") or None)
+            or (primary_of or {}).get(lot.get("assignee") or "") or None)
 
 
 def payment(row: dict, paid_harnesses=None) -> str | None:
@@ -180,6 +208,10 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
     return {
         "name": row["name"],
         "project": agent_project(row),
+        # L243 : l'agent apparaît dans le groupe de chaque projet ; `primary`
+        # dit lequel porte sa dépense (jamais comptée deux fois)
+        "projects": agent_projects(row),
+        "primary": True,
         "state": state,
         "reason": reason,
         "since_ts": round(float(since), 3) if since else None,
@@ -224,7 +256,7 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
             "last_sent_ts": round(float(w["last_sent_ts"]), 3)
             if w.get("last_sent_ts") is not None else None}
     by_name = {a["name"]: a for a in agents}
-    agent_projects = {a["name"]: a["project"] for a in agents}
+    primary_of = {a["name"]: a["project"] for a in agents}
 
     groups: dict = {}
 
@@ -234,10 +266,16 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
                             "lots_without_agent": []}
         return groups[name]
 
+    # L243 : un agent multi-projets apparaît dans le groupe de chacun de ses
+    # projets, marqué `(+)` hors de son projet primaire — le seul qui porte sa
+    # dépense, pour ne pas la compter deux fois.
     for agent in agents:
-        group(agent["project"])["agents"].append(agent)
+        names = agent["projects"] or [agent["project"]]
+        for rank, name in enumerate(names):
+            group(name)["agents"].append(
+                agent if rank == 0 else dict(agent, primary=False))
     for lot in lot_rows:
-        g = group(lot_project(lot, agent_projects))
+        g = group(lot_project(lot, primary_of))
         g["lots_open"] += 1
         who = lot.get("assignee") or None
         agent = by_name.get(who) if who else None
@@ -264,7 +302,7 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
         recipient = row.get("recipient")
         agent = by_name.get(recipient)
         sender = row.get("sender") or ""
-        where = agent["project"] if agent is not None else agent_projects.get(sender)
+        where = agent["project"] if agent is not None else primary_of.get(sender)
         group(where)
         entry = dead.setdefault(where, {}).setdefault(recipient, {
             "recipient": recipient,
@@ -308,9 +346,12 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
             "unread": sum(a["unread"] for a in g["agents"]),
             "undeliverable": undeliverable,
             "undeliverable_mail": letters,
-            "usd_24h": round(sum(a["usd_24h"] for a in g["agents"]), 6),
+            # L243 : la dépense n'est portée que par le projet primaire
+            "usd_24h": round(sum(a["usd_24h"] for a in g["agents"]
+                                 if a.get("primary", True)), 6),
             "usd_24h_token": round(sum(a["usd_24h"] for a in g["agents"]
-                                       if a["payment"] == "token"), 6),
+                                       if a.get("primary", True)
+                                       and a["payment"] == "token"), 6),
             "warnings": warnings,
         })
         projects.append(g)
@@ -383,6 +424,12 @@ def _span(seconds) -> str:
 
 def project_label(name: str | None) -> str:
     return name or NO_PROJECT
+
+
+def _display_name(agent: dict) -> str:
+    """« nom (+) » : l'agent est aussi listé dans le groupe d'un autre projet
+    (L243) ; sa dépense n'est comptée que dans son projet primaire."""
+    return agent["name"] + " (+)" if agent.get("primary") is False else agent["name"]
 
 
 def state_label(agent: dict, now: float) -> str:
@@ -474,7 +521,7 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
     hidden = [p for p in view["projects"] if not (p["active"] or show_inactive)]
     if not shown:
         out.append(indent + "no active project")
-    name_w = min(max([len(a["name"]) for p in shown for a in p["agents"]] + [6]), 20)
+    name_w = min(max([len(_display_name(a)) for p in shown for a in p["agents"]] + [6]), 20)
     for p in shown:
         if out:
             out.append("")
@@ -489,7 +536,7 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
             if narrow:
                 # espace insécable avant « $ » : la coupure ne l'isole jamais
                 wrap("%s — %s · %s · %.2f\u00a0$ · %d unread" % (
-                    a["name"], state_label(a, now), pay, a["usd_24h"], a["unread"]),
+                    _display_name(a), state_label(a, now), pay, a["usd_24h"], a["unread"]),
                     indent + "  ")
                 if _doing(a) != "—":
                     cell = _duration_cell(a)
@@ -503,8 +550,8 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
                     wrap(_watch(a, now), indent + "    ")
                 continue
             head = indent + "  %-*s %-19s %-7s %8.2f %4d %-9s " % (
-                name_w, a["name"][:name_w], state_label(a, now)[:19], pay, a["usd_24h"],
-                a["unread"], _duration_cell(a)[:9])
+                name_w, _display_name(a)[:name_w], state_label(a, now)[:19], pay,
+                a["usd_24h"], a["unread"], _duration_cell(a)[:9])
             out.append(head + _short(_doing(a, now), max(12, width - len(head))))
             if a.get("last_update"):
                 pad = indent + "  " + " " * (name_w + 1)
@@ -535,7 +582,9 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
 
 def format_text(view: dict, width: int | None = None, *, show_inactive: bool = False) -> str:
     projects = [p for p in view["projects"] if p["active"]]
-    agents = sum(len(p["agents"]) for p in view["projects"])
+    # L243 : un agent multi-projets est listé dans plusieurs groupes mais
+    # compté une fois dans le total
+    agents = len({a["name"] for p in view["projects"] for a in p["agents"]})
     lots = sum(p["lots_open"] for p in view["projects"])
     title = "projects — %s (%d active, %d agent(s), %d open lot(s))" % (
         time.strftime("%H:%M", time.localtime(view["generated_ts"])), len(projects),

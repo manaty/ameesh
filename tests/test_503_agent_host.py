@@ -113,8 +113,10 @@ import json, os, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
+# #1133 : the value given to -p must already be absolute — systemd-run does
+# not expand %h in a transient unit's properties (it answers "not absolute").
 assert args[:7] == ['--user', '--pipe', '--wait', '--quiet', '-p',
-                    'EnvironmentFile=%h/.config/ameesh/env', '--'], args
+                    'EnvironmentFile=' + str(state / 'runner.env'), '--'], args
 with (state / 'systemd-run.log').open('a') as f: f.write(' '.join(args) + '\n')
 # The manager supplies these values; this stub deliberately does not source
 # or reimplement EnvironmentFile. A separate test exercises the real parser.
@@ -191,8 +193,11 @@ class AgentHostTest(unittest.TestCase):
             AMEESH_DSN=expected, AMEESH_SCHEMA='test_runner_schema')))
         p = self.run_vm('controler')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('EnvironmentFile=%h/.config/ameesh/env',
-                      (self.state / 'systemd-run.log').read_text())
+        log = (self.state / 'systemd-run.log').read_text()
+        # #1133 : an absolute path, expanded before systemd-run sees it (the
+        # `%h` specifier is not expanded there and would fail the unit).
+        self.assertIn('EnvironmentFile=' + str(self.state / 'runner.env'), log)
+        self.assertNotIn('%h', log)
 
     def test_restart_uses_remote_registry_and_user_units(self):
         p = self.run_vm()

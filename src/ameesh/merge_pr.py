@@ -342,7 +342,7 @@ def pr_view(slug: str, pr: int, gh=land._gh) -> dict:
     """La PR lue par `gh` : état, base, tête, mergeabilité, checks."""
     proc = gh(["pr", "view", str(pr), "--repo", slug, "--json",
                "number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,"
-               "mergeCommit,statusCheckRollup,url,title"], timeout=60.0)
+               "mergeCommit,statusCheckRollup,url,title,autoMergeRequest"], timeout=60.0)
     if proc.returncode != 0:
         raise MergePrError("gh pr view #%s: %s"
                            % (pr, (proc.stderr or proc.stdout or "").strip()[:300]))
@@ -537,6 +537,16 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                             owner=owner)
         if project is None:
             project = _project_of(cfg, repo)
+        # #1656: the direct merge replays the whole proof here; an armed
+        # auto-merge would merge the head without it — GitHub checks its
+        # --match-head-commit only when it is armed, never after a head
+        # rewrite. Disarm before any guard: ameesh is the only merge actor.
+        if view.get("autoMergeRequest"):
+            error = land.pr_disable_auto(slug, pr, gh=gh)
+            if error is not None:
+                raise MergePrError(
+                    "PR #%d: auto-merge armed and not disarmed (%s): nothing written; disarm "
+                    "it (gh pr merge --disable-auto %d) and retry" % (pr, error, pr))
         _pr_guards(view, pr, head, target)
         ready = _admission(db, cfg, lot, repo, project, owner, view)
         if not _same(ready.get("frozen_sha"), head):

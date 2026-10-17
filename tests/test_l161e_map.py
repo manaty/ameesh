@@ -282,6 +282,247 @@ class FusionTest(unittest.TestCase):
         self.assertEqual(parts.map_durations(self.dossier / "absente.json.gz"), {})
 
 
+def _coverage_disponible() -> bool:
+    try:
+        import coverage  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class CouvertureTronqueeTest(unittest.TestCase):
+    """#1257 : une couverture tronquée (processus tué pendant l'écriture de sa
+    donnée) ne fait plus échouer la fusion de la carte ; elle est ignorée et
+    nommée, et les autres parts restent mesurées."""
+
+    def _part(self, nom: str = "mesure-psycopg-1") -> pathlib.Path:
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        (dossier / nom / "cov").mkdir(parents=True)
+        return dossier / nom
+
+    def _sqlite_tronque(self) -> bytes:
+        """Un fichier sqlite valide de plusieurs pages, tronqué de la dernière :
+        l'en-tête annonce N pages, N−1 sont écrites (trace de l'incident #1257 :
+        processus tué pendant l'écriture, `database disk image is malformed`)."""
+        import sqlite3
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        chemin = dossier / "base.sqlite"
+        con = sqlite3.connect(chemin)
+        with con:
+            con.execute("create table t (x integer)")
+            con.executemany("insert into t values (?)", [(i,) for i in range(2000)])
+        con.close()
+        octets = chemin.read_bytes()
+        self.assertGreater(len(octets), 4096)
+        return octets[:-4096]
+
+    #: la lecture d'un fichier de couverture passe par le paquet `coverage`
+    #: (scripts/map.py, `_coverage`) : sans lui, ces cas sont sautés plutôt que
+    #: rouges — le pilote psql de la suite complète ne l'installe pas.
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_tronquee_ignoree_et_nommee(self):
+        part = self._part()
+        (part / "cov" / ".coverage.tronquee").write_bytes(self._sqlite_tronque())
+        carte_ = carte.merge([str(part)], "abc")  # avant #1257 : DataError, fusion morte
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertEqual(ignorees[0]["part"], "mesure-psycopg-1")
+        self.assertEqual(ignorees[0]["fichier"], ".coverage.tronquee")
+        self.assertIn("tronqué", ignorees[0]["raison"])
+        self.assertEqual(carte_["mesure"]["processus"], 0)
+        resume = carte.summary(carte_)
+        self.assertIn("illisible", resume)
+        self.assertIn(".coverage.tronquee", resume)
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_entete_absent(self):
+        part = self._part()
+        (part / "cov" / ".coverage.pas-sqlite").write_bytes(b"pas du sqlite")
+        carte_ = carte.merge([str(part)], "abc")
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertEqual(ignorees[0]["part"], "mesure-psycopg-1")
+        self.assertEqual(ignorees[0]["fichier"], ".coverage.pas-sqlite")
+        # le diagnostic d'en-tête nomme la panne, le message de coverage suit
+        self.assertIn("en-tête sqlite absent", ignorees[0]["raison"])
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_couverture_vide_ignoree_et_nommee(self):
+        """R1 B3 #1257 : un fichier de 0 octet (processus tué avant d'écrire sa
+        mesure) se lit sans erreur et ne porte aucune mesure ; il est une perte
+        conservatrice nommée, pas un processus mesuré à zéro. Le témoin sain de
+        la même part reste mesuré."""
+        from coverage import CoverageData
+        part = self._part()
+        vide = part / "cov" / ".coverage.vide"
+        vide.write_bytes(b"")
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l1.T.test_a")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.write()
+        carte_ = carte.merge([str(part)], "abc")
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertEqual(ignorees[0]["part"], "mesure-psycopg-1")
+        self.assertEqual(ignorees[0]["fichier"], ".coverage.vide")
+        self.assertIn("vide (0 octet)", ignorees[0]["raison"])
+        self.assertEqual(carte_["mesure"]["processus"], 1)  # seule la valide
+        modules = {m for blocs in carte_["blocs"].values()
+                   for info in blocs.values() for m in info["modules"]}
+        self.assertIn("test_l1", modules)
+        self.assertIn(".coverage.vide", carte.summary(carte_))
+        # témoin du témoin : sans le fichier vide, la part reste mesurée
+        # normalement (aucune perte, un processus) — le contrôle sain.
+        vide.unlink()
+        saine = carte.merge([str(part)], "abc")
+        self.assertEqual(saine["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(saine["mesure"]["processus"], 1)
+
+    def test_aucune_couverture_ignoree_sans_corruption(self):
+        carte_ = carte.merge([str(self._part())], "abc")
+        self.assertEqual(carte_["mesure"]["couverture_ignoree"], [])
+        self.assertNotIn("illisible", carte.summary(carte_))
+
+    def _base_page_64k(self) -> pathlib.Path:
+        """Une base sqlite saine en pages de 64 Kio : le champ d'en-tête
+        « page_size » vaut 1 pour 65536 octets (format sqlite)."""
+        import sqlite3
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        chemin = dossier / "base-64k.sqlite"
+        con = sqlite3.connect(chemin)
+        with con:
+            con.execute("create table t (x integer)")
+            con.executemany("insert into t values (?)", [(i,) for i in range(2000)])
+        con.execute("pragma page_size=65536")
+        con.execute("vacuum")
+        self.assertEqual(con.execute("pragma integrity_check").fetchone()[0], "ok")
+        self.assertEqual(con.execute("pragma page_size").fetchone()[0], 65536)
+        con.close()
+        self.assertEqual(int.from_bytes(chemin.read_bytes()[16:18], "big"), 1)
+        return chemin
+
+    def test_base_saine_page_64k_non_rejetee(self):
+        """R1 #1257 : une base légitime en 64 Kio n'est pas un fichier tronqué
+        (l'ancienne lecture du champ 1 la rejetait comme 1 page)."""
+        self.assertIsNone(carte._entete_sqlite(str(self._base_page_64k())))
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_sqlite_sans_schema_coverage(self):
+        """Second fichier illisible de l'artefact du run 38485229713 : tables de
+        coverage présentes, schéma vide (aucune version) — le repli DataError
+        l'écarte au lieu de faire échouer la carte."""
+        import sqlite3
+
+        from coverage import CoverageData
+        part = self._part()
+        chemin = part / "cov" / ".coverage.sans-schema"
+        donnees = CoverageData(basename=str(chemin))
+        donnees.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        donnees.write()
+        con = sqlite3.connect(chemin)
+        with con:
+            con.execute("delete from coverage_schema")
+            con.execute("delete from meta")
+        con.close()
+        carte_ = carte.merge([str(part)], "abc")
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertIn("DataError", ignorees[0]["raison"])
+        self.assertEqual(carte_["mesure"]["processus"], 0)
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_valide_lue_tronquee_ignoree(self):
+        from coverage import CoverageData
+        part = self._part()
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l1.T.test_a")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.write()
+        (part / "cov" / ".coverage.tronquee").write_bytes(self._sqlite_tronque())
+        carte_ = carte.merge([str(part)], "abc")
+        self.assertEqual(carte_["mesure"]["processus"], 1)
+        self.assertEqual(len(carte_["mesure"]["couverture_ignoree"]), 1)
+        modules = {m for blocs in carte_["blocs"].values()
+                   for info in blocs.values() for m in info["modules"]}
+        self.assertIn("test_l1", modules)  # la part valide reste mesurée
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_couverture_valide_page_64k_mesuree(self):
+        """R1 #1257 : une couverture légitime en pages de 64 Kio (champ
+        d'en-tête = 1, format sqlite) reste mesurée au lieu d'être écartée."""
+        import sqlite3
+        from coverage import CoverageData
+        chemin = self._base_page_64k()
+        donnees = CoverageData(basename=str(chemin))
+        donnees.set_context("tests.test_l161e.T.test_64k")
+        donnees.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {4}})
+        donnees.write()
+        con = sqlite3.connect(chemin)
+        con.execute("pragma page_size=65536")
+        con.execute("vacuum")
+        con.close()
+        self.assertEqual(int.from_bytes(chemin.read_bytes()[16:18], "big"), 1)
+        part = self._part()
+        shutil.copy(chemin, part / "cov" / ".coverage.64k")
+        carte_ = carte.merge([str(part)], "abc")
+        self.assertEqual(carte_["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(carte_["mesure"]["processus"], 1)
+        modules = {m for blocs in carte_["blocs"].values()
+                   for info in blocs.values() for m in info["modules"]}
+        self.assertIn("test_l161e", modules)
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_panne_apres_lecture_ecarte_sans_partiel(self):
+        """R1 #1257 : une panne après `read()` (ici contexts_by_lineno) écarte
+        le fichier et nomme la panne ; rien de sa contribution partielle n'est
+        versé dans la carte, les autres fichiers restent mesurés."""
+        from coverage import CoverageData
+        from coverage.exceptions import DataError
+
+        part = self._part()
+        casse = CoverageData(basename=str(part / "cov" / ".coverage.casse"))
+        casse.set_context("tests.test_l1.T.test_casse")
+        casse.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1, 2}})
+        casse.write()
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l2.T.test_valide")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {3}})
+        valide.write()
+
+        original = CoverageData.contexts_by_lineno
+
+        def partielle(self, mesure):
+            donnees = original(self, mesure)
+            if ".coverage.casse" not in str(getattr(self, "_basename", "")):
+                return donnees
+
+            class PremiereSeule(dict):
+                def items(self):
+                    for index, element in enumerate(dict.items(self)):
+                        if index:
+                            raise DataError("panne simulée en cours d'exploitation")
+                        yield element
+
+            return PremiereSeule(donnees)
+
+        CoverageData.contexts_by_lineno = partielle
+        self.addCleanup(setattr, CoverageData, "contexts_by_lineno", original)
+
+        carte_ = carte.merge([str(part)], "abc")
+        self.assertEqual(carte_["mesure"]["processus"], 1)  # seule la part valide
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertEqual(ignorees[0]["fichier"], ".coverage.casse")
+        self.assertIn("DataError", ignorees[0]["raison"])
+        modules = {m for blocs in carte_["blocs"].values()
+                   for info in blocs.values() for m in info["modules"]}
+        self.assertIn("test_l2", modules)
+        self.assertNotIn("test_l1", modules)  # aucune ligne partielle versée
+
+
 def _mesure_possible() -> bool:
     try:
         import coverage  # noqa: F401

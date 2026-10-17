@@ -382,7 +382,7 @@ def other_family_available(agent: dict, others) -> bool:
 
 def fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
          others=None) -> bool:
-    """L'élément correspond-il à l'équipe et aux capacités de l'agent ?
+    """L'élément correspond-il aux projets et aux capacités de l'agent ?
 
     `others` : les lignes du registre, pour la garde structurelle de classe
     (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
@@ -390,8 +390,10 @@ def fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
     team = (item.get("team") or "").strip()
-    if team and team != (agent.get("team") or "").strip():
-        return False
+    if team:
+        from . import projects as projects_mod
+        if team not in projects_mod.agent_projects(agent):   # L243: membre, pas égal
+            return False
     required = set(item.get("required_capabilities") or ())
     if not required <= set(agent.get("capabilities") or ()):
         return False
@@ -505,7 +507,7 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
 
 def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
              others=None) -> bool:
-    """Le lot est-il de l'équipe de l'agent, et l'agent sait-il le faire ?
+    """Le lot vise-t-il un des projets de l'agent, et l'agent sait-il le faire ?
     Une capacité exigée `harness:<nom>` désigne le harnais de l'agent.
 
     `others` : les lignes du registre, pour la garde structurelle de classe
@@ -513,8 +515,9 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
     """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
-    team = (agent.get("team") or "").strip()
-    if not team or (item.get("lot_team") or "").strip() != team:
+    team = (item.get("lot_team") or "").strip()
+    from . import projects as projects_mod
+    if not team or team not in projects_mod.agent_projects(agent):   # L243: membre
         return False
     have = set(agent.get("capabilities") or ())
     if agent.get("harness"):
@@ -524,15 +527,23 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
     return not declared_class(item) or other_family_available(agent, others)
 
 
+def _primary_project(agent: dict) -> str:
+    """Le premier projet de l'agent ; '' s'il n'en déclare aucun (L243)."""
+    from . import projects as projects_mod
+    names = projects_mod.agent_projects(agent)
+    return names[0] if names else ""
+
+
 def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
-    """Les orchestrateurs du registre à prévenir d'une prise : ceux de
-    l'équipe, sinon tous."""
+    """Les orchestrateurs du registre à prévenir d'une prise : ceux d'un des
+    projets du lot, sinon tous."""
+    from . import projects as projects_mod
     from . import sous_utilisation
     if orchestras is None:
         orchestras = sous_utilisation.orchestrators(cfg, db, listing)
-    teams = {row["name"]: (row.get("team") or "").strip() for row in listing}
+    teams = {row["name"]: set(projects_mod.agent_projects(row)) for row in listing}
     known = [name for name in orchestras if name in teams]
-    return sorted([name for name in known if teams[name] == team] or known)
+    return sorted([name for name in known if team in teams[name]] or known)
 
 
 def _still_free(st, item_id) -> bool:
@@ -682,9 +693,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
+            # L243 : tant que le dossier de travail par lot n'existe pas
+            # (#811), la prise automatique reste sur le projet primaire — un
+            # lot d'un autre projet ne s'attribue qu'explicitement.
+            primary = _primary_project(agent)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"]), others=listing):
+                    continue
+                if (item.get("lot_team") or "").strip() != primary:
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -760,9 +777,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not auditor_mod.may_take(agent, canons):
             continue
         auditors = auditor_mod.cards([agent], canons)
+        primary = _primary_project(agent)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
                         card=auditors.get(row["name"]), others=listing):
+                continue
+            # L243 : même règle que les lots — un élément d'un autre projet
+            # attend une attribution explicite (#811).
+            team = (item.get("team") or "").strip()
+            if team and team != primary:
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,

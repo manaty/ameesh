@@ -807,11 +807,14 @@ class CostBook:
 
         With `account` (L30), use the marker preceding each turn, including
         markers outside the read tail. Only a stream with no account marker
-        belongs to `primary`. Leading readings before any established marker
-        in a marked stream stay unknown, never primary.
+        belongs to `primary` — the harness's default account (`accounts.
+        primary_of`), and only when one is declared: `primary=None` means no
+        account claims them (L1078), never "the account itself". Leading
+        readings before any established marker in a marked stream stay
+        unknown, never primary.
         """
         if account is not None:
-            return self._claude_gauges_of(account, primary or account)
+            return self._claude_gauges_of(account, primary)
         newest = None
         for agent in self.agents():
             if not self._claude_candidate(agent):
@@ -833,11 +836,13 @@ class CostBook:
                 break
         return newest[1] if newest else []
 
-    def _claude_gauges_of(self, account: str, primary: str) -> list:
+    def _claude_gauges_of(self, account: str, primary: str | None) -> list:
         """Read the newest gauges for one Claude account (L30).
 
         Compare turn-marker timestamps across agents. Only a stream without
-        any marker uses the primary account and file modification time.
+        any marker uses the `primary` account (the harness's default one,
+        L1078) and file modification time; with `primary` None, no account
+        claims them.
         """
         best = None
         for agent in self.agents():
@@ -866,12 +871,15 @@ class CostBook:
                 self._claude_gauge_cache.pop(path, None)
                 continue
             found = readings.get(account)
-            if found is None and account == primary:
+            if found is None and primary is not None and account == primary:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
-        # A caller must not mutate the cached list seen by another CostBook.
-        return list(best[1]) if best else []
+        # A caller must not mutate the cached list seen by another CostBook;
+        # the copy keeps the reading's overage flags (L226b, #1649).
+        # No reading: an empty Gauges (overage None), the same type as a
+        # reading, so a direct `.overage` read never meets a bare list (N1 impl-04).
+        return Gauges(best[1], best[2]) if best else Gauges()
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
@@ -2137,7 +2145,11 @@ def _racy(stat, now_ns: int) -> bool:
 
 
 def _claude_account_readings(events: list, mtime: float) -> dict:
-    """Attribute all accounts in one pass; None is a verified legacy stream."""
+    """Attribute all accounts in one pass; None is a verified legacy stream.
+
+    Each reading is (stamp, gauges, overage): the overage flags stay beside
+    the gauges, so the shared cache keeps them too (L226b, #1649).
+    """
     marked = any(_is_claude_marker(e) for e in events)
     current, stamp = None, 0.0 if marked else mtime
     readings = {}
@@ -2151,7 +2163,7 @@ def _claude_account_readings(events: list, mtime: float) -> dict:
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
             gauges = _claude_windows(event, stamp)
             if gauges is not None:
-                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
+                readings[current] = (stamp, gauges, _claude_overage(event))
     return readings
 
 

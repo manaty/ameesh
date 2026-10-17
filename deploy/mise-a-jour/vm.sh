@@ -162,11 +162,15 @@ utilisateur_agents() {
 }
 commande_agents() {
   # Use the runner's systemd EnvironmentFile parser, including literal $/#.
+  # `systemd-run -p` does not expand the `%h` specifier (a transient unit's
+  # properties are not specifier-expanded): it would refuse
+  # `EnvironmentFile=%h/...` as "not absolute" (#1133). Expand $HOME in the
+  # shell, where it is the ameesh home set by `utilisateur_agents`.
   utilisateur_agents bash -c 'set -euo pipefail
     test -r "$HOME/.config/ameesh/env" \
       || { echo "runner environment file unreadable: $HOME/.config/ameesh/env" >&2; exit 1; }
     exec systemd-run --user --pipe --wait --quiet \
-      -p EnvironmentFile=%h/.config/ameesh/env -- "$@"' -- "$@"
+      -p EnvironmentFile="$HOME/.config/ameesh/env" -- "$@"' -- "$@"
 }
 ameesh_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"; }
 python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/python "$@"; }
@@ -797,6 +801,12 @@ redemarrer() {
     suivantes=()
     for p in "${restantes[@]}"; do
       st=$(statut "$p")
+      # #1131 : persona arrêtée par le propriétaire — son unité active n'est
+      # pas réactivée (le mode agents filtre déjà `stopped`).
+      if [ "$st" = stopped ]; then
+        echo "$p : arrêté dans le registre — unité ameesh-runner@$p ignorée, pas de redémarrage"
+        continue
+      fi
       if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
       # #502: only a runner that held its lease must take it again (bail.sh)
       ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \

@@ -1193,6 +1193,13 @@ class PsycopgDriver:
                 conn.execute("LISTEN %s" % quote_ident(channel))
         except AttributeError as exc:  # psycopg trop ancien
             raise Unavailable("psycopg without LISTEN support: %s" % exc) from exc
+        except DbError:
+            raise
+        except Exception as exc:
+            # R2 auditeur P2-3 : une base qui refuse LISTEN (veille chaude,
+            # coupure entre connexion et LISTEN) doit rendre l'écouteur
+            # indisponible, pas tuer le fil du hub.
+            raise _map_error(exc) from exc
         return _PsycopgListener(conn, list(channels))
 
     def close(self) -> None:

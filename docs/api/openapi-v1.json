@@ -248,6 +248,54 @@
         ],
         "type": "object"
       },
+      "ameesh-event-1": {
+        "properties": {
+          "data": {
+            "type": "object"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "object": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ts": {
+            "type": "number"
+          },
+          "type": {
+            "enum": [
+              "lot.updated",
+              "turn.started",
+              "turn.ended",
+              "agent.updated",
+              "cost.recorded",
+              "thread.entry",
+              "decision.created",
+              "decision.closed",
+              "action.updated",
+              "receipt.attached",
+              "approval.recorded",
+              "alert.raised",
+              "alert.resolved"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "object",
+          "project",
+          "ts",
+          "data"
+        ],
+        "type": "object"
+      },
       "ameesh-host-1": {
         "properties": {
           "history": {
@@ -565,7 +613,7 @@
     }
   },
   "info": {
-    "description": "API of an ameesh mesh, local mode: reads (L84), each the serialisation of the matching `--json` output of the CLI (`schema` names it), and the human actions (L87), POST with a required `Idempotency-Key`. No route approves, produces or attaches a receipt.",
+    "description": "API of an ameesh mesh, local mode: reads (L84), each the serialisation of the matching `--json` output of the CLI (`schema` names it); `/events` streams the event log (L85); and the human actions (L87), POST with a required `Idempotency-Key`. No route approves, produces or attaches a receipt.",
     "license": {
       "identifier": "AGPL-3.0-only",
       "name": "AGPL-3.0-only"
@@ -1618,6 +1666,69 @@
           }
         },
         "summary": "Decisions waiting for the human (`ameesh decisions --for --json`)"
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "events",
+        "parameters": [
+          {
+            "description": "resume strictly after this position (the last `id:` received, \"tx-id-cluster\"); without it, the new events only",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "pattern": "^[0-9]{1,20}-[0-9]{1,19}-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "x-ameesh-data": {
+                  "$ref": "#/components/schemas/ameesh-event-1"
+                }
+              }
+            },
+            "description": "text/event-stream: `id: <tx-id-cluster>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended), `event: delayed` (events wait for an open transaction); a comment every 20 s"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable, or too many streams (Retry-After)"
+          }
+        },
+        "summary": "Event stream (Server-Sent Events): lots, turns, costs, threads, decisions, alerts"
       }
     },
     "/api/v1/hosts": {

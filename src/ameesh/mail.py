@@ -432,6 +432,21 @@ def is_human(row: Any) -> bool:
     return bool(_payload(row).get("human"))
 
 
+#: L514: payload keys of a message the sender marked as a review verdict
+#: (`agent-mail send --verdict`) or an arbitration (`--arbitration`)
+MID_TURN_KEYS = ("verdict", "arbitration")
+
+
+def mid_turn(row: Any) -> bool:
+    """L514: delivered DURING a dsh or codex turn, at its next safe point
+    (PostToolUse hook): a verdict, an arbitration, a human's message (a
+    decision answer included) or an urgent one. Anything else waits for the
+    end of the turn (L125)."""
+    payload = _payload(row)
+    return bool(payload.get("urgent") or payload.get("human")
+                or any(payload.get(key) for key in MID_TURN_KEYS))
+
+
 def passive_label(row: Any) -> str:
     """Le genre d'un message passif, pour son en-tête ; '' sinon."""
     reason = passive_reason(row)
