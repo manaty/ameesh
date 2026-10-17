@@ -44,17 +44,25 @@ sortie. La levée est **conditionnelle** : le motif exact de la pause posée
 (unique, avec son jeton) est son identité, et `ameesh resume --operator
 --expect-reason` ne lève que cette pause-là — la comparaison et la levée se
 font dans la même instruction SQL (migration 0458), donc une pause étrangère
-posée entre la lecture et la reprise n'est jamais levée. Si la réponse de la
+posée entre la lecture et la reprise n'est jamais levée. La levée
+conditionnelle reste possible si l'agent est passé `externe` pendant
+l'attente (migration 0459) : un changement de mode ne rend pas la pause du
+drain orpheline. Si la réponse de la
 pause se perd (SSH coupé, JSON illisible), le script réconcilie par l'état
 réel : motif identique, le drain continue ; sinon il ne redémarre ni ne lève
-rien et s'arrête en le disant. Pose et levée sont des gestes d'opérateur : le
+rien et le dit. Pose et levée sont des gestes d'opérateur : le
 CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh` doit
-être lancé hors session d'agent ; sinon la pause est refusée et le
-redémarrage de cet agent s'arrête sans interrompre aucun tour. Un CLI de
+être lancé hors session d'agent ; sinon la pause est refusée pour cet agent,
+qui est attendu sans drain, et les autres agents du balayage continuent
+(#2184/N2). Un CLI de
 cible antérieur à #2152 (sans `--expect-reason`) n'est jamais utilisé pour
 drainer : le script attend comme avant plutôt que de laisser une pause
-orpheline. Il relit le placement avant chaque redémarrage :
-un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
+orpheline. Les appels de drain sont bornés (`DRAIN_APPEL_DELAI`, 60 s) et
+couverts par un keepalive SSH ; la levée est retentée une fois à la sortie,
+et une pause qui n'a pas pu être levée est nommée pour une reprise manuelle.
+Il relit le placement et le mode avant chaque redémarrage :
+un agent déplacé ou passé en observation est ignoré ; son drain éventuel est
+levé. Un agent arrêté n’est
 pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
 est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
 reprise de l’owner avec la version d’avant le déploiement. Le compte

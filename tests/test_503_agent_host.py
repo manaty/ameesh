@@ -19,6 +19,8 @@ SCRIPT = ROOT / 'deploy/mise-a-jour/vm.sh'
 SSH = r'''#!/usr/bin/env python3
 import os, subprocess, sys
 from pathlib import Path
+if os.environ.get('FAKE_STALL_SSH'):
+    __import__('signal').pause()  # live transport, remote command never finishes
 state = Path(os.environ['FAKE_STATE'])
 argv = sys.argv[1:]
 command = argv[-1]
@@ -93,6 +95,13 @@ elif sys.argv[1] == 'show':
     if scenario == 'default-owner': row['lease_owner'] = 'host-agents:123'
     if scenario == 'db-ahead': row['lease_expires_ts'] = time.time()+30
     if scenario == 'moved-before': row['host'] = 'elsewhere'
+    # #2184/N1 : le mode peut changer entre la liste et la relecture ; dev9
+    # était execute au listage et passe externe au show.
+    if scenario == 'mode-change' and name == 'dev9': row['mode'] = 'externe'
+    # #2184/N1 + 0459 : le mode change alors qu'un drain est déjà posé ; la
+    # relecture doit encore pouvoir constater et lever notre pause.
+    if scenario == 'mode-change-apres-drain' and name == 'dev9' and pause.exists():
+        row['mode'] = 'externe'
     if scenario == 'always-busy': row['status'] = 'running'
     # #2152 : un agent qui enchaîne les tours ne rend la main qu'une fois
     # drainé ; « chaines-toujours » ne la rend jamais.
@@ -101,7 +110,8 @@ elif sys.argv[1] == 'show':
                                        'drain-remplace', 'pause-reponse-perdue',
                                        'pause-coupee', 'pause-coupee-etat-perdu',
                                        'pause-perdue-sans-pose',
-                                       'drain-refuse-identite') \
+                                       'drain-refuse-identite',
+                                       'mode-change-apres-drain') \
             and not pause.exists():
         row['status'] = 'running'
     if name == 'dev9' and scenario in ('chaines-toujours', 'chaines-relance'):
@@ -289,6 +299,21 @@ class AgentHostTest(unittest.TestCase):
         path = self.state / 'operateur.log'
         return path.read_text() if path.exists() else ''
 
+    def test_a_live_ssh_client_is_bounded_by_the_drain_deadline(self):
+        self.env.update(DRAIN_APPEL_DELAI='1', FAKE_STALL_SSH='1')
+        proc = subprocess.Popen(['bash', str(SCRIPT), 'agents', 'redemarrer'],
+                                env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            _, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.communicate()
+            self.fail('drain call outlived its deadline with a live SSH client')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('appel de drain expiré', stderr)
+        self.assertEqual(self.units(), '')
+
     def test_missing_runner_env_fails_before_any_execution(self):
         (self.state / 'runner.env').unlink()
         p = self.run_vm()
@@ -405,8 +430,12 @@ class AgentHostTest(unittest.TestCase):
 
     def test_lost_pause_answer_without_our_pause_stops_safely(self):
         """R1 B2 : réponse illisible et aucune pause à nous ; rien n'est levé
-        ni redémarré, et le script s'arrête en le disant."""
+        ni redémarré. #2184/N2 : le balayage des autres agents continue, puis
+        le script s'arrête à l'échéance en le disant."""
         self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='pause-perdue-sans-pose')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("n'est pas celle de ce drain", p.stderr)
@@ -414,8 +443,12 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
 
     def test_lost_pause_and_reconciliation_still_attempt_conditional_cleanup(self):
-        """A committed pause stays tracked when its reconciliation read fails."""
+        """A committed pause stays tracked when its reconciliation read fails.
+        #2184/N2 : l'échec ne stoppe pas le balayage ; la sortie retente."""
         self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='pause-coupee-etat-perdu')
         self.assertNotEqual(p.returncode, 0)
         self.assertTrue((self.state / 'lecture-perdue').exists())
@@ -427,8 +460,12 @@ class AgentHostTest(unittest.TestCase):
     def test_operator_gesture_refused_in_an_agent_session_stops_safely(self):
         """Périmètre annoncé : le drain est un geste d'opérateur. Un refus
         bad_actor (vm.sh lancé dans une session liée à un agent) n'interrompt
-        aucun tour et ne laisse aucune pause."""
+        aucun tour et ne laisse aucune pause. #2184/N2 : les autres agents du
+        balayage sont quand même traités ; l'échéance borne l'attente."""
         self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='drain-refuse-identite')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('bad_actor', p.stderr)
@@ -437,11 +474,19 @@ class AgentHostTest(unittest.TestCase):
         self.assertFalse((self.state / 'pause-dev9').exists())
         self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
 
-    def test_drain_refused_stops_without_restarting_the_agent(self):
+    def test_drain_refused_does_not_stop_the_other_agents(self):
+        """#2184/N2 : un refus de pose ne condamne que cet agent. Les autres
+        agents du balayage sont redémarrés ; l'agent non drainé n'est ni
+        redémarré ni repris, et l'échéance fait échouer la commande."""
         self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='chaines-pause-error')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('pose du drain refusée', p.stderr)
+        self.assertIn('toujours en tour', p.stderr)
+        self.assertIn('restart ameesh-runner-agent@dev8.service', self.units())
         self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
         self.assertNotIn('resume dev9', self.operateur())
         self.assertFalse((self.state / 'pause-dev9').exists())
@@ -595,10 +640,35 @@ class AgentHostTest(unittest.TestCase):
                 self.assertNotIn('redémarré', p.stdout)
 
     def test_moved_agent_is_skipped_before_restart(self):
+        """#2184/N1 : le motif du skip nomme l'hôte réel, pas seulement
+        « placement modifié »."""
         p = self.run_vm(scenario='moved-before')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.units(), '')
-        self.assertIn('placement modifié', p.stdout)
+        self.assertIn('dev9 : hôte=elsewhere, ignoré', p.stdout)
+
+    def test_non_execute_agent_is_skipped_before_restart(self):
+        """#2184/N1 : un agent passé en mode non-execute pendant l'attente
+        n'est ni drainé ni redémarré ; le motif du skip le nomme."""
+        p = self.run_vm(scenario='mode-change')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('dev9 : mode=externe, ignoré', p.stdout)
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertEqual(self.operateur(), '')
+
+    def test_mode_change_after_a_drain_still_lifts_the_pause(self):
+        """#2184/N1 + 0459 : l'agent passe externe après la pose du drain ;
+        la pause de ce drain est levée et l'agent n'est pas redémarré."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'horloge').write_text('0')
+        self.env['AMEESH_TEST_HORLOGE'] = str(self.state / 'horloge')
+        p = self.run_vm(scenario='mode-change-apres-drain')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('dev9 : mode=externe, ignoré', p.stdout)
+        self.assertIn('dev9 : drain levé', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertIn('resume dev9 --operator', self.operateur())
 
     def test_host_change_after_restart_is_not_a_valid_proof(self):
         p = self.run_vm(scenario='moved')
