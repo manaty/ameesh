@@ -6,6 +6,13 @@
 #
 # Deux passes : pilote `psql` (toujours disponible) puis pilote `psycopg` si un
 # venv local peut l'installer — les deux chemins de db.py sont ainsi couverts.
+#
+# Le banc partagé reçoit une base jetable par exécution (#1992) ; un
+# AMEESH_TEST_DSN explicite (CI, job déporté) est respecté tel quel.
+# #2170 : quand le profil de connexion ne couvre que `agent_mesh`, l'entrée
+# du banc est transmise aux bases jetables par un PGPASSFILE privé (couple
+# hôte/port et utilisateur du profil, base `*`), sans modifier ~/.pgpass ni
+# accorder de droit ; PGPASSWORD reste prioritaire.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,16 +20,66 @@ cd "$(dirname "$0")/.."
 [ "${AMEESH_PG_UP:-1}" = 0 ] || ./scripts/pg-up.sh
 
 #: DSN sans mot de passe : le secret vient de PGPASSWORD ou de ~/.pgpass.
-export AMEESH_TEST_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.0.0.1:55432/agent_mesh}}
-export AMEESH_REQUIRE_DB=1
+ADMIN_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.0.0.1:55432/agent_mesh}}
+# #1992 : le banc local est partagé par tous les agents de l'hôte ; deux
+# exécutions concurrentes sur la même base échangent leurs NOTIFY (faux rouges
+# du banc : le LISTEN d'un test recevait le payload d'un autre module, constat
+# impl-08 du 16/10). Une exécution qui gère elle-même le banc prend donc sa
+# propre base, jetable à la sortie, quel que soit le code de retour. Un DSN
+# explicite (CI, job déporté, outil) reste respecté tel quel : ces exécutions
+# ont déjà leur base.
+AMEESH_TEST_DB=""
+PGPASS_DIR=""
 # jamais la configuration de l'hôte (~/.config/ameesh/config.json) : sur un
 # poste basculé, elle fixerait canon, fils et hôte sous les tests. Fichier VIDE
 # mais existant : un chemin explicite absent est refusé (#1127) ; il est
 # supprimé à la sortie, quel que soit le code de retour (#1145).
 AMEESH_CONFIG="$(mktemp "${TMPDIR:-/tmp}/ameesh-config-vide-XXXXXX")"
 export AMEESH_CONFIG
-trap 'rm -f -- "$AMEESH_CONFIG" || true' EXIT
+nettoyer() {
+  rm -f -- "$AMEESH_CONFIG" || true
+  if [ -n "$AMEESH_TEST_DB" ]; then
+    psql -w --dbname "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q \
+      -c "DROP DATABASE IF EXISTS \"$AMEESH_TEST_DB\" WITH (FORCE)" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$PGPASS_DIR" ]; then
+    rm -rf -- "$PGPASS_DIR" || true
+  fi
+}
+trap nettoyer EXIT
+# le profil privé ne vaut que pour les deux passes de tests ; les gestes
+# d'administration (création, garde, suppression) gardent le profil du poste
+banc() {
+  if [ -n "$PGPASS_DIR" ]; then
+    PGPASSFILE="$PGPASS_DIR/pgpass" "$@"
+  else
+    "$@"
+  fi
+}
 printf '{}\n' > "$AMEESH_CONFIG"
+if [ "${AMEESH_PG_UP:-1}" != 0 ] && [ -z "${AMEESH_TEST_DSN:-}" ] \
+   && [ -z "${AGENT_MESH_TEST_DSN:-}" ]; then
+  AMEESH_TEST_DB="agent_mesh_test_$(date +%s)_$$_${RANDOM}"
+  psql -w --dbname "$ADMIN_DSN" -v ON_ERROR_STOP=1 -q \
+    -c "CREATE DATABASE \"$AMEESH_TEST_DB\""
+  if [ -z "${PGPASSWORD:-}" ]; then
+    PGPASS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ameesh-pgpass-XXXXXX")"
+    python3 scripts/pgpass-banc.py "$ADMIN_DSN" "$PGPASS_DIR/pgpass" \
+      || { rm -rf -- "$PGPASS_DIR"; PGPASS_DIR=""; }
+  fi
+  export AMEESH_TEST_DSN="${ADMIN_DSN%/*}/$AMEESH_TEST_DB"
+  # la garde échoue avant les deux passes, avec le contrat plutôt qu'une
+  # salve de « fe_sendauth: no password supplied »
+  if ! banc psql -w --dbname "$AMEESH_TEST_DSN" -v ON_ERROR_STOP=1 -q \
+       -c 'SELECT 1' >/dev/null 2>&1; then
+    echo "base jetable $AMEESH_TEST_DB injoignable : donnez PGPASSWORD, ou" \
+         "ajoutez 127.0.0.1:55432:*:agent_mesh:<mot de passe> à ~/.pgpass" >&2
+    exit 1
+  fi
+else
+  export AMEESH_TEST_DSN="$ADMIN_DSN"
+fi
+export AMEESH_REQUIRE_DB=1
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 # aucun réseau dans les tests : ni clé de fournisseur, ni relevé de solde (L26)
 unset DEEPSEEK_API_KEY AMEESH_DEEPSEEK_API_BASE
@@ -52,7 +109,7 @@ fi
 
 echo
 echo "=== pilote psql ==="
-AMEESH_DRIVER=psql python3 "${TEST_ARGS[@]}"
+banc env AMEESH_DRIVER=psql python3 "${TEST_ARGS[@]}"
 
 VENV=${AMEESH_TEST_VENV:-.venv}  # L159b : venv en cache sur la VM de déport
 if [ ! -x "$VENV/bin/python" ]; then
@@ -62,13 +119,13 @@ fi
 if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import psycopg, yaml" 2>/dev/null; then
   echo
   echo "=== pilote psycopg ==="
-  AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
+  banc env AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
 elif [ -x "$VENV/bin/pip" ]; then
   echo "=== installation de psycopg dans $VENV ==="
   if "$VENV/bin/pip" install --quiet 'psycopg[binary]' cryptography pyyaml 2>/dev/null; then
     echo
     echo "=== pilote psycopg ==="
-    AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
+    banc env AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
   else
     echo "psycopg non installé (hors ligne ?) : passe psql seulement"
   fi

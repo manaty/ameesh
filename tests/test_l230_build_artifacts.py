@@ -57,11 +57,20 @@ class _Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def fake_process(self, pid: int, *, cwd: str = "/", fds=(), maps=(), comm: str = "bash",
-                     argv0: str | None = None, unreadable: bool = False) -> None:
+                     argv0: str | None = None, state: str = "S",
+                     threads=(), unreadable: bool = False) -> None:
         d = os.path.join(self.proc, str(pid))
         os.makedirs(os.path.join(d, "fd"))
         _write(os.path.join(d, "comm"), text=comm + "\n")
         _write(os.path.join(d, "cmdline"), text="%s\0--flag\0" % (argv0 or "/usr/bin/" + comm))
+        # état du processus (`Z` = zombie, #1678) : /proc/<pid>/stat, champ 3
+        _write(os.path.join(d, "stat"),
+               text="%d (%s) %s 1 %d 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 100\n"
+                    % (pid, comm, state, pid))
+        # ses fils : le meneur, puis `threads` (tid, état)
+        for tid, tstate in ((pid, state),) + tuple(threads):
+            _write(os.path.join(d, "task", str(tid), "stat"),
+                   text="%d (%s) %s 1 %d\n" % (tid, comm, tstate, pid))
         os.symlink(cwd, os.path.join(d, "cwd"))
         os.symlink("/usr/bin/" + comm, os.path.join(d, "exe"))
         os.symlink("/", os.path.join(d, "root"))
@@ -172,6 +181,36 @@ class UserPathsTest(_Base):
         self.assertIn("22 btop", platform.user_paths(allow=["btop"]).doubt())
         with mock.patch.object(process, "PROC", os.path.join(self.base, "none")):
             self.assertIn("unreadable", platform.user_paths().doubt())
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_is_not_a_doubt(self):
+        """#1678 : un zombie (état Z) n'est plus qu'une entrée de table — ses
+        liens /proc illisibles ne sont pas un doute (constat #1665 :
+        « timeout <defunct> » retenait tout le ménage)."""
+        self.fake_process(30, comm="timeout", state="Z", unreadable=True)
+        scan = platform.user_paths()
+        self.assertEqual((scan.doubt(), scan.unreadable, scan.paths), ("", [], {}))
+        # l'état seul décide : le même processus vivant reste un doute
+        self.fake_process(31, comm="timeout", unreadable=True)
+        self.assertEqual(platform.user_paths().doubt(),
+                         "process(es) of the user unreadable: 31 timeout")
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_leader_with_a_live_thread_is_still_a_doubt(self):
+        """Un meneur sorti (`Z`) dont un fil vit encore détient toujours ses
+        fichiers : il reste un doute, il ne libère pas le ménage."""
+        self.fake_process(33, comm="worker", state="Z", threads=((34, "S"),),
+                          unreadable=True)
+        self.assertEqual(platform.user_paths().doubt(),
+                         "process(es) of the user unreadable: 33 worker")
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_does_not_hold_the_housekeeping(self):
+        """#1665 : l'artefact inactif est retiré malgré le zombie présent."""
+        wt = self.worktree()
+        self.fake_process(32, comm="timeout", state="Z", unreadable=True)
+        out = self.go(wt)
+        self.assertEqual(len(out["entries"]), 3)
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_allowed_process_is_logged_and_does_not_block(self):
@@ -557,6 +596,15 @@ class OrphanGuardsTest(unittest.TestCase):
             for label, branch, owner, state, recent in (
                 ("other-active", "lot/7-x", "other", "build", False),
                 ("other-closed", "lot/7-x", "other", "closed", False),
+                ("other-open-candidate", "review/other-6-7", "other",
+                 {7: "closed", 6: "build"}, False),
+                ("other-unknown-candidate", "review/other-6-7", "other",
+                 {7: "closed", 6: None}, False),
+                ("other-closed-candidates", "review/other-6-7", "other",
+                 {7: "closed", 6: "merged"}, False),
+                ("other-merged-kept", "lot/7-x", "other", "merged", False),
+                ("other-merged-kept-recent", "lot/7-x", "other", "merged", True),
+                ("other-unpushed-equivalent", "lot/7-x", "other", "closed", False),
                 ("unknown", "lot/7-x", None, None, False),
                 ("unreadable", "lot/7-x", None, RuntimeError("offline"), False),
                 ("named-directory", "", "other", "build", False),
@@ -576,14 +624,25 @@ class OrphanGuardsTest(unittest.TestCase):
                         os.utime(source, (now - 60, now - 60))
                     row = dict(id=1, path=path, agent="a1", lot=None, branch=branch,
                                detail=menage.UNATTRIBUTED, status="active", created_ts=now - 3 * 86400)
+                    if label.startswith("other-merged-kept"):
+                        row.update(status="kept", checked_ts=now - 2 * DAY,
+                                   detail="lot #7 merged (assigned to another agent): "
+                                          "kept — not integrated")
                     lookup = mock.Mock(return_value=dict(assignee=owner, state=state)
                                        if owner else None)
                     if isinstance(state, Exception):
                         lookup.side_effect = state
+                    elif isinstance(state, dict):
+                        lookup.side_effect = lambda ident: dict(
+                            assignee=owner, state=state.get(ident))
                     store = SimpleNamespace(work=SimpleNamespace(get=lookup),
-                        housekeeping=SimpleNamespace(worktrees=lambda *args: [row]))
+                        housekeeping=SimpleNamespace(worktrees=mock.Mock(return_value=[row])))
                     git = dict(exists=True, clean=True, pushed=True, integrated=False,
                                locked=False, submodules="", gitdir="", reason="not integrated")
+                    if label == "other-unpushed-equivalent":
+                        # git cherry / a squash can prove equivalent content
+                        # on main while the original HEAD is still unpushed.
+                        git.update(pushed=False, integrated=True, reason="")
                     with mock.patch.object(menage.storage, "of", return_value=store), \
                             mock.patch.object(menage, "worktree_state", return_value=git), \
                             mock.patch.object(menage, "worktree_in_use", return_value=False), \
@@ -592,8 +651,13 @@ class OrphanGuardsTest(unittest.TestCase):
                         entries, plan = menage._worktree_pass(None, "pc", dry_run=True,
                                                              protected=set(), now=now)
                     self.assertEqual(entries, [])
+                    # #2174: the pass reads every tracked worktree, uncapped
+                    self.assertIsNone(store.housekeeping.worktrees.call_args.kwargs["limit"])
+                    # #2174: another agent's ENDED lot follows the orphan
+                    # rule; its open, unknown or unreadable lot proves nothing
                     self.assertEqual(plan[0]["action"] == "retrait",
-                                     label in ("orphan", "own-closed"), plan)
+                                     label in ("orphan", "own-closed", "other-closed",
+                                               "other-closed-candidates", "other-merged-kept"), plan)
                     if recent:
                         outcome, freed, reason, built = menage._remove_kept_worktree(
                             path, root, "", artifacts=None, allow=(),

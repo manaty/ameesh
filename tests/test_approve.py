@@ -103,9 +103,10 @@ class Clock:
         return time.time() + self.offset
 
 
-def write_token_file(directory: str, mode: int = 0o600, token: str | None = None) -> tuple:
+def write_token_file(directory: str, mode: int = 0o600, token: str | None = None,
+                     name: str = "service-token") -> tuple:
     token = token or secrets.token_urlsafe(32)
-    path = os.path.join(directory, "service-token")
+    path = os.path.join(directory, name)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
         fh.write(token + "\n")
@@ -119,6 +120,8 @@ def write_token_file(directory: str, mode: int = 0o600, token: str | None = None
 
 class ApproveBase(PgTestCase):
     CONFIG: dict = {}
+    #: L232d : API des défis de connexion ouverte pour ce banc (jeton dédié)
+    LOGIN_API: bool = False
 
     def setUp(self) -> None:
         super().setUp()
@@ -132,15 +135,23 @@ class ApproveBase(PgTestCase):
         self.assertEqual(result["errors"], [])
         self.workdir = tempfile.mkdtemp(prefix="ameesh-approve-test-")
         self.token_file, self.service_token = write_token_file(self.workdir)
+        # L232d : le jeton de connexion est TOUJOURS distinct du jeton d'équipe
+        self.login_token_file, self.login_token = write_token_file(
+            self.workdir, name="login-token")
         self.acfg = approve_config.ApproveConfig(
             rp_id=RP_ID, origins=(ORIGIN,), port=0, token_file=self.token_file,
+            login_token_file=self.login_token_file,
+            login_api="open" if self.LOGIN_API else "closed",
             state_dir=os.path.join(self.workdir, "state"), **self.CONFIG).validate()
         self.source = MemoryActionSource()
         self.clock = Clock()
         self.server_db = self.connect()
         self.service = ApproveService(
             self.acfg, self.server_db, self.source,
-            service_token=approve_config.read_service_token(self.token_file), clock=self.clock)
+            service_token=approve_config.read_service_token(self.token_file),
+            login_token=(approve_config.read_login_token(self.login_token_file)
+                         if self.LOGIN_API else None),
+            clock=self.clock)
         self.server = approve_server.make_server(self.service)
         self.port = self.server.server_address[1]
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
@@ -1103,6 +1114,33 @@ class ApproveConfigTest(unittest.TestCase):
         self.assertGreaterEqual(len(approve_config.read_service_token(path)), 43)
         with self.assertRaisesRegex(approve_config.ApproveConfigError, "already exists"):
             approve_config.write_service_token(path)
+
+    def test_api_des_defis_fermee_par_defaut_et_jeton_dedie(self):
+        """L232d / B1 : fermée par défaut ; ouverte seulement avec un jeton
+        DÉDIÉ, distinct du jeton de service de l'équipe."""
+        self.assertEqual(self.config().login_api, approve_config.LOGIN_API_CLOSED)
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "login_token_file"):
+            self.config(login_api="open", login_token_file="")
+        path, _token = write_token_file(self.tmp)
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "DISTINCT"):
+            self.config(login_api="open", token_file=path, login_token_file=path)
+        other, _token = write_token_file(self.tmp, name="login-token")
+        opened = self.config(login_api="open", token_file=path, login_token_file=other)
+        self.assertEqual(opened.login_api, approve_config.LOGIN_API_OPEN)
+        self.assertEqual(opened.login_token_file, other)
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "unknown login_api"):
+            self.config(login_api="maybe")
+
+    def test_api_des_defis_jamais_ouverte_par_variable(self):
+        """Ouvrir l'API des défis est un choix ÉCRIT du JSON, pas une variable."""
+        absent = os.path.join(self.tmp, "absent.json")
+        env = {"AMEESH_APPROVE_RP_ID": RP_ID, "AMEESH_APPROVE_ORIGINS": ORIGIN,
+               "AMEESH_APPROVE_CONFIG": absent, "AMEESH_APPROVE_LOGIN_API": "open"}
+        self.assertEqual(approve_config.load(env).login_api, approve_config.LOGIN_API_CLOSED)
+        # le chemin du jeton dédié, lui, se règle par variable (ce n'est pas un choix)
+        env["AMEESH_APPROVE_LOGIN_TOKEN_FILE"] = os.path.join(self.tmp, "jeton")
+        self.assertEqual(approve_config.load(env).login_token_file,
+                         os.path.join(self.tmp, "jeton"))
 
     def test_le_service_refuse_un_jeton_trop_ouvert(self):
         path, _token = write_token_file(self.tmp, mode=0o644)

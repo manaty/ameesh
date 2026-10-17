@@ -11,11 +11,14 @@ compte en réalité au seuil.
 
 Règle (#1561, option (a) du pilote) : un relevé **partiel** — une fenêtre
 datée remise à zéro alors qu'une autre court encore, ou un relevé non daté
-plus vieux que sa plus courte fenêtre — est **non vérifié** : il ne passe
-jamais avant un compte à relevé courant (`rank`), sa raison le dit au lieu
-d'annoncer « 30 % utilisé » (`explain`), et il n'annonce ni perte ni échéance
-(`_forecast`). Il reste utilisable : sans compte vérifié il est essayé
-(L71, « essayé, pas écarté »), et son premier tour rapporte sa jauge.
+plus vieux que sa plus courte fenêtre — est **non vérifié** : sa raison le dit
+au lieu d'annoncer « 30 % utilisé » (`explain`), il n'annonce ni perte ni
+échéance (`_forecast`), et il passe après tout relevé courant (`rank`).
+#1672 **borne** ce dernier recours : quand le relevé est plus vieux que ce qui
+reste de chaque fenêtre encore ouverte (quatre jours contre neuf heures dans
+l'incident du 15/10), il ne place plus — le choix pause ; en deçà (témoin dev2
+de la R1 : six heures contre quatre jours), il reste plaçable après les
+relevés courants. La continuité et le forçage gardent leurs chemins.
 
 Un compte **sans aucun relevé** garde la décision owner L117 (amendement 0034
 du 2026-10-10) : il compte pour 0 % et passe en premier, pour ne pas laisser
@@ -35,8 +38,10 @@ from ameesh import accounts, cost
 
 from .test_l117_account_spread import _codex_weekly
 from .test_l30_accounts import _Base, _claude_rate_limit, _codex_rollout
+from .test_1672_placement_releve_perime import _age_journal
 
 HOUR = 3600.0
+DAY = 86400.0
 WEEK = 7 * 86400.0
 
 
@@ -59,18 +64,24 @@ class FraicheurTest(unittest.TestCase):
 
     def _perime(self, now: float) -> list:
         """Le relevé de l'incident : la fenêtre de 5 h est remise à zéro
-        depuis, celle de 7 j court encore à 30 % (reset dans 9 h)."""
+        depuis, celle de 7 j court encore à 30 % (reset dans 9 h), et le
+        relevé a quatre jours — plus vieux que ce qui reste de la fenêtre
+        ouverte (#1672), donc il ne place plus."""
         return [
-            cost.Gauge("claude", "five_hour", 0.78, now - HOUR, 5 * HOUR),
-            cost.Gauge("claude", "seven_day", 0.30, now + 9 * HOUR, WEEK),
+            cost.Gauge("claude", "five_hour", 0.78, now - HOUR, 5 * HOUR,
+                       now - 4 * DAY),
+            cost.Gauge("claude", "seven_day", 0.30, now + 9 * HOUR, WEEK,
+                       now - 4 * DAY),
         ]
 
     def test_incident_fenetre_7j_non_remise_a_zero(self):
-        """Le relevé partiel est non vérifié et ne passe plus avant un relevé
-        courant — alors même que son rythme lu (30 %) est plus favorable."""
+        """Le relevé partiel est non vérifié et, plus vieux que la fenêtre
+        encore ouverte (#1672), ne place plus de session — alors même que son
+        rythme lu (30 %) est plus favorable."""
         now = self.NOW
         perime, courant = self._perime(now), self._courant(now)
         self.assertTrue(cost.stale_reading(perime, now))
+        self.assertTrue(cost.reading_outdated(perime, now))
         self.assertFalse(cost.stale_reading(courant, now))
         # Le piège d'origine : au rythme seul, le relevé périmé gagne.
         self.assertLess(accounts.lag(perime, now)[0], accounts.lag(courant, now)[0])
@@ -83,12 +94,10 @@ class FraicheurTest(unittest.TestCase):
         evaluations = {"primaire": self._ev("primaire", courant),
                        "secondaire": self._ev("secondaire", perime)}
         ranked = accounts.rank(items, evaluations, now)
-        self.assertEqual([p.name for p in ranked], ["primaire", "secondaire"])
+        self.assertEqual([p.name for p in ranked], ["primaire"])
         self.assertEqual(
             accounts.reason_of(ranked, evaluations, now),
-            "seven_day 50% used (pace 60%), furthest behind its pace; "
-            "ahead of: secondaire stale reading (window reset since the "
-            "reading): unverified, last seven_day 30%")
+            "seven_day 50% used (pace 60%), furthest behind its pace")
 
     def test_absence_de_releve_reste_premier_l117(self):
         """Décision L117 : un compte jamais utilisé compte pour 0 % et passe
@@ -106,18 +115,18 @@ class FraicheurTest(unittest.TestCase):
             "no reading: unverified, tried first (L117); ahead of: primaire "
             "seven_day 50% used (pace 60%)")
 
-    def test_releve_perime_seul_est_essaye_faute_de_mieux(self):
-        """Sans compte à relevé courant, le compte périmé est essayé (L71) :
-        la raison ne prétend pas l'avoir choisi sur son rythme."""
+    def test_releve_perime_seul_n_est_plus_place(self):
+        """#1672 : sans compte à relevé courant, le relevé plus vieux que sa
+        fenêtre ouverte n'est pas placé — le choix pause (la continuité et le
+        forçage gardent leurs chemins, témoins dans test_1672)."""
         now = self.NOW
         items = [accounts.Profile("claude", "secondaire")]
         evaluations = {"secondaire": self._ev("secondaire", self._perime(now))}
-        ranked = accounts.rank(items, evaluations, now)
-        self.assertEqual([p.name for p in ranked], ["secondaire"])
+        self.assertEqual(accounts.rank(items, evaluations, now), [])
         self.assertEqual(
-            accounts.reason_of(ranked, evaluations, now),
+            accounts.explain(evaluations["secondaire"], now),
             "stale reading (window reset since the reading): unverified, "
-            "last seven_day 30%, tried (no current reading)")
+            "last seven_day 30%")
 
     def test_fenetres_toutes_remises_a_zero_comptent_pour_zero(self):
         """L71 inchangé : toutes les fenêtres datées sont échues, la suivante
@@ -131,12 +140,15 @@ class FraicheurTest(unittest.TestCase):
 
     def test_releve_non_date_perime_par_l_age(self):
         """Une source qui ne date pas ses fenêtres (`resets_at` absent) est
-        périmée quand le relevé dépasse sa plus courte fenêtre."""
+        périmée quand le relevé dépasse sa plus courte fenêtre — et #1672 ne
+        l'écarte pas plus loin : sans remise à zéro datée, il n'y a pas de
+        « reste » à dépasser, le relevé garde le rang #1561."""
         now = self.NOW
         vieux = [cost.Gauge("claude", "five_hour", 0.30, None, 5 * HOUR, now - 6 * HOUR)]
         recent = [cost.Gauge("claude", "five_hour", 0.30, None, 5 * HOUR, now - HOUR)]
         self.assertTrue(cost.stale_reading(vieux, now))
         self.assertFalse(cost.stale_reading(recent, now))
+        self.assertFalse(cost.reading_outdated(vieux, now))
         self.assertIn("stale reading (window reset since the reading): unverified",
                       accounts.explain(self._ev("x", vieux), now))
 
@@ -198,24 +210,28 @@ class FraicheurChoixTest(_Base):
 
     def test_le_choix_ne_suit_plus_un_releve_perime(self):
         """Le cas de l'incident, de bout en bout : le secondaire à 30 % avec
-        la fenêtre de 5 h remise à zéro ne prend plus la session ; son rapport
-        ne promet ni perte ni échéance, et il reste utilisable."""
+        la fenêtre de 5 h remise à zéro **et un relevé vieux de quatre jours**
+        ne prend plus la session (#1672) ; son rapport ne promet ni perte ni
+        échéance. Le primaire, à relevé courant, reste le choix (la pause sans
+        compte plaçable : test_1672 ; le partiel dans la borne y est placé)."""
         items = self._items()
         now = float(int(time.time()))
         _codex_weekly(items[0].path, 50, now + 0.5 * WEEK,
                       short=(30, now + 2.5 * HOUR))
         _codex_weekly(items[1].path, 30, now + 9 * HOUR, short=(78, now - HOUR))
+        _age_journal(items[1].path, now - 4 * DAY)
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
 
         choice = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertEqual(choice.profile.name, "primaire")
-        self.assertIn("ahead of: secondaire stale reading", choice.why)
+        self.assertNotIn("secondaire", choice.why)
 
         cfg = mock.Mock(host=self.cfg.host, accounts={"codex": self.declared})
         rows = accounts.report(cfg, self.db, book, now=now, record=False)
         perime = [r for r in rows if r["account"] == "secondaire"][0]
         self.assertTrue(perime["stale"])
-        self.assertTrue(perime["ok"])            # L71 : essayé, pas écarté
+        self.assertTrue(perime["ok"])            # L71 : le relevé ne bloque pas
+        self.assertFalse(perime["next"])         # mais il ne place plus
         self.assertEqual(perime["losses"], [])   # rien n'est « perdu » sur un
         self.assertIsNone(perime["expires_in_s"])  # relevé qui n'est qu'une borne
         self.assertTrue(all(g["read_at"] for g in perime["gauges"]))

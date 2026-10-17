@@ -572,6 +572,65 @@ class ClaudeStreamJsonTest(DriverCase):
             driver.send("after")
         self.assertFalse(driver.probe())
 
+    def test_probe_is_a_bounded_round_trip_not_only_liveness(self):
+        # T3 (#285): the Claude probe is the `initialize` handshake sent again
+        # outside a turn; a process that lives but no longer answers its
+        # protocol fails it (DEAF: the fake never reads its input again)
+        driver = self.driver()
+        driver.start()
+        self.assertTrue(driver.probe(2.0))
+        self.assertEqual([e["control"] for e in self.trace() if "control" in e].count(
+            "initialize"), 2)                       # the start handshake, then the probe
+        self.assertEqual(self.wait(driver.send("DEAF")).status, resident.COMPLETED)
+        self.assertTrue(driver.alive)               # the process lives…
+        self.assertFalse(driver.probe(0.5))         # …but does not answer any more
+
+    def test_a_refused_probe_still_proves_the_harness_alive(self):
+        # T3 (#285): an answer proves life, even a refusal — a defensive case:
+        # the Claude CLI answers `success` to the probe; only silence (or a
+        # process gone) is a failure
+        driver = self.driver()
+        driver.start()
+        with mock.patch.object(resident.ClaudeStreamJson, "_control",
+                               side_effect=resident.RequestRefused("initialize refused")):
+            self.assertTrue(driver.probe(0.1))
+        with mock.patch.object(resident.ClaudeStreamJson, "_control",
+                               side_effect=resident.ResidentError("no answer")):
+            self.assertFalse(driver.probe(0.1))
+        self.assertTrue(driver.probe(0.1))          # the mock is gone: it answers again
+
+    def test_a_push_after_the_probe_is_not_a_turn_event(self):
+        # #1337 (L76): after an `initialize` the CLI pushes its command list
+        # asynchronously — after the probe's answer, when the turn is already
+        # running. That push is not a turn's event and never reaches the turn.
+        driver = self.driver(env={"FAKE_CLAUDE_PUSH_AFTER": "0.4"})
+        driver.start()
+        self.assertTrue(driver.probe(2.0))
+        result = self.wait(driver.send("SLOW hello", input_id="in-1"))
+        self.assertEqual(result.status, resident.COMPLETED)
+        self.assertTrue([e for e in self.trace() if e.get("push")],
+                        "the fake harness pushed nothing")   # the witness is not vacuous
+        kinds = [(raw.get("type"), raw.get("subtype")) for raw, _parsed in self.events]
+        self.assertNotIn(("system", "commands_changed"), kinds)
+        self.assertIn(("system", "init"), kinds)    # the turn's own events are kept
+        self.assertIn(("result", "success"), kinds)
+
+    def test_the_cli_own_classification_sorts_turn_events(self):
+        # #1337: the classification is the CLI's own (`isTurnMessage`): the
+        # fire-and-forget pushes are dropped, an unknown message stays a turn
+        # event (a later harness version is never silently silenced)
+        self.assertFalse(resident.is_turn_event(
+            {"type": "system", "subtype": "commands_changed"}))
+        self.assertFalse(resident.is_turn_event({"type": "stream_event"}))
+        self.assertTrue(resident.is_turn_event({"type": "system", "subtype": "init"}))
+        self.assertTrue(resident.is_turn_event(
+            {"type": "system", "subtype": "compact_boundary"}))
+        self.assertTrue(resident.is_turn_event({"type": "system", "subtype": "future_thing"}))
+        self.assertTrue(resident.is_turn_event({"type": "assistant"}))
+        self.assertTrue(resident.is_turn_event({"type": "result"}))
+        self.assertTrue(resident.is_turn_event({"type": ["odd"]}))
+        self.assertTrue(resident.is_turn_event({"type": "system", "subtype": ["odd"]}))
+
     def test_close_stops_the_group(self):
         driver = self.driver()
         driver.start()

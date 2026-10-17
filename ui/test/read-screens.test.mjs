@@ -138,9 +138,9 @@ test("an event during a request schedules a fresh snapshot after that request", 
   assert.equal(calls, 2);
 });
 
-test("the app assembles all seven screens and navigates project → lot thread internally", async () => {
+test("the app assembles all eight screens and navigates project → lot thread internally", async () => {
   const { client } = fixture(); const app = await mount("ameesh-app", client);
-  assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 7);
+  assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 8);
   let view = app.shadowRoot.querySelector("ameesh-projects"); await settle(view);
   view.shadowRoot.querySelector(".link").click(); await settle(app);
   view = app.shadowRoot.querySelector("ameesh-timeline"); await settle(view);
@@ -148,6 +148,38 @@ test("the app assembles all seven screens and navigates project → lot thread i
   view.shadowRoot.querySelector(".link").click(); await settle(app);
   view = app.shadowRoot.querySelector("ameesh-thread"); await settle(view);
   assert.equal(view.lot, "7"); assert.match(text(view), /literal message/);
+});
+
+test("an alert link with no project keeps the selected project; an explicit empty one clears it", async () => {
+  const { client } = fixture(); const app = await mount("ameesh-app", client);
+  let view = app.shadowRoot.querySelector("ameesh-projects"); await settle(view);
+  view.shadowRoot.querySelector(".link").click(); await settle(app);
+  assert.equal(app.project, "ameesh");
+  // the alerts fixture names an agent but no project: the link must not wipe
+  // the project the user is working in (#1697)
+  app.shadowRoot.querySelectorAll("nav button")[4].click(); await settle(app);
+  const alerts = app.shadowRoot.querySelector("ameesh-alerts"); await settle(alerts);
+  alerts.shadowRoot.querySelector(".link").click(); await settle(app);
+  assert.equal(app.project, "ameesh");
+  view = app.shadowRoot.querySelector("ameesh-agent"); await settle(view);
+  assert.equal(view.project, "ameesh");
+  // an explicit empty string still means "no project"
+  view.dispatchEvent(new window.CustomEvent("ameesh:open-agent",
+    { detail: { agent: "ada", project: "" }, bubbles: true, composed: true }));
+  await settle(app);
+  assert.equal(app.project, "");
+});
+
+test("the selection form drives the home projects view too", async () => {
+  const { client, fetch } = fixture(); const app = await mount("ameesh-app", client);
+  const form = app.shadowRoot.querySelector("form");
+  form.elements.namedItem("project").value = "ameesh";
+  form.dispatchEvent(new window.SubmitEvent("submit", { cancelable: true }));
+  await settle(app);
+  const view = app.shadowRoot.querySelector("ameesh-projects"); await settle(view);
+  assert.equal(view.project, "ameesh");
+  assert.ok(fetch.calls.some((call) => call.path === "/api/v1/projects?project=ameesh"),
+    JSON.stringify(fetch.calls));
 });
 
 test("missing selections do not issue unscoped requests; unsupported live API keeps manual refresh", async () => {

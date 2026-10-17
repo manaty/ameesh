@@ -302,6 +302,7 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/projects/{project}/progress": "/api/v1/projects/demo/progress?since=2d",
             "/api/v1/agents": "/api/v1/agents",
             "/api/v1/agents/{agent}": "/api/v1/agents/a1",
+            "/api/v1/agents/{agent}/chat": "/api/v1/agents/a1/chat?limit=5",
             "/api/v1/lots": "/api/v1/lots?state=build&limit=10",
             "/api/v1/lots/{id}": "/api/v1/lots/" + lot,
             "/api/v1/decisions": "/api/v1/decisions?all=1",
@@ -388,7 +389,8 @@ class BuildersTest(unittest.TestCase):
             self.assertIn(name + "(", source)
         cli = (ROOT / "src" / "ameesh" / "mesh_cli.py").read_text(encoding="utf-8")
         for name in ("agent_detail(db, args.agent)", "work_rows(db,",
-                     "work_detail(cfg, db, args.id)", "_host_json(part)"):
+                     # #1905 : `work show` passe aussi repo= et target= (arguments nommés à défaut)
+                     "work_detail(cfg, db, args.id", "_host_json(part)"):
             self.assertIn(name, cli)
         self.assertTrue(callable(mesh_cli.agent_rows))
 

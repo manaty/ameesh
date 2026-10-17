@@ -271,18 +271,18 @@ class MessageTest(unittest.TestCase):
             base=SHA_B, risk="sensitive", policy_ref="canon@deadbeef")
         self.assertIn(SHA_A, text)
         self.assertIn("#1617", text)
-        self.assertIn("frozen #42", text)
+        self.assertIn("frozen milestone #42", text)
         self.assertIn("ameesh work milestone 1617 verdict ok|blocked --sha " + SHA_A, text)
         self.assertIn("git diff %s..%s" % (SHA_B[:12], SHA_A[:12]), text)
         self.assertIn("canon@deadbeef", text)
-        self.assertIn("tu deviens alors auteur", text)
+        self.assertIn("you then become the author", text)
 
     def test_capacity_message_refuses_implicit_admission(self):
         text = rd.capacity_message(LOT, freeze={"id": 42, "sha": SHA_A}, required=2,
                                    missing=1, why="1 missing family")
-        self.assertIn("Aucune admission implicite", text)
-        self.assertIn("manquants : 1", text)
-        self.assertIn("frozen #42", text)
+        self.assertIn("No implicit admission", text)
+        self.assertIn("missing: 1", text)
+        self.assertIn("frozen milestone #42", text)
 
 
 class ApplyTest(unittest.TestCase):
@@ -304,6 +304,20 @@ class ApplyTest(unittest.TestCase):
             latest = self.port.latest_freeze(LOT["id"]) or {}
             args["freeze_sha"] = latest.get("sha") or SHA_A
         return rd.apply(LOT, **args)
+
+    def test_an_abbreviated_freeze_is_the_same_head(self):
+        # #1775 N1 : un jalon frozen peut porter un SHA abrégé alors que le
+        # collecteur a le SHA complet — ce n'est pas un gel qui a bougé.
+        self.port = FakePort({1617: [{"id": 6281, "sha": SHA_A[:8]}]})
+        out = self.apply(freeze_sha=SHA_A)
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual(out["freeze"], {"id": 6281, "sha": SHA_A[:8]})
+
+    def test_a_different_freeze_still_moved(self):
+        self.port = FakePort({1617: [{"id": 6281, "sha": SHA_A}]})
+        with self.assertRaises(rd.FreezeMoved):
+            self.apply(freeze_sha=SHA_B)
+        self.assertEqual(self.port.commits, [])
 
     def test_designates_two_reviewers_and_hands_them_the_frozen_head(self):
         out = self.apply()
@@ -403,7 +417,7 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(out["missing"], 1)
         self.assertEqual(len(self.port.commits), 1)
         self.assertEqual(self.port.messages[0][0], "mesh-design")
-        self.assertIn("Aucune admission implicite", self.port.messages[0][1])
+        self.assertIn("No implicit admission", self.port.messages[0][1])
         again = self.apply(candidates=pool)
         self.assertTrue(again.get("replayed"))
         self.assertEqual(len(self.port.commits), 1)
@@ -430,7 +444,7 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("provenance unknown", out["why"])
         self.assertEqual(len(self.port.commits), 1)
         self.assertEqual(len(self.port.messages), 1)
-        self.assertIn("preuve", self.port.messages[0][1])
+        self.assertIn("provenance", self.port.messages[0][1])
         # La preuve arrive : le même gel peut alors désigner, sans seconde
         # notification ; la désignation devient la référence.
         again = self.apply()

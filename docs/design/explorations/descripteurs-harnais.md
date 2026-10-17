@@ -1,23 +1,23 @@
 ---
 type: Exploration
 status: exploration
-title: "Descripteurs de harnais et conformité"
+title: "Harness descriptors and conformance"
 ---
 
-# Descripteurs de harnais et conformité
+# Harness descriptors and conformance
 
-## Problème
+## Problem
 
-Les descripteurs et leur validation existent, mais un manifeste ne garantit pas la compatibilité des comportements d’un harnais. L’idée restante concerne un adaptateur générique, un catalogue et un banc de conformité.
+The descriptors and their validation exist, but a manifest does not guarantee that a harness's behaviours are compatible. What remains is a generic adapter, a catalogue and a conformance bench.
 
 ## Intuitions
 
-Un format commun pourrait décrire les capacités sans enfermer les harnais dans une liste codée en dur. Des observations de conformité pourraient distinguer une capacité déclarée de son comportement effectif.
+A common format could describe capabilities without locking harnesses into a hard-coded list. Conformance observations could tell a declared capability apart from its actual behaviour.
 
-## Questions ouvertes
+## Open questions
 
-- Quelles différences de cycle de session et de reprise résistent à un adaptateur générique ?
-- Quel sous-ensemble du manifeste est portable entre harnais ?
-- Comment vérifier la conformité sans confondre disponibilité du binaire et capacité du modèle ?
+- Which session-cycle and resume differences resist a generic adapter?
+- Which subset of the manifest is portable across harnesses?
+- How can conformance be checked without confusing binary availability with model capability?
 
-Contexte existant : [Descripteurs et commandes existantes](../descripteurs-de-harnais.md), [Étude des standards des harnais](../etudes/standards-des-harnais.md). Ces références éclairent la question ; elles ne promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Existing descriptors and commands](../descripteurs-de-harnais.md), [Study of harness standards](../etudes/standards-des-harnais.md). These references inform the question; they do not promote this card to a study or to decided work.

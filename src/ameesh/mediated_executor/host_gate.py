@@ -173,8 +173,10 @@ class FileGate(_GateBase):
 
     def __init__(self, path: str = STATE_FILE, ack_path: str | None = None, *,
                  fallback: str = "stopped", poll: float = FILE_POLL_S,
+                 lending: bool = False,
                  use_inotify: bool = True, log: Callable[[str], None] | None = None):
-        super().__init__(fallback=fallback, log=log)
+        super().__init__(fallback="stopped" if lending else fallback, log=log)
+        self.lending = lending
         self.path = path
         self.ack_path = ack_path or os.path.join(os.path.dirname(path) or ".",
                                                  os.path.basename(ACK_FILE))
@@ -198,7 +200,16 @@ class FileGate(_GateBase):
         try:
             if len(data) > MAX_STATE_BYTES:
                 raise ValueError("état trop grand")
-            return self._accept(parse_state(json.loads(data.decode("utf-8"))))
+            raw = json.loads(data.decode("utf-8"))
+            # The VM recipe requires a fresh guard heartbeat. Also validate
+            # any heartbeat supplied by a legacy device, without making the
+            # optional lending-window deadline stand in for liveness.
+            from ..host_gate import parse_state as guard_state
+            now = time.time()
+            checked = guard_state(raw, now=now, lending=self.lending)
+            if self.lending and checked.until_ts is not None and checked.until_ts <= now:
+                raise ValueError("lending window ended")
+            return self._accept(parse_state(raw))
         except (ValueError, TypeError, UnicodeDecodeError) as exc:
             self._note_error("état illisible (%s)" % exc)
             return self._fallback()
@@ -430,7 +441,8 @@ def from_config(cfg, *, log: Callable[[str], None] | None = None) -> Optional[Ho
     path = str(getattr(cfg, "host_gate_path", "") or "")
     if kind == "file":
         return FileGate(path or STATE_FILE, getattr(cfg, "host_gate_ack", "") or None,
-                        fallback=fallback, log=log)
+                        fallback=fallback, lending=bool(getattr(cfg, "host_gate_lending", False)),
+                        log=log)
     if kind == "socket":
         return SocketGate(path or SOCKET_PATH, fallback=fallback, log=log)
     raise ValueError("host_gate : %r inconnu (%s)" % (kind, " | ".join(GATE_KINDS)))

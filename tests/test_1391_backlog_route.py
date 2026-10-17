@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1391 — la route d'un défaut non bloquant : le backlog, pas un lot (§2).
+"""#1391 — the route of a non-blocking defect: the backlog, not a lot (§2).
 
-Canon §2 (owner, 15/10/2026) : « un défaut non bloquant (N, P2, P3) ne bloque
-jamais. Il ne crée pas de lot : il va au backlog (`ameesh work backlog add`,
-avec sa valeur et son chantier), regroupé avec les autres défauts mineurs du
-même chantier ». Sur ameesh, un P2 de la classe sensible bloque encore.
+Canon §2 (owner, 15/10/2026): "a non-blocking defect (N, P2, P3) never blocks.
+It does not create a lot: it goes to the backlog (`ameesh work backlog add`,
+with its value and its workstream), grouped with the other minor defects of the
+same workstream". On ameesh, a P2 of the sensitive class still blocks.
 
-Témoins : suite N détectée et orientée, suite de tests légitime non signalée
-(sans masquer un N explicite), suivis ordinaires silencieux, négation de
-« bloquant » et régression explicitement mineure orientées, bloquant nommé
-(B/B1/P1/incident/panne) prioritaire même avec une référence N historique, P2
-sensible conservé, avertissement rendu par les deux points d'entrée de création
-(`work add`, `mail --new-lot`), consigne injectée au relecteur d'après fusion
-citant la route, et backlog qui accepte la suite."""
+Witnesses: an N follow-up is detected and routed, a legitimate test suite is not
+reported (without hiding an explicit N), ordinary follow-ups stay silent, a
+negated "bloquant" and an explicitly minor regression are routed, a named
+blocking defect (B/B1/P1/incident/outage) wins over a historical N reference,
+a sensitive P2 is kept, the warning is returned by both creation entry points
+(`work add`, `mail --new-lot`), the instruction injected in the review-after-
+merge reviewer cites the route, and the backlog accepts the follow-up.
+
+#1622 — false positives of the route regexes (R Claude #1391): "N° 5" is a
+number, a lowercase `n2` ("Nexlink n2") is not the canon marker, and "avis" /
+"lot(s)" only count when they aim at a reference.
+"""
 from __future__ import annotations
 
 import unittest
@@ -23,8 +28,7 @@ from .support import PgTestCase
 
 
 class FollowupHintTest(unittest.TestCase):
-    """La détection seule : ce qui est une suite de relecture, et ce qui ne
-    l'est pas."""
+    """The detection alone: what is a review follow-up, and what is not."""
 
     def test_a_review_suite_is_routed_to_the_backlog(self):
         for title in (
@@ -57,8 +61,8 @@ class FollowupHintTest(unittest.TestCase):
             self.assertEqual(backlog.followup_hint(title=title), "", title)
 
     def test_an_explicit_n_survives_a_test_suite_locution(self):
-        # R1 cx2, P2 3 : « suite de tests » ne vaut pas marqueur, mais ne doit
-        # pas masquer un N/P2/P3 explicite.
+        # R1 cx2, P2 3: "suite de tests" is not a marker, but must not hide an
+        # explicit N/P2/P3.
         for title in (
             "N2 : améliorer les diagnostics de la suite de tests",
             "P2 : suite de tests instable",
@@ -66,8 +70,8 @@ class FollowupHintTest(unittest.TestCase):
             self.assertIn("backlog", backlog.followup_hint(title=title), title)
 
     def test_an_ordinary_follow_up_is_not_a_review_suite(self):
-        # R1 cx2, P2 2 : « suivi »/« follow-up » ne vaut marqueur que visant une
-        # relecture ou une référence ; le travail ordinaire reste silencieux.
+        # R1 cx2, P2 2: "suivi"/"follow-up" is a marker only when aiming at a
+        # review or a reference; ordinary work stays silent.
         for title in (
             "Suivi des coûts mensuels",
             "Suivi mensuel de la file",
@@ -84,8 +88,9 @@ class FollowupHintTest(unittest.TestCase):
             "incident de production : base indisponible",
             "panne : le relais ne redémarre plus",
             "régression : la file perd ses lignes",
-            # R1 cx2, P2 1 : un bloquant explicite garde son lot même quand le
-            # titre ou la source cite une suite N historique (B seul compris).
+            # R1 cx2, P2 1: an explicit blocking defect keeps its lot even when
+            # the title or the source quotes a historical N follow-up (bare "B"
+            # included).
             "P1 : corriger la panne issue du N2 de la R1",
             "N2 : corriger la panne issue de la R1",
             "B : suite #956 — perte de messages",
@@ -93,33 +98,33 @@ class FollowupHintTest(unittest.TestCase):
             self.assertEqual(backlog.followup_hint(title=title), "", title)
 
     def test_a_blocking_defect_wins_over_a_historical_n_reference(self):
-        # R1 cx2, P2 1 : le bloquant explicite garde son lot quand la source ne
-        # cite qu'une référence N historique.
+        # R1 cx2, P2 1: the explicit blocking defect keeps its lot when the
+        # source only quotes a historical N reference.
         self.assertEqual(backlog.followup_hint(
             title="P1 : corriger la panne", source="issue du N2 de la R1"), "")
 
     def test_a_negated_blocking_word_is_not_a_blocking_defect(self):
-        # R2 cx2, P2 : « non bloquant » / « pas bloquant » qualifie le défaut,
-        # ce n'est pas une occurrence positive de « bloquant » : la suite mineure
-        # garde sa route vers le backlog.
+        # R2 cx2, P2: "non bloquant" / "pas bloquant" qualifies the defect, it
+        # is not a positive occurrence of "bloquant": the minor follow-up keeps
+        # its route to the backlog.
         for title in (
             "non bloquant : simplifier le diagnostic",
             "pas bloquant : améliorer le libellé",
         ):
             self.assertIn("backlog", backlog.followup_hint(title=title), title)
-        # un « bloquant » positif reste prioritaire, même avec un marqueur N
+        # a positive "bloquant" stays ahead, even with an N marker
         self.assertEqual(backlog.followup_hint(
             title="N2 : défaut bloquant confirmé par la mesure"), "")
 
     def test_an_explicit_minor_regression_goes_to_the_backlog(self):
-        # R2 cx2, P2 : « régression » ne vaut pas à lui seul un bloquant ; avec
-        # un marqueur mineur explicite (N2), la suite va au backlog.
+        # R2 cx2, P2: "régression" alone is not a blocking defect; with an
+        # explicit minor marker (N2), the follow-up goes to the backlog.
         out = backlog.followup_hint(title="N2 : régression cosmétique du libellé")
         self.assertIn("backlog", out)
 
     def test_a_plain_french_suite_keeps_its_lot(self):
-        # « suite à / suite au » : du français ordinaire, souvent une demande
-        # d'humain — pas une suite de relecture (canon §2, avertissement ciblé).
+        # "suite à / suite au": ordinary French, often a human request — not a
+        # review follow-up (canon §2, targeted warning).
         for title in (
             "Suite à la demande de l'owner, ajouter un bouton d'export",
             "Suite au courrier du 15/10, préciser la consigne",
@@ -151,8 +156,56 @@ class FollowupHintTest(unittest.TestCase):
         self.assertIn("backlog", out)
 
 
+class RouteFalsePositiveTest(unittest.TestCase):
+    """#1622 — the false positives reported by the Claude review of #1391."""
+
+    def test_a_degree_sign_is_not_an_n_marker(self):
+        # N1: "N°"/"Nº" is a number, not the canon's N. The degree sign
+        # disqualifies the match, spaced or not.
+        for title in (
+            "Numéro N° 5 : le libellé est faux",
+            "Numéro Nº 5 : corriger le renvoi",
+            "N° 5 : le libellé est faux",
+            "N ° 5 : le libellé est faux",
+        ):
+            self.assertEqual(backlog.followup_hint(title=title), "", title)
+
+    def test_a_lowercase_number_is_not_the_canon_marker(self):
+        # N3: the marker is uppercase ("Nexlink n2" is not an N2). A lowercase
+        # follow-up is not reported — silence is the safe side (no lot warning).
+        for title in (
+            "Nexlink n2 : le relais perd des lignes",
+            "n2 : borner le diagnostic",
+        ):
+            self.assertEqual(backlog.followup_hint(title=title), "", title)
+
+    def test_avis_and_lots_need_a_reference(self):
+        # N2: "suivi des avis clients", "suivi des lots en retard" are ordinary
+        # work; the suivi must aim at a review or a reference.
+        for title in (
+            "Suivi des avis clients",
+            "Suivi des lots en retard",
+            "Suivi des lots de la file",
+        ):
+            self.assertEqual(backlog.followup_hint(title=title), "", title)
+        for title in (
+            "suivi du lot #956 : corriger le témoin",
+            "suivi des avis de la relecture R1 : borner",
+            "suivi des avis R2 : reprendre le libellé",
+        ):
+            self.assertIn("backlog", backlog.followup_hint(title=title), title)
+
+    def test_the_uppercase_n_still_routes(self):
+        for title in (
+            "N2 : borner le diagnostic",
+            "Suite #1037 N1 : attribuer la famille au lot produit",
+            "N : la sonde unreserved est morte",
+        ):
+            self.assertIn("backlog", backlog.followup_hint(title=title), title)
+
+
 class ReviewInstructionTest(unittest.TestCase):
-    """La consigne injectée au relecteur d'après fusion cite la route."""
+    """The instruction injected in the review-after-merge reviewer cites the route."""
 
     def test_the_after_merge_instruction_cites_the_backlog(self):
         body = review_lot.body_of({"title": "petit lot", "branch_target": "main"}, 7,
@@ -165,8 +218,8 @@ class ReviewInstructionTest(unittest.TestCase):
 
 
 class CreationRouteTest(PgTestCase):
-    """Les deux points d'entrée de création rendent l'avertissement sans rien
-    refuser, et le backlog accepte la suite."""
+    """Both creation entry points return the warning without refusing anything,
+    and the backlog accepts the follow-up."""
 
     def test_work_add_returns_the_hint_without_refusing(self):
         item = work.add(self.db, title="Suite #956 (N R2) : ORDER BY id")

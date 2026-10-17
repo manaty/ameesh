@@ -7,6 +7,7 @@ workstation venv, so no VM, unit, database or real mail is touched.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / 'deploy/mise-a-jour'
@@ -82,6 +84,9 @@ done
 if grep -qx "ko=sante:$hote" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=sante:$hote" "$state/scenario" > "$state/scenario.tmp" || true
   mv "$state/scenario.tmp" "$state/scenario"
+  # le vrai sante-courrier.py sort son rapport JSON KO sur stdout, meme quand
+  # il echoue : le banc le reproduit (#2190).
+  printf '{"hote": "%s", "verdict": "ko", "personas": 1, "souffrance": [], "boites_mortes": [], "sonde": {"message": 94495, "destinataire": "ameesh-dev3", "delai_s": null, "remise_s": null, "hote_destinataire": "%s", "statut_cible": "idle", "tour": "non remis"}, "pourquoi": "echec injecte"}\n' "$hote" "$hote"
   echo "courrier $hote : KO (echec injecte)" >&2
   exit 1
 fi
@@ -367,6 +372,23 @@ class StagingTest(unittest.TestCase):
         self.assertIn(('pc-smichea', 'retour'), self.actions())
         self.assertIn(('pc-smichea', 'controler'), self.actions())
 
+    def test_health_failure_keeps_the_json_report_in_trace_and_notification(self):
+        """#2190 : un KO de sonde garde son rapport JSON (message, motif) dans
+        la trace et dans la notification, au lieu de « sante en echec » seul."""
+        (self.state / 'scenario').write_text('ko=sante:ameesh-agents-1\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1)
+        trace = next(t for t in self.traces()
+                     if t['hote'] == 'ameesh-agents-1' and t['etape'] == 'sante'
+                     and t['verdict'] == 'ko')
+        self.assertEqual(trace['detail'], 'sante en echec')
+        self.assertEqual(trace['rapport']['verdict'], 'ko')
+        self.assertEqual(trace['rapport']['sonde']['message'], 94495)
+        self.assertEqual(trace['rapport']['sonde']['tour'], 'non remis')
+        journal = (self.state / 'calls.log').read_text()
+        self.assertIn('Rapport de sonde (JSON)', journal)
+        self.assertIn('"tour": "non remis"', journal)
+
     def test_preflight_failure_changes_nothing(self):
         (self.state / 'scenario').write_text('ko=ameesh-agents-2:verifier\n')
         p = self.run_staging()
@@ -541,7 +563,11 @@ class PosteMigrerTest(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, timeout=60)
 
     def test_dispatcher_forwards_the_ref(self):
-        """B1 : migrer REF doit migrer REF, pas HEAD du depot."""
+        """B1: migrer REF must migrate REF rather than the repository HEAD.
+
+        #1695: the single dispatcher test for migrer REF also checks the
+        snapshot contents, replacing test_1245_poste_migrer_ref.py.
+        """
         p = self.run_poste('migrer', self.premier)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         lignes = self.log.read_text().splitlines()
@@ -549,6 +575,19 @@ class PosteMigrerTest(unittest.TestCase):
         self.assertTrue(any('migrate --additive-only' in l for l in lignes), lignes)
         self.assertTrue(any(('src-%s' % self.premier[:7]) in l for l in lignes), lignes)
         self.assertFalse(any(('src-%s' % self.tete[:7]) in l for l in lignes), lignes)
+        snapshot = self.partage / ('src-%s' % self.premier[:7])
+        self.assertEqual((snapshot / 'marque').read_text(), 'base\n',
+                         "snapshot taken from HEAD despite an explicit REF")
+        self.assertFalse((self.partage / ('src-%s' % self.tete[:7])).exists())
+
+    def test_migrer_without_ref_takes_head(self):
+        """Without REF, migrer takes HEAD (coverage preserved from #1245)."""
+        p = self.run_poste('migrer')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        lines = self.log.read_text().splitlines()
+        self.assertTrue(any(('src-%s' % self.tete[:7]) in l for l in lines), lines)
+        self.assertFalse(any(('src-%s' % self.premier[:7]) in l for l in lines), lines)
+        self.assertTrue((self.partage / ('src-%s' % self.tete[:7]) / 'marque').is_file())
 
     def test_additive_guard_forced_on_a_reprise(self):
         """B2 : sur une cible deja installee, --additif-seulement garde le refus."""
@@ -556,9 +595,8 @@ class PosteMigrerTest(unittest.TestCase):
         (self.partage / 'src-current').symlink_to('src-%s' % self.tete[:7])
         p = self.run_poste('migrer', self.tete)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
-        self.assertIn('déjà installé', p.stdout)
-        self.assertFalse(any('migrate --additive-only' in l
-                             for l in self.log.read_text().splitlines()))
+        self.assertTrue(any('migrate --additive-only' in l
+                            for l in self.log.read_text().splitlines()))
         p = self.run_poste('migrer', '--additif-seulement', self.tete)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertTrue(any('migrate --additive-only' in l
@@ -648,14 +686,58 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertFalse(self.mod.driven({'lease_owner': None, 'lease_expires_ts': now + 5}, now))
         self.assertFalse(self.mod.driven({}, now))
 
-    def test_choose_auto_takes_first_driven(self):
+    def test_choose_auto_prend_la_premiere_persona_libre(self):
+        """#2190 : une persona occupee, meme premiere, n'est jamais sondee."""
         now = 1000.0
-        rows = [{'name': 'b', 'lease_owner': None, 'lease_expires_ts': None},
-                {'name': 'a', 'lease_owner': 'r', 'lease_expires_ts': now + 5},
+        rows = [{'name': 'busy', 'status': 'running', 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5},
+                {'name': 'b', 'lease_owner': None, 'lease_expires_ts': None},
+                {'name': 'a', 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5},
                 {'name': 'c', 'lease_owner': 'r', 'lease_expires_ts': now + 5}]
         self.assertEqual(self.mod.choose(rows, 'auto', now)[0]['name'], 'a')
         self.assertEqual(self.mod.choose(rows, 'jamais', now), (None, 'sonde desactivee'))
         self.assertEqual(self.mod.choose([], 'auto', now)[0], None)
+
+    def test_libre_exclut_la_pause_operateur(self):
+        """#2190 : une persona en pause garde `status` idle mais refuse le tour."""
+        self.assertTrue(self.mod.libre({'status': 'idle'}))
+        self.assertTrue(self.mod.libre({}))
+        self.assertFalse(self.mod.libre({'status': 'idle',
+                                         'operator_paused': True}))
+        self.assertFalse(self.mod.libre({'status': 'running'}))
+
+    def test_choose_auto_ignore_une_persona_en_pause(self):
+        """#2190 : la pause operateur n'est pas une cible de sonde."""
+        now = 1000.0
+        rows = [{'name': 'pause', 'status': 'idle', 'operator_paused': True,
+                 'lease_owner': 'r', 'lease_expires_ts': now + 5},
+                {'name': 'libre', 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5}]
+        self.assertEqual(self.mod.choose(rows, 'auto', now)[0]['name'], 'libre')
+        cible, pourquoi = self.mod.choose(rows[:1], 'auto', now)
+        self.assertIsNone(cible)
+        self.assertIn('pause (pause operateur)', pourquoi)
+
+    def test_choose_auto_toutes_occupees_ne_sonde_pas(self):
+        """#2190 : sans persona menee libre, la file n'est pas mesuree en KO."""
+        now = 1000.0
+        rows = [{'name': 'busy', 'status': 'running', 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5},
+                {'name': 'bloque', 'status': 'blocked', 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5}]
+        cible, pourquoi = self.mod.choose(rows, 'auto', now)
+        self.assertIsNone(cible)
+        self.assertIn('aucune persona menee libre', pourquoi)
+        self.assertIn('busy (running)', pourquoi)
+        self.assertIn('bloque (blocked)', pourquoi)
+
+    def test_stuck_ignore_une_persona_en_pause(self):
+        """#2190 : le courrier qui attend une pause n'est pas une chaine cassee."""
+        rows = [{'name': 'pause', 'status': 'idle', 'operator_paused': True}]
+        with mock.patch.object(self.mod.mail, 'unread_active') as unread:
+            self.assertEqual(self.mod.stuck(object(), rows, 0.0, 1000.0), [])
+        unread.assert_not_called()
 
     def test_dead_letters_include_stopped_personas(self):
         """N1 : une boite morte d'une persona arretee de l'hote est rapportee."""
@@ -747,6 +829,340 @@ class SanteCourrierTest(unittest.TestCase):
     def test_choose_explicit_target_must_exist(self):
         with self.assertRaises(SystemExit):
             self.mod.choose([{'name': 'a'}], 'inconnu', 1000.0)
+
+    def test_choose_cible_nommee_occupee_ne_sonde_pas(self):
+        """#2190 : meme nommee, une cible en tour n'est pas mesuree en file."""
+        rows = [{'name': 'a', 'status': 'running', 'lease_owner': 'r',
+                 'lease_expires_ts': 1005.0}]
+        cible, pourquoi = self.mod.choose(rows, 'a', 1000.0)
+        self.assertIsNone(cible)
+        self.assertIn('cible nommee a occupee', pourquoi)
+
+    def test_cible_nommee_sans_bail_vivant_ne_sonde_pas(self):
+        for fin in (None, 999.0):
+            row = {'name': 'a', 'host': 'autre', 'status': 'idle',
+                   'lease_owner': 'r', 'lease_expires_ts': fin}
+            for cible, pourquoi in (self.mod.choose([row], 'a', 1000.0),
+                                    self.mod.choisir_croise([row], 'h', 'a', 1000.0)):
+                self.assertIsNone(cible)
+                self.assertIn('sans bail vivant', pourquoi)
+
+    def test_choose_cible_nommee_en_pause_ne_sonde_pas(self):
+        """#2190 : une cible nommee en pause operateur n'est pas sondee."""
+        rows = [{'name': 'a', 'status': 'idle', 'operator_paused': True,
+                 'lease_owner': 'r', 'lease_expires_ts': 1005.0}]
+        cible, pourquoi = self.mod.choose(rows, 'a', 1000.0)
+        self.assertIsNone(cible)
+        self.assertIn('cible nommee a occupee (pause operateur)', pourquoi)
+
+    def test_choisir_croise_prend_une_persona_libre_d_un_autre_hote(self):
+        """#2190 : le serveur sonde une persona menee *libre* d'un autre hote.
+
+        #94495 visait ameesh-dev3 (running) et la remise a attendu la fin de
+        son tour (350 s) : c'est sa file qui a ete mesuree, pas la chaine.
+        """
+        now = 1000.0
+        rows = [{'name': 'busy', 'host': 'ameesh-agents-1', 'status': 'running',
+                 'lease_owner': 'r', 'lease_expires_ts': now + 5},
+                {'name': 'b', 'host': 'ameesh-agents-1', 'lease_owner': None,
+                 'lease_expires_ts': None},
+                {'name': 'c', 'host': 'ameesh-agents-2', 'status': 'idle',
+                 'lease_owner': 'r', 'lease_expires_ts': now + 5},
+                {'name': 'a', 'host': 'manaty-mesh-1', 'status': 'idle',
+                 'lease_owner': 'r', 'lease_expires_ts': now + 5}]
+        self.assertEqual(
+            self.mod.choisir_croise(rows, 'manaty-mesh-1', 'auto', now)[0]['name'], 'c')
+
+    def test_choisir_croise_toutes_occupees_ne_sonde_pas(self):
+        """#2190 : un autre hote entierement occupe ou en pause ne produit pas
+        de KO de file."""
+        now = 1000.0
+        rows = [{'name': 'busy', 'host': 'ameesh-agents-1', 'status': 'running',
+                 'lease_owner': 'r', 'lease_expires_ts': now + 5},
+                {'name': 'bloque', 'host': 'ameesh-agents-2', 'status': 'blocked',
+                 'lease_owner': 'r', 'lease_expires_ts': now + 5},
+                {'name': 'pause', 'host': 'ameesh-agents-3', 'status': 'idle',
+                 'operator_paused': True, 'lease_owner': 'r',
+                 'lease_expires_ts': now + 5}]
+        cible, pourquoi = self.mod.choisir_croise(rows, 'manaty-mesh-1', 'auto', now)
+        self.assertIsNone(cible)
+        self.assertIn('aucune persona menee libre sur un autre hote', pourquoi)
+        self.assertIn('busy (running)', pourquoi)
+        self.assertIn('bloque (blocked)', pourquoi)
+        self.assertIn('pause (pause operateur)', pourquoi)
+
+    def test_choisir_croise_cible_nommee_doit_exister_ailleurs(self):
+        rows = [{'name': 'a', 'host': 'ameesh-agents-1', 'lease_owner': 'r',
+                 'lease_expires_ts': 1005.0},
+                {'name': 'locale', 'host': 'manaty-mesh-1', 'lease_owner': 'r',
+                 'lease_expires_ts': 1005.0}]
+        self.assertEqual(
+            self.mod.choisir_croise(rows, 'manaty-mesh-1', 'a', 1000.0)[0]['name'], 'a')
+        for cible in ('inconnu', 'locale'):
+            with self.subTest(cible=cible):
+                with self.assertRaises(SystemExit):
+                    self.mod.choisir_croise(rows, 'manaty-mesh-1', cible, 1000.0)
+
+    def test_choisir_croise_cible_nommee_occupee_ne_sonde_pas(self):
+        """#2190 : une cible croisee nommee et occupee n'est pas mesuree en file."""
+        rows = [{'name': 'a', 'host': 'ameesh-agents-1', 'status': 'running',
+                 'lease_owner': 'r', 'lease_expires_ts': 1005.0}]
+        cible, pourquoi = self.mod.choisir_croise(rows, 'manaty-mesh-1', 'a', 1000.0)
+        self.assertIsNone(cible)
+        self.assertIn('cible nommee a occupee', pourquoi)
+
+    def test_choisir_croise_cible_nommee_en_pause_ne_sonde_pas(self):
+        """#2190 : une cible croisee nommee en pause n'est pas sondee."""
+        rows = [{'name': 'a', 'host': 'ameesh-agents-1', 'status': 'idle',
+                 'operator_paused': True, 'lease_owner': 'r',
+                 'lease_expires_ts': 1005.0}]
+        cible, pourquoi = self.mod.choisir_croise(rows, 'manaty-mesh-1', 'a', 1000.0)
+        self.assertIsNone(cible)
+        self.assertIn('cible nommee a occupee (pause operateur)', pourquoi)
+
+    def test_choisir_croise_sans_persona_menee(self):
+        rows = [{'name': 'b', 'host': 'ameesh-agents-1', 'lease_owner': None,
+                 'lease_expires_ts': None}]
+        cible, pourquoi = self.mod.choisir_croise(rows, 'manaty-mesh-1', 'auto', 1000.0)
+        self.assertIsNone(cible)
+        self.assertIn('autre hote', pourquoi)
+
+    def test_personas_sans_hote_liste_tous_les_executants(self):
+        rows = [{'name': 'a', 'host': 'h1', 'mode': 'execute', 'status': 'idle'},
+                {'name': 'b', 'host': 'h2', 'mode': 'execute', 'status': 'running'},
+                {'name': 'c', 'host': 'h2', 'mode': 'execute', 'status': 'stopped'},
+                {'name': 'd', 'host': 'h2', 'mode': 'externe', 'status': 'idle'}]
+        with mock.patch.object(self.mod.registry, 'overview', return_value=rows):
+            self.assertEqual([r['name'] for r in self.mod.personas(object(), None)],
+                             ['a', 'b'])
+            self.assertEqual([r['name'] for r in self.mod.personas(object(), 'h2')],
+                             ['b'])
+
+    def test_main_serveur_sonde_un_autre_hote(self):
+        """Le serveur sans executant sonde une persona menee d'un autre hote ;
+        la charge remise porte l'hote mesure et l'hote destinataire."""
+        sha = '0123456789abcdef0123456789abcdef01234567'
+        maintenant = 1000.0
+        autres = [{'name': 'vm-agent', 'host': 'ameesh-agents-1', 'mode': 'execute',
+                   'status': 'idle', 'lease_owner': 'r',
+                   'lease_expires_ts': maintenant + 60}]
+        envois = {}
+
+        def faux_send(db, sender, recipient, body, **kw):
+            envois.update(recipient=recipient, payload=kw.get('payload'),
+                          jeton=body.split('--ack ')[1].split()[0])
+            return 7
+
+        def faux_get(db, message_id):
+            return {'id': message_id, 'delivered_ts': maintenant}
+
+        def faux_history(db, nom, **kw):
+            return [{'sender': nom, 'body': envois['jeton'],
+                     'delivered_ts': maintenant}]
+
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=autres), \
+             mock.patch.object(self.mod.registry, 'get',
+                               return_value={'last_turn_ts': maintenant + 1,
+                                             'lease_owner': 'r',
+                                             'lease_expires_ts': maintenant + 60,
+                                             'status': 'idle'}), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send', side_effect=faux_send), \
+             mock.patch.object(self.mod.mail, 'get', side_effect=faux_get), \
+             mock.patch.object(self.mod.mail, 'history', side_effect=faux_history), \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             mock.patch.object(self.mod.time, 'monotonic', return_value=maintenant), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'manaty-mesh-1', '--serveur',
+                                  '--sha', sha, '--attente', '1', '--json'])
+        self.assertEqual(code, 0, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ok')
+        self.assertEqual(rapport['personas'], 0)
+        self.assertEqual(rapport['sonde']['destinataire'], 'vm-agent')
+        self.assertEqual(rapport['sonde']['hote_destinataire'], 'ameesh-agents-1')
+        self.assertEqual(envois['recipient'], 'vm-agent')
+        self.assertEqual(envois['payload']['staging'],
+                         {'hote': 'manaty-mesh-1', 'sha': sha,
+                          'destinataire_hote': 'ameesh-agents-1'})
+        self.assertEqual(rapport['sonde']['statut_cible'], 'idle')
+        self.assertEqual(rapport['sonde']['remise_s'], 0.0)
+
+    def test_main_serveur_toutes_occupees_repond_sans_sonde(self):
+        """#2190 : toutes les personas menees d'un autre hote sont occupees ->
+        `sans-sonde` motive, pas un KO de file ni un rollback."""
+        maintenant = 1000.0
+        autres = [{'name': 'dev3', 'host': 'ameesh-agents-1', 'mode': 'execute',
+                   'status': 'running', 'lease_owner': 'r',
+                   'lease_expires_ts': maintenant + 60}]
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=autres), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send') as envoi, \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'manaty-mesh-1', '--serveur',
+                                  '--attente', '1', '--json'])
+        self.assertEqual(code, 0, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'sans-sonde')
+        self.assertIsNone(rapport['sonde'])
+        self.assertIn('dev3 (running)', rapport['pourquoi'])
+        envoi.assert_not_called()
+
+    def test_main_revalide_la_cible_avant_envoi(self):
+        """#2190 : une cible libre dans la photo du registre mais entree en
+        tour avant l'envoi n'est pas sondee (sa file ne mesure rien)."""
+        maintenant = 1000.0
+        rows = [{'name': 'agent', 'host': 'ameesh-agents-1', 'mode': 'execute',
+                 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': maintenant + 60}]
+        occupee = {'name': 'agent', 'host': 'ameesh-agents-1',
+                   'status': 'running', 'lease_owner': 'r',
+                   'lease_expires_ts': maintenant + 60}
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.registry, 'get', return_value=occupee), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send') as envoi, \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'ameesh-agents-1', '--json'])
+        self.assertEqual(code, 0, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'sans-sonde')
+        self.assertIn('cible agent occupee (running)', rapport['pourquoi'])
+        envoi.assert_not_called()
+
+    def test_main_cible_disparue_ou_bail_expire_ne_sonde_pas(self):
+        row = dict(name='agent', host='h', status='idle', lease_owner='r',
+                   lease_expires_ts=1060.0)
+        for etat in (None, dict(row, lease_expires_ts=999.0)):
+            sortie = io.StringIO()
+            with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+                 mock.patch.object(self.mod.config, 'load', return_value={}), \
+                 mock.patch.multiple(self.mod.registry,
+                                     overview=mock.Mock(return_value=[row]),
+                                     get=mock.Mock(return_value=etat)), \
+                 mock.patch.object(self.mod, 'stuck', return_value=[]), \
+                 mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+                 mock.patch.object(self.mod.mail, 'send', return_value=7) as envoi, \
+                 mock.patch.object(self.mod.time, 'time', return_value=1000.0), \
+                 redirect_stdout(sortie):
+                code = self.mod.main(['--hote', 'h', '--attente', '0', '--json'])
+            self.assertEqual(code, 0, sortie.getvalue())
+            self.assertEqual(json.loads(sortie.getvalue())['verdict'], 'sans-sonde')
+            envoi.assert_not_called()
+
+    def test_main_revalide_une_cible_mise_en_pause_avant_envoi(self):
+        """#2190 : une cible libre dans la photo mais mise en pause avant
+        l'envoi n'est pas sondee : son tour sera refuse."""
+        maintenant = 1000.0
+        rows = [{'name': 'agent', 'host': 'ameesh-agents-1', 'mode': 'execute',
+                 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': maintenant + 60}]
+        en_pause = dict(rows[0], operator_paused=True)
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.registry, 'get', return_value=en_pause), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send') as envoi, \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'ameesh-agents-1', '--json'])
+        self.assertEqual(code, 0, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'sans-sonde')
+        self.assertIn('cible agent occupee (pause operateur)', rapport['pourquoi'])
+        envoi.assert_not_called()
+
+    def test_main_ko_non_remise_sort_en_rapport_json_complet(self):
+        """#2190 : une remise qui expire garde son rapport JSON (message,
+        tour, cible, borne), au lieu d'une sortie vide ou d'un simple KO."""
+        sha = '0123456789abcdef0123456789abcdef01234567'
+        maintenant = 1000.0
+        rows = [{'name': 'agent', 'host': 'ameesh-agents-1', 'mode': 'execute',
+                 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': maintenant + 60}]
+        horloge = iter(maintenant + i * 0.5 for i in range(1000))
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.registry, 'get', return_value=rows[0]), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send', return_value=7), \
+             mock.patch.object(self.mod.mail, 'get',
+                               return_value={'id': 7, 'delivered_ts': None}), \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             mock.patch.object(self.mod.time, 'monotonic',
+                               side_effect=lambda: next(horloge)), \
+             mock.patch.object(self.mod.time, 'sleep'), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'ameesh-agents-1', '--sha', sha,
+                                  '--attente', '1', '--json'])
+        self.assertEqual(code, 1, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ko')
+        self.assertEqual(rapport['sha'], sha)
+        self.assertEqual(rapport['attente_s'], 1.0)
+        self.assertEqual(rapport['sonde']['message'], 7)
+        self.assertEqual(rapport['sonde']['destinataire'], 'agent')
+        self.assertEqual(rapport['sonde']['tour'], 'non remis')
+        self.assertIsNone(rapport['sonde']['delai_s'])
+        self.assertIsNone(rapport['sonde']['remise_s'])
+        self.assertEqual(rapport['sonde']['statut_cible'], 'idle')
+
+    def test_main_erreur_de_sonde_sort_en_rapport_ko(self):
+        """#2190 : une erreur (base injoignable) sort en rapport JSON KO, pas
+        en trace vide : la notification peut la porter."""
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.db_mod, 'connect',
+                               side_effect=RuntimeError('base injoignable')), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'ameesh-agents-1', '--json'])
+        self.assertEqual(code, 1, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ko')
+        self.assertEqual(rapport['hote'], 'ameesh-agents-1')
+        self.assertIn('base injoignable', rapport['erreur'])
+
+    def test_main_cible_inconnue_sort_en_rapport_ko(self):
+        """#2190 : une cible nommee absente n'est pas une trace vide."""
+        rows = [{'name': 'a', 'host': 'ameesh-agents-1', 'mode': 'execute',
+                 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': 1060.0}]
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send') as envoi, \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'ameesh-agents-1', '--sonde',
+                                  'absente', '--json'])
+        self.assertEqual(code, 1, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ko')
+        self.assertIn("n'est pas une persona", rapport['erreur'])
+        envoi.assert_not_called()
 
 
 if __name__ == '__main__':
