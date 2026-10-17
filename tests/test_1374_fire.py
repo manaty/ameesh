@@ -318,6 +318,62 @@ class ReviewGateTest(unittest.TestCase):
         ok = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass="release")
         self.assertTrue(ok["ok"], ok["why"])
 
+    def test_pilot_waiver_lifts_the_verdicts_but_never_a_block(self):
+        # #2281 : `work reviewer --no-verdict` (#1979) marque la dispense de
+        # re-verdict (`reviewer = -none`) ; la porte partagée la respecte,
+        # sans changer la classe ni lever un verdict bloquant courant.
+        for item in ({"assignee": "author", "reviewer": work.REVIEWER_NONE},
+                     {"assignee": "author", "reviewers": [work.REVIEWER_NONE]}):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]}, item=item)
+            self.assertTrue(out["ok"], out["why"])
+            self.assertTrue(out["waived"])
+            self.assertEqual(out["required"], 2, "la dispense ne change pas la classe")
+        named = self.gate(_marks(_mark("frozen", A)),
+                          klass={"class": "sensitive", "files": [self.SQL]},
+                          item={"assignee": "author", "reviewer": work.REVIEWER_NONE,
+                                "events": [{"note": "verdict not required: no re-verdict "
+                                                    "due (#1979)", "actor": "pilote-x"}]})
+        self.assertEqual(named["waived_by"], "pilote-x")
+        blocked = self.gate(_marks(_mark("frozen", A),
+                                   _verdict("rev1", verdict="blocked")),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"assignee": "author", "reviewer": work.REVIEWER_NONE})
+        self.assertFalse(blocked["ok"], "une dispense ne lève jamais une correction due")
+        self.assertIn("blocked verdict", blocked["why"])
+
+    def test_a_stale_waiver_row_does_not_cover_a_new_freeze(self):
+        # #2281/B1 cx1 : la ligne passée à la porte peut être antérieure au
+        # gel ; le stockage a périmé la dispense en base mais la copie la
+        # porte encore. La porte relit la marque après les jalons : un gel B
+        # sans avis reste refusé, même avec une ligne A en main.
+        stale = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        fresh = {"id": 9, "assignee": "author", "reviewer": "", "reviewers": []}
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh):
+            out = self.gate(_marks(_mark("frozen", B)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            frozen=B, item=stale)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["waived"])
+        self.assertIn("no review verdict ok", out["why"])
+
+    def test_the_waiver_actor_comes_from_the_lot_journal(self):
+        # #2281/N1 cx1 : `work.get` ne rend pas les événements ; en usage réel
+        # la note de file doit citer le pilote, lu dans la table du journal.
+        fresh = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        ops = mock.Mock()
+        ops.work.events_noted.return_value = [
+            {"note": "verdict not required: no re-verdict due (#1979)",
+             "actor": "pilote-x"}]
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh), \
+                mock.patch.object(merge_queue.storage, "of", return_value=ops):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"id": 9, "assignee": "author",
+                                  "reviewer": work.REVIEWER_NONE})
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["waived_by"], "pilote-x")
+
 
 class ReadyTest(unittest.TestCase):
     """Les portes du feu : verdicts d'abord (sans PR), puis PR/CI."""
