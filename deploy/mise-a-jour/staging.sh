@@ -266,14 +266,23 @@ done
 
 SHA_TRAVE=${SHA:0:9}
 PRECEDENT=""
-trace() {  # hote etape verdict [detail]
-  python3 - "$JOURNAL" "$1" "$2" "$3" "${4:-}" "$SHA" "$PRECEDENT" <<'PY'
+trace() {  # hote etape verdict [detail] [rapport-json]
+  python3 - "$JOURNAL" "$1" "$2" "$3" "${4:-}" "$SHA" "$PRECEDENT" "${5:-}" <<'PY'
 import json, sys, time
-path, hote, etape, verdict, detail, sha, precedent = sys.argv[1:8]
+path, hote, etape, verdict, detail, sha, precedent, rapport = sys.argv[1:9]
 line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "hote": hote, "etape": etape, "verdict": verdict,
         "sha": sha or None, "precedent": precedent or None,
         "detail": detail or None}
+# le rapport de sonde reste structure dans la trace, pas seulement en texte
+# (#2190) ; `detail` garde sa forme historique, lue par actif.py.
+if rapport:
+    try:
+        objet = json.loads(rapport)
+    except ValueError:
+        objet = None
+    if isinstance(objet, dict):
+        line["rapport"] = objet
 with open(path, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 PY
@@ -329,7 +338,7 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
     sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde "${cible_sonde:-auto}" \
       --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
       ${args_hote[@]+"${args_hote[@]}"}) \
-      || { printf '%s\n' "$sortie"; return 1; }
+      || { printf '%s\n' "$sortie"; SANTE_DETAIL=$sortie; return 1; }
     printf '%s\n' "$sortie"
     SANTE_DETAIL=$sortie
   else
@@ -337,7 +346,7 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
     sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde jamais \
       --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
       ${args_hote[@]+"${args_hote[@]}"}) \
-      || { printf '%s\n' "$sortie"; return 1; }
+      || { printf '%s\n' "$sortie"; SANTE_DETAIL=$sortie; return 1; }
     printf '%s\n' "$sortie"
     SANTE_DETAIL=$sortie
   fi
@@ -358,14 +367,23 @@ finally:
 PY
 }
 echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
-  local nom=$1 ou=$2 detail=$3
-  trace "$nom" "$ou" ko "$detail"
+  local nom=$1 ou=$2 detail=$3 rapport="" complement=""
+  # le rapport JSON de la sonde n'est pas perdu : il va dans la trace (objet
+  # `rapport`) et dans la notification, pas seulement « sante en echec » (#2190).
+  if [ "$ou" = sante ] && [ -n "$SANTE_DETAIL" ]; then
+    rapport=$SANTE_DETAIL
+    complement=$(printf '\n\nRapport de sonde (JSON) :\n%s' "$rapport")
+  fi
+  trace "$nom" "$ou" ko "$detail" "$rapport"
   echo "!! $nom : $ou en echec — $detail" >&2
+  if [ -n "$rapport" ]; then
+    printf '   rapport de sonde : %s\n' "$rapport" >&2
+  fi
   etape "$nom : retour automatique (previous-sha)"
   if ! exec_hote "$nom" retour; then
     trace "$nom" retour ko "le retour lui-meme a echoue"
     notifier "staging #1155 : retour de $nom en ECHEC" \
-      "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail) et son retour automatique a echoue. Sequence arretee ; intervention requise. Trace : $JOURNAL"
+      "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail) et son retour automatique a echoue.$complement Sequence arretee ; intervention requise. Trace : $JOURNAL"
     exit 1
   fi
   trace "$nom" retour ok "retour au commit precedent applique"
@@ -373,12 +391,12 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   if ! exec_hote "$nom" controler; then
     trace "$nom" controle-retour ko "l'hote ne repond pas apres le retour"
     notifier "staging #1155 : retour de $nom non verifie" \
-      "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail) ; le code precedent est reinstalle mais ses controles echouent. Sequence arretee ; intervention requise. Trace : $JOURNAL"
+      "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail) ; le code precedent est reinstalle mais ses controles echouent.$complement Sequence arretee ; intervention requise. Trace : $JOURNAL"
     exit 1
   fi
   trace "$nom" controle-retour ok "unites et baux verts apres retour"
   notifier "staging #1155 : $nom en echec, retour effectue" \
-    "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). Retour automatique effectue et controle (unites, baux, doctor). Sequence arretee avant les hotes suivants : rien d'autre n'a ete modifie. Trace : $JOURNAL"
+    "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). Retour automatique effectue et controle (unites, baux, doctor). Sequence arretee avant les hotes suivants : rien d'autre n'a ete modifie.$complement Trace : $JOURNAL"
   echo "sequence arretee sur $nom (retour effectue et controle)" >&2
   exit 1
 }
@@ -445,7 +463,9 @@ for nom in "${HOTES[@]}"; do
   trace "$nom" controler ok
   etape "$nom : sante"
   sante_hote "$nom" || echec_hote "$nom" sante "sante en echec"
-  trace "$nom" sante ok "$SANTE_DETAIL"
+  # `detail` reste le rapport JSON (lu par actif.py) ; le meme contenu part en
+  # objet `rapport` pour la lecture structuree de la trace (#2190).
+  trace "$nom" sante ok "$SANTE_DETAIL" "$SANTE_DETAIL"
 done
 
 etape "sequence staging terminee : ${HOTES[*]} sur $SHA_TRAVE"
