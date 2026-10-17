@@ -60,6 +60,29 @@ Chaque commit de composition porte le trailer `ameesh-work: <lot>` (convention
 - Aucune CI de lot, aucune suite complète locale : une seule CI complète
   tourne sur la tête de la PR du paquet (§12).
 
+## Correctif de composition après la CI du 17/10 (tête `2fafa5755`)
+
+La CI psycopg 1/4 et 2/4 (runs `39004127666`, flux `117313147491` /
+`117315463228`) a rendu deux échecs :
+
+- `tests.test_l804_prise_executeur.PriseDeLExecuteurTest.test_garde_fous_conserves`
+  (psycopg 2/4) : déterministe. Le test attendait l'ancien garde-fou de repos
+  (dernier tour < `idle_s`), que #1677 (b) a explicitement remplacé par la
+  lecture des lots actionnables (`actionable_lots`) ; #1677 avait adapté
+  `test_l119_backlog` et `test_l165_prise_lots` mais pas ce témoin L804.
+  **Correction test-only** : le témoin vérifie désormais la prise d'un agent
+  sans lot actionnable, garde le plafond de budget, la pause d'hôte et
+  l'interrupteur `idle_s=0`. Aucun code de production modifié ; après
+  correction, `tests.test_l804_prise_executeur` = **14 OK**.
+- `tests.test_l109_mediated_mode.SessionTest.test_foreign_harness_hook_leaves_mediated_mail_pending`
+  (psycopg 1/4) : la sortie du hook a reçu une ligne de journal d'une session
+  `attach` (`harness stopped (lease ...)`). Non reproduit localement (module
+  complet : **35 OK**) ; à surveiller au rerun. Si l'échec revient, c'est un
+  défaut d'isolation du test (sortie d'un processus de fond), pas le paquet.
+
+Le correctif change la tête de la branche : l'auto-fusion doit être réarmée
+sur la nouvelle tête exacte par le pilote (§2, tête changée).
+
 ## Hors périmètre (différé, non retenu à ce cutoff)
 
 - **#1152** : la résolution publiée `refs/ameesh/resolutions/1152/2190` =
