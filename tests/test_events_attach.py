@@ -2,7 +2,9 @@
 """L8 — événements `kind='event'` (regroupement, urgent) et `ameesh attach` (C9)."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import os
 import subprocess
 import sys
@@ -12,9 +14,48 @@ import unittest
 from unittest import mock
 
 from ameesh import adapters, db as db_mod, mail, registry
+from ameesh import runner as runner_mod
 from ameesh.runner import AgentWorker, Runner, attach_owner, run_attach
 
 from .support import FAKEBIN, PgTestCase
+
+#: Sentinelle du journal asynchrone. La file d'`ameesh.runner._journal` est
+#: FIFO : la voir traverser le puits prouve que tous les messages précédents
+#: ont été drainés, sans temporisation de masquage (#2199).
+_FIN_JOURNAL = "[témoin #2199] journal drainé"
+
+
+class _PuitsJournalSature:
+    """Puits du journal asynchrone bloqué puis vidé **dans** le test.
+
+    Le journal d'`ameesh.runner` est un fil démon global, partagé par tous les
+    tests du processus. Le bloquer avec un `sleep` laissait ce fil vivant après
+    le test ; à son réveil il écrivait dans le `redirect_stdout` d'un test
+    suivant (`test_l109_mediated_mode`). Ce puits confine la saturation : le
+    premier message bloque, les suivants s'empilent, et `vider()` prouve leur
+    passage avant que le patch de `log` ne soit retiré.
+    """
+
+    def __init__(self) -> None:
+        self.entree = threading.Event()     # le fil journal a atteint le puits
+        self.liberer = threading.Event()    # le test a fini de mesurer l'arrêt
+        self.fin = threading.Event()        # la sentinelle a traversé
+        self.messages: list[str] = []
+
+    def __call__(self, message, *args, **kwargs) -> None:
+        texte = str(message)
+        self.messages.append(texte)
+        if _FIN_JOURNAL in texte:
+            self.fin.set()
+            return
+        self.entree.set()
+        self.liberer.wait()                 # tube plein : rien ne passe avant
+
+    def vider(self, timeout: float = 5.0) -> bool:
+        """Libère le puits et attend la sentinelle (donc tout le journal)."""
+        self.liberer.set()
+        runner_mod.log_async(_FIN_JOURNAL)
+        return self.fin.wait(timeout)
 
 
 class EventsTest(PgTestCase):
@@ -227,32 +268,67 @@ class AttachTest(PgTestCase):
     def test_attach_coupe_sans_journal_sur_le_chemin_d_arret(self):
         """Sonde codex3 du 04:42 : un journal synchrone bloqué (tube plein) ne
         doit pas retarder l'arrêt du harnais — le veilleur pose `perdu` avant de
-        journaliser, et le fil principal coupe avant de journaliser."""
+        journaliser, et le fil principal coupe avant de journaliser.
+
+        #2199 : le puits saturé reste confiné au test et son journal est vidé
+        **avant** la sortie du patch de `log` ; aucun message ne peut donc
+        atteindre la capture stdout d'un test suivant.
+        """
         self._agent("att")
         env = dict(self._env(), AMEESH_TEST_SLEEP="8")
-
-        def faux_log(message, *args, **kwargs):
-            if "deadline" in str(message) or "lease lost" in str(message):
-                time.sleep(30)  # simule un tube saturé
-
+        puits = _PuitsJournalSature()
         resultat: list = []
+        sortie = io.StringIO()
 
         def lance() -> None:
-            with mock.patch.dict(os.environ, env, clear=False), \
-                    mock.patch.object(registry, "renew",
-                                      side_effect=db_mod.DbError("panne SQL")), \
-                    mock.patch("ameesh.runner.log", side_effect=faux_log):
-                resultat.append(run_attach(self.cfg, self.db, "att", ttl=5))
+            resultat.append(run_attach(self.cfg, self.db, "att", ttl=5))
 
-        debut = time.monotonic()
-        thread = threading.Thread(target=lance, daemon=True)
-        thread.start()
-        thread.join(timeout=12)
-        ecoule = time.monotonic() - debut
-        self.assertFalse(thread.is_alive(),
-                         "le chemin d'arrêt a été bloqué par un journal synchrone")
-        self.assertLess(ecoule, 8.0)
-        self.assertTrue(resultat and resultat[0] < 0)
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(registry, "renew",
+                                  side_effect=db_mod.DbError("panne SQL")), \
+                mock.patch("ameesh.runner.log", side_effect=puits):
+            debut = time.monotonic()
+            thread = threading.Thread(target=lance, daemon=True)
+            try:
+                thread.start()
+                thread.join(timeout=12)
+                ecoule = time.monotonic() - debut
+                self.assertFalse(
+                    thread.is_alive(),
+                    "le chemin d'arrêt a été bloqué par un journal synchrone")
+                self.assertLess(ecoule, 8.0)
+                self.assertTrue(resultat and resultat[0] < 0)
+                # Témoin #2199 : run_attach a rendu la main alors que le puits
+                # était encore bloqué et que le journal gardait des messages.
+                self.assertTrue(puits.entree.wait(2.0),
+                                "le journal n'a pas atteint le puits")
+                self.assertFalse(puits.liberer.is_set())
+                self.assertFalse(
+                    any("harness stopped" in message for message in puits.messages),
+                    "le journal a déjà vidé l'arrêt : témoin invalide")
+            finally:
+                with contextlib.redirect_stdout(sortie):
+                    self.assertTrue(puits.vider(),
+                                    "le journal ne s'est pas vidé dans le test")
+                thread.join(timeout=5)
+        self.assertEqual(sortie.getvalue(), "",
+                         "le journal a écrit hors du puits après le test")
+        self.assertTrue(any("harness stopped" in message for message in puits.messages),
+                        "l'arrêt n'est pas passé par le journal asynchrone")
+        # Comme l109 : une capture ouverte après la fin du test ne doit plus
+        # recevoir aucun message d'attach. La sentinelle est FIFO : elle ne
+        # peut passer qu'après tout message déjà en file.
+        apres = io.StringIO()
+        marqueur = "%s-apres-%d" % (_FIN_JOURNAL, time.monotonic_ns())
+        with contextlib.redirect_stdout(apres):
+            runner_mod.log_async(marqueur)
+            fin = time.monotonic() + 10.0
+            while marqueur not in apres.getvalue() and time.monotonic() < fin:
+                time.sleep(0.01)
+        self.assertIn(marqueur, apres.getvalue(),
+                      "le journal ne répond plus après le test")
+        self.assertNotIn("[att]", apres.getvalue(),
+                         "un fil d'attach a écrit dans la capture suivante")
 
     def test_attach_owner_est_attache_a_l_hote(self):
         self.assertTrue(attach_owner("laptop").startswith("attach:"))
