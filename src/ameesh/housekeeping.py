@@ -2129,6 +2129,14 @@ def common_dir(cwd: str) -> str:
     return os.path.abspath(os.path.join(cwd, proc.stdout.strip()))
 
 
+def same_repository(path: str, repo: str) -> bool:
+    """#2180: `path` is a worktree of `repo`, whichever form the record kept
+    (common dir from `common_dir`, or top level) and through symlinks."""
+    here = common_dir(path)
+    there = common_dir(repo) if repo and os.path.isdir(repo) else ""
+    return bool(here and there) and _real(here) == _real(there)
+
+
 def _scratch_merge_tree(path: str, ref: str):
     """`git merge-tree --write-tree ref HEAD` whose new objects go to a
     scratch directory (the repository's objects as alternates), deleted
@@ -2760,7 +2768,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # #2180: a reused tracked path may now be a clone, a symlink or a
         # worktree of another repository. Old metadata never authorises it.
         from .housekeeping_discovery import _marker
-        if _marker(path) != "linked" or common_dir(path) != _real(row.get("repo") or ""):
+        if _marker(path) != "linked" or not same_repository(path, row.get("repo") or ""):
             plan.append(dict(base, action="garde",
                              detail="linked worktree no longer matches its tracked repository"))
             continue
