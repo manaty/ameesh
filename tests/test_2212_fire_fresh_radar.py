@@ -80,6 +80,44 @@ class FreshRadarTest(_ConfigFile):
         self.assertIs(config.fresh_radar(cfg), cfg)
 
 
+class ProfileInheritsRadarTest(unittest.TestCase):
+    """Un profil (#1466) sans `radar` prend celui du `config.json` de l'hôte."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(prefix="ameesh-2212-")
+        self.addCleanup(self.dir.cleanup)
+        cfgdir = os.path.join(self.dir.name, ".config", "ameesh")
+        os.makedirs(os.path.join(cfgdir, "runner-profiles"))
+        self.host = os.path.join(cfgdir, "config.json")
+        self.profile = os.path.join(cfgdir, "runner-profiles", "p.json")
+        self.write(self.host, {})
+        self.write(self.profile, {"canon": "/canon"})
+        env = mock.patch.dict(os.environ, {"HOME": self.dir.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def write(self, path, raw) -> None:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(raw if isinstance(raw, str) else json.dumps(raw))
+
+    def test_radar_declared_on_the_host_after_start_reaches_the_profile(self):
+        cfg = config.load({"AMEESH_CONFIG": self.profile})
+        self.write(self.host, {"radar": NEXLINK})
+        self.assertEqual(config.fresh_radar(cfg).radar, NEXLINK)
+
+    def test_the_profile_radar_wins(self):
+        cfg = config.load({"AMEESH_CONFIG": self.profile})
+        self.write(self.host, {"radar": NEXLINK})
+        self.write(self.profile, {"radar": {"projects": {}}})
+        self.assertEqual(config.fresh_radar(cfg).radar, {"projects": {}})
+
+    def test_unreadable_host_config_fails_closed(self):
+        cfg = config.load({"AMEESH_CONFIG": self.profile})
+        self.write(self.host, "{tronqué")
+        with self.assertRaises(ValueError):
+            config.fresh_radar(cfg)
+
+
 class RunnerPassesTest(_ConfigFile):
     """Les passages de l'exécuteur reçoivent la configuration relue."""
 
