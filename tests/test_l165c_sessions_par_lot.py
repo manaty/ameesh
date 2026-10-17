@@ -723,12 +723,18 @@ class BriefDeLotTest(_Base):
                 worker._lot_brief(str(a), "999", {"parked": None})
             consigne = brief.call_args.kwargs["consigne"]
             self.assertNotIn("is put aside and will be resumed", consigne)
-            self.assertIn("no session of lot #999 was put aside: it is finished", consigne)
+            self.assertIn("no session of lot #999 was put aside", consigne)
+            self.assertNotIn("it is finished or no longer assigned", consigne)
             with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
                 worker._lot_brief(str(a), "999", {"parked": "sess-999"})
             consigne = brief.call_args.kwargs["consigne"]
             self.assertIn("the one of lot #999 is put aside", consigne)
             self.assertNotIn("no session of lot #999 was put aside", consigne)
+            with mock.patch.object(reprise, "lot_brief", return_value="brief") as brief:
+                worker._lot_brief(str(a), "", {})
+            consigne = brief.call_args.kwargs["consigne"]
+            self.assertIn("no session was put aside", consigne)
+            self.assertNotIn("lot # was put aside", consigne)
         finally:
             worker.watchdog_stop.set()
 

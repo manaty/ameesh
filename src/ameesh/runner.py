@@ -2328,8 +2328,8 @@ class AgentWorker(threading.Thread):
             aside = ("the one of lot #%s is put aside and will be resumed when "
                      "feedback arrives on it" % courant
                      if out.get("parked") else
-                     "no session of lot #%s was put aside: it is finished or no "
-                     "longer assigned" % courant)
+                     "no session%s was put aside" % (
+                         " of lot #%s" % courant if courant else ""))
             return reprise.lot_brief(
                 self.cfg, self.db, self.agent, lot,
                 reason="new session dedicated to lot #%s" % lot,
