@@ -515,8 +515,11 @@ class AdmissionGuardTest(_Base):
         self.assertEqual(self.tip(), self.base)
 
     def test_a_blocked_verdict_is_refused(self):
+        # #1630 : le témoin vise le blocage lui-même — le préfixe commun
+        # « no review verdict ok » passerait aussi sur un simple manque d'avis.
         self.ready_marks(verdict="blocked")
-        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+        with self.assertRaisesRegex(merge_pr.MergePrError,
+                                    r"blocked verdict\(s\) not lifted: rev1"):
             self.merge(self.gh())
         self.assertEqual(self.tip(), self.base)
 
@@ -591,7 +594,8 @@ class FreshGuardTest(_Base):
             return original(*a, **kw)
 
         with mock.patch.object(merge_pr, "message", side_effect=side_effect):
-            with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+            with self.assertRaisesRegex(merge_pr.MergePrError,
+                                        r"blocked verdict\(s\) not lifted: rev1"):
                 self.merge(gh)
         self.assertEqual(self.tip(), self.base)
 
