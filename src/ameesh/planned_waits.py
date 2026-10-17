@@ -41,7 +41,8 @@ def ancestors(package_id, packages):
         package_id = package.get("parent")
 
 
-def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=()):
+def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=(),
+            landings=()):
     """Pure resolver. Only an open execution lot can block another lot.
 
     Commitments apply to their explicit work item or to their plan package
@@ -53,9 +54,19 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     (`gate:<name>` or `external:<name>`) *holds* its lot until the end of the
     commitment's due day: the gate is not a lot, so nothing else can release
     it, and the date is what makes the hold end by itself.
+
+    #1945: a declared landing (`landings`, rows of `work_landings` enriched
+    with the vehicle's state and last freeze) is an admission PINNED to one
+    freeze. It waits only while the vehicle is open, not `blocked`, its last
+    freeze is exactly `pinned_sha`, and the finite day `until_on` is not past
+    (its day counts in full, like a hold). A new freeze, a missing freeze or a
+    blocked vehicle gives the signal back until the pilot renews the
+    declaration explicitly. A scheduled start, a dependency or a gate stays
+    ahead: the more explicit wait wins. Nothing is inferred from prose or git.
     """
     open_ids = {int(r["id"]) for r in open_items
                 if r.get("state") not in ("merged", "promoted", "closed")}
+    landing_by_item = {int(l["work_item_id"]): l for l in landings}
     package_lots = {}
     for row in open_items:
         if int(row["id"]) not in open_ids:
@@ -133,7 +144,111 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
                     break
         if held:
             waits[ident] = dict(held, what="hold")
+            continue
+        # #1945 (revue B) : l'admission est épinglée au gel du véhicule. Elle
+        # n'éteint que si le véhicule est ouvert, non bloqué, et si son dernier
+        # gel est EXACTEMENT la tête épinglée ; l'échéance (journée finie,
+        # comptée en entier) doit être future. Nouveau gel, gel absent, véhicule
+        # bloqué, retrait ou échéance dépassée : le signal stale revient, et le
+        # pilote renouvelle explicitement la déclaration sur la nouvelle tête.
+        # #2171 N3 : le lot parké doit être EN REVUE (qa) — un atterrissage ne
+        # remplace que l'attente de fusion ; sorti de qa (build, blocked,
+        # waiting_human), le signal revient.
+        landing = landing_by_item.get(ident)
+        if (not landing or row.get("state") != "qa"
+                or landing.get("admitted") is False):
+            continue
+        vehicle = int(landing["vehicle_id"])
+        open_vehicle = landing.get("open")
+        if open_vehicle is None:
+            open_vehicle = vehicle in open_ids
+        etat = landing.get("vehicle_state")
+        pinned = (landing.get("pinned_sha") or "").strip()
+        tete = (landing.get("head") or "").strip()
+        end = hold_end(landing.get("until_on"))
+        if (vehicle == ident or not open_vehicle or etat == "blocked"
+                or not pinned or not tete or pinned != tete
+                or end is None or now >= end):
+            continue
+        wait = {"what": "landing", "vehicle": vehicle,
+                "until": str(landing.get("until_on"))[:10], "head": pinned}
+        if etat:
+            wait["step"] = etat
+        waits[ident] = wait
     return waits
+
+
+def latest_freeze(rows):
+    """Le dernier gel d'un lot : `(at, id)` maximal, jamais l'ordre de lecture.
+
+    #2171 N2 : `set_landing` épingle avec `ORDER BY at DESC, id DESC` ; tous les
+    lecteurs doivent départager un ex aequo de la même façon, sinon la tête
+    comparée à `pinned_sha` peut différer à tort (sens sûr : l'alerte revient).
+    Les jalons non `frozen` ou sans sha ne comptent pas."""
+    freezes = [r for r in rows if r.get("kind") == "frozen"
+               and (r.get("sha") or "").strip()]
+    if not freezes:
+        return None
+    return max(freezes, key=lambda r: (float(r.get("at_ts") or 0),
+                                       int(r.get("id") or 0)))
+
+
+def _admitted(st, rows, landings):
+    """#2171 N3 (revue) : l'admission se relit sur le LOT, pas seulement au geste.
+
+    Le chemin groupé ne doit pas parquer un lot qui a perdu son gel ou son
+    verdict acquis depuis la déclaration (nouveau gel sans verdict, retour en
+    `qa` après un build) : même vérité que `progress._jalons_de_lot`, donc le
+    signal stale revient comme dans `progress`. Trois lectures groupées, pour
+    les seuls lots déclarés."""
+    if not landings:
+        return []
+    from . import progress
+    ids = sorted({int(l["work_item_id"]) for l in landings})
+    by_id = {int(r["id"]): r for r in rows}
+    transitions, actions, declared = {}, {}, {}
+    for row in st.progress.lot_transitions(ids):
+        transitions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_actions(ids):
+        actions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_milestones(ids):
+        declared.setdefault(int(row["work_item_id"]), []).append(row)
+    out = []
+    for landing in landings:
+        ident = int(landing["work_item_id"])
+        item = by_id.get(ident)
+        if item is None:
+            out.append(landing)
+            continue
+        jalons = progress._jalons_de_lot(
+            item, transitions.get(ident, []), actions.get(ident, []),
+            declared.get(ident, []))
+        admitted = (jalons.get("last_frozen") is not None
+                    and jalons.get("verdict_kind") == "ok"
+                    and bool(jalons.get("verdict_current")))
+        out.append(dict(landing, admitted=admitted))
+    return out
+
+
+def _with_heads(st, landings):
+    """#1945 : la tête exacte du véhicule est son dernier gel, lu en base.
+
+    Une lecture groupée pour tous les véhicules déclarés, comparée à chaque
+    passe à la tête épinglée dans `work_landings` (`pinned_sha`) : un nouveau
+    gel ne prolonge donc rien sans renouvellement explicite. Le départage à
+    égalité d'instant est celui de `latest_freeze` (#2171 N2)."""
+    rows = list(landings)
+    vehicles = sorted({int(l["vehicle_id"]) for l in rows})
+    by_vehicle: dict[int, list] = {}
+    if vehicles:
+        for mark in st.progress.lot_milestones(vehicles):
+            by_vehicle.setdefault(int(mark["work_item_id"]), []).append(mark)
+    heads = {vid: latest_freeze(marks) for vid, marks in by_vehicle.items()}
+    out = []
+    for landing in rows:
+        head = heads.get(int(landing["vehicle_id"]))
+        out.append(dict(landing, head=head["sha"].strip()) if head else landing)
+    return out
 
 
 def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=None):
@@ -151,5 +266,7 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     if open_items is None:
         open_items = st.operations.open_lots_activity(None) if any(
             c.get("depends_on") for c in commitments) else []
+    landings = _with_heads(st, _admitted(
+        st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
     return resolve(rows, dates, commitments, packages, open_items, now=now,
-                   dependencies=dependencies)
+                   dependencies=dependencies, landings=landings)
