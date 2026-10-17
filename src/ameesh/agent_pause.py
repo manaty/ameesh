@@ -67,7 +67,10 @@ def cmd_cli(cfg, args, *, paused: bool) -> int:
             out = change(db, args.agent, paused=paused, reason=args.reason,
                          actor=human, principal=human)
         except (PauseRefused, ValueError) as exc:
-            print("ameesh operator pause: %s" % exc, file=sys.stderr)
+            # Le même chemin sert « resume --operator » : nommer le geste
+            # réellement demandé (N3 de la R2 sur #1462).
+            print("ameesh operator %s: %s" % ("pause" if paused else "resume", exc),
+                  file=sys.stderr)
             return 1
         if args.json:
             print(json.dumps(out, ensure_ascii=False))

@@ -881,6 +881,11 @@ class RunnerTest(PgTestCase):
 
         Ici l'ordre est instrumenté : sur une échéance atteinte, le premier
         événement doit être le signal, pas une écriture de journal.
+
+        #971 : `log_async` (le journal du chemin d'arrêt) est instrumenté à
+        part, et les vidages tardifs du fil « journal » — messages mis en file
+        par un test précédent — sont ignorés : l'ordre observé ne dépend plus
+        de l'ordonnancement.
         """
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
@@ -899,12 +904,21 @@ class RunnerTest(PgTestCase):
             vrai_signal(pgid, cible, sig)
 
         def log_trace(message):
+            # #971 : le fil « journal » peut vider ici un message mis en file
+            # par un test précédent (le puits est un singleton de module) :
+            # ce vidage tardif ne compte pas dans l'ordre de CE chemin d'arrêt.
+            if threading.current_thread().name == "journal":
+                return
             ordre.append(("log", message))
+
+        def journal_trace(message):
+            ordre.append(("journal", message))
 
         try:
             with mock.patch.object(AgentWorker, "_signal_group",
                                    staticmethod(signal_trace)), \
-                    mock.patch("ameesh.runner.log", side_effect=log_trace):
+                    mock.patch("ameesh.runner.log", side_effect=log_trace), \
+                    mock.patch("ameesh.runner.log_async", side_effect=journal_trace):
                 self.assertFalse(worker.renew())
             self.assertTrue(worker.lease_lost.is_set())
             self.assertTrue(ordre, "l'arrêt doit être tracé")
@@ -921,6 +935,11 @@ class RunnerTest(PgTestCase):
 
         Un journal bloqué ne doit pas retarder l'arrêt : ici l'ordre est
         instrumenté, le premier événement doit être le signal.
+
+        #971 : `log_async` (le journal du chemin d'arrêt) est instrumenté à
+        part, et les vidages tardifs du fil « journal » — messages mis en file
+        par un test précédent — sont ignorés : l'ordre observé ne dépend plus
+        de l'ordonnancement.
         """
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
@@ -940,12 +959,21 @@ class RunnerTest(PgTestCase):
             vrai_signal(pgid, cible, sig)
 
         def log_trace(message):
+            # #971 : le fil « journal » peut vider ici un message mis en file
+            # par un test précédent (le puits est un singleton de module) :
+            # ce vidage tardif ne compte pas dans l'ordre de CE chemin d'arrêt.
+            if threading.current_thread().name == "journal":
+                return
             ordre.append(("log", message))
+
+        def journal_trace(message):
+            ordre.append(("journal", message))
 
         try:
             with mock.patch.object(AgentWorker, "_signal_group",
                                    staticmethod(signal_trace)), \
                     mock.patch("ameesh.runner.log", side_effect=log_trace), \
+                    mock.patch("ameesh.runner.log_async", side_effect=journal_trace), \
                     mock.patch.object(registry, "renew",
                                       side_effect=db_mod.DbError("base injoignable")):
                 self.assertFalse(worker.renew())

@@ -163,7 +163,7 @@ read without limit (full log, all its actions).
 | `milestones_source` | `milestones` (lot milestones table, L10) \| `events` (deduction) |
 | `blocked_verdicts` | number of blocking verdicts (integer; null if the source does not know) |
 | `blocks` | number of holds (`blocked`, `waiting_human`) |
-| `assignee`, `reviewer` | author; the designated reviewer (`work move … qa --reviewer`, #705) while the review is open, otherwise the author of the retained verdict (approver for a merge action) |
+| `assignee`, `reviewer` | author; the designated reviewer (`work move … qa --reviewer`, #705) while the review is open, otherwise the author of the retained verdict (approver for a merge action); #1979: `null` when the pilot waived the re-verdict (`work reviewer … --no-verdict`) — the lot goes straight to `approved` |
 | `qa_loops` | `qa → build` round trips counted by `work_items` |
 | `updated_ts`, `budget_usd`, `spent_usd` | last modification, lot budget |
 | `actions` | ids of the actions linked to the lot |
@@ -191,7 +191,9 @@ deduction from the transition log:
 
 State: `merged` (`merged`/`promoted`); `blocked` (`blocked`/`waiting_human`);
 in `qa`, `approved` if the retained verdict is `ok` and later than the **last**
-freeze, otherwise `review` (a refrozen lot goes back to review); `active` otherwise
+freeze, or if the pilot waived the re-verdict (`ameesh work reviewer <id>
+--no-verdict`, #1979 — a current blocking verdict keeps `review` and the fix
+due), otherwise `review` (a refrozen lot goes back to review); `active` otherwise
 (`intake`, `build`).
 
 ## `agents[]`
