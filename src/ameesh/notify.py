@@ -53,11 +53,17 @@ stopped is sent on restart); rate limited per human (beyond that, a
 summary); a failing channel does not block the others and is retried on
 later passes, a bounded number of times.
 
-Channels: `desktop`, `ntfy`, `slack`. L66 — the `desktop` channel follows
-the OS through `ameesh.platform.notify`: `notify-send` on Linux, `osascript`
-on macOS, a Windows toast through `powershell.exe` under WSL2; native
-Windows comes with L67. `ameesh doctor --notify-test` says which backend
-this OS uses (and sends a test if a `desktop` route is configured).
+Channels: `desktop`, `ntfy`, `slack`, `app`. L66 — the `desktop` channel
+follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
+`osascript` on macOS, a Windows toast through `powershell.exe` under WSL2;
+native Windows comes with L67. `ameesh doctor --notify-test` says which
+backend this OS uses (and sends a test if a `desktop` route is configured).
+L90 — the `app` channel is the embedded interface: it pushes nothing, the
+application reads the alerts through the mesh's event stream
+(`GET /api/v1/events`, `alert.raised` / `alert.resolved`) and the alerts
+view. Declaring it in a route says that this human's alerts are read in the
+application; without it, a human whose only interface is the application
+would be counted as having no channel.
 """
 from __future__ import annotations
 
@@ -141,7 +147,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "budget_drift",
                  # #532: a local PgBouncer pool queues its mesh clients
                  "pgbouncer_pool_waiting")
-CHANNEL_KINDS = ("desktop", "ntfy", "slack")
+CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_TIMEOUT_S = 10.0
@@ -158,6 +164,9 @@ CHANNEL_OPTIONS = {
     "desktop": ("type", "timeout"),
     "ntfy": ("type", "timeout", "url", "topic", "token_env", "token_file"),
     "slack": ("type", "timeout", "webhook_env", "webhook_file"),
+    # L90 : l'application embarquée lit le journal d'événements ; le canal ne
+    # porte ni adresse ni secret, il déclare seulement la route.
+    "app": ("type", "timeout"),
 }
 TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per_minute",
             "max_attempts", "interval", "timeout")
@@ -438,12 +447,12 @@ def parse_config(raw) -> NotifyConfig:
             raise NotifyConfigError("notify.routes: key %r, `human:<id>` expected" % who)
         routes[human] = _names(names, "notify.routes.%s" % who)
     default = _names(raw.get("default") or [], "notify.default")
-    # un canal nommé par son type (desktop, slack) n'a pas besoin d'être déclaré
+    # un canal nommé par son type (desktop, slack, app) n'a pas besoin d'être déclaré
     for names in list(routes.values()) + [default]:
         for name in names:
             if name in channels:
                 continue
-            if name in ("desktop", "slack"):
+            if name in ("desktop", "slack", "app"):
                 channels[name] = _channel(name, {})
             elif name == "ntfy":
                 raise NotifyConfigError("ntfy channel used without declaration: "
@@ -801,6 +810,13 @@ class Sender:
         _post(url, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
               {"Content-Type": "application/json; charset=utf-8"}, timeout,
               show_url=False)   # l'URL d'un webhook est un secret : jamais journalisée
+
+    def _app(self, channel: Channel, message: Message, timeout: float) -> None:
+        """L90 : le canal de l'interface embarquée. Rien à pousser : l'alerte
+        est déjà dans le journal d'événements (`GET /api/v1/events`), que
+        l'application suit en direct. Le canal réussit donc toujours ; il sert
+        à router un humain vers son application, pas à transporter un texte."""
+        return
 
 
 class DrySender:

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // <ameesh-app>: the default assembly of the components, full screen (the
 // standalone page /ui/), with internal navigation (study §2.2). L88 gives
-// the frame and the seven read screens (L89). Outputs are DOM events (`ameesh:*`), never navigation.
+// the frame and the seven read screens (L89); L90 adds the decisions queue,
+// which files an approval request and emits `ameesh:approval-requested` —
+// standalone, the app opens the ameesh-approve link in the foreground
+// (https anywhere, http only on the loopback); embedded, the host does.
+// Outputs are DOM events (`ameesh:*`), never navigation.
 import { LitElement, css, html } from "lit";
 import { ApiError, type Client, type Schemas } from "../api/client";
 import { languageOf, pick, translate, type Params } from "../i18n/index";
@@ -60,6 +64,9 @@ export class AmeeshApp extends LitElement {
     this.addEventListener("ameesh:open-project", this.#navigate);
     this.addEventListener("ameesh:open-agent", this.#navigate);
     this.addEventListener("ameesh:open-lot", this.#navigate);
+    // L90: in the standalone page this element IS the host (there is no host
+    // script); embedded, the event keeps bubbling and the host opens the link.
+    this.addEventListener("ameesh:approval-requested", this.#openApproval);
     this.#config?.addEventListener(CONFIG_CHANGED, this.#onConfig);
     void this.refresh();
   }
@@ -71,6 +78,7 @@ export class AmeeshApp extends LitElement {
     this.removeEventListener("ameesh:open-project", this.#navigate);
     this.removeEventListener("ameesh:open-agent", this.#navigate);
     this.removeEventListener("ameesh:open-lot", this.#navigate);
+    this.removeEventListener("ameesh:approval-requested", this.#openApproval);
   }
 
   override updated(changed: Map<string, unknown>): void {
@@ -135,9 +143,19 @@ export class AmeeshApp extends LitElement {
       : event.type === "ameesh:open-agent" ? "agent" : "thread";
   };
 
+  // L90: the ameesh-approve link opened in the foreground. Only the standalone
+  // page opens it here (it has no host script); an embedded host decides, the
+  // event keeps bubbling to it. Never `javascript:`, never another scheme.
+  #openApproval = (event: Event): void => {
+    if (!this.standalone) return;
+    const url = approvableUrl((event as CustomEvent).detail?.url);
+    if (url) window.open(url, "_blank", "noopener");
+  };
+
   #screen() {
     const client = this.#client;
     switch (this.section) {
+      case "decisions": return html`<ameesh-decisions .client=${client} theme=${this.theme}></ameesh-decisions>`;
       case "timeline": return html`<ameesh-timeline .client=${client} project=${this.project} theme=${this.theme}></ameesh-timeline>`;
       case "agent": return html`<ameesh-agent .client=${client} project=${this.project} agent=${this.agent} theme=${this.theme}></ameesh-agent>`;
       case "alerts": return html`<ameesh-alerts .client=${client} theme=${this.theme}></ameesh-alerts>`;
@@ -168,7 +186,7 @@ export class AmeeshApp extends LitElement {
             version: ready.discovery.version, mode: ready.discovery.mode })}</span>` : ""}
       </header>
       <nav aria-label=${this.#t("app.nav")}>
-        <ul>${["projects", "timeline", "agent", "alerts", "hosts", "budget", "thread"].map((section) => html`
+        <ul>${["projects", "decisions", "timeline", "agent", "alerts", "hosts", "budget", "thread"].map((section) => html`
           <li><button type="button" aria-current=${this.section === section ? "page" : "false"}
             @click=${() => { this.section = section; }}>${this.#t(section === "projects" ? "app.home" : "view." + section)}</button></li>`)}</ul>
       </nav>
@@ -188,4 +206,21 @@ export class AmeeshApp extends LitElement {
           </form>${this.#screen()}` : ""}
       </main>`;
   }
+}
+
+/** An approval link the standalone page may open itself: https anywhere, http
+ * only on the loopback (a trial mesh); never another scheme. */
+export function approvableUrl(value: unknown): string {
+  if (typeof value !== "string") return "";
+  try {
+    const url = new URL(value);
+    if (url.protocol === "https:") return url.href;
+    if (url.protocol === "http:"
+        && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
+      return url.href;
+    }
+  } catch {
+    return "";
+  }
+  return "";
 }
