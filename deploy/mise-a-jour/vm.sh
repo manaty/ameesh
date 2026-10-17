@@ -48,8 +48,9 @@
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57) : VM (adresse WireGuard), PERSONAS_VM (personas servies
 # par le serveur ; liste vide admise, un hôte sans exécutant). Aucun secret
-# n'est lu ni affiché. ATTENTE_MAX (7200 s) et DRAIN_ATTENTE (300 s, 0 =
-# jamais) se règlent par l'environnement (#2152).
+# n'est lu ni affiché. ATTENTE_MAX (7200 s), DRAIN_ATTENTE (300 s, 0 =
+# jamais) et DRAIN_APPEL_DELAI (60 s, borne des appels de drain, #2184) se
+# règlent par l'environnement (#2152, #2184).
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -96,10 +97,22 @@ ATTENTE_MAX=${ATTENTE_MAX:-7200}
 DRAIN_ATTENTE=${DRAIN_ATTENTE:-300}
 [[ $DRAIN_ATTENTE =~ ^[0-9]+$ ]] \
   || { echo "DRAIN_ATTENTE invalide : « $DRAIN_ATTENTE » (secondes attendues)" >&2; exit 2; }
+# #2184/N3 : un lien SSH mort ou figé ne doit pas suspendre une pose, une
+# levée ou une lecture de drain. Le keepalive borne la connexion ; les appels
+# de drain sont en plus bornés par `timeout` quand il existe (macOS n'en a pas :
+# le keepalive et le délai de connexion restent la garde).
+DRAIN_APPEL_DELAI=${DRAIN_APPEL_DELAI:-60}
+[[ $DRAIN_APPEL_DELAI =~ ^[0-9]+$ ]] \
+  || { echo "DRAIN_APPEL_DELAI invalide : « $DRAIN_APPEL_DELAI » (secondes attendues)" >&2; exit 2; }
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
-ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
+# #2184/N3 : options communes à tous les liens SSH du script. ConnectTimeout
+# borne l'établissement ; ServerAliveInterval/CountMax coupent un lien devenu
+# muet (30 s) au lieu de laisser la commande suspendue.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10
+          -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+ssh_vm() { ssh "${SSH_OPTS[@]}" "root@$VM" "$@"; }
 # #1969 : le helper de bascule atomique est copié depuis le poste, pour que
 # l'installation et le retour emploient la même version quel que soit le
 # commit déployé (l'ancien code n'a pas forcément le fichier).
@@ -193,7 +206,7 @@ paquet_git() {
 # -n : le client consomme son entrée standard même quand la commande distante
 # ne la lit pas. Sans lui, la boucle `while read` de controler_agents lui livre
 # la liste des agents et n'en contrôle qu'un seul (#1455).
-ssh_agents() { ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$AGENTS_SSH" "$@"; }
+ssh_agents() { ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"; }
 utilisateur_agents() {
   local commande; printf -v commande '%q ' "$@"
   ssh_agents "set -euo pipefail
@@ -215,13 +228,31 @@ commande_agents() {
 }
 ameesh_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"; }
 python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/python "$@"; }
+# #2184/N3 : appels de drain bornés. En mode agents, `timeout` tourne dans
+# l'unité transitoire distante (Linux) ; en mode serveur, localement. Sans
+# `timeout` (poste macOS), l'appel reste couvert par le keepalive SSH.
+ameesh_agents_drain() {
+  if command -v timeout >/dev/null 2>&1; then
+    commande_agents timeout "$DRAIN_APPEL_DELAI" \
+      /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"
+  else
+    ameesh_agents "$@"
+  fi
+}
+ameesh_local_drain() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$DRAIN_APPEL_DELAI" "$AMEESH" "$@"
+  else
+    "$AMEESH" "$@"
+  fi
+}
 lire_bail() {
   if [ "$MODE" = agents ]; then
-    ameesh_agents show "$1" --json | python3 -c 'import json,sys
+    ameesh_agents_drain show "$1" --json | python3 -c 'import json,sys
 r=json.load(sys.stdin)
 if r.get("host") != sys.argv[1]: sys.exit("placement modifié")
 print(json.dumps(r))' "$HOTE_AGENTS"
-  else "$AMEESH" show "$1" --json; fi
+  else ameesh_local_drain show "$1" --json; fi
 }
 statut() { lire_bail "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")'; }
 heure_base() {
@@ -261,7 +292,7 @@ proprietaire_de() {
 # contrôleur ne les attend pas (aucun bail d'une persona arrêtée).
 agents_du_registre() {
   local arretes=${1:-} noms
-  noms=$(ameesh_agents list --json | python3 -c 'import json,re,sys
+  noms=$(ameesh_agents_drain list --json | python3 -c 'import json,re,sys
 rows = json.load(sys.stdin)
 avec_arretes = sys.argv[2:] == ["avec-arretes"]
 # Même règle que ameesh.config.NAME_RE (config.py:48), utilisée par
@@ -309,8 +340,19 @@ echec_agent() {
 # Geste d'opérateur : pause et reprise passent par le CLI local, qui refuse
 # une session liée à un agent (bad_actor). Le drain exige donc un chemin
 # opérateur humain (vm.sh lancé hors session d'agent) ; sinon la pose est
-# refusée, le script s'arrête sans redémarrer l'agent et le dit.
+# refusée et le balayage continue sans drain pour cet agent (#2184/N2).
+#
+# #2184/N1 : le registre est relu à chaque passe ; un agent déplacé ou passé
+# en mode non-execute est ignoré et notre drain, s'il est posé, est levé. Un
+# échec de levée n'interrompt plus le balayage : il est consigné, les autres
+# agents continuent, la sortie du script retente la levée.
+#
+# #2184/N6 : en mode agents, le CLI tourne sur la VM ; l'acteur d'audit est
+# l'opérateur du poste, passé explicitement (--human), pas le compte ameesh.
 DRAINS=()  # entrées « persona<TAB>motif exact de la pause posée »
+DRAINS_INDISPONIBLES=()  # personas dont la pose a été refusée (attente simple)
+DRAINS_NON_LEVES=()      # personas dont notre pause n'a pas pu être levée
+OPERATEUR_DRAIN=
 # N4 : l'horloge du drain est injectable par les bancs (fichier de secondes),
 # pour ne pas dépendre d'un budget de temps réel ; en production, c'est
 # l'horloge monotone du shell.
@@ -333,26 +375,43 @@ drain_reprise() {  # raison journalisée par la levée
   printf 'reprise après drain de déploiement #2152 (vm.sh %s) : redémarrage hors tour effectué' \
     "$(drain_lieu)"
 }
+# #2184/N6 : l'humain qui lance vm.sh sur le poste. Même règle que
+# `ameesh serve` (serve.owner) : AMEESH_OPERATEUR explicite, puis le défaut
+# configuré / l'humain déclaré unique, sinon l'utilisateur Unix du poste. Le
+# CLI distant valide le format ; on refuse un acteur illisible plutôt que de
+# consigner un acteur faux.
+operateur_drain() {
+  local h=
+  if [ -n "${AMEESH_OPERATEUR:-}" ]; then
+    h=$AMEESH_OPERATEUR
+  elif [ -x "${AMEESH%/*}/python" ]; then
+    h=$("${AMEESH%/*}/python" -c 'from ameesh import config, serve
+print(serve.owner(config.load()))' 2>/dev/null) || h=
+  fi
+  [ -n "$h" ] || h="human:${USER:-$(id -un)}"
+  [[ $h =~ ^human:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$ ]] || return 1
+  printf '%s' "$h"
+}
 drain_supporte() {  # le CLI de la cible connaît la reprise conditionnelle
   local aide
-  if [ "$MODE" = agents ]; then aide=$(ameesh_agents resume --help 2>&1) || return 1
-  else aide=$("$AMEESH" resume --help 2>&1) || return 1; fi
+  if [ "$MODE" = agents ]; then aide=$(ameesh_agents_drain resume --help 2>&1) || return 1
+  else aide=$(ameesh_local_drain resume --help 2>&1) || return 1; fi
   grep -q -- '--expect-reason' <<<"$aide"
 }
 pause_operateur() {  # $1 persona, $2 motif ; --json : « changed » dit si la pause est nôtre
   if [ "$MODE" = agents ]; then
-    ameesh_agents pause "$1" --reason "$2" --json
+    ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
   else
-    "$AMEESH" pause "$1" --reason "$2" --json
+    ameesh_local_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
   fi
 }
 reprise_operateur() {  # $1 persona, $2 motif attendu ; lève cette pause-là, ou rien
   if [ "$MODE" = agents ]; then
-    ameesh_agents resume "$1" --operator --reason "$(drain_reprise)" \
-      --expect-reason "$2" --json
+    ameesh_agents_drain resume "$1" --operator --reason "$(drain_reprise)" \
+      --expect-reason "$2" --human "$OPERATEUR_DRAIN" --json
   else
-    "$AMEESH" resume "$1" --operator --reason "$(drain_reprise)" \
-      --expect-reason "$2" --json
+    ameesh_local_drain resume "$1" --operator --reason "$(drain_reprise)" \
+      --expect-reason "$2" --human "$OPERATEUR_DRAIN" --json
   fi
 }
 json_champ() {  # $1 champ ; stdin : objet JSON → « 1 »/« 0 » pour un booléen, sinon la valeur
@@ -365,18 +424,20 @@ pause_etat() {  # stdin : `show --json` → « <operator_paused>|<raison> »
 r = json.loads(sys.stdin.read() or "{}")
 print("%d|%s" % (1 if r.get("operator_paused") else 0, r.get("operator_pause_reason") or ""))'
 }
-etat_agent() {  # $1 persona → « statut|pause » (une seule lecture)
+etat_agent() {  # $1 persona → « statut|pause|raison du skip » (une seule lecture)
   if [ "$MODE" = agents ]; then
-    ameesh_agents show "$1" --json | python3 -c 'import json,sys
+    ameesh_agents_drain show "$1" --json | python3 -c 'import json,sys
 r = json.load(sys.stdin)
-if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
-    print("skip|0")
+if r.get("host") != sys.argv[1]:
+    print("skip|0|hôte=%s" % (r.get("host") or "absent"))
+elif (r.get("mode") or "execute") != "execute":
+    print("skip|0|mode=%s" % (r.get("mode") or "execute"))
 else:
-    print("%s|%d" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' "$HOTE_AGENTS"
+    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' "$HOTE_AGENTS"
   else
-    "$AMEESH" show "$1" --json | python3 -c 'import json,sys
+    ameesh_local_drain show "$1" --json | python3 -c 'import json,sys
 r = json.load(sys.stdin)
-print("%s|%d" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))'
+print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))'
   fi
 }
 drain_motif_de() {  # $1 persona → motif exact si ce drain est le nôtre (rc 1 sinon)
@@ -393,9 +454,26 @@ drain_retire() {  # $1 persona : notre drain n'est plus en place
   done
   DRAINS=(${reste[@]+"${reste[@]}"})
 }
+drain_marque_indisponible() {  # $1 persona : ne pas reposer pendant ce balayage
+  DRAINS_INDISPONIBLES+=("$1")
+  echo "$1 : drain indisponible pour ce balayage — attente sans drain, les autres agents continuent" >&2
+}
+drain_est_indisponible() {  # $1 persona
+  local e
+  for e in ${DRAINS_INDISPONIBLES[@]+"${DRAINS_INDISPONIBLES[@]}"}; do
+    [ "$e" = "$1" ] && return 0
+  done
+  return 1
+}
 pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état réel
   local ligne
-  ligne=$(lire_bail "$1") || return 1
+  # #2184/N1 : lecture par nom, sans la garde de placement de lire_bail : un
+  # agent déplacé pendant le drain doit encore pouvoir être constaté levé.
+  if [ "$MODE" = agents ]; then
+    ligne=$(ameesh_agents_drain show "$1" --json) || return 1
+  else
+    ligne=$(ameesh_local_drain show "$1" --json) || return 1
+  fi
   pause_etat <<<"$ligne"
 }
 poser_drain() {  # $1 persona, $2 secondes déjà attendues
@@ -462,8 +540,10 @@ lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
     # était déjà levée. Dans les deux cas notre drain n'est plus en place, et
     # aucune pause étrangère n'a été touchée (R1 B1).
     if ! etat=$(pause_reelle "$1"); then
+      # #2184/N3 : garder l'intention pour une nouvelle tentative du trap ;
+      # rien n'a été levé, l'état ne prouve pas que la pause est partie.
       echo "$1 : reprise conditionnelle sans effet et état illisible — vérifier « ameesh show $1 »" >&2
-      drain_retire "$1"; return 1
+      return 1
     fi
     IFS='|' read -r pose raison <<<"$etat"
     drain_retire "$1"
@@ -493,10 +573,26 @@ lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
   fi
   return 0
 }
+lever_drain_sans_arreter() {  # $1 persona, $2 cause ; consigne l'échec, ne stoppe pas
+  lever_drain "$1" "$2" && return 0
+  local e
+  for e in ${DRAINS_NON_LEVES[@]+"${DRAINS_NON_LEVES[@]}"}; do
+    [ "$e" = "$1" ] && return 1
+  done
+  DRAINS_NON_LEVES+=("$1")
+  return 1
+}
 lever_drains() {  # sortie du script : aucun drain ne survit à la commande
-  local e code=0
-  for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
-    lever_drain "${e%%$'\t'*}" "sortie du script" || code=1
+  local e code tentative
+  # #2184/N3 : une coupure SSH passagère ne doit pas laisser la pause au
+  # premier échec ; une seconde passe, bornée par les timeouts, la retire.
+  for tentative in 1 2; do
+    code=0
+    for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+      lever_drain "${e%%$'\t'*}" "sortie du script" || code=1
+    done
+    [ "$code" = 0 ] && return 0
+    [ "$tentative" = 1 ] && sleep 2
   done
   return "$code"
 }
@@ -504,9 +600,11 @@ trap 'lever_drains || true' EXIT
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes suivantes debut=$(horloge)
-  local etat deja_pause ecoule
+  local etat deja_pause detail ecoule operateur
   local -A debut_tour=()
   local non_verifiees=()
+  DRAINS_INDISPONIBLES=()
+  DRAINS_NON_LEVES=()
   # #1633 : inclure les personas arrêtées pour recharger leur unité active.
   noms=$(agents_du_registre avec-arretes) || return 1
   mapfile -t restantes <<<"$noms"
@@ -517,28 +615,43 @@ redemarrer_agents() {
     echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --expect-reason (installer le code #2152 avant de redémarrer) — attente sans drain" >&2
     DRAIN_ATTENTE=0
   fi
+  # #2184/N6 : l'acteur d'audit est l'opérateur du poste, pas le compte de la
+  # VM. Sans acteur lisible, mieux vaut attendre sans drain que consigner faux.
+  if [ "$DRAIN_ATTENTE" -gt 0 ]; then
+    if ! operateur=$(operateur_drain); then
+      echo "opérateur illisible (human:<id> attendu, ou AMEESH_OPERATEUR) — attente sans drain" >&2
+      DRAIN_ATTENTE=0
+    else
+      OPERATEUR_DRAIN=$operateur
+    fi
+  fi
   etape "exécuteurs de $HOTE_AGENTS (${#restantes[@]}), un par un hors tour"
   while [ "${#restantes[@]}" -gt 0 ]; do
     suivantes=()
     for p in "${restantes[@]}"; do
-      # Le placement peut changer pendant l'attente d'un tour : relire avant
-      # de toucher une unité que cet hôte ne doit plus mener.
+      # #2184/N1 : le placement ou le mode peut changer pendant l'attente du
+      # drain ; relire avant de toucher une unité que cet hôte ne doit plus
+      # mener. Le motif du skip distingue déplacement et changement de mode.
       etat=$(etat_agent "$p") || return 1
-      IFS='|' read -r st deja_pause <<<"$etat"
+      IFS='|' read -r st deja_pause detail <<<"$etat"
       if [ "$st" = skip ]; then
-        lever_drain "$p" "placement modifié" || return 1
-        echo "$p : placement modifié, ignoré"; continue
+        lever_drain_sans_arreter "$p" "agent déplacé ou mode changé ($detail)" || true
+        echo "$p : $detail, ignoré"
+        continue
       fi
       if [ "$st" = running ]; then
         # #2152 : un agent qui enchaîne les tours de continuation ne rend
         # jamais la main ; après DRAIN_ATTENTE, le redémarrage pose lui-même
         # une pause opérateur courte (drain), qui prend effet à la fin du tour.
         # Une pause déjà posée par un autre acteur n'est ni doublée ni levée.
-        if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
+        # #2184/N2 : un refus de pose ne stoppe que le drain de cet agent ;
+        # les autres agents du balayage continuent.
+        if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ] \
+           && ! drain_est_indisponible "$p"; then
           if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$(horloge); fi
           ecoule=$(( $(horloge) - debut_tour[$p] ))
           if [ "$ecoule" -ge "$DRAIN_ATTENTE" ]; then
-            poser_drain "$p" "$ecoule" || return 1
+            poser_drain "$p" "$ecoule" || drain_marque_indisponible "$p"
           fi
         fi
         suivantes+=("$p"); continue
@@ -548,7 +661,7 @@ redemarrer_agents() {
       # sur le nouveau code, sans bail ni tour ; une unité déjà arrêtée n'est
       # pas relancée. #2152 : un drain posé par ce script est levé.
       if [ "$st" = stopped ]; then
-        lever_drain "$p" "persona arrêtée" || return 1
+        lever_drain_sans_arreter "$p" "persona arrêtée" || true
         if utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")"; then
           utilisateur_agents systemctl --user restart "$(unite_agents "$p")" \
             && utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
@@ -569,7 +682,9 @@ redemarrer_agents() {
         || { echec_agent "$p" "ne redémarre pas"; return 1; }
       # #2152 : l'agent est hors tour et l'unité tourne sur le nouveau code —
       # la pause du drain est levée ici, avant la preuve de reprise du bail.
-      lever_drain "$p" "redémarrage hors tour" || return 1
+      # #2184/N2 : un échec de levée est consigné, le balayage continue ; la
+      # sortie du script retente et le code de retour le signale.
+      lever_drain_sans_arreter "$p" "redémarrage hors tour" || true
       if [ "$tenu" = 0 ]; then
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
@@ -588,6 +703,10 @@ redemarrer_agents() {
   done
   if [ "${#non_verifiees[@]}" -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ "${#DRAINS_NON_LEVES[@]}" -gt 0 ]; then
+    etape "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — lever à la main : ameesh resume <agent> --operator --reason …"
+    return 1
   fi
 }
 
@@ -1111,14 +1230,26 @@ redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
   local restantes suivantes debut=$(horloge) st avant ligne heure tenu attendu
-  local etat deja_pause ecoule
+  local etat deja_pause detail ecoule operateur
   local -A debut_tour=()
   non_verifiees=()
+  DRAINS_INDISPONIBLES=()
+  DRAINS_NON_LEVES=()
   # R1 B1 : un CLI (ou une base) antérieur à 0458 ne saurait pas lever la
   # pause conditionnelle ; ne jamais poser un drain qu'on ne saurait pas lever.
   if [ "$DRAIN_ATTENTE" -gt 0 ] && ! drain_supporte; then
     echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --expect-reason (installer le code #2152 avant de redémarrer) — attente sans drain" >&2
     DRAIN_ATTENTE=0
+  fi
+  # #2184/N6 : même en mode serveur, l'acteur consigné est l'opérateur qui
+  # lance vm.sh, pas une identité ambiante du serveur.
+  if [ "$DRAIN_ATTENTE" -gt 0 ]; then
+    if ! operateur=$(operateur_drain); then
+      echo "opérateur illisible (human:<id> attendu, ou AMEESH_OPERATEUR) — attente sans drain" >&2
+      DRAIN_ATTENTE=0
+    else
+      OPERATEUR_DRAIN=$operateur
+    fi
   fi
   # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
   # elles, l'exécuteur redémarré échouerait
@@ -1131,14 +1262,15 @@ redemarrer() {
     for p in "${restantes[@]}"; do
       etat=$(etat_agent "$p") \
         || { echo "$p: registry unreadable — nothing restarted" >&2; exit 1; }
-      IFS='|' read -r st deja_pause <<<"$etat"
+      IFS='|' read -r st deja_pause detail <<<"$etat"
       # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
       # réactive pas.
       # #1633 : son unité encore active est seulement rechargée sur le nouveau
       # code, sans bail ni tour ; une unité déjà arrêtée n'est pas relancée.
-      # #2152 : un drain posé par ce script est levé.
+      # #2152 : un drain posé par ce script est levé. #2184/N2 : un échec de
+      # levée est consigné, le balayage continue.
       if [ "$st" = stopped ]; then
-        lever_drain "$p" "persona arrêtée" || exit 1
+        lever_drain_sans_arreter "$p" "persona arrêtée" || true
         if ssh_vm "systemctl is-active --quiet ameesh-runner@$p"; then
           ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
             || { echo "$p : unité d'une persona arrêtée, ne redémarre pas — journalctl -u ameesh-runner@$p -n 50" >&2; exit 1; }
@@ -1152,11 +1284,13 @@ redemarrer() {
         # #2152 : après DRAIN_ATTENTE, pause opérateur courte (drain) au lieu
         # d'attendre sans fin un agent qui enchaîne les tours ; une pause déjà
         # posée par un autre acteur n'est ni doublée ni levée.
-        if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
+        # #2184/N2 : une pose refusée ne stoppe que le drain de cet agent.
+        if [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ] \
+           && ! drain_est_indisponible "$p"; then
           if [ -z "${debut_tour[$p]:-}" ]; then debut_tour[$p]=$(horloge); fi
           ecoule=$(( $(horloge) - debut_tour[$p] ))
           if [ "$ecoule" -ge "$DRAIN_ATTENTE" ]; then
-            poser_drain "$p" "$ecoule" || exit 1
+            poser_drain "$p" "$ecoule" || drain_marque_indisponible "$p"
           fi
         fi
         suivantes+=("$p"); continue
@@ -1170,7 +1304,8 @@ redemarrer() {
       ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
         || { echo "$p : ne redémarre pas — journalctl -u ameesh-runner@$p -n 50 ; puis « $0 retour »" >&2; exit 1; }
       # #2152 : hors tour et unité relancée — la pause du drain est levée ici.
-      lever_drain "$p" "redémarrage hors tour" || exit 1
+      # #2184/N2 : un échec de levée est consigné, le balayage continue.
+      lever_drain_sans_arreter "$p" "redémarrage hors tour" || true
       if [ "$tenu" = 0 ]; then
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
@@ -1191,6 +1326,10 @@ redemarrer() {
   done
   if [ ${#non_verifiees[@]} -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ ${#DRAINS_NON_LEVES[@]} -gt 0 ]; then
+    etape "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — lever à la main : ameesh resume <agent> --operator --reason …"
+    exit 1
   fi
 }
 

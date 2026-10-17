@@ -321,10 +321,24 @@ class PauseTest(PgTestCase):
         self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
 
     def test_cli_expect_reason_requires_operator(self):
-        out = self.mesh("resume", "worker", "--expect-reason", "drain",
-                        "--human", "human:alice", "--reason", "reprise")
-        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
-        self.assertIn("--expect-reason requires --operator", out.stderr)
+        for motif in ("drain", ""):
+            with self.subTest(motif=motif):
+                out = self.mesh("resume", "worker", "--expect-reason", motif,
+                                "--human", "human:alice", "--reason", "reprise")
+                self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+                self.assertIn("--expect-reason requires --operator", out.stderr)
+
+    def test_conditional_resume_lifts_a_pause_when_the_agent_became_externe(self):
+        """#2184/N1 : le mode change pendant l'attente du drain (0459). La
+        pause posée sur l'agent execute est encore levée avec son motif ;
+        la pose reste, elle, refusée sur un agent externe."""
+        self.change(reason="drain #2152 [nous]")
+        self.assertTrue(registry.set_mode(self.db, "worker", "externe"))
+        self.assertTrue(self.change(False, reason="reprise",
+                                    expect_reason="drain #2152 [nous]")["changed"])
+        self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
+        with self.assertRaises(agent_pause.PauseRefused):
+            self.change(reason="maintenance")
 
     def test_cli_agent_identity_cannot_become_a_human_even_with_a_stale_lease(self):
         out = self.mesh("pause", "worker", "--reason", "maintenance", "--human", "human:alice",
