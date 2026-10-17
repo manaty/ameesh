@@ -374,8 +374,17 @@ class WorkItems(interface.WorkItems):
         # une base d'avant la migration. Les commandes historiques le lisent
         # par cette interface : un SELECT brut serait refusé sur une connexion
         # d'exécuteur médié (`work move`/`note`/`close` d'une VM).
+        # #2130/D : `workflow_stage` et `workflow_version` sont portés par la
+        # même lecture — `project_lots` y passe pour les lots anciens/orphelins
+        # retrouvés par leur marqueur, et la projection a besoin des trois
+        # champs (sinon `projection-stage-missing` sur un lot sain). Une base
+        # pré-0452 rend '', NULL, 0 : aucune sonde de colonne.
         rows = self.db.query(
-            "SELECT %s, coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref"
+            "SELECT %s,"
+            "       coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref,"
+            "       to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
+            "       coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
+            "         AS workflow_version"
             " FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
         return rows[0] if rows else None
 
@@ -999,6 +1008,33 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
             return rows[0]
 
+    def attach_implicit_branch(self, item_id, branch, *, detached_prefix, note,
+                               actor) -> dict | None:
+        """#2102 : la ligne du lot est verrouillée AVANT de lire sa branche et
+        son journal : un détachement (même transaction que son journal)
+        validé avant est vu par la lecture qui suit le verrou, un détachement
+        plus tardif attend ce verrou puis vide la branche ; une branche posée
+        explicitement entre-temps n'est jamais écrasée."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT state FROM work_items WHERE id = %%s AND branch IS NULL"
+                "   AND state NOT IN %s FOR UPDATE" % _CLOSED, (int(item_id),))
+            if not rows:
+                return None
+            if tx.query("SELECT 1 FROM work_item_events WHERE work_item_id = %s"
+                        "   AND starts_with(note, %s) LIMIT 1",
+                        (int(item_id), detached_prefix)):
+                return None
+            rows = tx.query(
+                "UPDATE work_items SET branch = %%s, branch_target = NULL,"
+                "       branch_head = NULL, branch_head_at = NULL, updated_at = now()"
+                " WHERE id = %%s AND branch IS NULL RETURNING %s" % item_columns(self.db),
+                (branch, int(item_id)))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
     # -- numéro de migration réservé (L122) ----------------------------------
     def _release_migration(self, tx, item_id, row, *, why, actor) -> None:
         """#956 : libère la réservation du lot qui entre dans un état terminal
@@ -1341,6 +1377,107 @@ class WorkItems(interface.WorkItems):
             " WHERE assignee = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
             " ORDER BY id" % item_columns(self.db), (assignee,))
 
+    def release_agent(self, agent, *, reason, actor, measure_actor="",
+                      measure_reason="", dry_run=False, stopped_with=()) -> list[dict]:
+        """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+        d'équipe — assigné effacé, journal au lot (raison), délégation en cours
+        annulée —, et ses lots promus (un déploiement porte toujours sa mesure
+        post-déploiement à refaire) vont à `measure_actor` (l'auditeur), journal
+        au lot (`measure_reason`). Le tout dans une transaction ; le lot est
+        verrouillé puis l'assigné recontrôlé : un lot repris entre-temps n'est
+        pas touché. `stopped_with` : si non vide, l'agent est relu et verrouillé
+        dans la transaction, et rien n'est rendu s'il n'est plus `stopped` pour
+        l'une de ces raisons (reprise entre le relevé et le geste). `dry_run` :
+        rien n'est écrit, les lots concernés sont rendus tels quels (clé
+        `assigned_to` pour ceux qui iraient à l'acteur de la mesure)."""
+        with self.db.transaction() as tx:
+            return WorkItems(tx)._release_agent(
+                agent, reason=reason, actor=actor, measure_actor=measure_actor,
+                measure_reason=measure_reason, dry_run=dry_run,
+                stopped_with=stopped_with)
+
+    def _cancel_delegation(self, item_id, actor) -> None:
+        """Annule la délégation en cours du lot (L40), dans la transaction."""
+        self.db.query(
+            "UPDATE work_item_delegations SET outcome = 'annulee',"
+            "       resolved_at = now(), resolved_by = %s"
+            " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
+            (actor or "", int(item_id)))
+
+    def _release_agent(self, agent, *, reason, actor, measure_actor="",
+                       measure_reason="", dry_run=False, stopped_with=()) -> list[dict]:
+        """`release_agent` dans la transaction ouverte."""
+        lock = "" if dry_run else " FOR NO KEY UPDATE"
+        # #753 (N3) : recontrôle de l'agent DANS la transaction. Sans lui, une
+        # reprise (`ameesh resume`) ou un arrêt d'une autre nature entre le
+        # relevé du registre et le geste rendrait les lots d'un agent qui
+        # travaille de nouveau. Verrou de la ligne du registre d'abord (ordre
+        # stable agent -> lots).
+        # #1425 (N6) : cet ordre est un invariant global. Les seules
+        # transactions qui verrouillent les DEUX tables le prennent dans ce
+        # sens — ici et `handoff` (`agent_registry ... FOR SHARE` puis
+        # `work_items`), plus `handoffs.drain` (registre puis lecture des
+        # lots) ; aucun chemin ne verrouille `work_items` puis
+        # `agent_registry`. Le tenir ainsi évite le cycle de verrous que
+        # PostgreSQL devrait sinon détecter et abandonner.
+        if stopped_with:
+            rows = self.db.query(
+                "SELECT status, stop_reason FROM agent_registry"
+                "   WHERE name = %s" + lock, (agent,))
+            if (not rows or rows[0]["status"] != "stopped"
+                    or rows[0]["stop_reason"] not in tuple(stopped_with)):
+                return []
+        out: list[dict] = []
+        # 1. lots ouverts : file d'équipe (assignee = NULL)
+        rows = self.db.query(
+            "SELECT %s FROM work_items WHERE assignee = %%s"
+            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+            " ORDER BY id%s" % (item_columns(self.db), lock), (agent,))
+        for row in rows:
+            if dry_run:
+                out.append(dict(row, dry_run=True))
+                continue
+            updated = self.db.query(
+                "UPDATE work_items SET assignee = NULL, updated_at = now(),"
+                "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                " WHERE id = %%s AND assignee = %%s"
+                "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                " RETURNING %s" % item_columns(self.db), (int(row["id"]), agent))
+            if not updated:
+                continue
+            self._cancel_delegation(row["id"], actor)
+            self._event(int(row["id"]), updated[0]["state"], reason, actor)
+            out.append(updated[0])
+        # 2. lots promus : acteur de la mesure post-deploiement (l'auditeur).
+        #    `work_item_measures` mesure la duree et le diff de livraison, pas
+        #    la mesure d'impact a refaire apres deploiement : elle ne dit donc
+        #    pas si l'action est close (revue auditeur, R1 #753).
+        if measure_actor and measure_actor != agent:
+            limit = "" if dry_run else " FOR NO KEY UPDATE OF w"
+            rows = self.db.query(
+                "SELECT %s FROM work_items w"
+                " WHERE w.assignee = %%s AND w.state = 'promoted'"
+                " ORDER BY w.id%s" % (item_columns(self.db), limit), (agent,))
+            for row in rows:
+                if dry_run:
+                    out.append(dict(row, dry_run=True, assigned_to=measure_actor))
+                    continue
+                updated = self.db.query(
+                    "UPDATE work_items SET assignee = %%s, updated_at = now(),"
+                    "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                    " WHERE id = %%s AND assignee = %%s AND state = 'promoted'"
+                    " RETURNING %s" % item_columns(self.db),
+                    (measure_actor, int(row["id"]), agent))
+                if not updated:
+                    continue
+                self._cancel_delegation(row["id"], actor)
+                self._event(int(row["id"]), "promoted", measure_reason, actor)
+                # #1425 : la même clé que le chemin `dry_run` — sans elle, les
+                # appelants (`cmd_stop`, la passe du runner) journalisaient un
+                # lot remis à l'auditeur comme « retourné à la file d'équipe ».
+                out.append(dict(updated[0], assigned_to=measure_actor))
+        return out
+
     def open_by_ref(self, ref) -> list[dict]:
         """Les lots ouverts désignés par une référence : `issue_ref`, fiche du
         plan (`package_id`), branche, ou premier mot du titre (« REF : … »),
@@ -1594,9 +1731,16 @@ class WorkItems(interface.WorkItems):
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def issue_feed(self, limit) -> list[dict]:
-        """Lots ouverts ou porteurs d'une `issue_ref` (les plus récents d'abord
-        pour la borne), rendus par id croissant, avec l'équipe de leur fiche et
-        l'équipe, le chantier et l'hôte de leur assigné."""
+        """Lots ouverts, porteurs d'une `issue_ref`, ou pinnés sur une révision
+        Process (#2130/D : un cœur `merged` reste projeté ouvert, il doit donc
+        être dans le flux), les plus récents d'abord pour la borne, rendus par
+        id croissant avec l'équipe de leur fiche et l'équipe, le chantier et
+        l'hôte de leur assigné.
+
+        #2130/D : `workflow_ref`, `workflow_stage` et `workflow_version` sont
+        portés par la lecture comme B5 les porte dans `work.get` (`to_jsonb`,
+        sans sonde de colonne) ; base pré-0452 : `''`, NULL, 0.
+        """
         return self.db.query(
             "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
             "       r.chantier AS assignee_chantier, r.host AS assignee_host,"
@@ -1604,11 +1748,17 @@ class WorkItems(interface.WorkItems):
             "       (SELECT extract(epoch from min(m.at))::float8 FROM work_item_milestones m"
             "         WHERE m.work_item_id = w.id AND m.kind = 'merged') AS merged_ts"
             "  FROM (SELECT %s,"
+            "               coalesce(to_jsonb(work_items)->>'workflow_ref', '')"
+            "                 AS workflow_ref,"
+            "               to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
+            "               coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
+            "                 AS workflow_version,"
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
             "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
             "          FROM work_items"
             "         WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
+            "            OR coalesce(to_jsonb(work_items)->>'workflow_ref', '') <> ''"
             "         ORDER BY id DESC LIMIT %%s) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN agent_registry r ON r.name = w.assignee"

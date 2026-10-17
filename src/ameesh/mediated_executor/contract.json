@@ -78,6 +78,62 @@
    ]
   },
   {
+   "name": "agents.runner_seen",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "host",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "owner",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "names",
+     "kind": "positional",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "null"
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
+   },
+   "rules": [
+    "Hôte forcé, names limité aux agents admis, owner préfixé exec:<id>: ; sans test de disponibilité."
+   ]
+  },
+  {
    "name": "agents.get",
    "write": false,
    "transport": "op",
@@ -4189,6 +4245,7 @@
     "lend_basis",
     "record_harness_version",
     "release",
+    "runners",
     "since",
     "usage"
    ],
@@ -4211,6 +4268,7 @@
     "revoke"
    ],
    "leases": [
+    "adopt_session_origin",
     "attach_claim",
     "hold_note",
     "release_hold",
@@ -4239,6 +4297,7 @@
     "adopt",
     "assigners",
     "gauge_history",
+    "gauge_latest",
     "latest_gauges",
     "listing",
     "open_lots_activity",
@@ -4248,6 +4307,7 @@
     "resume",
     "set_dormant",
     "set_settings",
+    "state_lots_activity",
     "turns"
    ],
    "packages": [
@@ -4336,6 +4396,7 @@
     "add_milestone",
     "assign",
     "assignment_events",
+    "attach_implicit_branch",
     "auto_takes_since",
     "backlog",
     "backlog_add",
@@ -4381,6 +4442,7 @@
     "record_resolution",
     "reference",
     "refresh_package_parents",
+    "release_agent",
     "reserve_migration",
     "resolutions",
     "resolve_delegation",

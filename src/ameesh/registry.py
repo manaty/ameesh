@@ -139,6 +139,11 @@ def overview(db: Db) -> list[dict]:
     return storage.of(db).agents.overview()
 
 
+def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> None:
+    """Preuve de vie du runner, indépendante du bail (#508)."""
+    storage.of(db).agents.runner_seen(host, owner, names)
+
+
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 
@@ -161,6 +166,29 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
         name, owner, ttl_seconds, require_responsible=_responsible_required(db))
 
 
+def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+    """Bail vivant et détenu par ce runner, AVEC la ligne lue au passage.
+
+    #811 : le hook a besoin des projets de l'agent (mono/multi) pour son
+    budget de remise (L61) ; la lecture du bail les ramène déjà (`state` porte
+    `projects`, `team`, `chantier`), le troisième élément évite une seconde
+    lecture du registre. `None` quand le backend ne les porte pas.
+    """
+    row = storage.of(db).leases.state(name)
+    if row is None:
+        return False, "agent %s not in the registry" % name, None
+    if row.get("status") == "stopped":
+        return False, "agent stopped", row
+    if (row.get("lease_owner") or "") != owner:
+        return False, "lease held by %s" % (row.get("lease_owner") or "nobody"), row
+    if int(row.get("lease_epoch") or 0) != int(epoch):
+        return (False, "epoch %s in the registry, %s in the session"
+                % (row.get("lease_epoch"), epoch), row)
+    if not row.get("live"):
+        return False, "lease expired", row
+    return True, "", row
+
+
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
     """Le bail est-il vivant et détenu par ce runner à cet epoch ?
 
@@ -168,18 +196,8 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     une session dont le bail a expiré ou a changé de main ne peut plus
     consommer le courrier de l'agent.
     """
-    row = storage.of(db).leases.state(name)
-    if row is None:
-        return False, "agent %s not in the registry" % name
-    if row.get("status") == "stopped":
-        return False, "agent stopped"
-    if (row.get("lease_owner") or "") != owner:
-        return False, "lease held by %s" % (row.get("lease_owner") or "nobody")
-    if int(row.get("lease_epoch") or 0) != int(epoch):
-        return False, "epoch %s in the registry, %s in the session" % (row.get("lease_epoch"), epoch)
-    if not row.get("live"):
-        return False, "lease expired"
-    return True, ""
+    ok, reason, _ = lease_agent(db, name, owner, epoch)
+    return ok, reason
 
 
 def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
@@ -289,6 +307,22 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     les autres opérations de bail.
     """
     return storage.of(db).leases.clear_session(name, owner, epoch)
+
+
+def adopt_session_origin(db: Db, name: str, session_id: str, lot: str, owner: str,
+                         epoch: int, *, harness: str | None = None,
+                         cwd: str | None = None) -> bool:
+    """#1900 B1 : note l'origine d'une session sans origine, **fencé**.
+
+    Sous verrou de ligne et bail vivant (owner, epoch, échéance recontrôlée
+    après l'attente), et seulement si la ligne porte encore `session_id` et
+    `lot` : une session remplacée entre-temps (rotation, remplaçant, autre lot)
+    n'est jamais réécrite. N'écrit que l'origine, le dossier et le harnais.
+    Renvoie False si le bail n'est plus le nôtre, s'il a expiré pendant
+    l'attente du verrou, ou si la session/le lot ont changé.
+    """
+    return storage.of(db).leases.adopt_session_origin(
+        name, owner, epoch, session_id, lot, harness=harness, cwd=cwd)
 
 
 def record_session_history(db: Db, name: str, session_id: str,

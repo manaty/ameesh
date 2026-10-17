@@ -315,6 +315,9 @@ class CertifiedTargetTest(unittest.TestCase):
                     dict(LOTS[-1], branch_target=self.new)]
         registry = mock.Mock()
         registry.work.migration_holder.return_value = None
+        # #2146 : le probe consulte aussi les numéros déjà atterris (L1567) ;
+        # le registre simulé doit le dire, sinon un Mock truthy les tairait.
+        registry.work.migration_landed_holder.return_value = None
         for published in (None, "0" * 40):
             with self.subTest(published=published), mock.patch.object(
                     migration_reservations.storage, "of", return_value=registry):

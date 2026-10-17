@@ -298,7 +298,40 @@ def _coverage_disponible() -> bool:
 _coverage_installe = _coverage_disponible
 
 
-class CouvertureTronqueeTest(unittest.TestCase):
+class _PetitDepot:
+    """#1770 : les cas de corruption appellent `carte.merge` plusieurs fois, et
+    chaque appel rescannait `SRC.rglob("*.py")` sur tout le dépôt (~10 s en
+    local, ~40 s sur un runner chargé) : le module pesait 24 min de carte.
+
+    Un arbre source minimal, de même forme que le dépôt (`src/ameesh/*.py` et
+    `src/ameesh/migrations/`), garde les mêmes assertions — `relative_path`
+    ramène tout chemin mesuré à `src/…` — sans rescanner le dépôt. Aucun
+    produit n'est touché : seules les globales du lecteur de carte sont
+    pointées sur la fixture le temps du cas."""
+
+    #: même forme que le dépôt : un module mesuré et une migration lue.
+    FICHIERS = {
+        "src/ameesh/db.py": "def lire():\n    return 1\n",
+        "src/ameesh/autre.py": "VALEUR = 1\n",
+        "src/ameesh/migrations/0001_fixture.sql": "create table t (x integer);\n",
+    }
+
+    def setUp(self):
+        super().setUp()
+        racine = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, racine)
+        for relatif, contenu in self.FICHIERS.items():
+            chemin = racine / relatif
+            chemin.parent.mkdir(parents=True, exist_ok=True)
+            chemin.write_text(contenu, encoding="utf-8")
+        for nom, valeur in (("REPO", racine), ("SRC", racine / "src"),
+                            ("MIGRATIONS", racine / "src" / "ameesh" / "migrations")):
+            patcheur = mock.patch.object(carte, nom, valeur)
+            patcheur.start()
+            self.addCleanup(patcheur.stop)
+
+
+class CouvertureTronqueeTest(_PetitDepot, unittest.TestCase):
     """#1257 : une couverture tronquée (processus tué pendant l'écriture de sa
     donnée) ne fait plus échouer la fusion de la carte ; elle est ignorée et
     nommée, et les autres parts restent mesurées."""
@@ -557,7 +590,7 @@ class _FauxCoverageData:
         return {}
 
 
-class ArtefactIncompletTest(unittest.TestCase):
+class ArtefactIncompletTest(_PetitDepot, unittest.TestCase):
     """#1690 : un artefact de mesure illisible est signalé, jamais compté."""
 
     @staticmethod
@@ -732,19 +765,70 @@ def _arbre(chemin):
     return _ARBRES[chemin]
 
 
+def _lien_de_valeur(valeur, liens):
+    """(module, nom d'origine) si `valeur` est un nom déjà lié ou l'attribut
+    d'un nom déjà lié (`_land.PrLandTest`), sinon None."""
+    if isinstance(valeur, ast.Name):
+        return liens.get(valeur.id)
+    if isinstance(valeur, ast.Attribute) and isinstance(valeur.value, ast.Name):
+        origine = liens.get(valeur.value.id)
+        if origine is not None:
+            return f"{origine[0]}.{origine[1]}", valeur.attr
+    return None
+
+
+def _etoiles(module: str) -> list:
+    """Noms liés par `from <module> import *` : les classes publiques du module
+    cible, ou celles d'un `__all__` littéral explicite."""
+    chemin = _fichier_module(module)
+    if chemin is None:
+        return []
+    arbre = _arbre(chemin)
+    noms = None
+    for node in arbre.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(cible, ast.Name) and cible.id == "__all__"
+                for cible in node.targets):
+            try:
+                noms = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                noms = None
+    exports = set(noms) if isinstance(noms, (list, tuple)) \
+        and all(isinstance(nom, str) for nom in noms) else None
+    return [node.name for node in arbre.body
+            if isinstance(node, ast.ClassDef)
+            and (node.name in exports if exports is not None
+                 else not node.name.startswith("_"))]
+
+
 def _liens(chemin) -> dict:
     """Nom lié au niveau module -> (module, nom d'origine) pour les
-    `from … import …` (relatifs compris). Seul le niveau module compte : une
-    importation dans une fonction ne lie rien pour le collecteur unittest."""
+    `from … import …` (relatifs compris), les affectations `Nom = Nom` ou
+    `Nom = module.Nom` d'un nom déjà lié, et les étoiles (`from … import *` :
+    classes publiques du module cible). Seul le niveau module compte : une
+    importation ou une affectation dans une fonction ne lie rien pour le
+    collecteur unittest."""
     liens = {}
     for node in _arbre(chemin).body:
-        if not isinstance(node, ast.ImportFrom):
-            continue
-        base = node.module or ""
-        if node.level:
-            base = "tests" + (f".{base}" if base else "")
-        for alias in node.names:
-            liens[alias.asname or alias.name] = (base, alias.name)
+        if isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                base = "tests" + (f".{base}" if base else "")
+            for alias in node.names:
+                if alias.name == "*":
+                    for nom in _etoiles(base):
+                        liens[nom] = (base, nom)
+                else:
+                    liens[alias.asname or alias.name] = (base, alias.name)
+        elif isinstance(node, ast.Assign):
+            lien = _lien_de_valeur(node.value, liens)
+            for cible in node.targets:
+                if not isinstance(cible, ast.Name):
+                    continue
+                if lien is not None:
+                    liens[cible.id] = lien
+                else:
+                    liens.pop(cible.id, None)
     return liens
 
 
@@ -793,6 +877,70 @@ def _a_des_tests(module: str, nom: str, vus=None) -> bool:
         elif nom_base in liens and _a_des_tests(*liens[nom_base], vus):
             return True
     return False
+
+
+class LiensTest(unittest.TestCase):
+    """#1944 : `_liens` suit aussi les deux formes qui lient une classe au
+    niveau module sans `from … import <classe>` — l'affectation d'un nom déjà
+    lié (`Clone = _module.Classe`) et l'étoile (`from … import *`). Sans
+    elles, le contrat d'attribution laissait passer une classe concrète
+    étrangère liée au module."""
+
+    def _liens_du_texte(self, texte: str) -> dict:
+        dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dossier)
+        chemin = pathlib.Path(dossier, "test_1944_exemple.py")
+        chemin.write_text(texte, encoding="utf-8")
+        return _liens(chemin)
+
+    def test_affectation_d_un_nom_deja_lie(self):
+        liens = self._liens_du_texte(
+            "from .test_l161e_map import AttributionContractTest as _A\n"
+            "AttributionClone = _A\n")
+        self.assertEqual(liens["AttributionClone"],
+                         ("tests.test_l161e_map", "AttributionContractTest"))
+        self.assertTrue(_a_des_tests(*liens["AttributionClone"]))
+
+    def test_affectation_d_un_attribut_d_un_module_lie(self):
+        liens = self._liens_du_texte(
+            "from . import test_l161e_map as _carte\n"
+            "AttributionClone = _carte.AttributionContractTest\n")
+        self.assertEqual(liens["AttributionClone"],
+                         ("tests.test_l161e_map", "AttributionContractTest"))
+        self.assertTrue(_a_des_tests(*liens["AttributionClone"]))
+
+    def test_etoile_lie_les_classes_publiques(self):
+        liens = self._liens_du_texte("from .test_l161e_map import *\n")
+        self.assertEqual(liens["AttributionContractTest"],
+                         ("tests.test_l161e_map", "AttributionContractTest"))
+        self.assertTrue(_a_des_tests(*liens["AttributionContractTest"]))
+        self.assertNotIn("_FauxCoverageData", liens)
+
+    def test_affectation_hors_lien_ignoree(self):
+        liens = self._liens_du_texte(
+            "AttributionClone = objet.AttributionContractTest\n"
+            "Vide = 3\n")
+        self.assertEqual({}, liens)
+
+    def test_reaffectation_efface_le_lien(self):
+        liens = self._liens_du_texte(
+            "from . import test_l161e_map as _carte\n"
+            "Clone = _carte.AttributionContractTest\nClone = None\n")
+        self.assertNotIn("Clone", liens)
+
+    def test_affectation_chainee_resout_la_valeur_une_fois(self):
+        liens = self._liens_du_texte(
+            "from . import test_l161e_map as _carte\n"
+            "_carte = Clone = _carte.AttributionContractTest\n")
+        self.assertEqual(liens["_carte"], liens["Clone"])
+
+    def test_etoile_respecte_all_explicite(self):
+        for noms, attendu in (("[]", []), ("['_Prive']", ["_Prive"])):
+            arbre = ast.parse(
+                f"__all__ = {noms}\nclass Publique: pass\nclass _Prive: pass\n")
+            with self.subTest(noms=noms), mock.patch(
+                    __name__ + "._arbre", return_value=arbre):
+                self.assertEqual(_etoiles("tests.test_l161e_map"), attendu)
 
 
 class AttributionContractTest(unittest.TestCase):

@@ -84,9 +84,10 @@ ESM) with `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`
 
 ## Screens
 
-The bundle served at `/ui/ameesh-ui.js` registers `<ameesh-app>` and seven
+The bundle served at `/ui/ameesh-ui.js` registers `<ameesh-app>` and eight
 independent elements: `<ameesh-projects>`, `<ameesh-timeline>`, `<ameesh-agent>`,
-`<ameesh-alerts>`, `<ameesh-hosts>`, `<ameesh-budget>` and `<ameesh-thread>`.
+`<ameesh-alerts>`, `<ameesh-hosts>`, `<ameesh-budget>`, `<ameesh-thread>` and
+`<ameesh-decisions>`.
 The standalone `/ui/` page assembles them with internal navigation.
 
 An embedded screen uses the nearest `<ameesh-config api-base="…">`, or a
@@ -109,7 +110,20 @@ Selection buttons emit bubbling, composed `ameesh:open-project`,
 `ameesh:open-agent` and `ameesh:open-lot` events. Their `detail` contains the
 selected `project`, `agent` or `lot`; the host chooses navigation. The app handles
 these events internally while leaving them available to its host. Thread text
-is rendered literally. These screens do not expose write actions.
+is rendered literally.
+
+`<ameesh-decisions>` (R17) is the human's single queue: gated actions waiting for
+an approval, requests filed by agents, lots waiting for a human, prose decisions.
+Its "Approve" button does not approve. It files the request
+(`POST /api/v1/actions/{id}/approval-request`) and emits a bubbling, composed
+`ameesh:approval-requested` event whose `detail` carries the `action` and the
+`url` of the ameesh-approve link; the host opens that link in the foreground
+(the component never navigates, contract §2.2). On the standalone page the link
+stays a real `target="_blank" rel="noopener noreferrer"` anchor: the human opens
+it. The passkey is signed on ameesh-approve's origin and the receipt comes back
+through the event stream (`receipt.attached`). One `Idempotency-Key` per action
+makes a retry after a network refusal replay the same request instead of filing
+twice. No other screen exposes a write action.
 
 Views using the same client share one `/api/v1/events` connection. Event bursts
 coalesce into at most one scheduled refresh per second per view; a change during

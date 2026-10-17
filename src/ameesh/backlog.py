@@ -491,6 +491,13 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     return bool((item.get("lot_team") or "").strip())
 
 
+def _lot_project(item: dict) -> str:
+    """Le projet d'un lot pour le dossier de travail : son dépôt (`app`)
+    d'abord, son équipe ensuite — même clé que `lot_workdir.project` (#811 N2 :
+    `lot_fits` filtrait sur `lot_team`, le dossier se résout sur `app`)."""
+    return (item.get("app") or item.get("lot_team") or item.get("team") or "").strip()
+
+
 def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
              others=None) -> bool:
     """Le lot vise-t-il un des projets de l'agent, et l'agent sait-il le faire ?
@@ -501,7 +508,7 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
     """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
-    team = (item.get("lot_team") or "").strip()
+    team = _lot_project(item)
     from . import projects as projects_mod
     if not team or team not in projects_mod.agent_projects(agent):   # L243: membre
         return False
@@ -518,6 +525,67 @@ def _primary_project(agent: dict) -> str:
     from . import projects as projects_mod
     names = projects_mod.agent_projects(agent)
     return names[0] if names else ""
+
+
+#: #1538 : marque d'un refus de dossier dans le journal d'un élément. La
+#: relecture se fait sur ce préfixe, jamais sur le texte complet : la note
+#: nomme l'agent qui l'a rencontré, mais elle est unique PAR ÉLÉMENT.
+#: #1900 N2 : c'est ce même préfixe que lit le relevé borné de la passe.
+DIRECTORY_NOTE_PREFIX = "L243-4:"
+
+
+class _DirNotes:
+    """Les éléments dont le refus de dossier a déjà été noté, lus une fois par
+    passe (#1900 N2).
+
+    La lecture est paresseuse — aucun item ne manque de dossier, aucune
+    requête — et bornée au préfixe DIRECTORY_NOTE_PREFIX ; `has` répond
+    ensuite en mémoire, `add` retient l'élément que `_directory_ready` vient
+    d'écrire. Sans elle, chaque passe d'`auto_take` relisait les 100 derniers
+    événements de chaque lot dont le dossier manque, pour chaque agent
+    candidat."""
+
+    def __init__(self, store):
+        self._store = store
+        self._items: set[int] | None = None
+
+    def _load(self) -> set[int]:
+        if self._items is None:
+            self._items = {int(row["work_item_id"])
+                           for row in self._store.events_noted(DIRECTORY_NOTE_PREFIX, 0.0)}
+        return self._items
+
+    def has(self, item_id) -> bool:
+        return int(item_id) in self._load()
+
+    def add(self, item_id) -> None:
+        self._load().add(int(item_id))
+
+
+def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, notes=None):
+    from . import lot_workdir, work
+    reason = lot_workdir.problem(cfg, agent, project, canons=canons)
+    if reason is None:
+        return True
+    # #811 N1 : hors périmètre (raison vide) — aucune note ; #1538 : une raison
+    # réelle (dossier déclaré absent ou ambigu) est notée une fois PAR ÉLÉMENT,
+    # quel que soit l'agent qui bute dessus — pas une note par (agent, élément).
+    # `notes` (le relevé borné de la passe) retient les éléments déjà notés :
+    # le journal n'est pas relu pour chaque couple (agent, élément) du lot.
+    if not dry_run and reason:
+        note = "%s %s cannot pick up project %s: %s" % (
+            DIRECTORY_NOTE_PREFIX, agent["name"], project, reason)
+        if notes is not None:
+            # #1900 N2 : le relevé borné de la passe porte les éléments déjà
+            # notés (une requête), plus les 100 derniers événements du lot
+            # relus par élément tant que le dossier manque.
+            if not notes.has(item["id"]):
+                work.note(db, item["id"], note, actor=SENDER)
+                notes.add(item["id"])
+        elif not any((e.get("note") or "").startswith(DIRECTORY_NOTE_PREFIX)
+                     for e in work.events(db, item["id"])):
+            work.note(db, item["id"], note, actor=SENDER)
+    return False
 
 
 def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
@@ -578,6 +646,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    # #1900 N2 : une lecture paresseuse et bornée des notes de dossier pour
+    # toute la passe (les deux boucles ci-dessous la partagent).
+    dir_notes = _DirNotes(st.work)
 
     # #804 : la place restante est relue avant **chaque** prise, pas une fois
     # par passe. Les compteurs sont en base et partagés par tous les
@@ -689,15 +760,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
-            # L243 : tant que le dossier de travail par lot n'existe pas
-            # (#811), la prise automatique reste sur le projet primaire — un
-            # lot d'un autre projet ne s'attribue qu'explicitement.
-            primary = _primary_project(agent)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"]), others=listing):
                     continue
-                if (item.get("lot_team") or "").strip() != primary:
+                if not _directory_ready(cfg, db, agent, item, _lot_project(item),
+                                        canons=canons, dry_run=dry_run, notes=dir_notes):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -763,15 +831,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not auditor_mod.may_take(agent, canons):
             continue
         auditors = auditor_mod.cards([agent], canons)
-        primary = _primary_project(agent)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
                         card=auditors.get(row["name"]), others=listing):
                 continue
-            # L243 : même règle que les lots — un élément d'un autre projet
-            # attend une attribution explicite (#811).
-            team = (item.get("team") or "").strip()
-            if team and team != primary:
+            if not _directory_ready(cfg, db, agent, item, _lot_project(item),
+                                    canons=canons, dry_run=dry_run, notes=dir_notes):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,

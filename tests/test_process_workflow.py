@@ -270,6 +270,20 @@ class GrapheTest(WorkflowTestCase):
         document["stages"].append({"status": "draft", "core": "build"})
         self.assertRefusal("stage-duplicate", self.compile, document)
 
+    def test_etape_avec_espaces_en_bord_refusee(self):
+        for status in (" draft", "draft ", "\tdraft"):
+            with self.subTest(status=status):
+                document = fixture()
+                document["stages"][0]["status"] = status
+                self.assertRefusal("stage-padded", self.compile, document)
+
+    def test_etape_dupliquee_a_la_casse_pres_refusee(self):
+        for status in ("Draft", "DRAFT", "dRaFt"):
+            with self.subTest(status=status):
+                document = fixture()
+                document["stages"].append({"status": status, "core": "build"})
+                self.assertRefusal("stage-case-duplicate", self.compile, document)
+
     def test_core_inconnu_refuse(self):
         for core in ("blocked", "waiting_human", "inconnu"):
             with self.subTest(core=core):

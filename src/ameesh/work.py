@@ -432,6 +432,81 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
     return row
 
 
+#: #2102 : le début de la ligne de journal d'un détachement, suivi du nom
+#: court de la branche et d'une espace ; le relevé des fusions n'associe plus
+#: implicitement (L118b) une branche ainsi détachée
+DETACH_NOTE = "branch detached: "
+
+
+def _detach_prefix(branch: str) -> str:
+    from . import plan_git
+
+    return "%s%s " % (DETACH_NOTE, plan_git.short_branch(branch))
+
+
+def is_detached(st, item_id: int, branch: str) -> bool:
+    """#2102 : la branche `branch` a été détachée du lot par `detach_branch`
+    (une ligne de journal la nomme). `st` : le stockage (`storage.of`)."""
+    prefix = _detach_prefix(branch)
+    return any((e.get("note") or "").startswith(prefix)
+               for e in st.work.assignment_events(int(item_id), [prefix]))
+
+
+def attach_implicit_branch(db: Db, item_id: int, branch: str, *, source: str,
+                           actor: str = "") -> dict | None:
+    """L118b, #2102 : la branche implicite `lot/<id>-…` devient celle du lot,
+    journalisée, seulement si le lot n'a toujours pas de branche et qu'elle
+    n'en a pas été détachée — vérifié atomiquement par le stockage, pour
+    qu'un détachement ou une branche explicite posés pendant le relevé ne
+    soient pas écrasés. Rend le lot, ou None si rien n'est posé."""
+    note = "branch %s — %s (before: none)" % (branch, source)
+    return storage.of(db).work.attach_implicit_branch(
+        item_id, branch, detached_prefix=_detach_prefix(branch), note=note, actor=actor)
+
+
+def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: str,
+                  actor: str = "") -> dict:
+    """#2102 : retire la branche d'un lot ouvert (PR fermée ou supplantée),
+    sans toucher à son état, son titulaire ni son relecteur ; journalisé avec
+    la raison et le dernier commit vu. Git n'est pas touché : la branche et
+    ses commits restent là où ils sont. Le relevé des fusions ne réassocie
+    plus implicitement ce nom ; une réassociation se fait explicitement
+    (`set_branch`, `ameesh work branch <id> <branche>`).
+
+    `branch` : la branche à détacher, par défaut celle du lot ; un lot sans
+    branche peut nommer celle à ne plus associer (détachement fait hors CLI).
+    Un nom déjà détaché d'un lot sans branche ne réécrit rien. Rend le lot."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise WorkError("a detachment needs a reason (--reason)")
+    named, _ = _branch_args(branch, None)
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    from . import plan_git
+
+    current = item.get("branch") or None
+    name = named or current
+    if not name:
+        raise WorkError("lot %s has no branch: name the branch to detach" % item_id)
+    if current and plan_git.short_branch(name) != plan_git.short_branch(current):
+        raise WorkError("lot %s carries the branch %s, not %s" % (item_id, current, name))
+    st = storage.of(db)
+    if not current and is_detached(st, item_id, name):
+        return item
+    head = (item.get("branch_head") or "").strip()
+    note = "%s(%s%s) — %s; the merge sweep no longer associates it implicitly " \
+           "(to associate it again: ameesh work branch %d %s)" % (
+               _detach_prefix(name),
+               "last seen %s" % head[:12] if head else "no commit seen",
+               ", target %s" % item["branch_target"] if item.get("branch_target") else "",
+               reason, int(item_id), plan_git.short_branch(name))
+    row = st.work.set_branch(item_id, None, None, note=note, actor=actor)
+    if row is None:
+        raise WorkError("lot %s already %s: branch not detached" % (item_id, item["state"]))
+    return row
+
+
 # --------------------------------------------------------------------------
 # numéro de migration réservé (L122)
 # --------------------------------------------------------------------------
@@ -676,6 +751,65 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
 def open_lots(db: Db, assignee: str) -> list[dict]:
     """L118 : les lots ouverts d'un assigné (ni livrés, ni fermés)."""
     return storage.of(db).work.open_for(assignee)
+
+
+#: #753 (B1, R2 Claude) : seuls les arrêts DÉLIBÉRÉS rendent les lots. Un arrêt
+#: automatique et réversible (`erreur` de `stop_after_failures`, `retire_du_canon`
+#: que `canon.revive` annule, `bail_expire`, `externe`) laisse l'agent reprendre
+#: ses lots à la reprise : sinon une panne fournisseur dessaisirait en rafale
+#: tous ses agents. Le pilote peut y ajouter `retire_du_canon` s'il le juge
+#: délibéré.
+RELEASABLE_STOP_REASONS = ("manuel",)
+
+
+def release_lots(db: Db, agent: str, *, reason: str, actor: str = "",
+                 measure_actor: str = "", measure_reason: str = "",
+                 dry_run: bool = False,
+                 stopped_with: tuple[str, ...] = ()) -> list[dict]:
+    """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+    d'équipe — assigné effacé (assignee = NULL), journal au lot avec la raison,
+    délégation en cours annulée —, et ses lots promus (un déploiement porte
+    toujours sa mesure post-déploiement à refaire) vont à `measure_actor`
+    (l'auditeur), avec `measure_reason`. Rend les lots rendus ; idempotent (un
+    lot repris ou fermé entre-temps n'est pas touché). `dry_run` : ce qui
+    serait fait, rien n'est écrit. `stopped_with` : si non vide, la transaction
+    revérifie que l'agent est encore `stopped` pour l'une de ces raisons avant
+    de rendre un lot — sans quoi une reprise (`ameesh resume`) entre le relevé
+    du registre et le geste dessaisirait un agent qui travaille de nouveau."""
+    name = (agent or "").strip()
+    if not name:
+        return []
+    return storage.of(db).work.release_agent(
+        name, reason=reason, actor=actor, measure_actor=measure_actor,
+        measure_reason=measure_reason, dry_run=dry_run,
+        stopped_with=stopped_with)
+
+
+def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
+    """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
+    l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent
+    du canon porte le rôle). Un auditeur arrêté ou mort n'est pas un acteur :
+    on ne réassigne pas un lot à un agent arrêté, ce serait le mal que ce lot
+    corrige. Chaîne vide s'il n'y a aucun auditeur vivant, ou plusieurs sans
+    choix évident : les lots promus restent alors en place. Jamais
+    d'exception. `canons` : canons déjà chargés (le balayage de l'exécuteur
+    espace cette lecture, #1425 N5) ; `None` les lit ici."""
+    from . import alert_briefs, registry
+
+    try:
+        if listing is None:
+            listing = registry.overview(db)
+    except Exception:  # noqa: BLE001 - jamais fatal à l'arrêt d'un agent
+        return ""
+    living = {row.get("name") for row in listing
+              if row.get("name")
+              and (row.get("status") or "") not in ("stopped", "dead")}
+    if alert_briefs.AUDITOR_NAME in living:   # le nom suffit : pas de canon
+        return alert_briefs.AUDITOR_NAME
+    names = [name for name in alert_briefs.auditors(
+                 listing, configured_canons(cfg) if canons is None else canons)
+             if name in living]
+    return names[0] if len(names) == 1 else ""
 
 
 # --------------------------------------------------------------------------
@@ -1883,11 +2017,13 @@ def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
-#: les jalons d'un lot : `requested` et `merged` sont automatiques (0013),
-#: `closed` et `delivered` le sont aussi (fermeture, #988), `frozen` et
-#: `verdict` se déclarent par la CLI.
-MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed", "delivered")
-MANUAL_KINDS = ("frozen", "verdict")
+#: les jalons d'un lot : `requested`, `merged`, `closed` et `delivered` sont
+#: automatiques (0013, 0026, fermeture #988) ; `frozen`, `verdict`, `fire` et
+#: `unfire` se déclarent par la CLI — le feu (`fire`/`unfire`, #1374) par
+#: `ameesh work fire` seulement, qui vérifie qu'il porte sur le gel courant
+#: (`ameesh.fire`).
+MILESTONE_KINDS = ("requested", "frozen", "verdict", "fire", "unfire", "merged", "closed", "delivered")
+MANUAL_KINDS = ("frozen", "verdict", "fire", "unfire")
 VERDICTS = ("ok", "blocked")
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
@@ -1929,11 +2065,12 @@ def milestone(
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
-    `frozen` (la branche est gelée pour la revue) et `verdict` (`ok` ou
-    `blocked`, avec le `sha` relu) sont les deux seuls : `requested`, `merged`,
-    `closed` et `delivered` sont écrits automatiquement (transitions et
-    fermeture, 0013 et #988), les déclarer à la main serait un mensonge sur la
-    frise.
+    `frozen` (la branche est gelée pour la revue), `verdict` (`ok` ou
+    `blocked`, avec le `sha` relu), et `fire`/`unfire` (le feu du pilote et son
+    retrait, #1374) sont les seuls déclarés : `requested`, `merged`, `closed`
+    et `delivered` sont écrits automatiquement (transitions, fermeture et
+    livraison hors cible : 0013, 0026, #988), les déclarer à la main serait un
+    mensonge sur la frise.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -1944,6 +2081,9 @@ def milestone(
     imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
     le raccord de la désignation des relecteurs se branche à l'activation du
     lot #1617, pas ici.
+
+    Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
+    porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))

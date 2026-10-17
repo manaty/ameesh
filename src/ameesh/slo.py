@@ -226,8 +226,11 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))
-        else:
-            # pas encore démarré : le délai court depuis que le lot est prêt
+        elif state == "intake":
+            # prêt, pas encore démarré : le délai court depuis que le lot est
+            # prêt. Passé intake sans événement `build` (#1982), la phase est
+            # franchie mais non mesurable : aucune ligne, donc aucun retard
+            # inventé — seules l'origine réelle et les durées mesurées restent.
             out.append(_row(step, ready, now=now, critical=critical))
 
     if state == "build":

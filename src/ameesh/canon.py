@@ -2887,6 +2887,15 @@ class _Loader:
                              **where, **subject)
                     continue
                 parsed[key] = number
+            elif key in resources_mod.ZOMBIE_KEYS:
+                # #2022: a count of processes
+                count = resources_mod.parse_count(value)
+                if count is None:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.resources.%s`: positive integer expected" % key,
+                             **where, **subject)
+                    continue
+                parsed[key] = count
             elif key in resources_mod.FRACTION_KEYS:
                 part = resources_mod.parse_fraction(value)
                 if part is None:

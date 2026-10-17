@@ -16,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 64 opérations et la liste des 364 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 65 opérations et la liste des 370 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -59,12 +59,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 64 opérations, dont 25 lectures et 39 écritures. 54 passent par
+Comptes : 65 opérations, dont 25 lectures et 40 écritures. 55 passent par
 `op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Six
 lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
 sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (428
+signature et les mêmes types. Il vérifie aussi que l'interface entière (435
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -90,6 +90,13 @@ l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de
 même. Sur un exécuteur médié, l'attente de pression ne s'affiche pas, et une
 pause critique n'est pas levée d'elle-même quand la pression retombe,
 comme avant L31b.
+
+`leases.adopt_session_origin` (#1900 B1 : noter l'origine d'une session sans
+origine sous un bail vivant, en n'écrivant que l'origine, le dossier et le
+harnais quand la session et le lot n'ont pas changé) est refusée aussi : le
+client la refuse avant tout appel, `registry` la traite comme une écriture
+impossible et garde la bascule forcée d'avant #1900. L'adoption d'une session
+sans origine reste donc l'affaire d'un runner à pilote local.
 
 Les huit opérations `work.*` de L118 (lots liés au courrier, branches des
 lots : `open_by_ref`, `open_for`, `set_branch`, `open_with_branch`,
