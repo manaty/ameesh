@@ -429,7 +429,7 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                                      responsible=package.get("responsible"),
                                      review_class=cls)
             detail = with_availability(detail, states, externals)
-            hold = holds.get(rid)
+            hold = waits.get(rid)
             if hold and hold.get("what") == "landing" and detail and detail.get("what") == "merge":
                 # #1945 : un atterrissage déclaré est plus précis que le libellé
                 # générique « merge (executor not designated) » ; le registre
