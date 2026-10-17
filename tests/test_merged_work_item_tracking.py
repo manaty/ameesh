@@ -809,6 +809,10 @@ class MergeSweepTest(_Base):
             "Merge (#12) retiré": {},
             "Merge #12 reverted": {},
             "Merge #12 sans #13": {12: "#id"},
+            # #2262 : un groupe ouvert sur un contraste est une proposition
+            # positive ; la négation du parent ne l'atteint pas.
+            "Merge sans #12 (mais #13 livré)": {13: "#id"},
+            "Merge sans (#12) (mais #13 livré)": {13: "#id"},
             "Merge #12 without #13": {12: "#id"},
             "Merge #12 hors #13": {12: "#id"},
             "paquet : tout sauf #12": {},
