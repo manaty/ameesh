@@ -25,6 +25,7 @@ test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et regl
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
 test_420_qa_role  # SQL: QA role, runner binding and TEMP registry spoofing (#420, #919)
 test_1132_jauges_perimees  # stockage : provenance des relevés (production, source), dédup par fraîcheur, gauge_latest (#1132)
+test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
@@ -34,6 +35,7 @@ test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un mê
 test_810_multi_project_consumers  # stockage : `projects` lu par la vue par projet et le filtre progress, prise au projet primaire (L243-3)
 test_831_packages_lock_scope  # storage : un verrou de sync par schéma (tous canons), attente hors statement_timeout (#831)
 test_811_lot_workdirs  # stockage : dossiers de projets par lot, reprise de session et prise secondaire (L243-4)
+test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
