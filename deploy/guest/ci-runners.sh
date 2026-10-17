@@ -62,7 +62,8 @@
 #                         file; the next --prepare adopts it when the option is
 #                         not repeated (R1 delta B5)
 #   --tarball FILE        use this actions-runner tarball instead of the
-#                         download (offline hosts)
+#                         download (offline hosts); FILE must be regular,
+#                         with no symlink in its path (parents included)
 #   --version V           runner version to download (default 2.338.0, the
 #                         fleet's), with --sha256
 #   --sha256 HEX          expected sha256 of the tarball (default: the pinned

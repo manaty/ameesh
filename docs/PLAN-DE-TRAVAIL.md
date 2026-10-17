@@ -92,8 +92,12 @@ The reviewer of a review can be **designated on entry to `qa`** (#705):
 a design agent designates, never the lot's assignee. The wait then names that
 reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
-designate one. Two corrections are gestures of the same authority (#1979):
-`ameesh work reviewer <id> --remove` removes a designation made by mistake
+designate one. A reviewer whose **declared harness** is the author's (claude,
+codex and deepseek are distinct families) gets an indicative warning on
+stderr (#800): the designation is kept — canon §2 asks for another model
+family, and the real family is judged on the review turn (decision 18855a).
+Two corrections are gestures of the same authority (#1979):
+`ameesh work reviewer <id> --remove` removes all designations made by mistake
 (the lot goes back to waiting for a reviewer, and the alert asks for one
 again); `ameesh work reviewer <id> --no-verdict` marks "verdict not required"
 when no re-verdict is due (mechanical composition resolution, canon §11
@@ -107,6 +111,20 @@ waits for the merge, not for a verdict — even when a reviewer is designated.
 The class is read once per pass, and only for lots whose wait would otherwise
 be a verdict; when it cannot be read (no repository, no freeze, unreadable
 policy), the prudent verdict wait is kept instead of guessing a class.
+
+Several reviewers can be designated for the same lot (#2076): repeat
+`ameesh work reviewer <id> <agent>` to add a name. `work show` and the JSON
+`reviewers` list retain them all. The wait and alerts name each reviewer
+whose verdict on the frozen head is still due; one GO does not complete the
+other reviews. Withdraw a designation explicitly with
+`ameesh work reviewer <id> <agent> --remove` (the same authority is required);
+a removal that removes nothing (an undesignated name, or an empty list)
+changes nothing and writes no journal line. Assigning or delegating the lot
+to a reviewer removes that person's designation and preserves the others;
+the journal names each removed reviewer. Migration 0456 keeps the legacy `reviewer` field for older
+runners during an upgrade. An older runner that writes `reviewer` as a
+replacement therefore *adds* a name instead: the previous designation is
+kept, and is withdrawn explicitly with `--remove` (or by upgrading the runner).
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,

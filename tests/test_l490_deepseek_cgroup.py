@@ -108,7 +108,7 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
             entry = root / "entry.cjs"
             entry.write_text('console.log("COMMAND RAN");')
             env = dict(os.environ, NODE_OPTIONS=deepseek_cgroup.node_options())
-            for module in (None, "unexpected", "0.1.5-rc.2"):
+            for module in (None, "unexpected", "0.1.5-rc.2", "0.2.0-rc.2"):
                 if module:
                     provider = root / "node_modules/@deepseek-ai/dsh-subprocess-local"
                     provider.mkdir(parents=True, exist_ok=True)
@@ -122,9 +122,11 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                 self.assertEqual(result.stdout, "COMMAND RAN\n")
                 self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
 
-    def test_vm_dsh_0_2_provider_runs_without_protection(self):
+    def test_vm_unreviewed_dsh_0_2_provider_runs_without_protection(self):
         # #1460 as seen on agents-1: global dsh under /opt/node with provider
         # 0.2.0-rc.2; the turn runs (no 127) and the preload is not inherited.
+        # 0.2.0-rc.2 is now reviewed (#2275), so version drift uses 0.2.0-rc.3
+        # while the "no 127 for an unreviewed provider" contract stays covered.
         with tempfile.TemporaryDirectory() as tmp:
             modules = Path(tmp) / "opt/node/lib/node_modules/@deepseek-ai"
             dsh = modules / "dsh"
@@ -133,7 +135,7 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
             provider = modules / "dsh-subprocess-local"
             provider.mkdir()
             (provider / "package.json").write_text(json.dumps({
-                "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.2.0-rc.2",
+                "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.2.0-rc.3",
                 "type": "module", "exports": {".": "./index.js"}}))
             (provider / "index.js").write_text('export const ran = "PROVIDER 0.2 RAN";\n')
             (dsh / "lib/bin.mjs").write_text(
@@ -155,7 +157,7 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, 'PROVIDER 0.2 RAN "--max-old-space-size=256"\n')
             self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
-            self.assertIn("unreviewed @deepseek-ai/dsh-subprocess-local 0.2.0-rc.2", result.stderr)
+            self.assertIn("unreviewed @deepseek-ai/dsh-subprocess-local 0.2.0-rc.3", result.stderr)
 
     def test_profile_source_and_esm_exports_are_verified_and_unreviewed_runs_unguarded(self):
         for absolute, conditional in ((False, False), (True, False), (False, True)):
@@ -171,7 +173,7 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                 actual.write_text(source)
                 exports = {"import": "./actual.js", "require": "./main.js"} if conditional else "./actual.js"
                 (provider / "package.json").write_text(json.dumps({
-                    "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.1.5-rc.2",
+                    "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.2.0-rc.2",
                     "type": "module", "main": "main.js", "exports": {".": exports}}))
                 importer = profile / "entry.mjs"
                 target = actual.as_uri() if absolute else "@deepseek-ai/dsh-subprocess-local"
@@ -431,8 +433,27 @@ class RealProviderTest(unittest.TestCase):
                 self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
                 return result
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("cgroup protection unavailable, running dsh without it", result.stderr)
             self.assertTrue(result.stdout.strip(), "provider returned no report: " + result.stderr)
             return json.loads(result.stdout.splitlines()[-1]), result.stderr
+
+    def test_reviewed_pins_match_installed_provider(self):
+        # #2275: prove the guard pins the provider bytes actually installed,
+        # including every provider module the entry imports (output.js too).
+        root = Path(PROVIDER).resolve()
+        manifest = json.loads((root / "package.json").read_text())
+        code = ("console.log(JSON.stringify(require(" +
+                json.dumps(str(deepseek_cgroup.PRELOAD)) + ").REVIEWED))")
+        result = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reviewed = json.loads(result.stdout)
+        self.assertEqual(reviewed["provider"], manifest["name"])
+        self.assertEqual(reviewed["version"], manifest["version"])
+        files = {hashlib.sha256(path.read_bytes()).hexdigest(): path.name
+                 for path in (root / "lib").glob("*.js")}
+        self.assertEqual(set(reviewed["files"]), set(files))
+        entry = root / manifest["main"]
+        self.assertEqual(reviewed["entry"], hashlib.sha256(entry.read_bytes()).hexdigest())
 
     def test_reviewed_provider_in_cache_or_preload_options_is_refused(self):
         for kind in ("cache", "require", "import"):

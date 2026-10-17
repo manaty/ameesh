@@ -216,6 +216,21 @@ class ReviewInstructionTest(unittest.TestCase):
         self.assertIn("P2 de la classe sensible bloque encore", body)
         self.assertIn("ameesh work milestone 7 verdict", body)
 
+    def test_the_after_merge_instruction_covers_the_correction_rule(self):
+        """#1534 N6 : le gabarit couvre la correction home#81, au-delà du N < 5 min."""
+        body = review_lot.body_of({"title": "petit lot", "branch_target": "main"}, 7,
+                                  klass={"class": "light", "why": ""},
+                                  merged_sha="a" * 40)
+        for expected in ("le relecteur corrige lui-même",
+                         "**bloquant** (B, P1)",
+                         "~50 lignes",
+                         "changement de conception",
+                         "seconde famille",
+                         "**avec** la correction",
+                         "ameesh provenance show --commit"):
+            self.assertIn(expected, body)
+        self.assertNotIn("lots de suite", body)
+
 
 class CreationRouteTest(PgTestCase):
     """Both creation entry points return the warning without refusing anything,

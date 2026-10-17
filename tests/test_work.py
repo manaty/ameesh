@@ -85,6 +85,41 @@ class WorkTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             work.note(self.db, self._add()["id"], "  ")
 
+    def test_once_note_serializes_concurrent_importers_without_deduplicating_regular_notes(self):
+        item = self._add("journal index fixture")
+        dbs = [self.connect(), self.connect()]
+        for connection in dbs:
+            self.addCleanup(connection.close)
+        barrier = threading.Barrier(2, timeout=10)
+        get = work.get
+        errors = []
+
+        def both_read(db, item_id):
+            value = get(db, item_id)
+            barrier.wait()
+            return value
+
+        def record(index):
+            try:
+                work.note(dbs[index], item["id"], "same immutable projection", actor=str(index), once=True)
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(work, "get", side_effect=both_read):
+            threads = [threading.Thread(target=record, args=(index,)) for index in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        rows = work.events(self.db, item["id"])
+        self.assertEqual(sum(row["note"] == "same immutable projection" for row in rows), 1)
+        for _ in range(2):
+            work.note(self.db, item["id"], "ordinary repeated note", actor="fixture")
+        self.assertEqual(sum(row["note"] == "ordinary repeated note"
+                             for row in work.events(self.db, item["id"])), 2)
+
     def test_assignation_et_budget(self):
         # L37 (0030) : l'assigné d'un lot doit exister (attribution gardée)
         registry.upsert(self.db, "deepseek7", harness="deepseek")

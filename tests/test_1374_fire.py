@@ -20,7 +20,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import fire, land, merge_queue, storage, work
+from ameesh import fire, land, lot_class, merge_queue, review, storage, work
 
 from .support import PgTestCase
 
@@ -166,6 +166,46 @@ class ReviewGateTest(unittest.TestCase):
         same = self.gate(_marks(_mark("frozen", A), _verdict("other")))
         self.assertFalse(same["ok"], "la famille de l'auteur ne compte pas")
 
+    def test_grouped_rule_does_not_add_unchanged_critical_files(self):
+        # #2218 : le canon regroupe runner et porte de fusion dans une règle.
+        policy, problems = review.parse({"default": "light", "rules": [{
+            "paths": ["src/ameesh/runner.py", "src/ameesh/merge_queue.py",
+                      "src/ameesh/land.py"], "class": "sensitive"}]})
+        self.assertEqual(problems, [])
+        klass = review.classify(policy, ["src/ameesh/runner.py", "tests/test_runner.py"])
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+        self.assertEqual(one["required"], 1)
+        self.assertTrue(one["ok"], one["why"])
+        for actor in ("author", "other", "ghost"):
+            with self.subTest(actor=actor):
+                self.assertFalse(self.gate(
+                    _marks(_mark("frozen", A), _verdict(actor)), klass=klass)["ok"])
+
+    def test_changed_critical_file_keeps_two_reviews_in_a_grouped_rule(self):
+        for path in ("src/ameesh/merge_queue.py", "src/ameesh/land.py",
+                     "src/ameesh/migrations/0460_overview_runner_seen.sql",
+                     "src/ameesh/authority.py", "src/ameesh/approve_check.py",
+                     "src/ameesh/approve_client.py", "src/ameesh/config.py",
+                     "deploy/mise-a-jour/poste.sh"):
+            with self.subTest(path=path):
+                policy, _ = review.parse({"default": "light", "rules": [{
+                    "paths": ["src/ameesh/runner.py", path], "class": "sensitive"}]})
+                klass = review.classify(policy, ["src/ameesh/runner.py", path])
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+                two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"),
+                                       _verdict("rev2")), klass=klass)
+                self.assertTrue(two["ok"], two["why"])
+
+    def test_sensitive_without_changed_paths_keeps_two_reviews(self):
+        for files in ([], [{"class": "sensitive", "rule": ["src/ameesh/runner.py"]}]):
+            with self.subTest(files=files):
+                klass = {"class": "sensitive", "doubt": False, "files": files}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+
     def test_sql_and_merge_gate_need_two_distinct_families(self):
         for entry in (self.SQL, self.GATE):
             klass = {"class": "sensitive", "files": [entry]}
@@ -197,6 +237,52 @@ class ReviewGateTest(unittest.TestCase):
             {"path": "src/ameesh/preview.py", "class": "sensitive",
              "rule": ["src/ameesh/preview.py"]}]}
         self.assertEqual(merge_queue.required_verdicts(near), 1, "motif ancré au nom")
+
+    #: le canon synthétique du témoin de bout en bout (#2264) : les trois
+    #: chemins que la porte de fusion doit voir (#1629), puis fire.py, qui
+    #: tombe dans la portée critique « prod » (deux avis).
+    GATE_CANON_PATHS = ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                        "src/ameesh/review.py")
+    CRITICAL_CANON_PATH = "src/ameesh/fire.py"
+
+    def canon(self, paths=(), default="light", root="canon"):
+        """Un canon minimal, de la même forme que celui de `test_review`."""
+        rules = [{"paths": [path], "class": "sensitive"} for path in paths]
+        return types.SimpleNamespace(
+            root=root, sources=[],
+            federation={"review_policies": {"risk_classes": {
+                "projects": {"ameesh": {"default": default, "rules": rules}}}}})
+
+    def test_the_canon_chain_drives_the_required_verdicts(self):
+        """#2264 : le témoin de #2249 forçait `klass` — il serait resté vert si
+        le canon ne classait plus ces chemins. Ici la classe est lue par
+        `lot_class.class_of_paths` sur un canon synthétique, puis la porte en
+        déduit les avis ; le contrôle négatif (même canon sans règle) retombe
+        à `light` et zéro avis, donc le témoin dépend bien du canon."""
+        canon = self.canon(self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        for path in self.GATE_CANON_PATHS:
+            klass = lot_class.class_of_paths([canon], "ameesh", [path])
+            self.assertEqual(klass["class"], "sensitive", (path, klass))
+            self.assertFalse(klass["doubt"], (path, klass))
+        critical = lot_class.class_of_paths(
+            [canon], "ameesh", [self.CRITICAL_CANON_PATH])
+        self.assertEqual(critical["class"], "sensitive", critical)
+        self.assertEqual(merge_queue.required_verdicts(critical), 2, critical)
+        together = lot_class.class_of_paths(
+            [canon], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        self.assertEqual(merge_queue.required_verdicts(together), 2, together)
+        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=together)
+        self.assertTrue(two["ok"], two["why"])
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=together)
+        self.assertFalse(one["ok"], "la classe lue exige bien deux avis")
+        # Contrôle négatif : sans règle, ces mêmes chemins ne sont plus
+        # sensibles et la porte n'exige plus d'avis.
+        bare = self.canon()
+        light = lot_class.class_of_paths(
+            [bare], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        self.assertEqual(light["class"], "light", light)
+        self.assertEqual(merge_queue.required_verdicts(light), 0, light)
 
     def test_author_family_never_counts(self):
         klass = {"class": "sensitive", "files": [self.SQL]}
@@ -288,6 +374,62 @@ class ReviewGateTest(unittest.TestCase):
         ok = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass="release")
         self.assertTrue(ok["ok"], ok["why"])
 
+    def test_pilot_waiver_lifts_the_verdicts_but_never_a_block(self):
+        # #2281 : `work reviewer --no-verdict` (#1979) marque la dispense de
+        # re-verdict (`reviewer = -none`) ; la porte partagée la respecte,
+        # sans changer la classe ni lever un verdict bloquant courant.
+        for item in ({"assignee": "author", "reviewer": work.REVIEWER_NONE},
+                     {"assignee": "author", "reviewers": [work.REVIEWER_NONE]}):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]}, item=item)
+            self.assertTrue(out["ok"], out["why"])
+            self.assertTrue(out["waived"])
+            self.assertEqual(out["required"], 2, "la dispense ne change pas la classe")
+        named = self.gate(_marks(_mark("frozen", A)),
+                          klass={"class": "sensitive", "files": [self.SQL]},
+                          item={"assignee": "author", "reviewer": work.REVIEWER_NONE,
+                                "events": [{"note": "verdict not required: no re-verdict "
+                                                    "due (#1979)", "actor": "pilote-x"}]})
+        self.assertEqual(named["waived_by"], "pilote-x")
+        blocked = self.gate(_marks(_mark("frozen", A),
+                                   _verdict("rev1", verdict="blocked")),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"assignee": "author", "reviewer": work.REVIEWER_NONE})
+        self.assertFalse(blocked["ok"], "une dispense ne lève jamais une correction due")
+        self.assertIn("blocked verdict", blocked["why"])
+
+    def test_a_stale_waiver_row_does_not_cover_a_new_freeze(self):
+        # #2281/B1 cx1 : la ligne passée à la porte peut être antérieure au
+        # gel ; le stockage a périmé la dispense en base mais la copie la
+        # porte encore. La porte relit la marque après les jalons : un gel B
+        # sans avis reste refusé, même avec une ligne A en main.
+        stale = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        fresh = {"id": 9, "assignee": "author", "reviewer": "", "reviewers": []}
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh):
+            out = self.gate(_marks(_mark("frozen", B)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            frozen=B, item=stale)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["waived"])
+        self.assertIn("no review verdict ok", out["why"])
+
+    def test_the_waiver_actor_comes_from_the_lot_journal(self):
+        # #2281/N1 cx1 : `work.get` ne rend pas les événements ; en usage réel
+        # la note de file doit citer le pilote, lu dans la table du journal.
+        fresh = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        ops = mock.Mock()
+        ops.work.events_noted.return_value = [
+            {"note": "verdict not required: no re-verdict due (#1979)",
+             "actor": "pilote-x"}]
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh), \
+                mock.patch.object(merge_queue.storage, "of", return_value=ops):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"id": 9, "assignee": "author",
+                                  "reviewer": work.REVIEWER_NONE})
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["waived_by"], "pilote-x")
+
 
 class ReadyTest(unittest.TestCase):
     """Les portes du feu : verdicts d'abord (sans PR), puis PR/CI."""
@@ -334,17 +476,23 @@ class ReadyTest(unittest.TestCase):
         self.assertIn("release", why)
 
     def test_pr_gates_need_a_green_ci_on_the_frozen_head(self):
+        # #2271 : la protection de la cible est lue à la forge ; ce témoin
+        # isole les autres portes de la PR avec une exigence vide.
         for ci in ("pending", "red"):
-            ok, why = fire.ready_pr(_status(ci=ci), target="main", project=None, frozen=A)
+            ok, why = fire.ready_pr(_status(ci=ci), target="main", project=None,
+                                    frozen=A, required=())
             self.assertFalse(ok)
             self.assertIn(ci, why)
-        ok, why = fire.ready_pr(_status(draft=True), target="main", project=None, frozen=A)
+        ok, why = fire.ready_pr(_status(draft=True), target="main", project=None,
+                                frozen=A, required=())
         self.assertFalse(ok)
         self.assertIn("draft", why)
-        ok, why = fire.ready_pr(_status(base="develop"), target="main", project=None, frozen=A)
+        ok, why = fire.ready_pr(_status(base="develop"), target="main", project=None,
+                                frozen=A, required=())
         self.assertFalse(ok)
         self.assertIn("targets", why)
-        ok, why = fire.ready_pr(_status(), target="main", project=None, frozen=A)
+        ok, why = fire.ready_pr(_status(), target="main", project=None,
+                                frozen=A, required=())
         self.assertTrue(ok, why)
 
 

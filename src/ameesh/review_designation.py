@@ -402,6 +402,11 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "- fix a blocking defect yourself and push to the lot branch "
         "(canon §2): you then become the author of your fix, your opinion on the "
         "new head no longer counts, another reviewer takes over;",
+        "- a fix longer than ~50 lines, or a design change, goes back to the author;",
+        "- in a sensitive class, the second family reviews the lot **with** your fix, "
+        "in the same round, distinct from every author;",
+        "- your commits carry their exact origin (`ameesh provenance show --commit "
+        "<sha>`): by fixing you become an author of the new head;",
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI "
         "runs on the frozen head once the required opinions are acquired.",

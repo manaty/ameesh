@@ -91,7 +91,25 @@ def item_columns(db, ref: str | None = None) -> str:
         reviewer = "reviewer"
     else:
         reviewer = "''::text AS reviewer"
-    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer)
+    # to_jsonb keeps reads compatible with schemas predating 0456, without
+    # another catalogue round trip (including bounded progress/list reads).
+    reviewers = "to_jsonb(%s)->'reviewers' AS reviewers" % (ref or "work_items")
+    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer + ", " + reviewers)
+
+
+def has_reviewers(db) -> bool:
+    if getattr(db, "_has_reviewers", False):
+        return True
+    found = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        " AND column_name = 'reviewers'"))
+    if found:
+        try:
+            db._has_reviewers = True
+        except Exception:
+            pass
+    return found
 
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
@@ -403,8 +421,133 @@ class WorkItems(interface.WorkItems):
             sql += " AND assignee = %s"
             params.append(assignee)
         sql += " ORDER BY updated_at DESC LIMIT %s"
-        params.append(int(limit))
+        params.append(None if limit is None else int(limit))
         return self.db.query(sql, tuple(params))
+
+    def items_missing_ref(self, *, states, ref_prefix, limit,
+                          attempt_prefix="", retry_s=0, terminal_prefix="",
+                          max_attempts=0, since=None) -> list[dict]:
+        """L539 (#1104) : les lots dont `ref_prefix + id` n'existe pas encore.
+
+        L'anti-jointure est faite **avant** la borne : `limit` borne les
+        manquants rendus, pas un balayage de lots déjà pourvus (R2 #1104
+        P2-2 : vingt pourvus plus récents ne cachent plus un manquant ancien).
+        Les états forment un seul ensemble ordonné ; `id` départage deux
+        `updated_at` égaux, sans quoi la sélection ne serait pas stable.
+
+        `attempt_prefix`/`retry_s` (binôme mesh-design, 14/10) : une tentative
+        de rattrapage sans création journalise `attempt_prefix<id>` (voir
+        `log_review_attempt`) ; un lot dont la tentative est plus récente que
+        `retry_s` est exclu **avant** la borne, sinon les mêmes candidats
+        confirmés (non-light, doutes, erreurs) consommeraient chaque passage et
+        affameraient les plus anciens. Le délai passé, la tentative redevient
+        sélectionnable : le marqueur est un délai, pas une suppression.
+
+        `since` (arbitrage pilote du 15/10) : ne rend que les lots dont le
+        jalon `merged` est à `since` ou après — la borne d'activation, jamais
+        l'historique. `terminal_prefix`/`max_attempts` : une marque terminale
+        exclut toujours, et un candidat qui a déjà `max_attempts` tentatives
+        n'est plus sélectionné (traitement borné, jamais perpétuel).
+
+        Le filtre lui-même (`_missing_ref_gates`) est partagé avec
+        `missing_ref_eligible`, pour qu'un lot donné reçoive la même vérité que
+        le balayage (B1 de la R1 #1104)."""
+        wanted = [str(s) for s in (states or ())]
+        if not wanted:
+            return []
+        params: list = list(wanted)
+        sql = (
+            "SELECT __COLUMNS__ FROM work_items w"
+            " WHERE w.state IN (__STATES__)"
+            + self._missing_ref_gates(
+                params, ref_prefix=ref_prefix, attempt_prefix=attempt_prefix,
+                retry_s=retry_s, terminal_prefix=terminal_prefix,
+                max_attempts=max_attempts, since=since)
+            + " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
+        )
+        params.append(int(limit))
+        return self.db.query(
+            sql.replace("__COLUMNS__", item_columns(self.db, "w")).replace(
+                "__STATES__", ", ".join(["%s"] * len(wanted))),
+            tuple(params))
+
+    @staticmethod
+    def _missing_ref_gates(params: list, *, ref_prefix, attempt_prefix="",
+                           retry_s=0, terminal_prefix="", max_attempts=0,
+                           since=None) -> str:
+        """L539 (#1104) : les conditions « relecture encore due » d'un lot.
+
+        Rendues en SQL pour être ajoutées après `WHERE …, ` et complète
+        `params` dans l'ordre du texte produit — le même filtre sert au
+        balayage borné (`items_missing_ref`) et à un lot donné
+        (`missing_ref_eligible`)."""
+        sql = (
+            "   AND NOT EXISTS (SELECT 1 FROM work_items r"
+            "                    WHERE r.issue_ref = %s || w.id::text)"
+        )
+        params.append(str(ref_prefix))
+        if since is not None:
+            sql += (
+                "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
+                "                WHERE m.work_item_id = w.id AND m.kind = 'merged'"
+                "                  AND m.at >= %s)"
+            )
+            params.append(since)
+        if terminal_prefix:
+            sql += (
+                "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                "                    WHERE e.work_item_id = w.id"
+                "                      AND split_part(e.note, ' ', 1) = %s || w.id::text)"
+            )
+            params.append(str(terminal_prefix))
+        if attempt_prefix:
+            if int(max_attempts) > 0:
+                sql += (
+                    "   AND (SELECT count(*) FROM work_item_events e"
+                    "         WHERE e.work_item_id = w.id"
+                    "           AND split_part(e.note, ' ', 1) = %s || w.id::text) < %s"
+                )
+                params += [str(attempt_prefix), int(max_attempts)]
+            if float(retry_s) > 0:
+                sql += (
+                    "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                    "                    WHERE e.work_item_id = w.id"
+                    "                      AND split_part(e.note, ' ', 1) = %s || w.id::text"
+                    "                      AND e.created_at > now() - make_interval(secs => %s))"
+                )
+                params += [str(attempt_prefix), float(retry_s)]
+        return sql
+
+    def missing_ref_eligible(self, item_id, *, ref_prefix, attempt_prefix="",
+                             retry_s=0, terminal_prefix="", max_attempts=0,
+                             since=None) -> bool:
+        """L539 (#1104, B1 de la R1) : le lot `item_id` passerait-il la
+        sélection de `items_missing_ref` ?
+
+        Même filtre, une seule ligne : le chemin `already` de `close_merged`
+        ne relance l'ouverture que pour un lot que le rattrapage borné
+        sélectionnerait encore — jamais pour l'historique d'avant l'activation
+        (migration 0438) ni pour un lot terminal, que `sync-github` rappelle
+        pourtant à chaque passage."""
+        params: list = []
+        sql = ("SELECT 1 FROM work_items w WHERE w.id = %s"
+               + self._missing_ref_gates(
+                   params, ref_prefix=ref_prefix, attempt_prefix=attempt_prefix,
+                   retry_s=retry_s, terminal_prefix=terminal_prefix,
+                   max_attempts=max_attempts, since=since)
+               + " LIMIT 1")
+        return bool(self.db.query(sql, (int(item_id),) + tuple(params)))
+
+    def review_catch_up_bound(self):
+        """L539 (#1104) : la borne d'activation (ligne unique de la migration
+        0438), ou None si elle manque — le rattrapage reste alors fermé. Rend
+        une chaîne ISO-8601, identique pour les deux pilotes (`psql` rend le
+        texte, `psycopg` un `datetime`), utilisable telle quelle en paramètre."""
+        rows = self.db.query("SELECT bound_at FROM review_catch_up WHERE id")
+        if not rows:
+            return None
+        value = rows[0]["bound_at"]
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
@@ -455,35 +598,87 @@ class WorkItems(interface.WorkItems):
                                     why="état %s" % state, actor=actor)
             return rows[0]
 
-    def designate_reviewer(self, item_id, reviewer, *, actor, event=None) -> dict | None:
-        """#705 : pose (ou change) le relecteur désigné d'un lot en `qa`, et le
-        journalise ; None si le lot n'est plus en `qa` (rien d'écrit). La
-        colonne vient de la migration 0421 : sans elle, l'écriture est refusée
-        avec la marche à suivre (les lectures, elles, s'en passent).
-        #1979 : `reviewer` vide efface la désignation, et `event` remplace la
-        ligne de journal par défaut (retrait, « verdict non requis »)."""
+    def designate_reviewer(self, item_id, reviewer, *, actor, remove=False,
+                           event=None) -> dict | None:
+        """Ajoute ou retire un relecteur en `qa`, avec sa ligne de journal.
+
+        Les écritures exigent 0421 et 0456 ; les lectures restent possibles
+        avant ces migrations. La mise à jour conditionnelle et le trigger
+        sérialisent les désignations et les changements de responsable."""
         if not has_reviewer(self.db):
             raise DbError("work_items.reviewer is missing (migration 0421): "
                           "run \"ameesh migrate\", then designate the reviewer")
+        if not has_reviewers(self.db):
+            raise DbError("work_items.reviewers is missing (migration 0456): "
+                          "run \"ameesh migrate\", then designate the reviewers")
         with self.db.transaction() as tx:
-            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor, event)
+            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor,
+                                                     remove=remove, event=event)
 
-    def _designate_reviewer(self, item_id, reviewer, actor, event=None) -> dict | None:
+    def _journal_cleared_reviewers(self, item_id, state, previous, row, actor):
+        """#2084/N1 : le trigger 0456 retire de `reviewers` toute personne qui
+        devient assigné ou délégué. Ce retrait automatique a sa propre ligne de
+        journal, nommant chaque relecteur retiré — pas seulement le dernier de
+        la liste, que l'ancien champ `reviewer` portait."""
+        remaining = row.get("reviewers")
+        if remaining is None:
+            remaining = [row.get("reviewer")] if row.get("reviewer") else []
+        remaining = set(remaining)
+        for name in dict.fromkeys(previous or []):
+            if name and name != REVIEWER_NONE and name not in remaining:
+                self._event(int(item_id), state,
+                            "reviewer %s cleared (they now hold the lot)" % name,
+                            actor)
+
+    def _designate_reviewer(self, item_id, reviewer, actor, *, remove=False,
+                            event=None) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
-        avant, un `assign` a pu la changer entre-temps."""
+        avant, un `assign` a pu la changer entre-temps.
+
+        #2084/N2 : un retrait ne journalise que s'il retire quelque chose.
+        La liste est lue sous le verrou de la ligne, dans la même transaction,
+        puis comparée à l'écriture : `--remove` d'un nom non désigné, ou
+        `--remove` global sur une liste déjà vide, ne laisse aucun faux
+        « removed » au journal."""
+        if remove or not reviewer:
+            locked = self.db.query(
+                "SELECT " + item_columns(self.db) + " FROM work_items"
+                " WHERE id = %s AND state = 'qa' FOR NO KEY UPDATE",
+                (int(item_id),))
+            if not locked:
+                return None
+            previous = list(locked[0]["reviewers"] or [])
+            # Ne pas toucher `updated_at`, ni le trigger, quand le retrait ne
+            # retire rien : c'est un non-effet complet, pas seulement muet.
+            if not previous or (remove and reviewer not in previous):
+                row = locked[0]
+                row["reviewer_changed"] = False
+                return row
+        if remove:
+            expression, params = "array_remove(reviewers, %s)", [reviewer]
+        elif not reviewer:
+            expression, params = "'{}'::text[]", []
+        elif reviewer == REVIEWER_NONE:
+            expression, params = "ARRAY[%s]::text[]", [REVIEWER_NONE]
+        else:
+            expression = ("array_remove(CASE WHEN %s = ANY(reviewers) THEN reviewers"
+                          " ELSE array_append(reviewers, %s) END, %s)")
+            params = [reviewer, reviewer, REVIEWER_NONE]
         rows = self.db.query(
-            "UPDATE work_items SET reviewer = %%s, updated_at = now()"
-            " WHERE id = %%s AND state = 'qa'"
-            "   AND assignee IS DISTINCT FROM %%s"
-            " RETURNING %s" % item_columns(self.db),
-            (reviewer, int(item_id), reviewer))
+            "UPDATE work_items SET reviewers = " + expression + ", updated_at = now()"
+            " WHERE id = %s AND state = 'qa'"
+            "   AND (assignee IS DISTINCT FROM %s OR %s)"
+            " RETURNING " + item_columns(self.db),
+            tuple(params + [int(item_id), reviewer, bool(remove)]))
         if not rows:
             return None
-        self._event(int(item_id), "qa",
-                    event or ("reviewer %s designated" % reviewer), actor)
-        return rows[0]
+        row = rows[0]
+        self._event(int(item_id), "qa", event or ("reviewer %s %s" % (
+            reviewer, "removed" if remove else "designated")), actor)
+        row["reviewer_changed"] = True
+        return row
 
     def assign(self, item_id, assignee, *, current, note, actor,
                queued_note=None, forced_note=None, take=False,
@@ -568,7 +763,7 @@ class WorkItems(interface.WorkItems):
         aussi quand l'assignation arrive après la désignation — la désignation
         tombe alors dans la MÊME écriture (l'assignation et la désignation
         peuvent se croiser), et le journal le dit."""
-        previous_reviewer = ""
+        previous_reviewers: list[str] = []
         reviewer_set = ""
         params: list = [assignee]
         if has_reviewer(self.db):
@@ -576,10 +771,16 @@ class WorkItems(interface.WorkItems):
             # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
             # insertions au journal et aux jalons du lot, que FOR UPDATE
             # bloquait jusqu'au commit.
+            with_reviewers = has_reviewers(self.db)
             seen = self.db.query(
-                "SELECT reviewer FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                (int(item_id),))
-            previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
+                "SELECT reviewer%s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                % (", reviewers" if with_reviewers else ""), (int(item_id),))
+            if not seen:
+                return None
+            previous_reviewer = seen[0]["reviewer"] or ""
+            previous_reviewers = (list(seen[0].get("reviewers") or [])
+                                  if with_reviewers else
+                                  ([previous_reviewer] if previous_reviewer else []))
             reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
                             " ELSE reviewer END")
             params.append(assignee)
@@ -595,15 +796,14 @@ class WorkItems(interface.WorkItems):
             tuple(params))
         if not rows:
             return None
-        if previous_reviewer and previous_reviewer == assignee:
-            note = "%s; reviewer %s cleared (they now hold the lot)" % (
-                note, previous_reviewer)
         self.db.query(
             "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
             "       resolved_by = %s"
             " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
             (actor or "", int(item_id)))
         self._event(int(item_id), rows[0]["state"], note, actor)
+        self._journal_cleared_reviewers(item_id, rows[0]["state"],
+                                        previous_reviewers, rows[0], actor)
         return rows[0]
 
     def handoff(self, item_id, assignee, *, current, state, paused_prefix, note_prefix,
@@ -643,17 +843,22 @@ class WorkItems(interface.WorkItems):
         Rend `{item, delegation, replaced}` ou None (lot modifié entre-temps)."""
         with self.db.transaction() as tx:
             with_reviewer = has_reviewer(self.db)
+            with_reviewers = has_reviewers(self.db)
             seen = tx.query(
                 "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
                 " FOR NO KEY UPDATE"
-                % (", reviewer" if with_reviewer else "", _CLOSED),
+                % (", reviewer, reviewers" if with_reviewers
+                   else (", reviewer" if with_reviewer else ""), _CLOSED),
                 (int(item_id), current))
             if not seen:
                 return None
             # #705 r2 (B1) : déléguer à son relecteur retire la désignation
             # (le relecteur relirait son propre travail), dans l'écriture même.
             previous_reviewer = (seen[0]["reviewer"] or "") if with_reviewer else ""
+            previous_reviewers = (list(seen[0].get("reviewers") or [])
+                                  if with_reviewers else
+                                  ([previous_reviewer] if previous_reviewer else []))
             replaced = tx.query(
                 "UPDATE work_item_delegations SET outcome = 'remplacee', resolved_at = now(),"
                 "       resolved_by = %s"
@@ -682,10 +887,9 @@ class WorkItems(interface.WorkItems):
                 " SELECT id, %%s, %%s, delegated_at, due_at FROM work_items WHERE id = %%s"
                 " RETURNING %s" % _DELEGATION_COLUMNS,
                 (delegate, delegated_by, int(item_id)))[0]
-            if previous_reviewer and previous_reviewer == delegate:
-                note = "%s; reviewer %s cleared (they now hold the lot)" % (
-                    note, previous_reviewer)
             WorkItems(tx)._event(int(item_id), item["state"], note, actor)
+            WorkItems(tx)._journal_cleared_reviewers(
+                item_id, item["state"], previous_reviewers, item, actor)
             return {"item": item, "delegation": delegation,
                     "replaced": replaced[0] if replaced else None}
 
@@ -757,11 +961,14 @@ class WorkItems(interface.WorkItems):
             # relu APRÈS le verrou, dans une instruction suivante : en READ
             # COMMITTED elle voit l'issue posée par un exécuteur concurrent
             with_reviewer = has_reviewer(self.db)
+            with_reviewers = has_reviewers(self.db)
             rows = tx.query(
                 "SELECT %s, %s AS worked, w.title, w.state, w.assignee%s"
                 "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
                 " WHERE d.id = %%s AND d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
-                % (_DELEGATION_COLUMNS, _WORKED, ", w.reviewer" if with_reviewer else ""),
+                % (_DELEGATION_COLUMNS, _WORKED,
+                   ", w.reviewer, w.reviewers" if with_reviewers
+                   else (", w.reviewer" if with_reviewer else "")),
                 (int(delegation_id), float(now_ts)))
             if not rows:
                 return None
@@ -810,12 +1017,14 @@ class WorkItems(interface.WorkItems):
                     "UPDATE work_items SET due_at = NULL WHERE id = %%s RETURNING %s"
                     % item_columns(self.db), (item_id,))
             text = describe(outcome, row) if describe else None
-            if outcome == "rendue" and row.get("reviewer") \
-                    and row["reviewer"] == row["delegated_by"]:
-                text = "%s; reviewer %s cleared (they now hold the lot)" % (
-                    text or "delegation expired", row["reviewer"])
             if text:
                 WorkItems(tx)._event(item_id, item[0]["state"], text, actor)
+            if outcome == "rendue":
+                previous_reviewers = (list(row.get("reviewers") or [])
+                                      if with_reviewers else
+                                      ([row["reviewer"]] if row.get("reviewer") else []))
+                WorkItems(tx)._journal_cleared_reviewers(
+                    item_id, item[0]["state"], previous_reviewers, item[0], actor)
             return dict(row, outcome=outcome, item=item[0])
 
     def overdue_delegations(self, now_ts) -> list[dict]:
@@ -839,10 +1048,30 @@ class WorkItems(interface.WorkItems):
             " ORDER BY d.resolved_at, d.id" % _DELEGATION_COLUMNS,
             (float(since_ts),))
 
-    def note(self, item_id, state, text, actor) -> None:
+    def note(self, item_id, state, text, actor, *, once=False) -> None:
+        if once:
+            with self.db.transaction() as tx:
+                rows = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                                (int(item_id),))
+                if not rows:
+                    raise DbError("lot %s not found" % item_id)
+                if tx.query("SELECT id FROM work_item_events"
+                            " WHERE work_item_id = %s AND note = %s LIMIT 1",
+                            (int(item_id), text)):
+                    return
+                WorkItems(tx).note(item_id, rows[0]["state"], text, actor)
+            return
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
+
+    def log_review_attempt(self, item_id, state, text, actor) -> None:
+        """L539 (#1104) : journalise une tentative de rattrapage sans création.
+
+        N'écrit que le journal (`work_item_events`) : `updated_at` n'est pas
+        touché — une tentative de fond ne doit ni réordonner la sélection ni
+        faire passer le lot pour actif."""
+        self._event(int(item_id), str(state or ""), str(text or ""), actor)
 
     def lock_deep_analysis(self, item_id) -> None:
         self.db.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
@@ -881,7 +1110,7 @@ class WorkItems(interface.WorkItems):
              WHERE work_item_id = %s
              ORDER BY id DESC LIMIT %s
             """,
-            (int(item_id), int(limit)),
+            (int(item_id), None if limit is None else int(limit)),
         )
 
     def events_noted(self, prefix, since_ts, *, ids=None) -> list[dict]:
@@ -919,7 +1148,7 @@ class WorkItems(interface.WorkItems):
              WHERE work_item_id = %s
              ORDER BY at DESC, id DESC LIMIT %s
             """,
-            (int(item_id), int(limit)),
+            (int(item_id), None if limit is None else int(limit)),
         )
 
     def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
@@ -950,8 +1179,8 @@ class WorkItems(interface.WorkItems):
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
-            tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                     (int(item_id),))
+            items = tx.query("SELECT id, app, branch_target FROM work_items"
+                             " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
                 """
                 INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, verdict, note)
@@ -962,6 +1191,17 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if kind == "verdict" and items:
+                from ... import merge_queue, train_events
+                item = items[0]
+                try:
+                    train_events.emit(tx, kind="verdict", project=item.get("app") or "",
+                        target=merge_queue._remote_branch(item.get("branch_target") or ""))
+                except ValueError:
+                    # An old/unscoped lot has no train routing subject. The
+                    # milestone remains valid; SQL/transport errors still roll
+                    # back its transaction, so a committed verdict loses no hint.
+                    pass
             if proof and proof.get("sha"):
                 tx.execute(
                     "INSERT INTO provenance_receipts"
@@ -1280,30 +1520,79 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="", frozen_id=None) -> dict | None:
+                  source="", frozen_id=None, packet=None, packet_initial=False, lease=None) -> dict | None:
         with self.db.transaction() as tx:
-            lot = tx.query("SELECT state FROM work_items WHERE id = %s"
+            lot = tx.query("SELECT state, app, branch, branch_target, type FROM work_items WHERE id = %s"
                            " AND state NOT IN ('merged', 'promoted', 'closed')"
                            " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
                 return None
+            if lease is not None:
+                key, owner, epoch = lease
+                held = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                                (key,))
+                if not held or (held[0]["owner"], held[0]["epoch"]) != (owner, epoch):
+                    return None
+                # Check after acquiring the row lock: waiting cannot extend
+                # the lease through a transaction-start timestamp.
+                if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                                " AND expires_at > clock_timestamp()", (key,)):
+                    return None
             latest = tx.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
                               " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
             latest_id = latest[0]["id"] if latest else None
             if frozen_id is not None and frozen_id != latest_id:
                 return None
-            tx.execute(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
-                " VALUES (%s, %s, %s, %s, %s, %s)"
-                " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
+            if packet is not None:
+                fields = ("app", "branch", "branch_target", "type")
+                if frozen_id is None or lot[0]["state"] != "qa" \
+                        or set(packet) != set(fields) | {"resolved_target"} \
+                        or packet["resolved_target"] != target \
+                        or any(lot[0][key] != packet[key] for key in fields):
+                    return None
+                current = self._queue_row(tx, item_id)
+                markers = tx.query("SELECT kind, frozen_id, generation FROM integration_train_queue_receipts"
+                                   " WHERE work_item_id = %s ORDER BY id", (int(item_id),))
+                allocated = None
+                for receipt in markers:
+                    if receipt.get("frozen_id") != frozen_id:
+                        continue
+                    if receipt.get("kind") == "removed":
+                        return None
+                    if receipt.get("kind") == "packet":
+                        allocated = receipt.get("generation")
+                if current is not None:
+                    same = (current["generation"], current["target"], current["frozen_id"],
+                            current["frozen_sha"], current["source"], current["state"])
+                    return current if same == (allocated, target, frozen_id, frozen_sha, source, "queued") else None
+                if allocated is not None:
+                    return None  # the allocated entry was withdrawn; do not resurrect it
+                if packet_initial is not True:
+                    return None  # absence is ambiguous for legacy DELETE-only writers
+            conflict = (" DO NOTHING" if packet is not None else
+                " DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
                 "   source = excluded.source, frozen_id = excluded.frozen_id,"
                 "   generation = nextval('merge_queue_generation_seq'), landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
-                "   updated_at = now()",
+                "   updated_at = now()")
+            # Packet cutoff eligibility starts at insertion, not at an
+            # enclosing transaction's BEGIN before it waited for these locks.
+            inserted = tx.query(
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id, queued_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, "
+                + ("clock_timestamp()" if packet is not None else "now()") + ")"
+                " ON CONFLICT (work_item_id)" + conflict + " RETURNING work_item_id",
                 (int(item_id), target, frozen_sha, actor or "", source or "", latest_id))
+            if not inserted:
+                return None
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
-            return self._queue_row(tx, item_id)
+            row = self._queue_row(tx, item_id)
+            if packet is not None:
+                tx.execute("INSERT INTO integration_train_queue_receipts"
+                           " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
+                           (row["work_item_id"], row["generation"], row["frozen_id"]))
+            return row
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
                      note="", actor="", clear_rank=False, lease=None,
@@ -1352,12 +1641,17 @@ class WorkItems(interface.WorkItems):
 
     def queue_remove(self, item_id, *, note, actor) -> bool:
         with self.db.transaction() as tx:
+            # Same order as allocation/refreeze: a withdrawal cannot vanish
+            # between a packet's check for absence and its insertion.
+            lot = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query("DELETE FROM merge_queue WHERE work_item_id = %s"
-                            " RETURNING work_item_id", (int(item_id),))
+                            " RETURNING work_item_id, generation, frozen_id", (int(item_id),))
             if not rows:
                 return False
-            lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            tx.execute("INSERT INTO integration_train_queue_receipts"
+                       " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'removed')",
+                       (rows[0]["work_item_id"], rows[0]["generation"], rows[0]["frozen_id"]))
             return True
 
     def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
@@ -1385,6 +1679,118 @@ class WorkItems(interface.WorkItems):
             " WHERE target = %s AND owner = %s AND epoch = %s RETURNING target",
             (key, owner, int(epoch)))
         return bool(rows)
+
+    def train_read(self, key) -> dict | None:
+        rows = self.db.query(
+            "SELECT revision, document FROM integration_trains WHERE target_key = %s", (key,))
+        if not rows:
+            return None
+        document = rows[0]["document"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        return dict(document, revision=int(rows[0]["revision"]))
+
+    def train_save(self, key, document, *, revision, owner, epoch) -> dict | None:
+        with self.db.transaction() as tx:
+            held = tx.query("SELECT owner, epoch"
+                            " FROM merge_locks WHERE target = %s FOR UPDATE", (key,))
+            if not held or held[0]["owner"] != owner or int(held[0]["epoch"]) != epoch:
+                return None
+            # Recheck after the row lock, never using a pre-lock clock.
+            live = tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                            " AND expires_at > clock_timestamp()", (key,))
+            if not live:
+                return None
+            rows = tx.query(
+                "INSERT INTO integration_trains (target_key, revision, document)"
+                " SELECT %s, 1, %s::jsonb WHERE %s = 0"
+                " ON CONFLICT (target_key) DO NOTHING RETURNING revision",
+                (key, json.dumps(document), int(revision))) if revision == 0 else tx.query(
+                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb,"
+                " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
+                " RETURNING revision", (json.dumps(document), key, int(revision)))
+            return dict(document, revision=int(rows[0]["revision"])) if rows else None
+
+    @staticmethod
+    def _train_fire(rows):
+        if not rows:
+            return None
+        row = dict(rows[0])
+        document = row.pop("document")
+        if isinstance(document, str):
+            document = json.loads(document)
+        return dict(document, **row)
+
+    def train_fire_read(self, key, plan_id) -> dict | None:
+        return self._train_fire(self.db.query(
+            "SELECT id, document, state, changed_by, owner, epoch,"
+            " extract(epoch from created_at)::float8 AS created_ts"
+            " FROM integration_train_fires WHERE target_key = %s AND plan_id = %s"
+            " ORDER BY id DESC LIMIT 1", (key, plan_id)))
+
+    def train_fire_give(self, key, document) -> dict | None:
+        with self.db.transaction() as tx:
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s FOR UPDATE", (key,)):
+                return None
+            # Serialize both a regrant and a plan revision with the claim.
+            rows = tx.query("SELECT document FROM integration_trains WHERE target_key = %s",
+                            (key,))
+            current = rows[0]["document"] if rows else {}
+            if isinstance(current, str):
+                current = json.loads(current)
+            if current.get("plan") != document["plan"] or current.get("phase") not in (
+                    "publishing", "ci-intent", "ci", "ready"):
+                return None
+            ops = WorkItems(tx)
+            old = ops.train_fire_read(key, document["plan"]["id"])
+            if old and old["state"] != "revoked":
+                return None
+            tx.execute("INSERT INTO integration_train_fires"
+                       " (target_key, plan_id, document, state, changed_by)"
+                       " VALUES (%s, %s, %s::jsonb, 'active', %s)",
+                       (key, document["plan"]["id"], json.dumps(document), document["actor"]))
+            return ops.train_fire_read(key, document["plan"]["id"])
+
+    def train_fire_change(self, key, fire_id, state, *, actor, owner=None, epoch=None) -> dict | None:
+        expected = {"revoked": "active", "promoting": "active", "landed": "promoting"}
+        if state not in expected:
+            raise ValueError("train fire transition: revoked | promoting | landed expected")
+        with self.db.transaction() as tx:
+            locks = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                             (key,))
+            if not locks:
+                return None
+            if state != "revoked":
+                if owner is None or epoch is None or locks[0]["owner"] != owner \
+                        or int(locks[0]["epoch"]) != epoch:
+                    return None
+                if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                                " AND expires_at > clock_timestamp()", (key,)):
+                    return None
+            rows = tx.query("SELECT document, owner, epoch FROM integration_train_fires"
+                            " WHERE target_key = %s AND id = %s AND state = %s FOR UPDATE",
+                            (key, int(fire_id), expected[state]))
+            if not rows:
+                return None
+            document = rows[0]["document"]
+            if isinstance(document, str):
+                document = json.loads(document)
+            if state != "revoked":
+                # The engine must have durably entered promoting on this
+                # exact plan, under the same target reservation.
+                if not tx.query("SELECT 1 FROM integration_trains WHERE target_key = %s"
+                                " AND document->>'phase' = 'promoting'"
+                                " AND document->'plan' = %s::jsonb",
+                                (key, json.dumps(document["plan"]))):
+                    return None
+                # A new live holder may finish a previous holder's claim
+                # after observing the exact remote head. It cannot reactivate
+                # the fire or retry the effect; business code supplies that
+                # fresh observation before requesting this transition.
+            tx.execute("UPDATE integration_train_fires SET state = %s, changed_by = %s,"
+                       " owner = %s, epoch = %s, updated_at = clock_timestamp() WHERE id = %s",
+                       (state, actor, owner, epoch, int(fire_id)))
+            return WorkItems(tx).train_fire_read(key, document["plan"]["id"])
 
     def queue(self, target=None) -> list[dict]:
         return self.db.query(
@@ -1513,7 +1919,7 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "SELECT %s FROM work_items w"
                 " WHERE w.assignee = %%s AND w.state = 'promoted'"
-                " ORDER BY w.id%s" % (item_columns(self.db), limit), (agent,))
+                " ORDER BY w.id%s" % (item_columns(self.db, "w"), limit), (agent,))
             for row in rows:
                 if dry_run:
                     out.append(dict(row, dry_run=True, assigned_to=measure_actor))
