@@ -243,7 +243,11 @@ def _idle_actionable_lot(alert: dict) -> str:
 def _slo_breach(alert: dict) -> str:
     """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
     délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
-    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, owner pour un P1)."""
+    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, owner pour un P1).
+
+    #2231 : quand l'attente est une fusion (`merge*`) ou un déblocage
+    (`unblock`), le porteur n'est pas le blocage — le brief vise le pilote/le
+    composeur et ne prescrit ni relance ni réassignation du porteur."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1)
@@ -259,7 +263,28 @@ def _slo_breach(alert: dict) -> str:
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
     # le lot a changé de main entre-temps, au lieu d'écraser le premier geste.
     holder = " --if-holder %s" % who if who else ""
-    if level >= 3:
+    waiting = alert.get("waiting") or {}
+    what = waiting.get("what") if isinstance(waiting, dict) else None
+    if what in ("merge", "merge-approval", "merge-outcome"):
+        if level >= 3:
+            move = ("bureau or auditor: the lot waits for its merge vehicle/package — "
+                    "the composer/pilot carries it, and reassigning or nudging its holder "
+                    "does not advance it; push the pilot/composer to include it in the next "
+                    "package")
+        else:
+            move = ("pilot: the lot is frozen with its review verdict acquired and waits "
+                    "for its merge vehicle/package — the composer/pilot carries it; do not "
+                    "reassign or nudge its holder, include it in the next package")
+    elif what == "unblock":
+        if level >= 3:
+            move = ("bureau or auditor: the lot is `blocked` and the pilot owns the "
+                    "unblock (or the recorded decision) — do not reassign its holder; "
+                    "push the pilot to unblock it or to say why the lot waits")
+        else:
+            move = ("pilot: the lot is `blocked` and waits for its unblock/decision — "
+                    "do not reassign its holder; unblock it or record the decision "
+                    "(ameesh work note %d \"hold: <reason>\")" % lot)
+    elif level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
                 "for the pilot if it is itself late" % (lot, holder, lot))
