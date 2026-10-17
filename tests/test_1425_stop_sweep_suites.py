@@ -129,7 +129,10 @@ class SweepAfterGuardsTest(_Base):
             power_hold=threading.Event(), draining=threading.Event(),
             restart_for_stale=False, _gate_settled=threading.Event(),
             mediated=True, host_gate=None, db=self.db, host="atelier",
-            agents_filter=None, once=True, runner_id="runner-test", dry_run=False)
+            agents_filter=None, once=True, runner_id="runner-test", dry_run=False,
+            # #804 : `sweep` déclenche la prise au repos ; ce témoin ne
+            # l'exerce pas (0 = désactivée), seule l'ordre release/claim compte.
+            take_interval=0, _take_next=0.0)
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
         # L85 (#373) : `sweep` prune aussi le journal d'événements.
