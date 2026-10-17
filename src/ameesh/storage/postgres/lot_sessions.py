@@ -87,7 +87,8 @@ class LotSessions(interface.LotSessions):
             tx.execute(
                 "UPDATE agent_registry SET session_id = %s, session_account = %s,"
                 "       session_harness = %s, session_cwd = %s, session_origin = %s,"
-                "       session_work_item = %s, updated_at = now()"
+                "       session_work_item = %s, session_reset_at = clock_timestamp(),"
+                "       updated_at = now()"
                 " WHERE name = %s",
                 (resumed, account if resumed else None, harness if resumed else None,
                  cwd if resumed else None, resumed, cible or None, name))

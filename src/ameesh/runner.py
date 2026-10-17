@@ -1975,7 +1975,8 @@ class AgentWorker(threading.Thread):
                 # #2055 : la session courante est celle d'un autre lot, encore
                 # ouvert : elle est mise de côté pour lui, jamais partagée avec
                 # le tour du lot fini (#794). Le tour part sans lot.
-                self._park_lot_session(courant, str(lot))
+                if not self._park_lot_session(courant, str(lot)):
+                    return dict(spec, lot_switch_failed=True)
             spec["lot_finished"] = True
             return spec
         if courant:
@@ -1998,7 +1999,12 @@ class AgentWorker(threading.Thread):
         # attend pour le lot du tour (mise de côté par une bascule, ou avant le
         # tour d'un lot fini), elle est reprise, comme toute bascule (#408) —
         # jamais une session neuve quand la sienne est de côté.
-        if self._has_parked_session(str(lot)) and self._switch_lot("", str(lot)):
+        parked = self._has_parked_session(str(lot))
+        if parked is None:
+            return dict(spec, lot_switch_failed=True)
+        if parked:
+            if not self._switch_lot("", str(lot)):
+                return dict(spec, lot_switch_failed=True)
             return spec
         self._open_lot_session(lot)
         return spec
@@ -2103,8 +2109,8 @@ class AgentWorker(threading.Thread):
         brief déterministe (comme la fermeture d'un lot fini). La session mise
         de côté pour `courant` sera reprise par la bascule au prochain tour sur
         ce lot. Fencé par le bail, sans reprise : bail perdu ou base
-        injoignable rend False, et le tour suit le chemin courant (session
-        partagée), comme une bascule refusée.
+        injoignable rend False, et le tour est différé, comme une bascule
+        refusée.
         """
         compte = account_turn.for_turn(self)
         nom = None if compte is None or compte is account_turn.INVALID else compte.name
@@ -2157,11 +2163,12 @@ class AgentWorker(threading.Thread):
                   "lot": courant, "fini": fini})
         return True
 
-    def _has_parked_session(self, lot: str) -> bool:
+    def _has_parked_session(self, lot: str) -> bool | None:
         """#2055 : une session est-elle mise de côté pour le lot `lot` ?
 
         Lecture seule : la bascule (`_switch_lot`) décide ensuite de la
-        reprendre (même harnais, compte et dossier) ou de l'écarter."""
+        reprendre (même harnais, compte et dossier) ou de l'écarter.
+        None si la lecture échoue : le tour doit attendre cette lecture."""
         lot = str(lot or "").strip()
         if not lot.isdigit():
             return False
@@ -2169,7 +2176,7 @@ class AgentWorker(threading.Thread):
             rows = storage.of(self.db).lot_sessions.listing(self.name)
         except db_mod.DbError as exc:
             log_async("[%s] parked sessions unreadable (%s)" % (self.name, exc))
-            return False
+            return None
         return any(str(r.get("work_item_id")) == lot and r.get("session_id")
                    for r in rows)
 

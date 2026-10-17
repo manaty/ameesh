@@ -12,7 +12,7 @@ import subprocess
 import time
 from unittest import mock
 
-from ameesh import mail, registry, storage, work
+from ameesh import db as db_mod, mail, registry, storage, work
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -548,6 +548,22 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_la_mise_de_cote_refusee_differe_le_tour(self):
+        worker = self._worker("w15")
+        self.addCleanup(worker.watchdog_stop.set)
+        b = work.add(self.db, title="B", assignee="w15", force=_FORCE)["id"]
+        self.tour(worker, b, "commence B", session="sess-B")
+        a = work.add(self.db, title="A", assignee="w15", force=_FORCE)["id"]
+        work.close(self.db, a, abandoned=True, actor="test")
+        for failure in (None, db_mod.DbError("base indisponible")):
+            with self.subTest(failure=failure), mock.patch.object(
+                    type(self.st), "switch", return_value=None, side_effect=failure):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
+                                              "ids": [], "lot": str(a)})
+                self.assertTrue(spec.get("lot_switch_failed"))
+                self.assertFalse(worker._run_turn(spec))
+                self.assertEqual(worker.current_session(), "sess-B")
+
     def test_le_tour_d_un_lot_fini_ne_partage_pas_la_session_d_un_autre_lot(self):
         """#2055 (P3 de la relecture de #1898) : quand le tour porte sur un lot
         FINI A alors que la session active est celle d'un AUTRE lot B encore
@@ -566,15 +582,21 @@ class RoutageTest(_Base):
             self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
             self.assertEqual(registry.get(self.db, "w14")["session_id"], "sess-B")
             work.close(self.db, a, abandoned=True, actor="test")
-            spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
-                                          "ids": [], "lot": str(a)})
+            with mock.patch("ameesh.runner.os.unlink", side_effect=PermissionError("read-only")):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
+                                              "ids": [], "lot": str(a)})
+                self.assertIsNone(worker.current_session(), "le fichier resté est périmé")
+                recree = AgentWorker(Runner(self.cfg, self.db, once=True),
+                                     registry.get(self.db, "w14"),
+                                     {"lease_epoch": worker.epoch})
+                self.assertIsNone(recree.current_session(), "oubli durable après redémarrage")
             self.assertEqual(spec["lot"], str(a))
             self.assertTrue(spec.get("lot_finished"))
             agent = registry.get(self.db, "w14")
             self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, None),
                              "la session de B est mise de côté, aucune n'est active")
-            self.assertIsNone(worker.read_session_file(),
-                              "le fichier de B ne sert pas le tour du lot fini")
+            self.assertEqual(worker.read_session_file(), "sess-B",
+                             "le refus de suppression a laissé le fichier de B")
             self.assertIsNone(worker.current_session())
             lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("w14")}
             self.assertEqual(lignes.get(b), "sess-B", "la session de B est gardée pour B")
@@ -588,6 +610,14 @@ class RoutageTest(_Base):
             agent = registry.get(self.db, "w14")
             self.assertEqual((agent["session_id"], agent["session_work_item"]),
                              ("sess-A2", None))
+            with mock.patch.object(worker, "_switch_lot", return_value=False):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de B",
+                                              "ids": [], "lot": str(b)})
+                self.assertTrue(spec.get("lot_switch_failed"))
+            with mock.patch.object(type(self.st), "listing", side_effect=db_mod.DbError("base")):
+                spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de B",
+                                              "ids": [], "lot": str(b)})
+                self.assertTrue(spec.get("lot_switch_failed"))
             # le tour suivant sur B reprend SA session, mise de côté.
             argv = self.tour(worker, b, "suite de B")
             self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
