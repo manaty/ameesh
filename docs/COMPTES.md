@@ -244,7 +244,14 @@ commencé est un **rejeu** du harnais : il reste lisible (la fenêtre échue vau
 0 %, L71) mais n'est pas daté et ne remplace jamais une mesure datée. Les
 lecteurs départagent par instant de production, jamais par l'heure
 d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
-exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
+exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais. Une
+fenêtre reprise de l'historique n'est jamais réécrite dans l'historique (pas
+d'écho d'un hôte à l'autre) et `accounts list` indique son âge (« read … ago »)
+quand elle n'a pas de lecture locale. Sur un exécuteur `backend=mediated`,
+`operations.gauge_latest` n'est **pas** admise au contrat médié : la
+réconciliation d'historique y est inerte et la lecture locale est rendue
+silencieusement. C'est un choix documenté, pas une panne : admettre cette
+lecture toucherait le contrat d'autorisation et demanderait deux avis.
 
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,
