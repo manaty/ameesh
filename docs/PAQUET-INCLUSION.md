@@ -55,6 +55,38 @@ Le script est en **lecture seule** : aucun réseau, aucune écriture dans le
 dépôt. Il lit le manifeste et l'historique git ; les commits cités par le
 manifeste doivent être présents localement (sinon `git fetch` d'abord).
 
+## Le trailer `ameesh-work:` des commits de composition (#2157)
+
+Chaque commit de composition — une unité du paquet — porte une ligne
+`ameesh-work: <id>` par lot qu'il porte, en fin de message :
+
+```
+vehicule 0400 : #2131 (ef22692ba6a3) — détachement conditionnel CAS et PR détachée
+
+ameesh-work: 2131
+```
+
+Sans elle, le commit ne désigne pas son lot : `ameesh work merged --sha
+<commit>` le refuse, et `sync-merges`/`sync-branches` ne voient que le gel
+enregistré quand la composition a porté une remise (#1628). Le trailer ne change
+ni l'arbre ni la CI.
+
+Pour l'écrire sans y penser, `scripts/paquet-compose.py` fait la fusion et le
+message, avec un `--lot` par lot porté :
+
+```sh
+scripts/paquet-compose.py --lot 2131 --source ef22692ba6a3 --cut 0400 \
+    --note "détachement conditionnel CAS et PR détachée"
+```
+
+Sur fusion propre, il crée le commit et affiche son SHA. Sur conflit, il ne
+commite pas : le message complet est déjà dans `.git/MERGE_MSG` ; on résout, on
+`git add`, puis `git commit --no-edit`. Le trailer reste en fin de message.
+
+La convention vaut pour les unités composées à partir de maintenant : un paquet
+déjà validé n'est pas réécrit pour ce seul métadonné, son manifeste et son run
+restent la preuve de ses lots.
+
 ## Ce qu'il vérifie
 
 1. **Admissions × manifeste.** Chaque lot attendu doit avoir une ligne de
