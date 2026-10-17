@@ -348,6 +348,35 @@ class PickupTest(consumers.PriseMultiProjetsTest):
         self.assertEqual(len(reasons), 1)
         self.assertIn('Host work root', reasons[0])
 
+    def test_two_agents_note_the_refusal_once(self):
+        """#1538 : le refus de dossier se note une fois par ÉLÉMENT, pas une
+        fois par (agent, élément) — deux agents et deux passages ne laissent
+        qu'une seule note L243-4 sur le lot."""
+        self.multi('m1')
+        self.multi('m2')
+        item = self.lot('secondary', app='nexlink')
+        self.assertEqual(self.take(), [])
+        self.assertEqual(self.take(), [])
+        self.assertIsNone(work.get(self.db, item['id'])['assignee'])
+        reasons = [e['note'] for e in work.events(self.db, item['id'])
+                   if (e.get('note') or '').startswith('L243-4:')]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn('Host work root', reasons[0])
+
+    def test_journal_is_read_once_per_element_in_a_pass(self):
+        """#1538 : le journal d'un élément refusé n'est plus relu pour chaque
+        couple (agent, élément) du même passage : deux agents butent sur le
+        même lot, le journal n'est lu qu'une fois."""
+        self.multi('m1')
+        self.multi('m2')
+        self.lot('secondary', app='nexlink')
+        with mock.patch('ameesh.lot_workdir.problem',
+                        wraps=lot_workdir.problem) as problem, \
+                mock.patch('ameesh.work.events', wraps=work.events) as events:
+            self.assertEqual(self.take(), [])
+        self.assertEqual(problem.call_count, 2)   # m1 puis m2 ont été évalués
+        self.assertEqual(events.call_count, 1)    # une seule lecture du journal
+
     def test_dry_run_missing_policy_does_not_write_reason(self):
         self.multi()
         item = self.lot('secondary', app='nexlink')

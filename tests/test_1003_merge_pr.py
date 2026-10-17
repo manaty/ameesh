@@ -652,7 +652,10 @@ class RunTest(unittest.TestCase):
                "tip": "d" * 40}
         for actor in ("", work.UNKNOWN_ACTOR):
             with self.subTest(actor=actor):
-                with mock.patch.object(merge_pr.work, "merged") as recorded:
+                # #2094: intercept the function the #1286 path really records
+                # with, `work.close_merged` — mocking `work.merged` left
+                # `assert_not_called` trivially true.
+                with mock.patch.object(merge_pr.work, "close_merged") as recorded:
                     code, text = self.run_with(out, args=self.args(actor=actor, json=False))
                 self.assertEqual(code, 0)
                 recorded.assert_not_called()
