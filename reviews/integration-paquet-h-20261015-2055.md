@@ -1,0 +1,181 @@
+# Paquet integration/paquet-h-20261015-2055 — composition scriptée (bureau, 15/10/2026 20:53)
+
+Base : origin/integration/paquet-h-20261015-1955 `13ae8c461`. Tête : `661367502`. Inclus : 60. Écartés : 102.
+
+## Inclus
+
+- #1411 Pression hôte : des ressources de tests abandonnées retiennent les relecteurs pa — ameesh-dev5, tête gelée `cb6dd6e20`, verdict ok de ameesh-dev4
+- #1190 #762 N1 (suite) : le dry-run credite deux fois un inode lie entre deux dossiers  — ameesh-cx1, tête gelée `a11665fe0`, verdict ok de ameesh-dev3
+- #1227 Suite #1176 (N1-N4, relecture Claude bureau R1) : heure until sous relèvement, p — ameesh-dev3, tête gelée `d9a1d8018`, verdict ok de mesh-design
+- #1245 poste.sh migrer ignore son argument REF (l'en-tête, BASCULE.md et le message d'e — mty-amh-impl-06, tête gelée `b3544e5db`, verdict ok de bureau
+- #1253 1003 suite : 5 N de la relecture Claude3 (merge_pr.py + EXPLOITATION.md) — mty-amh-impl-01, tête gelée `9bffb40d8`, verdict ok de ameesh-cx3
+- #1266 #339 suite : borner les processus illisibles par la vie du tour sans masquer un  — ameesh-cx1, tête gelée `9d075ed21`, verdict ok de bureau
+- #1296 #1005 tranche 2 (sensible hors prod) : le relevé ferme par le contenu (dernier g — ameesh-dev2, tête gelée `3c99cdb33`, verdict ok de mesh-design
+- #1305 Sauvegardes PostgreSQL : répertoire privé et dumps0600 durables — ameesh-dev2, tête gelée `31cabd074`, verdict ok de ameesh-dev1
+- #1323 Staging : réveiller le rapporteur sur preuve du correctif réellement installé et — ameesh-dev3, tête gelée `381794208`, verdict ok de mesh-design
+- #1335 radar/land : la sonde « unreserved » est morte — run_pass passe à migration_rese — mty-amh-impl-08, tête gelée `32ed208b2`, verdict ok de ameesh-dev2
+- #1341 Carte main incomplète : mesure psycopg40min et tests psql45min annulés sur0532 — mty-amh-qa-01, tête gelée `a8213ee03`, verdict ok de ameesh-dev1
+- #1549 Banc #1252 : VmAgentsBundleInstallTest échoue si TMPDIR contient « ~ » (dépendan — ameesh-cx2, tête gelée `c44e6c6a3`, verdict ok de ameesh-dev7
+- #1603 work migration : skip_branch ne couvre pas la branche d'intégration du paquet ;  — mty-amh-impl-03, tête gelée `877ccf387`, verdict ok de mesh-design
+- #1647 ameesh work list --json devenu très lent (38 s pour 100 lots, plus de 100 s pour — mty-amh-impl-05, tête gelée `bd2a07405`, verdict ok de ameesh-cx2
+- #1672 Comptes : le choix automatique prend un compte Claude à sa limite hebdomadaire ( — ameesh-dev3, tête gelée `23185d290`, verdict ok de ameesh-dev2
+- #1673 0024 : brancher la conversation L83 (lecture + saisie) dans la fiche agent — ameesh-dev7, tête gelée `a52febabf`, verdict ok de mty-amh-qa-01
+- #1678 platform.user_paths : un zombie de l'utilisateur est compté comme illisible et r — mty-amh-impl-03, tête gelée `3e0cf910e`, verdict ok de ameesh-dev7
+- #1680 #1607-2 Atterrissage Nexlink : réserver develop pendant la CI d'un paquet — codex3, tête gelée `a68f54790`, verdict ok de codex3
+- #1692 CI : rééquilibrer la suite psql complète en plus de parts (six parts dépassaient — deepseek4, tête gelée `9f418defc`, verdict ok de deepseek4
+- #1708 TEST-FLAKE : test_turn_grace.test_sans_grace_nettoyage_immediat lit ended_ts ava — ameesh-dev3, tête gelée `0c07f77f9`, verdict ok de mesh-design
+- #1737 Réveils one-shot (ameesh watch at) : un daemon-reload recale l'ancrage monotone  — ameesh-cx1, tête gelée `26b21b24a`, verdict ok de ameesh-dev4
+- #1761 work queue add échoue depuis un poste agent ou pilote (clone radar introuvable) — mty-amh-impl-04, tête gelée `1ca832295`, verdict ok de ameesh-cx1
+- #291 L83: conversation in the Nexlink page — mty-amh-impl-07, tête gelée `887b1fd58`, verdict ok de ameesh-dev7
+- #813 #705 follow-up: has_reviewer caches a negative answer for the life of the connec — mty-amh-impl-07, tête gelée `3460f9d68`, verdict ok de ameesh-dev1
+- #835 MIGRATION-LOCK : borner attente ACCESS EXCLUSIVE de 0422 — mty-amh-impl-03, tête gelée `8ab9134b7`, verdict ok de ameesh-cx2 (rebase identique)
+- #877 L361c : l'indexation d'un fil médié passe par le census absolu (threads.recount, — mty-amh-impl-08, tête gelée `db4de5ef3`, verdict ok de ameesh-dev7
+- #887 #287 suite : affichage des tours dupliqués, docstring !stop, robustesse loop() — mty-amh-impl-02, tête gelée `d21e5df4b`, verdict ok de ameesh-dev1
+- #923 HANDOFF-TEXT-TAKER : handoff.py:284 dit encore « the codex review stays required — mty-amh-impl-07, tête gelée `40c170e8c`, verdict ok de auditeur
+- #928 Suite #373 (R2 auditeur, n) : position SSE propre au journal, et cas limites de  — mty-amh-impl-06, tête gelée `a284837a0`, verdict ok de ameesh-cx2
+- #964 Courrier --lot : ne pas reassigner le lot quand l'expediteur n'est pas un orches — deepseek2, tête gelée `ded405007`, verdict ok de bureau
+- #967 Suite #956 (N R2 bureau) : ORDER BY id sur le SELECT ... FOR UPDATE des reservat — mty-amh-impl-08, tête gelée `e381762a9`, verdict ok de ameesh-dev2
+- #1002 CI relance hosted : refuser un événement périmé après changement de tentative — mty-amh-impl-05, tête gelée `7aaa56509`, verdict ok de auditeur
+- #1053 Suite #1037 N1 : attribuer la famille au lot produit, pas a la session courante  — mty-amh-impl-07, tête gelée `069ab54de`, verdict ok de bureau (rebase identique)
+- #1056 #976 suite R2 : observer le PID du verrou dans les temoins inscription/courrier — mty-amh-impl-01, tête gelée `811e15614`, verdict ok de bureau
+- #1179 Suite #532 (N1 bureau) : la sonde pgbouncer ne doit pas faire echouer run_pass n — mty-amh-impl-06, tête gelée `6ac27e750`, verdict ok de mesh-design
+- #1194 #919 suites Claude N1/N2 : audit TEMP des logins membres et documentation des fo — ameesh-cx2, tête gelée `967613a1a`, verdict ok de ameesh-dev2
+- #1298 Alerte stale : un lot en attente externe qualifiée (hold) se re-signale toutes l — mty-amh-impl-04, tête gelée `9c94249c2`, verdict ok de ameesh-cx1
+- #1318 stagnation : un verdict perime affiche encore son relecteur comme porte courante — ameesh-dev3, tête gelée `04ac0c0cf`, verdict ok de mesh-design
+- #1350 1339 N (bureau 20:00) : un raise/sys.exit top-level avant un import reste compté — ameesh-cx1, tête gelée `c81ff8587`, verdict ok de mty-amh-qa-01
+- #1383 #354 N3 : fermer les descripteurs restants si _grant_tree échoue — mty-amh-impl-05, tête gelée `4d476861f`, verdict ok de ameesh-dev1
+- #1397 Détection de quota : borner les motifs lus dans le résultat libre — mty-amh-impl-03, tête gelée `b7c32f920`, verdict ok de ameesh-dev1
+- #1404 Herméticité : renforcer la raison d'exemption et les témoins du lint — ameesh-cx2, tête gelée `ca0a12fb8`, verdict ok de bureau
+- #1437 Rebase de lots : borner le contrôle des sujets aux commits réellement rejoués — ameesh-cx1, tête gelée `d793e7b54`, verdict ok de ameesh-dev2
+- #1453 #846 : suite R2 dev4 (N1-N2) — run jamais conclue bloquant main_red ; pagination — ameesh-dev1, tête gelée `94c4d3738`, verdict ok de mesh-design
+- #1456 EXPLOITATION.md veilles faites main : Environment=PATH ne résout pas un ExecStar — ameesh-cx2, tête gelée `d9ff0df64`, verdict ok de mty-amh-impl-04
+- #1482 L361 : regrouper les N de la R2 finale de #499 — mty-amh-impl-05, tête gelée `8cab5397a`, verdict ok de ameesh-dev7
+- #1496 Prise automatique : absorber les deadlocks transitoires de l’attribution ready_o — ameesh-dev7, tête gelée `a7532b02e`, verdict ok de mty-amh-qa-01
+- #1497 L87 (#375) : N de la revue DeepSeek — acteur 'for' expediteur de fil (L86), cle  — ameesh-dev1, tête gelée `484465e0c`, verdict ok de ameesh-cx2
+- #1504 #1468 : retouches doc/commentaire après relecture (exemple de PR, workflow_call  — ameesh-dev5, tête gelée `f241fa50f`, verdict ok de ameesh-dev4
+- #1521 Exploitation : dater le début du motif de pause budget — mty-amh-impl-02, tête gelée `7860bd441`, verdict ok de ameesh-dev7
+- #1528 #1173 : N de la relecture Claude — mty-amh-docs-01, tête gelée `731301539`, verdict ok de ameesh-dev7
+- #1547 #1411 : les 4 N de la R2 dev4 (banc partagé étiqueté 762, témoins ps -a/pg-up.sh — ameesh-dev5, tête gelée `f8436f867`, verdict ok de bureau
+- #1586 #193 N1 : rejouer install-pilot remet $ROOT en 0755 et defait le layout 2710 de  — mty-amh-impl-05, tête gelée `42adc2399`, verdict ok de agent:ameesh-dev2
+- #1587 #193 N2 : test_purge_removes_only_the_recorded_paths depend d'un TMPDIR sans lie — mty-amh-impl-02, tête gelée `0fa5b24fa`, verdict ok de bureau
+- #1589 Garde de capacité : busy_units sans actions.runner.* dans les exemples, et insta — mty-amh-impl-02, tête gelée `d99ea5299`, verdict ok de bureau
+- #1601 l159g : 8 tests d'InstallPilotTest rouges quand le TMPDIR contient « ~ » (racine — mty-amh-impl-08, tête gelée `e081a13be`, verdict ok de ameesh-dev7
+- #1608 idle_capacity : la liste « lots ouverts sans agent » propose des lots bloqués pa — mty-amh-impl-05, tête gelée `93bd09aea`, verdict ok de ameesh-cx1
+- #1614 #1407 : N de la relecture Claude — mty-amh-impl-02, tête gelée `7c6215f67`, verdict ok de mesh-design
+- #1622 #1391 : N de la relecture Claude — ameesh-dev3, tête gelée `445fa1ab0`, verdict ok de ameesh-cx2
+
+## Écartés (coupure suivante)
+
+- #364 L232b: SSH release controller and delegated host helper — mty-amh-impl-04 : conflit : tests/test_cluster.py
+- #414 L242c CRITICAL-ROLES (#340 2c): critical agents derived from declared roles, not — mty-amh-impl-07 : tête gelée 2ef495b26 introuvable
+- #747 CI root cause 1: ameesh CI starved on hosted runners (20-job cap, 21 runs queued — mty-amh-impl-02 : tête gelée sans verdict, contenu différent de la tête relue
+- #748 CI root cause 2: tests that depend on the environment (file timestamps, clock ti — mty-amh-docs-01 : déjà dans origin/integration/paquet-h-20261015-1955
+- #750 CI root cause 4: the release absorbs every new merge (Zeno effect), each rebase  — deepseek3 : déjà dans origin/integration/paquet-h-20261015-1955
+- #756 CI rule: a release PR cannot be merged without a green full suite on its frozen  — deepseek3 : déjà dans origin/integration/paquet-h-20261015-1955
+- #810 L243-3: consumers of projects: — pick-up, orchestrators, briefs, roadmap/progres — mty-amh-impl-07 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1257 CI carte : couverture sqlite corrompue (database disk image is malformed) rougit — mty-amh-impl-06 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1466 Comptes : la configuration n'est pas relue par les exécuteurs (agents en pause s — mty-amh-impl-05 : conflit : src/ameesh/alert_briefs.py
+- #1517 Fichiers chauds : supprimer les conflits structurels des paquets (contract.json, — ameesh-dev7 : conflit : src/ameesh/mediated_executor/contract.json
+- #1580 Comptes : consommer d'abord le budget qui sera perdu au reset, et proposer les b — mty-amh-impl-03 : tête gelée sans verdict, contenu différent de la tête relue
+- #1616 Processus en code #1606 : compiler les paramètres de coupure et les règles de re — mty-amh-impl-07 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1617 Processus en code #1606 : désigner les relecteurs au gel depuis la politique can — mty-amh-impl-02 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1649 Claude : conserver Gauges.overage dans claude_gauges pour appliquer la garde arg — ameesh-dev4 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1651 Porte CI : refuser un vert partiel sans plan de parts sur une tête gelée ancienn — mty-amh-impl-06 : conflit : src/ameesh/merge_queue.py src/ameesh/radar.py
+- #1656 Auto-fusion GitHub : empêcher une tête modifiée de fusionner sous un ancien feu  — mty-amh-impl-06 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1665 Worktrees de lot : le runner et ameesh housekeeping les retirent après fusion ou — deepseek3 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1677 Prise automatique aveugle : lots bloqués par des lots en qa jamais pris, inactiv — mty-amh-impl-07 : tête retirée d'un paquet précédent (paquets/retires.tsv)
+- #1768 Porte : un paquet Nexlink (integration/**) n'est vert qu'avec un statut lot/* en — ameesh-dev7 : conflit : src/ameesh/land.py src/ameesh/merge_pr.py src/ameesh/radar.py
+- #193 L159h : prêt de capacité de la VM de CI, avec ses mainteneurs (isolement du grou — ameesh-dev4 : déjà dans origin/integration/paquet-h-20261015-1955
+- #373 L85: event log and SSE — mty-amh-impl-07 : déjà dans origin/integration/paquet-h-20261015-1955
+- #376 L89: read screens — ameesh-cx2 : déjà dans origin/integration/paquet-h-20261015-1955
+- #388 L63b: adopt/resume refuse without bypass when the session cannot be checked clos — mty-amh-impl-02 : déjà dans origin/integration/paquet-h-20261015-1955
+- #391 L66: desktop notifications on macOS (osascript) and WSL2 (Windows toast via powe — mty-amh-impl-07 : déjà dans origin/integration/paquet-h-20261015-1955
+- #423 L243b RENAME-AGENTS: rename existing agents to <org>-<repo>-<role>-<seq>, old na — mty-amh-impl-05 : conflit : src/ameesh/assignments.py src/ameesh/canon_sync.py src/ameesh/hostcheck.py src/ameesh/mediated_executor/contract.json
+- #498 L76c: per-turn delegated cgroup v2 (harness, tools, reparented descendants): sta — mty-amh-impl-02 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json
+- #508 Runner: per-persona liveness without a lease (last_seen with host), so deploy ch — mty-amh-impl-07 : tête gelée sans verdict, contenu différent de la tête relue
+- #514 WAKE-ON-EVENT : un courrier de relecteur, d'arbitre ou de l'owner interrompt le  — mty-amh-impl-02 : déjà dans origin/integration/paquet-h-20261015-1955
+- #537 config.mask_dsn shows quoted keyword passwords, 'password = x' and URI query pas — mty-amh-impl-05 : déjà dans origin/integration/paquet-h-20261015-1955
+- #711 L122: scoped migration reservations (slot, target repo/branch, targetSha, status — mty-amh-impl-05 : tête gelée sans verdict, contenu différent de la tête relue
+- #731 Bug: session restore --home OTHER --overwrite overwrites another agent's files w — mty-amh-impl-01 : déjà dans origin/integration/paquet-h-20261015-1955
+- #793 canon sync: concurrent syncs on one host each push the changed Process rules to  — auditeur : conflit : src/ameesh/mediated_executor/contract.json
+- #800 Aucune autre famille de modele imposee pour le relecteur : avertir quand le rele — mty-amh-impl-01 : conflit : docs/EXPLOITATION.md docs/PLAN-DE-TRAVAIL.md src/ameesh/alert_briefs.py src/ameesh/mediated_executor/contract.json
+- #804 Le tirage du lot se fait par l'exécuteur de l'agent, pas par notify — mty-amh-impl-06 : conflit : src/ameesh/runner.py
+- #848 GITHUB-API-QUOTA : éviter la saturation du jeton partagé lors des lectures CI — mty-amh-docs-01 : tête gelée sans verdict, contenu différent de la tête relue
+- #856 CI-FLOW-ORPHANS : conclure les checks tests (flux) après arrêt du runner — mty-amh-impl-02 : conflit : .github/workflows/tests.yml
+- #860 GitHub API : le PAT partagé épuise sa limite core (5000/h) et bloque la lecture  — mty-amh-impl-02 : déjà dans origin/integration/paquet-h-20261015-1955
+- #917 stale_lot d'un lot sans assigne : le brief part a tous les orchestrateurs, toute — mty-amh-impl-05 : conflit : src/ameesh/alert_briefs.py
+- #953 R5-IMAGE-APPROVE : publier et versionner l'image approve (digest) + politique de — mty-amh-impl-04 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1026 STALE-LOT-RACE : le brief stale_lot part a tous les orchestrateurs — deux agents — mty-amh-impl-02 : tête gelée sans verdict, contenu différent de la tête relue
+- #1070 Observabilité : pauses budget masquées derrière status blocked — mty-amh-impl-06 : conflit : docs/EXPLOITATION.md src/ameesh/mesh_cli.py
+- #1078 Comptes : jauges isolées par profil sans héritage du compte ambiant — mty-amh-impl-05 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1104 L539 : une fusion manuelle hors file n'ouvre pas le lot de relecture après fusio — mty-amh-impl-07 : tête gelée sans verdict, contenu différent de la tête relue
+- #1124 Explorations : sas des idées hors roadmap (docs/design/explorations + garde CI) — ameesh-cx1 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1131 Déploiement poste : ignorer les agents arrêtés par l'owner malgré leur unité act — mty-amh-impl-04 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1132 Jauges Claude : un relevé périmé à reset passé remplace la lecture fraîche et fa — mty-amh-impl-05 : conflit : src/ameesh/accounts.py src/ameesh/cost.py src/ameesh/gauge_cache.py src/ameesh/mediated_executor/contract.json
+- #1133 vm.sh agents : EnvironmentFile %h non absolu empêche le redémarrage et ses contr — mty-amh-impl-04 : déjà dans origin/integration/paquet-h-20261015-1955
+- #1256 Capacité CI : préparer des runners ameesh sur VM Nexlink existante libre — mty-amh-impl-07 : conflit : .github/workflows/tests.yml deploy/guest/install-pilot.sh tests/test_1468_ci_prio.py
+- #1283 CI #1236 : tests d'adoption voient une session fictive dans un processus DeepSee — mty-amh-impl-08 : conflit : src/ameesh/platform/process.py
+- #1343 CI ameesh déclenchée au gel, pas à chaque poussée (relecture avant CI) — mty-amh-impl-04 : contenu annulé non réappliqué : 0 lignes apportées pour 2860 retirées (rebaser en réappliquant)
+- #1359 Limite d'en-cours : au plus 2 lots en build par agent, surplus rendu à la file — mty-amh-impl-06 : conflit : src/ameesh/mesh_cli.py
+- #1374 Fusion automatique : feu au gel, atterrissage automatique à la CI verte (ameesh) — mty-amh-impl-08 : contenu annulé non réappliqué : 16 lignes apportées pour 2414 retirées (rebaser en réappliquant)
+- #1462 L87b : pause et reprise opérateur d'un agent (API et CLI) — ameesh-cx2 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json
+- #1463 L87c : accusé de réception persistant d'une alerte (API et CLI) — ameesh-cx2 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json
+- #1465 Relecteur qui corrige et fusionne dès le premier tour : consignes et outillage — mty-amh-impl-07 : conflit : src/ameesh/storage/interface.py src/ameesh/storage/postgres/work.py src/ameesh/work.py
+- #1476 CI ameesh sous 15 min, même en suite complète — mty-amh-impl-04 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json
+- #1635 CI : un workflow_dispatch de tests.yml sur une branche de lot publie un check te — ameesh-dev1 : conflit : .github/workflows/tests.yml
+- #1645 GitHub : une identité par agent ou par rôle au lieu du jeton de l'owner, pour at — ameesh-dev4 : conflit : src/ameesh/main.py
+- #289 L81: resident rotation — mty-amh-impl-08 : conflit : src/ameesh/cli.py
+- #290 L82: attach redefined (sleep then hand back, --max, duplicate refusal) — ameesh-cx2 : conflit : src/ameesh/reprise.py
+- #831 #802 follow-up: work_packages writes outside the sync lock (rebase_default), per — mty-amh-impl-01 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json tests/parts/pilote-psql.txt
+- #920 Suite #835 : temoins lock_timeout robustes sous charge (attente_vue 5 s -> 30 s) — mty-amh-impl-05 : conflit : tests/test_migrations.py
+- #1022 #711 N (bureau) : a la fusion, le creneau passe en released au lieu de landed — mty-amh-impl-05 : tête gelée sans verdict, contenu différent de la tête relue
+- #1250 #1037 suite (N1 R2) : ameesh show/list n'affichent pas le harnais de session (em — mty-amh-impl-02 : conflit : src/ameesh/mesh_cli.py
+- #1286 work merged : le SHA declare n'est rattache a aucun lot — un numero de PR homony — ameesh-cx3 : conflit : src/ameesh/merge_pr.py
+- #1349 ameesh agent peek <nom> : résumé lisible de ce que fait un agent en ce moment — ameesh-cx3 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json src/ameesh/serve.py tests/test_l84_serve.py
+- #1396 Courrier non distribuable : rendre les refus visibles et essayer les successeurs — ameesh-dev5 : conflit : src/ameesh/cli.py
+- #1416 #1256 : regrouper les six durcissements non bloquants (N1-N6) du prêt de runners — ameesh-dev5 : conflit : .github/workflows/tests.yml deploy/guest/install-pilot.sh tests/test_1468_ci_prio.py
+- #1425 Suite R2 #753 (N1-N5) : temoins stop/balayage, ordre des gardes, TOCTOU, nom abs — mty-amh-impl-03 : conflit : src/ameesh/mediated_executor/contract.json src/ameesh/runner.py src/ameesh/storage/postgres/operations.py tests/parts/pilote-psql.txt
+- #1483 CI-NEXLINK-WAKE : suites P3 de la R2 Claude #1110 (rattrapage sur les branches d — ameesh-dev5 : conflit : src/ameesh/ci.py src/ameesh/plan_github.py
+- #1494 #705 N (R2 Claude) : _reassign verrouille en FOR UPDATE, et cache has_reviewer f — ameesh-dev1 : conflit : src/ameesh/storage/postgres/work.py
+- #1508 #1374 N1 (avis dev4) : docstring de fire._target_lock fausse sur le retour quand — ameesh-dev4 : conflit : src/ameesh/fire.py
+- #1511 #1476 N : PyYAML absent des venvs CI des parts, ManifestesTest sélectionné mais  — ameesh-dev5 : conflit : .github/workflows/tests.yml
+- #1532 #1190 : N de la relecture Claude — ameesh-dev5 : conflit : src/ameesh/housekeeping.py
+- #1567 L122 : afficher le numero atterri d'une migration, pas seulement la reservation  — mty-nxl-impl-01 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json
+- #1573 ci.py (#901 suites) : relance courte finie entre deux passages non rouverte par  — ameesh-dev5 : conflit : docs/EXECUTEUR-MEDIEE.md src/ameesh/mediated_executor/contract.json
+- #1623 #1364 : N de la relecture Claude — ameesh-dev5 : plafond du paquet atteint
+- #1624 #1372 : N de la relecture Claude — mty-amh-docs-01 : plafond du paquet atteint
+- #1628 #1604 : les 2 N de la relecture (statusline_key sans nom d'agent, drapeau d'exce — ameesh-dev5 : plafond du paquet atteint
+- #1634 #1617 suite : en mode hook, un notify vide ou hors registre annule le gel lui-mê — ameesh-dev4 : plafond du paquet atteint
+- #1644 Packets §12 : controle d'inclusion des lots admis/routes avant le feu (cinq omis — mty-amh-docs-01 : plafond du paquet atteint
+- #1646 courrier --lot : une branche citée (celle du parent d'un lot empilé) est posée c — mty-amh-impl-08 : plafond du paquet atteint
+- #1648 #1580 N (avis dev4) : jauges du widget préférées à un journal plus frais, toléra — mty-amh-impl-08 : plafond du paquet atteint
+- #1652 Doc : la ligne stale_lot d'EXPLOITATION.md n'offre pas le hold de dependance (#1 — mty-amh-impl-08 : plafond du paquet atteint
+- #1655 #1644 : les 3 N (P3) de l'avis qa-01 (DeepSeek #832) — paquet-inclusion — mty-amh-docs-01 : plafond du paquet atteint
+- #1663 runner.AgentWorker : yield_to_host et _leave_for_host définis deux fois — mty-amh-impl-05 : plafond du paquet atteint
+- #1664 Alertes stale : une porte humaine/pilote sans lot ouvert ne peut pas éteindre la — mty-amh-impl-03 : plafond du paquet atteint
+- #1668 Dépendance fermée : le lot dépendant non assigné reste blocked et invisible au s — ameesh-dev3 : plafond du paquet atteint
+- #1670 #877 N : l'indexation médiée relit tout le fil (census) à chaque entrée — mty-amh-impl-08 : plafond du paquet atteint
+- #1676 veille règle 7 : « prochain paquet (environ dix lots) » contredit le canon §11 b — ameesh-dev5 : plafond du paquet atteint
+- #1682 land.py: si l'auto-merge fusionne entre pr_status et --disable-auto, constater l — mty-amh-impl-08 : plafond du paquet atteint
+- #1690 CI complete : dimensionnement sous charge et diagnostic des mesures coverage inc — mty-amh-impl-08 : plafond du paquet atteint
+- #1691 #1266 : N de la relecture Claude — ameesh-dev5 : plafond du paquet atteint
+- #1693 #759 : N de la relecture Claude — mty-amh-impl-05 : plafond du paquet atteint
+- #1694 #1665 N : cited_lot retient le dernier groupe numérique — une branche review/<ag — ameesh-dev5 : plafond du paquet atteint
+- #1696 #1242 : N de la relecture Claude — ameesh-dev5 : plafond du paquet atteint
+- #1699 #1133 : N de la relecture Claude — mty-amh-docs-01 : plafond du paquet atteint
+- #1707 #1690 suite : un .coverage present mais vide (0 octet) est compte comme processu — mty-amh-impl-08 : plafond du paquet atteint
+- #1716 #1690 N1 : une carte avec artefacts_incomplets peut restreindre le plan (bloc mu — mty-amh-impl-08 : plafond du paquet atteint
+- #1718 land : désarmement raté + gh pr list illisible ne doit pas rendre l'éjection sil — ameesh-dev7 : plafond du paquet atteint
+- #1720 Jauges Claude : read_at d'un flux sans marqueur = mtime du journal, surestime la — mty-amh-impl-03 : plafond du paquet atteint
+- #1756 Paquet horaire : un lot qa sans jalon frozen est invisible au composeur (deriver — mty-amh-impl-08 : plafond du paquet atteint
+
+## Retiré après CI (bureau, 15/10 22:00)
+
+- #794 — revert de sa fusion : test_l165c (session sans lot adoptée par un lot) rouge dans l'union du paquet, vert sur la tête seule ; à rebaser sur main puis paquet suivant.
+
+## Adaptations (bureau)
+
+- carte.yml : étape de suppression des mesures (PR #1300) sans condition « toujours » (garde #1341).
+- test_l161f_plan : tranche fixe de 235 modules (#1266 ajoutait un module et faisait basculer à 3 parts).
+- test_l56_role_executor : position SSE avec identité du journal (#928).
+- ui/src/api/schema.d.ts régénéré (npm run gen).

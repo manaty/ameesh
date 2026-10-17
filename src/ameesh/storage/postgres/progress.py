@@ -60,6 +60,32 @@ class Progress(interface.Progress):
             "  FROM work_item_events WHERE work_item_id IN (%s)"
             " ORDER BY id" % _marks(ids), tuple(ids))
 
+    def lot_transitions(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        # Seules les lignes où l'état change sortent : le texte des notes
+        # (des mégaoctets sur une liste de lots) n'est ni lu ni transféré.
+        return self.db.query(
+            "SELECT id, work_item_id, state, actor,"
+            "       extract(epoch from created_at)::float8 AS created_ts"
+            "  FROM (SELECT id, work_item_id, state, actor, created_at,"
+            "               lag(state) OVER (PARTITION BY work_item_id"
+            "                               ORDER BY id) AS prev"
+            "          FROM work_item_events WHERE work_item_id IN (%s)) marked"
+            " WHERE prev IS DISTINCT FROM state"
+            " ORDER BY id" % _marks(ids), tuple(ids))
+
+    def lot_event_last(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        return self.db.query(
+            "SELECT work_item_id,"
+            "       extract(epoch from max(created_at))::float8 AS last_ts"
+            "  FROM work_item_events WHERE work_item_id IN (%s)"
+            " GROUP BY work_item_id" % _marks(ids), tuple(ids))
+
     def lot_milestones(self, item_ids) -> list[dict]:
         ids = [int(i) for i in item_ids]
         if not ids:
@@ -125,6 +151,9 @@ class Progress(interface.Progress):
             SELECT r.name, r.workstream, r.workstream AS chantier,
                    r.team, r.harness, r.host, r.model, r.provider,
                    r.credential_mode, r.status, r.status_text, r.current_prompt,
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+                   r.operator_pause_for,
+                   extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    r.turns, r.lease_owner, r.mode, r.stop_reason, r.responsible,
                    (r.lease_owner IS NOT NULL AND r.lease_expires_at > now()) AS lease_live,
@@ -141,8 +170,14 @@ class Progress(interface.Progress):
         """
         params: tuple = ()
         if project:
-            sql += " WHERE r.workstream = %s OR r.team = %s"
-            params = (project, project)
+            # L243 : l'agent appartient à tous ses projets — `projects` déclaré
+            # (0388), sinon son équipe, sinon son `workstream`
+            sql += (" WHERE %s = any(coalesce(r.projects,"
+                    " case when coalesce(btrim(r.team), '') <> '' then array[btrim(r.team)]"
+                    "      when coalesce(btrim(r.workstream), '') <> ''"
+                    "           then array[btrim(r.workstream)]"
+                    "      else array[]::text[] end))")
+            params = (project,)
         sql += " ORDER BY r.name"
         return self.db.query(sql, params)
 

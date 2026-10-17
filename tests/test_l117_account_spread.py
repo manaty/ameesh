@@ -97,9 +97,9 @@ class RepartitionTest(_Base):
                       accounts.format_rows(rows))
 
     def test_spread_over_successive_new_sessions(self):
-        """Chaque nouvelle session va au compte le plus en retard ; l'usage
-        qu'elle produit le fait reculer dans le classement : les trois comptes
-        servent, aucun n'est laissé de côté."""
+        """Chaque nouvelle session va au compte dont le budget s'évapore le
+        plus vite (#1789/N1) ; l'usage qu'elle produit le fait reculer dans le
+        classement : les trois comptes servent, aucun n'est laissé de côté."""
         items = self._items()
         now = float(int(time.time()))
         usage = {"primaire": 35.0}
@@ -117,9 +117,14 @@ class RepartitionTest(_Base):
             _codex_weekly(accounts.by_name(items, name).path, usage[name], resets[name])
         self.assertEqual(sequence[:2], ["secondaire", "tertiaire"])
         self.assertEqual(set(sequence), {"primaire", "secondaire", "tertiaire"})
-        self.assertEqual(sequence, ["secondaire", "tertiaire", "secondaire", "tertiaire",
-                                    "primaire", "primaire"])
-        self.assertEqual(len(self._bascules()), 5)
+        # le primaire perd 0,65 de sa semaine en 3 j 20 h (≈0,007/h), les deux
+        # autres 0,96 en 7 jours (≈0,0057/h) : il est drainé d'abord, puis les
+        # deux comptes neufs se partagent le reste
+        self.assertEqual(sequence, ["secondaire", "tertiaire", "primaire", "primaire",
+                                    "primaire", "secondaire"])
+        # une bascule par changement de compte : quatre seulement, le primaire
+        # étant drainé trois sessions de suite
+        self.assertEqual(len(self._bascules()), 4)
 
     def test_account_at_threshold_is_excluded(self):
         """Le compte le plus en retard sur 7 jours, mais au seuil sur 5 h, n'est

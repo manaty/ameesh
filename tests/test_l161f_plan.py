@@ -11,6 +11,7 @@ modules the map did not select. No database needed.
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime
 import importlib.util
 import io
@@ -384,6 +385,31 @@ class MapTest(unittest.TestCase):
         self.assertIn("no test is guaranteed to load: src/ameesh/code.py", out["phase2_why"])
         self.assertEqual(out["classes"]["test_a"], ["P3", ""])
 
+    def test_incomplete_map_keeps_the_full_suite(self):
+        # #1716 : #1690 nomme un artefact de mesure illisible sans rendre la
+        # carte suspecte ; un bloc couvert par l'artefact perdu ressortait donc
+        # avec le seul module lisible et la sélection se réduisait en silence.
+        # La carte est inutilisable : suite complète.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        card = self.repo.card()
+        card["measure"] = {"parts": 5, "processus": 4, "artefacts_incomplets": [
+            {"fichier": "cov/.coverage.coupee",
+             "erreur": "DataError: file is not a database"}]}
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in parts.modules()}
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=self.repo.path)
+        self.assertFalse(out["map"]["used"])
+        self.assertIn("unreadable measure artefact", out["map"]["problem"])
+        self.assertFalse(out["phase2_safe"])
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                               base_ref="main", head_ref="lot/1716-carte-incomplete")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("map not usable", p["selection"]["why"])
+        self.assertIn("unreadable measure artefact", p["selection"]["why"])
+
     def test_new_file_is_covered_by_the_test_that_imports_it(self):
         # #1339 : un fichier nouveau, inconnu de la carte, est couvert par le
         # test du lot qui l'importe (graphe d'import statique) ; la suite
@@ -546,6 +572,26 @@ class MapTest(unittest.TestCase):
         self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
         self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
 
+    def test_new_file_imported_after_terminal_statement_keeps_the_doubt(self):
+        self.repo.write("tests/test_static.py",
+                        "raise RuntimeError\nimport ameesh.new_feature\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        card["modules"]["test_static"] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py",
+                      out["phase2_why"])
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
         # l'importe ; les tests que la carte a mesurés sur ce module (ici un
@@ -655,7 +701,7 @@ class MapTest(unittest.TestCase):
                     self.assertEqual(p["selection"]["mode"], "full")
                     self.assertIn("release/**", p["selection"]["why"])
                     self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                     self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                     self.assertEqual(
                         sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
@@ -683,7 +729,7 @@ class MapTest(unittest.TestCase):
         self.assertIn("release/**", release["selection"]["why"])
         self.assertNotEqual(release["parts"]["psycopg"], [])
         self.assertEqual(plan.outputs(release)["code"], "true")
-        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [9] * 9)
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -755,6 +801,37 @@ class MapTest(unittest.TestCase):
         stranger = dict(card, commit="0" * 40)
         self.assertIn("not an ancestor", plan.map_problem(stranger, NOW, "HEAD",
                                                           self.repo.path)[0])
+        # #1716 : une carte bâtie sur des mesures incomplètes (#1690) ne peut
+        # plus réduire la sélection à l'insu du plan. L'ancienne graphie
+        # `mesure` (L148 stage 6) est lue aussi.
+        for cle in ("measure", "mesure"):
+            with self.subTest(cle):
+                incomplet = dict(card, **{cle: {"artefacts_incomplets": [
+                    {"fichier": "cov/.coverage.coupee", "erreur": "DataError"}]}})
+                why, _ = plan.map_problem(incomplet, NOW, "HEAD", self.repo.path)
+                self.assertIn("unreadable measure artefact", why)
+                self.assertIn("cov/.coverage.coupee", why)
+        vide = dict(card, measure={"parts": 5, "processus": 5, "artefacts_incomplets": []})
+        self.assertEqual(plan.map_problem(vide, NOW, "HEAD", self.repo.path), ("", 0.0))
+
+    def test_map_problem_partial_measure(self):
+        """#1257 R1 B3 : une carte dont la fusion a écarté des couvertures est
+        partielle ; elle ne juge plus la sélection, même fraîche et ancêtre."""
+        card = self.repo.card()  # carte ancienne : la clé n'existe pas
+        self.assertEqual(plan.ignored_coverages(card), [])
+        self.assertEqual(plan.map_problem(card, NOW, "HEAD", self.repo.path)[0], "")
+        vide = dict(card, measure={"couverture_ignoree": []})  # carte neuve sans perte
+        self.assertEqual(plan.map_problem(vide, NOW, "HEAD", self.repo.path)[0], "")
+        partielle = dict(card, measure={"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]})
+        probleme, age = plan.map_problem(partielle, NOW, "HEAD", self.repo.path)
+        self.assertIn("partial measure", probleme)
+        self.assertIsNone(age)  # le refus ne dépend ni de la date ni du dépôt
+        # la forme ancienne (clé française) est lue aussi
+        ancienne = dict(card, mesure={"couverture_ignoree": [{"part": "m"}]})
+        self.assertIn("partial measure",
+                      plan.map_problem(ancienne, NOW, "HEAD", self.repo.path)[0])
 
     def test_always_and_recent_failures(self):
         changes = [("M", "src/ameesh/work.py"), ("A", "src/ameesh/migrations/0099_x.sql")]
@@ -898,6 +975,351 @@ class ImportGraphTest(unittest.TestCase):
                 if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
                     self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                      {"src/ameesh/db.py"}, why)
+
+    def test_terminal_statement_prevents_later_import_proof(self):
+        known = {"src/ameesh/db.py"}
+        for terminal in ("raise RuntimeError", "import sys\nsys.exit(1)"):
+            with self.subTest(terminal=terminal):
+                source = terminal + "\nimport ameesh.db\n"
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                # Keep the possible edge for selection, even without proof.
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        # Class bodies execute during the containing module's import too.
+        source = "class C:\n    raise RuntimeError\nimport ameesh.db\n"
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                              guaranteed=True), set())
+
+    def test_terminal_statement_keeps_earlier_and_nonexecuted_proofs(self):
+        known = {"src/ameesh/db.py"}
+        for source in (
+            "import ameesh.db\nraise RuntimeError\n",
+            "import ameesh.db\nimport sys\nsys.exit(1)\n",
+            "def unused():\n    raise RuntimeError\nimport ameesh.db\n",
+            "def unused():\n    import sys\n    sys.exit(1)\nimport ameesh.db\n",
+            "if False:\n    raise RuntimeError\nimport ameesh.db\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+    def test_guaranteed_edges_stop_at_a_module_level_termination(self):
+        # #1627 : une terminaison atteignable à l'import (`raise` gardé, garde
+        # d'exception, exit, assert faux) laisse les imports suivants possibles,
+        # jamais garantis — sinon le plan certifie un chargement qui peut ne pas
+        # avoir eu lieu. Sens conservateur : une preuve en moins, jamais une
+        # fausse preuve.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "raise gardé": "import os\n"
+                           "if not os.environ.get('PG'):\n"
+                           "    raise RuntimeError\n"
+                           "import ameesh.db\n",
+            "raise dans un except": "try:\n"
+                                    "    import psycopg\n"
+                                    "except ImportError:\n"
+                                    "    raise SystemExit\n"
+                                    "import ameesh.db\n",
+            "exit": "exit()\nimport ameesh.db\n",
+            "quit": "quit()\nimport ameesh.db\n",
+            "os._exit": "import os\nos._exit(1)\nimport ameesh.db\n",
+            "os._exit aliasé": "from os import _exit as bye\nbye(1)\nimport ameesh.db\n",
+            "sys.exit": "import sys\nsys.exit(1)\nimport ameesh.db\n",
+            "sys.exit aliasé": "import sys as s\ns.exit(1)\nimport ameesh.db\n",
+            "exit importé": "from sys import exit as bye\nbye(1)\nimport ameesh.db\n",
+            "assert faux": "assert False\nimport ameesh.db\n",
+            "raise avant, import dans le même corps de classe":
+                "class C:\n    raise RuntimeError\n    import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # un garde mort ne termine rien : `if TYPE_CHECKING:` ne s'exécute pas
+        dead = ("from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    raise RuntimeError\n"
+                "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(dead, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        # le corps d'une fonction ne tourne pas à l'import : son raise ne coupe
+        # pas la preuve du corps du module
+        deferred = ("def broken():\n    raise RuntimeError\n"
+                    "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(deferred, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        nested = ("def factory():\n"
+                  "    class C:\n        raise RuntimeError\n"
+                  "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(nested, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+
+    def test_exit_expressions_stop_proofs_before_class_body_and_after_assert(self):
+        # #1474 : les bases et décorateurs s'évaluent avant le corps de classe ;
+        # une sortie dans un assert s'exécute aussi, même sans assert faux.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import sys\nclass C(sys.exit(1)):\n    import ameesh.db\n",
+            "@exit()\nclass C:\n    import ameesh.db\n",
+            "import os as o\nclass C(metaclass=o._exit(1)):\n    import ameesh.db\n",
+            "from sys import exit as bye\nassert bye(1)\nimport ameesh.db\n",
+            "import os\nassert os._exit(1)\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+
+    def test_exit_expressions_stop_proofs_in_function_definitions(self):
+        # #1474 : décorateurs, valeurs par défaut et annotations d'une fonction
+        # ou d'un lambda s'évaluent à la définition ; seul le corps est différé.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "@exit()\ndef f():\n    pass\nimport ameesh.db\n",
+            "@exit()\nasync def f():\n    pass\nimport ameesh.db\n",
+            "import sys\ndef f(x=sys.exit(1)):\n    pass\nimport ameesh.db\n",
+            "import os as o\ndef f(*, x=o._exit(1)):\n    pass\nimport ameesh.db\n",
+            "def f(x: quit()):\n    pass\nimport ameesh.db\n",
+            "g = lambda a=quit(): 0\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        for source in ("def f():\n    exit()\nimport ameesh.db\n",
+                       "f = lambda: exit()\nimport ameesh.db\n",
+                       "@staticmethod\ndef f(x=1):\n    import os\nimport ameesh.db\n"):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_exit_expressions_keep_prior_dead_and_deferred_proofs(self):
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import ameesh.db\nclass C(exit()):\n    pass\n",
+            "if False:\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def factory():\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def unused():\n    assert quit()\nimport ameesh.db\n",
+            "class C:\n    import ameesh.db\n    quit()\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
+    def test_reassigned_exit_symbols_stay_conservative(self):
+        # #1474 : un symbole de terminaison réaffecté (`sys = ...`, puis un
+        # `bye = ...` sur un nom importé de sys/os) n'est pas suivi — la
+        # réaffectation peut être conditionnelle, donc la preuve reste coupée :
+        # une preuve perdue, jamais une preuve fausse. L'arête de sélection
+        # possible est conservée.
+        known = {"src/ameesh/db.py"}
+        reassigned = {
+            "sys rebindé": "import sys\n"
+                           "sys = None\n"
+                           "sys.exit(1)\n"
+                           "import ameesh.db\n",
+            "sys rebindé sans sortie": "import sys\n"
+                                       "class Fake:\n"
+                                       "    @staticmethod\n"
+                                       "    def exit(code):\n"
+                                       "        return None\n"
+                                       "sys = Fake\n"
+                                       "sys.exit(0)\n"
+                                       "import ameesh.db\n",
+            "exit importé puis rebindé": "from sys import exit as bye\n"
+                                         "bye = print\n"
+                                         "bye('x')\n"
+                                         "import ameesh.db\n",
+            "exit builtin rebindé": "exit = print\n"
+                                    "exit('x')\n"
+                                    "import ameesh.db\n",
+            "os._exit aliasé puis rebindé": "from os import _exit as bye\n"
+                                            "bye = print\n"
+                                            "bye('x')\n"
+                                            "import ameesh.db\n",
+        }
+        for why, source in reassigned.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+
+    def test_assigned_exit_aliases_and_star_imports_stop_proofs(self):
+        # #1860 : un alias de sortie par affectation (`e = sys.exit ; e()`) et
+        # `_exit()` après `from os import *` terminent aussi l'import : les
+        # imports suivants restent des arêtes possibles, jamais des preuves.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "sys.exit affecté": "import sys\n"
+                                "e = sys.exit\n"
+                                "e(1)\n"
+                                "import ameesh.db\n",
+            "os._exit affecté": "import os as o\n"
+                                "e = o._exit\n"
+                                "e(1)\n"
+                                "import ameesh.db\n",
+            "exit importé affecté": "from sys import exit as bye\n"
+                                    "e = bye\n"
+                                    "e(1)\n"
+                                    "import ameesh.db\n",
+            "quit builtin affecté": "q = quit\n"
+                                    "q()\n"
+                                    "import ameesh.db\n",
+            "chaîne d'alias": "import sys\n"
+                              "e = sys.exit\n"
+                              "f = e\n"
+                              "f(1)\n"
+                              "import ameesh.db\n",
+            "alias appelé dans son affectation": "import sys\n"
+                                                  "(e := sys.exit)(1)\n"
+                                                  "import ameesh.db\n",
+            "alias importé appelé dans son affectation": "from sys import exit as bye\n"
+                                                           "(e := bye)(1)\n"
+                                                           "import ameesh.db\n",
+            "affectation multiple": "import sys\n"
+                                    "e = f = sys.exit\n"
+                                    "f(1)\n"
+                                    "import ameesh.db\n",
+            "cible multiple lisible": "import sys\n"
+                                      "e, f = sys.exit, print\n"
+                                      "e(1)\n"
+                                      "import ameesh.db\n",
+            "affectation gardée": "import sys\n"
+                                  "if callable(sys):\n"
+                                  "    e = sys.exit\n"
+                                  "e(1)\n"
+                                  "import ameesh.db\n",
+            "affectation différée": "import sys\n"
+                                    "def quit_now():\n"
+                                    "    global e\n"
+                                    "    e = sys.exit\n"
+                                    "quit_now()\n"
+                                    "e(1)\n"
+                                    "import ameesh.db\n",
+            "from os import *": "from os import *\n"
+                                "_exit(1)\n"
+                                "import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # une affectation qui ne porte pas de sortie ne coupe aucune preuve
+        kept = {
+            "appel ordinaire": "e = print\n"
+                               "e('x')\n"
+                               "import ameesh.db\n",
+            "lambda ordinaire": "e = lambda: 0\n"
+                                "e()\n"
+                                "import ameesh.db\n",
+            "cible multiple ordinaire": "e, f = 1, 2\n"
+                                        "e()\n"
+                                        "import ameesh.db\n",
+            "nom affecté jamais appelé": "import sys\n"
+                                         "e = sys.exit\n"
+                                         "import ameesh.db\n",
+        }
+        for why, source in kept.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known, why)
+
+    def test_assigned_module_aliases_and_getattr_exits_stop_proofs(self):
+        # #1878, N de la relecture Claude de #1860 : un module sys/os renommé
+        # par affectation (`s = sys` puis `s.exit()`) et une lecture statique
+        # `getattr(sys, 'exit')` sont des sorties comme les autres : les
+        # imports suivants restent des arêtes possibles, jamais des preuves.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "sys renommé": "import sys\n"
+                           "s = sys\n"
+                           "s.exit(1)\n"
+                           "import ameesh.db\n",
+            "os renommé": "import os\n"
+                          "o = os\n"
+                          "o._exit(1)\n"
+                          "import ameesh.db\n",
+            "module importé aliasé puis renommé": "import sys as s0\n"
+                                                  "s = s0\n"
+                                                  "s.exit(1)\n"
+                                                  "import ameesh.db\n",
+            "chaîne de renommages": "import sys\n"
+                                    "s = sys\n"
+                                    "t = s\n"
+                                    "t.exit(1)\n"
+                                    "import ameesh.db\n",
+            "paire de modules": "import sys, os\n"
+                                "s, o = sys, os\n"
+                                "o._exit(1)\n"
+                                "import ameesh.db\n",
+            "getattr sys.exit": "import sys\n"
+                                "getattr(sys, 'exit')(1)\n"
+                                "import ameesh.db\n",
+            "getattr os._exit": "import os\n"
+                                "getattr(os, '_exit')(1)\n"
+                                "import ameesh.db\n",
+            "getattr avec défaut": "import sys\n"
+                                   "getattr(sys, 'exit', None)(1)\n"
+                                   "import ameesh.db\n",
+            "getattr via module renommé": "import sys\n"
+                                          "s = sys\n"
+                                          "getattr(s, 'exit')(1)\n"
+                                          "import ameesh.db\n",
+            "getattr affecté puis appelé": "import sys\n"
+                                           "e = getattr(sys, 'exit')\n"
+                                           "e(1)\n"
+                                           "import ameesh.db\n",
+            # #1906 : le porteur peut être affecté par walrus — la preuve
+            # d'import doit tomber comme pour un nom simple.
+            "walrus sys.exit": "import sys\n"
+                               "(s := sys).exit(1)\n"
+                               "import ameesh.db\n",
+            "getattr walrus sys.exit": "import sys\n"
+                                       "getattr((s := sys), 'exit')(1)\n"
+                                       "import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # une simple mention ne coupe rien : ni un module renommé non utilisé,
+        # ni un getattr d'un autre membre, d'un autre porteur ou dynamique
+        kept = {
+            "module renommé jamais appelé": "import sys\n"
+                                            "s = sys\n"
+                                            "import ameesh.db\n",
+            "getattr d'un autre membre": "import sys\n"
+                                         "getattr(sys, 'version')\n"
+                                         "import ameesh.db\n",
+            "getattr d'un porteur ordinaire": "class C:\n"
+                                              "    pass\n"
+                                              "getattr(C, 'exit')\n"
+                                              "import ameesh.db\n",
+            "getattr au nom dynamique": "import sys\n"
+                                        "name = 'exit'\n"
+                                        "getattr(sys, name)\n"
+                                        "import ameesh.db\n",
+            # #1906 : déballer un walrus ne classe pas un porteur ordinaire.
+            "getattr walrus d'un porteur ordinaire": "class C:\n"
+                                                     "    pass\n"
+                                                     "getattr((x := C), 'exit')\n"
+                                                     "import ameesh.db\n",
+        }
+        for why, source in kept.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known, why)
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
@@ -1103,6 +1525,21 @@ class DocsLaneTest(unittest.TestCase):
         self.assertFullSuite(self._plan(["docs/guide.md"]), "map not usable")
         self.assertFullSuite(self._plan_without_map(["docs/guide.md"]), "no map")
 
+    def test_partial_measure_card_runs_the_full_suite(self):
+        """#1257 R1 B3 : une couverture écartée à la fusion rend la carte
+        partielle ; le jugement de sélection est refusé et le repli suite
+        complète s'applique, même carte fraîche et ancêtre."""
+        self.card["measure"] = {"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]}
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
+        self.repo.write("docs/guide.md", "# Guide, again\n")
+        self.repo.commit()
+        p = self._plan(["docs/guide.md"])
+        self.assertFullSuite(p, "partial measure")
+        self.assertFalse(p["map"]["used"])
+        self.assertFalse(p["sure"])
+
     def _plan_without_map(self, files):
         self.card = None
         return self._plan(files)
@@ -1132,6 +1569,79 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
 
 
+def _coverage_disponible() -> bool:
+    try:
+        import coverage  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class PartialMeasureTest(unittest.TestCase):
+    """#1257 R1 B3 : de la collecte (`scripts/map.py`) à la décision de
+    sélection (`scripts/test-plan.py`)."""
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_partial_card(self):
+        """Une part dont un fichier de couverture est illisible donne une carte
+        partielle ; le plan refuse alors de juger la sélection (repli suite
+        complète) au lieu de croire la mesure complète."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage.tronquee").write_bytes(b"pas du sqlite")
+        # carte fraîche et ancêtre de HEAD : seule la perte la rend inutilisable
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(len(card["mesure"]["couverture_ignoree"]), 1)
+        # #1690 : le meme artefact tronque est aussi nomme dans
+        # `artefacts_incomplets` ; le temoin du temoin doit retirer les DEUX
+        # projections de la perte, sinon il n'est plus sain.
+        mesure = dict(card["mesure"], couverture_ignoree=[],
+                      artefacts_incomplets=[])
+        saine = dict(card, measure=mesure, mesure=mesure)  # témoin du témoin
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_zero_byte_coverage(self):
+        """R1 B3 #1257 : un fichier de couverture de 0 octet est une perte
+        conservatrice ; la carte est partielle et le plan refuse de juger la
+        sélection (repli suite complète). Le contrôle sain (même part sans le
+        fichier vide) reste utilisable."""
+        from coverage import CoverageData
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage.vide"
+        vide.write_bytes(b"")
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l1.T.test_a")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.write()
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        ignorees = card["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertIn("vide (0 octet)", ignorees[0]["raison"])
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
+        # témoin du témoin : sans le fichier vide, la même mesure est utilisable
+        vide.unlink()
+        saine = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(saine["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
 class InheritedFoundationTest(unittest.TestCase):
     """#1314 : le socle CI que la cible a déjà changé depuis la carte ne force
     plus la suite complète d'une branche de lot ; le changement du socle par
@@ -1311,10 +1821,10 @@ class PlanTest(unittest.TestCase):
         mods = parts.modules()
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         out = plan.outputs(p)
         self.assertEqual(json.loads(out["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(out["psql_parts"], "6")
+        self.assertEqual(out["psql_parts"], "9")
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
@@ -1337,7 +1847,9 @@ class PlanTest(unittest.TestCase):
         # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
-        self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
+        # #1692 : la suite complète passe de 6 à 9 parts ; le pilote d'une PR
+        # de lot reste à trois (n_pr), inchangé.
+        self.assertEqual(plan.PARTS["psql"][1], 9)
 
     def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
         # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
@@ -1413,8 +1925,8 @@ class PlanTest(unittest.TestCase):
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
         # #749 : une fusion a main passe la suite complete sous les deux pilotes
-        # (psql en 6 parts), pas seulement la CI de release.
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        # (psql en 9 parts depuis #1692), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -1466,6 +1978,26 @@ class PlanTest(unittest.TestCase):
         self.assertIn("psycopg=[1, 2, 3, 4]", (d / "out").read_text(encoding="utf-8"))
 
 
+def _full_suite_parts(driver: str) -> list[int]:
+    """`of` de chaque part de la suite complète, lu de `plan.PARTS`.
+
+    Le découpage appartient au plan (#1692 : 9 parts psql ; #1476 : 12 psql et
+    8 psycopg), épinglé par
+    `PlanTest.test_pull_request_psql_part_is_split_for_the_cap`. Un témoin de
+    cette voie le lit au lieu de recopier le nombre : sinon chaque changement
+    de découpage casse l'union des lots (#1343 × #1476, 5 FAIL sur l'arbre
+    composé du paquet 1700).
+    """
+    n = plan.PARTS[driver][1]
+    return [n] * n
+
+
+def _lot_request_parts(driver: str) -> list[int]:
+    """`of` de chaque part d'une demande de lot (voie rapide, `n_pr`)."""
+    n = plan.PARTS[driver][0]
+    return [n] * n
+
+
 class LotBranchTest(unittest.TestCase):
     """L1211 (canon §3) : une branche de lot ne lance que les tests impactés,
     plus toujours les tests de contrat, et se replie sur la suite complète
@@ -1501,14 +2033,14 @@ class LotBranchTest(unittest.TestCase):
 
     def _plan(self, event="pull_request", classes=None, card=None,
               base_ref="main", head_ref="lot/1211-ci-impactes-contrat",
-              nature_kw=None, **state_kw):
+              nature_kw=None, mode="auto", **state_kw):
         state = self._state(classes if classes is not None else self._classes(), **state_kw)
         nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
         nature.update(nature_kw or {})
         with mock.patch.object(plan, "classify", return_value=state), \
                 mock.patch.object(plan, "nature", return_value=dict(nature)):
             return plan.make_plan(event, card if card is not None else {}, NOW,
-                                  base_ref=base_ref, head_ref=head_ref)
+                                  base_ref=base_ref, head_ref=head_ref, mode=mode)
 
     def _ran(self, p, driver="psycopg"):
         return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
@@ -1568,12 +2100,23 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
 
     def test_full_suite_on_main_release_and_integration(self):
-        for event in ("push", "workflow_dispatch"):
-            with self.subTest(event):
-                p = self._plan(event=event)
-                self.assertEqual(p["selection"]["mode"], "full")
-                self.assertIn("integration", p["selection"]["why"])
-                self.assertEqual(self._ran(p), sorted(self.mods))
+        # une poussée sur main/release/integration garde la suite complète.
+        p = self._plan(event="push")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("integration", p["selection"]["why"])
+        self.assertEqual(self._ran(p), sorted(self.mods))
+
+    def test_full_request_on_a_lot_pull_request_runs_the_whole_suite(self):
+        # #1343 : `ci-full-<sha>` (release, paquet, demande explicite) sur une
+        # PR ordinaire garde la suite complète, les deux pilotes.
+        p = self._plan(event="pull_request", mode="full")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertEqual(self._ran(p), sorted(self.mods))
+        self.assertEqual(self._ran(p, "psql"), sorted(self.mods))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _full_suite_parts("psycopg"))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
 
     def test_release_pull_request_never_takes_the_impacted_selection(self):
         # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
@@ -1595,8 +2138,10 @@ class LotBranchTest(unittest.TestCase):
                 self.assertIn("release/**", p["selection"]["why"])
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
                 self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                                 _full_suite_parts("psycopg"))
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                                 _full_suite_parts("psql"))
                 self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                 self.assertEqual(plan.outputs(p)["code"], "true")
 
@@ -1623,7 +2168,7 @@ class LotBranchTest(unittest.TestCase):
         p = plan.fallback_plan("pull_request", "boom", base_ref="main",
                                head_ref="release/1.10.0")
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), list(range(1, 10)))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
@@ -1666,13 +2211,19 @@ class LotBranchTest(unittest.TestCase):
         self.assertIn(f"candidates: `{self.mods[0]}`", text)
 
     def test_parts_shrink_to_the_estimate(self):
+        # Liste fixe (#1800) : le témoin porte sur la formule de découpage
+        # (235 modules × 2 s = 470 s -> deux parts), pas sur l'inventaire du
+        # dépôt, qui grandit à chaque paquet et ferait basculer l'attente.
+        # Noms synthétiques : test_count, qui lit un fichier réel, est neutralisé.
+        mods = [f"test_fixe_{i:03d}" for i in range(235)]
+
         def card(seconds):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
-                                for m in self.mods}}
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
-        self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
+                                for m in mods}}
+        with mock.patch.object(plan.parts, "test_count", lambda module, tests=None: 1):
+            self.assertEqual(plan.lot_part_count("psycopg", mods[:10], card(1.0)), 1)
+            self.assertEqual(plan.lot_part_count("psycopg", mods, card(2.0)), 2)
+            self.assertGreaterEqual(plan.lot_part_count("psycopg", mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):
         # un lot très large (60 s par module) reste dans PARTS : quatre parts
@@ -1952,8 +2503,17 @@ def _run_bodies(text: str) -> list[str]:
 
 
 _BRANCH_REF = re.compile(r"github\.(base|head)_ref")
+# #1559: the value YAML reads is the same expression whatever the spacing
+# inside `${{ }}` and whether the scalar is quoted (`"${{ … }}"`,
+# `'${{ … }}'`), and a tab or extra spaces after the colon still open the
+# mapping value. Everything else stays an escape (fail closed).
+_BRANCH_REF_EXPR = r"\$\{\{\s*github\.(?:base|head)_ref\s*\}\}"
 _BRANCH_REF_ENV = re.compile(
-    r"^[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}\s*(?:#.*)?$")
+    "^[A-Z][A-Z0-9_]*:[ \t]+(?:"
+    + _BRANCH_REF_EXPR
+    + '|"' + _BRANCH_REF_EXPR + '"'
+    + "|'" + _BRANCH_REF_EXPR + "'"
+    + r")[ \t]*(?:#.*)?$")
 _ANY_KEY = re.compile(
     r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"{\[][^#]*?)\s*:(?:\s+|$)(?P<rest>.*)$""")
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_.-]+:(?:\s+&[A-Za-z0-9_.-]+)?\s*(?:#.*)?$")
@@ -2026,12 +2586,16 @@ def _under_env(lines: list[str], k: int, structural: set[int]) -> bool:
         if j not in structural or not line.strip() or line.lstrip().startswith("#"):
             continue
         dash, key = _dash_column(line), _key_column(line)
+        # #1559: an anchor or a tag before the key (`- &s env:`) does not
+        # change the mapping; only node properties are seen through, a scalar
+        # on the way still fails the witness.
+        _, content = _node_properties(line[key:])
         if key < col:
-            if not _BARE_KEY.match(line[key:]) or (
-                    first and line[key:].split(":", 1)[0] != "env"):
+            if not _BARE_KEY.match(content) or (
+                    first and content.split(":", 1)[0] != "env"):
                 return False
         elif dash is not None and dash < col:
-            if first or not _ITEM.match(line[key:]):
+            if first or not _ITEM.match(content):
                 return False
         else:
             continue
@@ -2061,9 +2625,43 @@ def _branch_ref_escapes(text: str) -> list[str]:
     return escapes
 
 
-_RUNNER_SELECTION = re.compile(r"^runs-on:[ \t]*\$\{\{.*\}\}[ \t]*(?:#.*)?$")
+_RUNNER_SELECTION = re.compile(
+    r"^runs-on:[ \t]*(?:"
+    r"\$\{\{.*\}\}"                       # valeur nue
+    r"|\"\$\{\{.*\}\}\""                  # valeur a guillemets doubles
+    r"|'\$\{\{.*\}\}'"                    # valeur a guillemets simples
+    r")[ \t]*(?:#.*)?$")
 _BRANCH_REF_COMPARED = re.compile(
-    r"startsWith\(github\.(?:base|head)_ref,\s*'[^',()]*'\)")
+    r"startsWith\(\s*github\.(?:base|head)_ref\s*,\s*'(?:[^',()]|'')*'\)")
+
+
+def _job_level(lines: list[str], k: int, structural: set[int]) -> bool:
+    """Is line `k` a direct key of a job mapping, under `jobs:`?
+
+    #1563: the `runs-on:` exemption is job-level only. A `runs-on:` nested in
+    a step mapping, a strategy or any other level is not the label GitHub
+    reads for a job; it stays text and the witness keeps refusing an
+    interpolation there (fail closed).
+    """
+    col, ancestors = _key_column(lines[k]), []
+    for j in range(k - 1, -1, -1):
+        line = lines[j]
+        if j not in structural or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash, key = _dash_column(line), _key_column(line)
+        if dash is not None and dash < col:
+            return False                     # un item de sequence sur le chemin
+        if key < col:
+            if not _BARE_KEY.match(line[key:]):
+                return False
+            ancestors.append(j)
+            col = key
+            if len(ancestors) == 2:
+                break
+    if len(ancestors) != 2:
+        return False
+    _job, jobs = ancestors
+    return _key_column(lines[jobs]) == 0 and lines[jobs].startswith("jobs:")
 
 
 def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
@@ -2079,6 +2677,15 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     The compared literal is a single argument: dev4's N, a quoted literal that
     spans arguments of a `format()` (`'…startsWith(github.head_ref, ', …`)
     must not absolve the interpolated reference that follows.
+
+    #1563: the `runs-on:` exemption is bound to the job level (`_job_level`)
+    and reads the YAML spellings GitHub reads for the value: bare or quoted
+    (`"${{ … }}"`, `'${{ … }}'`), spaces after `startsWith(` and around the
+    literal, and `''` for an apostrophe inside a compared literal. Two forms
+    stay documented fail-closed limits: a `${{` opened on one line and closed
+    on another (`_left_open` refuses the unclosed flow), and a single-quoted
+    value whose compared literal uses the `''` escape, which the witness does
+    not decode.
     """
     line = lines[k]
     col = _key_column(line)
@@ -2087,6 +2694,8 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     if _BRANCH_REF_ENV.match(line[col:]) and _under_env(lines, k, structural):
         return True
     if _RUNNER_SELECTION.match(line[col:]) is None:
+        return False
+    if not _job_level(lines, k, structural):
         return False
     return not _BRANCH_REF.search(_BRANCH_REF_COMPARED.sub("", line[col:]))
 
@@ -2179,10 +2788,40 @@ class RunBodiesTest(unittest.TestCase):
                              '          HEAD_REF: ${{ github.head_ref }}\n',
             "env first in the item": '      - env:\n'
                                      '          BASE_REF: ${{ github.base_ref }}\n',
+            # #1559: YAML reads the same env value under these legitimate
+            # spellings; only the semantics must count, not the exact form.
+            "quoted value": '      - name: s\n        env:\n'
+                            '          HEAD_REF: "${{ github.head_ref }}"\n'
+                            '        run: echo "$HEAD_REF"\n',
+            "single quoted value": '      - name: s\n        env:\n'
+                                   "          BASE_REF: '${{ github.base_ref }}'\n"
+                                   '        run: echo "$BASE_REF"\n',
+            "no inner spaces": '      - name: s\n        env:\n'
+                               '          HEAD_REF: ${{github.head_ref}}\n'
+                               '        run: echo "$HEAD_REF"\n',
+            "two spaces after colon": '      - name: s\n        env:\n'
+                                      '          BASE_REF:  ${{ github.base_ref }}\n'
+                                      '        run: echo "$BASE_REF"\n',
+            "anchor before the env key": '      - &s env:\n'
+                                         '          BASE_REF: ${{ github.base_ref }}\n'
+                                         '        run: echo "$BASE_REF"\n',
         }
         for name, step in allowed.items():
             with self.subTest(name=name):
                 self.assertEqual([], _branch_ref_escapes(steps + step))
+        # #1559: the same values, read by YAML in a `run:` body instead of an
+        # `env:` value, stay escapes: the witness follows the semantics.
+        for name, body in {
+            "quoted": 'BASE_REF: "${{ github.base_ref }}"\n',
+            "single quoted": "BASE_REF: '${{ github.base_ref }}'\n",
+            "no inner spaces": 'HEAD_REF: ${{github.head_ref}}\n',
+            "two spaces after colon": 'BASE_REF:  ${{ github.base_ref }}\n',
+        }.items():
+            with self.subTest(run=name):
+                self.assertNotEqual([], _branch_ref_escapes(
+                    steps + '      - run: |\n          ' + body))
+        self.assertNotEqual([], _branch_ref_escapes(
+            steps + '      - &s run: |\n          BASE_REF: ${{ github.base_ref }}\n'))
         self.assertEqual([], _branch_ref_escapes(
             "env:\n  BASE_REF: ${{ github.base_ref }}\n"
             "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
@@ -2203,6 +2842,40 @@ class RunBodiesTest(unittest.TestCase):
                      "\n      run: echo ok\"\n"):
             with self.subTest(bare=bare):
                 self.assertNotEqual([], _branch_ref_escapes("jobs:\n  a:\n" + bare))
+
+    def test_runner_selection_is_job_level_and_reads_yaml_spellings(self):
+        # #1563: l'exemption suit les formes YAML que GitHub lit pour un vrai
+        # `runs-on:` de job, et rien d'autre.
+        compared = "startsWith(github.head_ref, 'refs/heads/integration/')"
+        for name, line in {
+            "nue": "    runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared,
+            "guillemets doubles": (
+                "    runs-on: \"${{ %s && 'pool' || 'ci' }}\"\n" % compared),
+            "espace apres startsWith(": (
+                "    runs-on: ${{ startsWith( github.head_ref, "
+                "'refs/heads/integration/') && 'pool' || 'ci' }}\n"),
+            "apostrophe doublee": (
+                "    runs-on: ${{ startsWith(github.head_ref, "
+                "'refs/heads/it''s/') && 'pool' || 'ci' }}\n"),
+        }.items():
+            with self.subTest(forme=name):
+                self.assertEqual([], _branch_ref_escapes("jobs:\n  a:\n" + line))
+        # La meme ligne nichee dans un mapping d'etape ou une matrice n'est pas
+        # le `runs-on:` d'un job : elle reste une evasion (echec ferme).
+        for name, text in {
+            "mapping d'etape": ("jobs:\n  a:\n    steps:\n      - name: s\n"
+                                "        runs-on: ${{ %s && 'pool' || 'ci' }}\n"
+                                % compared),
+            "matrice": ("jobs:\n  a:\n    strategy:\n      matrix:\n"
+                        "        runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared),
+        }.items():
+            with self.subTest(hors_job=name):
+                self.assertNotEqual([], _branch_ref_escapes(text))
+        # Une expression `${{` ouverte sur une ligne et fermee sur une autre
+        # reste refusee : limite d'echec ferme documentee sur _branch_ref_allowed.
+        self.assertNotEqual([], _branch_ref_escapes(
+            "jobs:\n  a:\n    runs-on: ${{\n"
+            "      startsWith(github.head_ref, 'refs/heads/integration/') }}\n"))
 
     def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
         # YAML ignores indentation inside quotes, even after an anchor/tag.
@@ -2357,9 +3030,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("--annotations", self.text)
 
     def test_plan_job_passes_the_pushed_range(self):
-        # #833: a push is planned from github.event.before, not HEAD^1 alone
-        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
-                      "github.event.before || 'HEAD^1' }}", self.text)
+        # #833: a push is planned from github.event.before, not HEAD^1 alone ;
+        # #1343 : une demande de gel est planifiée depuis la base du payload
+        # (`pull_request.base.sha`), la composition même du merge-ref vérifié.
+        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && "
+                      "github.event.pull_request.base.sha || (github.event_name == 'push' && "
+                      "github.event.before || 'HEAD^1') }}", self.text)
         self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
     def test_dynamic_matrices(self):
@@ -2397,6 +3073,22 @@ class WorkflowTest(unittest.TestCase):
             self.assertNotIn("github.head_ref", body)
         self.assertEqual([], _branch_ref_escapes(self.text))
 
+    def test_fs_class_lane_follows_the_plan_release_output(self):
+        # #748 / #1247 R2 : le job « autre système de fichiers » ne rejoue la
+        # suite que pour une release (source ou cible `release/**`) ou à la
+        # main ; son `if:` lit l'output `release` du plan — posé par un step
+        # qui reçoit les branches par `env:` — et n'interpole aucun nom de
+        # branche dans une condition.
+        self.assertIn("release: ${{ steps.release.outputs.release }}", self.text)
+        fs_class = self.text[self.text.index("\n  fs-class:\n"):
+                             self.text.index("\n  platform-macos:\n")]
+        self.assertIn("needs.plan.outputs.release == 'true'", fs_class)
+        condition = fs_class.split("    if:", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("github.head_ref", condition)
+        self.assertNotIn("github.base_ref", condition)
+        self.assertIn('case "$BASE_REF" in release/*) release=true ;; esac', self.text)
+        self.assertIn('case "$HEAD_REF" in release/*) release=true ;; esac', self.text)
+
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
         # décide), main et release/** portent la suite complète ; le check
@@ -2404,14 +3096,204 @@ class WorkflowTest(unittest.TestCase):
         # d'intégration du paquet ne déclenche plus ce workflow — une tête de
         # paquet n'a qu'une suite, celle de sa PR ; le portier paquet.yml
         # appelle la suite (workflow_call) quand aucune PR ouverte ne couvre
-        # la tête exacte.
-        self.assertIn('branches: [main, "release/**"]', self.text)
-        self.assertNotIn('"integration/**"]', self.text)
-        self.assertIn("\n  pull_request:\n", self.text)
+        # la tête exacte. #1343 : la cible de PR garde integration/** (une PR
+        # de paquet doit pouvoir demander son ci-full) ; seule la poussée
+        # integration/** est hors du déclencheur direct.
+        push_start = self.text.index("\n  push:\n") + len("\n  push:\n")
+        push = self.text[push_start:self.text.index("\n", push_start)]
+        self.assertIn('branches: [main, "release/**"]', push)
+        self.assertNotIn("integration", push)
+        pull_start = self.text.index("\n  pull_request:\n") + len("\n  pull_request:\n")
+        pull = self.text[pull_start:self.text.index("\n  workflow_call:\n")]
+        self.assertIn('branches: [main, "release/**", "integration/**"]', pull)
+        self.assertIn("types: [labeled]", pull)
         self.assertIn("\n  workflow_call:\n", self.text)
         self.assertIn("L1211", self.text)
         self.assertIn("tests/parts/toujours.txt", self.text)
         self.assertIn("une PR de release", self.text)
+
+    def test_no_lot_push_ci_review_first(self):
+        # #1343 (canon §3, home 66) : une poussée sur une PR de LOT ne lance
+        # plus rien — la CI part au gel, par l'étiquette `ci-lot-<sha>` /
+        # `ci-full-<sha>` posée sur la PR (`pull_request` `types: [labeled]`).
+        # Les poussées main/release gardent la suite complète ; celles
+        # d'integration/** passent par le portier paquet.yml (§12).
+        # Le dispatch manuel reste un point d'entrée d'exploitation : hors PR,
+        # il ne peut pas satisfaire un check requis de PR ; la porte de gel,
+        # elle, n'existe que sur le parcours PR.
+        self.assertIn('  pull_request:\n    types: [labeled]\n    branches: [main, '
+                      '"release/**", "integration/**"]\n', self.text)
+        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+        self.assertIn("\n  workflow_dispatch:\n", self.text)
+        # ancré sur l'étape gel : le `if` du job version ne doit pas suffire.
+        self.assertIn("        id: gel\n        if: github.event_name == 'pull_request'\n",
+                      self.text)
+
+    def test_label_gate_exact_frozen_sha_and_composition(self):
+        # #1343 : le job plan ne teste que la composition demandée — étiquette
+        # exacte `ci-lot/ci-full-<40hex>`, SHA égal à `pull_request.head.sha`,
+        # checkout = merge-ref composé de la base du payload et de cette tête.
+        # Un refus rougit le check requis sans exécuter de tests, jamais un vert
+        # sur une autre tête.
+        self.assertIn("^ci-(lot|full)-[0-9a-f]{40}$", self.text)
+        self.assertIn("foreign label, nothing run", self.text)
+        self.assertIn('if [ "$sha" != "$head" ]', self.text)
+        self.assertIn("source or target release/** or integration/** requires ci-full-<sha>",
+                      self.text)
+        self.assertIn("the merge-ref base is", self.text)
+        self.assertIn("the merge-ref head is", self.text)
+        self.assertIn('--mode "$AMEESH_CI_MODE"', self.text)
+
+    def test_label_concurrency_is_distinct_from_a_foreign_label(self):
+        # #1343 : une étiquette étrangère a sa propre concurrency — l'ajouter
+        # n'annule pas un run gelé valide.
+        self.assertIn("format('pr-{0}-{1}', github.event.pull_request.number, "
+                      "github.event.label.name)", self.text)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                      self.text)
+
+    def test_label_aggregate_refuses_a_green_without_tests(self):
+        # #1343 : une demande de gel (étiquette ci-lot/ci-full) ne prend jamais
+        # les voies version seule (L157) ou documentation seule (L161a) ; si le
+        # plan en produisait une, l'agrégat requis rougit au lieu de verdir
+        # sans tests.
+        job = self.text[self.text.index("\n  tests:\n"):]
+        # #940 : l'agrégat n'admet que les expressions de son contrat et garde
+        # `github.event_name` dans le script (pas d'`env:` intercalé).
+        self.assertIn('if [ "${{ github.event_name }}" = pull_request ]; then', job)
+        self.assertIn('test "${{ needs.plan.outputs.version_only }}" = "false"', job)
+        self.assertIn('test "${{ needs.plan.outputs.docs_only }}" = "false"', job)
+
+    def test_run_name_carries_the_freeze_request(self):
+        # #1343 : le titre du run porte la PR, l'étiquette (mode et SHA) et la
+        # base, pour que la commande et la preuve de fusion puissent le relire.
+        self.assertIn("run-name:", self.text)
+        self.assertIn("format(' [PR #{0} {1} base {2}]'", self.text)
+        self.assertIn("github.event.label.name", self.text)
+
+
+class LotFreezePlanTest(unittest.TestCase):
+    """#1343 — la CI d'un lot au gel (canon §3) : impactés + contrat sur la
+    tête demandée par l'étiquette `ci-lot-<sha>`, jamais une voie qui saute les
+    tests ; `ci-full-<sha>` et release/** gardent la suite complète."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def _card(self) -> dict:
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in mods}
+        return card
+
+    def _code_change(self) -> None:
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+
+    def _plan(self, mode: str, *, base_ref: str = "main",
+              head_ref: str = "lot/1343-ci-au-gel", nature: dict | None = None) -> dict:
+        nat = nature or {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
+            return plan.make_plan("pull_request", self._card(), NOW, head="HEAD",
+                                  repo=self.repo.path, base="HEAD^1", mode=mode,
+                                  base_ref=base_ref, head_ref=head_ref)
+
+    def test_gel_selectionne_impactes_et_contrat(self):
+        self._code_change()
+        touched = parts.modules()[0]
+        card = self._card()
+        card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [touched]
+        nat = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD",
+                               repo=self.repo.path, base="HEAD^1", mode="lot",
+                               base_ref="main", head_ref="lot/x")
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        # la raison du plan est le gel, pas l'événement (`nature` dit « not a
+        # pull request » pour un ancien dispatch) : le plan.json relu le dit.
+        self.assertEqual(p["why"], "lot CI at freeze: impacted + contract")
+        ran = [m for ps in p["parts"]["psycopg"] for m in ps["modules"]]
+        self.assertIn(touched, ran)
+        self.assertTrue(p["contract"])
+        for module in p["contract"]:
+            self.assertIn(module, ran)
+        # le pilote psql est borné à sa liste (3 parts au plus, L1211)
+        self.assertLessEqual(len(p["parts"]["psql"]), 3)
+
+    def test_gel_ne_prend_jamais_les_voies_qui_sautent_les_tests(self):
+        # L157 (version seule) et L161a (documentation seule) restent des voies
+        # de poussée : au gel, le contrat tourne, donc un check vert veut dire
+        # que des tests ont tourné.
+        for why, nat in (("version", {"version_only": True, "docs_only": False,
+                                      "why": "version seule",
+                                      "files": ["pyproject.toml"]}),
+                         ("documentation", {"version_only": False, "docs_only": True,
+                                            "why": "documentation seule",
+                                            "files": ["docs/x.md"]})):
+            with self.subTest(why):
+                p = self._plan("lot", nature=nat)
+                self.assertFalse(p["version_only"], p["why"])
+                self.assertFalse(p["docs_only"], p["why"])
+                self.assertEqual(p["doc_readers"], [])
+                self.assertNotEqual(p["parts"]["psycopg"], [])
+
+    def test_gel_sur_une_branche_release_garde_la_suite_complete(self):
+        self._code_change()
+        p = self._plan("lot", head_ref="release/1.10.0")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("release/**", p["selection"]["why"])
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
+        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+
+    def test_demande_full_garde_la_suite_complete(self):
+        self._code_change()
+        p = self._plan("full")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _full_suite_parts("psycopg"))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
+
+    def test_demande_full_ne_prend_pas_la_voie_version_seule(self):
+        # #1343 : une demande explicite `ci-full-<sha>` ne peut pas verdir par
+        # la voie version seule (L157) — la suite complète tourne.
+        p = self._plan("full", nature={"version_only": True, "docs_only": False,
+                                       "why": "version seule",
+                                       "files": ["pyproject.toml"]})
+        self.assertFalse(p["version_only"], p["why"])
+        self.assertNotEqual(p["parts"]["psycopg"], [])
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
+
+    def test_repli_d_un_gel_garde_la_forme_du_lot(self):
+        p = plan.fallback_plan("pull_request", "boom", mode="lot",
+                               base_ref="main", head_ref="lot/x")
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _lot_request_parts("psycopg"))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _lot_request_parts("psql"))
+        self.assertTrue(all(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+
+    def test_repli_d_un_gel_release_garde_la_suite_complete(self):
+        p = plan.fallback_plan("pull_request", "boom", mode="lot",
+                               base_ref="main", head_ref="release/1.10.0")
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
+        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+
+    def test_cli_mode_lot_sans_base_refuse(self):
+        # sans la base du payload, la sélection porterait sur HEAD^1 et
+        # manquerait des modules du lot : la CLI refuse plutôt que de deviner.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = plan.main(["plan", "--out", str(self.repo.path / "plan.json"),
+                              "--event", "pull_request", "--mode", "lot"])
+        self.assertEqual(code, 2)
+        self.assertIn("requires --base", err.getvalue())
+        self.assertFalse((self.repo.path / "plan.json").exists())
 
 
 if __name__ == "__main__":
