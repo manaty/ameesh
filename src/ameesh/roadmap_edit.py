@@ -90,7 +90,8 @@ def export(db, *, project=None, all_states=False) -> dict:
         entry = payload(row)
         entry["depends_on"] = []
         for reference in row.get("depends_on") or []:
-            match = _COMMITMENT.fullmatch(reference.strip())
+            match = (_COMMITMENT.fullmatch(reference.strip())
+                     if isinstance(reference, str) else None)
             entry["depends_on"].append("@" + aliases[int(match[1])] if match and int(match[1]) in aliases else reference)
         entries.append(entry)
     return {"schema": SCHEMA, "commitments": entries}
@@ -203,6 +204,49 @@ def _normalize(db, fields, *, base=None, now=None, literal_dates=False, warnings
     return value
 
 
+def _components(nodes, edges):
+    """Strongly connected components (Kosaraju, iterative).
+
+    Imported graphs can be long: no recursion, and one pass rather than a
+    reachability walk per introduced edge.
+    """
+    order, seen = [], set()
+    for start in nodes:
+        if start in seen:
+            continue
+        seen.add(start)
+        stack = [(start, iter(edges.get(start, ())))]
+        while stack:
+            node, children = stack[-1]
+            for child in children:
+                if child in nodes and child not in seen:
+                    seen.add(child)
+                    stack.append((child, iter(edges.get(child, ()))))
+                    break
+            else:
+                order.append(node)
+                stack.pop()
+    reverse = {node: [] for node in nodes}
+    for node in nodes:
+        for child in edges.get(node, ()):
+            if child in nodes:
+                reverse[child].append(node)
+    component, number = {}, 0
+    for start in reversed(order):
+        if start in component:
+            continue
+        component[start] = number
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for parent in reverse[node]:
+                if parent not in component:
+                    component[parent] = number
+                    stack.append(parent)
+        number += 1
+    return component
+
+
 def _references(db, rows, *, roots=None, validate_fields=False, introduced=None):
     """Validate references and cycles in the reachable commitment graph.
 
@@ -291,9 +335,17 @@ def _references(db, rows, *, roots=None, validate_fields=False, introduced=None)
         del degree[node]
     if degree:
         issue = {"code": "dependency_cycle", "ids": sorted(degree)}
-        fresh = introduced is not None and any(
-            source in degree and child in degree and (source, child) in introduced
-            for source, children in edges.items() for child in children)
+        fresh = False
+        if introduced is not None:
+            # An introduced edge only introduces the cycle when its target can
+            # already climb back to its source: both ends sit in the same
+            # strongly connected component. An edge leaving an inherited cycle
+            # towards a dependency downstream of it stays safe (warning only),
+            # as does the rest of the inherited cycle.
+            component = _components(degree, edges)
+            fresh = any(source in degree and child in degree
+                        and component[source] == component[child]
+                        for source, child in introduced)
         if introduced is not None and not fresh:
             warnings.append(dict(issue, stale=True))
         else:
@@ -356,7 +408,9 @@ def update(db, value, fields, *, if_match=None, now=None, warnings=None):
             raise roadmap.RoadmapError("keys are immutable; use accept/done/cancel to change status")
         prepared = _normalize(tx, fields, base=current, now=now, warnings=collected)
         node = "e"+str(current["id"])
-        previous = set(payload(current)["depends_on"])
+        # A legacy jsonb value may hold non-string refs (written outside the
+        # CLI): they cannot be hashed, and they are not edges of this edit.
+        previous = {ref for ref in payload(current)["depends_on"] if isinstance(ref, str)}
         introduced = {(node, ref) for ref in prepared["depends_on"] if ref not in previous}
         graph = {"e"+str(r["id"]): payload(r) for r in st.roadmap.commitments()}
         graph[node] = prepared
@@ -387,7 +441,8 @@ def _prepare_import(db, body, existing, *, update_existing):
                                                        for ref in normalized["depends_on"]))
         node = aliases[entry["key"]]
         graph[node] = normalized
-        previous = set(payload(current)["depends_on"]) if current else set()
+        previous = ({ref for ref in payload(current)["depends_on"] if isinstance(ref, str)}
+                    if current else set())
         introduced.update((node, ref) for ref in normalized["depends_on"] if ref not in previous)
         action = "create"
         if current:

@@ -48,9 +48,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sys
-import tempfile
 import textwrap
 import time
 
@@ -1127,12 +1127,26 @@ def _read_plan_text(filename: str) -> str:
 def _write_atomic(filename: str, text: str) -> None:
     """Write the export beside its target, then replace it in one step."""
     target = Path(filename)
+    # A symlinked target is written through, as a plain ``write_text`` did:
+    # replacing the link itself would silently turn it into a regular file.
+    if target.is_symlink():
+        target = Path(os.path.realpath(target))
+    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
-                                   dir=str(target.parent))
-    except OSError as exc:
-        raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
-    try:
+        # ``mkstemp`` forces 0600; a new export must honour the umask like an
+        # ordinary file. ``os.open(..., 0o666)`` lets the kernel apply it, and
+        # O_EXCL keeps the temporary name private.
+        fd = None
+        for _ in range(16):
+            candidate = str(target.parent / ("%s.%s.tmp" % (target.name, secrets.token_hex(8))))
+            try:
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            except FileExistsError:
+                continue
+            tmp = candidate
+            break
+        if fd is None:
+            raise OSError("cannot create a temporary file beside %s" % target)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
             stream.write(text)
             stream.flush()
@@ -1141,10 +1155,11 @@ def _write_atomic(filename: str, text: str) -> None:
             shutil.copymode(target, tmp)
         os.replace(tmp, target)
     except OSError as exc:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if tmp is not None and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
 
 
