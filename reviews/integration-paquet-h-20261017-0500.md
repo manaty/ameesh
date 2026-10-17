@@ -1,7 +1,7 @@
 # Paquet integration/paquet-h-20261017-0500 — composition
 
 Base : `main` après atterrissage de PR1577 (`integration/paquet-h-20261017-0400`),
-merge réel **`MERGE_SHA_A_REMPLIR`** (HEURE_A_REMPLIR, arbre identique à la tête
+merge réel **`18859e0664c291f199bc88b8c98abd7e68b1222f`** (04:49:02Z, arbre identique à la tête
 `f2be9d0f4fca990afa54f8ed03084a459b699352`). La branche est construite sur
 `f2be9d0f4`, ancêtre de `main` après cette fusion : le diff de la PR ne porte
 que les unités ci-dessous.
@@ -76,7 +76,7 @@ Chaque commit de composition porte le trailer `ameesh-work: <lot>` (convention
   demande un véhicule dédié avec mty-amh-impl-04, pas ce cutoff prioritaire.
 - **#2186** : admission conditionnée à #2043, absent de `main`.
 - **#1114** : précondition de configuration staging toujours ouverte.
-- **#1465/#1612** : non admis à ce cutoff (compositions de banc seulement).
+- **#1465/#1612** : prêts (gel/verdict ok, remises `fb9a2575`/`70c9afa3`) mais reportés au véhicule suivant ; composition de banc locale `wip/paquet-0400-7units`, non poussée.
 
 ## CI et fusion
 
