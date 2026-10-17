@@ -189,6 +189,42 @@ class EntryTest(_Base):
             self.enter(2, ci=None)
         self.assertEqual(set(self.fake.queue_rows), {1})
 
+    def test_a_pilot_waiver_lifts_the_verdict_gate(self):
+        """#2281 : `work reviewer --no-verdict` (#1979) marque la dispense de
+        re-verdict sur la tête gelée (`reviewer = -none`) ; `queue add` la
+        respecte au lieu de redemander les avis de la classe."""
+        tip = self.tip(1)
+        self.fake.lots[1]["reviewer"] = work.REVIEWER_NONE
+        self.fake.lots[1]["events"] = [{"note": "verdict not required: no re-verdict due "
+                                                "(#1979)", "actor": "pilote-x"}]
+        self.marks[1] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        row = self.enter(1)
+        self.assertEqual(row["state"], "queued")
+        self.assertTrue(row["waived"])
+        self.assertIn("verdict waived by pilote-x", self.fake.notes[-1][1])
+
+    def test_a_pilot_waiver_never_lifts_a_blocked_verdict(self):
+        """#2281 : la dispense ne survit pas à une correction due — un verdict
+        bloquant courant refuse la file, comme il refuse la dispense (#1979)."""
+        tip = self.tip(1)
+        self.fake.lots[1]["reviewer"] = work.REVIEWER_NONE
+        self.marks[1] = [{"id": 2, "kind": "verdict", "verdict": "blocked", "sha": tip,
+                          "at_ts": 2.0, "actor": "rev1"},
+                         {"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        with self.assertRaisesRegex(merge_queue.QueueError, "blocked verdict"):
+            self.enter(1)
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_waived_lot_still_refuses_a_draft_pr(self):
+        """#2281 : sans avis, la qualité de la PR reste une porte — une PR en
+        brouillon ne s'atterrit pas, même sous dispense."""
+        tip = self.tip(1)
+        self.fake.lots[1]["reviewer"] = work.REVIEWER_NONE
+        self.marks[1] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        with self.assertRaisesRegex(merge_queue.QueueError, "PR #7 is a draft"):
+            self.enter(1, ci=self.green(1, draft=True))
+        self.assertEqual(self.fake.queue_rows, {})
+
     def test_required_commit_ci_certifies_a_landing_without_a_pr(self):
         """Revue #544 r2 : sans PR (lecteur muet ou `None`), un projet
         `ci_required` se certifie par la CI du commit gelé — le refus de

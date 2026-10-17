@@ -272,6 +272,30 @@ class ReviewGateTest(unittest.TestCase):
         ok = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass="release")
         self.assertTrue(ok["ok"], ok["why"])
 
+    def test_pilot_waiver_lifts_the_verdicts_but_never_a_block(self):
+        # #2281 : `work reviewer --no-verdict` (#1979) marque la dispense de
+        # re-verdict (`reviewer = -none`) ; la porte partagée la respecte,
+        # sans changer la classe ni lever un verdict bloquant courant.
+        for item in ({"assignee": "author", "reviewer": work.REVIEWER_NONE},
+                     {"assignee": "author", "reviewers": [work.REVIEWER_NONE]}):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]}, item=item)
+            self.assertTrue(out["ok"], out["why"])
+            self.assertTrue(out["waived"])
+            self.assertEqual(out["required"], 2, "la dispense ne change pas la classe")
+        named = self.gate(_marks(_mark("frozen", A)),
+                          klass={"class": "sensitive", "files": [self.SQL]},
+                          item={"assignee": "author", "reviewer": work.REVIEWER_NONE,
+                                "events": [{"note": "verdict not required: no re-verdict "
+                                                    "due (#1979)", "actor": "pilote-x"}]})
+        self.assertEqual(named["waived_by"], "pilote-x")
+        blocked = self.gate(_marks(_mark("frozen", A),
+                                   _verdict("rev1", verdict="blocked")),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"assignee": "author", "reviewer": work.REVIEWER_NONE})
+        self.assertFalse(blocked["ok"], "une dispense ne lève jamais une correction due")
+        self.assertIn("blocked verdict", blocked["why"])
+
 
 class ReadyTest(unittest.TestCase):
     """Les portes du feu : verdicts d'abord (sans PR), puis PR/CI."""
