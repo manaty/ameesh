@@ -2157,18 +2157,29 @@ def _reader_label(item: dict) -> str:
 
 def _parent_verdict(db: Db, parent: int | None, item: dict | None = None) -> bool:
     """Le parent relu porte-t-il un jalon `verdict` **du lecteur de cette
-    mission** ? Le titre d'un avis rattache le parent, il ne prouve pas que
-    la relecture a été rendue ; et un verdict d'un autre lecteur ne prouve pas
-    la mission de celui-ci (R codex3 #1280, B1). Sans lecteur, pas de preuve :
-    la mission doit être assignée (ou ses relecteurs désignés) avant `done`."""
+    mission**, rendu **après son ouverture** ? Le titre d'un avis rattache le
+    parent, il ne prouve pas que la relecture a été rendue ; un verdict d'un
+    autre lecteur ne prouve pas la mission de celui-ci (R codex3 #1280, B1) ;
+    et le verdict que le même lecteur a rendu avant la mission (sa R1, pour
+    une mission R2 de delta) ne la prouve pas non plus (R dev4 #1280, B1).
+    Sans lecteur, pas de preuve : la mission doit être assignée (ou ses
+    relecteurs désignés) avant `done`. Tout l'historique du parent est lu : un
+    verdict valide ne se perd pas derrière les cent derniers jalons."""
     if parent is None:
         return False
-    readers = set(_mission_readers(item or {}))
+    mission = item or {}
+    readers = set(_mission_readers(mission))
     if not readers:
         return False
-    return any(m.get("kind") == "verdict"
-               and str(m.get("actor") or "").strip() in readers
-               for m in milestones(db, parent))
+    opened = float(mission.get("created_ts") or 0)
+    for mark in milestones(db, parent, limit=None):
+        if mark.get("kind") != "verdict":
+            continue
+        if str(mark.get("actor") or "").strip() not in readers:
+            continue
+        if float(mark.get("at_ts") or 0) >= opened:
+            return True
+    return False
 
 
 def _review_parent(item: dict) -> tuple[bool, int | None]:

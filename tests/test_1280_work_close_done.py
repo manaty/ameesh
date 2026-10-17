@@ -9,8 +9,10 @@ de code (avec branche) reste à fusionner : `done` le refuse.
 Le titre `REVUE #N` rattache le parent relu, il ne prouve pas : `done` exige le
 jalon `verdict` sur ce parent, rendu par le **lecteur de la mission** — son
 assigné, ou un relecteur désigné (arbitrage mesh-design 34598, 14/10 ; R
-codex3 B1) — sans lui, une relecture « livrée » ne serait qu'une affirmation,
-et le verdict d'un autre lecteur ne prouverait pas cette mission. Les missions
+codex3 B1) — et **après l'ouverture de la mission** (R dev4 B1 : la R1 du même
+lecteur ne prouve pas une mission R2 de delta) ; sans lui, une relecture
+« livrée » ne serait qu'une affirmation, et le verdict d'un autre lecteur ne
+prouverait pas cette mission. Les missions
 ouvertes à la main hors convention (`R1`/`R2 <harnais> #<parent>`, cas #1249)
 suivent les mêmes preuves : pas de branche ni de PR, parent réel, verdict livré
 sur le parent par ce lecteur — un verdict `blocked` est une relecture livrée,
@@ -120,8 +122,8 @@ class CloseDoneTest(PgTestCase):
                          ["closed", "requested"])
 
     def test_done_ferme_un_avis_avec_son_parent(self):
-        self.verdict()
         review = self.review()
+        self.verdict()
         work.move(self.db, review["id"], "build")
         work.move(self.db, review["id"], "qa")
         out = work.close(self.db, review["id"], done=True, actor="t")
@@ -132,8 +134,8 @@ class CloseDoneTest(PgTestCase):
     def test_done_ferme_un_avis_faussement_merged(self):
         """#938/#1076/#1231 : une fusion déclarée à tort sur un avis (aucun
         code produit) se régularise en `done`, sans réécrire la fusion."""
-        self.verdict()
         review = self.review()
+        self.verdict()
         work.close_merged(self.db, review["id"], sha="a" * 40, actor="t",
                           source="sync-merges")
         self.assertEqual(work.get(self.db, review["id"])["state"], "merged")
@@ -144,11 +146,11 @@ class CloseDoneTest(PgTestCase):
         """#949/#1041/#1042/#1047/#1068 : les avis ouverts à la main ne portent
         pas la source `review-after-merge:` ; leur titre dit le parent relu, et
         le verdict doit être enregistré sur ce parent (inventaire 14/10)."""
-        self.verdict()
         review = work.add(self.db, title="REVUE #%d : R1 autre famille"
                                           % self.parent["id"],
                           source="mail", issue_ref="manaty/ameesh#1", app="ameesh",
                           assignee="relecteur")
+        self.verdict()
         work.close_merged(self.db, review["id"], sha="c" * 40, actor="t",
                           source="sync-merges")
         out = work.close(self.db, review["id"], done=True, actor="t")
@@ -159,18 +161,18 @@ class CloseDoneTest(PgTestCase):
         """#1249 : `R1 Codex #<parent>`, sans branche ni PR, se clôt `done`
         sur le verdict livré du parent — `blocked` compris, qui est une
         relecture livrée et pas un GO produit."""
+        review = self.manual_review()
         work.milestone(self.db, self.parent["id"], "verdict", verdict="blocked",
                        sha="f" * 40, actor="relecteur")
-        review = self.manual_review()
         out = work.close(self.db, review["id"], done=True, actor="regul")
         self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
 
     def test_done_rectifie_une_mission_manuelle_superseded_par_son_parent(self):
         """Régularisation du cas #1249 : fermé `superseded by` son parent relu,
         rectifié `done` sans rouvrir ni effacer la fermeture et son jalon."""
+        review = self.manual_review()
         work.milestone(self.db, self.parent["id"], "verdict", verdict="blocked",
                        sha="f" * 40, actor="relecteur")
-        review = self.manual_review()
         work.close(self.db, review["id"], superseded_by=self.parent["id"],
                    note="clôture administrative du suivi de revue", actor="qa")
         before = work.get(self.db, review["id"])
@@ -204,16 +206,16 @@ class CloseDoneTest(PgTestCase):
         self.assertEqual(work.get(self.db, review["id"])["state"], "intake")
 
     def test_done_refuse_une_mission_manuelle_avec_branche(self):
-        self.verdict()
         review = self.manual_review(branch="lot/1249-x", branch_target="main")
+        self.verdict()
         with self.assertRaises(work.WorkError) as caught:
             work.close(self.db, review["id"], done=True)
         self.assertIn("carries branch", str(caught.exception))
 
     def test_done_refuse_un_lot_avec_pr(self):
         """Une PR rattache le lot au code : il se fusionne, il ne se clôt pas."""
-        self.verdict()
         review = self.manual_review()
+        self.verdict()
         work.close_merged(self.db, review["id"], sha="d" * 40, actor="t",
                           source="sync-github", pr_ref="manaty/ameesh#941")
         with self.assertRaises(work.WorkError) as caught:
@@ -224,9 +226,9 @@ class CloseDoneTest(PgTestCase):
     def test_done_refuse_le_verdict_d_un_autre_lecteur(self):
         """R codex3 B1 : un verdict existe sur le parent, mais il est d'un
         autre agent ; la mission assignée à `reader-due` n'est pas prouvée."""
+        review = self.review(assignee="reader-due")
         work.milestone(self.db, self.parent["id"], "verdict", verdict="ok",
                        sha="e" * 40, actor="another-reader")
-        review = self.review(assignee="reader-due")
         with self.assertRaises(work.WorkError) as caught:
             work.close(self.db, review["id"], done=True, actor="reader-due")
         self.assertIn("no verdict milestone on its parent", str(caught.exception))
@@ -235,16 +237,57 @@ class CloseDoneTest(PgTestCase):
 
     def test_done_accepte_le_verdict_du_lecteur_de_la_mission(self):
         """Le verdict rendu par le lecteur assigné à la mission la prouve."""
-        self.verdict()  # acteur « relecteur »
         review = self.review(assignee="relecteur")
+        self.verdict()  # acteur « relecteur »
         out = work.close(self.db, review["id"], done=True, actor="relecteur")
+        self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
+
+    def test_done_refuse_un_verdict_anterieur_a_la_mission(self):
+        """R dev4 B1 : le verdict que le lecteur a rendu *avant* l'ouverture
+        de la mission (sa R1, pour une mission R2 de delta) ne prouve pas
+        cette mission ; le verdict rendu ensuite la prouve."""
+        self.verdict()                       # la R1, avant la mission
+        review = self.review(assignee="relecteur")
+        with self.assertRaises(work.WorkError) as caught:
+            work.close(self.db, review["id"], done=True, actor="t")
+        self.assertIn("no verdict milestone on its parent", str(caught.exception))
+        self.assertEqual(work.get(self.db, review["id"])["state"], "intake")
+        self.verdict()                       # la R2, après l'ouverture
+        out = work.close(self.db, review["id"], done=True, actor="t")
+        self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
+
+    def test_done_rectifie_apres_un_verdict_posterieur_a_la_mission(self):
+        """La rectification `done` porte la même garde temporelle : un verdict
+        antérieur à la mission laisse la fermeture intacte ; un verdict
+        postérieur la régularise, sans réouverture."""
+        self.verdict()                       # avant la mission
+        review = self.review()
+        work.close(self.db, review["id"], superseded_by=self.parent["id"], actor="t")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review["id"], done=True, actor="t")
+        after = work.get(self.db, review["id"])
+        self.assertEqual(after["close_reason"], "superseded")
+        self.verdict()                       # après l'ouverture
+        out = work.close(self.db, review["id"], done=True, actor="t")
+        self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
+
+    def test_done_lit_un_verdict_au_dela_des_cent_derniers_jalons(self):
+        """La preuve ne se perd pas dans l'historique du parent : un verdict
+        postérieur à la mission reste valide même quand plus de cent jalons
+        ont été écrits depuis (lecture de tout l'historique)."""
+        review = self.review()
+        self.verdict()
+        for _ in range(101):
+            work.milestone(self.db, self.parent["id"], "frozen",
+                           sha="a" * 40, actor="t")
+        out = work.close(self.db, review["id"], done=True, actor="t")
         self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
 
     def test_done_refuse_un_avis_sans_lecteur(self):
         """Sans assigné ni relecteur désigné, aucun verdict ne peut prouver
         *cette* mission : la clôture `done` est refusée."""
-        self.verdict()
         review = self.review(assignee=None)
+        self.verdict()
         with self.assertRaises(work.WorkError) as caught:
             work.close(self.db, review["id"], done=True)
         self.assertIn("aucun lecteur assigné", str(caught.exception))
@@ -253,9 +296,9 @@ class CloseDoneTest(PgTestCase):
     def test_done_refuse_la_rectification_sur_le_verdict_d_un_autre(self):
         """La rectification `done` porte la même garde : le verdict du parent
         doit être celui du lecteur de la mission, pas d'un autre."""
+        review = self.review(assignee="reader-due")
         work.milestone(self.db, self.parent["id"], "verdict", verdict="ok",
                        sha="e" * 40, actor="another-reader")
-        review = self.review(assignee="reader-due")
         work.close(self.db, review["id"], superseded_by=self.parent["id"], actor="qa")
         with self.assertRaises(work.WorkError) as caught:
             work.close(self.db, review["id"], done=True, actor="reader-due")
@@ -266,8 +309,8 @@ class CloseDoneTest(PgTestCase):
 
     # -- la régularisation d'un avis fermé par son propre parent ----------
     def test_done_rectifie_un_avis_superseded_par_son_parent(self):
-        self.verdict()
         review = self.review()
+        self.verdict()
         work.close(self.db, review["id"], superseded_by=self.parent["id"],
                    note="nudge stale", actor="t")
         before = work.get(self.db, review["id"])
@@ -289,11 +332,11 @@ class CloseDoneTest(PgTestCase):
     def test_done_rectifie_un_avis_historique_par_son_titre(self):
         """#1043/#1218 : un avis ouvert à la main (source `mail`) se régularise
         par le parent nommé dans son titre `REVUE #N`, verdict enregistré."""
-        self.verdict()
         review = work.add(self.db, title="REVUE #%d : R1 delta Codex"
                                           % self.parent["id"],
                           source="mail", issue_ref="manaty/ameesh#800",
                           app="ameesh", assignee="relecteur")
+        self.verdict()
         work.close(self.db, review["id"], superseded_by=self.parent["id"], actor="t")
         out = work.close(self.db, review["id"], done=True, actor="regul")
         self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
@@ -376,8 +419,8 @@ class CloseDoneTest(PgTestCase):
 
     # -- la CLI -----------------------------------------------------------
     def test_cli_close_done_affiche_et_refuse(self):
-        self.verdict()
         review = self.review()
+        self.verdict()
         out = self.mesh("work", "close", str(review["id"]), "--done")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("done (delivered without merge)", out.stdout)
