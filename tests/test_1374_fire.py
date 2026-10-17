@@ -20,7 +20,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import fire, land, lot_class, merge_queue, storage, work
+from ameesh import fire, land, lot_class, merge_queue, review, storage, work
 
 from .support import PgTestCase
 
@@ -166,6 +166,46 @@ class ReviewGateTest(unittest.TestCase):
         same = self.gate(_marks(_mark("frozen", A), _verdict("other")))
         self.assertFalse(same["ok"], "la famille de l'auteur ne compte pas")
 
+    def test_grouped_rule_does_not_add_unchanged_critical_files(self):
+        # #2218 : le canon regroupe runner et porte de fusion dans une règle.
+        policy, problems = review.parse({"default": "light", "rules": [{
+            "paths": ["src/ameesh/runner.py", "src/ameesh/merge_queue.py",
+                      "src/ameesh/land.py"], "class": "sensitive"}]})
+        self.assertEqual(problems, [])
+        klass = review.classify(policy, ["src/ameesh/runner.py", "tests/test_runner.py"])
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+        self.assertEqual(one["required"], 1)
+        self.assertTrue(one["ok"], one["why"])
+        for actor in ("author", "other", "ghost"):
+            with self.subTest(actor=actor):
+                self.assertFalse(self.gate(
+                    _marks(_mark("frozen", A), _verdict(actor)), klass=klass)["ok"])
+
+    def test_changed_critical_file_keeps_two_reviews_in_a_grouped_rule(self):
+        for path in ("src/ameesh/merge_queue.py", "src/ameesh/land.py",
+                     "src/ameesh/migrations/0460_overview_runner_seen.sql",
+                     "src/ameesh/authority.py", "src/ameesh/approve_check.py",
+                     "src/ameesh/approve_client.py", "src/ameesh/config.py",
+                     "deploy/mise-a-jour/poste.sh"):
+            with self.subTest(path=path):
+                policy, _ = review.parse({"default": "light", "rules": [{
+                    "paths": ["src/ameesh/runner.py", path], "class": "sensitive"}]})
+                klass = review.classify(policy, ["src/ameesh/runner.py", path])
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+                two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"),
+                                       _verdict("rev2")), klass=klass)
+                self.assertTrue(two["ok"], two["why"])
+
+    def test_sensitive_without_changed_paths_keeps_two_reviews(self):
+        for files in ([], [{"class": "sensitive", "rule": ["src/ameesh/runner.py"]}]):
+            with self.subTest(files=files):
+                klass = {"class": "sensitive", "doubt": False, "files": files}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+
     def test_sql_and_merge_gate_need_two_distinct_families(self):
         for entry in (self.SQL, self.GATE):
             klass = {"class": "sensitive", "files": [entry]}
@@ -220,13 +260,31 @@ class ReviewGateTest(unittest.TestCase):
         self.assertTrue(two["ok"], two["why"])
         one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=together)
         self.assertFalse(one["ok"], "la classe lue exige bien deux avis")
-        # Contrôle négatif : sans règle, ces mêmes chemins ne sont plus
-        # sensibles et la porte n'exige plus d'avis.
+        # Contrôle négatif : sans règle, un chemin hors des domaines critiques
+        # retombe `light` et la porte n'exige aucun avis — la classe vient bien
+        # du canon. (Depuis #2265, les motifs de secours gardent deux avis sur
+        # les chemins critiques même classés légers ; le contrôle prend donc un
+        # chemin ordinaire, valable avec et sans #2265.)
         bare = self.canon()
-        light = lot_class.class_of_paths(
-            [bare], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
-        self.assertEqual(light["class"], "light", light)
-        self.assertEqual(merge_queue.required_verdicts(light), 0, light)
+        plain = lot_class.class_of_paths([bare], "ameesh", ["src/ameesh/preview.py"])
+        self.assertEqual(plain["class"], "light", plain)
+        self.assertEqual(merge_queue.required_verdicts(plain), 0, plain)
+
+    def test_class_and_off_api_merge_need_two_families(self):
+        # #2249 : la classe du lot, son classement et la fusion hors API sont
+        # la porte de fusion, comme merge_queue et land.
+        for path in ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                     "src/ameesh/review.py"):
+            with self.subTest(path=path):
+                klass = {"class": "sensitive", "files": [
+                    {"path": path, "class": "sensitive", "rule": [path]}]}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+        near = {"class": "sensitive", "files": [
+            {"path": "src/ameesh/preview.py", "class": "sensitive",
+             "rule": ["src/ameesh/preview.py"]}]}
+        self.assertEqual(merge_queue.required_verdicts(near), 1, "motif ancré au nom")
 
     def test_author_family_never_counts(self):
         klass = {"class": "sensitive", "files": [self.SQL]}
