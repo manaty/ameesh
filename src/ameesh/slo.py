@@ -149,14 +149,25 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
 
     L'attribution gardée (`assigned to X (before: nobody)`) est un événement ;
     un lot créé déjà assigné (`work add --assignee`, `--new-lot` d'un
-    orchestrateur) l'est dès sa création, sans événement."""
+    orchestrateur) l'est dès sa création, sans événement. #2217 : une prise
+    automatique de la file (`backlog.AUTO_TAKE_NOTE`) ou de l'équipe
+    (`backlog.LOT_TAKE_NOTE`) est aussi une première attribution — elle ne
+    s'applique qu'à un lot sans preneur. Sans elle, un lot pris par la file
+    restait « jamais assigné » : `signal_assigned` courait depuis sa création
+    et l'alerte demandait de le réassigner juste après sa prise (#660)."""
+    from . import backlog
+
     first = None
     for ev in events:
         note = ev.get("note") or ""
-        if note.startswith("assigned to ") and "(before: nobody)" in note:
-            at = ev.get("created_ts")
-            if at is not None and (first is None or float(at) < first):
-                first = float(at)
+        if note.startswith("assigned to "):
+            if "(before: nobody)" not in note:
+                continue
+        elif not note.startswith((backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE)):
+            continue
+        at = ev.get("created_ts")
+        if at is not None and (first is None or float(at) < first):
+            first = float(at)
     if first is not None:
         return first
     if item.get("assignee"):
@@ -164,22 +175,40 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     return None
 
 
+def handover_prefixes() -> tuple:
+    """Les débuts de note qui confient le lot à un porteur (#2217).
+
+    Une seule source pour les attributions : `handoff.assign_prefixes`
+    (assignation, prise automatique de la file ou de l'équipe, reprise d'un
+    lot en pause budget), moins le rendu à la file (`RETURN_NOTE` : le lot
+    n'a plus de porteur, il n'y a pas de prise à dater) ; la délégation
+    (`delegated to …`) transfère aussi le porteur."""
+    from . import handoff
+
+    return tuple(p for p in handoff.assign_prefixes()
+                 if p != handoff.RETURN_NOTE) + ("delegated to ",)
+
+
 def handover_ts(item: dict, events: Iterable[dict]) -> float | None:
     """L'instant de la dernière prise en charge du lot (#2217).
 
-    `work assign` (et `--claim`) écrivent « assigned to X (before: Y|nobody) »
-    dans le journal du lot : la dernière de ces lignes est la prise la plus
-    récente, réassignation comprise. `None` quand le journal n'en porte aucune
-    (lot jamais assigné par cette voie, ou créé déjà assigné par
-    `work add --assignee`) : il n'y a alors pas de prise à dater, donc pas de
-    grâce à ouvrir."""
+    Toutes les notes d'attribution comptent (`handover_prefixes`) :
+    `work assign`/`--claim`, prise automatique de la file ou de l'équipe,
+    reprise après une pause budget, délégation. `None` quand le lot n'a pas
+    de porteur courant (rendu à la file) ou quand le journal n'en porte
+    aucune (lot créé déjà assigné par `work add --assignee`) : il n'y a alors
+    pas de prise à dater, donc pas de grâce à ouvrir."""
+    if not str(item.get("assignee") or "").strip():
+        return None
+    prefixes = handover_prefixes()
     last = None
     for ev in events:
         note = ev.get("note") or ""
-        if note.startswith("assigned to ") and "(before: " in note:
-            at = ev.get("created_ts")
-            if at is not None and (last is None or float(at) > last):
-                last = float(at)
+        if not note.startswith(prefixes):
+            continue
+        at = ev.get("created_ts")
+        if at is not None and (last is None or float(at) > last):
+            last = float(at)
     return last
 
 
