@@ -337,12 +337,13 @@ def waiting_for(item: dict, events: Iterable[dict], milestones: Iterable[dict],
 # lecture groupée (alerte stale_lot, work list, progress)
 # --------------------------------------------------------------------------
 
-def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict, dict]:
+def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict, dict, list]:
     events: dict = {}
     milestones: dict = {}
     actions: dict = {}
     messages: dict = {}
     last_events: dict = {}
+    hold_events: list = []
     if ids:
         # #1647 : les vues groupées ne lisent que les transitions ; le texte
         # des notes (des mégaoctets) n'est ni transféré ni recopié, et le
@@ -351,13 +352,18 @@ def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict, dict]:
             events.setdefault(int(ev["work_item_id"]), []).append(ev)
         for row in st.progress.lot_event_last(ids):
             last_events[int(row["work_item_id"])] = float(row["last_ts"])
+        # #1664 : le flux ciblé des retenues (transitions + notes hold/levée),
+        # lu une fois pour toute la vue.
+        from . import planned_waits
+        hold_events = list(st.progress.lot_hold_events(
+            ids, planned_waits.HOLD_NOTE_PATTERNS))
         for ms in st.progress.lot_milestones(ids):
             milestones.setdefault(int(ms["work_item_id"]), []).append(ms)
         for act in st.progress.lot_actions(ids):
             actions.setdefault(int(act["work_item"]), []).append(act)
         for row in st.progress.lot_messages(ids):
             messages[int(row["work_item_id"])] = row.get("last_ts")
-    return events, milestones, actions, messages, last_events
+    return events, milestones, actions, messages, last_events, hold_events
 
 
 def describe(db, rows: list[dict], *, now: float | None = None,
@@ -391,12 +397,16 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     agents = st.progress.agents(None)
     states, externals = availability_of(agents)
     agent_projects = {r["name"]: projects.agent_project(r) for r in agents}
-    events, milestones, actions, messages, last_events = _grouped(st, ids)
+    events, milestones, actions, messages, last_events, hold_events = _grouped(st, ids)
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    # #1664 : le flux ciblé est déjà lu ici (transitions + notes hold/levée) ;
+    # les holds explicites en viennent, sans deuxième lecture.
+    waits = planned_waits.read(
+        db, rows, now=now, packages=packages, open_items=open_items,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(db, hold_events))
     out: dict[int, dict] = {}
     classes: dict = {}
     known = review_class or {}
@@ -427,16 +437,16 @@ def describe(db, rows: list[dict], *, now: float | None = None,
             # #1107 : une ligne illisible (horodatage textuel…) est isolée ;
             # aucun instant ni attente inventés, le consommateur la signale
             out[rid] = {"waiting": None, "waiting_for": None, "last_activity_ts": None,
-                        "project": None, "planned_wait": holds.get(rid),
+                        "project": None, "planned_wait": waits.get(rid),
                         "dependencies": dependencies.get(rid, []), "stale": None,
                         "unreadable": unreadable(exc)}
             continue
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
                     "project": project,
-                    "planned_wait": holds.get(rid),
+                    "planned_wait": waits.get(rid),
                     "dependencies": dependencies.get(rid, []),
-                    "stale": None if rid in holds else
+                    "stale": None if rid in waits else
                              stale(row.get("state") or "", last, now, threshold),
                     "unreadable": None}
     return out
