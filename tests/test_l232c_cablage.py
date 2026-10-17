@@ -160,6 +160,45 @@ class IntentionTest(Materiel):
             self.livraison(Transport(self.installeur)).deliver(REFERENCE, HOST, UTILISATEUR)
         self.assertEqual(caught.exception.category, 'intent_record')
 
+    def test_parent_des_intentions_refuse_avant_ecriture_et_transport(self):
+        for kind in ('public', 'link', 'dangling', 'file', 'owner'):
+            with self.subTest(kind=kind):
+                base = self.root / kind
+                base.mkdir(mode=0o700)
+                parent = base / 'journal'
+                elsewhere = base / 'elsewhere'
+                elsewhere.mkdir(mode=0o700)
+                if kind == 'public':
+                    parent.mkdir(mode=0o755)
+                    parent.chmod(0o755)
+                elif kind in ('link', 'dangling'):
+                    parent.symlink_to(elsewhere if kind == 'link' else base / 'absent')
+                elif kind == 'file':
+                    parent.write_text('ordinary file')
+                else:
+                    parent.mkdir(mode=0o700)
+                journal = coffre.Journal(parent, uid=os.geteuid() + 1 if kind == 'owner'
+                                        else os.geteuid())
+                peer = Transport(self.installeur)
+                with self.assertRaises(coffre.Refused) as caught:
+                    coffre.Livraison(self.policy, peer, journal).deliver(
+                        REFERENCE, HOST, UTILISATEUR)
+                self.assertEqual(caught.exception.category, 'intent_root')
+                self.assertEqual(peer.payloads, [])
+                self.assertFalse(self.key.exists())
+                self.assertFalse((parent / 'intents').exists())
+                self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_lien_mourant_des_intentions_refuse_explicitement(self):
+        self.journal.root.mkdir(mode=0o700)
+        (self.journal.root / 'intents').symlink_to(self.root / 'absent')
+        peer = Transport(self.installeur)
+        with self.assertRaises(coffre.Refused) as caught:
+            self.livraison(peer).deliver(REFERENCE, HOST, UTILISATEUR)
+        self.assertEqual(caught.exception.category, 'intent_root')
+        self.assertEqual(peer.payloads, [])
+        self.assertFalse((self.journal.root / 'rotations.jsonl').exists())
+
     def test_groupe_root_refuse_au_pont(self):
         document = self.destination_document(group='root')
         helper = dict(self.helper_document, destinations=[document])
@@ -251,6 +290,58 @@ class TransportSecretsTest(Materiel):
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_modules_controles_avant_execution(self):
+        dispatcher = charger('hote-secrets.py', 'l2034_dispatcher')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            lib = root / 'lib'
+            lib.mkdir(mode=0o700)
+            marker = root / 'executed'
+            source = lib / 'hote-release.py'
+            source.write_text('from pathlib import Path\n'
+                              'Path(%r).write_text("executed")\n' % str(marker))
+            source.chmod(0o600)
+            original_lstat = Path.lstat
+
+            for kind in ('file_mode', 'file_owner', 'parent_mode', 'parent_owner',
+                         'link', 'dangling', 'parent_link', 'trusted'):
+                with self.subTest(kind=kind):
+                    marker.unlink(missing_ok=True)
+                    def enrolled_lstat(path):
+                        info = list(original_lstat(path))
+                        info[4] = 0
+                        if path in root.parents:
+                            info[0] &= ~0o022  # temporary fixture ancestors
+                        if (path == source and kind == 'file_mode'
+                                or path == lib and kind == 'parent_mode'):
+                            info[0] |= 0o020
+                        if (path == source and kind == 'file_owner'
+                                or path == lib and kind == 'parent_owner'):
+                            info[4] = 12345
+                        return os.stat_result(info)
+
+                    fake_dispatcher = lib / 'hote-secrets.py'
+                    module_name = 'hote-release'
+                    if kind in ('link', 'dangling'):
+                        (lib / 'linked.py').symlink_to(source if kind == 'link'
+                                                       else lib / 'absent')
+                        module_name = 'linked'
+                    if kind == 'parent_link':
+                        alias = root / 'alias'
+                        alias.symlink_to(lib)
+                        fake_dispatcher = alias / 'hote-secrets.py'
+                    with mock.patch.object(dispatcher, '__file__', str(fake_dispatcher)), \
+                            mock.patch.object(Path, 'lstat', enrolled_lstat):
+                        if kind == 'trusted':
+                            dispatcher.module(module_name, 'l2034_enrolled')
+                            self.assertEqual(marker.read_text(), 'executed')
+                        else:
+                            with self.assertRaises((ValueError, OSError)):
+                                dispatcher.module(module_name, 'l2034_untrusted')
+                            self.assertFalse(marker.exists())
+                    if kind in ('link', 'dangling'):
+                        (lib / 'linked.py').unlink()
+
     def lancer(self, *args, stdin=b''):
         return subprocess.run([sys.executable, str(HOTE), *args], input=stdin,
                               capture_output=True, timeout=30)

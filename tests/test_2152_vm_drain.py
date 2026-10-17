@@ -3,7 +3,7 @@
 est drainé par une pause opérateur courte, puis la pause est levée dès qu'il
 est redémarré hors tour.
 
-Faux `ssh` (aucune VM : lectures de migrations, horloge, unité) et faux CLI
+Faux `ssh` (aucune VM : lectures de migrations, unité) et faux CLI
 `ameesh` du poste (registre, pause, reprise) sur PATH. Les règles du drain
 (posé/levé/non levé, trap de sortie) sont couvertes en mode agents par
 `tests/test_503_agent_host.py` ; ce banc prouve le câblage du mode serveur,
@@ -12,7 +12,6 @@ où la pause passe par le CLI du poste.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -34,8 +33,17 @@ elif 'schema_migrations' in cmd:
     print('1')
 elif 'clock_timestamp' in cmd:
     print(time.time())
+elif 'systemctl show' in cmd and 'ActiveState' in cmd:
+    print('inactive' if (state / 'stopped-dev9').exists() else 'active')
+elif 'systemctl show' in cmd and 'MainPID' in cmd:
+    print('0' if (state / 'stopped-dev9').exists() else '123')
 elif 'systemctl show' in cmd:
     print('{ path=/bin/runner ; argv[]=/bin/runner run --runner-id runner-dev9@mesh ; }')
+elif 'systemctl stop' in cmd:
+    (state / 'stopped-dev9').touch()
+elif 'systemctl start' in cmd:
+    (state / 'restart-dev9').touch()
+    (state / 'stopped-dev9').unlink(missing_ok=True)
 elif 'systemctl restart' in cmd:
     (state / 'restart-dev9').touch()
 elif 'rev-parse' in cmd:
@@ -103,16 +111,9 @@ elif action == 'resume':
 sys.exit(0)
 '''
 
-#: #2152 : seule l'attente de la boucle (15 s) avance l'horloge du banc ;
-#: N4 : quand HORLOGE_FICHIER est posé, elle avance de 2 s par attente.
-SLEEP = ('#!/bin/sh\n'
-         'if [ "$1" = 15 ]; then\n'
-         '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
-         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
-         '  fi\n'
-         '  exec %s 0.5\n'
-         'fi\n'
-         'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
+#: #2152 : plus aucune attente de créneau « idle » (DRAIN_ATTENTE est un
+#: interrupteur) ; les attentes de bail restent instantanées dans le banc.
+SLEEP = '#!/bin/sh\nexit 0\n'
 
 
 class RedemarrageServeurDrainTest(unittest.TestCase):
@@ -164,25 +165,28 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
         self.assertIn('reprise prouvée (operator_paused=false)', p.stdout)
         self.assertIn('dev9 : redémarré (était idle)', p.stdout)
-        self.assertIn('systemctl restart ameesh-runner@dev9', (self.state / 'ssh.log').read_text())
+        journal_ssh = (self.state / 'ssh.log').read_text()
+        self.assertIn('systemctl stop ameesh-runner@dev9', journal_ssh)
+        self.assertIn('systemctl start ameesh-runner@dev9', journal_ssh)
+        self.assertNotIn('systemctl restart ameesh-runner@dev9', journal_ssh)
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_unsupported_cli_never_poses_a_pause(self):
-        """N5 B1 : CLI antérieur à --expect-reason — aucune pause posée, on
-        attend sans drain puis on s'arrête à l'échéance."""
+        """N5 B1 : CLI antérieur à --expect-reason — aucune pause posée ;
+        l'arrêt prouvé #1152 s'applique sans attendre une échéance."""
         self.env['DRAIN_ATTENTE'] = '1'
-        self.env['ATTENTE_MAX'] = '5'
         (self.state / 'sans-expect-reason').touch()
-        (self.state / 'horloge').write_text('0')
-        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
         p = self.run_vm()
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('drain #2152 indisponible', p.stderr)
-        self.assertIn('toujours en tour', p.stderr)
+        self.assertNotIn('toujours en tour', p.stderr)
         journal = self.poste()
         self.assertNotIn('pause dev9', journal)
         self.assertNotIn('resume dev9 --operator', journal)
         self.assertFalse((self.state / 'pause-dev9').exists())
+        journal_ssh = (self.state / 'ssh.log').read_text()
+        self.assertIn('systemctl stop ameesh-runner@dev9', journal_ssh)
+        self.assertIn('systemctl start ameesh-runner@dev9', journal_ssh)
 
     def test_foreign_pause_is_not_lifted(self):
         self.env['DRAIN_ATTENTE'] = '1'
@@ -193,7 +197,10 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertNotIn('pause dev9', self.poste())
         self.assertNotIn('resume dev9', self.poste())
         self.assertTrue((self.state / 'pause-dev9').exists())
-        self.assertIn('systemctl restart ameesh-runner@dev9', (self.state / 'ssh.log').read_text())
+        self.assertIn('systemctl stop ameesh-runner@dev9',
+                      (self.state / 'ssh.log').read_text())
+        self.assertIn('systemctl start ameesh-runner@dev9',
+                      (self.state / 'ssh.log').read_text())
 
 
 if __name__ == '__main__':

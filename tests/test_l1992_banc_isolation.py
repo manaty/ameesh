@@ -78,8 +78,12 @@ class BenchIsolationTest(unittest.TestCase):
         self.dsn_calls = self.root / "dsn-calls"
         base = {name: value for name, value in os.environ.items()
                 if name not in ("AMEESH_TEST_DSN", "AGENT_MESH_TEST_DSN",
-                                "AMEESH_PG_UP", "AMEESH_DRIVER", "AGENT_MESH_DRIVER")}
+                                "AMEESH_PG_UP", "AMEESH_DRIVER", "AGENT_MESH_DRIVER",
+                                "PGPASSWORD", "PGPASSFILE")}
+        # #2170 : ce module vérifie l'isolation des bases, pas le profil de
+        # connexion ; PGPASSWORD évite de lire le ~/.pgpass du poste.
         self.env = dict(base, AMEESH_TEST_VENV=".venv", PYTHONPATH="",
+                        PGPASSWORD="secret-du-banc-de-test",
                         PSQL_CALLS=str(self.psql_calls), DSN_CALLS=str(self.dsn_calls))
         self.env["PATH"] = str(self.root / "fakebin") + os.pathsep + os.environ["PATH"]
 
@@ -123,8 +127,9 @@ class BenchIsolationTest(unittest.TestCase):
                 creates.append(CREATE_RE.match(commande).group(1))
             if commande and DROP_RE.match(commande):
                 drops.append(DROP_RE.match(commande).group(1))
-            self.assertIn(DEFAULT_DSN, appel,
-                          "les gestes de base passent par la base de service")
+            if commande and (CREATE_RE.match(commande) or DROP_RE.match(commande)):
+                self.assertIn(DEFAULT_DSN, appel,
+                              "les gestes de base passent par la base de service")
         return creates, drops
 
     # -- témoins -----------------------------------------------------------

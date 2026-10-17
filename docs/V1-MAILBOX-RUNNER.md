@@ -204,10 +204,11 @@ local files). The lease is the only authorization to run.
   adds a client delay (the same + 5 s) that abandons the subprocess if the
   server no longer responds at all. Migrations, for their part, lift the timeout for
   the duration of their transaction (`SET LOCAL statement_timeout = 0`) and bound their
-  wait for a table lock (`SET LOCAL lock_timeout = 5 s`; a migration that must wait
-  longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
+  wait for a lock — table or row (`SET LOCAL lock_timeout = 5 s`; a migration that must
+  wait longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
   lock fails in seconds and stays pending, instead of holding every reader and writer
-  of the table behind it.
+  of the table behind it. The same bound applies to a row lock (`select … for update`):
+  a data migration that must wait for another transaction's row sets its own timeout.
 * **Robust heartbeat** — a database outage during a turn does not leave the
   harness running without a lease: the heartbeat counts failures
   (`max(3, ttl/3)` second interval), and stops the process as soon as the
@@ -524,7 +525,10 @@ agent fail: any error → exit 0 with nothing.
 `scripts/pg-up.sh` starts `agent-mesh-pg` (`postgres:17`, port published
 only on `127.0.0.1:55432`, named volume). `scripts/test.sh` runs the
 suite twice: `psql` driver, then `psycopg` driver in a local venv if
-installation is possible.
+installation is possible. Each run takes a throwaway `agent_mesh_test_*`
+database (#1992); when the connection profile only covers `agent_mesh`, the
+script derives a private `PGPASSFILE` for the bench's databases from the
+existing entry and removes it on exit (#2170).
 
 63 `unittest` tests (stdlib), a throwaway Postgres schema and a throwaway disk
 state per class: migrations, mailbox, notifications, leases (races with 2 and

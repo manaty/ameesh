@@ -292,6 +292,8 @@ class FauxApi:
         self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
         #: #846/#901 B1 : jobs d'une tentative — (run_id, attempt) -> jobs
         self.attempt_jobs: dict[tuple[int, int], list[dict]] = {}
+        #: #1612 : état d'une tentative — (run_id, attempt) -> exécution
+        self.attempts: dict[tuple[int, int], dict] = {}
         #: #845 : chemins appelés, pour compter les appels de la garde
         self.paths: list[str] = []
         #: tête de branche rendue par l'API (#1161)
@@ -343,6 +345,11 @@ class FauxApi:
                                   for item in self.workflows]}
         if "/branches/" in path:
             return {"commit": {"sha": self.branches.get(path.split("/branches/", 1)[1], "")}}
+        if "/actions/runs/" in path and "/attempts/" in path:
+            run_id = int(path.split("/actions/runs/")[1].split("/")[0])
+            attempt = int(path.rsplit("/", 1)[1])
+            return self.attempts.get((run_id, attempt), {"status": "in_progress",
+                                                         "run_attempt": attempt})
         if "/actions/runs/" in path:
             run_id = int(path.rsplit("/", 1)[1])
             if run_id in self.done:
@@ -793,7 +800,7 @@ class WatcherTest(PgTestCase):
         self.assertEqual(self.watcher.tick(self.db), [])
         # fin de l'attempt 2 : verdict, la ligne ne reste pas figée
         self.api.live = []
-        self.api.done[801] = {"status": "completed", "conclusion": "failure"}
+        self.api.done[801] = completed(".github/workflows/tests.yml", "failure", attempt=2)
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "failure")])
         row = storage.of(self.db).ci.run(DEPOT, 801)
@@ -860,7 +867,8 @@ class WatcherTest(PgTestCase):
                          [("tests.test_b.T.test_2", 2)])
         # le verdict ne charge que l'attempt courant ; test_1 reste en base
         # (son message d'attempt 1 est toujours retirable)
-        self.api.live, self.api.done[811] = [], {"status": "completed", "conclusion": "failure"}
+        self.api.live = []
+        self.api.done[811] = completed(".github/workflows/tests.yml", "failure", attempt=2)
         self.watcher.tick(self.db)
         verdict = self.mails("dev-a")[-1]["body"]
         self.assertIn("red, 1 failure(s)", verdict)
@@ -1622,7 +1630,7 @@ class WatcherTest(PgTestCase):
         """Le verdict situe la suite et l'attempt relancé (#901, #1110)."""
         self.api.workflows = ["backend-suite.yml"]
         sha = "3" * 40
-        self.api.live = [run_view(960, sha, "lot/1-un", workflow="backend-suite.yml")]
+        self.api.live = [run_view(960, sha, "lot/1-un", workflow="backend-suite.yml", attempt=2)]
         self.watcher.tick(self.db)
         self.api.live = []
         self.api.done[960] = completed(".github/workflows/backend-suite.yml", "success",
@@ -1802,6 +1810,43 @@ class WatcherTest(PgTestCase):
         self.assertEqual(st.ci.base_failures(repo, "main", workflow="tests.yml")["run_id"],
                          2002)
 
+    def test_seconde_egale_garde_la_tete_poussee_en_dernier(self):
+        """#2064 : `created_at` est à la seconde ; à observation égale, une
+        tête plus ancienne conclue plus tard ne redevient pas la référence —
+        c'est la tête poussée en dernier (run_id le plus grand) qui l'est."""
+        st = storage.of(self.db)
+        repo = "manaty/seconde-egale"
+        ancienne, recente = "0f" * 20, "10" * 20
+        for run_id, tete in ((2201, ancienne), (2202, recente)):
+            st.ci.open_run(repo, run_id, head_sha=tete, branch="main", event="push",
+                           base="main", work_item_id=None, url=None,
+                           workflow="tests.yml",
+                           created_at="2026-01-01T10:00:00Z")
+        st.ci.add_failure(repo, 2201, run_attempt=1, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(repo, 2201, "failure")
+        st.ci.conclude(repo, 2202, "success")
+        # la tête ancienne est conclue plus tard, dans la même seconde
+        self.db.execute(
+            "UPDATE ci_runs SET concluded_at = CASE run_id"
+            " WHEN 2201 THEN '2026-01-01T11:00:00Z'::timestamptz"
+            " WHEN 2202 THEN '2026-01-01T10:30:00Z'::timestamptz END"
+            " WHERE repo = %s AND run_id IN (2201, 2202)", (repo,))
+        reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+        self.assertEqual((reference["run_id"], reference["head_sha"]), (2202, recente))
+        self.assertEqual(reference["tests"], [])
+        # Une nouvelle exécution sur l'ancienne tête ne la rajeunit pas,
+        # même quand les premières observations des deux têtes sont égales.
+        st.ci.open_run(repo, 2203, head_sha=ancienne, branch="main", event="push",
+                       base="main", work_item_id=None, url=None,
+                       workflow="tests.yml", created_at="2026-01-01T10:01:00Z")
+        st.ci.conclude(repo, 2203, "failure")
+        reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+        self.assertEqual((reference["run_id"], reference["head_sha"]), (2202, recente))
+        self.assertEqual(reference["tests"], [])
+
     def test_reference_garde_le_dernier_resultat_de_la_tete_recente(self):
         """Une reprise actualise le résultat, jamais l'âge de sa tête."""
         st = storage.of(self.db)
@@ -1932,6 +1977,47 @@ class WatcherTest(PgTestCase):
         # un seul verdict par tentative : le passage suivant ne double rien
         self.assertEqual(watcher.tick(self.db), [])
         self.assertEqual(len(self.mails("dev-a")), 2)
+
+    def test_verdict_d_un_autre_attempt_ne_conclut_pas_la_ligne(self):
+        """#1612 : le dernier état GitHub ne conclut jamais un autre attempt,
+        au rattrapage comme au relevé normal d'une ligne encore running ;
+        l'attempt suivi est conclu par son propre état (`attempts/<n>`)."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        st = storage.of(self.db)
+        for index, (catchup, tracked) in enumerate(((False, 1), (True, 1),
+                                                   (False, 3), (True, 3))):
+            with self.subTest(catchup=catchup, tracked=tracked):
+                run_id = 1040 + index * 2
+                sha = "%040x" % run_id
+                # Sur main les anciennes têtes restent running. La tête plus
+                # récente empêche reopen_run de rouvrir celle-ci à l'attempt 2.
+                st.ci.open_run(DEPOT, run_id, head_sha=sha, branch="main",
+                               event="push", base="main", work_item_id=self.lot_main["id"],
+                               url=None, workflow="tests.yml", run_attempt=tracked)
+                st.ci.open_run(DEPOT, run_id + 1, head_sha="%040x" % (run_id + 1),
+                               branch="main", event="push", base="main",
+                               work_item_id=None, url=None, workflow="tests.yml")
+                self.api.done[run_id] = completed(".github/workflows/tests.yml", "success",
+                                                  attempt=2)
+                self.api.terminated = [self.terminated(run_id, sha, "main",
+                                                       conclusion="success", attempt=2)] \
+                    if catchup else []
+                self.assertEqual(watcher.tick(self.db), [])
+                row = st.ci.run(DEPOT, run_id)
+                self.assertEqual((row["status"], row["run_attempt"]), ("running", tracked))
+                self.assertEqual(len(self.mails("dev-b")), index)
+                # l'attempt suivi se conclut par son propre état, pas par le
+                # dernier : la ligne ne reste pas `running` sans fin
+                self.api.attempts[(run_id, tracked)] = completed(
+                    ".github/workflows/tests.yml", "failure", attempt=tracked)
+                out = watcher.tick(self.db)
+                self.assertEqual([(o["action"], o["run_id"], o["status"]) for o in out],
+                                 [("verdict", run_id, "failure")])
+                row = st.ci.run(DEPOT, run_id)
+                self.assertEqual((row["status"], row["run_attempt"]), ("failure", tracked))
+                self.assertEqual(len(self.mails("dev-b")), index + 1)
+                self.assertIn("red", self.mails("dev-b")[-1]["body"])
+                self.assertEqual(watcher.tick(self.db), [])
 
     def test_echec_de_l_attempt_suivant_inscrit_avant_la_reouverture(self):
         """#1573 N2 : une liste en retard (#828) peut publier un échec de

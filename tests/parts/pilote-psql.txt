@@ -28,6 +28,13 @@ test_1677_prise_empilee  # stockage : blocage par dépendances lu sous verrou (v
 test_420_qa_role  # SQL: QA role, runner binding and TEMP registry spoofing (#420, #919)
 test_1132_jauges_perimees  # stockage : provenance des relevés (production, source), dédup par fraîcheur, gauge_latest (#1132)
 test_2179_roadmap_cli  # stockage : import transactionnel, clés stables, CAS et filtre projet avant LIMIT (#2179)
+test_1467_train_admissions  # stockage : admissions courantes, prérequis et exclusion CAS sous bail (#1467)
+test_1467_train_candidates  # stockage : inventaire qa complet, distinct des générations de file (#1467)
+test_1467_train_fire  # stockage : feu exact, retrait/réservation sérialisés et reprise SQL (#1467)
+test_1467_train_history  # stockage : historique de jalons sans troncature, ancien blocage conservé (#1467)
+test_1467_train_runner  # stockage : passage, clone privé, provenance et promotion Git réels (#1467)
+test_1467_train_runtime  # stockage : raccord train/feu SQL et gardes finales avant effet (#1467)
+test_1467_train_storage  # stockage : intentions CAS et bail cible partagé (#1467)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)

@@ -14,7 +14,9 @@ class ReservationTest(PgTestCase):
         super().setUp()
         # PgTestCase's lot truncation does not clear the independent lease
         # table. Each scenario owns a fresh target lease in this test schema.
-        self.db.execute("TRUNCATE merge_locks")
+        # Train ledgers reference this lease table even when empty. Reset
+        # exactly these fixture tables together, without a cascading truncate.
+        self.db.execute("TRUNCATE integration_trains, integration_train_fires, merge_locks")
         self.ops = storage.of(self.db).work
         self.project = types.SimpleNamespace(name="nexlink")
         self.target = "origin/develop"

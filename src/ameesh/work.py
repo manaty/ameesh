@@ -2007,17 +2007,18 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     return row
 
 
-def note(db: Db, item_id: int, text: str, *, actor: str = "") -> bool:
+def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False) -> bool:
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     if not (text or "").strip():
         raise WorkError("empty note")
-    storage.of(db).work.note(item_id, item["state"], text.strip(), actor)
+    options = {"once": True} if once else {}
+    storage.of(db).work.note(item_id, item["state"], text.strip(), actor, **options)
     return True
 
 
-def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
+def events(db: Db, item_id: int, limit: int | None = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
@@ -2105,9 +2106,17 @@ def milestone(
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     if get(db, item_id) is None:
         raise WorkError("lot %s not found" % item_id)
+    # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
+    # preuve exacte de son origine (acteur, session, tour, harnais, sha
+    # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
+    # preuve : l'origine reste inconnue, jamais devinée par proximité.
+    from . import review_provenance
+    proof = review_provenance.proof_for_current_turn(db, actor=actor, sha=sha)
+    if proof and not actor:
+        actor = proof["actor"]
     return storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
-        on_frozen=on_frozen, after_commit=after_commit)
+        on_frozen=on_frozen, after_commit=after_commit, proof=proof)
 
 
 def delays(db: Db, limit: int = 200, *, ids: Sequence[int] | None = None) -> list[dict]:

@@ -38,6 +38,9 @@
   agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
+  agent-mesh ci run <item> [--avis N] [--exception …]   the CI of a frozen lot, once,
+        [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
+  agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
 
 The owner's authority is never inferred from text: it is proven by an Ed25519
@@ -58,7 +61,7 @@ import time
 from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
-from . import migrations, placement, registry
+from . import migrations, placement, progress, registry
 from . import rebalance as rebalance_mod
 from . import fil, release, signing, storage, work
 from .config import Config
@@ -148,12 +151,12 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
     from . import exploitation
     exploitation.annotate(cfg, db, rows)
-    # #1070 : la pause budget, distincte du `state` « paused » d'un `blocked`
-    # hors budget (hôte non prêt, authentification) — un lecteur machine n'a
-    # pas à déchiffrer un `status_text` français. Posé ici plutôt que dans
-    # `exploitation.agent_view` (§8 prod) : `agent_rows` sert aussi
-    # `GET /api/v1/agents`, les deux chemins le portent sans toucher au prod.
-    from . import progress
+    # #1070 : the budget pause, distinct from the `state` "paused" of a
+    # `blocked` for another cause (host not ready, authentication) — a
+    # machine reader must not have to decode a French `status_text`. Set
+    # here rather than in `exploitation.agent_view` (§8 prod): `agent_rows`
+    # also serves `GET /api/v1/agents`; both paths carry it without touching
+    # prod.
     for row in rows:
         row["paused_on_budget"] = progress.paused_on_budget(row)
     return rows
@@ -176,6 +179,9 @@ def agent_detail(db, name: str) -> dict | None:
     if row is None:
         return None
     row = dict(row)
+    # #1070 : the budget pause reaches `show --json` too, as it does
+    # `list --json` and `/api/v1/agents` (set in `_annotate_agents`)
+    row["paused_on_budget"] = progress.paused_on_budget(row)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
@@ -226,7 +232,6 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
         # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
-        from . import progress
         from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
@@ -261,9 +266,9 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("operator_paused") and row.get("status") not in ("stopped", "dead", "blocked"):
                 status = ("pause-next" if row.get("status") == "running" else "op-paused")
             if progress.paused_on_budget(row):
-                # #1070 : le mot « pause » doit survivre à la troncature de la
-                # colonne — « blocked/bud » masquait les pauses budget (le
-                # bilan du bureau en comptait zéro).
+                # #1070 : the word "pause" must survive the column truncation
+                # — "blocked/bud" hid the budget pauses (the bureau's tally
+                # counted none).
                 status = "paused/%s" % row["status_text"][:22]
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
@@ -2564,6 +2569,45 @@ def build_parser() -> argparse.ArgumentParser:
                              help="maximum runs shown (default 5)")
     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
     p_ci_status.set_defaults(func=cmd_ci)
+    # #1343 (canon §3) : la CI d'un lot part au gel, après les verdicts requis,
+    # par une étiquette `ci-lot-<sha>`/`ci-full-<sha>` posée sur la PR.
+    p_ci_run = ci_sub.add_parser(
+        "run", help="request the CI of a frozen lot, once, on the frozen head, "
+                    "by the ci-lot/ci-full label (#1343)")
+    p_ci_run.add_argument("id", type=int, help="work item number")
+    p_ci_run.add_argument("--sha", default="", help="the frozen commit (default: the "
+                          "last `frozen` milestone)")
+    p_ci_run.add_argument("--avis", type=int, default=1,
+                          help="required independent verdicts on the frozen commit: "
+                               "0 (lot léger), 1 (sensible), 2 (SQL/sécurité/prod)")
+    p_ci_run.add_argument("--exception", choices=("incident", "unblock"), default="",
+                          help="incident|unblock: CI in parallel of the review, marked "
+                               "(canon §3); requires --reason")
+    p_ci_run.add_argument("--reason", default="",
+                          help="why (the exception, the full suite): written to the lot")
+    p_ci_run.add_argument("--full", action="store_true",
+                          help="whole suite (release, package, explicit request), not the "
+                               "lot selection; requires --reason")
+    p_ci_run.add_argument("--force", action="store_true",
+                          help="request the CI again although this composition already "
+                               "ran, none green (red or cancelled): explicit resumption")
+    p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
+                          "issue_ref or github.projects)")
+    p_ci_run.add_argument("--dry-run", action="store_true",
+                          help="decide and print, pose no label")
+    p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
+    p_ci_run.set_defaults(func=cmd_ci)
+    p_ci_cancel = ci_sub.add_parser(
+        "cancel", help="cancel the open runs of a lot that do not carry its frozen commit")
+    p_ci_cancel.add_argument("id", type=int, help="work item number")
+    p_ci_cancel.add_argument("--all", action="store_true",
+                             help="also cancel the run of the frozen commit")
+    p_ci_cancel.add_argument("--repo", default="", help="owner/name (default: the lot's "
+                             "issue_ref or github.projects)")
+    p_ci_cancel.add_argument("--dry-run", action="store_true",
+                             help="list the runs, cancel nothing")
+    p_ci_cancel.add_argument("--json", action="store_true", help="`ameesh-ci-cancel/1` report")
+    p_ci_cancel.set_defaults(func=cmd_ci)
 
     # L750/L756 : le périmètre d'une release et sa porte (`ameesh release`)
     release.add_parser(sub, cmd_release)
@@ -3312,7 +3356,6 @@ def cmd_accounts(cfg: Config, args) -> int:
 
 
 def _since_seconds(text: str) -> float:
-    from . import progress
     now = time.time()
     return max(0.0, now - progress.parse_since(text, now))
 
