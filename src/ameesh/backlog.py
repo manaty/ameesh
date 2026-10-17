@@ -527,17 +527,37 @@ def _primary_project(agent: dict) -> str:
     return names[0] if names else ""
 
 
-def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run):
+#: #1538 : marque d'un refus de dossier dans le journal d'un élément. La
+#: relecture se fait sur ce préfixe, jamais sur le texte complet : la note
+#: nomme l'agent qui l'a rencontré, mais elle est unique PAR ÉLÉMENT.
+DIRECTORY_NOTE_PREFIX = "L243-4:"
+
+
+def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, noted=None):
     from . import lot_workdir, work
     reason = lot_workdir.problem(cfg, agent, project, canons=canons)
     if reason is None:
         return True
-    # #811 N1 : hors périmètre (raison vide) — aucune note ; un projet déclaré
-    # qui attend son dossier est noté une fois par lot.
+    # #811 N1 : hors périmètre (raison vide) — aucune note ; #1538 : une raison
+    # réelle (dossier déclaré absent ou ambigu) est notée une fois PAR ÉLÉMENT,
+    # quel que soit l'agent qui bute dessus — pas une note par (agent, élément).
+    # `noted` retient les éléments déjà lus pendant le passage : le journal
+    # n'est pas relu pour chaque couple (agent, élément) qui vise le même lot.
     if not dry_run and reason:
-        note = "L243-4: %s cannot pick up project %s: %s" % (agent["name"], project, reason)
-        if not any(e.get("note") == note for e in work.events(db, item["id"])):
-            work.note(db, item["id"], note, actor=SENDER)
+        key = int(item["id"])
+        if noted is not None and key in noted:
+            already = noted[key]
+        else:
+            already = any((e.get("note") or "").startswith(DIRECTORY_NOTE_PREFIX)
+                          for e in work.events(db, key))
+            if noted is not None:
+                noted[key] = already
+        if not already:
+            note = "%s %s cannot pick up project %s: %s" % (
+                DIRECTORY_NOTE_PREFIX, agent["name"], project, reason)
+            work.note(db, key, note, actor=SENDER)
+            if noted is not None:
+                noted[key] = True
     return False
 
 
@@ -688,6 +708,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             return False
 
     taken: list = []
+    # #1538 : les éléments dont le refus de dossier a déjà été lu (ou noté)
+    # pendant CE passage — une note par élément, une lecture par élément.
+    directory_noted: dict = {}
     if lots:
         # un orchestrateur répartit : il ne se sert pas lui-même
         if orchestras is None:
@@ -715,7 +738,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                 card=auditors.get(row["name"]), others=listing):
                     continue
                 if not _directory_ready(cfg, db, agent, item, _lot_project(item),
-                                        canons=canons, dry_run=dry_run):
+                                        canons=canons, dry_run=dry_run,
+                                        noted=directory_noted):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -786,7 +810,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                         card=auditors.get(row["name"]), others=listing):
                 continue
             if not _directory_ready(cfg, db, agent, item, _lot_project(item),
-                                    canons=canons, dry_run=dry_run):
+                                    canons=canons, dry_run=dry_run,
+                                    noted=directory_noted):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
