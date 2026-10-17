@@ -441,6 +441,14 @@ l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
 
+Le feu choisit cette voie d'après la **déclaration du projet**, jamais
+d'après la configuration locale de l'hôte qui a pris le bail `fire:<lot>`
+(#2256) : `land: local` ou `pr` entre en file, `land: off` fusionne en
+direct. Un hôte qui ne déclare pas le projet s'abstient (`no-land`) s'il ne
+trouve pas non plus de ligne de file pour ce dépôt ; il ne fusionne jamais
+en direct par défaut. Le bail est rendu, et un hôte qui connaît le projet
+agit au passage suivant.
+
 ## Intégration par paquets §12 : contrôle d'inclusion avant le feu
 
 Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
