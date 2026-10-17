@@ -939,9 +939,10 @@ def _target_lock(db, project, target: str):
     """Le bail de la cible, commun au train de fusion (#1467) et à la fusion
     directe du feu.
 
-    `(handle, True)` : un autre hôte tient `land.lock_key(project, target)` :
+    `(handle, False)` : le bail est pris, `handle` le rend ensuite.
+    `(None, True)` : un autre hôte tient `land.lock_key(project, target)` :
     aucun geste. `(None, False)` sans projet ni cible déclarés : il n'y a pas de
-    train à croiser. Le bail est pris après `fire:<lot>` et jamais avant, le
+    train à croiser (#1508). Le bail est pris après `fire:<lot>` et jamais avant, le
     train ne prenant jamais `fire:<lot>` : pas de cycle.
 
     Le TTL est celui du train (`land.LOCK_TTL_S`, réglable par
