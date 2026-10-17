@@ -48,6 +48,7 @@ class BriefsTest(unittest.TestCase):
         # un second agent parti du même brief sera refusé si le lot a changé de
         # main entre-temps.
         self.assertIn("ameesh work assign 42 <agent> --if-holder dev1", text)
+        self.assertIn("ameesh work landing 42 --vehicle", text)
 
     def test_stale_lot_offre_le_hold_de_dependance(self):
         """#1642 : le brief doit offrir la dépendance déclarée (planned_wait),
@@ -80,6 +81,7 @@ class BriefsTest(unittest.TestCase):
                                    auditor_names=["auditeur"])["orch"]
         self.assertIn("candidate for its merge packet/queue", text)
         self.assertIn("do not nudge its assignee or reassign it", text)
+        self.assertIn("ameesh work landing 42 --vehicle", text)
         self.assertNotIn("ameesh mail send dev1", text)
         self.assertNotIn("ameesh work assign 42", text)
         self.assertIn("ameesh work merged 42 --sha", text)
