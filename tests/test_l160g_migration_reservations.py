@@ -7,6 +7,7 @@ from unittest import mock
 
 from ameesh import db as db_mod, migration_reservations as reservations, radar, storage, work
 from ameesh.storage.postgres.work import WorkItems
+from ameesh.storage.postgres.migration_reservations import MigrationReservations
 
 from .support import PgTestCase
 
@@ -101,27 +102,46 @@ class ReservationImportTest(PgTestCase):
             self.run_import(apply=True)
         self.assertEqual(work.get(self.db, self.a)["migration"], 327)
 
-    def test_concurrent_collision_rolls_back_the_entire_import(self):
+    def test_concurrent_collision_rechecked_after_repository_lock(self):
         other = self.lot("Concurrent holder", 3)
         conn = db_mod.connect(self.cfg)
         self.addCleanup(conn.close)
-        original = WorkItems.reserve_migration
+        original = MigrationReservations.lock_target
         raced = []
 
-        def race(registry, item_id, *args, **kwargs):
-            if item_id == self.b and not raced:
+        def race(registry, *args):
+            if not raced:
                 raced.append(True)
-                original(WorkItems(conn), other, self.slug, 324, 0,
-                         actor="other", note="concurrent %(number)s")
-            return original(registry, item_id, *args, **kwargs)
+                WorkItems(conn).reserve_migration(other, self.slug, 324, 0,
+                    actor="other", note="concurrent %(number)s")
+            return original(registry, *args)
 
-        with mock.patch.object(WorkItems, "reserve_migration", new=race):
-            with self.assertRaises(db_mod.DbError):
+        with mock.patch.object(MigrationReservations, "lock_target", new=race):
+            with self.assertRaisesRegex(work.WorkError, "already held"):
                 self.run_import(apply=True)
         self.assertTrue(raced)
         self.assertIsNone(work.get(self.db, self.a)["migration"])
         self.assertIsNone(work.get(self.db, self.b)["migration"])
         self.assertEqual(work.get(self.db, other)["migration"], 324)
+
+    def test_second_write_failure_rolls_back_the_entire_import(self):
+        original = WorkItems.reserve_migration
+        written = []
+
+        def fail_second(registry, item_id, *args, **kwargs):
+            if item_id == self.b:
+                self.assertEqual(written, [self.a])
+                raise db_mod.DbError("second reservation rejected")
+            result = original(registry, item_id, *args, **kwargs)
+            written.append(item_id)
+            return result
+
+        with mock.patch.object(WorkItems, "reserve_migration", new=fail_second):
+            with self.assertRaisesRegex(db_mod.DbError, "second reservation rejected"):
+                self.run_import(apply=True)
+        self.assertEqual(written, [self.a])
+        self.assertIsNone(work.get(self.db, self.a)["migration"])
+        self.assertIsNone(work.get(self.db, self.b)["migration"])
 
     def test_probe_checks_owner_and_repository_and_reports_new_files_only(self):
         self.run_import(apply=True)
