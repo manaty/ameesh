@@ -257,8 +257,9 @@ table : aucun écart n'est toléré d'un côté seulement.
   `fil.member`) ; le nom nu reste admis.
 - **`HostInfo.limits`** (`GET /host`) : `{"max_agents": int|null,
   "resources": {"min_mem_available", "max_swap_used", "max_load",
-  "min_disk_free"}}`, tiré du canon (`resources.host_limits`). Un seuil
-  absent prend son défaut prudent côté exécuteur.
+  "min_disk_free", "max_mem_pressure"}}`, tiré du canon
+  (`resources.host_limits`). Un seuil absent prend son défaut prudent côté
+  exécuteur (`max_mem_pressure` : 10 %, #2296).
 - **Porte.** `GateAck.from_json` lève `ValueError` pour tout corps faux.
   Un état illisible vaut `stopped` pour un hôte médié. `max_concurrent`
   vaut 1 par défaut.
