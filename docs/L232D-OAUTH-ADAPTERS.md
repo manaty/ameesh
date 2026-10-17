@@ -162,7 +162,10 @@ Targeted tests of the slice, no full suite:
 - the pilot records its explicit acceptance of the residual risk (declared
   host/requester; the device code authorises the device that generated it),
   and names the custody of the login token: which account/process holds it,
-  outside the agents' reach.
+  outside the agents' reach. The service JSON and its directory follow the
+  same custody: they are not writable by the agents, otherwise an agent could
+  open `login_api` or redirect `login_token_file` to a token it controls —
+  the token's custody alone does not close that path.
 
 See also `docs/COMPTES.md` for account declaration and the sentinel's health
 rules.
