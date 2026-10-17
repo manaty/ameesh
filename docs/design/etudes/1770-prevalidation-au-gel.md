@@ -63,12 +63,19 @@ il le nomme, sinon de la seule convention du schéma.
 
 ```
 ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
-        [--base <sha>] [--repo <dépôt>] --canon-commit <sha> [--canon-repo <dépôt>]
+        [--profile <profil>] [--base <sha>] [--repo <dépôt>]
+        --canon-commit <sha> [--canon-repo <dépôt>]
         [--project <nom>] [--published-ref <ref>] [--json]
 ```
 
 - sans canon relu (`--canon-commit` absent ou bloc absent) : refus
   `block-missing`, aucune exécution ;
+- `--profile` nomme le profil d'offload du guest L159b (dépendances et base du
+  projet) ; absent, le profil par défaut de l'hôte s'applique. Le profil de
+  projet pose `AMEESH_TEST_VENV` (contrat L159b, `scripts/test.sh`), et le
+  script distant lance les parts avec `$AMEESH_TEST_VENV/bin/python3` : sur le
+  guest, le python système n'a ni psycopg ni la base jetable, donc un run sans
+  profil de projet est rouge/incomplet, jamais un faux vert ;
 - contrôles avant tout run : hôte déclaré au canon (sinon `no-vm`) ; chaque
   fichier de contrat déclaré est **relu au SHA candidat**, depuis les objets
   Git (un fichier absent de ce SHA ou illisible refuse), et son
@@ -147,9 +154,11 @@ c'est l'effet voulu de l'ordre de mise en service.
 ## Raccord générique par projet
 
 Le geste est générique : `--project` choisit la fiche du canon, `--canon-repo`
-et `--repo` les dépôts, `--plan` le plan du projet ; classes, contrats, hôtes,
-délai et lanceur de part ne viennent que du bloc `prevalidation` du canon du
-projet, jamais d'une valeur codée en dur.
+et `--repo` les dépôts, `--plan` le plan du projet, `--profile` le profil
+d'offload du guest (dépendances et base du projet, contrat L159b
+`AMEESH_TEST_VENV`) ; classes, contrats, hôtes, délai et lanceur de part ne
+viennent que du bloc `prevalidation` du canon du projet, jamais d'une valeur
+codée en dur.
 
 Chaque projet fournit quatre pièces :
 

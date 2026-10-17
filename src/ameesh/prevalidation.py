@@ -377,7 +377,7 @@ def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = (
 
 
 def remote_script(plan_path: str, parts: Sequence[dict],
-                  python: str = "python3", parts_script: str = "") -> str:
+                  python: str = "", parts_script: str = "") -> str:
     """Le script exécuté sur la VM : chaque part, son flux, puis la durée.
 
     Chaque part est lancée séparément, sa sortie verbeuse est écartée (seul le
@@ -388,9 +388,21 @@ def remote_script(plan_path: str, parts: Sequence[dict],
 
     `parts_script` vient du bloc canon (`parts_script`) : un projet qui n'a pas
     `scripts/test-parts.py` nomme le sien ; absent, `DEFAULT_PARTS_SCRIPT`
-    s'applique."""
+    s'applique.
+
+    L'interpréteur vient du profil d'offload du guest quand il en pose un :
+    `AMEESH_TEST_VENV` est le contrat L159b du profil de projet (le venv en
+    cache porte les dépendances du projet et la base jetable), donc les parts
+    tournent avec `$AMEESH_TEST_VENV/bin/python3` ; sans lui, `python3` du
+    système. Le paramètre `python` force un interpréteur (tests)."""
     lanceur = _q(str(parts_script or DEFAULT_PARTS_SCRIPT))
     lignes = ["ec=0", "debut=$(date +%s)", "flux=$(mktemp -d)"]
+    if python:
+        runner = _q(str(python))
+    else:
+        lignes += ['py="${AMEESH_TEST_VENV:+$AMEESH_TEST_VENV/bin/python3}"',
+                   '[ -n "$py" ] || py=python3']
+        runner = '"$py"'
     for index, part in enumerate(parts, 1):
         driver = _q(str(part.get("driver")))
         numero = _q(str(part.get("part")))
@@ -398,7 +410,7 @@ def remote_script(plan_path: str, parts: Sequence[dict],
         lignes.append('echo "%s%s"' % (PART_MARK, part_label(part)))
         lignes.append("%s %s run --plan %s --part %s --driver %s"
                       " --flow %s >/dev/null 2>&1 || ec=$?"
-                      % (python, lanceur, _q(plan_path), numero, driver, fichier))
+                      % (runner, lanceur, _q(plan_path), numero, driver, fichier))
         lignes.append("cat %s 2>/dev/null || true" % fichier)
     lignes += ["fin=$(date +%s)", 'echo "%s$((fin-debut))"' % SECONDS_MARK,
                "rm -rf \"$flux\"", "exit $ec"]
@@ -485,12 +497,18 @@ def _q(value: str) -> str:
 
 
 def offload_argv(host: str, command: str, *, timeout: int | None = None,
-                 snapshot: str = "", executable: str = "ameesh") -> list[str]:
+                 snapshot: str = "", profile: str = "",
+                 executable: str = "ameesh") -> list[str]:
     """L'appel d'offload, toujours `--fallback none` : pas de repli local.
 
     `--snapshot` fige le contenu envoyé (arbre construit du SHA + plan) ; sans
-    lui, l'offload photographierait l'arbre de travail."""
-    argv = [executable, "offload", "run", "--host", host, "--fallback", "none"]
+    lui, l'offload photographierait l'arbre de travail. `profile` choisit le
+    profil du guest L159b (dépendances et base du projet) ; absent, le profil
+    par défaut de l'hôte s'applique."""
+    argv = [executable, "offload", "run", "--host", host]
+    if profile:
+        argv += ["--profile", str(profile)]
+    argv += ["--fallback", "none"]
     if timeout:
         argv += ["--timeout", str(int(timeout))]
     if snapshot:
@@ -561,15 +579,17 @@ def parse_seconds(text: str) -> float | None:
 
 
 def run_offload(host: str, command: str, *, timeout: int | None = None,
-                snapshot: str = "", cwd: str | None = None, env: dict | None = None,
+                snapshot: str = "", profile: str = "", cwd: str | None = None,
+                env: dict | None = None,
                 runner=subprocess.run, executable: str = "ameesh") -> dict:
     """Exécute la sélection sur la VM et rend `{outcome, exit, seconds, host, flow}`.
 
     Aucun repli : un transport perdu n'est jamais rejoué ici (la suite peut
     tourner encore sur la VM). La durée distante est lue dans la sortie, la
-    durée murale sert de repli."""
+    durée murale sert de repli. `profile` est le profil d'offload du guest
+    (dépendances et base du projet)."""
     argv = offload_argv(host, command, timeout=timeout, snapshot=snapshot,
-                        executable=executable)
+                        profile=profile, executable=executable)
     started = time.time()
     proc = runner(argv, cwd=cwd, env=env, capture_output=True, text=True)
     output = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
@@ -684,7 +704,7 @@ def published_head(ref: str, *, repo: str = ".", remote: str = "origin",
 
 def validate(*, lot: int, plan_path: str, head: str, host: str, params,
              base: str = "", repo: str = "", published_ref: str = "",
-             remote: str = "origin", local: str | None = None,
+             profile: str = "", remote: str = "origin", local: str | None = None,
              cwd: str | None = None, env: dict | None = None,
              runner=subprocess.run, git_runner=subprocess.run,
              snapshotter=None, executable: str = "ameesh") -> dict:
@@ -723,7 +743,8 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
         remote_plan, chosen.parts,
         parts_script=getattr(params, "parts_script", None) or ""),
         timeout=int(getattr(params, "timeout_seconds", 0) or 0),
-        snapshot=pinned, cwd=root, env=env, runner=runner, executable=executable)
+        snapshot=pinned, profile=profile, cwd=root, env=env, runner=runner,
+        executable=executable)
     # la tête est relue APRÈS le run : l'arbre local d'abord (a-t-il bougé
     # pendant l'exécution ?), la référence publiée ensuite si elle est nommée.
     # Une relecture impossible ne vaut pas « inchangée » : elle invalide.
@@ -770,6 +791,8 @@ def add_parsers(work_sub, func) -> None:
     parser.add_argument("--sha", required=True, help="tête candidate exacte")
     parser.add_argument("--plan", required=True, help="plan L161f (scripts/test-plan.py)")
     parser.add_argument("--host", required=True, help="VM agents (jamais le poste local)")
+    parser.add_argument("--profile", default="",
+                        help="profil d'offload du guest (dépendances et base du projet)")
     parser.add_argument("--base", default="")
     parser.add_argument("--repo", default="",
                         help="arbre du lot : contrats, tête vérifiée, plan embarqué")
@@ -799,9 +822,9 @@ def run(cfg, db, args) -> int:
             raise PrevalidationError("block-missing",
                                      "aucun canon relu fourni (--canon-commit)")
         report = validate(lot=args.lot, plan_path=args.plan, head=args.sha,
-                          host=args.host, params=params, base=args.base,
-                          repo=args.repo or "", published_ref=args.published_ref,
-                          remote=args.remote)
+                          host=args.host, profile=getattr(args, "profile", ""),
+                          params=params, base=args.base, repo=args.repo or "",
+                          published_ref=args.published_ref, remote=args.remote)
     except PrevalidationError as exc:
         if getattr(args, "json", False):
             print(json.dumps({"schema": REPORT_SCHEMA, "lot": args.lot,

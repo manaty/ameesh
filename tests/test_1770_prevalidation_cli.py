@@ -269,6 +269,22 @@ class ValidateTest(unittest.TestCase):
         self.assertIn("--plan plan.json", command)
         self.assertNotIn(self.tmp.name, command)
 
+    def test_profil_du_guest_transmis_a_l_offload(self):
+        """Le profil du guest (dépendances, base) part dans l'appel d'offload."""
+        seen: list = []
+
+        def capture(argv, **kwargs):
+            seen.append(argv)
+            return _Proc(0, flux())
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             profile="ameesh", params=params(), repo=self.tmp.name,
+                             runner=capture, snapshotter=snapshot_for(),
+                             git_runner=git_runner_for())
+        self.assertTrue(report["ok"], report)
+        argv = seen[0]
+        self.assertEqual(argv[argv.index("--profile") + 1], "ameesh")
+
     def test_hote_hors_canon_refuse(self):
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="pc-smichea",

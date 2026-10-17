@@ -269,6 +269,13 @@ class RunTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--snapshot") + 1], B)
         self.assertLess(argv.index("--snapshot"), argv.index("--"))
 
+    def test_argv_porte_le_profil_du_guest(self):
+        """Le profil du guest porte les dépendances et la base du projet."""
+        argv = pv.offload_argv("vm-agents-1", "echo ok", profile="ameesh")
+        self.assertEqual(argv[argv.index("--profile") + 1], "ameesh")
+        # sans profil, l'offload garde le profil par défaut de l'hôte
+        self.assertNotIn("--profile", pv.offload_argv("vm-agents-1", "echo ok"))
+
     def test_script_distant_par_part_et_marqueurs(self):
         sel = pv.selection(plan_sain(), head=A)
         script = pv.remote_script(sel.plan_path or "plan.json", sel.parts)
@@ -280,6 +287,25 @@ class RunTest(unittest.TestCase):
         self.assertNotIn("--fallback", script)
         # sans clé au bloc, la convention du plan L161f s'applique
         self.assertIn(pv.DEFAULT_PARTS_SCRIPT + " run --plan", script)
+
+    def test_script_distant_utilise_le_venv_du_profil(self):
+        """Le profil du guest pose `AMEESH_TEST_VENV` (contrat L159b) : les
+        parts tournent avec ce venv (psycopg, dépendances), jamais avec le
+        python système nu du guest."""
+        sel = pv.selection(plan_sain(), head=A)
+        script = pv.remote_script(sel.plan_path or "plan.json", sel.parts)
+        self.assertIn('AMEESH_TEST_VENV', script)
+        self.assertIn('"$py" ' + pv.DEFAULT_PARTS_SCRIPT + " run --plan", script)
+        self.assertIn('[ -n "$py" ] || py=python3', script)
+
+    def test_script_distant_interpreteur_force(self):
+        """Un interpréteur explicite reste possible (tests, autre projet)."""
+        sel = pv.selection(plan_sain(), head=A)
+        script = pv.remote_script(sel.plan_path or "plan.json", sel.parts,
+                                  python="/opt/projet/bin/python3")
+        self.assertIn("/opt/projet/bin/python3 " + pv.DEFAULT_PARTS_SCRIPT + " run --plan",
+                      script)
+        self.assertNotIn("AMEESH_TEST_VENV", script)
 
     def test_script_distant_suit_le_lanceur_du_bloc(self):
         """Le bloc peut nommer un autre lanceur de part (#1770, Nexlink)."""
