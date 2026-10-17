@@ -302,7 +302,8 @@ def _target_commit(repo: str, row, target: str | None = None, *,
     `target` est la cible que l'appelant a réellement contrôlée (`readiness`,
     feu) ; à défaut celle du lot, puis la cible du dépôt — jamais `origin/main`
     en dur. La ref privée de la file (`refs/ameesh/queue/<branche>`, fraîche)
-    est honorée avant `target`, `origin/<branche>` et la branche locale.
+    est honorée avant les autres refs. Une cible sans préfixe préfère la ref
+    distante à la branche locale ; une ref explicitement qualifiée est gardée.
     `other` est l'autre dépôt à interroger quand la tête gelée vit dans le
     clone de la file et pas dans le checkout de l'auteur (`readiness`)."""
     target = str(target or (row or {}).get("branch_target") or "").strip()
@@ -331,8 +332,13 @@ def _target_commit(repo: str, row, target: str | None = None, *,
                                    % (private, place, exc)) from exc
         if found:
             return found, private, place
-    for place in places:
-        for candidate in (target, "origin/" + short, short):
+    candidates = (target, "origin/" + short, short)
+    if target == short:
+        # Le feu normalise origin/develop en develop. Une branche locale
+        # peut déjà porter le gel sans qu'il ait atteint la cible distante.
+        candidates = ("refs/remotes/origin/" + short, target)
+    for candidate in dict.fromkeys(candidates):
+        for place in places:
             if not candidate:
                 continue
             try:

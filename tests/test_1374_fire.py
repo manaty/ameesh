@@ -580,6 +580,26 @@ class DeltaAuthorsTest(unittest.TestCase):
             self.assertFalse(right["ok"], "sur develop, rev1 est l'auteur du delta")
             self.assertIn("rev1", right["authors"])
 
+    def test_a_local_target_ahead_of_origin_does_not_hide_a_corrector(self):
+        # Le feu passe une cible sans préfixe. Un montage local non publié
+        # ne prouve pas que la correction est déjà dans la cible distante.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            git("checkout", "-qb", "develop")
+            git("update-ref", "refs/remotes/origin/develop", "HEAD")
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "correction\n")
+            git("commit", "-qam", "correction", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            git("branch", "-f", "develop", frozen)
+            self.assertEqual(
+                merge_queue._delta_authors(tmp, {}, frozen, target="develop"),
+                ["rev1"], "la branche locale masque le correcteur")
+            self.assertEqual(
+                merge_queue._delta_authors(tmp, {}, frozen, target="refs/heads/develop"),
+                [], "une cible locale explicite reste respectée")
+
     def test_the_private_queue_ref_is_honoured(self):
         # #1515 B2 : la ref privée de la file est fraîche ; la branche locale
         # peut être en avance (ou en retard), c'est la ref privée qui fait foi.
