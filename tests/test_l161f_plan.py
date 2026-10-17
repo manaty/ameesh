@@ -1285,6 +1285,17 @@ class ImportGraphTest(unittest.TestCase):
             "getattr walrus sys.exit": "import sys\n"
                                        "getattr((s := sys), 'exit')(1)\n"
                                        "import ameesh.db\n",
+            # #2098 : walrus imbriqué — le déballage doit boucler sur les
+            # deux sites ; profondeur bornée (quatre niveaux) pour la boucle.
+            "walrus imbriqué sys.exit": "import sys\n"
+                                        "((a := (b := sys)).exit(1))\n"
+                                        "import ameesh.db\n",
+            "getattr walrus imbriqué": "import sys\n"
+                                       "getattr((a := (b := sys)), 'exit')(1)\n"
+                                       "import ameesh.db\n",
+            "walrus imbriqué à quatre niveaux": "import sys\n"
+                                                "((a := (b := (c := (d := sys)))).exit(1))\n"
+                                                "import ameesh.db\n",
         }
         for why, source in stopped.items():
             with self.subTest(why):
@@ -1314,6 +1325,11 @@ class ImportGraphTest(unittest.TestCase):
                                                      "    pass\n"
                                                      "getattr((x := C), 'exit')\n"
                                                      "import ameesh.db\n",
+            # #2098 : idem quand le walrus du porteur ordinaire est imbriqué.
+            "getattr walrus imbriqué d'un porteur ordinaire": "class C:\n"
+                                                              "    pass\n"
+                                                              "getattr((a := (b := C)), 'exit')\n"
+                                                              "import ameesh.db\n",
         }
         for why, source in kept.items():
             with self.subTest(why):

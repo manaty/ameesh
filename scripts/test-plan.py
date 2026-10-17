@@ -360,20 +360,27 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _unwrap_namedexpr(node: ast.expr) -> ast.expr:
+    """Déballe `ast.NamedExpr` en boucle : `(a := (b := sys))` porte le nom
+    `sys` à deux niveaux (#2098), comme `(s := sys)` à un seul (#1906)."""
+    while isinstance(node, ast.NamedExpr):
+        node = node.value
+    return node
+
+
 def _getattr_member(node: ast.Call) -> tuple[str, str] | None:
     """`getattr(<name>, '<constant>', ...)` lu statiquement : le couple
     (porteur, membre), ou `None` (forme dynamique, argument manquant). Le
     défaut éventuel est sans effet ici : `sys.exit`/`os._exit` existent
     toujours, donc l'appel termine quel que soit le défaut. Le porteur peut
-    être affecté par walrus (`getattr((s := sys), 'exit')`, #1906) : on
-    déballe `ast.NamedExpr` avant le test de nom."""
+    être affecté par walrus, même imbriqué (`getattr((s := sys), 'exit')`,
+    #1906 ; `getattr((a := (b := sys)), 'exit')`, #2098) : on déballe les
+    `ast.NamedExpr` avant le test de nom."""
     if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
         return None
     if len(node.args) < 2:
         return None
-    owner, attr = node.args[0], node.args[1]
-    if isinstance(owner, ast.NamedExpr):
-        owner = owner.value
+    owner, attr = _unwrap_namedexpr(node.args[0]), node.args[1]
     if (isinstance(owner, ast.Name) and isinstance(attr, ast.Constant)
             and isinstance(attr.value, str)):
         return owner.id, attr.value
@@ -385,14 +392,15 @@ def _is_exit_func(node: ast.expr, exit_names: set[str],
     """Whether an expression designates a known import-time termination: a
     bound name, `sys.exit`/`os._exit`, or their static `getattr` read (#1878)
     (aliases of `sys`, `os` and of the imported names included). Le porteur
-    peut être affecté par walrus (`(s := sys).exit(1)`, #1906)."""
+    peut être affecté par walrus, même imbriqué (`(s := sys).exit(1)`, #1906 ;
+    `(a := (b := sys)).exit(1)`, #2098)."""
     if isinstance(node, ast.NamedExpr):
         # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
         return _is_exit_func(node.value, exit_names, sys_names, os_names)
     if isinstance(node, ast.Name):
         return node.id in exit_names
     if isinstance(node, ast.Attribute):
-        owner = node.value.value if isinstance(node.value, ast.NamedExpr) else node.value
+        owner = _unwrap_namedexpr(node.value)
         if isinstance(owner, ast.Name):
             if node.attr == "exit":
                 return owner.id in sys_names
