@@ -436,7 +436,7 @@ class WorkflowTest(unittest.TestCase):
     def test_version_job_gates_the_required_check(self):
         text = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/version-level.py pr HEAD^1 HEAD", text)
-        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, doc-readers]", text)
+        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]", text)
         # checked before the early exits of version-only and documentation-only PRs
         self.assertLess(text.index('test "${{ needs.version.result }}" = success'),
                         text.index("PR de version seule"))

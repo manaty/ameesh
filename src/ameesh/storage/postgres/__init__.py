@@ -11,6 +11,7 @@ from typing import Any
 from .. import interface
 from .action_source import ActionSource
 from .api_requests import ApiRequests
+from .alert_acknowledgements import AlertAcknowledgements
 from .accounts import Accounts
 from .actions import Actions
 from .budgets import Budgets
@@ -23,6 +24,7 @@ from .decisions import Decisions
 from .costs import TurnCosts
 from .conversations import Conversations
 from .credentials import Credentials
+from .events import Events
 from .grants import Grants
 from .host_lifecycle import HostLifecycle
 from .handoffs import Handoffs
@@ -60,7 +62,9 @@ class PostgresStorage(interface.Storage):
         self.credentials = Credentials(db)
         self.budgets = Budgets(db)
         self.api_requests = ApiRequests(db)
+        self.alert_acknowledgements = AlertAcknowledgements(db)
         self.watches = Watches(db)
+        self.events = Events(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)

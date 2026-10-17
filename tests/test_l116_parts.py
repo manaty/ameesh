@@ -60,15 +60,17 @@ class RepartitionTest(unittest.TestCase):
             pathlib.Path(f.name).unlink()
 
     def test_liste_pilote_rangee(self):
-        """L160a : liste additive, un module par ligne, rangée, sans doublon."""
+        """L160a : liste additive, un module par ligne ; #1517 : ce qu'une
+        fusion `union` produit (deux ajouts adjacents dans l'ordre des côtés,
+        ou le même ajout des deux côtés) se lit rangé et sans doublon."""
         mods = parts.modules()
         for contenu in ("test_migrations\ntest_catalog_store\n",
-                        "test_catalog_store\ntest_catalog_store\n"):
+                        "test_catalog_store\ntest_migrations\ntest_catalog_store\n"):
             with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
                 f.write(contenu)
             try:
-                with self.assertRaises(SystemExit):
-                    parts.read_list(f.name, mods)
+                self.assertEqual(parts.read_list(f.name, mods),
+                                 ["test_catalog_store", "test_migrations"])
             finally:
                 pathlib.Path(f.name).unlink()
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
