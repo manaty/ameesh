@@ -1580,7 +1580,26 @@ def gates_for(project, files) -> tuple:
 
 def conflicts_of(report: dict) -> dict:
     """{clé: conflit} d'un rapport : paires en conflit, lots en conflit avec
-    leur cible, numéros de migration en double (mêmes clés que `_states`)."""
+    leur cible, numéros de migration en double (mêmes clés que `_states`).
+
+    #2238: a pair, a stale resolution and a conflict with the target carry
+    their `fingerprint` — the lots' heads, their target's head and the
+    resolution commit, never the replay state (which can vary from one pass
+    to the next while nothing changes); `send_mail` does not resend a notice
+    whose inputs have not moved."""
+    heads = {b["work_item"]: b for b in report.get("branches") or ()}
+
+    def fingerprint(lots, tips=(), resolution=None) -> str:
+        tips = list(tips or ())
+        parts = []
+        for i, lot in enumerate(lots):
+            one = heads.get(lot) or {}
+            tip = (tips[i] if i < len(tips) else None) or one.get("tip") or ""
+            parts.append("%d:%s@%s" % (lot, tip, one.get("target_head") or ""))
+        if resolution:
+            parts.append("resolution:%s" % resolution)
+        return "|".join(parts)
+
     out = {}
     for pair in report.get("pairs") or ():
         if pair["state"] in ("conflict", "unclassified"):
@@ -1588,19 +1607,24 @@ def conflicts_of(report: dict) -> dict:
                 "kind": "pair", "lots": list(pair["lots"]),
                 "files": pair["files"] or pair.get("uncertain_files") or [],
                 "target": pair["target"], "resolver": pair.get("resolver"),
-                "attribution_pending": pair.get("attribution_pending", False)}
+                "attribution_pending": pair.get("attribution_pending", False),
+                "fingerprint": fingerprint(pair["lots"], pair.get("tips"),
+                                           (pair.get("resolution") or {}).get("commit"))}
         elif pair["state"] == "stale":
             # L160d: only the lot that prepared the resolution is told
             resolution = pair["resolution"]
             out["stale:%d-%d" % tuple(pair["lots"])] = {
                 "kind": "stale", "lots": [resolution["by"]], "pair": list(pair["lots"]),
                 "files": resolution.get("remaining") or pair["files"],
-                "target": pair["target"], "commit": resolution["commit"]}
+                "target": pair["target"], "commit": resolution["commit"],
+                "fingerprint": fingerprint(pair["lots"], pair.get("tips"),
+                                           resolution["commit"])}
     for one in report.get("against_target") or ():
         if one["state"] == "conflict":
             out["target:%d" % one["work_item"]] = {
                 "kind": "target", "lots": [one["work_item"]], "files": one["files"],
-                "target": one["target"]}
+                "target": one["target"],
+                "fingerprint": fingerprint([one["work_item"]], [one.get("tip")])}
     for dup in report.get("migrations") or ():
         out["migration:%s:%s" % (dup["target"], dup["number"])] = {
             "kind": "migration", "lots": sorted({h["work_item"] for h in dup["lots"]}),
@@ -1740,10 +1764,31 @@ def _merged_partners(db, lot: int, keys, present) -> list[int]:
     return merged
 
 
+def _key_lots(key: str) -> list[int] | None:
+    """The lots a conflict key names (`pair:a-b`, `stale:a-b`, `target:n`),
+    or None for a key without readable lots (migrations)."""
+    kind, _, rest = key.partition(":")
+    try:
+        if kind in ("pair", "stale"):
+            return [int(n) for n in rest.split("-")]
+        if kind == "target":
+            return [int(rest)]
+    except ValueError:
+        return None
+    return None
+
+
 def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[dict]:
     """Le courrier d'un passage : un message par lot concerné et par conflit
     nouveau (passif), puis un réveil quand un conflit avec la cible bloque
-    une PR verte. Rend les envois `{key, lot, to, level, message_id}`."""
+    une PR verte. Rend les envois `{key, lot, to, level, message_id}`.
+
+    #2238: a conflict that leaves a pass while all its lots stay on the radar
+    (the resolution replay read in one pass, not in the next) is kept
+    "dormant" with its `fingerprint`; if it comes back on the same inputs
+    (heads, target, resolution), no notice is resent. It is new again only
+    when its inputs changed, or when one of its lots left the radar (merged,
+    closed)."""
     from . import mail, work
     if ci == "github":
         ci = github_ci(project)
@@ -1754,6 +1799,10 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
     sent: list[dict] = []
     for key, conflict in sorted(current.items()):
         done = dict(before.get(key) or {})
+        fingerprint = conflict.get("fingerprint")
+        if done.pop("dormant", False) and done.get("fp") != fingerprint:
+            # #2238: back on other inputs than the notice already sent
+            done = {}
         for lot in conflict["lots"]:
             one = branches.get(lot) or {}
             to = one.get("assignee")
@@ -1788,7 +1837,17 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
             sent.append({"key": key, "lot": lot, "to": to, "level": level,
                          "message_id": message_id})
         if done:
+            if fingerprint is not None:
+                done["fp"] = fingerprint
             keys[key] = done
+    # #2238: a conflict absent from this pass whose lots all stay on the
+    # radar keeps its notice, dormant, instead of being forgotten.
+    for key, done in before.items():
+        if key in current or "fp" not in done:
+            continue
+        lots = _key_lots(key)
+        if lots and all(n in branches for n in lots):
+            keys[key] = dict(done, dormant=True)
     if keys != before:
         _write_notified(cfg, project.name, keys)
     return sent
