@@ -113,10 +113,16 @@ Several reviewers can be designated for the same lot (#2076): repeat
 `reviewers` list retain them all. The wait and alerts name each reviewer
 whose verdict on the frozen head is still due; one GO does not complete the
 other reviews. Withdraw a designation explicitly with
-`ameesh work reviewer <id> <agent> --remove` (the same authority is required).
-Assigning or delegating the lot to a reviewer removes that person's
-designation and preserves the others. Migration 0456 keeps the legacy
-`reviewer` field for older runners during an upgrade.
+`ameesh work reviewer <id> <agent> --remove` (the same authority is required);
+a removal that removes nothing (an undesignated name, or an empty list)
+changes nothing and writes no journal line. Assigning or delegating the lot
+to a reviewer removes that person's designation and preserves the others;
+the journal names each removed
+reviewer. Migration 0456 keeps the legacy `reviewer` field for older
+runners during an upgrade. An older runner that writes `reviewer` as a
+replacement therefore *adds* a name instead: the previous designation is
+kept, and is withdrawn explicitly with `--remove` (or by upgrading the
+runner).
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,

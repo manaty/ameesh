@@ -477,12 +477,47 @@ class WorkItems(interface.WorkItems):
             return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor,
                                                      remove=remove, event=event)
 
+    def _journal_cleared_reviewers(self, item_id, state, previous, row, actor):
+        """#2084/N1 : le trigger 0456 retire de `reviewers` toute personne qui
+        devient assigné ou délégué. Ce retrait automatique a sa propre ligne de
+        journal, nommant chaque relecteur retiré — pas seulement le dernier de
+        la liste, que l'ancien champ `reviewer` portait."""
+        remaining = row.get("reviewers")
+        if remaining is None:
+            remaining = [row.get("reviewer")] if row.get("reviewer") else []
+        remaining = set(remaining)
+        for name in dict.fromkeys(previous or []):
+            if name and name != REVIEWER_NONE and name not in remaining:
+                self._event(int(item_id), state,
+                            "reviewer %s cleared (they now hold the lot)" % name,
+                            actor)
+
     def _designate_reviewer(self, item_id, reviewer, actor, *, remove=False,
                             event=None) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
-        avant, un `assign` a pu la changer entre-temps."""
+        avant, un `assign` a pu la changer entre-temps.
+
+        #2084/N2 : un retrait ne journalise que s'il retire quelque chose.
+        La liste est lue sous le verrou de la ligne, dans la même transaction,
+        puis comparée à l'écriture : `--remove` d'un nom non désigné, ou
+        `--remove` global sur une liste déjà vide, ne laisse aucun faux
+        « removed » au journal."""
+        if remove or not reviewer:
+            locked = self.db.query(
+                "SELECT " + item_columns(self.db) + " FROM work_items"
+                " WHERE id = %s AND state = 'qa' FOR NO KEY UPDATE",
+                (int(item_id),))
+            if not locked:
+                return None
+            previous = list(locked[0]["reviewers"] or [])
+            # Ne pas toucher `updated_at`, ni le trigger, quand le retrait ne
+            # retire rien : c'est un non-effet complet, pas seulement muet.
+            if not previous or (remove and reviewer not in previous):
+                row = locked[0]
+                row["reviewer_changed"] = False
+                return row
         if remove:
             expression, params = "array_remove(reviewers, %s)", [reviewer]
         elif not reviewer:
@@ -501,9 +536,11 @@ class WorkItems(interface.WorkItems):
             tuple(params + [int(item_id), reviewer, bool(remove)]))
         if not rows:
             return None
+        row = rows[0]
         self._event(int(item_id), "qa", event or ("reviewer %s %s" % (
             reviewer, "removed" if remove else "designated")), actor)
-        return rows[0]
+        row["reviewer_changed"] = True
+        return row
 
     def assign(self, item_id, assignee, *, current, note, actor,
                queued_note=None, forced_note=None, take=False,
@@ -578,7 +615,7 @@ class WorkItems(interface.WorkItems):
         aussi quand l'assignation arrive après la désignation — la désignation
         tombe alors dans la MÊME écriture (l'assignation et la désignation
         peuvent se croiser), et le journal le dit."""
-        previous_reviewer = ""
+        previous_reviewers: list[str] = []
         reviewer_set = ""
         params: list = [assignee]
         if has_reviewer(self.db):
@@ -586,10 +623,14 @@ class WorkItems(interface.WorkItems):
             # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
             # insertions au journal et aux jalons du lot, que FOR UPDATE
             # bloquait jusqu'au commit.
+            with_reviewers = has_reviewers(self.db)
             seen = self.db.query(
-                "SELECT reviewer FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                (int(item_id),))
+                "SELECT reviewer%s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                % (", reviewers" if with_reviewers else ""), (int(item_id),))
             previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
+            previous_reviewers = (list(seen[0].get("reviewers") or [])
+                                  if with_reviewers else
+                                  ([previous_reviewer] if previous_reviewer else []))
             reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
                             " ELSE reviewer END")
             params.append(assignee)
@@ -605,15 +646,14 @@ class WorkItems(interface.WorkItems):
             tuple(params))
         if not rows:
             return None
-        if previous_reviewer and previous_reviewer == assignee:
-            note = "%s; reviewer %s cleared (they now hold the lot)" % (
-                note, previous_reviewer)
         self.db.query(
             "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
             "       resolved_by = %s"
             " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
             (actor or "", int(item_id)))
         self._event(int(item_id), rows[0]["state"], note, actor)
+        self._journal_cleared_reviewers(item_id, rows[0]["state"],
+                                        previous_reviewers, rows[0], actor)
         return rows[0]
 
     def handoff(self, item_id, assignee, *, current, state, paused_prefix, note_prefix,
@@ -653,17 +693,22 @@ class WorkItems(interface.WorkItems):
         Rend `{item, delegation, replaced}` ou None (lot modifié entre-temps)."""
         with self.db.transaction() as tx:
             with_reviewer = has_reviewer(self.db)
+            with_reviewers = has_reviewers(self.db)
             seen = tx.query(
                 "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
                 " FOR NO KEY UPDATE"
-                % (", reviewer" if with_reviewer else "", _CLOSED),
+                % (", reviewer, reviewers" if with_reviewers
+                   else (", reviewer" if with_reviewer else ""), _CLOSED),
                 (int(item_id), current))
             if not seen:
                 return None
             # #705 r2 (B1) : déléguer à son relecteur retire la désignation
             # (le relecteur relirait son propre travail), dans l'écriture même.
             previous_reviewer = (seen[0]["reviewer"] or "") if with_reviewer else ""
+            previous_reviewers = (list(seen[0].get("reviewers") or [])
+                                  if with_reviewers else
+                                  ([previous_reviewer] if previous_reviewer else []))
             replaced = tx.query(
                 "UPDATE work_item_delegations SET outcome = 'remplacee', resolved_at = now(),"
                 "       resolved_by = %s"
@@ -692,10 +737,9 @@ class WorkItems(interface.WorkItems):
                 " SELECT id, %%s, %%s, delegated_at, due_at FROM work_items WHERE id = %%s"
                 " RETURNING %s" % _DELEGATION_COLUMNS,
                 (delegate, delegated_by, int(item_id)))[0]
-            if previous_reviewer and previous_reviewer == delegate:
-                note = "%s; reviewer %s cleared (they now hold the lot)" % (
-                    note, previous_reviewer)
             WorkItems(tx)._event(int(item_id), item["state"], note, actor)
+            WorkItems(tx)._journal_cleared_reviewers(
+                item_id, item["state"], previous_reviewers, item, actor)
             return {"item": item, "delegation": delegation,
                     "replaced": replaced[0] if replaced else None}
 
@@ -767,11 +811,14 @@ class WorkItems(interface.WorkItems):
             # relu APRÈS le verrou, dans une instruction suivante : en READ
             # COMMITTED elle voit l'issue posée par un exécuteur concurrent
             with_reviewer = has_reviewer(self.db)
+            with_reviewers = has_reviewers(self.db)
             rows = tx.query(
                 "SELECT %s, %s AS worked, w.title, w.state, w.assignee%s"
                 "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
                 " WHERE d.id = %%s AND d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
-                % (_DELEGATION_COLUMNS, _WORKED, ", w.reviewer" if with_reviewer else ""),
+                % (_DELEGATION_COLUMNS, _WORKED,
+                   ", w.reviewer, w.reviewers" if with_reviewers
+                   else (", w.reviewer" if with_reviewer else "")),
                 (int(delegation_id), float(now_ts)))
             if not rows:
                 return None
@@ -820,12 +867,14 @@ class WorkItems(interface.WorkItems):
                     "UPDATE work_items SET due_at = NULL WHERE id = %%s RETURNING %s"
                     % item_columns(self.db), (item_id,))
             text = describe(outcome, row) if describe else None
-            if outcome == "rendue" and row.get("reviewer") \
-                    and row["reviewer"] == row["delegated_by"]:
-                text = "%s; reviewer %s cleared (they now hold the lot)" % (
-                    text or "delegation expired", row["reviewer"])
             if text:
                 WorkItems(tx)._event(item_id, item[0]["state"], text, actor)
+            if outcome == "rendue":
+                previous_reviewers = (list(row.get("reviewers") or [])
+                                      if with_reviewers else
+                                      ([row["reviewer"]] if row.get("reviewer") else []))
+                WorkItems(tx)._journal_cleared_reviewers(
+                    item_id, item[0]["state"], previous_reviewers, item[0], actor)
             return dict(row, outcome=outcome, item=item[0])
 
     def overdue_delegations(self, now_ts) -> list[dict]:
