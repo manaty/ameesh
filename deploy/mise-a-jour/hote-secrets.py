@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import sys
 
 RUNTIME = Path('/opt/ameesh-release/runtime/bin/python')
@@ -22,7 +23,14 @@ SECONDS = 30
 
 
 def module(name, label):
-    spec = importlib.util.spec_from_file_location(label, Path(__file__).with_name(name+'.py'))
+    path = Path(__file__).with_name(name+'.py').absolute()
+    # Bootstrap trust locally: hote-release must be checked before executing
+    # the module which supplies its own trusted() function.
+    for candidate in (path, *path.parents):
+        info = candidate.lstat()
+        if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022):
+            raise ValueError('untrusted enrolled file')
+    spec = importlib.util.spec_from_file_location(label, path)
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
     return loaded
