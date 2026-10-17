@@ -1863,13 +1863,25 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if args.remove and args.agent:
                 item = work.designate_reviewer(cfg, db, args.id, args.agent,
                                                actor=args.actor, remove=True)
-                print("lot #%d: reviewer %s removed (state %s, by %s)" % (
-                    item["id"], args.agent, item["state"],
-                    args.actor or "the bound identity"))
+                if item.get("reviewer_changed") is False:
+                    # #2084/N2 : dire le non-effet, sans écrire un faux
+                    # « removed » au journal.
+                    print("lot #%d: reviewer %s was not designated: nothing removed "
+                          "(state %s, by %s)" % (
+                              item["id"], args.agent, item["state"],
+                              args.actor or "the bound identity"))
+                else:
+                    print("lot #%d: reviewer %s removed (state %s, by %s)" % (
+                        item["id"], args.agent, item["state"],
+                        args.actor or "the bound identity"))
             elif args.remove:
                 item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
-                print("lot #%d: reviewer designation removed (state %s, by %s)" % (
-                    item["id"], item["state"], args.actor or "the bound identity"))
+                if item.get("reviewer_changed") is False:
+                    print("lot #%d: no reviewer designation to remove (state %s, by %s)" % (
+                        item["id"], item["state"], args.actor or "the bound identity"))
+                else:
+                    print("lot #%d: reviewer designation removed (state %s, by %s)" % (
+                        item["id"], item["state"], args.actor or "the bound identity"))
             elif args.no_verdict:
                 item = work.waive_review(cfg, db, args.id, actor=args.actor)
                 print("lot #%d: verdict not required (state %s, by %s)" % (
