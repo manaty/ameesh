@@ -97,6 +97,9 @@ scripts are untouched. The switch is described step by step, with rollback, in
 ```bash
 scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.1:55432
 # several agents on one host: AMEESH_PG_NAME=<agent>-pgtest AMEESH_PG_PORT=…
+# AMEESH_PG_DISPOSABLE=1 declares a lot bench disposable: housekeeping may reap
+# its <name>-data volume after 24 h without a container (conservation by
+# default; the shared ameesh-pg volume is never declared disposable)
 # (its volume is then <name>-data; a volume already mounted is refused)
 export PYTHONPATH=src
 # Aucun secret n'est codé dans le dépôt : le mot de passe du banc vient de
@@ -135,9 +138,11 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 `agent-mail` keeps the v0 interface — and the v0 hook JSON, byte for byte:
 
 ```
-agent-mail send <dest> <texte…> [--from NOM] [--lot ID] [--kind request|reply|notify|event] [--urgent]
-               [--ack] [--cc NOM[,NOM…]]       # dest = nom ou "all" ; L125 : courrier regroupé
-                                               # (90 s), --urgent sans délai, --ack et --cc sans réveil
+agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind request|reply|notify|event] [--urgent]
+               [--ack] [--cc NOM[,NOM…]]       # dest = name or "all"; L125: batched mail
+                                               # (90 s), --urgent without delay, --ack and --cc without waking
+                                               # --lot: thread label; hands over a free lot (L94
+                                               # history, or --assign #964), never one held by an agent (#1066)
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
@@ -164,7 +169,8 @@ une diffusion à « all » sont lus au tour suivant, sans réveil. Les
 **événements** (`--kind event`) réveillent l'agent comme un message, mais un
 lot d'événements n'en réveille qu'un par `AMEESH_EVENT_COALESCE` secondes
 (défaut 120) ; `--urgent` perce le regroupement. Un `--urgent` venu d'un
-expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`, demain une capacité du canon)
+expéditeur habilité (l'owner, un événement de CI vérifié en base, ou
+`AMEESH_INTERRUPT_SENDERS` ; demain une capacité du canon)
 **interrompt le tour en cours** : le harnais est arrêté, la consigne repart en
 attente et le message passe en tête. La **rotation de session** (résumé de
 reprise puis session neuve, seuils `AMEESH_SESSION_MAX_TOKENS` /
@@ -326,8 +332,19 @@ agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
 agent-runner register <nom> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXTE]
              [--session ID] [--chantier C] [--model M] [--budget USD]
 agent-runner stop <nom>
-ameesh attach <agent> [--wait] [--ttl S]      # session interactive sur le bail (C9)
+ameesh attach <agent> [--wait] [--ttl S] [--max 2h]  # bounded native session (L82)
 ```
+
+`attach` is for native harness features such as login, settings and debugging.
+The runner finishes its turn (`--wait`), puts the resident to sleep, then
+hands over the lease. A second attach is refused. Closing the native session
+returns the lease; pending inputs wake the resident on the same session.
+The interactive session ends after two hours by default; `--max 30m` or
+`--max 4h` changes that limit. A notice precedes expiry (exit code 124), and
+inputs waiting more than ten minutes produce an alert without being consumed.
+`adopt` and an unleased `resume` refuse a session still open in another
+process or modified in the last minute: close it and let its journal settle.
+The existing audited `adopt --force` override remains available.
 
 ## Language choice
 

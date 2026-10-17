@@ -37,6 +37,10 @@ elif args[0] == "restart":
     with open(os.path.join(state, "restarted"), "w") as fh:
         fh.write(str(time.time()))
 elif args[0] == "is-active":
+    # le marqueur ne vise que l'unité du runner : `ameesh-notify` reste active
+    if "ameesh-runner" in " ".join(args) \
+            and os.path.exists(os.path.join(state, "unit-inactive")):
+        sys.exit(3)
     print("active")
 '''
 
@@ -83,6 +87,9 @@ case $last in
     [ -e "$FAKE_STATE/execstart" ] && argv=$(cat "$FAKE_STATE/execstart")
     [ "$argv" = - ] || echo "{ path=/x ; argv[]=$argv ; }" ;;
   *"systemctl restart"*) : > "$FAKE_STATE/restarted" ;;
+  *"is-active --quiet ameesh-runner@"*)
+    [ -e "$FAKE_STATE/unit-inactive" ] && exit 3
+    echo active ;;
 esac
 '''
 
@@ -170,21 +177,32 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertIn("dev9 : redémarré", proc.stdout)
         self.assertIn("no lease before the restart", proc.stdout)
 
-    def test_persona_stopped_in_the_registry_is_not_restarted(self):
-        # #1131 : un agent arrêté par le propriétaire (registre `stopped`) ne
-        # doit pas être réactivé par le déploiement (poste.sh comme vm.sh),
-        # même si son unité est encore active ; la persona est nommée et son
-        # unité laissée en place.
+    def test_persona_stopped_with_an_active_unit_is_reloaded_not_reactivated(self):
+        # #1131/#1633 : la persona arrêtée par le propriétaire n'est pas
+        # réactivée (aucun bail exigé, aucun tour), mais son unité encore
+        # active recharge le nouveau code — sinon une reprise ultérieure
+        # repartait sur l'ancienne version.
         proc = self.restart("stopped")
-        # le marqueur `restarted` est aussi écrit par le redémarrage de
-        # ameesh-notify : on regarde l'unité de la persona dans le journal.
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(os.path.join(self.state, "argv.log"), encoding="utf-8") as fh:
             log = fh.read()
-        self.assertNotIn("restart ameesh-runner-agent@dev9.service", log)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("restart ameesh-runner", log)
         self.assertIn("dev9 : arrêté dans le registre", proc.stdout)
-        self.assertIn("ignorée", proc.stdout)
-        self.assertNotIn("dev9 : redémarré", proc.stdout)
+        self.assertIn("nouveau code", proc.stdout)
+        self.assertNotIn("no lease before the restart", proc.stdout)
+        self.assertNotIn("dev9 : redémarré (était", proc.stdout)
+
+    def test_persona_stopped_with_an_inactive_unit_is_not_started(self):
+        # #1633 : une unité déjà arrêtée n'est pas relancée — elle chargera le
+        # nouveau code à son démarrage.
+        with open(os.path.join(self.state, "unit-inactive"), "w", encoding="utf-8"):
+            pass
+        proc = self.restart("stopped")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(os.path.join(self.state, "argv.log"), encoding="utf-8") as fh:
+            log = fh.read()
+        self.assertNotIn("restart ameesh-runner", log)
+        self.assertIn("déjà arrêtée", proc.stdout)
 
     def test_active_unit_without_its_lease_fails_the_restart(self):
         for scenario in ("no-lease", "stale-lease", "other-owner", "expired"):

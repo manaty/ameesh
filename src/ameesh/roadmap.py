@@ -509,7 +509,8 @@ def build(db, *, now: float | None = None, project: str | None = None,
         rows = [r for r in rows if project in (r.get("app"), r.get("workstream"))]
     ids = [int(r["id"]) for r in rows]
     events: dict = {}
-    for ev in st.progress.lot_events(ids):
+    # #1647 : les jalons réels ne lisent que les transitions, jamais les notes.
+    for ev in st.progress.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
     actions: dict = {}
     for act in st.progress.lot_actions(ids):
@@ -996,7 +997,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--source", dest="source_ref", default=None,
                        help="source identifier or link (conversation, decision, message)")
     p_add.add_argument("--depends-on", dest="depends_on", action=UniqueAppend, default=[],
-                       help="dependency (task #N, commitment eN, lot Lxx); repeatable")
+                       help="dependency (task #N, commitment eN, lot Lxx); "
+                            "gate:<name> holds the lot (L368) until the due day; repeatable")
     p_add.add_argument("--depend-de", dest="depends_on", action=DeprecatedAlias,
                        canonical="--depends-on", append=True, default=argparse.SUPPRESS,
                        help=argparse.SUPPRESS)

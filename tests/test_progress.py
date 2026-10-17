@@ -94,17 +94,22 @@ class JalonsTest(unittest.TestCase):
 
     def test_regel_apres_approbation_repasse_en_revue(self):
         """Sonde codex3 B2 : qa 200 → build 300 → qa 400, action approuvée à 350.
-        Le verdict retenu précède le DERNIER gel : en revue, pas approuvé ; le
-        relecteur est l'auteur du verdict retenu (l'approbation), pas du rejet."""
+        Le verdict retenu précède le DERNIER gel : en revue, pas approuvé. Un
+        verdict périmé ne désigne personne (#1318) : sans désignation, la porte
+        est « un relecteur (non désigné) », ni l'auteur de l'approbation caduque
+        ni celui du rejet."""
         actions = [{"connector": "git-merge", "state": "approved", "approved_ts": 350,
                     "last_actor": "human:reviewer"}]
         events = [ev("intake", 100), ev("build", 110), ev("qa", 200),
                   ev("build", 300, "rev"), ev("qa", 400)]
         j = progress._jalons_de_lot(self.item, events, actions)
         self.assertEqual((j["frozen"], j["last_frozen"], j["verdict"]), (200, 400, 350))
-        self.assertEqual(j["reviewer"], "human:reviewer")
+        self.assertIsNone(j["reviewer"])
         self.assertFalse(j["verdict_current"])
         self.assertEqual(progress.lot_state("qa", j), "review")
+        # le relecteur désigné (#705), lui, reste nommé après un regel
+        j = progress._jalons_de_lot(dict(self.item, reviewer="rev2"), events, actions)
+        self.assertEqual(j["reviewer"], "rev2")
         # une approbation postérieure au regel, elle, approuve
         actions[0]["approved_ts"] = 450
         j = progress._jalons_de_lot(self.item, events, actions)
@@ -430,7 +435,9 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lots["lot en revue"]["state"], "review")
         self.assertEqual(lots["lot en revue"]["blocked_verdicts"], 1)
         self.assertEqual(lots["lot en revue"]["verdict"], "blocked")
-        self.assertEqual(lots["lot en revue"]["reviewer"], "rev")
+        # un verdict bloquant périmé (lot regelé) ne désigne plus son auteur
+        # (#1318) : sans relecteur désigné, la porte n'est nommée par personne.
+        self.assertIsNone(lots["lot en revue"]["reviewer"])
         self.assertEqual(lots["lot approuvé"]["state"], "approved")
         self.assertEqual(lots["lot approuvé"]["actions"], [act])
         self.assertEqual(lots["lot fusionné"]["state"], "merged")

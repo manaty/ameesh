@@ -124,7 +124,10 @@ export class AmeeshApp extends LitElement {
 
   #navigate = (event: Event): void => {
     const detail = (event as CustomEvent).detail;
-    if (detail && "project" in detail) this.project = typeof detail.project === "string" ? detail.project : "";
+    // #1697: only an explicit project string governs the selection. A detail
+    // that carries none — an alert naming an agent or a lot but no project —
+    // must not wipe the project the user is working in.
+    if (typeof detail?.project === "string") this.project = detail.project;
     if (event.type === "ameesh:open-project") this.lot = "";
     if (typeof detail?.agent === "string") this.agent = detail.agent;
     if (typeof detail?.lot === "string" || typeof detail?.lot === "number") this.lot = String(detail.lot);
@@ -141,7 +144,7 @@ export class AmeeshApp extends LitElement {
       case "hosts": return html`<ameesh-hosts .client=${client} theme=${this.theme}></ameesh-hosts>`;
       case "budget": return html`<ameesh-budget .client=${client} project=${this.project} theme=${this.theme}></ameesh-budget>`;
       case "thread": return html`<ameesh-thread .client=${client} project=${this.project} lot=${this.lot} theme=${this.theme}></ameesh-thread>`;
-      default: return html`<ameesh-projects .client=${client} theme=${this.theme}></ameesh-projects>`;
+      default: return html`<ameesh-projects .client=${client} project=${this.project} theme=${this.theme}></ameesh-projects>`;
     }
   }
 

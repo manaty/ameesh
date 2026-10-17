@@ -105,6 +105,7 @@ elif 'show' in args:
 elif 'is-active' in args:
     if scenario == 'inactive': sys.exit(3)
     if scenario == 'inactive-dev9' and '@dev9.' in args[-1]: sys.exit(3)
+    if (state / ('inactive-' + unit.split('@')[1].removesuffix('.service'))).exists(): sys.exit(3)
     print('active')
 '''
 
@@ -203,9 +204,26 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm()
         self.assertEqual(p.returncode, 0, p.stderr)
         restarts = [l for l in self.units().splitlines() if 'restart' in l]
+        # #1633 : la persona arrêtée du registre est du lot — son unité active
+        # est rechargée sur le nouveau code (aucun bail exigé) ; l'observateur
+        # et l'agent d'un autre hôte restent ignorés.
         self.assertEqual(restarts, ['--user restart ameesh-runner-agent@dev8.service',
-                                    '--user restart ameesh-runner-agent@dev9.service'])
+                                    '--user restart ameesh-runner-agent@dev9.service',
+                                    '--user restart ameesh-runner-agent@stopped.service'])
         self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertIn('stopped : arrêté dans le registre', p.stdout)
+        self.assertNotIn('stopped : redémarré (était', p.stdout)
+        self.assertNotIn('no lease before the restart', p.stdout)
+
+    def test_restart_leaves_an_inactive_stopped_unit_alone(self):
+        # #1633 : unité déjà arrêtée — aucune relance : elle chargera le
+        # nouveau code à son démarrage.
+        (self.state / 'inactive-stopped').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('restart ameesh-runner-agent@stopped.service', self.units())
+        self.assertIn('stopped : arrêté dans le registre', p.stdout)
+        self.assertIn('déjà arrêtée', p.stdout)
 
     def test_restart_waits_for_agent_out_of_turn(self):
         p = self.run_vm(scenario='busy-once')
