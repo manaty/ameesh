@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -158,6 +159,42 @@ def _pip_install(directory, src):
     _run([pip, "install", "-q", src])
 
 
+def _shebang_valide(ameesh, python):
+    """Le script `ameesh` désigne-t-il l'interpréteur de CE venv ?
+
+    pip écrit `#!<venv>/bin/python3` quand le shebang tient dans 127 octets.
+    Au-delà (ou si le chemin contient une espace), distlib écrit un préambule
+    /bin/sh qui ré-exécute ce même interpréteur (#2156) :
+
+        #!/bin/sh
+        '''exec' <venv>/bin/python3 "$0" "$@"
+        ' '''
+
+    La troisième ligne ferme la chaîne triple : le fichier reste un script
+    Python valide, lancé par sh puis par l'interpréteur cible.
+    """
+    with open(ameesh, "rb") as handle:
+        lignes = [handle.readline().decode("utf-8", "replace").rstrip("\r\n")
+                  for _ in range(3)]
+    lignes[0] = lignes[0].strip()
+    # pip écrit le shebang de l'interpréteur qui l'exécute : `bin/python3`
+    # (ou `bin/python3.X`) dans un venv réel, jamais `bin/python` seul ; on
+    # exige seulement l'interpréteur de CE venv.
+    motif = re.escape(python) + r"(?:[0-9]+(?:\.[0-9]+)*)?"
+    if re.fullmatch("#!" + motif, lignes[0]):
+        return True
+    prefixe = "'''exec' "
+    if (lignes[0] == "#!/bin/sh" and lignes[2] == "' '''"
+            and lignes[1].startswith(prefixe)):
+        try:
+            mots = shlex.split(lignes[1][len(prefixe):])
+        except ValueError:
+            return False
+        return (len(mots) == 3 and mots[1:] == ["$0", "$@"]
+                and re.fullmatch(motif, mots[0]) is not None)
+    return False
+
+
 def _controles(directory):
     """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule."""
     python = os.path.join(directory, "bin", "python")
@@ -165,12 +202,9 @@ def _controles(directory):
     _run([python, "-c", "import psycopg, ameesh; print('imports ok')"],
          stdout=subprocess.DEVNULL)
     _run([ameesh, "--version"], stdout=subprocess.DEVNULL)
-    with open(ameesh, "rb") as handle:
-        shebang = handle.readline().decode("utf-8", "replace").strip()
-    # pip écrit le shebang de l'interpréteur qui l'exécute : `bin/python3`
-    # (ou `bin/python3.X`) dans un venv réel, jamais `bin/python` seul ; on
-    # exige seulement l'interpréteur de CE venv.
-    if not re.fullmatch(re.escape("#!" + python) + r"(?:[0-9]+(?:\.[0-9]+)*)?", shebang):
+    if not _shebang_valide(ameesh, python):
+        with open(ameesh, "rb") as handle:
+            shebang = handle.readline().decode("utf-8", "replace").strip()
         raise RuntimeError("shebang inattendu dans %s : %r" % (ameesh, shebang))
 
 

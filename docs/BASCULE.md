@@ -1304,7 +1304,8 @@ runner's import) therefore sees either the whole old code or the whole new
 code — never the incomplete state of the 16/10 incident
 (`ModuleNotFoundError ameesh.platform.process`, missing `ameesh`/code 127).
 Controls run **before** the switch: imports (`psycopg`, `ameesh`),
-`ameesh --version`, and the console script's shebang pointing at the
+`ameesh --version`, and the console script's shebang (direct, or pip's
+`/bin/sh` preamble when the venv path exceeds 127 bytes) pointing at the
 versioned venv's Python.
 
 The live `venv` is **not** a venv that a switch rewrites under running
