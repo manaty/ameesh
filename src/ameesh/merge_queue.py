@@ -633,6 +633,11 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
     `cfg` absent ou dépôt illisible : `lot_class.of_lot` rend un doute
     (`sensitive`, drapeau `doubt`), et la file garde l'exigence de verdict."""
     from . import lot_class
+    # La borne de diff peut être un commit ou un ref de file : l'axe release se
+    # lit sur la cible résolue, que la ligne du lot ne porte pas toujours.
+    item = row
+    if target and not row.get("branch_target"):
+        item = dict(row, branch_target=target)
     paths = []
     if target:
         source = where or repo
@@ -662,7 +667,7 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
         paths.append((repo, target))
     best = None
     for path, base_ref in paths:
-        current = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base_ref,
+        current = lot_class.of_lot(db, lot, cfg=cfg, item=item, repo=path, base=base_ref,
                                    head=tip)
         if best is None or _class_worse(current, best):
             best = current

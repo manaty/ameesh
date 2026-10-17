@@ -650,6 +650,40 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
                 self.assertEqual(out["class"], "light")
                 self.assertFalse(out["doubt"])
 
+    def test_a_release_target_keeps_the_release_axis(self):
+        """Une borne de cible fraîche (commit ou `QUEUE_REF`) ne doit pas
+        effacer l'axe release de la cible résolue, absent de la ligne du lot."""
+        upstream = os.path.join(self.tmp, "upstream-release")
+        os.makedirs(upstream)
+        _git(upstream, "init", "-q", "-b", "main")
+        _write(upstream, "README.md", "A\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "A")
+        _git(upstream, "checkout", "-q", "-b", "release/1.10")
+        # les agents clonent la release à A : B et C ne vivront que dans le
+        # clone après le fetch d'admission
+        agents = os.path.join(self.tmp, "agents-release")
+        _git(self.tmp, "clone", "-q", "--branch", "release/1.10", upstream, agents)
+        _git(agents, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.assertEqual(_git(agents, "symbolic-ref", "--short",
+                              "refs/remotes/origin/HEAD"), "origin/main")
+        _write(upstream, "src/ameesh/migrations/9999_already_merged.sql", "-- merged\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "B, already merged")
+        b = _git(upstream, "rev-parse", "HEAD")
+        _git(upstream, "checkout", "-q", "-b", "lot/light", b)
+        _write(upstream, "README.md", "C\n")
+        _git(upstream, "commit", "-qam", "C, light")
+        c = _git(upstream, "rev-parse", "HEAD")
+        _git(upstream, "checkout", "-q", "main")   # l'origin par défaut reste main
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "clone-release"))
+        merge_queue.fetch_fresh(agents, ["lot/light", "release/1.10"], clone)
+        self.row = {"id": 1, "app": "ameesh"}   # ni branche ni cible sur la ligne
+        out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                    "release/1.10", c, cfg=None)
+        self.assertEqual(out["class"], "release")
+        self.assertEqual(out["doubt"], False)
+
     def test_a_stale_agent_target_does_not_overclassify_the_fresh_read(self):
         """P2-2 : même avec `QUEUE_REF` frais, un `origin/<cible>` d'agent
         remis en arrière (A) ne doit pas surclasser la lecture fraîche."""
