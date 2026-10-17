@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // L90: <ameesh-decisions> — the human's queue and the approval path. The
 // button files the request (L87) and emits `ameesh:approval-requested`; it
-// never approves, and the standalone page is the host that opens the link.
+// never approves, and no component opens the link (contract §2.2): the host
+// opens it, and the standalone page shows it for the human to click.
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 import { fakeFetch, settle, ui, violations, window } from "./dom.mjs";
@@ -96,27 +97,25 @@ test("a refused filing is reported under the action and allows another try", asy
   assert.equal(fetch.calls.filter((call) => call.init?.method === "POST").length, 1);
 });
 
-test("the standalone app opens the approval link in the foreground, the embedded app does not", async () => {
+test("no component opens a link: the event bubbles to the host, the link stays for the human", async () => {
   const opened = [];
   const realOpen = window.open;
   window.open = (url, target) => { opened.push([url, target]); return null; };
   try {
     const { client } = fixture();
     const app = await mount(client, { standalone: true, section: "decisions" }, "ameesh-app");
+    // the host listens above the components, as the contract (§2.2) requires
+    const seen = [];
+    document.body.addEventListener("ameesh:approval-requested", (event) => seen.push(event.detail));
     app.shadowRoot.querySelectorAll("nav button")[1].click(); await settle(app);
     const view = app.shadowRoot.querySelector("ameesh-decisions"); await settle(view);
     view.shadowRoot.querySelector(".cards button").click(); await settle(view); await settle(app);
-    assert.deepEqual(opened, [[LINK, "_blank"]]);
-    // embedded: the event reaches the host, which decides (nothing opened here)
-    const embedded = await mount(client, {}, "ameesh-app");
-    embedded.shadowRoot.querySelectorAll("nav button")[1].click(); await settle(embedded);
-    const screen = embedded.shadowRoot.querySelector("ameesh-decisions"); await settle(screen);
-    screen.shadowRoot.querySelector(".cards button").click(); await settle(screen); await settle(embedded);
-    assert.equal(opened.length, 1);
-    // never another scheme, even in the standalone page
-    app.dispatchEvent(new window.CustomEvent("ameesh:approval-requested",
-      { detail: { url: "javascript:alert(1)" }, bubbles: true, composed: true }));
-    assert.equal(opened.length, 1);
+    assert.deepEqual(seen, [{ action: ACTION, url: LINK }]);  // composed: crosses both shadow roots
+    assert.deepEqual(opened, []);                             // nothing opened by the components
+    const link = view.shadowRoot.querySelector("a");          // the human opens it, in the page
+    assert.equal(link.getAttribute("href"), LINK);
+    assert.equal(link.getAttribute("target"), "_blank");
+    assert.equal(link.getAttribute("rel"), "noopener noreferrer");
   } finally {
     window.open = realOpen;
   }

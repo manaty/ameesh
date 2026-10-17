@@ -5,8 +5,10 @@
 // "Approve" button does not approve: it files the request (L87's
 // `POST /actions/{id}/approval-request`), then emits
 // `ameesh:approval-requested` with the ameesh-approve link for the host to
-// open in the foreground; the passkey is signed on ameesh-approve's origin
-// and the receipt comes back through the stream (`receipt.attached`).
+// open in the foreground (contract §2.2: no component opens or navigates);
+// standalone, the link stays a real anchor for the human to click. The
+// passkey is signed on ameesh-approve's origin and the receipt comes back
+// through the stream (`receipt.attached`).
 import { html, nothing } from "lit";
 import { ApiError, type Client } from "../api/client";
 import { ReadView, label, number, object, rows, type Row } from "./read-view";
