@@ -35,11 +35,36 @@ Le redémarrage ferme l’admission de chaque unité par `stop` (SIGTERM) avant
 de la démarrer : le tour en cours draine, borné par `TimeoutStopSec` (35 min),
 et le démarrage n’a lieu qu’après preuve du point sûr (`ActiveState=inactive`
 et `MainPID=0`). Aucune fenêtre « idle » n’est attendue : une persona en tour
-ne bloque plus la mise à jour. Il relit le placement avant chaque redémarrage :
-un agent déplacé ou passé en observation est ignoré. Un agent arrêté n’est pas
-réactivé (aucun bail, aucun tour — #1131), mais son unité encore active est
-rechargée sur le nouveau code (#1633), sans quoi elle servirait la reprise de
-l’owner avec la version d’avant le déploiement. Le compte
+ne bloque plus la mise à jour.
+
+Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
+interrupteur, pas un délai : un agent vu en tour reçoit **immédiatement**,
+avant l’arrêt prouvé ci-dessus, une pause opérateur courte et nommée (drain,
+#2152) : le tour en cours se termine — aucun tour n’est interrompu —, plus
+aucun ne commence, puis le redémarrage procède à l’arrêt prouvé et la pause
+est levée après le démarrage. La valeur ne mesure plus une attente d’un
+créneau « idle » ; aucune fenêtre « idle » n’est attendue. Le mesh journalise
+la pose et la levée (`operator_pause_events`) ; une pause déjà posée par un
+autre acteur n’est ni doublée ni levée, et aucune pause posée par le script ne
+survit à sa sortie. La levée est **conditionnelle** : le motif exact de la
+pause posée (unique, avec son jeton) est son identité, et `ameesh resume
+--operator --expect-reason` ne lève que cette pause-là — la comparaison et la
+levée se font dans la même instruction SQL (migration 0458), donc une pause
+étrangère posée entre la lecture et la reprise n’est jamais levée. Si la
+réponse de la pause se perd (SSH coupé, JSON illisible), le script réconcilie
+par l’état réel : motif identique, le drain continue ; sinon il ne redémarre
+ni ne lève rien et s’arrête en le disant, en nommant l’agent, le motif exact
+et la commande conditionnelle de levée manuelle. Pose et levée sont des gestes
+d’opérateur : le CLI local refuse une session liée à un agent (`bad_actor`),
+donc `vm.sh` doit être lancé hors session d’agent ; sinon la pause est refusée
+et le redémarrage de cet agent s’arrête sans interrompre aucun tour. Un CLI de
+cible antérieur à #2152 (sans `--expect-reason`) n’est jamais utilisé pour
+drainer : le script arrête l’agent sans drain plutôt que de laisser une pause
+orpheline. Il relit le placement avant chaque redémarrage :
+un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
+pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
+est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
+reprise de l’owner avec la version d’avant le déploiement. Le compte
 `ameesh` doit avoir un gestionnaire systemd utilisateur ; le script pose
 `HOME`, `XDG_RUNTIME_DIR` et `DBUS_SESSION_BUS_ADDRESS` pour joindre son bus.
 Le CLI distant est celui de l’unité :

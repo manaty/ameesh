@@ -216,11 +216,18 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
-                       actor: str, principal: str) -> dict | None:
+                       actor: str, principal: str,
+                       expect_reason: str | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
         External agents are returned unchanged. Not exposed to executors.
+
+        `expect_reason` (#2152) : ne lève que la pause dont la raison est
+        exactement celle-là. La comparaison et la levée restent dans la même
+        instruction, sous le verrou de ligne : une pause étrangère posée entre
+        la lecture et la reprise n'est jamais levée. Refusé pour POSER une
+        pause (`paused=True`).
         """
 
     @abc.abstractmethod
@@ -1424,6 +1431,14 @@ class WorkItems(Domain):
         (détachement), vérifiés sous le verrou de la ligne du lot ; None sinon."""
 
     @abc.abstractmethod
+    def detach_branch(self, item_id: int, expected: str | None, *, note: str,
+                      actor: str) -> dict | None:
+        """#2102 : retire la branche (et la cible, le dernier commit vu) d'un
+        lot ouvert, avec une ligne de journal, seulement si sa branche est
+        encore `expected` (None : aucune), vérifié sous le verrou de la ligne
+        du lot ; None sinon (lot fermé, ou branche changée entre-temps)."""
+
+    @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:
@@ -1824,6 +1839,21 @@ class WorkItems(Domain):
         `decision_milestone` (un jalon de décision ouvert y est rattaché).
         #1193: a lot whose explicit prerequisite is not finished is excluded —
         the ready intake never offers a lot that cannot be started."""
+
+    @abc.abstractmethod
+    def review_proposals(self, limit: int, *, proposal_prefix: str,
+                         window_s: float = 21600.0) -> list[dict]:
+        """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
+        sans verdict COURANT (une relecture est due) ou à verdict courant
+        bloquant (une correction est due) — avec leur auteur, leur branche,
+        leur tête gelée, leur équipe résolue (`lot_team`) et les colonnes du
+        lot dont la prise a besoin.
+
+        Un lot déjà muni d'un relecteur désigné, ou sans tête gelée, est
+        écarté ; un lot dont une proposition (`proposal_prefix` au journal) a
+        moins de `window_s` n'est pas reproposé. Le verdict retenu est celui
+        qui nomme le dernier gel (#1677 B1) : un `ok` périmé par un regel ne
+        dispense pas de la relecture."""
 
     @abc.abstractmethod
     def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
@@ -2681,13 +2711,13 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def items(self, *, since_ts: float, limit: int,
-              done_states: Sequence[str]) -> list[dict]:
+              done_states: Sequence[str], project: str | None = None) -> list[dict]:
         """Les tâches de la feuille de route : ouvertes (état hors de
         `done_states`, fourni par l'appelant), ou datées, ou portant un
         engagement en cours, ou modifiées depuis `since_ts` — colonnes de `work_items` utiles à la
         frise (id, title, state, app, workstream, assignee, package_id,
         created_ts, updated_ts, closed_ts) et dates prévues ; `total` avant
-        la borne."""
+        la borne. Le filtre projet est appliqué avant la borne et le total."""
 
     @abc.abstractmethod
     def commitments(self, *, statuses: Sequence[str] | None = None,
@@ -2707,10 +2737,11 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def set_commitment(self, ident: int, *, current: Sequence[str],
-                       values: dict) -> dict | None:
+                       values: dict, expect: dict | None = None) -> dict | None:
         """Change un engagement (`status`, `due_on`, `note`…) s'il est dans
         l'un des statuts `current` ; None sinon (inconnu ou déjà changé).
-        Un statut `done` ou `cancelled` pose `closed_at`."""
+        Un statut `done` ou `cancelled` pose `closed_at`. Avec `expect`, les
+        champs éditables doivent être inchangés depuis leur lecture."""
 
 
 # --------------------------------------------------------------------------
