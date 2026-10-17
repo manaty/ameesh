@@ -19,6 +19,8 @@ SCRIPT = ROOT / 'deploy/mise-a-jour/vm.sh'
 SSH = r'''#!/usr/bin/env python3
 import os, subprocess, sys
 from pathlib import Path
+if os.environ.get('FAKE_STALL_SSH'):
+    __import__('signal').pause()  # live transport, remote command never finishes
 state = Path(os.environ['FAKE_STATE'])
 argv = sys.argv[1:]
 command = argv[-1]
@@ -295,6 +297,21 @@ class AgentHostTest(unittest.TestCase):
         """#2152 : les gestes de pause/reprise réellement demandés au CLI."""
         path = self.state / 'operateur.log'
         return path.read_text() if path.exists() else ''
+
+    def test_a_live_ssh_client_is_bounded_by_the_drain_deadline(self):
+        self.env.update(DRAIN_APPEL_DELAI='1', FAKE_STALL_SSH='1')
+        proc = subprocess.Popen(['bash', str(SCRIPT), 'agents', 'redemarrer'],
+                                env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            _, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.communicate()
+            self.fail('drain call outlived its deadline with a live SSH client')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('appel de drain expiré', stderr)
+        self.assertEqual(self.units(), '')
 
     def test_missing_runner_env_fails_before_any_execution(self):
         (self.state / 'runner.env').unlink()

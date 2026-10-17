@@ -99,10 +99,9 @@ DRAIN_ATTENTE=${DRAIN_ATTENTE:-300}
   || { echo "DRAIN_ATTENTE invalide : « $DRAIN_ATTENTE » (secondes attendues)" >&2; exit 2; }
 # #2184/N3 : un lien SSH mort ou figé ne doit pas suspendre une pose, une
 # levée ou une lecture de drain. Le keepalive borne la connexion ; les appels
-# de drain sont en plus bornés par `timeout` quand il existe (macOS n'en a pas :
-# le keepalive et le délai de connexion restent la garde).
+# de drain ont une borne locale Python, y compris sans `timeout` sur le poste.
 DRAIN_APPEL_DELAI=${DRAIN_APPEL_DELAI:-60}
-[[ $DRAIN_APPEL_DELAI =~ ^[0-9]+$ ]] \
+[[ $DRAIN_APPEL_DELAI =~ ^[0-9]+$ ]] && [ "$DRAIN_APPEL_DELAI" -gt 0 ] \
   || { echo "DRAIN_APPEL_DELAI invalide : « $DRAIN_APPEL_DELAI » (secondes attendues)" >&2; exit 2; }
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
@@ -206,7 +205,11 @@ paquet_git() {
 # -n : le client consomme son entrée standard même quand la commande distante
 # ne la lit pas. Sans lui, la boucle `while read` de controler_agents lui livre
 # la liste des agents et n'en contrôle qu'un seul (#1455).
-ssh_agents() { ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"; }
+ssh_agents() {
+  if [ "${BORNE_APPEL_DRAIN:-}" = 1 ]; then
+    appel_drain ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"
+  else ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"; fi
+}
 utilisateur_agents() {
   local commande; printf -v commande '%q ' "$@"
   ssh_agents "set -euo pipefail
@@ -228,23 +231,33 @@ commande_agents() {
 }
 ameesh_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"; }
 python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/python "$@"; }
-# #2184/N3 : appels de drain bornés. En mode agents, `timeout` tourne dans
-# l'unité transitoire distante (Linux) ; en mode serveur, localement. Sans
-# `timeout` (poste macOS), l'appel reste couvert par le keepalive SSH.
+# Borne tout l'appel, transport SSH compris. Un keepalive ne limite pas une
+# commande sur un lien vivant. Python est déjà requis sur le poste ; le groupe
+# est tué avant de récolter le chef, descendants compris.
+appel_drain() {
+  python3 - "$DRAIN_APPEL_DELAI" "$@" <<'PY'
+import os, signal, subprocess, sys
+p = subprocess.Popen(sys.argv[2:], start_new_session=True)
+try:
+    sys.exit(p.wait(timeout=int(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    p.wait()
+    print("appel de drain expiré", file=sys.stderr)
+    sys.exit(124)
+PY
+}
+# La VM est Linux : sa propre borne évite une commande distante orpheline
+# après perte du client. Elle ne dépend pas des outils installés sur le poste.
 ameesh_agents_drain() {
-  if command -v timeout >/dev/null 2>&1; then
-    commande_agents timeout "$DRAIN_APPEL_DELAI" \
-      /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"
-  else
-    ameesh_agents "$@"
-  fi
+  BORNE_APPEL_DRAIN=1 commande_agents timeout --kill-after=5 "$DRAIN_APPEL_DELAI" \
+    /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"
 }
 ameesh_local_drain() {
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$DRAIN_APPEL_DELAI" "$AMEESH" "$@"
-  else
-    "$AMEESH" "$@"
-  fi
+  appel_drain "$AMEESH" "$@"
 }
 lire_bail() {
   if [ "$MODE" = agents ]; then
