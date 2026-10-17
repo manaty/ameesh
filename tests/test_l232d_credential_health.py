@@ -292,6 +292,28 @@ class HealthReportTest(unittest.TestCase):
         self.assertEqual(state, "failing")
         self.assertEqual(self.credentials.calls, [])
 
+    def test_gh_jeton_remplace_pendant_la_sonde_ne_prouve_pas_la_connexion(self):
+        """La santé de l'ancien jeton ne peut pas valider le nouveau."""
+        profile = accounts_mod.Profile(harness="gh", name="", path=self.home,
+                                       declared=True)
+        token = "gho_new_unvalidated"
+        def run(argv, **kwargs):
+            nonlocal token
+            if list(argv)[2] == "token":
+                return 0, token + "\n"
+            token = "gho_old_healthy"
+            return 0, "Logged in to github.com"
+        request = SimpleNamespace(harness="gh", account="")
+        with mock.patch("ameesh.sentinel.shutil.which", return_value="gh"):
+            state = login_cli.health_report(
+                self.store, self.cfg, profile, request, environ={}, run=run,
+                credential_before=sentinel._digest("gho_old_healthy"))
+        self.assertEqual(state, "unknown")
+        (_, _, _, written, kwargs), = self.credentials.calls
+        self.assertEqual(written, "unknown")
+        self.assertIsNone(kwargs["fingerprint"])
+        self.assertEqual(kwargs["reason"], sentinel.REPLACED)
+
 
 if __name__ == "__main__":
     unittest.main()

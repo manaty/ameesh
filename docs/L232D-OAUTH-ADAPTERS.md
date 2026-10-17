@@ -152,6 +152,8 @@ none changes the activation preconditions of #366.
   of the `hosts.yml` file: a comment in the file no longer fakes a new
   credential. When no token can be read (locked keyring, no token), the
   verdict carries no fingerprint and the fresh-credential proof is refused.
+  The effective token is read again after the health probe; a change makes
+  the verdict `unknown`, so one token's health cannot validate another.
 - **`gh` probe pinned to github.com (N5).** `probe_health("gh")` and the
   sentinel's `gh` pass run `gh auth status --hostname github.com`, and
   `login_env` drops `GH_HOST`; another host can no longer make the

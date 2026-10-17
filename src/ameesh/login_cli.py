@@ -210,10 +210,15 @@ def probe_health(cfg: Config, profile, harness: str, *, environ=None, run=None,
         # elle est inconnue, le verdict n'en porte aucune et la preuve est
         # refusée par `health_report`.
         held = sentinel.gh_credential_fingerprint(env, run=probe_gh)
-        return sentinel.probe_cli("gh", ["gh", "auth", "status",
-                                         "--hostname", "github.com"],
-                                  "gh auth login -h github.com", probe_gh,
-                                  sentinel.gh_store(env), credential=held)
+        verdict = sentinel.probe_cli("gh", ["gh", "auth", "status",
+                                            "--hostname", "github.com"],
+                                     "gh auth login -h github.com", probe_gh,
+                                     sentinel.gh_store(env), credential=held)
+        # Une sonde portant sur un autre jeton ne valide pas celui lu avant
+        # son lancement (même garde que pour un magasin remplacé).
+        if verdict is not None and sentinel.gh_credential_fingerprint(env, run=probe_gh) != held:
+            return sentinel.Verdict("gh", "", "unknown", sentinel.REPLACED)
+        return verdict
     return None
 
 
