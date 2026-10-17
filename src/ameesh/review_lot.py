@@ -305,6 +305,16 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
         "et pousser la correction sur la cible : le relecteur corrige lui-même dès le "
         "premier tour (canon §2, home#81) ; les autres défauts non bloquants vont au "
         "backlog ;",
+        "- **correction** (canon §2, home#81) : le relecteur corrige lui-même, y compris "
+        "un défaut **bloquant** (B, P1) — après la fusion, le correctif passe par le lot "
+        "de correction ; il pousse sa correction au lieu de la renvoyer à l'auteur ; "
+        "au-delà de ~50 lignes ou pour un changement de conception, la correction "
+        "revient à l'auteur ; en classe **sensible**, la seconde famille relit le lot "
+        "**avec** la correction, dans le même tour, et reste distincte de chaque "
+        "auteur ;",
+        "- les commits du correcteur portent leur preuve d'origine "
+        "(`ameesh provenance show --commit <sha>`) : il en est l'auteur, et son avis "
+        "ne couvre pas sa correction ;",
         "- %s." % BLOCKING,
         "",
         "Ce lot n'est assigné à personne : il est dans la file de l'équipe, le premier "
