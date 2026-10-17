@@ -127,6 +127,37 @@ BEGIN
                 END IF;
             END LOOP;
         END LOOP;
+        -- B2 (R Codex cx2 sur #1448) : un parent qui porte INSERT/UPDATE/
+        -- DELETE sur une table en lecture seule reste effectif par SET ROLE,
+        -- même si le membre est accordé WITH INHERIT FALSE ;
+        -- has_table_privilege(r, …) ne le voit pas. B1 : un droit de colonne
+        -- (pg_attribute.attacl) est aussi un droit d'écriture effectif, que
+        -- le contrôle de table ignore. Les deux se vérifient sur chaque rôle
+        -- que r peut devenir, pas seulement sur r.
+        IF parent.rolname <> r THEN
+            FOR item IN SELECT c.oid, c.relname FROM pg_class c
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE n.nspname = s AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                           AND c.relname IN ('project_modules', 'host_release_operations',
+                                             'host_release_fences',
+                                             'host_release_fence_receipts',
+                                             'review_catch_up') LOOP
+                FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
+                    IF has_table_privilege(parent.oid, item.oid, privilege) THEN
+                        violations := violations || format('forbidden %s on %s through %s',
+                                                           privilege, item.relname,
+                                                           parent.rolname);
+                    END IF;
+                END LOOP;
+                FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE'] LOOP
+                    IF has_any_column_privilege(parent.oid, item.oid, privilege) THEN
+                        violations := violations || format(
+                            'forbidden %s on a column of %s through %s',
+                            privilege, item.relname, parent.rolname);
+                    END IF;
+                END LOOP;
+            END LOOP;
+        END IF;
         IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = s AND pg_has_role(parent.oid, c.relowner, 'MEMBER'))
            OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -173,6 +204,14 @@ BEGIN
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
                 IF has_table_privilege(r, item.oid, privilege) THEN
                     violations := violations || format('forbidden %s on %s', privilege, item.relname);
+                END IF;
+            END LOOP;
+            -- B1 : un droit de colonne laissé au rôle nommé (le REVOKE de
+            -- table le nettoie normalement, mais l'audit reste fail-closed).
+            FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE'] LOOP
+                IF has_any_column_privilege(r, item.oid, privilege) THEN
+                    violations := violations || format('forbidden %s on a column of %s',
+                                                       privilege, item.relname);
                 END IF;
             END LOOP;
         ELSE

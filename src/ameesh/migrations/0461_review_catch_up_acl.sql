@@ -29,5 +29,28 @@ BEGIN
                        CASE WHEN item.grantee = 0 THEN 'PUBLIC'
                             ELSE quote_ident(pg_get_userbyid(item.grantee)) END);
     END LOOP;
+    -- B1 (R Codex cx2 sur #1448) : un droit de colonne (par exemple
+    -- UPDATE(bound_at)) vit dans pg_attribute.attacl, pas dans
+    -- pg_class.relacl. La boucle ci-dessus ne voit alors aucun droit de table
+    -- à révoquer et le laisserait en place, permettant encore à un exécuteur
+    -- de déplacer la borne. On révoque ces droits nommément, y compris
+    -- PUBLIC.
+    FOR item IN SELECT DISTINCT c.relname, a.attname, acl.grantee, acl.privilege_type
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  JOIN pg_attribute a ON a.attrelid = c.oid
+                                     AND a.attnum > 0 AND NOT a.attisdropped
+                  CROSS JOIN LATERAL aclexplode(a.attacl) acl
+                 WHERE n.nspname = current_schema()
+                   AND c.relname = 'review_catch_up'
+                   AND acl.grantee <> c.relowner
+                   AND acl.privilege_type <> 'SELECT' LOOP
+        EXECUTE format('REVOKE %s (%I) ON %I.%I FROM %s',
+                       item.privilege_type,
+                       item.attname,
+                       current_schema(), item.relname,
+                       CASE WHEN item.grantee = 0 THEN 'PUBLIC'
+                            ELSE quote_ident(pg_get_userbyid(item.grantee)) END);
+    END LOOP;
 END
 $review_acl$;
