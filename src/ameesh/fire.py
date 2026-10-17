@@ -519,6 +519,18 @@ def _rollup_state(entry) -> str:
     return str(entry.get("conclusion") or "").upper()
 
 
+def _same_head(left, right) -> bool:
+    """Deux identifiants du même commit : égaux, ou l'un abrégé de l'autre
+    (un gel peut citer `48c6372e` quand la PR rend le SHA complet)."""
+    left, right = _norm(left), _norm(right)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    short, long = (left, right) if len(left) < len(right) else (right, left)
+    return len(short) >= 7 and long.startswith(short)
+
+
 def _required_pairs(required) -> tuple:
     """Les checks requis sous la forme `(contexte, app_id)` : un nom seul vaut
     `(nom, None)` (aucune application imposée)."""
@@ -614,7 +626,7 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
                     or not run["name"].strip():
                 raise land.LandError("gh api %s: malformed check run" % path)
             head = _norm(run.get("head_sha"))
-            if head and head != _norm(sha):
+            if head and not _same_head(head, sha):
                 raise land.LandError("gh api %s: a check run of %s is on %s"
                                      % (path, run["name"].strip(), head))
             app = run.get("app")
@@ -732,7 +744,7 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         return False, "PR #%s targets %s, not %s" % (status.get("number"), status["base"],
                                                      target)
     head, frozen_head = _norm(status.get("head")), _norm(frozen)
-    if head and frozen_head and not same_commit(head, frozen_head):
+    if head and frozen_head and not _same_head(head, frozen_head):
         return False, ("PR #%s is on %s, not the freeze %s"
                        % (status.get("number"), head[:12], frozen_head[:12]))
     if status.get("ci") != "green":
@@ -748,7 +760,7 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
     provenance = None
     if any(app_id is not None for _, app_id in pairs):
         try:
-            provenance = _head_check_runs(slug, frozen_head, gh=gh)
+            provenance = _head_check_runs(slug, head or frozen_head, gh=gh)
         except land.LandError as exc:
             return False, ("the source of the required checks of %s on the freeze %s "
                            "cannot be proven: %s"

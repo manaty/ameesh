@@ -269,6 +269,14 @@ class ReadyPrTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("not the freeze", why)
 
+    def test_an_abbreviated_freeze_names_the_same_head(self):
+        # Un gel peut citer `48c6372e` : la tête complète de la PR le nomme.
+        gh = FakeGh(check_runs=[_run("tests")])
+        ok, why = self.ready([_check("tests")], gh=gh, frozen=SHA[:8])
+        self.assertTrue(ok, why)
+        paths = [" ".join(call) for call in gh.calls if any("/check-runs" in a for a in call)]
+        self.assertIn("/commits/%s/check-runs" % SHA, paths[0])
+
     def test_the_checks_are_read_on_the_frozen_head(self):
         gh = FakeGh(check_runs=[_run("tests")])
         self.ready([_check("tests")], gh=gh)
@@ -347,6 +355,11 @@ class HeadCheckRunsTest(unittest.TestCase):
         self.assertEqual(runs[1]["app_id"], 15368)
         self.assertIn("--paginate", gh.calls[0])
         self.assertIn("--slurp", gh.calls[0])
+
+    def test_an_abbreviated_head_is_accepted(self):
+        gh = PagesGh([{"check_runs": [_run("tests")]}])
+        runs = fire._head_check_runs("manaty/ameesh", SHA[:8], gh=gh)
+        self.assertEqual([run["name"] for run in runs], ["tests"])
 
     def test_a_malformed_check_run_is_refused(self):
         for bad in ([{"check_runs": [{"name": "tests", "app": {"id": "15368"}}]}],
