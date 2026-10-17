@@ -53,6 +53,8 @@ class VMSupervisor(unittest.TestCase):
     def supervise(self, launch, stop=None, **kwargs):
         kwargs.setdefault('log', lambda _: None)
         kwargs.setdefault('now', lambda: 100)
+        # la fenêtre de reprise suit l'horloge du test, sauf témoin dédié
+        kwargs.setdefault('monotonic', kwargs['now'])
         return V.supervise(self.recipe, stop or threading.Event(), launch=launch,
                            **kwargs)
 
@@ -237,6 +239,59 @@ class VMSupervisor(unittest.TestCase):
                     launch, Stop(), run=lambda *_, **__: Process(0),
                     now=lambda: clock[0]), 0)
                 self.assertEqual(len(launches), expected)
+
+    def test_stale_window_follows_the_monotonic_clock_not_the_wall(self):
+        """#1971 : un saut de l'heure murale (NTP) pendant la fenêtre ne la
+        ferme pas ; seule l'horloge monotone la mesure. #1972 : l'entrée dans
+        la fenêtre et le retour de la porte sont journalisés."""
+        fresh = json.loads(self.state.read_text())
+        wall, mono, launches, logs = [100.0], [0.0], [], []
+        def launch(_):
+            launches.append(wall[0])
+            if len(launches) == 1:
+                self.state.unlink()
+                return Process(0, running=True)
+            return Process(0)
+        class Stop:
+            waits = 0
+            def is_set(inner):
+                return False
+            def wait(inner, _):
+                inner.waits += 1
+                mono[0] += 1
+                if inner.waits == 1:
+                    wall[0] += 3600                 # saut NTP en avant
+                elif inner.waits == 2:
+                    self.state.write_text(json.dumps(dict(
+                        fresh, expires_ts=wall[0] + 90, until_ts=wall[0] + 200)))
+                return False
+        self.assertEqual(self.supervise(
+            launch, Stop(), run=lambda *_, **__: Process(0), log=logs.append,
+            now=lambda: wall[0], monotonic=lambda: mono[0]), 0)
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(sum('guard gate stale, executor stopped' in l for l in logs), 1, logs)
+        self.assertIn('within %ds' % V.STALE_RESUME_MAX_S,
+                      next(l for l in logs if 'guard gate stale' in l))
+        self.assertIn('VM supervisor: guard gate fresh again (available)', logs)
+
+    def test_stale_window_expiry_is_logged(self):
+        """#1972 : la fin de la fenêtre sans porte fraîche est dite avant la
+        sortie."""
+        clock, logs = [100.0], []
+        def launch(_):
+            self.state.unlink()
+            return Process(0, running=True)
+        class Stop:
+            def is_set(inner):
+                return False
+            def wait(inner, _):
+                clock[0] += V.STALE_RESUME_MAX_S
+                return False
+        self.assertEqual(self.supervise(
+            launch, Stop(), run=lambda *_, **__: Process(0), log=logs.append,
+            now=lambda: clock[0]), 0)
+        self.assertEqual(logs[-1], 'VM supervisor: guard gate still stale after %ds, exiting'
+                         % V.STALE_RESUME_MAX_S)
 
     def test_fresh_guard_with_no_window_launches(self):
         self.state.write_text(json.dumps({'schema': 'ameesh-host-state/1', 'state': 'available',

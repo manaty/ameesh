@@ -220,7 +220,7 @@ def provider_module():
         info = os.lstat(path)
     except OSError:
         raise RetentionError("provider retention module unavailable") from None
-    if (stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid()
+    if (stat.S_ISLNK(info.st_mode) or info.st_uid not in (0, os.geteuid())
             or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode)):
         raise RetentionError("untrusted provider retention module")
     spec = importlib.util.spec_from_file_location("private_retention_scaleway", path)

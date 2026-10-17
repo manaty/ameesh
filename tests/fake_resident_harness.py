@@ -27,8 +27,11 @@ the answer to `turn/steer` waits for the next `turn/interrupt`, then refuses.
 Environment: `FAKE_RESIDENT_LOG` (JSONL trace of argv and of what was
 received), `FAKE_CLAUDE_QUEUE=1` (an input written during a turn is not
 injected: it opens the next harness turn, as when it arrives just after the
-last tool call), `FAKE_CODEX_STEER_REFUSE=1` (`turn/steer` always refused),
-`FAKE_START_DELAY` (seconds before answering `initialize`).
+last tool call), `FAKE_CLAUDE_PUSH_AFTER` (seconds after an `initialize`
+answer before the harness pushes its `system/commands_changed` event, as the
+real CLI does asynchronously — #1337), `FAKE_CODEX_STEER_REFUSE=1`
+(`turn/steer` always refused), `FAKE_START_DELAY` (seconds before answering
+`initialize`).
 """
 from __future__ import annotations
 
@@ -91,6 +94,31 @@ class Claude:
         out({"type": "control_response", "response": {
             "subtype": "success", "request_id": message.get("request_id"),
             "response": {"still_queued": []}}})
+        self.push_after_initialize(request)
+
+    def push_after_initialize(self, request: dict) -> None:
+        """#1337 : the CLI pushes `system/commands_changed` asynchronously
+        after an `initialize` answer (observed on 2.1.296: ~1.4 s later, well
+        after the drain that precedes the next turn's send). The delay makes
+        the push land in a turn that is already running."""
+        if request.get("subtype") != "initialize":
+            return
+        try:
+            delay = float(os.environ.get("FAKE_CLAUDE_PUSH_AFTER", "0") or 0)
+        except ValueError:
+            return
+        if delay <= 0:
+            return
+        timer = threading.Timer(delay, self.push)
+        timer.daemon = True
+        timer.start()
+
+    def push(self) -> None:
+        """One fire-and-forget push of the harness, outside any turn."""
+        out({"type": "system", "subtype": "commands_changed", "session_id": self.session,
+             "uuid": "push-%d" % time.monotonic_ns(),
+             "commands": [{"name": "probe-push", "description": "fake"}]})
+        trace({"push": "commands_changed"})
 
     def replay(self, message: dict) -> str:
         out(dict(message, session_id=self.session, isReplay=True))

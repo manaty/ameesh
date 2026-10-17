@@ -1650,6 +1650,50 @@ class RegistryTest(PgTestCase):
             version=waiting.version), spec=self.spec)
         self.assertEqual(after.state, "build")
 
+    @unittest.skipUnless(pv is not None, "tranche C (#1924) absente de main")
+    def test_seam_reel_acteur_du_verdict_et_id_de_livraison(self):
+        """#1994 : les deux coutures B -> C passent par le `read_sources` réel.
+
+        (1) l'acteur du verdict est projeté : `work_completed` accepte une revue
+        réelle (avant le correctif : `completion-review-missing`) ; (2) l'id de
+        livraison est projeté en chaîne, comme la référence client : une
+        livraison de code référencée par son id est trouvée (avant :
+        `completion-evidence-missing`)."""
+        saved = pr.installed_verifiers()
+
+        def restore():
+            pr.INSTALLED_VERIFIERS.clear()
+            pr.INSTALLED_VERIFIERS.update(saved)
+
+        self.addCleanup(restore)
+        pv.install_verifiers(pr)
+
+        sha = "c" * 40
+        # Un lot de code : la livraison est référencée par son id (chaîne) et
+        # la revue par son acteur — les deux coutures du même `read_sources`.
+        code = self.pinned(stage="staging", state="merged")
+        delivered = int(self.db.query(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'delivered', %s, %s) RETURNING id",
+            (code, sha, ACME_ACTOR))[0]["id"])
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor,"
+            "                                verdict)"
+            " VALUES (%s, 'verdict', %s, %s, 'ok')", (code, sha, "relecteur-1"))
+        context = pr.VerificationContext(
+            db=self.db, work_item=self.row(code),
+            command=self.command(code, frm="staging", to="done",
+                                 guard="work_completed"),
+            spec=self.spec, from_stage="staging", to_stage="done")
+        sources = pr.read_sources(context)
+        verdicts = [m for m in sources["milestones"] if m["kind"] == "verdict"]
+        self.assertEqual([m["actor"] for m in verdicts], ["relecteur-1"])
+        self.assertEqual([d["id"] for d in sources["deliveries"]], [str(delivered)])
+        completed = pr.apply_command(self.db, self.command(
+            code, frm="staging", to="done", guard="work_completed",
+            facts={"delivery": str(delivered)}), spec=self.spec)
+        self.assertEqual(completed.state, "promoted")
+
 
 @unittest.skipUnless(pw is not None, "slice A (#1918) missing from main")
 class CompiledArtifactTest(PgTestCase):
@@ -1693,6 +1737,66 @@ class CompiledArtifactTest(PgTestCase):
             verifiers={"planning": lambda context: pr.Verification(ok=True)})
         self.assertEqual(receipt.state, "build")
         self.assertEqual(receipt.workflow_stage, "implementation")
+
+    def test_two_targets_under_one_guard_chosen_by_to_stage(self):
+        """#1379 : deux cibles distinctes sous une même garde.
+
+        La carte de référence a `draft -> backlog` et `draft -> sprint` sous
+        `planning`. Le compilateur accepte ces deux arêtes ; le registre
+        choisit l'arête sur le couple exact (`to_stage`, `guard`) depuis
+        `from_stage`, et refuse un couple non déclaré.
+        """
+        stages = (ACME_STAGES[0], _Stage("backlog", "intake"),
+                  _Stage("sprint", "intake")) + ACME_STAGES[1:]
+        transitions = ACME_TRANSITIONS + (
+            _Transition("draft", "backlog", "planning"),
+            _Transition("draft", "sprint", "planning"))
+        document = {
+            "schema": "process-workflow/1",
+            "initial": "draft",
+            "types": ["evolution"],
+            "stages": [{"status": s.status, "core": s.core} for s in stages],
+            "transitions": [{"from": t.source, "to": t.target, "guard": t.guard}
+                            for t in transitions],
+            "projection": {
+                "project": "acme", "status_field": "state",
+                "product_field": "product",
+                "issue_open": ["intake", "build", "qa", "merged"],
+                "issue_completed": ["promoted"],
+                "issue_not_planned": ["closed"],
+            },
+        }
+        compiled = pw.compile_workflow(document, ref=ACME_REF, version=ACME_VERSION)
+        self.db.execute(
+            "INSERT INTO agent_registry (name, lease_owner, lease_epoch,"
+            "                            lease_expires_at)"
+            " VALUES ('acme-dev1', 'acme-runner-1', 4, now() + interval '1 hour')")
+
+        def advance(target, guard):
+            row = self.db.query(
+                "INSERT INTO work_items (title, state, app, workflow_ref,"
+                "                        workflow_stage, workflow_version)"
+                " VALUES ('acme : lot bi-cible', 'intake', 'acme', %s, 'draft', %s)"
+                " RETURNING id", (ACME_REF, ACME_VERSION))
+            command = pr.Command(
+                work_item_id=int(row[0]["id"]), command_id=str(uuid.uuid4()),
+                expected_version=0,
+                authority=pr.Authority(actor="acme-dev1", source="runner", epoch=4,
+                                       runner_id="acme-runner-1"),
+                workflow_ref=ACME_REF, workflow_version=ACME_VERSION, action="advance",
+                from_stage="draft", to_stage=target, guard=guard)
+            return pr._apply(
+                self.db, command, spec=compiled,
+                verifiers={"planning": lambda context: pr.Verification(ok=True)})
+
+        for target in ("backlog", "sprint"):
+            with self.subTest(target=target):
+                receipt = advance(target, "planning")
+                self.assertEqual(receipt.state, "intake")
+                self.assertEqual(receipt.workflow_stage, target)
+        with self.assertRaises(pr.RegistryRefusal) as caught:
+            advance("implementation", "stop_work")
+        self.assertEqual("edge-undeclared", caught.exception.code)
 
 
 if __name__ == "__main__":  # pragma: no cover

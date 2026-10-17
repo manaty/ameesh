@@ -546,6 +546,98 @@ class ReviewTest(_Base):
         self.assertIn("work_resolutions", error)
 
 
+class IdempotentDoneTest(_Base):
+    """#2142 : `--done` relancé après l'enregistrement ne refait rien, il finit
+    le nettoyage et rend l'état `prepared`."""
+
+    def resolved(self):
+        path = resolutions.open_resolution(None, 2, 1, repo=self.repo)["path"]
+        _write(path, "shared.py", RESOLVED)
+        return path
+
+    def test_k_done_from_inside_the_worktree_cleans_it_up(self):
+        # signalement : `--done` lancé depuis le worktree de résolution ; le
+        # `git worktree prune` qui suit la suppression tournait dans le dossier
+        # disparu et git répondait « git not found », après l'enregistrement.
+        path = self.resolved()
+        done = resolutions.finish_resolution(None, 2, 1, repo=path, actor="a2")
+        self.assertEqual(done["state"], "prepared")
+        self.assertFalse(done["already"])
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".json"))
+        self.assertNotIn("ameesh-resolve", _git(self.repo, "worktree", "list"))
+        self.assertEqual(self.fake.rows[(2, 1)]["commit_sha"], done["commit"])
+
+    def test_l_done_after_a_failed_cleanup_finishes_it_without_redoing(self):
+        path = self.resolved()
+        real = resolutions._remove_worktree
+        calls = []
+
+        def failing_once(repo, p, *, force=True):
+            calls.append(p)
+            if len(calls) == 1:
+                raise resolutions.GitError("git not found")
+            return real(repo, p, force=force)
+
+        with mock.patch.object(resolutions, "_remove_worktree", side_effect=failing_once):
+            with self.assertRaises(resolutions.GitError):
+                resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        row = self.fake.rows[(2, 1)]
+        self.assertTrue(os.path.isdir(path))      # enregistré, mais pas nettoyé
+        pushed = []
+        done = resolutions.finish_resolution(
+            None, 2, 1, repo=self.repo, actor="a2",
+            push_fn=lambda *a, **k: pushed.append(a) or (None, "no origin remote"))
+        self.assertTrue(done["already"])
+        self.assertEqual(done["state"], "prepared")
+        self.assertEqual(done["commit"], row["commit_sha"])
+        self.assertEqual(pushed, [])              # ni repoussé ni réenregistré
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(path + ".json"))
+        self.assertNotIn("ameesh-resolve", _git(self.repo, "worktree", "list"))
+
+    def test_m_second_done_without_a_worktree_is_idempotent(self):
+        path = self.resolved()
+        first = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        second = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertTrue(second["already"])
+        self.assertEqual(second["commit"], first["commit"])
+        self.assertEqual(self.fake.rows[(2, 1)]["commit_sha"], first["commit"])
+        self.assertFalse(os.path.exists(path))
+
+    def test_m_ignored_files_message_gives_the_cleanup_command(self):
+        _git(self.repo, "checkout", "-q", "lot/2-b")
+        _write(self.repo, ".gitignore", "*.local\n")
+        _git(self.repo, "add", ".gitignore")
+        _git(self.repo, "commit", "-qm", "b ignores *.local")
+        _git(self.repo, "checkout", "-q", "main")
+        path = self.resolved()
+        _write(path, "notes.local", "kept\n")
+        with self.assertRaises(resolutions.ResolveError) as ctx:
+            resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertIn("notes.local", str(ctx.exception))
+        self.assertIn("git worktree remove -f -f %s" % path, str(ctx.exception))
+        self.assertTrue(os.path.isfile(os.path.join(path, "notes.local")))
+
+    def test_n_reopening_a_current_resolution_reports_prepared(self):
+        path = self.resolved()
+        done = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        out = resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        self.assertEqual(out["state"], "prepared")
+        self.assertEqual(out["commit"], done["commit"])
+        self.assertIsNone(out["path"])
+        self.assertFalse(os.path.exists(path))    # aucun worktree rouvert
+        self.assertNotIn("ameesh-resolve", _git(self.repo, "worktree", "list"))
+
+    def test_n_a_moved_tip_reopens_instead_of_prepared(self):
+        self.resolved()
+        resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        _commit_on(self.repo, "lot/2-b", "other.py", "z\n", "b elsewhere")
+        out = resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        self.assertEqual(out["state"], "open")
+        self.assertTrue(os.path.isdir(out["path"]))
+
+
 class RadarTest(_Base):
     """The radar pass: resolver, `prepared`/`stale`, mail, rendering."""
 

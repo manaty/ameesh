@@ -818,10 +818,18 @@ def run(cfg, db, args) -> int:
                     raise MergePrError(
                         "unknown actor: pass --actor <agent|human:id>, or run from a bound "
                         "session; the merge is a fact, the lot is not declared")
-                out["recorded"] = work.merged(
-                    db, args.lot, sha=sha, actor=actor,
-                    note="ameesh work merge-pr %d --head %s (merge outside gh, "
+                # This is an observed merge: direct_merge has verified the
+                # lot/freeze/branch/target and read back the remote result.
+                # Its scratch clone is gone; the caller's checkout need not
+                # contain the commit required by a manual work.merged call.
+                recorded = work.close_merged(
+                    db, args.lot, sha=sha, actor=actor, source="merge-pr",
+                    pr_ref="%s#%d" % (slug, args.pr),
+                    extra="ameesh work merge-pr %d --head %s (merge outside gh, "
                          "#1003/REL-11)" % (args.pr, out["frozen"][:12]))
+                if recorded["result"] not in ("merged", "already"):
+                    raise MergePrError(recorded["detail"])
+                out["recorded"] = recorded
             except Exception as exc:  # noqa: BLE001 - the merge is a fact, never undone
                 out["record_warning"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
         print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else _human(out))

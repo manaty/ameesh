@@ -139,6 +139,21 @@ class ReleaseFenceTest(PgTestCase):
         self.assertEqual(self.perform('unfence'), expected)
         self.assertEqual(self.db.query('SELECT operation FROM host_release_fences')[0]['operation'], 'another')
 
+    def test_same_operation_cannot_reclose_the_host_after_its_unfence(self):
+        self.perform()
+        self.perform('unfence')
+        self.assertEqual(self.db.query('SELECT * FROM host_release_fences'), [])
+        # A second closure of the same operation, under another fence action,
+        # must not resurrect the host closure after its terminal unfence.
+        with self.assertRaisesRegex(fence.FenceError, 'reconcile'):
+            self.perform('recovery_fence')
+        self.assertEqual(self.db.query('SELECT * FROM host_release_fences'), [])
+        # A same-action replay is refused too: it would attest a live closure.
+        with self.assertRaisesRegex(fence.FenceError, 'reconcile'):
+            self.perform('fence')
+        self.assertEqual(self.db.query('SELECT * FROM host_release_fences'), [])
+        self.assertFalse(self.adapter.fenced(self.request('migrate')))
+
     def test_foreign_fence_and_changed_receipt_hold_release(self):
         self.db.execute('INSERT INTO host_release_operations(operation,host,manifest_digest) VALUES (%s,%s,%s)',
                         ('another','release-host','c'*64))

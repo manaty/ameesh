@@ -1344,14 +1344,18 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
     (`observations` is not installed): a verifier that requires it refuses
     `source-unavailable` (fail-closed), never a default agreement.
 
-    * `milestones`: `{id, kind, sha, verdict, note}`;
+    * `milestones`: `{id, kind, sha, verdict, note, actor}` — the actor is
+      projected (#1994): C assigns the verdict per actor (`_current_verdict`),
+      and a verdict without an actor is not a review;
     * `receipts`: accepted receipts (`command_id` not null) — `{accepted, guard,
       event_id, command_id, workflow_stage, workflow_version, sha256,
       evidence, facts}`; `guard` is the Process guard, or the reserved name of
       the verifier (`hold`, `revision_transfer`);
     * `decisions`: open native decision requests, `{id, kind, payload,
       work_item_id}` (L233);
-    * `deliveries`: native `delivered` milestones, `{id, sha, accepted}`.
+    * `deliveries`: native `delivered` milestones, `{id, sha, accepted}` — `id`
+      is projected as a string (#1994): it is the client reference that C
+      compares.
     """
     if not isinstance(context, VerificationContext):
         raise RegistryRefusal("verifier-invalid", "VerificationContext expected")
@@ -1360,9 +1364,9 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
     milestones = [
         {"id": int(row["id"]), "kind": str(row["kind"]),
          "sha": str(row["sha"] or ""), "verdict": row["verdict"],
-         "note": str(row["note"] or "")}
+         "note": str(row["note"] or ""), "actor": str(row["actor"] or "")}
         for row in db.query(
-            "SELECT id, kind, sha, verdict, note FROM work_item_milestones"
+            "SELECT id, kind, sha, verdict, note, actor FROM work_item_milestones"
             " WHERE work_item_id = %s ORDER BY id", (item_id,))]
     receipts: list[dict[str, Any]] = []
     for row in db.query(
@@ -1403,7 +1407,7 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
             "   AND (payload -> 'decision') IS NOT NULL"
             "   AND btrim(work_item_id) = %s ORDER BY id", (str(item_id),))]
     deliveries = [
-        {"id": int(row["id"]), "sha": str(row["sha"] or ""), "accepted": True}
+        {"id": str(row["id"]), "sha": str(row["sha"] or ""), "accepted": True}
         for row in db.query(
             "SELECT id, sha FROM work_item_milestones"
             " WHERE work_item_id = %s AND kind = 'delivered' ORDER BY id",

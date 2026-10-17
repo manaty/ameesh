@@ -24,6 +24,7 @@ import unittest
 from unittest import mock
 
 from ameesh import background, config as config_mod, mail, platform, registry, storage
+from ameesh.platform import turn_cgroup
 from ameesh.runner import AgentWorker, Runner
 
 from .support import EMPTY_CONFIG, FAKEBIN, PgTestCase
@@ -368,7 +369,7 @@ class GraceTest(_Base):
         pidfile = os.path.join(self.tmp, "detached.pid")
         ready = os.path.join(self.tmp, "detached.ready")
 
-        def failed_scan(turn_id, pgid, *, handles):
+        def failed_scan(turn_id, pgid, *, handles, cgroup=None):
             # Detach an already captured real child before failing the handoff.
             with open(pidfile) as f:
                 pid = int(f.read())
@@ -403,8 +404,9 @@ class GraceTest(_Base):
         pidfile = os.path.join(self.tmp, "migrated.pid")
         ready = os.path.join(self.tmp, "migrated.ready")
         foreign_turn = "foreign-live-turn"
+        seen: dict = {}
 
-        def failed_scan(turn_id, pgid, *, handles):
+        def failed_scan(turn_id, pgid, *, handles, cgroup=None):
             with open(pidfile) as f:
                 pid = int(f.read())
             self.assertIn(pid, handles)
@@ -413,6 +415,25 @@ class GraceTest(_Base):
                 foreign_turn, "other-agent", runner.host, pgid=pid, label="foreign")
             os.kill(pid, signal.SIGUSR1)
             self.wait_for(lambda: os.getpgid(pid) == pid, timeout=5)
+            if cgroup:
+                # L498 : la propriété est le cgroup, pas le pgid. Une migration
+                # réelle sort l'enfant du cgroup du tour (sinon le kill du tour
+                # l'emporte, à raison) ; sur un hôte non délégué, `cgroup` est
+                # None et la revendication PID/PGID suffit.
+                root = str(cgroup).rsplit("/", 1)[0]
+                foreign = turn_cgroup.create(root, foreign_turn)
+                self.assertIsNotNone(foreign, "foreign turn cgroup not created")
+                procs = os.path.join(turn_cgroup.CGROUP_ROOT,
+                                     str(foreign).lstrip("/"), "cgroup.procs")
+                with open(procs, "w", encoding="ascii") as fh:
+                    fh.write(str(pid))
+
+                def moved():
+                    with open(procs, encoding="ascii") as fh:
+                        return str(pid) in fh.read().split()
+
+                self.wait_for(moved, timeout=5)
+                seen["foreign"] = foreign
             raise RuntimeError("handoff table unavailable")
 
         # A process can only join a group in its own session. This foreign
@@ -433,6 +454,9 @@ class GraceTest(_Base):
                               (worker.name,))[0]["turn_id"])
             self.assertEqual(resource["status"], "orphan")
         finally:
+            foreign = seen.get("foreign")
+            if foreign:  # le cgroup étranger porte l'enfant : c'est lui qui le tue
+                turn_cgroup.kill(foreign, timeout=2.0)
             if os.path.exists(pidfile):
                 with open(pidfile) as f:
                     migrated = int(f.read())

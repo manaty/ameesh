@@ -266,6 +266,45 @@ class SharedReadsTest(unittest.TestCase):
         gc.collect()
         self.assertEqual(self.reads().counters()["hits"], 2)
 
+    def test_flush_reads_ecrit_les_compteurs_du_passage(self):
+        """#1813 : `flush_reads` (fin de passage du Watcher) écrit les compteurs
+        des caches vivants, sans attendre la requête réelle suivante."""
+        reads = self.reads()
+        reads.count("hits", 3)
+        self.assertFalse(os.path.exists(reads._quota_path))
+        self.assertGreaterEqual(plan_github.flush_reads(self.dir.name), 1)
+        self.assertEqual(self.reads().counters()["hits"], 3)
+        # un second passage sans nouveau hit n'écrit rien
+        before = os.path.getmtime(reads._quota_path)
+        plan_github.flush_reads(self.dir.name)
+        self.assertEqual(os.path.getmtime(reads._quota_path), before)
+
+    def test_flush_reads_ignore_un_autre_etat(self):
+        """#1813 : le passage d'un hôte ne vide pas les compteurs d'un autre."""
+        reads = self.reads()
+        reads.count("hits", 1)
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        self.assertEqual(plan_github.flush_reads(other.name), 0)
+        self.assertEqual(plan_github.flush_reads(""), 0)
+        self.assertFalse(os.path.exists(reads._quota_path))
+        self.assertEqual(reads.counters()["hits"], 1)
+
+    def test_count_atomique_entre_fils(self):
+        """#1813 : un client partagé entre fils ne perd pas de compteur."""
+        reads = self.reads()
+
+        def bump():
+            for _ in range(200):
+                reads.count("hits")
+
+        threads = [threading.Thread(target=bump) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(reads.counters()["hits"], 800)
+
     # -- #1927 : un incrément concurrent ne se perd pas entre fusion et purge --
 
     def _during_write(self, quota_path, trigger):
@@ -421,6 +460,20 @@ class SharedReadsTest(unittest.TestCase):
             self.assertNotIn(token, name, "le jeton est dans un nom de fichier")
             with open(os.path.join(reads_dir, name), encoding="utf-8") as fh:
                 self.assertNotIn(token, fh.read(), "le jeton est dans le cache")
+
+
+class WatcherFlushTest(unittest.TestCase):
+    """#1813 : le passage du Watcher écrit les compteurs du cache partagé."""
+
+    def test_le_passage_ecrit_les_compteurs_meme_sans_depot(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            reads = plan_github.SharedReads(state_dir)
+            reads.count("hits", 4)
+            cfg = SimpleNamespace(state_dir=state_dir, github={}, host="h")
+            watcher = ci.Watcher(cfg, api=lambda path: {})
+            with mock.patch.object(watcher, "repos", return_value=[]):
+                self.assertEqual(watcher.tick(None), [])
+            self.assertEqual(plan_github.SharedReads(state_dir).counters()["hits"], 4)
 
 
 class ApiTest(unittest.TestCase):

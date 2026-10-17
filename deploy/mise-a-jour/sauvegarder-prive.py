@@ -33,6 +33,34 @@ def run(args, *, env=None):
         raise BackupError("backup subprocess failed: " + Path(args[0]).name) from None
 
 
+def private_parent(path, what):
+    """Create or tighten a private directory, never narrow a shared one.
+
+    A directory this process owns is narrowed to 0700 (an installer may have
+    created it 0755). A shared directory — another owner's, world-writable or
+    sticky, like `/tmp` — is refused as it is: its mode is never changed under
+    whoever else is using it, whatever uid this helper runs as.
+    """
+    path = Path(path)
+    try:
+        path.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        pass
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise BackupError(what + " must be a private owned directory") from None
+    try:
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid() or info.st_mode & (stat.S_IWOTH | stat.S_ISVTX):
+            raise BackupError(what + " must be a private owned directory")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+    return path
+
+
 def parameters_from(config):
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
     parameters = conninfo_to_dict(json.loads(Path(config).read_text())["dsn"])
@@ -76,8 +104,7 @@ def dump(config, output):
 
 def dump_parameters(parameters, output, *, snapshot=None):
     output = Path(output)
-    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    output.parent.chmod(0o700)
+    private_parent(output.parent, "backup directory")
     if os.path.lexists(output):
         raise BackupError("backup destination already exists")
     with tempfile.TemporaryDirectory(prefix=".backup-", dir=output.parent) as staging:
@@ -171,12 +198,76 @@ def digest(path):
     return result.hexdigest()
 
 
+VERIFY_PREFIX = "ameesh_verify_"
+VERIFY_MARKER = re.compile(r"\.verify-([0-9a-f]{32})\.json\Z")
+
+
+def verify_marker(parent, database):
+    """The private durable intent naming one disposable verification database."""
+    return Path(parent) / (".verify-" + database[len(VERIFY_PREFIX):] + ".json")
+
+
+def read_verify_marker(path):
+    """Return the database named by one marker, or None when it is not ours.
+
+    A marker is only trusted about a database this module creates: exact name,
+    private owned regular file, no other key. Anything else is left alone, so a
+    tampered document can never aim a DROP at a live database.
+    """
+    match = VERIFY_MARKER.fullmatch(path.name)
+    if match is None:
+        return None
+    try:
+        info = path.lstat()
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077):
+            return None
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    database = VERIFY_PREFIX + match.group(1)
+    if not isinstance(value, dict) or value != {"database": database}:
+        return None
+    return database
+
+
+def write_verify_marker(path, database):
+    """Record, before CREATE, the disposable database a kill would leave behind."""
+    with path.open("x") as stream:
+        path.chmod(0o600)
+        stream.write(json.dumps({"database": database}, sort_keys=True))
+        stream.flush()
+        os.fsync(stream.fileno())
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def reap_verify_databases(admin, parent):
+    """Drop the recorded databases of verifications killed before cleanup.
+
+    The retention directory is private to one host and every verification of
+    that host is serialised by the controller, so a marker can only name a
+    disposable database whose verifying process is gone.
+    """
+    from psycopg import sql
+    for path in sorted(Path(parent).glob(".verify-*.json")):
+        database = read_verify_marker(path)
+        if database is None:
+            continue
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(database)))
+        path.unlink(missing_ok=True)
+
+
 def verify_restore(config, archive, expected):
     """Restore only into a new random database, checking the pinned inventory.
 
     config is the separately approved restore identity, never a runner DSN.
     expected is a private inventory captured with the source backup snapshot.
-    No restore, clean or DROP command can target an existing database.
+    No restore, clean or DROP command can target a database this module did not
+    create: only the exact names carried by its own private markers are reaped.
     """
     import psycopg
     from psycopg import sql
@@ -194,9 +285,18 @@ def verify_restore(config, archive, expected):
     if sha != expected.get("artifact_sha256"):
         raise BackupError("restore artifact digest mismatch")
     parameters = parameters_from(config)
-    database = "ameesh_verify_" + uuid.uuid4().hex
+    database = VERIFY_PREFIX + uuid.uuid4().hex
+    marker = verify_marker(archive.parent, database)
     # In-process libpq receives credentials directly; they never become argv.
     with psycopg.connect(make_conninfo(**parameters), autocommit=True) as admin:
+        # A verification killed between CREATE and DROP names its database in a
+        # private marker; reaping it here is the cleanup that survives the kill,
+        # and it runs before another cleartext copy is created.
+        reap_verify_databases(admin, archive.parent)
+        try:
+            write_verify_marker(marker, database)
+        except OSError:
+            raise BackupError("restore cleanup marker unavailable") from None
         created = False
         try:
             admin.execute(sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(database)))
@@ -221,6 +321,7 @@ def verify_restore(config, archive, expected):
         finally:
             if created:
                 admin.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
+            marker.unlink(missing_ok=True)
     # A cleanup failure prevents a verified result as well.
     return {"artifact_sha256": sha, "restore_verified": True, "disposable_database_removed": True}
 
@@ -296,9 +397,8 @@ def upload(archive, host, *, receipt=None, credentials=None, staging=None):
             raise BackupError("private owned receipt directory required")
         sha = digest(archive)
     # The caller provides on-disk staging; never fall back to a shared tmpfs.
-    staging_root = Path(staging) if staging is not None else Path(os.environ["TMPDIR"])
-    staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    staging_root.chmod(0o700)
+    staging_root = private_parent(Path(staging) if staging is not None else Path(os.environ["TMPDIR"]),
+                                  "upload staging directory")
     with tempfile.TemporaryDirectory(prefix="backup-upload-", dir=staging_root) as workspace:
         curl_config = Path(workspace) / "curl.conf"
         with curl_config.open("x") as stream:
@@ -370,8 +470,7 @@ def retrieve(credentials, host, name, sha256, output, *, version_id=None):
     if version_id is not None:
         object_version(version_id)
     output = Path(output)
-    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    output.parent.chmod(0o700)
+    private_parent(output.parent, "recovery destination directory")
     if os.path.lexists(output):
         raise BackupError("recovery destination already exists")
     with tempfile.TemporaryDirectory(prefix=".recovery-", dir=output.parent) as staging:
