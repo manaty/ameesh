@@ -505,6 +505,23 @@ class GelPlanTest(GelTestCase):
                 self.assertIn("integration-paquet-h-20261017-0600.md",
                               str(caught.exception))
 
+    def test_un_avis_zero_full_refuse_un_repertoire_nomme_comme_le_manifeste(self):
+        manifest = "integration-paquet-h-20261017-0600.md"
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                     manifest=manifest)
+
+        def directory_api(path):
+            rows = api(path)
+            if "/contents/reviews?" in path:
+                return [{**row, "type": "dir"} if row["name"] == manifest else row
+                        for row in rows]
+            return rows
+
+        with self.assertRaises(ci.GelError):
+            self.gel(directory_api, avis=0, full=True, reason="porteur sans fichier manifeste")
+        self.assertFalse(any("/contents/.github/workflows/" in path for path in api.paths),
+                         "aucune CI sans fichier manifeste")
+
     def test_un_avis_zero_full_passe_sur_porteur_et_son_manifeste(self):
         # N1 #2240 (b) : le porteur `integration/**` qui publie son manifeste
         # à la tête demande la suite complète sans avis sur la tête composée.

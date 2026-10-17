@@ -2207,7 +2207,7 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
 
 
 def _reviews_at(api, repo: str, ref: str) -> set[str] | None:
-    """Les noms du dossier `reviews/` à `ref`, ou None s'il est illisible."""
+    """Les fichiers du dossier `reviews/` à `ref`, ou None s'il est illisible."""
     from . import plan_github
     try:
         data = api("repos/%s/contents/reviews?ref=%s" % (repo, _q(ref)))
@@ -2215,7 +2215,8 @@ def _reviews_at(api, repo: str, ref: str) -> set[str] | None:
         return None
     if not isinstance(data, list):
         return None
-    return {str((item or {}).get("name") or "") for item in data if isinstance(item, dict)}
+    return {str(item.get("name") or "") for item in data
+            if isinstance(item, dict) and item.get("type") == "file"}
 
 
 def _manifest_name(head_ref: str) -> str:
