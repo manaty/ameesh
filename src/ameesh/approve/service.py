@@ -49,7 +49,7 @@ from . import duplicate, enroll, render
 from . import config as config_mod
 from .config import ApproveConfig
 from .sources import ACTION_ID_RE, REQUESTABLE_STATES, ActionSource, ActionSourceError
-from .store import Store, new_login_id, new_request_id, new_token
+from .store import Store, new_login_id, new_request_id, new_token, token_hash
 
 log = logging.getLogger("ameesh.approve")
 
@@ -521,6 +521,10 @@ class ApproveService:
         except receipts.ReceiptError as exc:
             raise ApproveError(400, "format", str(exc)) from exc
         token = new_token()
+        # N3 (#2178) : capacité de clôture propre à CE défi. Le jeton global de
+        # l'API des défis reste nécessaire, mais ne suffit plus à fermer le
+        # défi d'un autre gardien : seul le créateur a reçu cette valeur.
+        close_token = new_token()
         record = {
             "login_id": login_id,
             "request": request,
@@ -528,6 +532,7 @@ class ApproveService:
             "link_exp": request["exp"],     # le lien vit exactement le défi
             "exp": request["exp"],
             "created": now,
+            "close_token_hash": token_hash(close_token),
         }
         # B3 (#366) : une seule opération vivante par tuple, réservée AVANT
         # l'écriture publique — deux invocations concurrentes (processus
@@ -550,6 +555,8 @@ class ApproveService:
         return {
             "login_id": login_id,
             "link": self._link("login", token),
+            # rendu une seule fois, à la création : jamais journalisé
+            "close_token": close_token,
             "link_exp": record["link_exp"],
             "exp": request["exp"],
             "host": host,
@@ -661,14 +668,20 @@ class ApproveService:
                  verdict.approver)
         return {"login_id": record["login_id"], "decision": decision}
 
-    def close_login(self, login_id) -> dict:
+    def close_login(self, login_id, close_token=None) -> dict:
         """Clôture TECHNIQUE d'un défi, demandée par le superviseur (jeton de
-        l'API des défis) : marque clos, efface la charge privée, libère la
-        réservation. N'écrit AUCUN reçu humain ; le lien et toute assertion
-        tardive sont ensuite refusés par `_live_login`."""
+        l'API des défis) ET titulaire de la capacité de clôture de CE défi
+        (N3) : marque clos, efface la charge privée, libère la réservation.
+        N'écrit AUCUN reçu humain ; le lien et toute assertion tardive sont
+        ensuite refusés par `_live_login`."""
         record = self.store.get_login(login_id) if isinstance(login_id, str) else None
         if record is None:
             raise ApproveError(404, "unknown_request", "unknown challenge")
+        expected = str(record.get("close_token_hash") or "")
+        presented = token_hash(close_token) if isinstance(close_token, str) and close_token else ""
+        if not expected or not presented or not hmac.compare_digest(expected, presented):
+            raise ApproveError(403, "close_token",
+                               "close capability missing or invalid for this challenge")
         written = self.store.close_login(record["login_id"])
         log.info("login %s: technical closure by the login API", record["login_id"])
         return {"login_id": record["login_id"], "closed": True, "was_open": bool(written)}

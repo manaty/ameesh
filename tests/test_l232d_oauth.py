@@ -136,13 +136,14 @@ class FlowTest(unittest.TestCase):
 class EnvTest(unittest.TestCase):
     def test_environnement_epure(self):
         base = {"PATH": "/bin", "HOME": "/tmp/x", "GH_TOKEN": "secret",
-                "GITHUB_TOKEN": "secret", "ANTHROPIC_API_KEY": "sk-secret",
+                "GITHUB_TOKEN": "secret", "GH_HOST": "evil.example",
+                "ANTHROPIC_API_KEY": "sk-secret",
                 "OPENAI_API_KEY": "sk-secret", "BROWSER": "firefox"}
         env = login.login_env(login.ADAPTERS["gh"], "/srv/gh", base)
         self.assertEqual(env["PATH"], "/bin")
         self.assertEqual(env["GH_CONFIG_DIR"], "/srv/gh")
         self.assertEqual(env["NO_COLOR"], "1")
-        for name in ("GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY",
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "ANTHROPIC_API_KEY",
                      "OPENAI_API_KEY", "BROWSER"):
             self.assertNotIn(name, env)
         # la base n'est jamais modifiée
@@ -198,16 +199,42 @@ class FakeCliTest(unittest.TestCase):
 
 class SupervisorTest(FakeCliTest):
     def test_le_groupe_est_tue_meme_si_son_chef_est_deja_sorti(self):
+        """N1 : la sortie est observée SANS récolter, donc le zombie garde le
+        PID (et le pgid) pendant le killpg de nettoyage."""
         sup = login.Supervisor(grace=0)
         request = sup.registry.open(host="h", harness="codex", account="default")
-        proc = mock.Mock(pid=424242)
-        proc.poll.return_value = 0
+        proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.assertTrue(wait_for(lambda: login.exited_child_status(proc.pid) is not None))
         sup._procs[request.id] = proc
-        with mock.patch.object(login.os, "getpgid", side_effect=ProcessLookupError), \
-                mock.patch.object(login.os, "killpg") as kill:
+        with mock.patch.object(login.os, "killpg") as kill:
             sup.finish(request.id, "cancel")
         kill.assert_any_call(proc.pid, login.signal.SIGTERM)
         kill.assert_any_call(proc.pid, login.signal.SIGKILL)
+        self.assertIsNotNone(proc.returncode)
+
+    def test_un_chef_recolte_n_est_jamais_signale(self):
+        """N1 : un PID déjà récolté peut être recyclé ; on ne le signale pas."""
+        sup = login.Supervisor(grace=0)
+        request = sup.registry.open(host="h", harness="codex", account="default")
+        proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        proc.wait(timeout=5)          # récolté : le PID est réutilisable
+        sup._procs[request.id] = proc
+        with mock.patch.object(login.os, "killpg") as kill:
+            sup._terminate(request)
+        kill.assert_not_called()
+        self.assertNotIn(request.id, sup._procs)
+
+    def test_close_ne_renvoie_pas_de_cloture_pour_une_demande_close(self):
+        """N4 : une demande déjà close healthy n'appelle plus le service."""
+        sup = login.Supervisor(invalidate=mock.Mock())
+        request = sup.registry.open(host="h", harness="gh", account="a")
+        request.login_id = "lgn_" + "a" * 26
+        sup.registry.finish(request, login.DONE, "healthy")
+        sup._threads[request.id] = mock.Mock()
+        sup.close()
+        sup.invalidate.assert_not_called()
+        self.assertNotIn(request.id, sup._threads)
 
     def test_gh_publie_le_flux_prive_puis_done(self):
         # la fin fournisseur est prouvee par la sortie propre du CLI (code 0)
@@ -504,6 +531,22 @@ class SupervisorTest(FakeCliTest):
 
 
 class SupervisorClosureRaceTest(unittest.TestCase):
+    def test_sortie_fournisseur_non_nulle_invalide_le_defi_une_fois(self):
+        invalidated = []
+        sup = login.Supervisor(invalidate=lambda request: invalidated.append(request.login_id))
+        request = sup.registry.open(host="h", harness="gh", account="a")
+        remote_id = "lgn_" + "a" * 26
+        sup.registry.published(request, remote_id, close_token="x" * 43)
+        proc = mock.Mock(returncode=1)
+        sup._threads[request.id] = mock.Mock()
+
+        sup._settle(request, proc)
+        self.assertEqual((request.state, request.category),
+                         (login.FAILED, "provider_refused"))
+        self.assertEqual(invalidated, [remote_id])
+        sup.close()
+        self.assertEqual(invalidated, [remote_id])
+
     def test_publication_revenue_apres_annulation_est_invalidee(self):
         invalidated = []
         sup = login.Supervisor(invalidate=lambda request: invalidated.append(request.login_id))
@@ -524,14 +567,63 @@ class SupervisorClosureRaceTest(unittest.TestCase):
     def test_done_nettoie_le_groupe_apres_sortie_reussie_du_chef(self):
         sup = login.Supervisor(health=lambda _request: "healthy", grace=0)
         request = sup.registry.open(host="h", harness="gh", account="a")
-        proc = mock.Mock(pid=424242)
-        proc.poll.return_value = 0
+        proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.assertTrue(wait_for(lambda: login.exited_child_status(proc.pid) is not None))
         sup._procs[request.id] = proc
         with mock.patch.object(login.os, "killpg") as kill:
             done = sup.finish(request.id, "done")
         self.assertEqual(done.category, "healthy")
         kill.assert_any_call(proc.pid, login.signal.SIGTERM)
         kill.assert_any_call(proc.pid, login.signal.SIGKILL)
+        self.assertEqual(proc.returncode, 0)
+
+    def _sans_waitid(self, proc, forward=False):
+        """Repli sans waitid(WNOWAIT) : journal ordonné des récoltes et signaux."""
+        events = []
+        poll = proc.poll
+        real_killpg = os.killpg
+
+        def logged_killpg(pgid, sig):
+            events.append(sig)
+            if forward:
+                real_killpg(pgid, sig)
+
+        def logged_poll():
+            before = proc.returncode
+            status = poll()
+            if before is None and status is not None:
+                events.append("reap")
+            return status
+        proc.poll = logged_poll
+        for patcher in (mock.patch.object(login, "PEEK_EXIT", False),
+                        mock.patch.object(login.os, "killpg", side_effect=logged_killpg)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return events
+
+    def test_done_sans_waitid_tue_le_groupe_des_la_recolte(self):
+        sup = login.Supervisor(health=lambda _request: "healthy", grace=0)
+        request = sup.registry.open(host="h", harness="gh", account="a")
+        proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        sup._procs[request.id] = proc
+        events = self._sans_waitid(proc)
+        done = sup.finish(request.id, "done")
+        self.assertEqual(done.category, "healthy")
+        self.assertEqual(events, ["reap", login.signal.SIGKILL])
+        self.assertEqual(proc.returncode, 0)
+
+    def test_terminate_sans_waitid_ne_signale_plus_apres_la_recolte(self):
+        sup = login.Supervisor(grace=5)
+        request = sup.registry.open(host="h", harness="codex", account="default")
+        proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        sup._procs[request.id] = proc
+        events = self._sans_waitid(proc, forward=True)
+        sup.finish(request.id, "cancel")
+        self.assertEqual(events, [login.signal.SIGTERM, "reap", login.signal.SIGKILL])
+        self.assertIsNotNone(proc.returncode)
 
 
 class ReceiptTest(unittest.TestCase):

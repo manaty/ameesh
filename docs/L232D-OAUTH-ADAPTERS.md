@@ -66,6 +66,11 @@ never an environment variable:
   by the agents would degrade the confinement back to a declared-only claim.
 - the ameesh client reads `AMEESH_LOGIN_TOKEN_FILE` (`login_token_file`);
   without it, `ameesh accounts login` refuses before publishing.
+- each challenge also gets a **close capability** (`close_token`, 256 bits)
+  returned once to its creator. `POST /login-close/<id>` requires that
+  capability *and* the dedicated token: a guardian cannot close another
+  guardian's challenge, and the capability is never logged, stored in the
+  clear or shown by the public view (N3, #2178).
 
 The page states what the service actually knows: the host and the requester
 are shown as **"declared by the caller, not verified"**, and the private view
@@ -123,6 +128,48 @@ verdict is written to `credential_health` for the next placement or handoff
 only `sentinel | turn | manual | relay`, and the on-demand pass already writes
 `sentinel` with these probes. A distinct `login` source would need a migration.
 
+## Hardening after the pilot (lot #2178)
+
+The five non-blocking findings of the #366 security review are addressed here,
+with the N1 fallback limitation below; none changes the activation preconditions
+of #366.
+
+- **Safe process-group cleanup (N1).** The supervisor observes the provider
+  exit with `waitid(WNOWAIT)` and does **not** reap the leader before killing
+  the group: the zombie keeps the PID (hence the session pgid) reserved, so
+  `killpg` cannot target a recycled PID. A leader already reaped is never
+  signalled; the cleanup is local only. A clean exit 0 stays a zombie until
+  `done`/`cancel`/`close`, which then kills leftover children and reaps it.
+  Without `waitid(WNOWAIT)` (including macOS with Python before 3.13), the
+  fallback uses `proc.poll()` and immediately kills the remaining group.
+  This retains a theoretical PID reuse window between reaping and `killpg`;
+  N1 is not fully resolved on these platforms.
+- **No redundant remote closure (N4).** `Supervisor.close()` skips requests
+  already terminal: no `close_login` call and no `technical closure` log line
+  for a challenge already `healthy`/closed; only local references are dropped.
+- **Fresh credential proof (N2).** The credential fingerprint (a truncated
+  SHA-256, never a secret) is read **before** the CLI starts. A healthy probe
+  only becomes `healthy` when the post-login fingerprint is present and
+  differs (or no credential existed before); the same fingerprint never
+  proves a new login, and no row is overwritten in that case. For `gh` the
+  fingerprint is that of the **effective github.com token**
+  (`gh auth token --hostname github.com`, so `hosts.yml` or the keyring), not
+  of the `hosts.yml` file: a comment in the file no longer fakes a new
+  credential. When no token can be read (locked keyring, no token), the
+  verdict carries no fingerprint and the fresh-credential proof is refused.
+  The effective token is read again after the health probe; a change makes
+  the verdict `unknown`, so one token's health cannot validate another.
+- **`gh` probe pinned to github.com (N5).** `probe_health("gh")` and the
+  sentinel's `gh` pass run `gh auth status --hostname github.com`, and
+  `login_env` drops `GH_HOST`; another host can no longer make the
+  `credential_health` line look healthy.
+- **Cleaned version probe (N6).** `pinned_version` runs `<cli> --version` with
+  the same cleaned environment as the login (`login_env`): inherited
+  `GH_TOKEN`, `ANTHROPIC_API_KEY`, … are not visible to the probe.
+- **Per-challenge close capability (N3).** See the login-API section above:
+  the dedicated token no longer suffices to close another guardian's
+  challenge.
+
 Observable categories (never a value, never a digest): `already_pending`,
 `unsupported_version`, `flow_unrecognized`, `expired`, `cancelled`,
 `provider_refused`, `healthy`, `failed`.
@@ -133,15 +180,20 @@ Targeted tests of the slice, no full suite:
 
 - `tests/test_l232d_oauth.py` — pinned commands, flow parsing, cleaned
   environment, one live request, expiry/cancel/refusal categories, process
-  group termination, receipt binding and publisher.
+  group termination without reaping the leader, close of an already terminal
+  request without a remote call, receipt binding and publisher.
 - `tests/test_l232d_challenge_view.py` — the private challenge kind in the real
   service (mute link, assertion, private view, signed receipt, nonce replay),
   the honest page wording, and the login-API confinement: closed by default
   (`403 login_api_closed`), the team service token refused (`401`), the
-  dedicated login token the only one accepted.
+  dedicated login token the only one accepted, and the per-challenge close
+  capability required (N3).
 - `tests/test_l232d_accounts_login.py` — CLI helpers (identity, profile,
-  private home, version pinning, refusals).
-- `tests/test_l232d_credential_health.py` — post-login health writing.
+  private home, version pinning with the cleaned environment, refusals).
+- `tests/test_l232d_credential_health.py` — post-login health writing, the
+  fresh-credential fingerprint proof (N2) including the `gh` effective-token
+  fingerprint (keyring included, no fallback to `hosts.yml` on a comment or a
+  missing token), and the `gh` probe bound to `--hostname github.com` (N5).
 - `tests/test_l232d_login_e2e.py` — the whole chain against the **real**
   service on loopback with a migrated database: fake codex CLI → real
   `POST /login-requests` → WebAuthn assertion → private view → `done` → real

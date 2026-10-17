@@ -15,10 +15,12 @@ Routes :
                               JSON du service) ; le jeton de service de
                               l'équipe n'y est JAMAIS accepté (avis B1 dev4)
     GET  /login-receipts/<id> jeton de connexion — le reçu du défi (200|202|410)
-    POST /login-close/<id>    jeton de connexion — clôture TECHNIQUE demandée
-                              par le superviseur : efface l'URL et le code,
-                              libère la réservation, refuse lien/assertion
-                              tardifs ; n'écrit jamais de reçu humain
+    POST /login-close/<id>    jeton de connexion + capacité de clôture du défi
+                              (`close_token`, rendu une fois à la création) —
+                              clôture TECHNIQUE demandée par le superviseur :
+                              efface l'URL et le code, libère la réservation,
+                              refuse lien/assertion tardifs ; n'écrit jamais
+                              de reçu humain
     GET  /a/<jeton>           page d'approbation
     POST /a/<jeton>           assertion WebAuthn → reçu (approve | deny)
     GET  /login/<jeton>       page du défi : sans URL ni code (lien muet)
@@ -45,6 +47,10 @@ En plus :
   des agents) est accepté — jamais le jeton de service de l'équipe, partagé
   par tous ses agents : l'humain signerait un code d'appareil généré
   ailleurs, présenté comme venant de l'hôte déclaré (avis sécurité B1) ;
+* clôture d'un défi : le jeton dédié ne suffit pas, il faut la capacité
+  `close_token` rendue au seul créateur du défi (N3, #2178) — un gardien ne
+  ferme pas le défi d'un autre ; la capacité n'est ni journalisée ni rendue
+  par la vue publique ;
 * POST humains : `Origin` doit être une origine autorisée (et
   `Sec-Fetch-Site`, s'il est présent, same-origin) ; API : aucun `Origin`
   (un navigateur n'a rien à y faire) ;
@@ -390,7 +396,9 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if kind == "login-api":
             if self.command == "POST":
                 if reference is not None:  # /login-close/<id> : clôture technique
-                    return self._json(200, service.close_login(reference))
+                    body = load_json_body(raw)
+                    return self._json(200, service.close_login(
+                        reference, body.get("close_token")))
                 return self._json(201, service.create_login_request(load_json_body(raw)))
             status, payload = service.login_receipt(reference)
         else:
