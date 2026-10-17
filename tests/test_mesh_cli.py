@@ -358,6 +358,35 @@ class DelaysCliTest(MeshCliTest):
         proc = self.mesh("list", "--json")
         self.assertIsInstance(json.loads(proc.stdout), list)
 
+    def test_gel_effectif_derive_dans_work_show_et_list(self):
+        """#1756 : `show`/`list --freeze` exposent le gel effectif et sa provenance."""
+        self.mesh("work", "add", "--title", "Gel dérivé", "--assignee", AGENT)
+        self.mesh("work", "move", "1", "build")
+        # avis favorable sans gel déclaré : le candidat vient de l'avis
+        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "a" * 40)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        item = json.loads(self.mesh("work", "show", "1", "--json").stdout)
+        self.assertEqual(item["freeze"]["sha"], "a" * 40)
+        self.assertEqual(item["freeze"]["origin"], "verdict")
+        self.assertEqual(item["freeze"]["causes"], [])
+
+        rows = json.loads(self.mesh("work", "list", "--json", "--freeze").stdout)
+        self.assertEqual(rows[0]["freeze"]["sha"], "a" * 40)
+        self.assertEqual(rows[0]["freeze"]["origin"], "verdict")
+        self.assertIsNone(rows[0]["freeze"]["declared"])
+
+        # sans --freeze, la forme de `list --json` ne change pas
+        rows = json.loads(self.mesh("work", "list", "--json").stdout)
+        self.assertNotIn("freeze", rows[0])
+
+        # un gel déclaré sur le même commit l'emporte, en forme complète
+        proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = json.loads(self.mesh("work", "show", "1", "--json").stdout)
+        self.assertEqual(item["freeze"]["origin"], "frozen")
+        self.assertIsNotNone(item["freeze"]["declared"])
+
     def test_lot_filtre_hors_fenetre_garde_ses_delais(self):
         """Un lot ancien filtré garde sa frise, derrière 200 lots récents (B3).
 

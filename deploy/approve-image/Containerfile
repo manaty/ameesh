@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Image `ameesh-approve` : le service d'approbation humaine d'une équipe
+# (profil docs/profils/heberger-ameesh-approve.md, décision 0026).
+# Contrat et politique de mise à jour : docs/IMAGE-APPROVE.md.
+#
+#   docker build -f deploy/approve-image/Containerfile \
+#       --build-arg VERSION=<version> --build-arg REVISION=<sha> \
+#       -t ameesh-approve:dev .
+#   docker run --rm ameesh-approve:dev ameesh-approve --help
+#
+# Contenu : Python slim, ameesh installé depuis ce dépôt (psycopg pour la base,
+# cryptography pour ECDSA), tini comme PID 1. AUCUN SECRET : DSN de la base,
+# jeton de service, certificats TLS et configuration arrivent au lancement
+# (fichiers montés, en 0600, propriétaire du service, ou variables
+# d'environnement).
+#
+# Le service n'écoute QUE sur la boucle locale, en clair (le mandataire inverse
+# termine TLS) ou en TLS local (`AMEESH_APPROVE_TLS_CERT`/`_KEY`). L'image ne
+# peut donc pas être jointe par un autre conteneur : le mandataire inverse doit
+# partager son espace de noms réseau (même pod, ou réseau hôte). Le port 8765
+# n'est qu'une indication.
+#
+# L'état (passkeys, demandes, reçus, propositions) vit dans
+# /var/lib/ameesh-approve, à monter sur un volume persistant ; la base de
+# l'équipe reste externe (AMEESH_DSN).
+
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+
+# --- roue ameesh (le dépôt ne va pas dans l'image finale) --------------------
+FROM ${PYTHON_IMAGE} AS build
+WORKDIR /src
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels .
+
+# --- image d'exécution -------------------------------------------------------
+FROM ${PYTHON_IMAGE}
+
+ARG VERSION=0.0.0
+ARG REVISION=unknown
+
+LABEL org.opencontainers.image.title="ameesh-approve" \
+      org.opencontainers.image.description="Service d'approbation humaine d'une équipe (ameesh-approve serve)" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="https://github.com/manaty/ameesh"
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends tini ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /wheels /wheels
+RUN pip install --no-cache-dir /wheels/ameesh-*.whl 'psycopg[binary]>=3.1' 'cryptography>=41' \
+    && rm -rf /wheels
+
+RUN useradd --uid 10002 --user-group --create-home --home-dir /home/approve \
+        --shell /usr/sbin/nologin approve; \
+    install -d -o approve -g approve -m 0700 /var/lib/ameesh-approve /etc/ameesh-approve
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/home/approve \
+    AMEESH_APPROVE_CONFIG=/etc/ameesh-approve/config.json \
+    AMEESH_APPROVE_STATE=/var/lib/ameesh-approve \
+    AMEESH_APPROVE_BIND=127.0.0.1 \
+    AMEESH_APPROVE_PORT=8765
+
+USER 10002:10002
+WORKDIR /home/approve
+EXPOSE 8765
+
+ENTRYPOINT ["/usr/bin/tini", "--", "ameesh-approve"]
+CMD ["serve"]

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from ameesh import backlog, db as db_mod, notify, storage, work
+from ameesh.storage.postgres.work import WorkItems
 
 from .support import hold_for_owner
 from .test_l119_backlog import HEURE, _Base, _seuils
@@ -133,6 +134,93 @@ class PriseDeLotTest(_Lots):
         self.assertEqual(errors, [])
         self.assertEqual([t["item"]["id"] for t in result], [pret["id"]])
         self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+
+    def test_interblocage_de_prise_laisse_le_lot_libre_et_passe_au_suivant(self):
+        # #1496 : le serveur annule la prise victime d'un interblocage ; le
+        # passage continue comme après une prise perdue entre-temps.
+        self.agent("claude1", team="nexlink")
+        premier = self.lot("premier", priority=1)
+        second = self.lot("second", priority=2)
+        # §4 (#1359) : la prise passe par `assign_capped` (compte des lots en
+        # `build` sous le verrou de l'agent) — c'est lui que le témoin remplace.
+        assign_capped = WorkItems.assign_capped
+        calls = []
+
+        def deadlock_once(store, item_id, *args, **kwargs):
+            calls.append(int(item_id))
+            if int(item_id) == premier["id"]:
+                raise db_mod.DbError("deadlock detected", sqlstate=db_mod.DEADLOCK_DETECTED)
+            return assign_capped(store, item_id, *args, **kwargs)
+
+        with patch.object(WorkItems, "assign_capped", deadlock_once):
+            out = self.take()
+        self.assertEqual(calls, [premier["id"], second["id"]])
+        self.assertEqual([t["item"]["id"] for t in out], [second["id"]])
+        self.assertIsNone(work.get(self.db, premier["id"])["assignee"])
+        self.assertFalse(any(m["work_item_id"] == str(premier["id"])
+                             for m in self.courriers()))
+        # le lot reste éligible : le passage suivant le prend
+        self.agent("claude2", team="nexlink")
+        self.assertEqual([t["item"]["id"] for t in self.take()], [premier["id"]])
+
+    def test_interblocage_de_prise_d_amelioration_passe_au_suivant(self):
+        self.agent("claude1")
+        premier = self.element("premier", 80)
+        second = self.element("second", 40)
+        # §4 (#1359) : la prise passe par `assign_capped` (compte des lots en
+        # `build` sous le verrou de l'agent) — c'est lui que le témoin remplace.
+        assign_capped = WorkItems.assign_capped
+
+        def deadlock_once(store, item_id, *args, **kwargs):
+            if int(item_id) == premier["id"]:
+                raise db_mod.DbError("deadlock detected", sqlstate=db_mod.DEADLOCK_DETECTED)
+            return assign_capped(store, item_id, *args, **kwargs)
+
+        with patch.object(WorkItems, "assign_capped", deadlock_once):
+            out = self.take()
+        self.assertEqual([(t["kind"], t["item"]["id"]) for t in out],
+                         [("backlog", second["id"])])
+        self.assertIsNone(work.get(self.db, premier["id"])["assignee"])
+
+    def test_autre_erreur_de_prise_remonte(self):
+        self.agent("claude1", team="nexlink")
+        self.lot("lot")
+
+        def unique_violation(*args, **kwargs):
+            raise db_mod.DbError("duplicate key", sqlstate=db_mod.UNIQUE_VIOLATION)
+
+        with patch.object(WorkItems, "assign_capped", unique_violation):
+            with self.assertRaises(db_mod.DbError):
+                self.take()
+
+    def test_interblocage_reel_classe_par_le_pilote(self):
+        # Le code 40P01 vient bien du pilote en service (psycopg ou psql),
+        # pas seulement du témoin simulé ci-dessus.
+        lots = [self.lot("verrou%d" % i)["id"] for i in range(2)]
+        barrier = threading.Barrier(2, timeout=15)
+        errors = []
+
+        def cross(first, second):
+            connection = db_mod.connect(self.cfg)
+            try:
+                with connection.transaction() as tx:
+                    tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE", (first,))
+                    barrier.wait()
+                    tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE", (second,))
+            except db_mod.DbError as exc:
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        workers = [threading.Thread(target=cross, args=pair, daemon=True)
+                   for pair in (lots, lots[::-1])]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(30)
+        self.assertFalse(any(w.is_alive() for w in workers), "interblocage non résolu")
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(db_mod.is_deadlock(errors[0]), errors[0].sqlstate)
 
     def test_auditeur_ne_prend_que_les_bugs_hors_instructions_protegees(self):
         self.agent("auditeur", team="ameesh")
@@ -278,7 +366,12 @@ class PriseDeLotTest(_Lots):
             {"state": "intake", "lot_team": "web", "planned_start": "2026-10-11"},
             "2026-10-11"))
 
-    def test_equipe_du_lot_fiche_puis_application(self):
+    def test_prise_par_le_projet_du_lot_pas_par_l_equipe_de_la_fiche(self):
+        """#811 : la prise suit le projet du lot (`app` d'abord, comme le
+        dossier de travail et `projects.lot_project`) ; `lot_team` (équipe du
+        lot, sinon de sa fiche ou de la fiche parente, sinon son application)
+        reste lu pour le personnel et les alertes, il ne route plus la prise —
+        la garde L243 « projet primaire » est levée."""
         self.agent("web1", team="web")
         self.agent("api1", team="api")
         self.db.execute("INSERT INTO work_packages (id, kind, title, team, canon_ref)"
@@ -290,12 +383,17 @@ class PriseDeLotTest(_Lots):
         sans_equipe = self.lot("sans équipe", app="")
         par_app = self.lot("par l'application", app="api")
         rows = {i["id"]: i for i in storage.of(self.db).work.unassigned_lots(10)}
+        # lot_team : équipe de la fiche puis application (stockage inchangé).
         self.assertEqual(rows[par_fiche["id"]]["lot_team"], "web")
         self.assertEqual(rows[par_app["id"]]["lot_team"], "api")
         self.assertIsNone(rows[sans_equipe["id"]]["lot_team"])
         out = self.take()
+        # `par_fiche` a pour projet `app=api` : api1 le prend (le plus ancien
+        # des deux lots api) ; web1 ne déclare pas api et ne prend rien.
         self.assertEqual(sorted((t["agent"], t["item"]["id"]) for t in out),
-                         [("api1", par_app["id"]), ("web1", par_fiche["id"])])
+                         [("api1", par_fiche["id"])])
+        # `par_app` reste à la file : api1 tient déjà un lot non démarré (#540).
+        self.assertIsNone(work.get(self.db, par_app["id"])["assignee"])
         self.assertIsNone(work.get(self.db, sans_equipe["id"])["assignee"])
 
     def test_capacites_et_harnais(self):
@@ -368,6 +466,26 @@ class PriseDeLotTest(_Lots):
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out], [("claude1", lot["id"])])
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
         self.assertEqual(self.courriers(), [])
+
+    def test_assign_if_holder_refuse_un_titulaire_change(self):
+        """#2016 : la réassignation porte le titulaire lu (`if_holder`) ; si le
+        lot a changé de main depuis le relevé, elle est refusée en nommant le
+        porteur courant — deux agents partis du même brief ne se volent plus le
+        lot."""
+        self.agent("claude1", team="nexlink")
+        self.agent("claude2", team="nexlink")
+        lot = self.lot("course d'assignation", assignee="claude1")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.assign(self.db, lot["id"], "claude2", if_holder="claude3")
+        self.assertIn("changed holder since the reading", str(ctx.exception))
+        self.assertIn("now claude1 (expected claude3)", str(ctx.exception))
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "claude1")
+        # le titulaire attendu est bien celui du relevé : la réassignation passe
+        out = work.assign(self.db, lot["id"], "claude2", if_holder="claude1")
+        self.assertEqual(out["item"]["assignee"], "claude2")
+        # sans instantané, le geste explicite reste possible (comportement inchangé)
+        out = work.assign(self.db, lot["id"], "claude1")
+        self.assertEqual(out["item"]["assignee"], "claude1")
 
 
 class NotifyTest(_Lots):
