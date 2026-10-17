@@ -121,10 +121,12 @@ Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
 de compte qui précède chaque tour ; Codex : les journaux de session du
 `CODEX_HOME` du compte. Une fenêtre dont `resets_at` est passé compte pour
 0 % (`Gauge.used_at`, L71) ; une fois **toutes** les fenêtres datées remises à
-zéro, le relevé redevient courant (0 %) et le compte replaçable. Un relevé
-seulement **partiel** ne place plus de session quand il est plus vieux que
-toute fenêtre encore ouverte (#1672, « Fraîcheur du relevé ») ; en deçà, il
-reste plaçable après les relevés courants.
+zéro — et aucune fenêtre non datée encore ouverte, qui ne prouve pas sa remise
+à zéro (#1566 N2) — le relevé redevient courant (0 %) et le compte replaçable.
+Un relevé seulement **partiel** ne place plus de session quand il est plus
+vieux que toute fenêtre encore ouverte (#1672, « Fraîcheur du relevé ») ; en
+deçà, s'il reste **informateur** (`_informative_partial`, #1566 N1), il
+concourt avec les relevés courants et peut passer devant eux.
 
 Chaque choix porte sa raison (`Choice.why`, « no reading: unverified, le plus
 en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
@@ -1586,8 +1588,8 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
     Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
     un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
     laisser un forfait inutilisé. Un relevé dont **toutes** les fenêtres
-    datées sont remises à zéro est courant (L71, 0 %) : le compte est
-    replaçable.
+    datées sont remises à zéro — et aucune fenêtre non datée encore ouverte
+    (#1566 N2) — est courant (L71, 0 %) : le compte est replaçable.
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
