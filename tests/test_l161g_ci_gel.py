@@ -193,13 +193,15 @@ class Github:
     """Les lectures GitHub de `gel_plan`/`cancel_plan`/`cmd_ci_run`, sans réseau."""
 
     def __init__(self, *, head: str = GEL, runs=(), workflow: str | None = WORKFLOW,
-                 pulls=None, checks=None, manifest: str | None = None):
+                 pulls=None, checks=None, manifest: str | None = None,
+                 base_reviews=("integration-paquet-h-20261017-0500.md",)):
         self.head = head
         self.runs = list(runs)
         self.workflow = workflow
         self.pulls = [pull()] if pulls is None else pulls
         self.checks = {"check_runs": [check_run()]} if checks is None else checks
         self.manifest = manifest
+        self.base_reviews = list(base_reviews)
         self.paths: list[str] = []
 
     def rows(self) -> list[dict]:
@@ -241,9 +243,12 @@ class Github:
             # N1 #2240 : le manifeste de composition du porteur, lu à la tête.
             # Sans manifeste, GitHub rend un 404 que `_json` lève en
             # `GithubError` ; le faux rend une liste vide, même verdict.
-            if self.manifest is None:
-                return {}
-            return [{"name": self.manifest, "type": "file"}]
+            # La base porte déjà les manifestes des paquets fusionnés ; la tête
+            # en hérite, plus le sien (R1 ameesh-dev1).
+            noms = list(self.base_reviews)
+            if "ref=%s" % BASE not in path and self.manifest is not None:
+                noms.append(self.manifest)
+            return [{"name": n, "type": "file"} for n in noms]
         if "/check-runs?" in path:
             return self.checks
         raise AssertionError("chemin GitHub inattendu : %s" % path)
@@ -483,6 +488,23 @@ class GelPlanTest(GelTestCase):
         self.assertIn("manifest", str(caught.exception))
         self.assertIn(GEL[:12], str(caught.exception))
 
+    def test_un_avis_zero_full_refuse_un_manifeste_herite_ou_d_un_autre(self):
+        # R1 ameesh-dev1 : `main` porte les manifestes des paquets fusionnés ;
+        # un porteur qui n'en publie pas un à son nom, nouveau, est refusé.
+        for manifeste, base in (
+                ("integration-paquet-h-20261017-0500.md", ()),
+                ("integration-paquet-h-20261017-0600.md",
+                 ("integration-paquet-h-20261017-0600.md",))):
+            with self.subTest(manifeste=manifeste, base=base):
+                self.gele()
+                api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                             manifest=manifeste, base_reviews=base)
+                with self.assertRaises(ci.GelError) as caught:
+                    self.gel(api, avis=0, full=True,
+                             reason="porteur, unités relues au manifeste")
+                self.assertIn("integration-paquet-h-20261017-0600.md",
+                              str(caught.exception))
+
     def test_un_avis_zero_full_passe_sur_porteur_et_son_manifeste(self):
         # N1 #2240 (b) : le porteur `integration/**` qui publie son manifeste
         # à la tête demande la suite complète sans avis sur la tête composée.
@@ -494,6 +516,7 @@ class GelPlanTest(GelTestCase):
         self.assertEqual((decision["action"], decision["mode"], decision["avis"]),
                          ("request", "full", 0))
         self.assertIn("contents/reviews?ref=%s" % GEL, " ".join(api.paths))
+        self.assertIn("contents/reviews?ref=%s" % BASE, " ".join(api.paths))
 
     def test_un_full_ne_consomme_pas_un_avis_manquant(self):
         # #2214, constat #2209 : `--avis 2 --full` avec un seul `ok` doit

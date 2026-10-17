@@ -2206,26 +2206,40 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
     return "types: [labeled]" in text and "ci-(lot|full)-" in text
 
 
-def _carrier_manifest(api, repo: str, sha: str) -> str:
-    """Le manifeste de composition d'un porteur à `sha`, ou "" (N1 #2240).
-
-    Un porteur `integration/**` publie `reviews/integration-paquet-<…>.md` :
-    c'est la revue unitaire du paquet qui tient lieu d'avis sur la tête
-    composée, pour la seule demande de CI (`--avis 0 --full`). Toute réponse
-    illisible ou absente vaut « pas de manifeste » : le refus est nommé, jamais
-    un zéro avis supposé.
-    """
+def _reviews_at(api, repo: str, ref: str) -> set[str] | None:
+    """Les noms du dossier `reviews/` à `ref`, ou None s'il est illisible."""
     from . import plan_github
     try:
-        data = api("repos/%s/contents/reviews?ref=%s" % (repo, _q(sha)))
+        data = api("repos/%s/contents/reviews?ref=%s" % (repo, _q(ref)))
     except plan_github.GithubError:
-        return ""
+        return None
     if not isinstance(data, list):
+        return None
+    return {str((item or {}).get("name") or "") for item in data if isinstance(item, dict)}
+
+
+def _manifest_name(head_ref: str) -> str:
+    """`integration/<nom>` → `integration-<nom>.md`, le nom que publient les porteurs."""
+    return "integration-%s.md" % head_ref[len("integration/"):].replace("/", "-")
+
+
+def _carrier_manifest(api, repo: str, head_ref: str, sha: str, base: str) -> str:
+    """Le manifeste de composition que publie le porteur à `sha`, ou "" (N1 #2240).
+
+    Un porteur `integration/<nom>` publie `reviews/integration-<nom>.md` :
+    c'est la revue unitaire du paquet qui tient lieu d'avis sur la tête
+    composée, pour la seule demande de CI (`--avis 0 --full`). Le manifeste
+    doit être le sien et absent de la base de la PR : `main` porte déjà ceux
+    des paquets fusionnés, qu'une branche `integration/**` hériterait sans rien
+    publier (R1 ameesh-dev1). Toute réponse illisible vaut « pas de manifeste » :
+    le refus est nommé, jamais un zéro avis supposé.
+    """
+    name = _manifest_name(head_ref)
+    at_head = _reviews_at(api, repo, sha)
+    at_base = _reviews_at(api, repo, base)
+    if at_head is None or at_base is None or name not in at_head or name in at_base:
         return ""
-    names = sorted(str((item or {}).get("name") or "") for item in data
-                   if isinstance(item, dict))
-    return next((name for name in names
-                 if name.startswith("integration-paquet-") and name.endswith(".md")), "")
+    return name
 
 
 def _short_run(row: dict) -> dict:
@@ -2434,6 +2448,9 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
         raise GelError("pull request #%d head is %s, the freeze is %s: the PR moved — "
                        "refreeze and re-review, nothing requested"
                        % (pr["number"], pr["head"][:12], frozen_sha[:12]))
+    if not _sha_ok(pr["base"]):
+        raise GelError("pull request #%d: unusable base commit (%r): the composition "
+                       "cannot be checked" % (pr["number"], pr["base"]))
     if full and avis == 0 and not exception:
         # (b) §12 #2240 (pilote mesh-design, 17/10 13:22) : le zéro avis d'une
         # suite complète est réservé à un porteur `integration/**` qui publie
@@ -2446,15 +2463,12 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                            "integration/** carrier head (source %r); review the head "
                            "and pass its required verdicts"
                            % (pr["number"], head_ref or "—"))
-        manifest = _carrier_manifest(api, name, frozen_sha)
+        manifest = _carrier_manifest(api, name, head_ref, frozen_sha, pr["base"])
         if not manifest:
-            raise GelError("pull request #%d: --avis 0 --full needs the carrier's "
-                           "manifest (reviews/integration-paquet-*.md) at %s; without "
+            raise GelError("pull request #%d: --avis 0 --full needs the carrier's own "
+                           "manifest (reviews/%s) at %s, absent from the base; without "
                            "it, review the head and pass its required verdicts"
-                           % (pr["number"], frozen_sha[:12]))
-    if not _sha_ok(pr["base"]):
-        raise GelError("pull request #%d: unusable base commit (%r): the composition "
-                       "cannot be checked" % (pr["number"], pr["base"]))
+                           % (pr["number"], _manifest_name(head_ref), frozen_sha[:12]))
     if release_refs(pr["head_ref"], pr["base_ref"]) and mode == "lot":
         raise GelError("pull request #%d: source %s or target %s is release/** or "
                        "integration/**: request the full suite (--full --reason …); a lot "
