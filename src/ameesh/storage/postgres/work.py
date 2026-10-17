@@ -11,11 +11,12 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 from __future__ import annotations
 
 import datetime as _dt
+import functools
 import json
 import random
 import time
 
-from ...db import DbError, is_unique_violation
+from ...db import DbError, in_transaction, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
 from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
@@ -127,6 +128,14 @@ _WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 _RESERVE_BUDGET_S = 30.0
 _RESERVE_WAIT_BASE_S = 0.005
 _RESERVE_WAIT_MAX_S = 0.5
+#: #879 : pendant la fenêtre de déploiement mixte, un client pré-0419 verrouille
+#: la ligne du lot puis le dépôt (trigger), l'ordre inverse du code courant :
+#: PostgreSQL tue l'une des deux transactions (40P01). La victime rejouée dans
+#: le bon ordre retrouve les verrous libérés par l'autre. Reprise bornée : au
+#: delà, l'erreur remonte telle quelle.
+_DEADLOCK_ATTEMPTS = 5
+_DEADLOCK_WAIT_BASE_S = 0.05
+_DEADLOCK_WAIT_MAX_S = 0.5
 #: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
 MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: l'index unique (dépôt, numéro atterri) de #1567 : deux lots d'un même dépôt
@@ -225,10 +234,69 @@ _DELAYS_SELECT = """
 """
 
 
+def _deadlock_victim(exc) -> bool:
+    """40P01, reconnu par le seul code du serveur (jamais le texte)."""
+    return isinstance(exc, DbError) and exc.sqlstate == '40P01'
+
+
+def _retry_deadlock(writer):
+    """Rejoue `writer` quand sa transaction est victime d'un interblocage.
+
+    Chaque essai ouvre sa propre transaction : la reprise reprend les verrous
+    dans l'ordre du code courant (dépôt avant ligne de lot). Le nombre
+    d'essais est borné, et seule la victime 40P01 est rejouée.
+
+    Jamais en transaction appelante (#879 B2) : sous psql l'erreur a fermé la
+    session, et la reprise en rouvrirait une neuve, hors du bloc atomique de
+    l'appelant (`import_reservations`) ; sous psycopg la transaction est
+    avortée. C'est à l'appelant de décider de l'échec ou de la reprise."""
+
+    @functools.wraps(writer)
+    def wrapped(self, *args, **kwargs):
+        for attempt in range(_DEADLOCK_ATTEMPTS):
+            try:
+                return writer(self, *args, **kwargs)
+            except DbError as exc:
+                if (not _deadlock_victim(exc) or attempt == _DEADLOCK_ATTEMPTS - 1
+                        or in_transaction(self.db)):
+                    raise
+                time.sleep(random.uniform(
+                    0.0, min(_DEADLOCK_WAIT_MAX_S, _DEADLOCK_WAIT_BASE_S * 2 ** attempt)))
+        raise AssertionError('unreachable')
+
+    return wrapped
+
+
+def _lock_migration_writer(tx, item_id, proposed=None):
+    """Take repository locks before the lot and recheck its observed scope."""
+    before = tx.query('SELECT migration_repo FROM work_items WHERE id = %s', (int(item_id),))
+    if not before:
+        return False
+    previous = before[0]['migration_repo']
+    repositories = {repo for repo in (previous, proposed) if repo}
+    # A legacy reservation may move between repositories. Lock both old and
+    # new in canonical order, including release's OLD repository.
+    for repo in sorted(repositories):
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                   "current_schema() || ':migration-repo:' || %s, 0))", ('github.com/' + repo,))
+    after = tx.query('SELECT migration_repo FROM work_items WHERE id = %s FOR NO KEY UPDATE',
+                     (int(item_id),))
+    if not after:
+        return False
+    # A concurrent legacy reservation can change the repository while we
+    # wait. Abort rather than acquire a new repo lock after locking the lot.
+    if after[0]['migration_repo'] != previous:
+        raise DbError('lot migration repository changed; retry')
+    return True
+
+
 class WorkItems(interface.WorkItems):
 
+    @_retry_deadlock
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
                             % item_columns(self.db), (int(item_id),))
             if not rows:
@@ -393,6 +461,7 @@ class WorkItems(interface.WorkItems):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    @_retry_deadlock
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
@@ -428,12 +497,17 @@ class WorkItems(interface.WorkItems):
                   + (int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
         if state not in ("merged", "promoted", "closed"):
-            rows = self.db.query(sql, params)
-            if not rows:
-                return None
-            self._event(int(item_id), state, note, actor)
-            return rows[0]
+            with self.db.transaction() as tx:
+                if not _lock_migration_writer(tx, item_id):
+                    return None
+                rows = tx.query(sql, params)
+                if not rows:
+                    return None
+                WorkItems(tx)._event(int(item_id), state, note, actor)
+                return rows[0]
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(sql, params)
             if not rows:
                 return None
@@ -979,11 +1053,14 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- branche d'un lot (L118) ---------------------------------------------
+    @_retry_deadlock
     def set_branch(self, item_id, branch, target, *, note, actor) -> dict | None:
         """Pose la branche (et la cible) d'un lot ouvert, avec une ligne de
         journal ; le dernier commit vu est oublié si la branche change. None
         si le lot n'est plus ouvert."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 "UPDATE work_items SET"
                 "       branch_head = CASE WHEN branch IS DISTINCT FROM %%s"
@@ -1020,6 +1097,7 @@ class WorkItems(interface.WorkItems):
             int(item_id), row["state"],
             "migration %s released (%s, #956)" % (number, why), actor)
 
+    @_retry_deadlock
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
                           issue_ref, release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
@@ -1036,14 +1114,18 @@ class WorkItems(interface.WorkItems):
         condition du CAS, NULL et chaîne vide confondus — une correction
         concurrente de la référence pendant le scan du dépôt ne peut plus
         laisser `issue_ref` d'un dépôt avec `migration_repo` d'un autre ;
-        `release` l'ignore."""
+        `release` l'ignore. En transaction appelante (`import_reservations`,
+        #879 B2), aucune reprise locale : la transaction y est perdue, la
+        DbError remonte et l'appelant décide."""
         if release:
             value, params = "NULL", ()
         elif number is None:
             value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
                      "               WHERE migration_repo = %s"
-                     "                 AND state NOT IN ('merged', 'promoted', 'closed')))")
-            params = (int(floor), repo)
+                     "                 AND state NOT IN ('merged', 'promoted', 'closed')),"
+                     " (SELECT coalesce(max(number), 0) + 1 FROM work_migration_reservations"
+                     " WHERE target_repo = %s AND status = 'reserved'))")
+            params = (int(floor), repo, "github.com/" + repo)
         else:
             value, params = "%s", (int(number),)
         # `release` libère aussi un lot déjà terminal (#956) ; les autres
@@ -1056,6 +1138,8 @@ class WorkItems(interface.WorkItems):
         while True:
             try:
                 with self.db.transaction() as tx:
+                    if not _lock_migration_writer(tx, item_id, None if release else repo):
+                        return None
                     if not release:
                         # #956 : une réservation héritée d'un lot terminal
                         # (prise avant ce correctif) ne tient plus le numéro :
@@ -1094,8 +1178,9 @@ class WorkItems(interface.WorkItems):
                                          actor)
                     return rows[0]
             except DbError as exc:
-                if (number is not None or release
-                        or not is_unique_violation(exc, MIGRATION_INDEX)):
+                if (number is not None or release or in_transaction(self.db)
+                        or not (is_unique_violation(exc, MIGRATION_INDEX)
+                                or is_unique_violation(exc, "work_migration_reservations_active_idx"))):
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1365,6 +1450,7 @@ class WorkItems(interface.WorkItems):
             "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % item_columns(self.db),
             (package_id,))
 
+    @_retry_deadlock
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
                      frozen_id=None, landed=None) -> dict | None:
         """`current` → `merged` si le lot y est encore (sinon None, rien d'écrit),
@@ -1393,6 +1479,8 @@ class WorkItems(interface.WorkItems):
         """
         number, repo = landed if landed else (None, None)
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             locked = tx.query(
                 "SELECT id FROM work_items WHERE id = %s AND state = %s AND "
                 + _UNPINNED + " FOR UPDATE",
@@ -1428,6 +1516,7 @@ class WorkItems(interface.WorkItems):
                 (sha or "", actor or "", note or "", int(item_id)))
             return rows[0]
 
+    @_retry_deadlock
     def close(self, item_id, *, current, reason, superseded_by, sha="", actor, note) -> dict | None:
         """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
         si le lot y est encore ; journal et jalon `closed` dans la même
@@ -1435,6 +1524,8 @@ class WorkItems(interface.WorkItems):
         porte le `sha` de la tête relue. Un lot pinné sur une révision Process
         n'est jamais fermé ici : le filtre est dans le SQL (#1922/N8)."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 """
                 UPDATE work_items
