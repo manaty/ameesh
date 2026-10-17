@@ -395,7 +395,9 @@ def parse_settings(raw) -> Settings:
         if not isinstance(required_checks, (list, tuple)) or not all(
                 isinstance(name, str) and name.strip() for name in required_checks):
             raise SettingsError("%s.required_checks: a list of check names expected" % where)
-        required_checks = tuple(name.strip() for name in required_checks)
+        # Un nom de check est un contexte exact : ne pas rogner ses espaces
+        # significatifs, `tests ` n'est pas `tests` pour la forge.
+        required_checks = tuple(required_checks)
         if len(set(required_checks)) != len(required_checks):
             raise SettingsError("%s.required_checks: duplicate check name" % where)
         ci_parts = None

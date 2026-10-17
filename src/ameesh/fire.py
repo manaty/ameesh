@@ -533,12 +533,13 @@ def _same_head(left, right) -> bool:
 
 def _required_pairs(required) -> tuple:
     """Les checks requis sous la forme `(contexte, app_id)` : un nom seul vaut
-    `(nom, None)` (aucune application imposée)."""
+    `(nom, None)` (aucune application imposée). Un contexte est un nom exact :
+    ses espaces significatifs sont conservés, `tests ` n'est pas `tests`."""
     values = (required,) if isinstance(required, str) else tuple(required or ())
     pairs = []
     for value in values:
         if isinstance(value, str) and value.strip():
-            pairs.append((value.strip(), None))
+            pairs.append((value, None))
             continue
         if isinstance(value, (tuple, list)) and len(value) == 2:
             name, app_id = value
@@ -546,7 +547,7 @@ def _required_pairs(required) -> tuple:
                     and (app_id is None or (isinstance(app_id, int)
                                             and not isinstance(app_id, bool)
                                             and app_id > 0)):
-                pairs.append((name.strip(), app_id))
+                pairs.append((name, app_id))
                 continue
         raise land.LandError("invalid required check %r" % (value,))
     return tuple(pairs)
@@ -599,8 +600,10 @@ def _required_gap(required, rollup, provenance=None) -> list:
 def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
     """Les check runs de la tête **exacte** `sha`, avec l'application qui les a
     produits. `statusCheckRollup` ne porte pas cette source : elle se lit sur
-    le commit (`commits/<sha>/check-runs`). Une lecture impossible ou
-    malformée lève `land.LandError` : une source absente ne prouve rien."""
+    le commit (`commits/<sha>/check-runs`). Les noms sont rendus exactement,
+    espaces significatifs compris : `tests ` n'est pas le contexte `tests`.
+    Une lecture impossible ou malformée lève `land.LandError` : une source
+    absente ne prouve rien."""
     if not slug:
         raise land.LandError("no GitHub repository known: the source of the checks "
                              "of %s cannot be read" % (sha or "the head"))
@@ -628,13 +631,13 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
             head = _norm(run.get("head_sha"))
             if head and not _same_head(head, sha):
                 raise land.LandError("gh api %s: a check run of %s is on %s"
-                                     % (path, run["name"].strip(), head))
+                                     % (path, run["name"], head))
             app = run.get("app")
             app_id = app.get("id") if isinstance(app, dict) else None
             if app_id is not None and (isinstance(app_id, bool)
                                        or not isinstance(app_id, int)):
                 raise land.LandError("gh api %s: malformed check run app" % path)
-            runs.append({"name": run["name"].strip(),
+            runs.append({"name": run["name"],
                          "status": str(run.get("status") or ""),
                          "conclusion": str(run.get("conclusion") or ""),
                          "app_id": app_id})
@@ -646,7 +649,9 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
     forge, sous la forme `(contexte, app_id)` : `app_id` est l'application
     GitHub que la protection impose (`checks[].app_id`), `None` quand elle
     n'impose aucun fournisseur (ancienne liste `contexts`). Perdre `app_id`
-    accepterait un check homonyme produit par n'importe qui.
+    accepterait un check homonyme produit par n'importe qui. Le contexte est
+    rendu exactement, espaces significatifs compris : `tests ` n'est pas
+    `tests`.
 
     Un 404 « Branch not protected » est une réponse (aucun check requis) ;
     toute autre lecture — droits, branche absente, réponse malformée — lève
@@ -685,7 +690,7 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
         if app_id is not None and (isinstance(app_id, bool)
                                    or not isinstance(app_id, int) or app_id <= 0):
             raise land.LandError("gh api %s: invalid required check app_id" % path)
-        context = check["context"].strip()
+        context = check["context"]
         pairs.append((context, app_id))
         scoped.add(context)
     for context in contexts:
@@ -693,8 +698,8 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
             raise land.LandError("gh api %s: invalid required context" % path)
         # `checks` porte la même liste avec l'application : ne pas la doubler
         # d'une exigence sans fournisseur qui n'ajouterait aucune garantie.
-        if context.strip() not in scoped:
-            pairs.append((context.strip(), None))
+        if context not in scoped:
+            pairs.append((context, None))
     return tuple(dict.fromkeys(pairs))
 
 
@@ -706,8 +711,9 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     Quand la protection ne peut pas être lue (jeton sans droits, forge
     muette), la déclaration du projet la remplace ; sans déclaration, la
     lecture refuse. La déclaration ne peut jamais retirer un check que la
-    forge exige : elle s'ajoute."""
-    declared = tuple((str(name).strip(), None) for name in
+    forge exige : elle s'ajoute. Les noms sont exacts de bout en bout :
+    la déclaration `tests ` ne vaut pas le contexte `tests`."""
+    declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
                      if str(name).strip())
     if not target:

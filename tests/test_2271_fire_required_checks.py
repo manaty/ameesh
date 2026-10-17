@@ -16,8 +16,11 @@ absent ou `SKIPPED` laisse la PR non prête. La protection peut imposer une
 application GitHub (`checks[].app_id`) : le feu lit alors la provenance des
 check runs de la tête exacte et refuse un homonyme d'une autre application,
 un statut de commit sans source, ou une source illisible (B1 de la relecture
-du 17/10). Témoins sans base : rollup du constat, check sauté, check absent,
-panne de lecture, déclaration, mauvais fournisseur.
+du 17/10). Un contexte est un nom exact : ses espaces significatifs sont
+conservés de la protection ou de la déclaration jusqu'aux check runs, `tests `
+ne vaut pas `tests` (B2 de la relecture, 17/10). Témoins sans base : rollup du
+constat, check sauté, check absent, panne de lecture, déclaration, mauvais
+fournisseur, noms exacts.
 """
 from __future__ import annotations
 
@@ -122,6 +125,14 @@ class ProtectionTest(unittest.TestCase):
         self.assertEqual(fire._protection_required("manaty/ameesh", "main", gh=FakeGh()),
                          (("tests", 15368),))
 
+    def test_the_protection_keeps_a_context_name_exactly(self):
+        # B2 : un nom de contexte est un nom exact ; `tests ` n'est pas
+        # `tests`, et la protection doit le rendre tel quel.
+        gh = FakeGh(protection={"required_status_checks": {
+            "contexts": ["tests "],
+            "checks": [{"context": "tests ", "app_id": 15368}]}})
+        self.assertEqual(self._required(gh), (("tests ", 15368),))
+
     def test_a_legacy_context_imposes_no_app(self):
         gh = FakeGh(protection={"required_status_checks": {
             "contexts": ["tests"], "checks": []}})
@@ -158,6 +169,17 @@ class ProtectionTest(unittest.TestCase):
         project = _project(required_checks=("coverage",))
         self.assertEqual(self._required(FakeGh(), project=project),
                          (("tests", 15368), ("coverage", None)))
+
+    def test_a_declared_context_keeps_its_significant_spaces(self):
+        # B2 : la déclaration traverse jusqu'aux paires sans être rognée.
+        gh = FakeGh(protection={"required_status_checks": None})
+        project = _project(required_checks=("tests ",))
+        self.assertEqual(self._required(gh, project=project), (("tests ", None),))
+
+    def test_a_declared_context_that_differs_by_a_space_is_not_merged(self):
+        project = _project(required_checks=("tests ",))
+        self.assertEqual(self._required(FakeGh(), project=project),
+                         (("tests", 15368), ("tests ", None)))
 
     def test_a_target_is_needed_to_read_the_protection(self):
         with self.assertRaises(land.LandError):
@@ -218,6 +240,40 @@ class ReadyPrTest(unittest.TestCase):
         # protection : la porte est franchie.
         gh = FakeGh(check_runs=[_run("tests", app_id=15368)])
         ok, why = self.ready([_check("tests")], gh=gh)
+        self.assertTrue(ok, why)
+
+    def test_a_check_run_name_with_a_trailing_space_does_not_prove_the_context(self):
+        # B2, témoin rouge : le check run `tests ` (même application, SUCCESS)
+        # satisfaisait à tort le contexte exact `tests`.
+        gh = FakeGh(check_runs=[_run("tests ")])
+        ok, why = self.ready([_check("tests ")], gh=gh)
+        self.assertFalse(ok, why)
+        self.assertIn("tests (absent)", why)
+
+    def test_a_check_run_without_the_required_space_does_not_prove_it(self):
+        # B2, sens inverse : `tests ` exigé n'est pas prouvé par `tests`.
+        gh = FakeGh(protection={"required_status_checks": {
+            "contexts": ["tests "],
+            "checks": [{"context": "tests ", "app_id": 15368}]}},
+            check_runs=[_run("tests")])
+        ok, why = self.ready([_check("tests")], gh=gh)
+        self.assertFalse(ok, why)
+        self.assertIn("(absent)", why)
+
+    def test_a_declared_name_with_a_space_matches_only_its_exact_check(self):
+        # B2 de bout en bout : déclaration -> paires -> rollup, sans rognage.
+        gh = FakeGh(error="gh: Resource not accessible by integration (HTTP 403)")
+        project = _project(required_checks=("tests ",))
+        ok, why = self.ready([_check("tests")], project=project, gh=gh)
+        self.assertFalse(ok, why)
+        ok, why = self.ready([_check("tests ")], project=project, gh=gh)
+        self.assertTrue(ok, why)
+
+    def test_an_explicit_required_name_keeps_its_spaces(self):
+        gh = FakeGh()
+        ok, why = self.ready([_check("tests")], required=("tests ",), gh=gh)
+        self.assertFalse(ok, why)
+        ok, why = self.ready([_check("tests ")], required=("tests ",), gh=gh)
         self.assertTrue(ok, why)
 
     def test_a_required_check_from_another_app_is_not_ready(self):
@@ -361,6 +417,12 @@ class HeadCheckRunsTest(unittest.TestCase):
         runs = fire._head_check_runs("manaty/ameesh", SHA[:8], gh=gh)
         self.assertEqual([run["name"] for run in runs], ["tests"])
 
+    def test_check_run_names_are_kept_exactly(self):
+        # B2 : la source de provenance ne rogne pas le nom du check run.
+        gh = PagesGh([{"check_runs": [_run("tests ")]}])
+        runs = fire._head_check_runs("manaty/ameesh", SHA, gh=gh)
+        self.assertEqual([run["name"] for run in runs], ["tests "])
+
     def test_a_malformed_check_run_is_refused(self):
         for bad in ([{"check_runs": [{"name": "tests", "app": {"id": "15368"}}]}],
                     [{"check_runs": [{"status": "completed"}]}],
@@ -382,6 +444,17 @@ class HeadCheckRunsTest(unittest.TestCase):
 
 
 class SettingsTest(unittest.TestCase):
+    def test_declared_names_keep_their_significant_spaces(self):
+        # B2 : ` tests ` n'est pas `tests`, de la configuration au feu.
+        settings = radar.parse_settings({"projects": {"ameesh": {
+            "repo": "/r", "required_checks": [" tests "]}}})
+        project = settings.projects["ameesh"]
+        self.assertEqual(project.required_checks, (" tests ",))
+        self.assertEqual(fire.required_checks(
+            "manaty/ameesh", "main", project,
+            gh=FakeGh(protection={"required_status_checks": None})),
+            ((" tests ", None),))
+
     def test_declared_required_checks(self):
         settings = radar.parse_settings({"projects": {"ameesh": {
             "repo": "/r", "required_checks": ["tests", "coverage"]}}})
