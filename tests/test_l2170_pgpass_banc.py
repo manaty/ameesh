@@ -150,7 +150,7 @@ with open(os.environ["PSQL_CALLS"], "a") as out:
 if "-c" in argv and argv[argv.index("-c") + 1] == "SELECT 1":
     dsn = argv[argv.index("--dbname") + 1]
     db = dsn.rsplit("/", 1)[-1]
-    ok = bool(os.environ.get("PGPASSWORD"))
+    ok = bool(os.environ.get("PSQL_TRUST") or os.environ.get("PGPASSWORD"))
     pf = os.environ.get("PGPASSFILE")
     if pf:
         try:
@@ -281,10 +281,26 @@ class BranchementTest(unittest.TestCase):
         self.passfile.write_text("127.0.0.1:55432:autre:agent_mesh:secret\n")
         proc = self.lancer(PGPASSFILE=str(self.passfile))
         self.assertNotEqual(proc.returncode, 0)
+        # le refus du helper reste utile quand la garde échoue
+        self.assertIn("aucune entrée", proc.stderr)
         self.assertIn("base jetable", proc.stderr)
         self.assertIn("PGPASSWORD", proc.stderr)
         self.assertIn("~/.pgpass", proc.stderr)
         self.assertEqual(self.appels(self.dsn_calls), [])
+        self.assertEqual(list(self.tmpdir.glob("ameesh-pgpass-*")), [])
+
+    def test_sans_entree_mais_serveur_sans_mot_de_passe_sans_bruit(self):
+        # le profil ne couvre pas le banc, mais le serveur accepte la
+        # connexion sans mot de passe : le refus du helper ne s'affiche pas
+        self.passfile.write_text("127.0.0.1:55432:autre:agent_mesh:secret\n")
+        proc = self.lancer(PGPASSFILE=str(self.passfile), PSQL_TRUST="1")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("aucune entrée", proc.stderr)
+        self.assertNotIn("pgpass-banc", proc.stderr)
+        vus = self.appels(self.dsn_calls)
+        self.assertEqual(len(vus), 2, vus)
+        # aucun profil dérivé : les passes gardent le profil du poste
+        self.assertTrue(all(v["pgpassfile"] == str(self.passfile) for v in vus), vus)
         self.assertEqual(list(self.tmpdir.glob("ameesh-pgpass-*")), [])
 
 

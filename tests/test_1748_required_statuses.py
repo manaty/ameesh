@@ -167,20 +167,24 @@ class FireTest(unittest.TestCase):
     def test_fire_waits_for_the_lot_status(self):
         project = radar.Project("nexlink", "/r", github="o/nexlink",
                                 required_statuses=(("integration/**", "lot/"),))
+        # #2271: no required check, only the declared statuses are at stake
         status = {"number": 7, "base": "develop", "draft": False, "ci": "green",
                   "branch": "integration/paquet-9", "rollup": BOOTSTRAP_ONLY}
-        ok, why = fire.ready_pr(status, target="develop", project=project, frozen=SHA)
+        ok, why = fire.ready_pr(status, target="develop", project=project, frozen=SHA,
+                                required=())
         self.assertFalse(ok)
         self.assertIn("lot/*", why)
         ok, _ = fire.ready_pr(dict(status, rollup=BOOTSTRAP_ONLY + [_status("lot/x")]),
-                              target="develop", project=project, frozen=SHA)
+                              target="develop", project=project, frozen=SHA,
+                              required=())
         self.assertTrue(ok)
         # an unreadable head branch gets every declared prefix
         ok, _ = fire.ready_pr(dict(status, branch=""), target="develop", project=project,
-                              frozen=SHA)
+                              frozen=SHA, required=())
         self.assertFalse(ok)
         # no setting: unchanged
-        ok, _ = fire.ready_pr(status, target="develop", project=None, frozen=SHA)
+        ok, _ = fire.ready_pr(status, target="develop", project=None, frozen=SHA,
+                              required=())
         self.assertTrue(ok)
 
 

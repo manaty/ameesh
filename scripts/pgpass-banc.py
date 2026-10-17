@@ -14,11 +14,13 @@ entrée du profil qui correspond à la connexion d'administration, puis écrit u
 
 Le profil privé couvre le couple hôte/port du banc et l'utilisateur de
 l'entrée, avec le champ base `*` : c'est la seule forme que libpq offre pour
-des noms de bases tirés à chaque exécution. Il ne copie aucune autre entrée du
-profil et n'accorde aucun droit côté serveur ; le rôle du banc les avait déjà.
-Il est supprimé à la sortie du script de test. Aucun secret n'est affiché ; le
-fichier source doit être un fichier ordinaire non lisible par le groupe ni les
-autres, comme libpq l'exige.
+des noms de bases tirés à chaque exécution. Pendant les deux passes, il est le
+seul profil que lit libpq : les autres entrées du profil de l'utilisateur sont
+masquées, ce qui est voulu (même hôte, même port, même rôle). Il ne copie
+aucune autre entrée du profil et n'accorde aucun droit côté serveur ; le rôle
+du banc les avait déjà. Il est supprimé à la sortie du script de test. Aucun
+secret n'est affiché ; le fichier source doit être un fichier ordinaire non
+lisible par le groupe ni les autres, comme libpq l'exige.
 """
 from __future__ import annotations
 
