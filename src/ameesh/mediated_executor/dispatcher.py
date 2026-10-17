@@ -306,6 +306,23 @@ class PgDispatcher(ExecDispatcher):
                       agent=request.fence.agent if request.fence else principal.agent,
                       replayed=True, idempotency_key=key)
                 return replay
+        from ..agent_names import resolve
+        # Normalize inside the server transaction before scope and fencing.
+        # The input request/digest stay unchanged for replay and diagnostics.
+        bound = dict(bound)
+        for param in set(filter(None, (op.agent_param, "sender", "recipient", "assignee"))):
+            value = bound.get(param)
+            if isinstance(value, str):
+                bare = contract.agent_name(value)
+                primary = resolve(bare, db=tx, operation="mediated." + op.name)
+                bound[param] = "agent:" + primary if value.startswith("agent:") else primary
+        if isinstance(bound.get("names"), list):
+            bound["names"] = list(dict.fromkeys(resolve(n, db=tx, operation="mediated." + op.name)
+                                               for n in bound["names"]))
+        if request.fence is not None:
+            fence = dataclasses.replace(request.fence, agent=resolve(
+                request.fence.agent, db=tx, operation="mediated.fence." + op.name))
+            request = dataclasses.replace(request, fence=fence)
         rules = self.rules(tx)
         fenced = False
         try:
