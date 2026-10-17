@@ -4212,6 +4212,7 @@
     "revoke"
    ],
    "leases": [
+    "adopt_session_origin",
     "attach_claim",
     "hold_note",
     "release_hold",

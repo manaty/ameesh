@@ -753,6 +753,38 @@ class Leases(interface.Leases):
         )
         return bool(rows)
 
+    def adopt_session_origin(self, name, owner, epoch, session, lot, *,
+                             harness=None, cwd=None) -> bool:
+        """#1900 B1 : origine d'une session sans origine, sous verrou.
+
+        Verrou de ligne d'abord, puis recontrôle dans l'écriture : bail vivant
+        (owner, epoch, échéance recontrôlée après l'attente du verrou), et
+        ligne portant encore la session ET le lot attendus. Seuls
+        `session_origin`, `session_cwd` et `session_harness` sont écrits —
+        jamais `session_id`, qu'une rotation ou un remplaçant a pu poser
+        pendant l'attente."""
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, session_id, session_work_item, lease_owner, lease_epoch,
+                       lease_expires_at
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET session_origin = %s, session_cwd = %s, session_harness = %s,
+                   updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+               AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.session_id = %s
+               AND verrou.session_work_item = %s
+            RETURNING r.name
+            """,
+            (name, session, cwd, harness, owner, int(epoch), session, str(lot)),
+        )
+        return bool(rows)
+
     def hold_note(self, name, owner, epoch, status_text) -> bool:
         """Texte d'attente (L31b) : même verrou et mêmes recontrôles que
         `pause`, mais le statut reste ce qu'il est (`idle` ou `queued`)."""

@@ -527,13 +527,42 @@ def _primary_project(agent: dict) -> str:
     return names[0] if names else ""
 
 
-#: #1538 : marque d'un refus de dossier dans le journal d'un élément. La
-#: relecture se fait sur ce préfixe, jamais sur le texte complet : la note
-#: nomme l'agent qui l'a rencontré, mais elle est unique PAR ÉLÉMENT.
-DIRECTORY_NOTE_PREFIX = "L243-4:"
+#: #1900 N2 : préfixe des notes « projet déclaré sans dossier »
+#: (`_directory_ready`). La note est unique PAR ÉLÉMENT, pas par agent
+#: (#1538) : la relecture porte sur ce préfixe, jamais sur le texte complet.
+MISSING_DIR_NOTE_PREFIX = "L243-4: "
 
 
-def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, noted=None):
+class _DirNotes:
+    """Les éléments dont une note de dossier L243-4 a déjà été écrite, lus une
+    fois par passe (#1900 N2).
+
+    La lecture est paresseuse — aucun item ne manque de dossier, aucune
+    requête — et bornée au préfixe des notes L243-4 ; `has` répond ensuite en
+    mémoire, `add` retient l'élément que `_directory_ready` vient d'écrire.
+    Sans elle, chaque passe d'`auto_take` relisait les 100 derniers événements
+    de chaque lot dont le dossier manque, pour chaque agent candidat. Le
+    relevé est indexé par ÉLÉMENT (#1538) : la note reste unique par lot, un
+    second agent qui bute dessus ne réécrit pas celle du premier."""
+
+    def __init__(self, store):
+        self._store = store
+        self._items: set[int] | None = None
+
+    def _load(self) -> set[int]:
+        if self._items is None:
+            self._items = {int(row["work_item_id"])
+                           for row in self._store.events_noted(MISSING_DIR_NOTE_PREFIX, 0.0)}
+        return self._items
+
+    def has(self, item_id) -> bool:
+        return int(item_id) in self._load()
+
+    def add(self, item_id) -> None:
+        self._load().add(int(item_id))
+
+
+def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, notes=None):
     from . import lot_workdir, work
     reason = lot_workdir.problem(cfg, agent, project, canons=canons)
     if reason is None:
@@ -541,23 +570,20 @@ def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, noted=No
     # #811 N1 : hors périmètre (raison vide) — aucune note ; #1538 : une raison
     # réelle (dossier déclaré absent ou ambigu) est notée une fois PAR ÉLÉMENT,
     # quel que soit l'agent qui bute dessus — pas une note par (agent, élément).
-    # `noted` retient les éléments déjà lus pendant le passage : le journal
-    # n'est pas relu pour chaque couple (agent, élément) qui vise le même lot.
     if not dry_run and reason:
-        key = int(item["id"])
-        if noted is not None and key in noted:
-            already = noted[key]
-        else:
-            already = any((e.get("note") or "").startswith(DIRECTORY_NOTE_PREFIX)
-                          for e in work.events(db, key))
-            if noted is not None:
-                noted[key] = already
-        if not already:
-            note = "%s %s cannot pick up project %s: %s" % (
-                DIRECTORY_NOTE_PREFIX, agent["name"], project, reason)
-            work.note(db, key, note, actor=SENDER)
-            if noted is not None:
-                noted[key] = True
+        note = MISSING_DIR_NOTE_PREFIX + "%s cannot pick up project %s: %s" % (
+            agent["name"], project, reason)
+        if notes is not None:
+            # #1900 N2 : la note déjà écrite se lit dans le relevé borné de la
+            # passe (une requête), plus dans les 100 derniers événements du lot
+            # relus à chaque passe tant que le dossier manque. #1538 : `has`
+            # répond par ÉLÉMENT, sans le nom de l'agent.
+            if not notes.has(item["id"]):
+                work.note(db, item["id"], note, actor=SENDER)
+                notes.add(item["id"])
+        elif not any((e.get("note") or "").startswith(MISSING_DIR_NOTE_PREFIX)
+                     for e in work.events(db, item["id"])):
+            work.note(db, item["id"], note, actor=SENDER)
     return False
 
 
@@ -619,6 +645,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    # #1900 N2 : une lecture paresseuse et bornée des notes de dossier pour
+    # toute la passe (les deux boucles ci-dessous la partagent).
+    dir_notes = _DirNotes(st.work)
 
     # #804 : la place restante est relue avant **chaque** prise, pas une fois
     # par passe. Les compteurs sont en base et partagés par tous les
@@ -708,9 +737,6 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             return False
 
     taken: list = []
-    # #1538 : les éléments dont le refus de dossier a déjà été lu (ou noté)
-    # pendant CE passage — une note par élément, une lecture par élément.
-    directory_noted: dict = {}
     if lots:
         # un orchestrateur répartit : il ne se sert pas lui-même
         if orchestras is None:
@@ -738,8 +764,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                 card=auditors.get(row["name"]), others=listing):
                     continue
                 if not _directory_ready(cfg, db, agent, item, _lot_project(item),
-                                        canons=canons, dry_run=dry_run,
-                                        noted=directory_noted):
+                                        canons=canons, dry_run=dry_run, notes=dir_notes):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -810,8 +835,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                         card=auditors.get(row["name"]), others=listing):
                 continue
             if not _directory_ready(cfg, db, agent, item, _lot_project(item),
-                                    canons=canons, dry_run=dry_run,
-                                    noted=directory_noted):
+                                    canons=canons, dry_run=dry_run, notes=dir_notes):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
