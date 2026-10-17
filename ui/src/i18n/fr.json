@@ -113,6 +113,8 @@
   "decisions.filing": "Dépôt…",
   "decisions.filed": "Demande déposée :",
   "decisions.open": "ouvrir la page d’approbation",
+  "decisions.renew": "Déposer une nouvelle demande",
+  "decisions.expired": "Le lien déposé a expiré ; déposez une nouvelle demande.",
   "decisions.failed": "La demande n’a pas été déposée ({code}).",
   "decisions.request": "Demande n°{id}",
   "decisions.answerHint": "Répondre avec `ameesh decide {id} <option>`.",

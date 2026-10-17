@@ -17,7 +17,7 @@ const POST_ROUTE = "/api/v1/actions/" + ACTION + "/approval-request";
 const REPLY = [200, { schema: "ameesh-action/1", action: "approval_request",
   by: "human:ada", for: "human:ada",
   result: { request_id: "req-1", action_id: ACTION, approver: "human:ada", link: LINK,
-    link_exp: 1792003600, digest: "sha256:abc" } }];
+    link_exp: 4102444800, exp: 4102445100, digest: "sha256:abc" } }];
 
 function fixture(overrides = {}) {
   const fetch = fakeFetch({ ...routes, [POST_ROUTE]: REPLY, ...overrides });
@@ -101,6 +101,58 @@ test("Approve files the request once, keeps the key on a retry, never approves",
   const link = el.shadowRoot.querySelector("a");
   assert.equal(link.getAttribute("href"), LINK);
   assert.equal(link.getAttribute("target"), "_blank");
+});
+
+test("an expired filing is renewed in place with a fresh key, an uncertain retry keeps it", async () => {
+  const realNow = Date.now;
+  let clock = 1792000000;                        // controlled clock, in seconds
+  Date.now = () => clock * 1000;
+  try {
+    const { client } = fixture();
+    const keys = [];
+    let failing = false;
+    const wrapped = { ...client, post: async (_path, options) => {
+      keys.push(options.headers["Idempotency-Key"]);
+      if (failing) throw new ui.ApiError(502, "approve_unreachable", "ameesh-approve unreachable");
+      return { schema: "ameesh-action/1", action: "approval_request", by: "human:ada",
+        for: "human:ada", result: { request_id: "req-" + keys.length, action_id: ACTION,
+          approver: "human:ada", link: LINK, link_exp: clock + 600, exp: clock + 900 } };
+    } };
+    const el = await mount(wrapped);
+    const events = [];
+    el.parentNode.addEventListener("ameesh:approval-requested", (event) => events.push(event.detail));
+
+    el.shadowRoot.querySelector(".cards button").click(); await settle(el);
+    assert.equal(keys.length, 1);
+    assert.match(text(el), /Request filed:/);          // the open link stays an anchor
+    assert.equal(el.shadowRoot.querySelector("a").getAttribute("href"), LINK);
+
+    clock += 601;                                      // the filed link expired (link_exp)
+    await el.refresh(); await settle(el);              // a refresh is enough, no recreation
+    assert.doesNotMatch(text(el), /Request filed:/);
+    assert.match(text(el), /The filed link has expired/);
+    assert.equal(el.shadowRoot.querySelector(".cards a"), null);
+
+    el.shadowRoot.querySelector(".cards button").click(); await settle(el);
+    assert.equal(keys.length, 2);
+    assert.notEqual(keys[1], keys[0]);                 // renewal: a fresh key files again
+    assert.match(text(el), /Request filed:/);
+    assert.deepEqual(events.map((event) => event.url), [LINK, LINK]);
+
+    clock += 601;                                      // expired again: an uncertain renewal
+    await el.refresh(); await settle(el);
+    failing = true;
+    el.shadowRoot.querySelector(".cards button").click(); await settle(el);
+    assert.match(text(el), /not filed \(approve_unreachable\)/);
+    const uncertain = keys[2];
+    assert.notEqual(uncertain, keys[1]);
+    failing = false;
+    el.shadowRoot.querySelector(".cards button").click(); await settle(el);
+    assert.equal(keys[3], uncertain);                  // the retry replays, never files twice
+    assert.match(text(el), /Request filed:/);
+  } finally {
+    Date.now = realNow;
+  }
 });
 
 test("a refused filing is reported under the action and allows another try", async () => {

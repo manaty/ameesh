@@ -23,6 +23,19 @@ export function idempotencyKey(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/** The request filed for one action: the key that filed it, and the instant
+ *  (epoch seconds) its link stops opening. */
+type Filing = { expires: number; key: string };
+
+/** When the filed request stops opening: the earlier of the link's own TTL
+ *  (`link_exp`) and the request's `exp`, as ameesh-approve checks them; a
+ *  reply without either never expires here. */
+function expiryOf(result: Row): number {
+  const stamps = [number(result.link_exp), number(result.exp)]
+    .filter((stamp): stamp is number => stamp !== null);
+  return stamps.length ? Math.min(...stamps) : Infinity;
+}
+
 export class AmeeshDecisions extends ReadView {
   static override properties = {
     ...ReadView.properties,
@@ -35,8 +48,12 @@ export class AmeeshDecisions extends ReadView {
   filed: Record<string, string> = {};
   /** action id → the refusal to show under its card. */
   failed: Record<string, string> = {};
-  //: one key per action: a retry after a network failure replays, never files twice
+  //: one key per action while its request is open: a retry after an uncertain
+  //: network failure replays, never files twice. A renewal, once the expiry is
+  //: known, replaces the key (`approve`), the old one only replaying the dead link.
   #keys = new Map<string, string>();
+  //: what was filed per action: the key in flight and the link's expiry
+  #filings = new Map<string, Filing>();
 
   protected load(client: Client, signal: AbortSignal) {
     return client.get("/api/v1/decisions", { signal });
@@ -51,6 +68,15 @@ export class AmeeshDecisions extends ReadView {
     return key;
   }
 
+  /** The API's seconds: the same unit as `link_exp`/`exp`. */
+  #now(): number { return Math.floor(Date.now() / 1000); }
+
+  /** The filed link of `action` is past its known expiry (410 at ameesh-approve). */
+  #expired(action: string): boolean {
+    const filed = this.#filings.get(action);
+    return filed !== undefined && filed.expires <= this.#now();
+  }
+
   /** File the approval request of `action`, keep its link, tell the host. */
   async approve(action: string): Promise<void> {
     const client = this.api;
@@ -59,15 +85,25 @@ export class AmeeshDecisions extends ReadView {
     this.failed = { ...this.failed };
     delete this.failed[action];
     try {
+      const filed = this.#filings.get(action);
+      if (filed && filed.expires <= this.#now() && this.#keys.get(action) === filed.key) {
+        // The filed link expired: this call is a renewal, and the old key would
+        // only replay the dead link. A fresh key files a new request; an
+        // uncertain retry of the renewal (same key as the attempt in flight) keeps it.
+        this.#keys.delete(action);
+      }
+      const key = this.#key(action);
       const reply = await client.post("/api/v1/actions/{action}/approval-request", {
         path: { action },
         body: {},
-        headers: { "Idempotency-Key": this.#key(action) },
+        headers: { "Idempotency-Key": key },
       });
-      const link = object(object(reply).result).link;
+      const result = object(object(reply).result);
+      const link = result.link;
       const url = typeof link === "string" ? link : "";
       if (url) {
         this.filed = { ...this.filed, [action]: url };
+        this.#filings.set(action, { expires: expiryOf(result), key });
         // the host opens it in the foreground; the button here never approves
         this.dispatchEvent(new CustomEvent("ameesh:approval-requested", {
           detail: { action, url }, bubbles: true, composed: true }));
@@ -93,6 +129,7 @@ export class AmeeshDecisions extends ReadView {
       ? format.format(amount / 10 ** (format.resolvedOptions().maximumFractionDigits ?? 2))
       : this.t("decisions.minorAmount", { amount: label(amount) });
     const url = this.filed[action] || "";
+    const expired = url !== "" && this.#expired(action);
     const failed = this.failed[action] || "";
     return html`<article>
       <h3>${action}</h3>
@@ -103,12 +140,14 @@ export class AmeeshDecisions extends ReadView {
         <dt>${this.t("field.proposedBy")}</dt><dd>${label(row.proposed_by)}</dd>
         <dt>${this.t("field.project")}</dt><dd>${label(row.project)}${row.work_item ? html` · #${label(row.work_item)}` : nothing}</dd>
       </dl>
-      ${url ? html`<p role="status">${this.t("decisions.filed")}
+      ${url && !expired ? html`<p role="status">${this.t("decisions.filed")}
           <a href=${url} target="_blank" rel="noopener noreferrer">${this.t("decisions.open")}</a></p>`
         : html`<button type="button" @click=${() => this.approve(action)}
             ?disabled=${!this.api || this.filing === action}>${this.filing === action
-              ? this.t("decisions.filing") : this.t("decisions.approve")}</button>
-          <p class="muted">${this.t("decisions.approveHint")}</p>`}
+              ? this.t("decisions.filing")
+              : expired ? this.t("decisions.renew") : this.t("decisions.approve")}</button>
+          <p class="muted">${expired
+            ? this.t("decisions.expired") : this.t("decisions.approveHint")}</p>`}
       ${failed ? html`<p role="alert" class="critical">${this.t("decisions.failed", { code: failed })}</p>` : nothing}
     </article>`;
   }
