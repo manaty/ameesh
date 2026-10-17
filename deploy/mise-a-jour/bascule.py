@@ -49,6 +49,7 @@ MARKER = ".pret"                 # venv-<version> complet et contrôlé
 CURRENT = "venv-courant"         # lien : version vivante
 REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
+SHEBANG_MAX_LINE = 8192          # borne en octets, même pour un script malformé
 
 _LAUNCHER = """#!/bin/sh
 # #1969 : lanceur stable du venv d'ameesh. Il résout le venv versionné vivant
@@ -104,10 +105,16 @@ def _version_name(value):
 def _write(path, data, mode=0o755):
     """Écrit un fichier en une fois (temp + rename) : jamais lu à moitié."""
     tmp = "%s.tmp.%d" % (path, os.getpid())
-    with open(tmp, "w") as handle:
-        handle.write(data)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as handle:
+            handle.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass  # déjà renommé, ou nettoyage impossible : garder l'erreur initiale
 
 
 def _live_target(venv):
@@ -159,8 +166,8 @@ def _pip_install(directory, src):
     _run([pip, "install", "-q", src])
 
 
-def _shebang_valide(ameesh, python):
-    """Le script `ameesh` désigne-t-il l'interpréteur de CE venv ?
+def _verifier_shebang(ameesh, python):
+    """Refuse un préambule qui ne désigne pas l'interpréteur de CE venv.
 
     pip écrit `#!<venv>/bin/python3` quand le shebang tient dans 127 octets.
     Au-delà (ou si le chemin contient une espace), distlib écrit un préambule
@@ -173,39 +180,50 @@ def _shebang_valide(ameesh, python):
     La troisième ligne ferme la chaîne triple : le fichier reste un script
     Python valide, lancé par sh puis par l'interpréteur cible.
     """
-    with open(ameesh, "rb") as handle:
-        lignes = [handle.readline().decode("utf-8", "replace").rstrip("\r\n")
-                  for _ in range(3)]
-    lignes[0] = lignes[0].strip()
+    def refuser(message):
+        raise RuntimeError("préambule inattendu dans %s : %s" % (ameesh, message))
+
+    def lire_ligne(handle, numero):
+        ligne = handle.readline(SHEBANG_MAX_LINE + 1)
+        if len(ligne) > SHEBANG_MAX_LINE:
+            refuser("ligne %d : dépasse %d octets" % (numero, SHEBANG_MAX_LINE))
+        return ligne.decode("utf-8", "replace").rstrip("\r\n")
+
     # pip écrit le shebang de l'interpréteur qui l'exécute : `bin/python3`
     # (ou `bin/python3.X`) dans un venv réel, jamais `bin/python` seul ; on
     # exige seulement l'interpréteur de CE venv.
     motif = re.escape(python) + r"(?:[0-9]+(?:\.[0-9]+)*)?"
-    if re.fullmatch("#!" + motif, lignes[0]):
-        return True
+    with open(ameesh, "rb") as handle:
+        premiere = lire_ligne(handle, 1).strip()
+        if re.fullmatch("#!" + motif, premiere):
+            return  # aucune lecture du corps Python derrière un shebang direct
+        if premiere != "#!/bin/sh":
+            refuser("ligne 1 %r ; interpréteur attendu %r" % (premiere, python))
+        execution = lire_ligne(handle, 2)
+        fermeture = lire_ligne(handle, 3)
     prefixe = "'''exec' "
-    if (lignes[0] == "#!/bin/sh" and lignes[2] == "' '''"
-            and lignes[1].startswith(prefixe)):
-        try:
-            mots = shlex.split(lignes[1][len(prefixe):])
-        except ValueError:
-            return False
-        return (len(mots) == 3 and mots[1:] == ["$0", "$@"]
-                and re.fullmatch(motif, mots[0]) is not None)
-    return False
+    if not execution.startswith(prefixe):
+        refuser("ligne 2 %r : instruction exec de pip attendue" % execution)
+    if fermeture != "' '''":
+        refuser("ligne 3 %r : fermeture du préambule pip attendue" % fermeture)
+    try:
+        mots = shlex.split(execution[len(prefixe):])
+    except ValueError as exc:
+        refuser("ligne 2 %r : quotage shell invalide (%s)" % (execution, exc))
+    if len(mots) != 3 or mots[1:] != ["$0", "$@"]:
+        refuser('ligne 2 %r : arguments "$0" "$@" attendus' % execution)
+    if re.fullmatch(motif, mots[0]) is None:
+        refuser("ligne 2 %r : interpréteur attendu %r" % (execution, python))
 
 
 def _controles(directory):
     """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule."""
     python = os.path.join(directory, "bin", "python")
     ameesh = os.path.join(directory, "bin", "ameesh")
+    _verifier_shebang(ameesh, python)
     _run([python, "-c", "import psycopg, ameesh; print('imports ok')"],
          stdout=subprocess.DEVNULL)
     _run([ameesh, "--version"], stdout=subprocess.DEVNULL)
-    if not _shebang_valide(ameesh, python):
-        with open(ameesh, "rb") as handle:
-            shebang = handle.readline().decode("utf-8", "replace").strip()
-        raise RuntimeError("shebang inattendu dans %s : %r" % (ameesh, shebang))
 
 
 def preparer(args):
