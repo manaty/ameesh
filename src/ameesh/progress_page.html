@@ -1069,6 +1069,21 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       });
       box.appendChild(cards);
 
+      // #1476 : durée médiane des suites complètes, cible de 15 min
+      var ci = D.ci_suite;
+      if (ci && (ci.repos || []).length) {
+        var cibox = el("div", "watch");
+        cibox.appendChild(el("h2", null, "CI full suite"));
+        (ci.repos || []).forEach(function (r) {
+          if (!r.runs) { cibox.appendChild(el("p", "meta", r.repo + ": no concluded full suite")); return; }
+          cibox.appendChild(el("p", "meta", r.repo + ": median " + dur(r.median_s) + " · p80 " + dur(r.p80_s)
+            + " (" + r.runs + " run(s), target ≤ " + dur(ci.target_s) + ")"));
+          if (r.priority_runs) cibox.appendChild(el("p", "meta", "priority pool: median "
+            + dur(r.priority_median_s) + " over " + r.priority_runs + " run(s)"));
+        });
+        box.appendChild(cibox);
+      }
+
       // à regarder : décisions, lots bloqués, stagnants ou en attente d'un humain
       var watch = [];
       sc.decisions.forEach(function (d) {
