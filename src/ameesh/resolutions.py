@@ -386,25 +386,48 @@ def _status(path: str) -> list[str]:
     return [e for e in proc.stdout.decode("utf-8", "replace").split("\0") if e[2:3] == " "]
 
 
+def _admin_cwd(repo: str, path: str) -> str:
+    """A cwd that survives the removal of `path` (#2142). Quand `--done` est
+    lancé depuis le worktree de résolution, `repo` *est* `path` : le
+    `git worktree prune` qui suit la suppression tournait alors dans un dossier
+    disparu et git répondait `git not found`, après l'enregistrement de la
+    résolution. On administre depuis le worktree principal, qui survit."""
+    if os.path.realpath(repo) != os.path.realpath(path):
+        return repo
+    proc = _run(repo, "worktree", "list", "--porcelain")
+    if proc.returncode == 0:
+        for line in _text(proc).splitlines():
+            if line.startswith("worktree ") and line[len("worktree "):].strip():
+                main = line[len("worktree "):].strip()
+                if os.path.isdir(main) and os.path.realpath(main) != os.path.realpath(path):
+                    return main
+                break
+    parent = os.path.dirname(path)
+    return parent if os.path.isdir(parent) else repo
+
+
 def _remove_worktree(repo: str, path: str, *, force: bool = True) -> None:
     """Removes the worktree and its metadata. `force=False` (after `--done`):
     only a clean worktree, else ResolveError and nothing removed."""
     if not force and os.path.isdir(path):
         dirty = _status(path)
         if dirty:
-            raise ResolveError("worktree %s not removed, it holds changes: %s"
-                               % (path, ", ".join(e[3:] for e in dirty[:10])))
-    _run(repo, "worktree", "unlock", path)
+            raise ResolveError("worktree %s not removed, it holds changes: %s; keep them, "
+                               "or drop the worktree with: git worktree remove -f -f %s"
+                               % (path, ", ".join(e[3:] for e in dirty[:10]), path))
+    admin = _admin_cwd(repo, path)
+    _run(admin, "worktree", "unlock", path)
     if not force:
         # no --force, no rmtree: git refuses a worktree that changed since the check
-        proc = _run(repo, "worktree", "remove", path)
+        proc = _run(admin, "worktree", "remove", path)
         if proc.returncode != 0 and os.path.isdir(path):
-            _run(repo, "worktree", "lock", "--reason", "ameesh work resolve", path)
-            raise ResolveError("worktree %s not removed: %s" % (path, _err(proc)))
+            _run(admin, "worktree", "lock", "--reason", "ameesh work resolve", path)
+            raise ResolveError("worktree %s not removed: %s; drop it with: "
+                               "git worktree remove -f -f %s" % (path, _err(proc), path))
     else:
-        _run(repo, "worktree", "remove", "--force", path)
+        _run(admin, "worktree", "remove", "--force", path)
         shutil.rmtree(path, ignore_errors=True)
-    _run(repo, "worktree", "prune")
+    _run(admin, "worktree", "prune")
     try:
         os.unlink(_meta_path(path))
     except FileNotFoundError:
@@ -420,9 +443,24 @@ def _read_meta(path: str) -> dict | None:
     return data if isinstance(data, dict) and os.path.isdir(path) else None
 
 
+def _current_resolution(db, lot: int, other: int, lot_tip: str,
+                        other_tip: str) -> dict | None:
+    """La résolution enregistrée de la paire qui couvre les deux têtes
+    courantes, dans un sens ou dans l'autre (`prepared` du radar), la plus
+    récente d'abord."""
+    for row in _recorded(db, lot, other):
+        mine, theirs = ((row["lot_tip"], row["other_tip"])
+                        if int(row["work_item_id"]) == lot
+                        else (row["other_tip"], row["lot_tip"]))
+        if mine == lot_tip and theirs == other_tip:
+            return row
+    return None
+
+
 def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dict:
     """Opens (or shows, if already open) the resolution of `lot` with
-    `other`. Returns `{state: open|clean, path, files, replayed, remaining}`."""
+    `other`. Returns `{state: open|prepared|clean, path, files, replayed,
+    remaining}`."""
     repo = repo_root(repo)
     path = worktree_path(repo, lot, other)
     meta = _read_meta(path)
@@ -435,6 +473,16 @@ def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dic
                            "ameesh work resolve %d --with %d --abort to drop it"
                            % (path, _meta_path(path), lot, other))
     ctx = pair(db, lot, other, repo)
+    row = _current_resolution(db, lot, other, ctx["lot_tip"], ctx["other_tip"])
+    if row is not None:
+        # #2142 : la paire porte déjà une résolution à jour : ne pas rouvrir un
+        # worktree pour la même chose. L'état est `prepared` (le radar la
+        # rejoue), pas `open` avec un index non fusionné.
+        return {"state": "prepared", "lot": lot, "other": other, "path": None,
+                "commit": row["commit_sha"], "ref": row.get("ref"),
+                "files": list(row.get("files") or []),
+                "lot_tip": ctx["lot_tip"], "other_tip": ctx["other_tip"],
+                "target": ctx["target"], "replayed": [], "remaining": [], "markers": []}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     _check(_run(repo, "worktree", "add", "--quiet", "--detach", path, ctx["lot_tip"]),
            "worktree add")
@@ -538,14 +586,32 @@ def push(repo: str, sha: str, lot: int, other: int, *,
     return None, error
 
 
+def _prepared_out(row: dict, lot: int, other: int, *, already: bool) -> dict:
+    """Sortie d'un `--done` dont le commit est déjà enregistré : seul le
+    nettoyage restait (#2142)."""
+    return {"lot": lot, "other": other, "commit": row["commit_sha"], "ref": row.get("ref"),
+            "push_error": None, "local_ref": ref_name(lot, other),
+            "files": list(row.get("files") or []), "state": "prepared", "already": already}
+
+
 def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
                       actor: str = "", note: str = "", push_fn=push) -> dict:
     """Commits the resolution open in its worktree, points the dedicated ref
-    at it, pushes it, records it, and removes the worktree."""
+    at it, pushes it, records it, and removes the worktree. Idempotent : si le
+    commit est déjà enregistré (nettoyage manqué d'un `--done` précédent), elle
+    ne repousse ni ne réenregistre, elle finit le nettoyage et rend l'état
+    `prepared` (#2142)."""
     repo = repo_root(repo)
     path = worktree_path(repo, lot, other)
     meta = _read_meta(path)
     if meta is None:
+        row = next(iter(_recorded(db, lot, other)), None)
+        if row is not None and not os.path.isdir(path) and _ensure_commit(repo, row):
+            # le worktree est déjà retiré et la résolution enregistrée : le
+            # `.json` de méta (et l'entrée git) peuvent rester d'un nettoyage
+            # interrompu ; on les enlève au lieu d'exiger une nouvelle passe.
+            _remove_worktree(repo, path)
+            return _prepared_out(row, lot, other, already=True)
         if os.path.exists(path):
             raise ResolveError("%s exists without readable metadata: look at it, then "
                                "ameesh work resolve %d --with %d --abort"
@@ -560,13 +626,16 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
         untracked = [e[3:] for e in _status(path) if e.startswith("??")]
         if untracked:
             raise ResolveError("untracked files in %s: %s; git add them if the resolution "
-                               "needs them, else delete them"
-                               % (path, ", ".join(untracked[:10])))
+                               "needs them, else delete them, or drop the worktree with: "
+                               "git worktree remove -f -f %s"
+                               % (path, ", ".join(untracked[:10]), path))
         ignored = [e[3:] for e in _status(path) if e.startswith("!!")]
         if ignored:
             raise ResolveError("ignored files in %s: %s; removing the worktree would lose "
                                "them: git add -f them if the resolution needs them, else "
-                               "move or delete them" % (path, ", ".join(ignored[:10])))
+                               "move or delete them, or drop the worktree with: "
+                               "git worktree remove -f -f %s"
+                               % (path, ", ".join(ignored[:10]), path))
         _check(_run(path, "add", "-u"), "add")
         present = [f for f in meta["files"] if os.path.lexists(os.path.join(path, f))]
         if present:
@@ -596,6 +665,13 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
     if _status(path):
         raise ResolveError("%s is not clean after the resolution commit: %s"
                            % (path, ", ".join(e[3:] for e in _status(path)[:10])))
+    row = next(iter(_recorded(db, lot, other)), None)
+    if row is not None and row["commit_sha"] == sha:
+        # déjà poussé et enregistré par une passe précédente : ne pas repousser
+        # ni réenregistrer, finir le nettoyage et rendre l'état `prepared`
+        # (#2142, `--done` idempotent).
+        _remove_worktree(repo, path, force=False)
+        return _prepared_out(row, lot, other, already=True)
     _check(_run(repo, "update-ref", ref_name(lot, other), sha), "update-ref")
     branch = "refs/heads/" + branch_name(lot, other)
     previous = next((r["commit_sha"] for r in _recorded(db, lot, other)
@@ -612,7 +688,8 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
                            "kept in %s)" % (lot, other, sha[:12], path))
     _remove_worktree(repo, path, force=False)
     return {"lot": lot, "other": other, "commit": sha, "ref": pushed, "push_error": error,
-            "local_ref": ref_name(lot, other), "files": meta["files"]}
+            "local_ref": ref_name(lot, other), "files": meta["files"],
+            "state": "prepared", "already": False}
 
 
 def abort_resolution(lot: int, other: int, *, repo: str | None = None) -> bool:
@@ -858,6 +935,12 @@ def _print_open(out: dict) -> None:
         print("#%d and #%d merge without conflict (%s + %s): nothing to prepare"
               % (out["lot"], out["other"], out["lot_tip"][:12], out["other_tip"][:12]))
         return
+    if out["state"] == "prepared":
+        print("resolution of #%d with #%d already prepared: %s (%s)" % (
+            out["lot"], out["other"], out["commit"][:12], out.get("ref") or "local only"))
+        print("nothing to open; the radar replays it at each pass and tells the "
+              "resolver when a tip moves and it goes stale")
+        return
     print("resolution of #%d with #%d %s: %s" % (
         out["lot"], out["other"], "already open" if out.get("already") else "open",
         out["path"]))
@@ -898,6 +981,13 @@ def run(cfg, db, args) -> int:
                                     actor=args.actor, note=args.message)
             if args.json:
                 print(json.dumps(out, ensure_ascii=False, indent=2))
+                return 0
+            if out.get("already"):
+                print("resolution of #%d with #%d already prepared: %s, %s" % (
+                    out["lot"], out["other"], out["commit"][:12],
+                    "pushed to origin %s" % out["ref"] if out["ref"] else
+                    "kept in %s only" % out["local_ref"]))
+                print("the worktree was cleaned up; nothing re-committed, nothing re-recorded")
                 return 0
             print("resolution of #%d with #%d recorded: %s, %s" % (
                 out["lot"], out["other"], out["commit"][:12],

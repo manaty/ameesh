@@ -1277,6 +1277,14 @@ class ImportGraphTest(unittest.TestCase):
                                            "e = getattr(sys, 'exit')\n"
                                            "e(1)\n"
                                            "import ameesh.db\n",
+            # #1906 : le porteur peut être affecté par walrus — la preuve
+            # d'import doit tomber comme pour un nom simple.
+            "walrus sys.exit": "import sys\n"
+                               "(s := sys).exit(1)\n"
+                               "import ameesh.db\n",
+            "getattr walrus sys.exit": "import sys\n"
+                                       "getattr((s := sys), 'exit')(1)\n"
+                                       "import ameesh.db\n",
         }
         for why, source in stopped.items():
             with self.subTest(why):
@@ -1301,6 +1309,11 @@ class ImportGraphTest(unittest.TestCase):
                                         "name = 'exit'\n"
                                         "getattr(sys, name)\n"
                                         "import ameesh.db\n",
+            # #1906 : déballer un walrus ne classe pas un porteur ordinaire.
+            "getattr walrus d'un porteur ordinaire": "class C:\n"
+                                                     "    pass\n"
+                                                     "getattr((x := C), 'exit')\n"
+                                                     "import ameesh.db\n",
         }
         for why, source in kept.items():
             with self.subTest(why):

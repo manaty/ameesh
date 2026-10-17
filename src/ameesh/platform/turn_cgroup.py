@@ -27,7 +27,8 @@ Ce fichier sert à deux choses.
    exactement celle attendue (ou si le chemin sort de la racine par un lien),
    écrit `READY` sur le descripteur hérité, puis `exec` le harnais : même pid,
    même session, même groupe — les descendants suivent par `fork`/`exec` et
-   `setsid` ne les fait plus sortir.
+   `setsid` ne les fait plus sortir. Un placement refusé enlève le cgroup du
+   tour, resté vide (#1641), au lieu de le laisser au balayage.
 
 Aucune dépendance au paquet installé : le trampoline tourne dans le dossier de
 travail du harnais, qui n'est pas forcément importable (même modèle que
@@ -328,7 +329,7 @@ def _fail(message: str) -> int:
     return REFUSED
 
 
-def main(args: list) -> int:
+def main(args: list, *, root_dir: str = CGROUP_ROOT) -> int:
     cgroup = ""
     ready_fd: int | None = None
     index = 0
@@ -352,11 +353,18 @@ def main(args: list) -> int:
     argv = args[index:]
     if not cgroup or ready_fd is None or not argv:
         return _fail("usage: ameesh.platform.turn_cgroup --cgroup PATH --ready-fd FD -- ARGV")
-    if _target(cgroup) is None:
-        return _fail("cgroup %s outside %s or behind a link" % (cgroup, CGROUP_ROOT))
-    if not enter(cgroup):
+    if _target(cgroup, root_dir) is None:
+        return _fail("cgroup %s outside %s or behind a link" % (cgroup, root_dir))
+    if not enter(cgroup, root_dir=root_dir):
+        # #1641 : le placement refusé laisse le cgroup du tour vide. On
+        # l'enlève ici, tout de suite : ce processus est le seul à savoir, à
+        # cet instant, que rien n'y tournera, et l'exécuteur peut disparaître
+        # avant son propre nettoyage (redémarrage, arrêt dur) — le dossier
+        # n'attend alors plus le balayage de réconciliation.
+        remove(cgroup, root_dir=root_dir)
         return _fail("could not enter cgroup %s (refused)" % cgroup)
-    if populated(cgroup) is not True:
+    if populated(cgroup, root_dir=root_dir) is not True:
+        remove(cgroup, root_dir=root_dir)
         return _fail("cgroup %s is not populated after placement" % cgroup)
     try:
         os.write(ready_fd, (READY + "\n").encode("ascii"))

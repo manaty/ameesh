@@ -28,7 +28,12 @@ compte est choisi ainsi :
    plus courte fenêtre) n'est plus un instantané courant : le compte est **non
    vérifié**, sa raison le dit, et il passe après tout compte à relevé courant,
    quel que soit son rythme lu — il reste **essayé** faute de mieux (L71,
-   « essayé, pas écarté »). #1672 **borne cet essai** : quand une fenêtre datée
+   « essayé, pas écarté »). #1566 : ce partiel reste **informateur** — date de
+   lecture connue et sous ce qui reste d'**au moins une** fenêtre datée encore
+   ouverte, et **chaque** fenêtre ouverte (non datée comprise) sous son plafond
+   effectif moins `RESERVE` — et garde alors le rang d'un relevé **courant**
+   (jamais celui d'un relevé absent) ; sans preuve, il reste après eux. #1672
+   **borne cet essai** : quand une fenêtre datée
    s'est remise à zéro, un relevé plus vieux que ce qui reste de **chaque**
    fenêtre encore ouverte est une information trop ancienne pour engager un
    tour — prudence, pas preuve d'un quota atteint —, le compte est écarté du
@@ -52,7 +57,11 @@ n'est pas dans ce cas : la fenêtre ouverte n'est qu'une **borne inférieure**
 (le compte a pu servir depuis, ici ou ailleurs), donc le relevé n'est plus
 courant et le compte devient **non vérifié** (#1561) : sa raison le dit au lieu
 d'annoncer la valeur périmée comme courante, il n'annonce ni perte ni échéance,
-et il passe après tout relevé courant, **essayé** faute de mieux (L71). #1672
+et il passe après tout relevé courant, **essayé** faute de mieux (L71). #1566 :
+quand il reste **informateur** (âge sous ce qui reste d'une fenêtre datée
+ouverte, chaque fenêtre ouverte sous son plafond effectif moins `RESERVE`), il
+garde le rang d'un relevé courant — la raison dit « partiel », pas une mesure
+fraîche. #1672
 borne cet essai : un relevé plus vieux que ce qui reste de chaque fenêtre
 encore ouverte est trop ancien pour engager un tour, le compte est écarté du
 placement et le choix pause jusqu'à la remise à zéro qui la motive. Le cas
@@ -223,6 +232,19 @@ ne change rien. Un seau de modèle (`title`, ex. « Fable Weekly ») ne compte
 que pour une session **de ce modèle** ; un modèle inconnu l'ignore, et
 `accounts list` les montre tous (la ligne d'état peut donc être retenue par un
 seau de modèle).
+
+Un relevé ne date pas de son écriture : un `rate_limit_event` ne porte aucun
+instant, et le dater au `mtime` du journal faisait passer la dernière mesure
+d'un agent arrêté pour une mesure fraîche (incident du 13/10 : seven_day 67 %
+a écrasé 87 % et l'admission est passée sous le plafond). Chaque relevé Claude
+porte donc sa **provenance** : l'instant de production — le ts du marqueur du
+tour qui l'a publié, absent pour un flux sans marqueur — et le journal
+d'origine. Un relevé dont une fenêtre était déjà close quand le tour a
+commencé est un **rejeu** du harnais : il reste lisible (la fenêtre échue vaut
+0 %, L71) mais n'est pas daté et ne remplace jamais une mesure datée. Les
+lecteurs départagent par instant de production, jamais par l'heure
+d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
+exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
 
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,

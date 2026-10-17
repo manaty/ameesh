@@ -56,7 +56,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
    pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
-   turn_costs      last_reading insert spent ledger correct
+   turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
                    pending_recipients_sorted unread_total dead_letters forward
@@ -98,7 +98,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity turns record_gauges gauge_history
-                   latest_gauges assigners record_balance balances
+                   latest_gauges gauge_latest assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
@@ -506,6 +506,20 @@ class TurnCosts(Domain):
         l'agent pour ce harnais — de cette session seulement si `session` est
         donnée : session, cum_usd, cum_input_tokens, cum_cached_input_tokens,
         cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
+
+    @abc.abstractmethod
+    def last_before(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la dernière ligne écrite de `agent` à `ts` (epoch) ou avant :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. Lecture seule,
+        pour relire le harnais qui tournait avant un instant donné (le gel d'un
+        lot)."""
+
+    @abc.abstractmethod
+    def first_after(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
+        écrit la ligne d'un tour à sa fin : le tour qui a posé un gel est le
+        premier écrit APRÈS l'instant du gel. Lecture seule."""
 
     @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
@@ -1385,6 +1399,14 @@ class WorkItems(Domain):
         None si le lot n'est plus ouvert."""
 
     @abc.abstractmethod
+    def attach_implicit_branch(self, item_id: int, branch: str, *, detached_prefix: str,
+                               note: str, actor: str) -> dict | None:
+        """#2102 : pose la branche implicite (L118b) d'un lot ouvert, sans
+        cible, avec une ligne de journal, seulement s'il n'a pas de branche et
+        qu'aucune ligne de son journal ne commence par `detached_prefix`
+        (détachement), vérifiés sous le verrou de la ligne du lot ; None sinon."""
+
+    @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:
@@ -1790,11 +1812,14 @@ class WorkItems(Domain):
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod
     def issue_feed(self, limit: int) -> list[dict]:
-        """Les lots que la projection en issues examine : ouverts, ou qui
-        portent une `issue_ref` (les `limit` plus récents), par id croissant.
-        Chaque ligne ajoute l'équipe de la fiche du plan (`package_team`) et
-        l'équipe, le chantier et l'hôte de l'assigné au registre
-        (`assignee_team`, `assignee_chantier`, `assignee_host`). Une
+        """Les lots que la projection en issues examine : ouverts, porteurs
+        d'une `issue_ref`, ou pinnés sur une révision Process (#2130/D : un
+        cœur `merged` reste projeté ouvert), les `limit` plus récents, par id
+        croissant. Chaque ligne ajoute l'équipe de la fiche du plan
+        (`package_team`), l'équipe, le chantier et l'hôte de l'assigné au
+        registre (`assignee_team`, `assignee_chantier`, `assignee_host`), et
+        la révision Process du lot (`workflow_ref`, `workflow_stage`,
+        `workflow_version` ; `''`, NULL, 0 sur une base pré-0452). Une
         instruction."""
 
     @abc.abstractmethod
@@ -1991,6 +2016,14 @@ class Canon(Domain):
     @abc.abstractmethod
     def states(self, host: str) -> list[dict]:
         """Tous les états enregistrés pour l'hôte, un par canon (L42)."""
+
+    @abc.abstractmethod
+    def claim_commit(self, host: str, old: str, new: str, canon: str = "") -> bool:
+        """#793 : avance le repère d'envoi `process_commit` de `old` à `new`,
+        si aucune autre synchronisation ne l'a fait ; False sinon. NULL :
+        initialiser depuis `last_good_commit`. `record_state` ne touche jamais
+        ce repère. Dans la transaction de l'appelant, la ligne reste verrouillée
+        jusqu'à son commit."""
 
     @abc.abstractmethod
     def key_for_root(self, host: str, root: str) -> str | None:
@@ -2766,8 +2799,10 @@ class Operations(Domain):
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee, `package_id`, type et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
-        son relecteur désigné), `workflow_ref` (#1922/N13 : la révision Process
-        qui pinne le lot, '' sur une base d'avant la 0452). Les plus
+        son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
+        celle de son paquet ou du parent, sinon son `app`), `workflow_ref`
+        (#1922/N13 : la révision Process qui pinne le lot, '' sur une base
+        d'avant la 0452). Les plus
         anciennement actifs d'abord. `limit=None` lit toute la vérité avant le
         filtrage des attentes planifiées (L368)."""
 
@@ -2783,22 +2818,36 @@ class Operations(Domain):
     @abc.abstractmethod
     def record_gauges(self, readings: Sequence[dict]) -> int:
         """Ajoute les relevés de jauge (harness, key, used, resets_at,
-        window_s, et `account` facultatif — L30, 0028) qui CHANGENT le dernier
-        relevé de leur jauge (du même compte), ou dont le dernier relevé a plus
-        de dix minutes. Rend le nombre de lignes."""
+        window_s, `account` facultatif — L30, 0028, `produced_at` et `source`
+        facultatifs — #1132, 0434) qui CHANGENT le dernier relevé de leur jauge
+        (du même compte), ou dont le dernier relevé a plus de dix minutes. Rend
+        le nombre de lignes. `produced_at` (epoch) est l'instant de PRODUCTION
+        du relevé, NULL quand le flux ne le date pas ; `source` nomme le
+        journal d'origine."""
 
     @abc.abstractmethod
     def gauge_history(self, *, since_s: float, harness: str | None,
                       account: str | None = None) -> list[dict]:
         """Relevés des `since_s` dernières secondes, dans l'ordre
-        chronologique : harness, key, used, resets_at_ts, window_s,
-        observed_ts, account (L30 ; None sans comptes). `account` filtre."""
+        chronologique d'insertion : harness, key, used, resets_at_ts, window_s,
+        observed_ts, produced_ts (#1132 ; None si non daté), source (#1132) et
+        account (L30 ; None sans comptes). `account` filtre."""
 
     @abc.abstractmethod
     def latest_gauges(self, *, since_s: float) -> list[dict]:
         """L94 : le DERNIER relevé de chaque jauge (harness, account, key)
-        observé dans les `since_s` dernières secondes : harness, key, used,
-        resets_at_ts, window_s, observed_ts, account (None sans comptes)."""
+        observé dans les `since_s` dernières secondes, choisi par instant de
+        PRODUCTION (#1132 : `produced_at` d'abord, NULL en dernier, puis
+        `observed_at`) : harness, key, used, resets_at_ts, window_s,
+        observed_ts, produced_ts, source, account (None sans comptes)."""
+
+    @abc.abstractmethod
+    def gauge_latest(self, *, harness: str, account: str) -> list[dict]:
+        """#1132 : le dernier relevé CONNU de chaque jauge d'un compte nommé,
+        sans limite d'âge : le plus récent par instant de production
+        (`produced_at` d'abord, NULL en dernier), puis par insertion — harness,
+        key, used, resets_at_ts, window_s, observed_ts, produced_ts, source,
+        account. Aucune ligne pour un compte inconnu."""
 
     @abc.abstractmethod
     def assigners(self, *, since_s: float) -> list[str]:
@@ -2941,6 +2990,11 @@ class HostResources(Domain):
     def current(self, host: str | None) -> list[dict]:
         """Le dernier relevé de CHAQUE hôte connu (celui de `host` seulement
         s'il est donné), trié par nom d'hôte."""
+
+    @abc.abstractmethod
+    def runners(self, host: str, since_s: float) -> list[dict]:
+        """#2022: the last reading of each runner of `host` (`runner_id`)
+        within `since_s` seconds, the most zombies first."""
 
     @abc.abstractmethod
     def turns_in_progress(self, host: str) -> int:
@@ -3309,11 +3363,6 @@ class CiResults(Domain):
         `started_at` prend l'heure du relevé (la fin de l'attente d'un runner)."""
 
     @abc.abstractmethod
-    def queued(self) -> list[dict]:
-        """#747 : les exécutions `running` jamais vues démarrées, de la plus
-        ancienne à la plus récente, tous dépôts."""
-
-    @abc.abstractmethod
     def reopen_run(self, repo: str, run_id: int, *, run_attempt: int) -> dict | None:
         """Une exécution conclue que GitHub dit de nouveau en cours (relance,
         #901 : même `run_id`, `run_attempt` strictement supérieur) repasse
@@ -3369,11 +3418,13 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def base_failures(self, repo: str, branch: str, *, workflow: str = "") -> dict:
-        """Dernière exécution conclue (verte ou rouge) de `branch` **pour ce
-        workflow** : `{run_id, head_sha, tests}` (tests en échec de son attempt
-        courant), ou {} sans exécution. Le workflow évite de comparer deux
-        suites étrangères ; les lignes antérieures à la migration 0433, toutes
-        de l'ancien filtre global `tests.yml`, y sont nommées."""
+        """Dernière exécution conclue (verte ou rouge) de la **tête la plus récemment
+        poussée** de `branch`, pour ce workflow (#1683 : la conclusion la plus
+        récente peut être celle d'une tête plus ancienne) : `{run_id, head_sha,
+        tests}` (tests en échec de son attempt courant), ou {} sans exécution.
+        Le workflow évite de comparer deux suites étrangères ; les lignes
+        antérieures à la migration 0433, toutes de l'ancien filtre global
+        `tests.yml`, y sont nommées."""
 
     @abc.abstractmethod
     def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
@@ -3438,11 +3489,6 @@ class CiResults(Domain):
                           covered: int, complete: bool, reason: str | None = None) -> None:
         """Clôt le relevé : appels réellement consommés, exécutions listées et
         couvertes, et raison d'un relevé incomplet (qui n'a rien publié)."""
-
-    @abc.abstractmethod
-    def guard_runs(self, repo: str) -> dict:
-        """Le cache des relevés par exécution, clé `(run_id, attempt)` :
-        `{run_id, attempt, status, queued, oldest_id, oldest_at, runners}`."""
 
     @abc.abstractmethod
     def observe_guard_run(self, repo: str, *, run_id: int, attempt: int, status: str,

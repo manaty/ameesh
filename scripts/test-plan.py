@@ -364,12 +364,16 @@ def _getattr_member(node: ast.Call) -> tuple[str, str] | None:
     """`getattr(<name>, '<constant>', ...)` lu statiquement : le couple
     (porteur, membre), ou `None` (forme dynamique, argument manquant). Le
     défaut éventuel est sans effet ici : `sys.exit`/`os._exit` existent
-    toujours, donc l'appel termine quel que soit le défaut."""
+    toujours, donc l'appel termine quel que soit le défaut. Le porteur peut
+    être affecté par walrus (`getattr((s := sys), 'exit')`, #1906) : on
+    déballe `ast.NamedExpr` avant le test de nom."""
     if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
         return None
     if len(node.args) < 2:
         return None
     owner, attr = node.args[0], node.args[1]
+    if isinstance(owner, ast.NamedExpr):
+        owner = owner.value
     if (isinstance(owner, ast.Name) and isinstance(attr, ast.Constant)
             and isinstance(attr.value, str)):
         return owner.id, attr.value
@@ -380,17 +384,20 @@ def _is_exit_func(node: ast.expr, exit_names: set[str],
                   sys_names: set[str], os_names: set[str]) -> bool:
     """Whether an expression designates a known import-time termination: a
     bound name, `sys.exit`/`os._exit`, or their static `getattr` read (#1878)
-    (aliases of `sys`, `os` and of the imported names included)."""
+    (aliases of `sys`, `os` and of the imported names included). Le porteur
+    peut être affecté par walrus (`(s := sys).exit(1)`, #1906)."""
     if isinstance(node, ast.NamedExpr):
         # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
         return _is_exit_func(node.value, exit_names, sys_names, os_names)
     if isinstance(node, ast.Name):
         return node.id in exit_names
-    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-        if node.attr == "exit":
-            return node.value.id in sys_names
-        if node.attr == "_exit":
-            return node.value.id in os_names
+    if isinstance(node, ast.Attribute):
+        owner = node.value.value if isinstance(node.value, ast.NamedExpr) else node.value
+        if isinstance(owner, ast.Name):
+            if node.attr == "exit":
+                return owner.id in sys_names
+            if node.attr == "_exit":
+                return owner.id in os_names
         return False
     if isinstance(node, ast.Call):
         read = _getattr_member(node)

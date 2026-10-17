@@ -116,10 +116,17 @@ def annotate(cfg, db, alerts: list[dict], *, human: str | None = None) -> list[d
 
 
 def reconcile(db, current: list[dict], *, observed_ts: float, dry_run: bool = False,
-              observation_host: str | None = None, perimeter: str | None = None,
+              observation_host: str | None = None,
+              unreadable: list[str] | tuple[str, ...] = (),
+              perimeter: str | None = None,
               evaluate=None) -> list[dict]:
     """Invalidate old observations; return the pre-invalidation rows too, so
     a just-resolved acknowledged alert does not send a resolution message.
+
+    `unreadable` (#1901): alert families this pass could not read at all
+    (`exploitation.alerts`). An alert absent from an incomplete snapshot is
+    not resolved: the acknowledgements of the host gate stay valid until a
+    pass that observed it.
 
     #1473: a row is judged in the perimeter that acknowledged it. A pass
     observing another perimeter (`perimeter` is its canonical identity) asks
@@ -127,9 +134,12 @@ def reconcile(db, current: list[dict], *, observed_ts: float, dry_run: bool = Fa
     resolution; an unknown perimeter (NULL, row predating the column) or an
     absent `evaluate` falls back to the pass's own observation.
     """
+    from .mediated_executor import availability
+
     domain = storage.of(db).alert_acknowledgements
     rows = domain.live()
     levels = {key_of(a): severity(a) for a in current}
+    gate_unreadable = availability.GATE_FAMILY in unreadable
     others: dict = {}
 
     def observed(own: str | None) -> dict:
@@ -153,6 +163,10 @@ def reconcile(db, current: list[dict], *, observed_ts: float, dry_run: bool = Fa
     if not dry_run:
         for row in rows:
             if row["observation_host"] is not None and row["observation_host"] != observation_host:
+                continue
+            # Le type de l'alerte n'est pas dans la ligne d'acquittement ; la
+            # porte d'hôte est la seule famille à renseigner l'hôte observé.
+            if gate_unreadable and row["observation_host"] is not None:
                 continue
             level = levels.get(row["alert_key"])
             if level == row["severity"]:

@@ -278,6 +278,21 @@ def _base_set(branches) -> frozenset:
     return frozenset(str(b).casefold() for b in (branches or BASE_BRANCHES))
 
 
+def bases_for_repo(settings, repo: str) -> tuple:
+    """Les branches de base d'un dépôt (#1483) : celles que déclare
+    `github.projects.<projet>.base`, en tête (la première est la référence d'un
+    push hors PR), puis `BASE_BRANCHES` — `main` reste une base même quand le
+    dépôt déclare `develop` : traitée en branche de lot, chaque tête de main y
+    remplacerait la précédente et retirerait son verdict, comme `ci_main_red`
+    la lit déjà.
+
+    #1683 : source unique du veilleur (`Watcher.bases`) et de l'alerte
+    (`main_red`) — une branche d'un autre dépôt qui porterait le même nom
+    n'est pas lue comme une base."""
+    declared = settings.bases_for(repo) if settings is not None else None
+    return tuple(dict.fromkeys(tuple(declared or ()) + BASE_BRANCHES))
+
+
 def lot_of_run(run: dict, lots: list[dict], bases=BASE_BRANCHES) -> int | None:
     """Le lot d'une exécution : par sa branche (lots ouverts), sinon par la
     ligne `ameesh-work:` de son commit de tête. `bases` : les branches de base
@@ -674,15 +689,10 @@ class Watcher:
         return sorted(set(settings.projects.values()))
 
     def bases(self, repo: str) -> tuple:
-        """Les branches de base d'un dépôt (#1483) : celles que déclare
-        `github.projects.<projet>.base`, en tête (la première est la référence
-        d'un push hors PR), puis `BASE_BRANCHES` — `main` reste une base même
-        quand le dépôt déclare `develop` : traitée en branche de lot, chaque
-        tête de main y remplacerait la précédente et retirerait son verdict,
-        comme `ci_main_red` la lit déjà."""
-        settings = self.settings()
-        declared = settings.bases_for(repo) if settings else None
-        return tuple(dict.fromkeys(tuple(declared or ()) + BASE_BRANCHES))
+        """Les branches de base d'un dépôt (#1483, #1683) : `bases_for_repo`,
+        la même lecture que `ci.main_red` — le veilleur et l'alerte ne
+        divergent pas."""
+        return bases_for_repo(self.settings(), repo)
 
     def discovered_workflows(self, repo: str) -> tuple[str, ...] | None:
         """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
@@ -725,7 +735,12 @@ class Watcher:
         journalisés, et la liste déclarée les suit explicitement ; si aucun
         workflow découvert ne ressemble à une suite, le comportement de #1110
         est conservé (tous suivis) pour qu'aucune suite au nom inhabituel ne
-        soit perdue."""
+        soit perdue.
+
+        #1683 : un `ci.yml` générique ne porte aucun marqueur de suite
+        (`SUITE_RE`) — il est donc écarté **dès qu'une autre suite est
+        reconnue**, comportement assumé, journalisé une fois, et la liste
+        déclarée reste le moyen de le suivre. Aucun n'est ignoré en silence."""
         settings = self.settings()
         declared = settings.workflows_for(repo) if settings else None
         found = self.discovered_workflows(repo)
@@ -1403,7 +1418,7 @@ def describe(record: dict) -> str:
 # alerte ci_main_red
 # --------------------------------------------------------------------------
 
-def main_red(db, bases=BASE_BRANCHES) -> list[dict]:
+def main_red(db, bases=BASE_BRANCHES, *, bases_for=None) -> list[dict]:
     """Les exécutions des branches de base qui sont rouges : la dernière
     exécution conclue de chaque workflow (un succès d'une suite ne masque pas
     l'échec d'une autre, #1110), et une exécution encore en cours dont un échec
@@ -1416,10 +1431,22 @@ def main_red(db, bases=BASE_BRANCHES) -> list[dict]:
     `bases` : toutes les branches de base configurables des dépôts (#1483 ;
     `Settings.all_bases`, le défaut `BASE_BRANCHES` restant à la charge de
     l'appelant).
+    `bases_for(repo)` : les branches de base propres à un dépôt (#1683,
+    `bases_for_repo`) ; sans lui, `bases` s'applique à tous les dépôts (appel
+    historique) — une branche d'un dépôt qui porte le nom de la base d'un autre
+    serait alors lue comme une base.
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
+
+    def on_base(row) -> bool:
+        if bases_for is None:
+            return True
+        return (row.get("branch") or "").casefold() in _base_set(bases_for(row["repo"]))
+
     out, newest = [], {}
     for row in st.ci.latest_concluded(bases):
+        if not on_base(row):
+            continue
         key = (row["repo"], row["branch"], row.get("workflow"))
         newest[key] = max(newest.get(key, 0), int(row["run_id"]))
         if row.get("status") != "failure":
@@ -1427,6 +1454,8 @@ def main_red(db, bases=BASE_BRANCHES) -> list[dict]:
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
     for row in st.ci.running_on(bases):
+        if not on_base(row):
+            continue
         if int(row["run_id"]) < newest.get(
                 (row["repo"], row["branch"], row.get("workflow")), 0):
             continue
