@@ -490,7 +490,7 @@ pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état r
   pause_etat <<<"$ligne"
 }
 poser_drain() {  # $1 persona, $2 secondes déjà attendues
-  local motif sortie change etat pose raison
+  local motif sortie change etat pose raison rc=0
   motif=$(drain_motif "$(drain_jeton)")
   # R1 B2 : le motif courant remplace l'ancien — après une levée humaine, un
   # re-drain ne doit pas garder une entrée périmée que drain_motif_de lirait
@@ -500,7 +500,8 @@ poser_drain() {  # $1 persona, $2 secondes déjà attendues
   # read can fail after commit. EXIT still attempts the conditional cleanup.
   DRAINS+=("$1"$'\t'"$motif")
   echo "$1 : en tour depuis ${2}s — pose d'une pause opérateur (drain #2152)"
-  if sortie=$(pause_operateur "$1" "$motif"); then
+  sortie=$(pause_operateur "$1" "$motif") || rc=$?
+  if [ "$rc" = 0 ]; then
     if change=$(json_champ changed <<<"$sortie") && [ -n "$change" ]; then
       if [ "$change" = 1 ]; then
         echo "$1 : drain posé — le tour en cours se termine, aucun tour interrompu ; redémarrage dès qu'il est hors tour"
@@ -526,7 +527,13 @@ poser_drain() {  # $1 persona, $2 secondes déjà attendues
     echo "$1 : drain posé (confirmé par l'état réel) — le tour en cours se termine, aucun tour interrompu"
     return 0
   fi
-  drain_retire "$1"
+  # Timeout local ou transport SSH coupé : la pause distante peut encore
+  # aboutir après cette relecture. L'intention reste suivie pour que EXIT
+  # tente la levée conditionnelle (motif identique) au lieu de l'orpheliner.
+  case $rc in
+    124|137|255) ;;
+    *) drain_retire "$1" ;;
+  esac
   echo "$1 : la pause en place n'est pas celle de ce drain — aucun redémarrage, aucune levée" >&2
   return 1
 }
