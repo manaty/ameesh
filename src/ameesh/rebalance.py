@@ -115,41 +115,50 @@ def live_fleet(db, now: float, host: str | None = None) -> dict:
     return fleet
 
 
-def _offer(items: list, agents: list, now: float, book) -> Offer:
-    """The margin of a forfait harness: its accounts, their long window."""
+def _offer(items: list, agents: list, now: float, book, unreadable: list | None = None) -> Offer:
+    """The margin of a forfait harness: its accounts, their long window.
+
+    `unreadable`: accounts whose gauge could not be read (#1600) — a failed
+    reading must not take down `accounts list`.
+    """
     free = 0.0
     used = 0.0
     measured = []
     for profile in items:
         if profile.kind == "api_key_env":
             continue  # an API key is not a forfait capacity
-        # non-critical threshold: the reserve stays with critical agents (L242b)
-        # #1580 (slice 3): `model=''` — the margin is read on the general
-        # windows; a model-specific bucket (Fable) does not cancel it for
-        # the agents of another model. Per-model capacity remains to be done.
-        result = accounts.evaluate(book, profile, items, now, record=False,
-                                   reserve=True, model="")
-        # An expired window does not measure the next one, and an expired short
-        # one invalidates the long one still open (#1561). The display promises
-        # nothing without a current margin, even if the guard allows a try.
-        if any(g.reset_passed(now) for g in result.gauges):
+        try:
+            # non-critical threshold: the reserve stays with critical agents (L242b)
+            # #1580 (slice 3): `model=''` — the margin is read on the general
+            # windows; a model-specific bucket (Fable) does not cancel it for
+            # the agents of another model. Per-model capacity remains to be done.
+            result = accounts.evaluate(book, profile, items, now, record=False,
+                                       reserve=True, model="")
+            # An expired window does not measure the next one, and an expired short
+            # one invalidates the long one still open (#1561). The display promises
+            # nothing without a current margin, even if the guard allows a try.
+            if any(g.reset_passed(now) for g in result.gauges):
+                continue
+            stamps = [stamp for g in result.gauges
+                      if (stamp := getattr(g, "read_at", None)) is not None]
+            if stamps and now - min(stamps) > min(g.window_s for g in result.gauges):
+                continue
+            long = [g for g in result.gauges if g.window_s >= LONG_WINDOW_S]
+            if not long:
+                continue  # no long window measured: nothing to carry
+            # #1789/N5: the observed unit sums the usage of ALL the harness's
+            # measurable accounts, including the one the guard sets aside
+            # (saturated, fixed cap): its agents count in `agents`, so its
+            # consumption must count too — otherwise the unit is underestimated
+            # and the announced capacity too large.
+            used += sum(g.used_at(now) for g in long)
+            if not result.ok or result.hard:
+                continue
+            free += min(max(0.0, result.limits[g.key][0] - g.used_at(now)) for g in long)
+        except Exception:  # noqa: BLE001 — unreadable gauge: account not measured (#1600)
+            if unreadable is not None:
+                unreadable.append(profile.name)
             continue
-        stamps = [stamp for g in result.gauges
-                  if (stamp := getattr(g, "read_at", None)) is not None]
-        if stamps and now - min(stamps) > min(g.window_s for g in result.gauges):
-            continue
-        long = [g for g in result.gauges if g.window_s >= LONG_WINDOW_S]
-        if not long:
-            continue  # no long window measured: nothing to carry
-        # #1789/N5: the observed unit sums the usage of ALL the harness's
-        # measurable accounts, including the one the guard sets aside
-        # (saturated, fixed cap): its agents count in `agents`, so its
-        # consumption must count too — otherwise the unit is underestimated
-        # and the announced capacity too large.
-        used += sum(g.used_at(now) for g in long)
-        if not result.ok or result.hard:
-            continue
-        free += min(max(0.0, result.limits[g.key][0] - g.used_at(now)) for g in long)
         measured.append(profile.name)
     unit = DEFAULT_AGENT_SHARE
     if agents:
@@ -206,11 +215,21 @@ def proposal(cfg, db, book, *, now: float | None = None, fleet: dict | None = No
         members = [name for name, harness in agents.items() if harness == family]
         if members and all(name in candidates for name in members):
             kept += 1
+    unreadable: list = []
     offers = [_offer(declared[harness], [name for name, h in agents.items()
-                                         if h == harness], now, book)
+                                         if h == harness], now, book,
+                     unreadable=unreadable)
               for harness in sorted(declared) if harness not in billed]
     ranked = sorted((o for o in offers if o.capacity > 0),
                     key=lambda o: (-o.capacity, o.harness))
+    if not ranked and unreadable:
+        # #1600 : aucune marge mesurable parce que des jauges sont illisibles —
+        # on le dit (l'affichage des comptes ne tombe pas), comme `live_fleet`
+        # rend {} sur une base illisible.
+        return Proposal(offers=tuple(offers), candidates=len(candidates),
+                        kept_for_review=kept,
+                        reason="gauge readings unreadable for %s"
+                               % ", ".join(sorted(set(unreadable))))
     movable = min(len(candidates) - kept, sum(o.capacity for o in ranked))
     moves = []
     remaining = movable
