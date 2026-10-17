@@ -255,6 +255,12 @@ class RoleExecutorTest(PgTestCase):
                 for _ in range(2):
                     proc = run_writers()
                     self.assertEqual(proc.returncode, 0, proc.stderr)
+                # #2274: the review catch-up activation bound stays owner-only;
+                # granting canon sync DML on it would move the review horizon.
+                self.assertFalse(self.db.query(
+                    "SELECT has_table_privilege('ameesh_canon_sync', %s,"
+                    " 'INSERT,UPDATE,DELETE') AS p",
+                    ("%s.review_catch_up" % q(self.schema),))[0]["p"])
                 # This class has a private database: never mutate shared bench ACLs.
                 for grantee in (*names, "PUBLIC"):
                     with self.subTest(temp_grantee=grantee):
