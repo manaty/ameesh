@@ -785,6 +785,42 @@ def check_reviewer_choice(db: Db, item: dict, reviewer: str, *, cfg=None) -> str
     return name
 
 
+def _declared_harness(db: Db, name: str) -> str:
+    """Le harnais **déclaré au registre** d'un agent (`""` si absent)."""
+    from . import registry
+
+    try:
+        row = registry.get(db, name)
+    except Exception:
+        return ""
+    return ((row or {}).get("harness") or "").strip().lower()
+
+
+def reviewer_family_warning(db: Db, item: dict, reviewer: str) -> str:
+    """#800 : avertit (sans refuser) un relecteur de la famille de l'auteur.
+
+    Le canon §2 demande une relecture par une autre famille de modèle ; la
+    désignation (#705) ne le vérifiait pas. « Même famille » se lit au harnais
+    **déclaré au registre** (claude, codex et deepseek sont distincts :
+    consigne mesh-design du 13/10) ; c'est un avertissement indicatif — la
+    famille réelle se juge au tour de relecture (décision 18855a). Un humain,
+    un agent hors registre ou un harnais inconnu n'avertissent pas, et la
+    désignation est conservée dans tous les cas.
+    """
+    name = (reviewer or "").strip()
+    author = (item.get("assignee") or "").strip()
+    if not name or not author:
+        return ""
+    if name.startswith(HUMAN_PREFIX) or author.startswith(HUMAN_PREFIX):
+        return ""
+    author_harness = _declared_harness(db, author)
+    if not author_harness or author_harness != _declared_harness(db, name):
+        return ""
+    return ("reviewer %s and the lot's author %s share the harness %r: canon §2 "
+            "asks for a review by another model family (indicative warning, the "
+            "designation is kept, #800)" % (name, author, author_harness))
+
+
 def _review_item(cfg, db: Db, item_id: int, actor: str | None):
     """#705/#1979 : l'autorité du geste de relecture, et le lot, qui doit être
     en `qa` (comme pour `designate_reviewer`)."""
@@ -801,7 +837,8 @@ def _review_item(cfg, db: Db, item_id: int, actor: str | None):
     return who, item
 
 
-def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str) -> dict:
+def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str,
+                    warning: str = "") -> dict:
     """Écrit la colonne du relecteur (nom, vide, ou `REVIEWER_NONE`) et sa
     ligne de journal, ou dit pourquoi l'écriture n'a pas eu lieu."""
     row = storage.of(db).work.designate_reviewer(item_id, value, actor=who, event=event)
@@ -813,6 +850,8 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str) -> d
             raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
                             "reviews another agent's work" % (value, item_id))
         raise WorkError("lot %s left qa in the meantime: retry" % item_id)
+    if warning:
+        row["reviewer_warning"] = warning
     return row
 
 
@@ -826,7 +865,9 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
     who, item = _review_item(cfg, db, item_id, actor)
     name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
-    return _write_reviewer(db, item_id, name, who, "reviewer %s designated" % name)
+    warning = reviewer_family_warning(db, item, name)
+    return _write_reviewer(db, item_id, name, who, "reviewer %s designated" % name,
+                           warning=warning)
 
 
 def clear_reviewer(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
@@ -1713,13 +1754,16 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     il doit être joignable et différent de l'assigné (`check_reviewer_choice`),
     et seul un humain ou un orchestrateur le désigne (`corrector`). La
     désignation est journalisée ; `waiting()`, la vue de progrès et l'alerte
-    `stale_lot` le nomment avant tout verdict."""
+    `stale_lot` le nomment avant tout verdict. Un relecteur du **même harnais
+    déclaré** que l'auteur rend un avertissement indicatif (#800), jamais un
+    refus : il est posé sur la ligne rendue (`reviewer_warning`)."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id> | --delivered --sha <reviewed head>")
     reviewer = (reviewer or "").strip() or None
+    reviewer_warning = ""
     if reviewer is not None:
         if state != "qa":
             raise WorkError(
@@ -1749,6 +1793,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     if reviewer is not None:
         reviewer = check_reviewer_choice(db, item, reviewer,
                                          cfg=getattr(db, "cfg", None))
+        # #800 : l'avertissement est calculé sur l'assigné d'avant le move (il
+        # ne change pas), et posé sur la ligne rendue quand la désignation
+        # aboutit — le CLI l'imprime, les appelants peuvent l'ignorer.
+        reviewer_warning = reviewer_family_warning(db, item, reviewer)
     if correct is not None:
         reason = (correct or "").strip()
         if not reason:
@@ -1815,6 +1863,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 "(ameesh work show %s) and designate the reviewer once it is in qa"
                 % (item_id, state, reviewer, reviewer, item_id))
         row["reviewer"] = reviewer      # le CLI et les appelants le lisent
+        if reviewer_warning:
+            row["reviewer_warning"] = reviewer_warning
     return row
 
 
