@@ -109,7 +109,9 @@ CRITICAL_SCOPE = (
     re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
                r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
                r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
-               r"relocation|placement|merge_queue|land|fire)\.py$"),
+               r"relocation|placement|merge_queue|land|fire)\.py$|"
+               # la classe du lot, son classement et la fusion hors API (#2249)
+               r"(^|/)(merge_pr|lot_class|review)\.py$"),
 )
 #: le nombre d'avis d'un lot sensible hors de ces domaines
 SENSITIVE_REVIEWS = 1
