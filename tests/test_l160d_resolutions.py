@@ -278,6 +278,23 @@ class ReplayTest(_Base):
         _add_on(self.repo, "lot/2-b", path, "l1\nfrom-b\n", "b adds a part")
         return _manual_resolution(self.repo, attributes_tree=target), target
 
+    def test_moving_target_attributes_retrains_for_the_new_scope(self):
+        sha, target = self.target_only_union()
+        rp = self.replayer(None)
+        rp.ensure()
+        self.assertEqual(rp.prime([sha], attributes_tree=target), [])
+        # Same blob, different directory: the union no longer covers parts.
+        os.makedirs(os.path.join(self.repo, "scoped"))
+        _git(self.repo, "mv", ".gitattributes", "scoped/.gitattributes")
+        _git(self.repo, "commit", "-qm", "move attributes outside their scope")
+        moved = _git(self.repo, "rev-parse", "main")
+        self.assertNotIn(sha, rp.trained(moved))
+        self.assertEqual(rp.prime([sha], attributes_tree=moved), [])
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        got = rp.replay(a, b, sha, attributes_tree=moved)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+        self.assertIn("tests/parts/pilote-psql.txt", got["files"])
+
     def check_target_attributes(self, script):
         sha, target = self.target_only_union()
         rp = self.replayer(script)

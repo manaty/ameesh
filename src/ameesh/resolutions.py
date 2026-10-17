@@ -882,7 +882,7 @@ class Replayer:
         return os.path.join(self.path, ".git", root, sha)
 
     def attributes_key(self, attributes_tree: str) -> str:
-        """The `.gitattributes` blobs of `attributes_tree`: two target trees
+        """The `.gitattributes` paths and entries of `attributes_tree`: two target trees
         with the same key drive the same merges, so a cache trained for one
         serves the other; a different key retrains it (#2189)."""
         if attributes_tree not in self._attr_keys:
@@ -891,11 +891,13 @@ class Replayer:
             blobs = []
             if proc.returncode == 0:
                 for entry in proc.stdout.decode("utf-8", "replace").split("\0"):
-                    info, _, more = entry.partition("\t")
+                    _info, _, more = entry.partition("\t")
                     if more and more.rsplit("/", 1)[-1] == ".gitattributes":
-                        blobs.append(info.split()[-1])
+                        # The directory determines a rule's scope; the mode
+                        # also matters (Git does not follow attribute symlinks).
+                        blobs.append(entry)
             # unreadable tree: fall back on its name, never reuse a wrong cache
-            self._attr_keys[attributes_tree] = ",".join(blobs) if proc.returncode == 0 \
+            self._attr_keys[attributes_tree] = json.dumps(blobs) if proc.returncode == 0 \
                 else attributes_tree
         return self._attr_keys[attributes_tree]
 
