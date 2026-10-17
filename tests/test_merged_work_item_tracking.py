@@ -441,6 +441,62 @@ class MergeSweepTest(_Base):
         self.merge("lot/%d-local" % n, "Merge branch 'lot/%d-local' into develop" % n)
         self.assertEqual(self.sync(pr_body=jamais)["merged"], 1)
 
+    # --- #2260 : une citation `#<id>` exige une preuve de livraison ---------
+
+    def test_diese_dementie_par_la_branche_en_avance(self):
+        # cas Nexlink #598 cité positivement : la PR du lot reste ouverte, sa
+        # tête n'est pas dans la cible ; le doute se trace une fois
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        n = self.lot()["id"]
+        branch = "lot/%d-ouvert" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("travail-du-lot")
+        _git(self.repo, "checkout", "-q", "develop")
+        work.set_branch(self.db, n, branch, "develop", actor="orch")
+        sha = self.merge("feature/paquet-53", "paquet 53 : montage #%d" % n)
+        tip = _git(self.repo, "rev-parse", branch)[:12]
+        report = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual((report[n]["result"], report[n]["how"], report[n]["ref"]),
+                         ("open", "unproven", sha))
+        self.assertIn("the tip %s of %s is not in develop" % (tip, branch),
+                      report[n]["detail"])
+        # au relevé suivant, la pointe est devenue la dernière tête vue
+        report = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertIn("the last head seen %s is not in develop" % tip, report[n]["detail"])
+        notes = [e["note"] for e in work.events(self.db, n, 40)
+                 if "a mention is not a proof of delivery" in (e.get("note") or "")]
+        self.assertEqual(len(notes), 1, notes)
+
+    def test_diese_dementie_par_le_gel_hors_cible(self):
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        n = self.lot()["id"]
+        _git(self.repo, "checkout", "-q", "-b", "agent/gel", "develop")
+        self.commit("gel")
+        gel = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "branch", "-q", "-D", "agent/gel")
+        work.milestone(self.db, n, "frozen", sha=gel, actor="ouvrier")
+        self.merge("feature/paquet-54", "paquet 54 : #%d" % n)
+        report = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(report[n]["how"], "unproven")
+        self.assertIn("the last freeze %s is not in develop" % gel[:12], report[n]["detail"])
+
+    def test_diese_prouvee_par_le_gel_ancetre(self):
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        n = self.lot()["id"]
+        _git(self.repo, "checkout", "-q", "-b", "agent/livre", "develop")
+        self.commit("livre")
+        gel = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        work.milestone(self.db, n, "frozen", sha=gel, actor="ouvrier")
+        sha = _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet 55 : #%d" % n,
+                   "agent/livre") or _git(self.repo, "rev-parse", "HEAD")
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "#id"))
+        self.assertEqual(self.merged_milestone(n)["sha"], sha)
+
     def test_branche_implicite_en_avance_rapide(self):
         lot = self.lot()
         n = lot["id"]
