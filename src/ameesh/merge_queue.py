@@ -222,6 +222,59 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
                   key=_mark_order)
 
 
+def _waiver(db, item) -> tuple:
+    """#2281/B1 : la dispense de re-verdict lue **à la porte**, après les jalons.
+
+    `item` peut être une ligne lue avant les jalons : si un gel d'une autre
+    tête a été committé entre-temps, le stockage a effacé la marque
+    (`_lapse_waiver`) mais cette copie la porte encore. La porte relit donc la
+    ligne ici — l'appelant a déjà lu les jalons qu'il nous passe — et une
+    dispense périmée ne couvre jamais la nouvelle tête. Une relecture
+    impossible ne prouve rien : la dispense est alors tenue pour absente.
+
+    N1 : l'auteur du geste se lit au **journal du lot** (`work.get` ne rend pas
+    les événements), pour que la note de file nomme le pilote en usage réel.
+
+    Rend `(waived, waived_by, row)` ; `row` est la ligne fraîche quand elle a
+    pu être relue.
+    """
+    row = item or {}
+    lot = row.get("id")
+    waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+              or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    if waived and lot is not None:
+        # Seule une ligne qui *réclame* la dispense peut périmer dans le
+        # mauvais sens : relire la base après les jalons ferme la course. Une
+        # ligne sans dispense ne peut qu'être plus stricte, rien à relire.
+        try:
+            fresh = work.get(db, int(lot))
+        except Exception:  # noqa: BLE001 - lecture impossible : aucune preuve
+            fresh = None
+        if fresh is None:
+            row = dict(row, reviewer="", reviewers=[])
+        else:
+            row = fresh
+        waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+                  or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    waived_by = ""
+    if waived and lot is not None:
+        try:
+            events = storage.of(db).work.events_noted(
+                "verdict not required", 0.0, ids=[int(lot)])
+        except Exception:  # noqa: BLE001 - journal illisible : nom générique
+            events = []
+        for event in events:
+            actor = str(event.get("actor") or "").strip()
+            if actor:
+                waived_by = actor
+    if not waived_by:
+        for event in row.get("events") or ():
+            if str(event.get("note") or "").startswith("verdict not required"):
+                waived_by = str(event.get("actor") or "").strip()
+                break
+    return waived, waived_by, row
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
@@ -241,17 +294,31 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
     décision 18855a).
 
-    Rend `{ok, why, class, required, accepted, blocked, author, author_family,
-    on_freeze}` ; ne lève jamais.
+    #1979 : le pilote peut marquer « verdict non requis » (`work.reviewer
+    --no-verdict`, colonne `reviewer = -none`, geste d'autorité journalisé) ;
+    la marque lève alors l'exigence d'avis **de cette tête gelée** — le
+    stockage la périme à un nouveau gel (`_lapse_waiver`). #2281 : la marque
+    est relue à la porte, **après** les jalons, pour qu'une ligne lue avant un
+    gel ne couvre jamais la nouvelle tête. Un verdict bloquant courant, lui,
+    n'est jamais levé par la dispense : la correction reste due.
+
+    Rend `{ok, why, class, required, accepted, blocked, waived, author,
+    author_family, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     frozen = str(frozen or "").strip().lower()
-    row = item or {}
+    # #1979/#2281 : la dispense de re-verdict du pilote (`-none`) lève la
+    # porte, comme elle lève l'attente dans `progress` ; elle ne survit pas à
+    # un nouveau gel (stockage `_lapse_waiver`) et ne lève jamais un blocage.
+    # La marque est relue après les jalons (`_waiver`) pour ne pas appliquer
+    # une copie antérieure au gel.
+    waived, waived_by, row = _waiver(db, item)
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
-           "blocked": [], "author": author, "author_family": "", "on_freeze": 0}
+           "blocked": [], "waived": waived, "waived_by": waived_by,
+           "author": author, "author_family": "", "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -274,6 +341,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       "not lifted: %s"
                       % (frozen[:12], cls, ", ".join(sorted(
                           str(m.get("actor") or "relecteur sans nom") for m in blocked))))
+        return out
+    if waived:
+        out["ok"] = True
         return out
     if required == 0:
         out["ok"] = True
@@ -444,8 +514,8 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
               commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
-    pr, class, class_why}`; QueueError says what is missing. Commit ids are
-    resolved to full ones before being compared; `ci` (`radar.github_ci(...,
+    pr, class, class_why, waived}`; QueueError says what is missing. Commit ids
+    are resolved to full ones before being compared; `ci` (`radar.github_ci(...,
     strict=True)`) must report the PR green on the frozen commit itself, and
     an error reading it refuses the lot. A project with `ci_required` (L160g)
     also needs GitHub's CI green on the frozen commit itself, PR or not
@@ -459,6 +529,11 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     are traced in the queue note. The target resolved here (`branch_target`,
     then the project's, then the repository's default) carries through the
     classification and the admission (revue #544 r2).
+
+    #2281 : un lot dont le pilote a marqué « verdict non requis » (#1979,
+    `reviewer = -none`) entre sans avis, comme le veut la marque ; le gel
+    d'une autre tête la périme (stockage) et un verdict bloquant courant la
+    surclasse. `waived` le dit à la note de file.
 
     L756 (#566): a lot of class **release** must additionally certify its
     frozen head with a **full-suite** run — a push or a manual dispatch,
@@ -528,7 +603,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
     # #1374 : la même porte que le feu — avis comptés par classe, indépendants
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
-    # `blocked` d'un autre relecteur (P1-1).
+    # `blocked` d'un autre relecteur (P1-1). #2281 : la dispense de re-verdict
+    # du pilote (#1979) lève l'exigence d'avis sur cette tête gelée.
     gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row)
     if not gate["ok"]:
         raise QueueError("lot #%d: %s" % (lot, gate["why"]))
@@ -561,9 +637,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-        if gate["required"] == 0 and status.get("draft"):
-            raise QueueError("PR #%s is a draft: a light lot merges only from a "
-                             "non-draft PR" % status.get("number"))
+        if (gate["required"] == 0 or gate["waived"]) and status.get("draft"):
+            raise QueueError("PR #%s is a draft: a lot without a review verdict merges only "
+                             "from a non-draft PR" % status.get("number"))
     proof = None
     if needs_commit_ci:
         if parts is None and getattr(project, "ci_parts", None):
@@ -572,7 +648,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),
-            "class_why": klass.get("why") or "", "parts": proof}
+            "class_why": klass.get("why") or "", "parts": proof,
+            "waived": bool(gate.get("waived")),
+            "waived_by": gate.get("waived_by") or ""}
 
 
 def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
@@ -785,18 +863,25 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
         parts_note = ", parts %s@%s (%d due)" % (proof.get("selector") or "?",
                                                  (proof.get("base") or "?")[:12],
                                                  len(proof.get("due") or ()))
+    # #2281 : la dispense de re-verdict du pilote (#1979) est nommée dans la
+    # note de file, avec l'auteur du geste lu au journal du lot.
+    waived_note = ""
+    if ready.get("waived"):
+        waived_note = ", verdict waived by %s (#1979)" % (
+            ready.get("waived_by") or "pilot")
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s" % (
+        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
             ready["target"], ready["frozen_sha"][:12],
             ", PR #%s green" % ready["pr"] if ready["pr"] else "",
             ready.get("class") or "?", " (%s)" % ready["class_why"]
-            if ready.get("class_why") else "", parts_note), actor=actor)
+            if ready.get("class_why") else "", parts_note, waived_note), actor=actor)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
     row["class"] = ready.get("class")
     row["class_why"] = ready.get("class_why")
+    row["waived"] = bool(ready.get("waived"))
     return row
 
 
