@@ -53,7 +53,7 @@ class LandError(RuntimeError):
 
 
 def lock_key(project, target: str) -> str:
-    return "%s:%s" % (project.name, target)
+    return "%s:%s" % (project.name, merge_queue._remote_branch(target))
 
 
 def _branch_of(target: str) -> str:
@@ -75,6 +75,25 @@ def _passive(db, to, lot: int, text: str, data: dict) -> None:
                   payload={"radar": dict(data, kind="landed")})
     except Exception:  # noqa: BLE001 - a notice is never fatal
         pass
+
+
+def _fire_guard(landing) -> dict | None:
+    """#1374, P1-2 : le feu et les blocages sont revalidés au dernier geste.
+
+    Le retrait ou l'invalidation d'un feu retire la ligne de file au passage
+    suivant ; entre les deux, `land` pourrait encore pousser ou fusionner. Sous
+    son bail, juste avant le geste, il redemande l'autorisation : un lot qui a
+    porté un feu ne part que sous un feu actif couvrant le gel de sa file et
+    sans verdict bloqué non levé. Rend l'éjection, ou None si la voie est
+    libre."""
+    from . import fire
+    ok, why = fire.land_guard(landing.db, landing.lot, landing.row.get("frozen_sha") or "",
+                              repo=landing.project.repo)
+    if ok:
+        return None
+    return landing.eject(why, "The fire no longer authorizes this landing: ask the pilot for a "
+                              "fire on the current freeze, or take the lot out of the queue "
+                              "(`ameesh work queue remove %d`)." % landing.lot)
 
 
 # --------------------------------------------------------------------------
@@ -413,7 +432,7 @@ class _Landing:
     once, at the end (`land_head`)."""
 
     def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
-                 cfg=None, clone=None):
+                 cfg=None, clone=None, replayer=None, parts=None):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
@@ -421,6 +440,10 @@ class _Landing:
         self.release = False
         self.projects = projects
         self.cfg, self.clone = cfg, clone
+        #: L1651 : le clone radar (pour relire la source de sélection versionnée
+        #: de la cible) et les parts dues déjà requalifiées par l'appelant
+        #: (§12 : le manifeste de paquet remplace la CI individuelle)
+        self.replayer, self.parts = replayer, parts
         self.entry = tuple(row.get(k) for k in
                            ("generation", "target", "frozen_id", "frozen_sha"))
 
@@ -494,7 +517,16 @@ class _Landing:
     def required_ci(self):
         if getattr(self.project, "ci_required", False):
             try:
-                merge_queue._required_ci(self.project, self.row["frozen_sha"])
+                parts = self.parts
+                if parts is None and getattr(self.project, "ci_parts", None):
+                    # L1651 (#1650) : la preuve de complétude est refaite ici,
+                    # sur la cible de cette entrée de file, avec la source de
+                    # sélection versionnée relue maintenant (le contrat peut
+                    # avoir bougé depuis l'admission).
+                    parts = merge_queue._parts_reader(
+                        self.project, self.project.repo, self.row.get("target") or "",
+                        self.row["frozen_sha"], self.replayer, cfg=self.cfg)
+                merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts)
             except merge_queue.QueueError as exc:
                 return self.eject(str(exc), "Restore green CI on the frozen commit, then "
                                   "ameesh work queue add %d." % self.lot)
@@ -551,9 +583,14 @@ class _Landing:
 
 
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
-              gh=_gh) -> dict:
+              gh=_gh, parts=None) -> dict:
     """Lands (or follows the landing of) `row`, the head of its queue.
-    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`."""
+    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`.
+
+    L1651 (#1650) : `parts` porte la requalification d'un lot dont la CI
+    individuelle est remplacée par celle d'un paquet (§12, #1467) — les
+    contextes dus que l'appelant atteste, ou `()` ; None : la porte du projet
+    (`ci_parts`) s'applique telle quelle."""
     from . import radar, resolutions
     locks = locks if locks is not None else {}
     lot = int(row["work_item_id"])
@@ -577,7 +614,8 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
-                       cfg=cfg, clone=getattr(replayer, "path", None))
+                       cfg=cfg, clone=getattr(replayer, "path", None), replayer=replayer,
+                       parts=parts)
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
         try:
@@ -697,7 +735,19 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if project.land == "local" and resolutions._run(
             replayer.path, "merge-base", "--is-ancestor", row["frozen_sha"],
             base).returncode == 0:
-        # #194 r4: another executor (an earlier epoch) already pushed it
+        # #194 r4: another executor (an earlier epoch) already pushed it.
+        # #1776: ancestry alone does not prove the content is still in the
+        # tree — a composition reverted on the target leaves the freeze an
+        # ancestor without its content. Judge the content as the branch sweep
+        # does (plan_git.probe, #1825's revert proof) and eject with a way
+        # forward rather than record a delivery that is no longer there.
+        found = plan_git.probe(replayer.path, row["frozen_sha"], base, lot=lot)
+        if not found["merged"]:
+            return landing.eject(
+                "the frozen content is no longer in %s: %s"
+                % (row["target"], found["detail"]),
+                "Rebase the branch on %s, freeze again at constant content, then "
+                "ameesh work queue add %d." % (row["target"], lot))
         return landing.landed({"sha": base, "state": "already", "files": []}, base)
     refused = landing.required_ci()
     if refused is not None:
@@ -727,6 +777,9 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if project.land == "local":
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
+        stopped = _fire_guard(landing)
+        if stopped is not None:
+            return stopped
         # #194 r6: one atomic push, two compare-and-swaps that the server
         # checks: the target on the base seen, the lease ref on the value this
         # holder wrote — moved to a child commit, so git sends that update
@@ -764,6 +817,9 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             "ameesh work queue add %d." % lot)
     if not landing.held():
         return landing.busy("lease on %s lost before pushing" % landing.key)
+    stopped = _fire_guard(landing)
+    if stopped is not None:
+        return stopped
     # #194 r4: compare and swap on the freeze (see `local`)
     branch_ref = "refs/heads/%s" % row["branch"]
     proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
@@ -903,6 +959,9 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return refused
     if not landing.held():
         return landing.busy("lease lost before merging PR #%s" % status["number"])
+    stopped = _fire_guard(landing)
+    if stopped is not None:
+        return stopped
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     # #194 r8: past this call, the PR may be merged: nothing raises any more,
     # and every outcome is read back from GitHub

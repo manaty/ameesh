@@ -372,6 +372,48 @@ class PaquetInclusionTest(unittest.TestCase):
                             for check in entry["paths"]))
         self.assertEqual([check["added"] for check in entry["paths"]], [0])
 
+    def test_fichier_nouveau_et_vide_n_est_pas_binaire(self) -> None:
+        # Un commit qui AJOUTE un fichier vide (statut A) n'émet ni hunk ni
+        # en-tête ---/+++ (aucun blob parent) : le chemin est absent de
+        # parse_added. Ce n'est pas un binaire, et il ne doit pas faire un
+        # faux défaut sous --strict (#1684).
+        self.git("switch", "-q", "-c", "lot/970", "main")
+        (self.repo / "vide.txt").write_text("", encoding="utf-8")
+        source = self.commit("#970 : ajoute un fichier vide")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "#970: compose", "lot/970")
+        head = self.rev("HEAD")
+        manifest = self.manifest_simple(970, source, source)
+        code, payload = inclusion.run(
+            self.namespace(expected=[970], strict=True, head=head,
+                           manifest=manifest)
+        )
+        self.assertEqual(code, 0)
+        entry = payload["entries"][0]
+        self.assertEqual(entry["verdict"], "présent")
+        check = entry["paths"][0]
+        self.assertEqual(check["verdict"], "identique")
+        self.assertEqual(check["added"], 0)
+
+    def test_fichier_vide_disparu_de_la_tete_reste_absent(self) -> None:
+        # Le même ajout vide, mais la tête ne porte plus le fichier : le delta
+        # vide ne doit pas masquer la disparition (#1684).
+        self.git("switch", "-q", "-c", "lot/971", "main")
+        (self.repo / "vide.txt").write_text("", encoding="utf-8")
+        source = self.commit("#971 : ajoute un fichier vide")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "#971: compose", "lot/971")
+        self.git("rm", "-q", "vide.txt")
+        head = self.commit("retrait du fichier vide")
+        manifest = self.manifest_simple(971, source, source)
+        code, payload = inclusion.run(
+            self.namespace(expected=[971], head=head, manifest=manifest)
+        )
+        self.assertEqual(code, 1)
+        entry = payload["entries"][0]
+        self.assertEqual(entry["verdict"], "absent")
+        self.assertEqual([c["verdict"] for c in entry["paths"]], ["absent"])
+
     def test_binaire_remplace_par_du_texte_reste_binaire(self) -> None:
         # Le diff d'un binaire n'a ni hunk ni en-tête ---/+++ : le chemin est
         # absent de parse_added. La comparaison des blobs le distingue d'un
