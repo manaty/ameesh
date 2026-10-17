@@ -54,6 +54,24 @@ class ReviewWaitingTest(unittest.TestCase):
         self.assertIn("first", briefs)
         self.assertIn("second", briefs)
 
+    def test_delayed_other_head_verdict_preserves_current_blocker(self):
+        a, b = "a" * 40, "b" * 40
+        item, marks = self.marks(("first", "blocked", a), ("second", "ok", a),
+                                 ("first", "ok", b))
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "fix")
+        self.assertEqual(marks["verdict_kind"], "blocked")
+        self.assertTrue(marks["verdict_current"])
+
+    def test_delayed_other_head_verdict_preserves_completed_reviews(self):
+        a, b = "a" * 40, "b" * 40
+        for actor in ("first", "third"):
+            with self.subTest(actor=actor):
+                item, marks = self.marks(("first", "ok", a), ("second", "ok", a),
+                                         (actor, "ok", b))
+                self.assertEqual(marks["pending_reviewers"], [])
+                self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+                self.assertEqual(progress.lot_state("qa", marks), "approved")
+
     def test_waiver_is_not_a_reviewer_and_light_lots_can_merge(self):
         from ameesh import lot_class
         item, marks = self.marks()

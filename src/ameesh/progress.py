@@ -277,8 +277,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     reviewer = (last["actor"] if last else None) if verdict_current else designated
     from .work_reviewers import designated as designated_reviewers
     reviewers = designated_reviewers(item)
-    latest = {v["actor"]: v for v in verdicts}
-    current = {name: v for name, v in latest.items() if _verdict_applies(v, last_frozen)}
+    current = {v["actor"]: v for v in verdicts if _verdict_applies(v, last_frozen)}
     pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
                if item.get("reviewers") is not None else [])
     # Every designated reviewer owes their own verdict on the frozen head.
@@ -289,6 +288,9 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         verdict_current = True
     elif reviewers and pending:
         verdict_current = False
+    elif item.get("reviewers") is not None and reviewers and current:
+        last = max(current.values(), key=lambda v: v["at_ts"])
+        verdict_current = True
     if item.get("reviewers") is not None and reviewers:
         reviewer = last["actor"] if verdict_current and last else designated
     # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
