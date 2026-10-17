@@ -43,7 +43,7 @@ prochain paquet par le pilote depuis 22:34Z.
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot et il
 porte le trailer `ameesh-work: #<lot>`. Aucun contenu nouveau : les 9 unités ajoutent
 **35 fichiers, +2033/−321** vs `734a0825b` ; avec ce manifeste, `fde44e51c..HEAD` fait
-**36 fichiers, +2129/−321**, dont la migration `0461_review_catch_up_acl.sql` et
+**36 fichiers, +2130/−321**, dont la migration `0461_review_catch_up_acl.sql` et
 `deploy/sql/role-executor.sql` (unité 2, SQL revisé deux familles), aucun `.github/**`.
 
 ## Conflits et résolution
