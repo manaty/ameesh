@@ -12,6 +12,8 @@ export type { Body, Client, ClientOptions, PostOptions, ReadPath, Schemas, Token
 export { EventStreamParser, readStream } from "./sse";
 export type { StreamEvent, StreamOptions } from "./sse";
 export { LANGUAGES, translate } from "./i18n/index";
+export { HOST_EVENTS, connectHost } from "./host";
+export type { AmeeshHost, AmeeshHostAlert, AmeeshHostTarget, AmeeshMesh, ConnectHostOptions, HostRow } from "./host";
 export { AmeeshApp, AmeeshConfig, AmeeshDecisions, AmeeshProjects, AmeeshTimeline, AmeeshAgent, AmeeshAlerts, AmeeshHosts, AmeeshBudget, AmeeshThread, idempotencyKey };
 export { configOf } from "./components/ameesh-config";
 
