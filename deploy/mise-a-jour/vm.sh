@@ -223,11 +223,17 @@ commande_agents() {
   # properties are not specifier-expanded): it would refuse
   # `EnvironmentFile=%h/...` as "not absolute" (#1133). Expand $HOME in the
   # shell, where it is the ameesh home set by `utilisateur_agents`.
+  # #2184/B1 : pour une pose de pause, DRAIN_UNITE donne un nom stable à
+  # l'unité transitoire ; il permet de l'arrêter avant toute relecture de
+  # réconciliation (voir arreter_unite_drain).
+  local unite=${DRAIN_UNITE:-}
   utilisateur_agents bash -c 'set -euo pipefail
+    unite=${1:-}
+    shift
     test -r "$HOME/.config/ameesh/env" \
       || { echo "runner environment file unreadable: $HOME/.config/ameesh/env" >&2; exit 1; }
-    exec systemd-run --user --pipe --wait --quiet \
-      -p EnvironmentFile="$HOME/.config/ameesh/env" -- "$@"' -- "$@"
+    exec systemd-run --user --pipe --wait --quiet ${unite:+--unit="$unite"} \
+      -p EnvironmentFile="$HOME/.config/ameesh/env" -- "$@"' -- "$unite" "$@"
 }
 ameesh_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"; }
 python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/python "$@"; }
@@ -388,6 +394,14 @@ drain_reprise() {  # raison journalisée par la levée
   printf 'reprise après drain de déploiement #2152 (vm.sh %s) : redémarrage hors tour effectué' \
     "$(drain_lieu)"
 }
+# #2184/B1 : nom stable de l'unité transitoire d'une pose de pause, dérivé du
+# motif (lui-même suivi dans DRAINS). La pose et la relecture de réconciliation
+# calculent le même nom, donc peuvent ordonner l'arrêt de la commande distante
+# avant de conclure — sans dépendre d'une attente.
+unite_drain() {  # $1 motif → nom d'unité systemd (≤ 255 caractères, stable)
+  printf 'ameesh-drain-%s.service' \
+    "$(printf '%s' "$1" | sha256sum | cut -c1-24)"
+}
 # #2184/N6 : l'humain qui lance vm.sh sur le poste. Même règle que
 # `ameesh serve` (serve.owner) : AMEESH_OPERATEUR explicite, puis le défaut
 # configuré / l'humain déclaré unique, sinon l'utilisateur Unix du poste. Le
@@ -411,12 +425,30 @@ drain_supporte() {  # le CLI de la cible connaît la reprise conditionnelle
   else aide=$(ameesh_local_drain resume --help 2>&1) || return 1; fi
   grep -q -- '--expect-reason' <<<"$aide"
 }
-pause_operateur() {  # $1 persona, $2 motif ; --json : « changed » dit si la pause est nôtre
+pause_operateur() {  # $1 persona, $2 motif, $3 unité de la pose (mode agents) ; --json : « changed » dit si la pause est nôtre
+  local unite=${3:-}
   if [ "$MODE" = agents ]; then
-    ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
+    DRAIN_UNITE="$unite" ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
   else
     ameesh_local_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
   fi
+}
+# #2184/B1 : ordonne l'arrêt de la commande distante de pause avant toute
+# relecture de réconciliation. Si l'unité était encore en file, elle est
+# annulée ; si elle avait déjà commité, l'arrêt est un no-op et la lecture
+# suivante voit la pause. Sans cet ordre, une pose expirée côté client peut
+# aboutir après la lecture et rester orpheline.
+arreter_unite_drain() {  # $1 unité ; 0 si arrêtée/absente et prouvé, 1 sinon
+  [ "$MODE" = agents ] || return 0
+  local rc=0
+  BORNE_APPEL_DRAIN=1 utilisateur_agents systemctl --user stop "$1" \
+    >/dev/null 2>&1 || rc=$?
+  # 5 = unité inconnue : elle a déjà fini (la pause, si elle a commité, est
+  # lue par l'appelant). Tout autre échec ne prouve pas l'arrêt.
+  case $rc in
+    0|5) return 0 ;;
+    *) echo "arrêt de l'unité de pause $1 non prouvé (rc=$rc)" >&2; return 1 ;;
+  esac
 }
 reprise_operateur() {  # $1 persona, $2 motif attendu ; lève cette pause-là, ou rien
   if [ "$MODE" = agents ]; then
@@ -490,17 +522,24 @@ pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état r
   pause_etat <<<"$ligne"
 }
 poser_drain() {  # $1 persona, $2 secondes déjà attendues
-  local motif sortie change etat pose raison rc=0
+  local motif sortie change etat pose raison rc=0 unite ancien
   motif=$(drain_motif "$(drain_jeton)")
+  unite=$(unite_drain "$motif")
   # R1 B2 : le motif courant remplace l'ancien — après une levée humaine, un
   # re-drain ne doit pas garder une entrée périmée que drain_motif_de lirait
   # en premier à la sortie (et laisserait la pause vivante orpheline).
+  # #2184/B1 : une pose précédente expirée peut encore être en file ; on
+  # ordonne son arrêt avant de l'oublier, sinon elle commiterait plus tard
+  # une pause que plus rien ne suit.
+  if ancien=$(drain_motif_de "$1"); then
+    arreter_unite_drain "$(unite_drain "$ancien")" || return 1
+  fi
   drain_retire "$1"
   # Track the intent before the call: both its reply and the reconciliation
   # read can fail after commit. EXIT still attempts the conditional cleanup.
   DRAINS+=("$1"$'\t'"$motif")
   echo "$1 : en tour depuis ${2}s — pose d'une pause opérateur (drain #2152)"
-  sortie=$(pause_operateur "$1" "$motif") || rc=$?
+  sortie=$(pause_operateur "$1" "$motif" "$unite") || rc=$?
   if [ "$rc" = 0 ]; then
     if change=$(json_champ changed <<<"$sortie") && [ -n "$change" ]; then
       if [ "$change" = 1 ]; then
@@ -540,6 +579,13 @@ poser_drain() {  # $1 persona, $2 secondes déjà attendues
 lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
   local motif sortie change etat pose raison
   motif=$(drain_motif_de "$1") || return 0
+  # #2184/B1 : la pose a peut-être expiré côté client et être encore en file
+  # sur la VM. L'arrêt ordonné de son unité précède la reprise : unité en file
+  # = annulée, unité déjà commitée = la reprise conditionnelle la lève.
+  if ! arreter_unite_drain "$(unite_drain "$motif")"; then
+    echo "$1 : arrêt de l'unité de pause non prouvé — pause éventuelle à vérifier : « ameesh show $1 »" >&2
+    return 1
+  fi
   sortie=$(reprise_operateur "$1" "$motif") && change=$(json_champ changed <<<"$sortie") || change=
   if [ "$change" = 1 ]; then
     # Levée par nous ; l'état réel doit le confirmer.
