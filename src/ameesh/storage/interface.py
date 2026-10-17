@@ -3336,8 +3336,9 @@ class Housekeeping(Domain):
     def register_worktree(self, *, host: str, path: str, repo: str, agent: str,
                           lot: str | None, turn_id: str | None, branch: str,
                           head: str) -> dict | None:
-        """Enregistre un worktree apparu pendant un tour ; None s'il est déjà
-        suivi (vivant ou gardé) sur cet hôte."""
+        """Enregistre un worktree apparu pendant un tour ou découvert dans un
+        dépôt local ; None s'il est déjà suivi (vivant ou gardé). Un chemin
+        auparavant removed/gone reçoit un nouveau cycle, sans ancien lot."""
 
     @abc.abstractmethod
     def worktrees(self, host: str | None, statuses: Sequence[str] | None = None,

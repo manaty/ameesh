@@ -76,8 +76,9 @@ l'humain. Cinq familles, cinq règles :
   copie git dedans n'a de travail non commité ou non poussé
   (`orphan_cleanup: false` : jamais, par hôte).
 
-Ce qu'ameesh n'a pas créé ni vu apparaître pendant un tour n'est JAMAIS
-supprimé automatiquement. Toute suppression dans un dossier géré passe par
+Les worktrees liés découverts dans les dépôts des agents locaux rejoignent
+le même suivi, avec un âge neuf (#2180). Les clones et dossiers sans Git
+sont seulement signalés. Toute suppression dans un dossier géré passe par
 [`_safe_rmtree`], qui refuse un chemin hors des dossiers gérés, un lien
 symbolique, ou une racine sans marqueur `.ameesh-menage` ; dans `/tmp`, par
 [`_remove_tmp_entry`], qui revérifie l'entrée juste avant.
@@ -268,6 +269,9 @@ class Policy:
     #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
     #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
+    #: #2180: discovery roots derived from Host work_root/work_roots, never
+    #: deletion roots. Not a separate housekeeping setting.
+    worktree_roots: tuple = ()
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -379,9 +383,21 @@ def effective(canons, host: str) -> Policy:
     longest."""
     values: dict = {}
     origin: dict = {}
+    roots: set[str] = set()
     for canon in canons or ():
         fiche = canon.host(host) if hasattr(canon, "host") else None
-        declared = getattr(getattr(fiche, "policy", None), "housekeeping", None) or {}
+        host_policy = getattr(fiche, "policy", None)
+        declared = getattr(host_policy, "housekeeping", None) or {}
+        for template in [getattr(host_policy, "work_root", None),
+                         *(getattr(host_policy, "work_roots", None) or {}).values()]:
+            if not template:
+                continue
+            path = os.path.expanduser(template)
+            if "{agent}" in path:
+                path = os.path.dirname(path.split("{agent}", 1)[0] + "x")
+            path = os.path.abspath(path)
+            if path not in (*FORBIDDEN_ROOTS, os.path.expanduser("~")):
+                roots.add(path)
         label = getattr(canon, "id", "") or "?"
         for key, value in declared.items():
             if key not in POLICY_KEYS:
@@ -397,7 +413,7 @@ def effective(canons, host: str) -> Policy:
                     (key in ("orphan_cleanup", "deps", "docker_volumes") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
-    return Policy(origin=origin, **values)
+    return Policy(origin=origin, worktree_roots=tuple(sorted(roots)), **values)
 
 
 def disabled(env=None) -> bool:
@@ -2741,6 +2757,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))
             continue
+        # #2180: a reused tracked path may now be a clone, a symlink or a
+        # worktree of another repository. Old metadata never authorises it.
+        from .housekeeping_discovery import _marker
+        if _marker(path) != "linked" or common_dir(path) != _real(row.get("repo") or ""):
+            plan.append(dict(base, action="garde",
+                             detail="linked worktree no longer matches its tracked repository"))
+            continue
         st = worktree_state(path)
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
@@ -3360,9 +3383,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     registered: set[str] = set()
     protected: set[str] = set()
     cwd_of: dict[str, str] = {}
+    agent_rows: list[dict] = []
     running: set[str] = set(agents_in_turn)
     try:
-        for row in storage.of(db).operations.listing():
+        agent_rows = list(storage.of(db).operations.listing())
+        for row in agent_rows:
             registered.add(row["name"])
             if row.get("cwd"):
                 protected.add(os.path.abspath(os.path.expanduser(row["cwd"])))
@@ -3521,6 +3546,15 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         # sans registre, ni dossiers d'agents ni tours en cours connus
         skipped.append("worktrees: registry unreadable, no removal")
     elif policy.worktrees:
+        if artifact_scan:
+            from . import housekeeping_discovery
+            local = {row["name"]: row["cwd"] for row in agent_rows
+                     if row.get("host") == host and row.get("cwd")}
+            found = housekeeping_discovery.discover(
+                db, host, local, policy.worktree_roots, dry_run=dry_run)
+            entries += found["entries"]
+            plan += found["plan"]
+            skipped += found["skipped"]
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              protected=protected, now=now, running=running,
                                              artifacts=policy.artifacts,
