@@ -158,6 +158,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 from __future__ import annotations
 
 from .conversations import Conversations
+from .provenance import Provenance
 from .work_dependencies import WorkDependencies
 
 import abc
@@ -1684,9 +1685,14 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
-                      verdict: str | None, note: str, on_frozen=None,
-                      after_commit: list | None = None) -> dict:
+                      verdict: str | None, note: str, proof: dict | None = None,
+                      on_frozen=None, after_commit: list | None = None) -> dict:
         """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
+
+        `proof` (#1465) : l'identité exacte du tour qui déclare (`actor`,
+        `session`, `turn`, `harness`, `sha` complet), écrite DANS LA MÊME
+        TRANSACTION que le jalon sous le sujet `milestone:<id>`. Absent, le
+        jalon s'écrit sans preuve : l'origine reste inconnue, jamais devinée.
 
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
         transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
@@ -3607,6 +3613,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    provenance: Provenance
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
