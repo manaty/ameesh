@@ -29,6 +29,7 @@ review_policies:
     rules:
       - paths: ["**/*.sql", "migrations/**"]
         class: sensitive
+        critical: true
       - paths: ["docs/**"]
         class: light
 ```
@@ -37,6 +38,21 @@ Patterns are repository path globs: `*` does not cross `/`, `**` does, and
 `docs` does not cover `docs/a.md` (write `docs/**`). `ameesh canon check`
 validates the declaration; a policy without `default` gives a warning, not an
 error.
+
+Set `critical: true` on a `sensitive` rule for SQL, security or production
+paths that require two independent reviews from different model families,
+both different from the author's. This declaration applies in every project
+policy, including policies under `risk_classes.projects`. It follows the
+changed file: another critical path in an unmatched rule does not add a review.
+If several matching rules or canons apply, any `critical: true` declaration
+wins. A non-boolean value, or `critical: true` on another class, is an error.
+
+Declare new critical paths here when adding them. The review gate uses this
+declaration even when its fallback path patterns do not yet recognize a new
+module. Those fallback patterns remain a minimum: a recognized SQL, security
+or production path still requires two reviews if the canon omits it or calls
+it `light` or `normal`. Ordinary light changes still require no review before
+merge; other sensitive paths require one independent review.
 
 ## Computing the class of a change
 
@@ -59,7 +75,8 @@ classe : sensible
 ```
 
 The `--json` form gives `class`, `default_used`, and for each file its `path`,
-`class` and matching `rule`, plus the canon commit the policy was read from
+`class` and matching `rule` (plus `critical: true` when declared), and the canon
+commit the policy was read from
 (`policy_ref`). Like every canon read, the policy comes from the merged
 canonical branch (`--canon`, `--ref`, `--fetch` work as for `ameesh canon`).
 
