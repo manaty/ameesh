@@ -8,8 +8,24 @@ Routes :
                               assume_duplicate?})
     GET  /receipts/<id>       jeton de service — le reçu (200), en attente (202),
                               échu sans reçu (410)
+    POST /login-requests      jeton de CONNEXION (dédié, L232d) — crée un DÉFI
+                              DE CONNEXION (hôte, fournisseur, compte, portée,
+                              échéance) ; rend le lien, jamais l'URL ni le code.
+                              Fermé par défaut (`login_api: "open"` dans le
+                              JSON du service) ; le jeton de service de
+                              l'équipe n'y est JAMAIS accepté (avis B1 dev4)
+    GET  /login-receipts/<id> jeton de connexion — le reçu du défi (200|202|410)
+    POST /login-close/<id>    jeton de connexion + capacité de clôture du défi
+                              (`close_token`, rendu une fois à la création) —
+                              clôture TECHNIQUE demandée par le superviseur :
+                              efface l'URL et le code, libère la réservation,
+                              refuse lien/assertion tardifs ; n'écrit jamais
+                              de reçu humain
     GET  /a/<jeton>           page d'approbation
     POST /a/<jeton>           assertion WebAuthn → reçu (approve | deny)
+    GET  /login/<jeton>       page du défi : sans URL ni code (lien muet)
+    POST /login/<jeton>       assertion WebAuthn → `view` (ouvre la vue privée,
+                              rend URL + code) | `done` | `cancel` → reçu
     GET  /enroll/<jeton>      page d'enrôlement
     POST /enroll/<jeton>      attestation → proposition de canon
     GET  /static/<fichier>    approve.js, approve.css
@@ -25,6 +41,16 @@ En plus :
 * en-tête Host contrôlé : pages humaines sous un hôte des origines
   autorisées ; API de service sous l'hôte local (127.0.0.1:port) seulement,
   sauf `api_via_public` (anti-rebinding DNS), écrit dans le JSON ;
+* API des défis de connexion (L232d) : fermée par défaut ; quand `login_api`
+  vaut « open » (choix écrit du JSON), seuls le jeton DÉDIÉ
+  (`login_token_file`, tenu par le superviseur de connexion, hors de portée
+  des agents) est accepté — jamais le jeton de service de l'équipe, partagé
+  par tous ses agents : l'humain signerait un code d'appareil généré
+  ailleurs, présenté comme venant de l'hôte déclaré (avis sécurité B1) ;
+* clôture d'un défi : le jeton dédié ne suffit pas, il faut la capacité
+  `close_token` rendue au seul créateur du défi (N3, #2178) — un gardien ne
+  ferme pas le défi d'un autre ; la capacité n'est ni journalisée ni rendue
+  par la vue publique ;
 * POST humains : `Origin` doit être une origine autorisée (et
   `Sec-Fetch-Site`, s'il est présent, same-origin) ; API : aucun `Origin`
   (un navigateur n'a rien à y faire) ;
@@ -79,8 +105,12 @@ _TOKEN_PATH = r"([A-Za-z0-9_-]{43})"
 _ROUTES = (
     ("api", "POST", re.compile(r"^/requests$")),
     ("api", "GET", re.compile(r"^/receipts/(req_[0-9a-z]{26})$")),
+    ("login-api", "POST", re.compile(r"^/login-requests$")),
+    ("login-api", "POST", re.compile(r"^/login-close/(lgn_[0-9a-z]{26})$")),
+    ("login-api", "GET", re.compile(r"^/login-receipts/(lgn_[0-9a-z]{26})$")),
     ("health", "GET", re.compile(r"^/health$")),
     ("approve", "GET POST", re.compile(r"^/a/%s$" % _TOKEN_PATH)),
+    ("login", "GET POST", re.compile(r"^/login/%s$" % _TOKEN_PATH)),
     ("enroll", "GET POST", re.compile(r"^/enroll/%s$" % _TOKEN_PATH)),
     ("static", "GET", re.compile(r"^/static/([a-z]+\.(?:js|css))$")),
 )
@@ -88,7 +118,7 @@ _ROUTES = (
 #: fermeture (sinon le noyau répond RST et le client perd la réponse)
 DRAIN_LIMIT = 1024 * 1024
 _SECRET_RE = re.compile(r"[A-Za-z0-9_-]{32,}")
-_PATH_SECRET_RE = re.compile(r"/(a|enroll)/[^/?\s]*")
+_PATH_SECRET_RE = re.compile(r"/(a|enroll|login)/[^/?\s]*")
 
 
 def redact(text: str) -> str:
@@ -199,7 +229,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         self._send(status, page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _error(self, kind: str, exc: ApproveError, extra: tuple = ()) -> None:
-        if kind in ("approve", "enroll") and self.command == "GET":
+        if kind in ("approve", "enroll", "login") and self.command == "GET":
             titles = {404: "Unknown link", 410: "Unusable link", 409: "Obsolete request",
                       429: "Too many requests", 503: "Service unavailable"}
             self._html(exc.status, render.message_page(
@@ -236,7 +266,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if len(hosts) != 1:
             return False
         host = hosts[0].strip().lower()
-        if kind in ("api", "health"):
+        if kind in ("api", "login-api", "health"):
             allowed = self.server.local_hosts
             if self.server.service.cfg.api_via_public:
                 allowed = allowed | self.server.public_hosts
@@ -323,8 +353,8 @@ class ApproveHandler(BaseHTTPRequestHandler):
             # corps lu (borné) AVANT les contrôles d'autorisation : la réponse
             # d'erreur part sur une connexion propre
             body = self._read_body() if self.command == "POST" else b""
-            if kind == "api":
-                return self._api(value, body)
+            if kind in ("api", "login-api"):
+                return self._api(kind, value, body)
             return self._human(kind, value, body)
         except ApproveError as exc:
             self._discard_body()
@@ -344,20 +374,39 @@ class ApproveHandler(BaseHTTPRequestHandler):
             raise ApproveError(404, "not_found", "not found")
         self._send(200, entry[0], entry[1])
 
-    def _api(self, request_id: str | None, raw: bytes) -> None:
+    def _api(self, kind: str, reference: str | None, raw: bytes) -> None:
         if self.headers.get("Origin") is not None:
             raise ApproveError(403, "origin", "service API: no browser allowed")
         authorization = self.headers.get("Authorization") or ""
         scheme, _, presented = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not self.server.service.check_service_token(
-                presented.strip()):
-            raise ApproveError(401, "unauthorized", "service token missing or invalid")
+        presented = presented.strip()
         service = self.server.service
-        if self.command == "POST":
-            return self._json(201, service.create_request(load_json_body(raw)))
-        if not REQUEST_ID_RE.fullmatch(request_id or ""):
-            raise ApproveError(404, "not_found", "not found")
-        status, payload = service.receipt(request_id)
+        if kind == "login-api":
+            # L232d (avis B1 dev4) : fermée par défaut, et jamais ouverte au
+            # jeton de service de l'équipe — tous ses agents le lisent, et un
+            # défi déposé par n'importe qui ferait signer à l'humain un code
+            # d'appareil généré ailleurs, sous l'hôte déclaré.
+            if not service.login_api_open:
+                raise ApproveError(403, "login_api_closed",
+                                   "login API closed: connection challenges are refused")
+            if scheme.lower() != "bearer" or not service.check_login_token(presented):
+                raise ApproveError(401, "unauthorized", "login token missing or invalid")
+        elif scheme.lower() != "bearer" or not service.check_service_token(presented):
+            raise ApproveError(401, "unauthorized", "service token missing or invalid")
+        if kind == "login-api":
+            if self.command == "POST":
+                if reference is not None:  # /login-close/<id> : clôture technique
+                    body = load_json_body(raw)
+                    return self._json(200, service.close_login(
+                        reference, body.get("close_token")))
+                return self._json(201, service.create_login_request(load_json_body(raw)))
+            status, payload = service.login_receipt(reference)
+        else:
+            if self.command == "POST":
+                return self._json(201, service.create_request(load_json_body(raw)))
+            if not REQUEST_ID_RE.fullmatch(reference or ""):
+                raise ApproveError(404, "not_found", "not found")
+            status, payload = service.receipt(reference)
         if isinstance(payload, bytes):
             return self._send(status, payload, "application/json; charset=utf-8")
         return self._json(status, payload)
@@ -375,10 +424,14 @@ class ApproveHandler(BaseHTTPRequestHandler):
             body = load_json_body(raw)
             if kind == "approve":
                 return self._json(200, service.submit(token, body))
+            if kind == "login":
+                return self._json(200, service.login_submit(token, body))
             return self._json(200, service.enroll_submit(
                 token, body, origin=self.headers.get("Origin")))
         if kind == "approve":
             return self._html(200, render.approval_page(service.link_view(token)))
+        if kind == "login":
+            return self._html(200, render.login_page(service.login_view(token)))
         return self._html(200, render.enroll_page(service.enroll_view(token)))
 
 

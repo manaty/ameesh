@@ -12,7 +12,8 @@ Ces tests tiennent la propriété, sans réseau ni base :
   processus), et une lecture périmée se revalide sans quota ;
 * le quota épuisé sort en code 3 seulement si rien n'est en cache ; une
   valeur gardée est servie, marquée périmée, sans requête ;
-* une erreur GitHub sort en 1, un chemin ou un `--ttl` refusés en 2 ;
+* une erreur GitHub sort en 1, un chemin (blanc ou caractère de contrôle) ou
+  un `--ttl` (non fini) refusés en 2, sans traceback ;
 * le jeton n'apparaît ni sur la sortie, ni dans les erreurs ;
 * la commande est routée par le point d'entrée public (`ameesh github read`).
 """
@@ -29,6 +30,7 @@ import urllib.error
 from unittest import mock
 
 from . import support  # noqa: F401 - isoler l'environnement (L142) avant ameesh
+from .fake_github import FakeGh
 from ameesh import config as config_mod
 from ameesh import github_cli, main as main_mod, plan_github
 
@@ -137,11 +139,11 @@ class CliCase(unittest.TestCase):
                                ttl=kw.get("ttl", plan_github.READS_TTL),
                                clock=self.clock, opener=self.gh)
 
-    def run_cli(self, argv):
+    def run_cli(self, argv, client_factory=None):
         """`ameesh github …` par le point d'entrée public, sortie et code."""
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(config_mod, "load", return_value=self.cfg), \
-                mock.patch.object(plan_github, "client", self.client):
+                mock.patch.object(plan_github, "client", client_factory or self.client):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 try:
                     code = main_mod.main(argv)
@@ -230,12 +232,17 @@ class ReadPathTest(CliCase):
         self.assertIn("HTTP 404", err)
 
     def test_chemin_refuse_code_2(self):
-        for path in ("repos/o/r", "/repos/o/r pulls", "/repos/o/r\n"):
+        """Blancs et caractères de contrôle (C0, DEL, C1) : refus 2, jamais un
+        traceback d'`urllib` (N1 #894)."""
+        for path in ("repos/o/r", "/repos/o/r pulls", "/repos/o/r\n",
+                     "/repos/o/r\x01", "/repos/o/r\x1b", "/repos/o/r\x7f",
+                     "/repos/o/r\x85"):
             with self.subTest(path=path):
                 code, out, err = self.run_cli(["github", "read", path])
                 self.assertEqual(code, 2)
                 self.assertEqual(out, "")
                 self.assertIn("github:", err)
+                self.assertNotIn("Traceback", err)
         self.assertEqual(self.gh.calls, [])
 
     def test_ttl_trop_court_code_2(self):
@@ -243,6 +250,19 @@ class ReadPathTest(CliCase):
         code, _out, err = self.run_cli(["github", "read", "/repos/o/r", "--ttl", "1"])
         self.assertEqual(code, 2)
         self.assertIn("at least", err)
+        self.assertEqual(self.gh.calls, [])
+
+    def test_ttl_non_fini_code_2(self):
+        """`--ttl nan` ne désactive pas la garde, `inf` ne sert pas le cache
+        indéfiniment : refus 2 (N2 #894)."""
+        for ttl in ("nan", "inf", "-inf"):
+            with self.subTest(ttl=ttl):
+                code, out, err = self.run_cli(
+                    ["github", "read", "/repos/o/r", "--ttl=%s" % ttl])
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("finite", err)
+                self.assertNotIn("Traceback", err)
         self.assertEqual(self.gh.calls, [])
 
     def test_le_jeton_n_apparait_jamais(self):
@@ -264,6 +284,37 @@ class ReadPathTest(CliCase):
         code, _out, err = self.run_cli(["github", "write", "/repos/o/r"])
         self.assertEqual(code, 2)
         self.assertIn("invalid choice", err)
+
+    def test_la_cle_du_cli_est_celle_des_lecteurs_internes(self):
+        """Le chemin d'URL de la commande et `repos/…` des lecteurs internes
+        (#848 : notify, ci, versions) désignent la même entrée de cache."""
+        self.gh.body["repos/o/r"] = {"id": 1}
+        code, _out, err = self.run_cli(["github", "read", "/repos/o/r"])
+        self.assertEqual(code, 0, err)
+        reader = plan_github.Api(token=TOKEN, base=BASE, cache_dir=self.dir.name,
+                                 clock=self.clock, opener=self.gh)
+        self.assertEqual(reader.get("repos/o/r"), {"id": 1})
+        self.assertEqual(len(self.gh.calls), 1)  # servie par l'entrée du CLI
+
+    def test_repli_gh_par_le_cli(self):
+        """Sans jeton (hôte d'agents), la lecture passe par `gh api -i` et le
+        cache partagé : le second appel ne relance aucune commande `gh`."""
+        gh = FakeGh({"repos": {"o/r": {"visibility": "private"}}})
+
+        def client(**kw):
+            self.seen.update(kw)
+            return plan_github.GhApi(
+                gh, reads=plan_github.SharedReads(kw["cache_dir"], clock=self.clock,
+                                                  ttl=kw["ttl"]),
+                ttl=kw["ttl"], clock=self.clock)
+
+        for _ in range(2):
+            code, out, err = self.run_cli(["github", "read", "/repos/o/r"],
+                                          client_factory=client)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(out)["visibility"], "private")
+        self.assertEqual(len(gh.calls()), 1)
+        self.assertIn("api", gh.calls()[0])
 
 
 class ReadPathUnitTest(unittest.TestCase):
@@ -287,7 +338,7 @@ class ReadPathUnitTest(unittest.TestCase):
             self.assertEqual(github_cli.read_path(cfg, "/repos/o/r"), {"ok": True})
         self.assertEqual(seen["cache_dir"], "/state")
         self.assertEqual(seen["ttl"], 45.0)
-        self.assertEqual(seen["path"], "/repos/o/r")
+        self.assertEqual(seen["path"], "repos/o/r")  # clé du cache #848
 
     def test_ttl_explicite_gagne(self):
         cfg = dataclasses.replace(config_mod.Config(), state_dir="/state",
@@ -299,18 +350,29 @@ class ReadPathUnitTest(unittest.TestCase):
         self.assertEqual(seen["ttl"], 90.0)
 
     def test_check_path(self):
-        self.assertEqual(github_cli.check_path("/repos/o/r"), "/repos/o/r")
-        for bad in ("", None, "repos/o/r", "https://api.github.com/repos/o/r"):
+        self.assertEqual(github_cli.check_path("/repos/o/r"), "repos/o/r")
+        self.assertEqual(github_cli.check_path("//repos/o/r"), "repos/o/r")
+        for bad in ("", None, "repos/o/r", "https://api.github.com/repos/o/r",
+                    "/repos/o/r\x01", "/repos/o/r\x7f", "/repos/o/r\x85"):
             with self.subTest(path=bad):
                 with self.assertRaises(ValueError):
                     github_cli.check_path(bad)
 
     def test_ttl_of(self):
         self.assertEqual(github_cli.ttl_of("90"), 90.0)
-        for bad in ("4", "abc", None, True):
+        for bad in ("4", "abc", None, True, "nan", "inf", "-inf",
+                    float("nan"), float("inf")):
             with self.subTest(ttl=bad):
                 with self.assertRaises(ValueError):
                     github_cli.ttl_of(bad)
+
+    def test_read_path_valide_le_ttl_comme_le_cli(self):
+        """`read_path` refuse aussi un `--ttl` non fini (N2 #894)."""
+        cfg = dataclasses.replace(config_mod.Config(), state_dir="/state", github={})
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(ttl=bad):
+                with self.assertRaises(ValueError):
+                    github_cli.read_path(cfg, "/repos/o/r", ttl=bad)
 
 
 class _EmptyClient:

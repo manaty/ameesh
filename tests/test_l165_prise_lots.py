@@ -302,19 +302,23 @@ class PriseDeLotTest(_Lots):
         self.assertEqual(work.get(self.db, pour_deepseek["id"])["assignee"], "deepseek7")
 
     def test_seuil_de_repos_propre_aux_lots(self):
+        # #1677 (b) : le seuil de temps ne borne plus la prise des lots quand
+        # le relevé porte `actionable_lots` — un agent sans lot actionnable est
+        # au repos, quel que soit le temps depuis son dernier tour. Zéro reste
+        # l'interrupteur qui désactive la prise.
         self.agent("claude1", team="nexlink", since_s=20 * 60)
         lot = self.lot("lot")
-        self.assertEqual(self.take(lot_idle_s=30 * 60), [])
         self.assertEqual(self.take(lot_idle_s=0), [])
         self.assertEqual(self.take(lot_max_per_hour=0), [])
         # un lot tout juste créé est laissé à qui l'a créé
         self.db.execute("UPDATE work_items SET created_at = now() WHERE id = %s",
                         (lot["id"],))
-        self.assertEqual(self.take(), [])
+        self.assertEqual(self.take(lot_idle_s=30 * 60), [])
         self.db.execute("UPDATE work_items SET created_at = now() - interval '10 minutes'"
                         " WHERE id = %s", (lot["id"],))
-        # défaut : 15 min de repos suffisent, la file en demande 30
-        self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
+        # 20 min de repos, seuil de lot à 30 min : la prise part quand même
+        self.assertEqual([t["item"]["id"] for t in self.take(lot_idle_s=30 * 60)],
+                         [lot["id"]])
 
     def test_ordre_priorite_puis_dates_prevues(self):
         self.agent("a1", team="nexlink", since_s=3 * HEURE)
@@ -362,7 +366,12 @@ class PriseDeLotTest(_Lots):
             {"state": "intake", "lot_team": "web", "planned_start": "2026-10-11"},
             "2026-10-11"))
 
-    def test_equipe_du_lot_fiche_puis_application(self):
+    def test_prise_par_le_projet_du_lot_pas_par_l_equipe_de_la_fiche(self):
+        """#811 : la prise suit le projet du lot (`app` d'abord, comme le
+        dossier de travail et `projects.lot_project`) ; `lot_team` (équipe du
+        lot, sinon de sa fiche ou de la fiche parente, sinon son application)
+        reste lu pour le personnel et les alertes, il ne route plus la prise —
+        la garde L243 « projet primaire » est levée."""
         self.agent("web1", team="web")
         self.agent("api1", team="api")
         self.db.execute("INSERT INTO work_packages (id, kind, title, team, canon_ref)"
@@ -374,12 +383,17 @@ class PriseDeLotTest(_Lots):
         sans_equipe = self.lot("sans équipe", app="")
         par_app = self.lot("par l'application", app="api")
         rows = {i["id"]: i for i in storage.of(self.db).work.unassigned_lots(10)}
+        # lot_team : équipe de la fiche puis application (stockage inchangé).
         self.assertEqual(rows[par_fiche["id"]]["lot_team"], "web")
         self.assertEqual(rows[par_app["id"]]["lot_team"], "api")
         self.assertIsNone(rows[sans_equipe["id"]]["lot_team"])
         out = self.take()
+        # `par_fiche` a pour projet `app=api` : api1 le prend (le plus ancien
+        # des deux lots api) ; web1 ne déclare pas api et ne prend rien.
         self.assertEqual(sorted((t["agent"], t["item"]["id"]) for t in out),
-                         [("api1", par_app["id"]), ("web1", par_fiche["id"])])
+                         [("api1", par_fiche["id"])])
+        # `par_app` reste à la file : api1 tient déjà un lot non démarré (#540).
+        self.assertIsNone(work.get(self.db, par_app["id"])["assignee"])
         self.assertIsNone(work.get(self.db, sans_equipe["id"])["assignee"])
 
     def test_capacites_et_harnais(self):
@@ -434,6 +448,22 @@ class PriseDeLotTest(_Lots):
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
                          [("claude1", un["id"]), ("deepseek7", deux["id"])])
 
+    def test_orchestrateur_sert_un_lot_qu_aucun_autre_ne_prend(self):
+        """#1739 : sans autre preneur, l'orchestrateur prend le lot laissé, et
+        la note d'attribution garde la trace du repli."""
+        self.agent("orchestrateur", team="nexlink", since_s=5 * HEURE)
+        lot = self.lot("demande")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"], t.get("fallback")) for t in out],
+                         [("orchestrateur", lot["id"], True)])
+        self.assertNotIn("orchestrateur", out[0]["notified"])
+        note = self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s"
+            " ORDER BY id DESC LIMIT 1", (lot["id"],))[0]["note"]
+        self.assertIn(backlog.LOT_TAKE_NOTE, note)
+        self.assertIn("aucun autre preneur ; orchestrateur", note)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "orchestrateur")
+
     def test_lot_avant_la_file_et_garde_fous(self):
         self.agent("claude1", team="nexlink")
         element = self.element("dette", 90, team="nexlink")
@@ -452,6 +482,26 @@ class PriseDeLotTest(_Lots):
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out], [("claude1", lot["id"])])
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
         self.assertEqual(self.courriers(), [])
+
+    def test_assign_if_holder_refuse_un_titulaire_change(self):
+        """#2016 : la réassignation porte le titulaire lu (`if_holder`) ; si le
+        lot a changé de main depuis le relevé, elle est refusée en nommant le
+        porteur courant — deux agents partis du même brief ne se volent plus le
+        lot."""
+        self.agent("claude1", team="nexlink")
+        self.agent("claude2", team="nexlink")
+        lot = self.lot("course d'assignation", assignee="claude1")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.assign(self.db, lot["id"], "claude2", if_holder="claude3")
+        self.assertIn("changed holder since the reading", str(ctx.exception))
+        self.assertIn("now claude1 (expected claude3)", str(ctx.exception))
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "claude1")
+        # le titulaire attendu est bien celui du relevé : la réassignation passe
+        out = work.assign(self.db, lot["id"], "claude2", if_holder="claude1")
+        self.assertEqual(out["item"]["assignee"], "claude2")
+        # sans instantané, le geste explicite reste possible (comportement inchangé)
+        out = work.assign(self.db, lot["id"], "claude1")
+        self.assertEqual(out["item"]["assignee"], "claude1")
 
 
 class NotifyTest(_Lots):

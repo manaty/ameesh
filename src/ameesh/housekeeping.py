@@ -3,7 +3,7 @@
 de base #1, cycle de vie des worktrees).
 
 ameesh fait le ménage de ce que SES agents créent, au lieu de le laisser à
-l'humain. Quatre familles, quatre règles :
+l'humain. Cinq familles, cinq règles :
 
 * **Dossier temporaire d'un agent** (jetable) : `TMPDIR`/`TMP`/`TEMP` d'un
   tour pointent vers `<tmp_root>/<agent>` (par défaut
@@ -49,6 +49,20 @@ l'humain. Quatre familles, quatre règles :
   `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
   with no process of the user inside; never in a main checkout.
 
+* **Volumes Docker sans conteneur** (L73/#2003, [`reap_volumes`]) : seuls
+  ceux dont le mesh a DÉCLARÉ le cycle de vie jetable sont récoltés —
+  l'étiquette `ameesh.bench=disposable`, posée par `scripts/pg-up.sh` quand
+  l'appelant a déclaré le banc de lot jetable (`AMEESH_PG_DISPOSABLE=1`) —
+  et seulement après `docker_volume_idle` (24 h) d'ABSENCE
+  CONTINUE, mesurée par les relevés successifs du ménage (jamais l'âge de
+  création). Le banc partagé persistant (`ameesh-pg-data`), tout volume nommé
+  sans étiquette, tout volume anonyme (`com.docker.volume.anonymous`, sans
+  provenance du mesh : il part avec le conteneur étiqueté qui l'a créé,
+  `rm -f -v`) : listés dans `others` (borné) avec la commande
+  `docker volume rm`, JAMAIS supprimés (précédent #411 : les volumes nommés
+  existants sont conservés) ; `docker volume rm` refuse de lui-même un volume
+  encore monté.
+
 * **Entrées de `/tmp` apparues pendant un tour** (L162 : clone de relecture,
   `--cacheDirectory` explicite, image `docker save`) : elles sont signalées
   (`tmp_orphan`) avec la commande à lancer, NON ATTRIBUÉES (#222 : `/tmp` est
@@ -62,8 +76,9 @@ l'humain. Quatre familles, quatre règles :
   copie git dedans n'a de travail non commité ou non poussé
   (`orphan_cleanup: false` : jamais, par hôte).
 
-Ce qu'ameesh n'a pas créé ni vu apparaître pendant un tour n'est JAMAIS
-supprimé automatiquement. Toute suppression dans un dossier géré passe par
+Les worktrees liés découverts dans les dépôts des agents locaux rejoignent
+le même suivi, avec un âge neuf (#2180). Les clones et dossiers sans Git
+sont seulement signalés. Toute suppression dans un dossier géré passe par
 [`_safe_rmtree`], qui refuse un chemin hors des dossiers gérés, un lien
 symbolique, ou une racine sans marqueur `.ameesh-menage` ; dans `/tmp`, par
 [`_remove_tmp_entry`], qui revérifie l'entrée juste avant.
@@ -133,6 +148,19 @@ TMP_TOP = 5
 #: #1547 (N3) : conteneurs hors tour détaillés dans le relevé de ménage — le
 #: journal garde le compte total (`others_total`), jamais une liste non bornée
 OTHERS_TOP = 20
+#: L73/#2003 : délai (secondes) d'ABSENCE CONTINUE, mesuré par les relevés
+#: successifs du ménage, avant qu'un volume Docker DÉCLARÉ JETABLE
+#: (`ameesh.bench=disposable`) ne soit récolté. L'âge de création n'en tient
+#: pas lieu ; les volumes non déclarés ne sont jamais supprimés.
+DEFAULT_DOCKER_VOLUME_IDLE_S = 24 * 3600.0
+#: #2003 : volumes Docker non déclarés jetables détaillés dans le relevé — le
+#: journal garde le compte total, jamais une liste non bornée (comme
+#: `OTHERS_TOP`)
+VOLUMES_TOP = 20
+#: L162/L230 : début de la raison rendue quand l'OS ne dit pas qui tient une
+#: entrée ; l'hôte qui a déclaré des processus illisibles sans doute
+#: (`unreadable_ok`) repose alors la question avec son allow
+HOLDERS_UNREADABLE = "holders unreadable"
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
@@ -194,7 +222,7 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
-               "docker_build_cache_alert")
+               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -213,6 +241,12 @@ class Policy:
     tmpfs_alert: float = DEFAULT_TMPFS_ALERT
     docker_orphan_volumes_alert: int = 100
     docker_build_cache_alert: int = 20 * 1024 ** 3
+    #: #2003 : récolter les volumes Docker DÉCLARÉS JETABLES par le mesh
+    #: (`ameesh.bench=disposable`) ; `false` : aucun volume n'est supprimé
+    docker_volumes: bool = True
+    #: #2003 : absence continue (secondes, mesurée par les relevés) avant
+    #: cette récolte
+    docker_volume_idle: float = DEFAULT_DOCKER_VOLUME_IDLE_S
     redirect: bool = True
     xdg_cache: bool = False
     worktrees: bool = True
@@ -230,10 +264,14 @@ class Policy:
     artifacts: tuple | None = None
     #: L230: inactivity (seconds) of a worktree before its artifacts go
     artifact_idle: float = build_artifacts.DEFAULT_IDLE_S
-    #: L230: names of the user's processes whose unreadability (not dumpable:
-    #: capabilities, setuid) does not block a deletion; empty by default, set
-    #: per host in its Host card
+    #: L230/L162: names of the user's processes whose unreadability (not
+    #: dumpable: capabilities, setuid) does not block a deletion — the build
+    #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
+    #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
+    #: #2180: discovery roots derived from Host work_root/work_roots, never
+    #: deletion roots. Not a separate housekeeping setting.
+    worktree_roots: tuple = ()
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -288,7 +326,7 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert`: fraction expected (0 < x <= 1, or \"60%\")")
         else:
             parsed["tmpfs_alert"] = part
-    for key in ("orphan_idle", "deps_idle", "artifact_idle"):
+    for key in ("orphan_idle", "deps_idle", "artifact_idle", "docker_volume_idle"):
         if raw.get(key) is None:
             continue
         seconds = parse_idle(raw[key])
@@ -308,7 +346,8 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`unreadable_ok` : %s" % problem)
         else:
             parsed["unreadable_ok"] = names
-    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps"):
+    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps",
+                "docker_volumes"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
@@ -344,9 +383,21 @@ def effective(canons, host: str) -> Policy:
     longest."""
     values: dict = {}
     origin: dict = {}
+    roots: set[str] = set()
     for canon in canons or ():
         fiche = canon.host(host) if hasattr(canon, "host") else None
-        declared = getattr(getattr(fiche, "policy", None), "housekeeping", None) or {}
+        host_policy = getattr(fiche, "policy", None)
+        declared = getattr(host_policy, "housekeeping", None) or {}
+        for template in [getattr(host_policy, "work_root", None),
+                         *(getattr(host_policy, "work_roots", None) or {}).values()]:
+            if not template:
+                continue
+            path = os.path.expanduser(template)
+            if "{agent}" in path:
+                path = os.path.dirname(path.split("{agent}", 1)[0] + "x")
+            path = os.path.abspath(path)
+            if path not in (*FORBIDDEN_ROOTS, os.path.expanduser("~")):
+                roots.add(path)
         label = getattr(canon, "id", "") or "?"
         for key, value in declared.items():
             if key not in POLICY_KEYS:
@@ -357,11 +408,12 @@ def effective(canons, host: str) -> Policy:
                          "docker_orphan_volumes_alert", "docker_build_cache_alert") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
-            elif (key in ("orphan_idle", "deps_idle", "artifact_idle") and value > values[key]) or \
-                    (key in ("orphan_cleanup", "deps") and value is False
+            elif (key in ("orphan_idle", "deps_idle", "artifact_idle",
+                          "docker_volume_idle") and value > values[key]) or \
+                    (key in ("orphan_cleanup", "deps", "docker_volumes") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
-    return Policy(origin=origin, **values)
+    return Policy(origin=origin, worktree_roots=tuple(sorted(roots)), **values)
 
 
 def disabled(env=None) -> bool:
@@ -1770,14 +1822,20 @@ def unsaved_git_work(path: str) -> str:
     return ""
 
 
-def tmp_holder(path: str) -> str:
+def tmp_holder(path: str, allow=()) -> str:
     """Le processus qui tient `path` (fichier ouvert dedans, dossier courant,
     chemin sur sa ligne de commande), en clair ; vide si aucun. Si l'OS ne
-    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed)."""
+    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed).
+    `allow` (L230) : noms des processus dont l'illisibilité n'est pas un doute
+    — le choix de l'hôte, vide par défaut ; un détenteur constaté reste dit.
+    L'appel sans `allow` pose la question d'origine (un seul argument) : c'est
+    lui qui découvre l'illisibilité, `_orphan_verdict` repose la question avec
+    l'allow de l'hôte quand il y en a un."""
     try:
-        found = platform.holders(_real(path), needle=os.path.abspath(path))
+        found = platform.holders(_real(path), needle=os.path.abspath(path),
+                                 allow=allow)
     except platform.NotAvailable as exc:
-        return "holders unreadable (%s)" % exc
+        return "%s (%s)" % (HOLDERS_UNREADABLE, exc)
     if not found:
         return ""
     first = found[0]
@@ -1877,12 +1935,17 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
     if idle < policy.orphan_idle:
         return "attend", "modified %s ago (deleted after %s without change)" % (
             fmt_idle(max(0.0, idle)), fmt_idle(policy.orphan_idle))
+    holder = tmp_holder(path)
+    if holder.startswith(HOLDERS_UNREADABLE) and policy.unreadable_ok:
+        # L230 : la première lecture est muette (processus non dumpable) ;
+        # l'hôte qui a nommé ces processus repose la question avec son allow,
+        # et un détenteur CONSTATÉ reste rapporté.
+        holder = tmp_holder(path, allow=policy.unreadable_ok)
+    if holder:
+        return "attend", holder
     work = unsaved_git_work(path)
     if work:
         return "garde", "git work to keep — %s" % work
-    holder = tmp_holder(path)
-    if holder:
-        return "attend", holder
     return "suppression", "left by turn %s of %s, unchanged for %s, held by no " \
         "process" % (str(data.get("turn") or "?")[:8], agent, fmt_idle(idle))
 
@@ -2245,19 +2308,28 @@ def owns_worktree(path: str, cwd: str | None, other_cwds) -> bool:
 #: (L118b), `work/<id>[-…]`, `agent/<nom>-<id>[-…]`, `review/<nom>-<id>[-…]`.
 #: Le nom de l'agent peut porter un chiffre (`mty-nxl-rel-01`, `deepseek3`) :
 #: sous `lot/` et `work/` l'id est le premier groupe numérique, sous `agent/`
-#: et `review/` le dernier.
+#: et `review/` le dernier. #1694 : une branche peut citer plusieurs groupes
+#: (`review/claude2-t3-unit-459-460-r2`) ; ils sont essayés dans cet ordre.
 CITED_LOT = re.compile(r"^(lot|work|agent|review)/(.+)$")
 
 
-def cited_lot(branch: str) -> int | None:
-    """#1665 : l'id de lot cité par un nom de branche, ou None."""
+def cited_lots(branch: str) -> list[int]:
+    """#1694: every lot id a branch name cites, in trial order — first to last
+    under `lot/`/`work/`, last to first under `agent/`/`review/` (the agent
+    name may itself carry a digit, the lot id is the last group there). Empty
+    when the branch cites no number."""
     found = CITED_LOT.match(branch or "")
     if not found:
-        return None
-    groupes = [part for part in found.group(2).split("-") if part.isdigit()]
-    if not groupes:
-        return None
-    return int(groupes[0] if found.group(1) in ("lot", "work") else groupes[-1])
+        return []
+    groupes = [int(part) for part in found.group(2).split("-") if part.isdigit()]
+    return groupes if found.group(1) in ("lot", "work") else list(reversed(groupes))
+
+
+def cited_lot(branch: str) -> int | None:
+    """#1665 : l'id de lot cité par un nom de branche, ou None — le premier
+    candidat de `cited_lots`, pour les appelants qui n'en veulent qu'un."""
+    lots = cited_lots(branch)
+    return lots[0] if lots else None
 
 
 def named_lot(name: str, agent: str) -> int | None:
@@ -2274,26 +2346,36 @@ def lot_of_worktree(db, agent: str, path: str, branch: str = "") -> str | None:
     ou, à défaut, son dossier nomment l'id, et ce lot est assigné à CET agent.
     Sinon None : le worktree reste non attribué (jamais retiré à ce titre, il
     suivra la règle des orphelins). Un lot d'un autre agent, inconnu, ou un
-    registre illisible ne prouve rien : None."""
-    ident = cited_lot(branch) or named_lot(os.path.basename(os.path.normpath(path)), agent)
-    if ident is None or not agent:
+    registre illisible ne prouve rien : None.
+
+    #1694: the branch candidates are tried in `cited_lots` order and the first
+    lot owned by the agent wins; the folder name is only read when the branch
+    cites no number (the #1665 rule)."""
+    if not agent:
         return None
-    try:
-        row = storage.of(db).work.get(ident)
-    except Exception:
-        return None
-    if not row or row.get("assignee") != agent:
-        return None
-    return str(ident)
+    idents = cited_lots(branch)
+    if not idents:
+        nom = named_lot(os.path.basename(os.path.normpath(path)), agent)
+        idents = [nom] if nom is not None else []
+    for ident in idents:
+        try:
+            row = storage.of(db).work.get(ident)
+        except Exception:
+            return None
+        if row and row.get("assignee") == agent:
+            return str(ident)
+    return None
 
 
-def worktree_in_use(path: str) -> bool:
+def worktree_in_use(path: str, allow=()) -> bool:
     """Un processus de l'hôte travaille-t-il dans ce worktree (dossier courant
     ou fichier ouvert dedans) ? Lu par la couche plateforme (L63). Si l'OS ne
     permet pas de le savoir, la réponse est OUI (fail-closed) : le worktree
-    attend plutôt que d'être retiré sous les pieds d'un agent."""
+    attend plutôt que d'être retiré sous les pieds d'un agent. `allow` (L230) :
+    noms des processus dont l'illisibilité n'est pas un doute — le choix de
+    l'hôte, vide par défaut ; un détenteur CONSTATÉ reste rapporté."""
     try:
-        return bool(platform.holders(_real(path)))
+        return bool(platform.holders(_real(path), allow=allow))
     except platform.NotAvailable:
         return True
 
@@ -2598,7 +2680,10 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     plan: list[dict] = []
     running = set(running or ())
     store = storage.of(db).housekeeping
-    for row in store.worktrees(host, ("active", "kept")):
+    # #2174: every tracked worktree — with the 500 oldest stuck, a capped
+    # read never reached the newer ones (17/10: 822 on agents-1, 789 on
+    # agents-2, 1 309 on the workstation)
+    for row in store.worktrees(host, ("active", "kept"), limit=None):
         path, lot = row["path"], row.get("lot")
         if (row.get("detail") or "").startswith((UNATTRIBUTED, UNATTRIBUTED_LEGACY)):
             # #1665 : la branche (ou, à défaut, le dossier) d'un worktree
@@ -2618,20 +2703,37 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             continue
         named = cited_lot(row.get("branch") or "") or named_lot(
             os.path.basename(os.path.normpath(path)), row.get("agent") or "")
-        if lot is None and named is not None:
-            # A named lot that cannot be attributed is not an orphan: the
-            # lot may be open, belong to another agent, or be unreadable.
-            plan.append(dict(base, action="garde", detail="named lot #%s not attributable"
-                             % named))
-            continue
-        state = _lot_state(db, lot) if lot else None
+        # #2174: a named lot that cannot be attributed (another agent's: a
+        # review copy, a reassigned lot) follows the orphan rule once that lot
+        # has ended — 24 h idle, clean and pushed; open, unknown or unreadable,
+        # it proves nothing and the worktree stays (agents-1, 17/10: 205 of
+        # 221 such copies named a merged or closed lot, kept forever).
+        foreign = lot is None and named is not None
+        if foreign:
+            try:
+                # #1694: review branches can cite several candidates. One
+                # ended lot proves nothing about the others still served.
+                states = [_lot_state(db, ident) for ident in
+                          (cited_lots(row.get("branch") or "") or [named])]
+            except Exception:  # registre illisible : rien n'est prouvé
+                states = [None]
+            if any(state not in LOT_ENDED for state in states):
+                plan.append(dict(base, action="garde",
+                                 detail="named lot #%s not attributable" % named))
+                continue
+            state = states[0]
+            lot = str(named)
+            base["lot"] = lot
+        else:
+            state = _lot_state(db, lot) if lot else None
         ended = state in LOT_ENDED
         orphan = lot is None
         if not ended and not orphan:
             plan.append(dict(base, action="attend",
                              detail="lot %s" % (state or "unknown")))
             continue
-        why = ("lot #%s %s" % (lot, state)) if ended else \
+        why = ("lot #%s %s%s" % (lot, state, " (assigned to another agent)" if foreign
+                                 else "")) if ended else \
             "no lot named by the branch or the directory (orphan)"
         target = _real(path)
         if any(_under(_real(cwd), target) for cwd in protected):
@@ -2643,11 +2745,24 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             continue
         moments = [float(row.get("created_ts") or now), _mtime(path)]
         youngest = max(m for m in moments if m is not None)
-        floor = ORPHAN_WORKTREE_IDLE_S if orphan else WORKTREE_MIN_AGE_S
+        floor = ORPHAN_WORKTREE_IDLE_S if orphan or foreign else WORKTREE_MIN_AGE_S
         if now - youngest < floor:
             plan.append(dict(base, action="attend",
                              detail="%s; created or modified less than %s ago" % (
-                                 why, "24 h" if orphan else "an hour")))
+                                 why, "24 h" if orphan or foreign else "an hour")))
+            continue
+        # #2167: holders (including unreadable processes) can retain the
+        # whole host's worktrees; do not pay for Git before that decision.
+        if worktree_in_use(path, allow=allow):
+            plan.append(dict(base, action="attend",
+                             detail="%s; a process is working in it" % why))
+            continue
+        # #2180: a reused tracked path may now be a clone, a symlink or a
+        # worktree of another repository. Old metadata never authorises it.
+        from .housekeeping_discovery import _marker
+        if _marker(path) != "linked" or common_dir(path) != _real(row.get("repo") or ""):
+            plan.append(dict(base, action="garde",
+                             detail="linked worktree no longer matches its tracked repository"))
             continue
         st = worktree_state(path)
         if not st["exists"]:
@@ -2661,7 +2776,10 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if st["locked"]:
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
-        if worktree_in_use(path):
+        if foreign and not st["pushed"]:
+            plan.append(dict(base, action="garde", detail="%s; commits not pushed" % why))
+            continue
+        if worktree_in_use(path, allow=allow):
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))
             continue
@@ -2672,7 +2790,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # #1665: an orphan (or a lot that ended without integration) follows
         # the same end after ORPHAN_WORKTREE_IDLE_S of inactivity, clean and
         # pushed; the branch stays too.
-        grace = (state in LOT_MERGED and row["status"] == "kept"
+        # Foreign copies always need 24 h of source/git inactivity, even
+        # when the same integration failure has kept them for a day.
+        grace = (not foreign and state in LOT_MERGED and row["status"] == "kept"
                  and row.get("detail") == detail
                  and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
         abandoned = (ended or orphan) and now - youngest >= ORPHAN_WORKTREE_IDLE_S
@@ -2871,7 +2991,7 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
     the tracked ones), their build artifacts deleted once idle; in a thread
     at the lowest priority, one worktree at a time."""
     rules = build_artifacts.rules_of(policy.artifacts)
-    tracked = storage.of(db).housekeeping.worktrees(host, ("active", "kept"))
+    tracked = storage.of(db).housekeeping.worktrees(host, ("active", "kept"), limit=None)
     owner = {_real(row["path"]): row["agent"] for row in tracked}
     agents = sorted(cwd_of.items(), key=lambda item: -len(item[1]))
 
@@ -2980,6 +3100,171 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     return out
 
 
+#: #2003 : actions du journal qui portent un épisode d'absence continue d'un
+#: volume (le volume était sans conteneur à ce relevé-là)
+_VOLUME_EPISODE_ACTIONS = ("waiting", "kept")
+
+
+def _volume_episode(previous: dict | None, created: float | None) -> float | None:
+    """#2003 : début de l'épisode d'absence continue d'un volume, tel que le
+    dernier relevé du journal l'a laissé ; None quand l'épisode commence à ce
+    passage — aucune ligne, ligne d'une autre action (une reprise a refermé
+    l'épisode), identité de volume illisible ou différente (le nom a été
+    recréé : c'est un autre volume)."""
+    if not previous or created is None:
+        return None
+    if (previous.get("action") or "") not in _VOLUME_EPISODE_ACTIONS:
+        return None
+    data = previous.get("data") or {}
+    try:
+        if float(data.get("created")) != float(created):
+            return None
+        return float(data.get("episode_since"))
+    except (TypeError, ValueError):
+        return None
+
+
+def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = False,
+                 now: float | None = None) -> dict:
+    """Volumes Docker de l'hôte (L73/#2003) : récolte les volumes SANS
+    conteneur (arrêtés compris, `volume ls --filter dangling=true`) dont le
+    mesh a DÉCLARÉ le cycle de vie jetable — l'étiquette `ameesh.bench`
+    [`containers.BENCH_DISPOSABLE`] que `scripts/pg-up.sh` pose sur le volume
+    d'un banc de lot quand son appelant l'a déclaré jetable
+    (`AMEESH_PG_DISPOSABLE=1`) — et seulement après `policy.docker_volume_idle`
+    d'ABSENCE CONTINUE.
+
+    La provenance n'est jamais déduite d'une proximité d'heure : un volume
+    anonyme (`com.docker.volume.anonymous`) ne porte aucune identité du mesh
+    et n'est jamais supprimé ici (les conteneurs étiquetés d'un tour partent
+    avec leurs volumes anonymes, `rm -f -v`) ; le banc partagé et persistant
+    (`ameesh-pg-data`) ne porte pas l'étiquette et n'est jamais récolté.
+
+    Le délai sans conteneur se mesure sur les relevés successifs : chaque
+    passage journalise l'épisode (`episode_since`, avec l'identité `created`
+    du volume) ; un premier relevé ne supprime donc jamais, une reprise du
+    volume (`referenced`) referme l'épisode, un volume recréé sous le même nom
+    en ouvre un nouveau. Le journal est celui du ménage (30 jours de
+    rétention) : au-delà, l'épisode repart, ce qui ne fait que retarder.
+
+    Les autres volumes — anonyme, nommé sans étiquette, étiquette non
+    jetable — ne sont JAMAIS supprimés : listés dans `others` (borné à
+    `VOLUMES_TOP`, compte total dans `others_total`) avec la commande
+    `docker volume rm` qu'un humain peut décider (précédent #411 : les volumes
+    nommés existants sont conservés). Un volume jetable dont l'identité est
+    illisible est signalé dans `ours` sans suppression. `docker volume rm`
+    refuse de lui-même un volume encore monté : la course avec un `docker run`
+    qui le reprend est fermée par Docker. Seul `docker` est couvert (comme la
+    mesure #411). `dry_run` : le plan seulement, aucun épisode n'est écrit.
+
+    Rend `{entries, plan, ours, others, others_total}` ; `ours`/`others` à
+    None si le moteur ne répond pas, comme [`reap_containers`]."""
+    from . import containers as containers_mod
+    out: dict = {"entries": [], "plan": [], "ours": None, "others": None,
+                 "others_total": None}
+    if runtime is None or not getattr(policy, "docker_volumes", True):
+        return out
+    binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
+    if binary != "docker" or not hasattr(runtime, "volumes"):
+        return out
+    all_rows = runtime.volumes(dangling=False)
+    dangling_rows = runtime.volumes(dangling=True)
+    if all_rows is None or dangling_rows is None:
+        return out
+    now = time.time() if now is None else float(now)
+    idle = max(0.0, float(policy.docker_volume_idle))
+    free = {row["name"] for row in dangling_rows}
+    ours, others, others_total = [], [], 0
+
+    def _other(row: dict, name: str, reason: str) -> None:
+        nonlocal others_total
+        others_total += 1
+        if len(others) < VOLUMES_TOP:
+            others.append({"kind": "volume", "path": name, "driver": row.get("driver"),
+                           "detail": reason,
+                           "command": "%s volume rm %s" % (binary, shlex.quote(name))})
+
+    declared = []
+    for row in all_rows:
+        label = (row.get("labels") or {}).get(containers_mod.BENCH_LABEL)
+        if label is None:
+            continue
+        if label == containers_mod.BENCH_DISPOSABLE:
+            declared.append(row)
+        elif row["name"] in free:
+            _other(row, row["name"],
+                   "labelled %s=%s: not declared disposable by the mesh"
+                   % (containers_mod.BENCH_LABEL, label))
+    for row in dangling_rows:
+        labels = row.get("labels") or {}
+        if containers_mod.BENCH_LABEL in labels:
+            continue                    # déclaré (plus bas) ou déjà signalé
+        if containers_mod.ANONYMOUS_LABEL in labels:
+            _other(row, row["name"],
+                   "anonymous volume: no mesh provenance (never deleted)")
+        else:
+            _other(row, row["name"],
+                   "no container references it; not declared disposable by the mesh")
+
+    previous: dict = {}
+    if db is not None:
+        try:
+            for line in storage.of(db).housekeeping.latest_by_path(host or None, "volume"):
+                if line.get("path"):
+                    previous[str(line["path"])] = line
+        except Exception:               # journal illisible : chaque épisode repart
+            previous = {}
+    stamps = runtime.volume_created([row["name"] for row in declared]) \
+        if declared and hasattr(runtime, "volume_created") else {}
+    if stamps is None:                  # inspection illisible : aucune identité
+        stamps = {}
+    for row in declared:
+        name = row["name"]
+        base = {"kind": "volume", "path": name}
+        stamp = stamps.get(name)
+        if name not in free:
+            # Une référence suffit à fermer l'absence, même si l'inspection
+            # de CreatedAt échoue : elle ne doit pas préserver l'ancien délai.
+            if (previous.get(name) or {}).get("action") in _VOLUME_EPISODE_ACTIONS:
+                out["entries"].append(dict(
+                    base, action="referenced",
+                    detail="volume %s is referenced again: the absence episode is closed" % name,
+                    data={"created": stamp}))
+            continue
+        if stamp is None:
+            why = "declared disposable: creation identity unreadable: flagged only"
+            ours.append(dict(base, action="signalé", detail=why))
+            out["plan"].append(dict(base, action="signalé", detail=why))
+            continue
+        since = _volume_episode(previous.get(name), stamp)
+        if since is None:
+            since = now
+        absence = max(0.0, now - since)
+        if absence < idle:
+            detail = "declared disposable; no container for %s (under %s)" % (
+                fmt_idle(absence), fmt_idle(idle))
+            out["entries"].append(dict(base, action="waiting", detail=detail,
+                                       data={"created": stamp, "episode_since": since}))
+            ours.append(dict(base, action="attend", detail=detail))
+            continue
+        why = "declared disposable; no container for %s" % fmt_idle(absence)
+        out["plan"].append(dict(base, action="suppression", detail=why))
+        if dry_run:
+            ours.append(dict(base, action="suppression", detail=why))
+            continue
+        ok, error = runtime.remove_volume(name)
+        entry = dict(base, action="removed" if ok else "kept",
+                     detail=("%s: %s volume rm" % (why, binary)) if ok
+                     else "%s: deletion refused — %s" % (why, error),
+                     data={"created": stamp, "episode_since": since})
+        out["entries"].append(entry)
+        ours.append(entry)
+    out["ours"] = ours
+    out["others"] = others
+    out["others_total"] = others_total
+    return out
+
+
 def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
                 idle_after: float, now: float) -> str:
     """L219: why the pass keeps the temporary directory `path` of an agent
@@ -3007,7 +3292,63 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
-             runtime=None, artifact_scan: bool = True) -> dict:
+             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0) -> dict:
+    """One host pass across all runners and the CLI, without waiting.
+
+    Periodic callers share the last completed pass's timestamp, under the
+    same stable OS lock. An explicit or pressure-triggered pass bypasses the
+    interval; dry runs never postpone real cleanup. Nothing is cached about
+    whether a path may be deleted.
+    """
+    from .platform import session_lock
+
+    def skipped(reason):
+        # #2173: a pass that did not run must not read as executed. The
+        # dedicated `status` lets the report (and `--json`) tell a skipped
+        # pass from an empty one, without touching the lock itself.
+        return {"host": host, "dry_run": dry_run, "status": "skipped",
+                "entries": [], "plan": [], "skipped": [reason], "orphans": [],
+                "measure": None}
+
+    lock = session_lock.try_lock(os.path.join(cfg.state_dir, MANAGED_DIR), "host-pass")
+    if lock is None:
+        return skipped("another housekeeping pass is running on this host")
+    try:
+        tick = time.time() if now is None else float(now)
+        key = mesh_key(cfg)
+        try:
+            lock.seek(0)
+            completed_passes = json.loads(lock.read())
+            if not isinstance(completed_passes, dict):
+                completed_passes = {}
+        except ValueError:
+            completed_passes = {}
+        if min_interval_s > 0:
+            try:
+                elapsed = tick - float(completed_passes[key])
+            except (KeyError, TypeError, ValueError):  # new or interrupted timestamp
+                elapsed = -1.0
+            if 0 <= elapsed < min_interval_s:
+                return skipped("housekeeping already ran on this host less than %gs ago"
+                               % min_interval_s)
+        report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
+                           busy=busy, agents_in_turn=agents_in_turn, now=now,
+                           runtime=runtime, artifact_scan=artifact_scan)
+        if not dry_run and not report.get("disabled"):
+            completed_passes[key] = time.time() if now is None else float(now)
+            lock.seek(0)
+            lock.truncate()
+            lock.write(json.dumps(completed_passes).encode("ascii"))
+            lock.flush()
+        return report
+    finally:
+        lock.close()
+
+
+def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
+              busy: bool = False, agents_in_turn: set | None = None,
+              now: float | None = None,
+              runtime=None, artifact_scan: bool = True) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
@@ -3021,6 +3362,11 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       poussé et qu'aucun agent ne l'utilise ;
     * L230: regenerable build dirs of idle worktrees (`build_artifacts`),
       when `artifact_scan` (the runner: at most every `SCAN_EVERY_S`);
+    * conteneurs des tours d'ameesh finis (L73, `reap_containers`) ;
+    * volumes Docker sans conteneur (L73/#2003, `reap_volumes`) : ceux que le
+      mesh a déclarés jetables (`ameesh.bench=disposable`) sont récoltés après
+      `docker_volume_idle` d'absence continue, les autres signalés avec leur
+      commande, jamais supprimés ;
     * entrées de /tmp signalées pendant un tour : jamais supprimées si non
       attribuées (#222) ; un signalement attribué d'avant #222, supprimé si
       abandonné (garde-fous de `_orphan_verdict`, L162) ; sinon dites avec la
@@ -3041,9 +3387,11 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     registered: set[str] = set()
     protected: set[str] = set()
     cwd_of: dict[str, str] = {}
+    agent_rows: list[dict] = []
     running: set[str] = set(agents_in_turn)
     try:
-        for row in storage.of(db).operations.listing():
+        agent_rows = list(storage.of(db).operations.listing())
+        for row in agent_rows:
             registered.add(row["name"])
             if row.get("cwd"):
                 protected.add(os.path.abspath(os.path.expanduser(row["cwd"])))
@@ -3202,6 +3550,15 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         # sans registre, ni dossiers d'agents ni tours en cours connus
         skipped.append("worktrees: registry unreadable, no removal")
     elif policy.worktrees:
+        if artifact_scan:
+            from . import housekeeping_discovery
+            local = {row["name"]: row["cwd"] for row in agent_rows
+                     if row.get("host") == host and row.get("cwd")}
+            found = housekeeping_discovery.discover(
+                db, host, local, policy.worktree_roots, dry_run=dry_run)
+            entries += found["entries"]
+            plan += found["plan"]
+            skipped += found["skipped"]
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              protected=protected, now=now, running=running,
                                              artifacts=policy.artifacts,
@@ -3227,6 +3584,13 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
+    # 4b. #2003 : volumes Docker sans conteneur — ceux que le mesh a déclarés
+    #     jetables (`ameesh.bench=disposable`, banc de lot) récoltés après
+    #     `docker_volume_idle` d'absence continue ; les autres signalés,
+    #     jamais supprimés
+    volumes = reap_volumes(runtime, db, host, policy, dry_run=dry_run, now=now)
+    entries += volumes["entries"]
+    plan += volumes["plan"]
     # 5. /tmp entries signaled during a turn (L162): unattributed ones are
     #    never deleted (#222), an attributed one (before #222) is deleted once
     #    abandoned (`_orphan_verdict` guards), the others are told
@@ -3253,6 +3617,9 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     report_measure["containers"] = {
         "ameesh": conteneurs["ameesh"], "others": conteneurs["others"],
         "others_total": conteneurs["others_total"]}
+    report_measure["volumes"] = {
+        "ameesh": volumes["ours"], "others": volumes["others"],
+        "others_total": volumes["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
     if not dry_run:
@@ -3265,6 +3632,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     return {"host": host, "dry_run": dry_run, "entries": entries, "plan": plan,
             "skipped": skipped, "orphans": orphans, "measure": report_measure,
             "containers": report_measure["containers"],
+            "volumes": report_measure["volumes"],
             "policy": policy.as_dict()}
 
 
@@ -3303,8 +3671,15 @@ def _fmt(value) -> str:
 
 
 def print_report(report: dict) -> None:
-    mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
-        else "executed"
+    # #2173: a pass skipped by the host lock ran nothing; it must not print
+    # "executed" (nor "nothing to do": the concurrent pass is doing the work).
+    skipped_pass = report.get("status") == "skipped"
+    if skipped_pass:
+        reason = next(iter(report.get("skipped") or ()), "")
+        mode = "skipped" + (" — %s" % reason if reason else "")
+    else:
+        mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
+            else "executed"
     print("housekeeping of %s — %s" % (report["host"] or "?", mode))
     m = report.get("measure") or {}
     if m:
@@ -3322,27 +3697,42 @@ def print_report(report: dict) -> None:
     # en essai, les entrées de /tmp ont leur propre section (avec la commande)
     rows = [p for p in report["plan"] if p.get("kind") != "orphan"] if report["dry_run"] \
         else [e for e in report["entries"] if e["kind"] != "mesure"]
-    if not rows:
+    if not rows and not skipped_pass:
         print("  nothing to do")
     for row in rows:
         print("  %-9s %-12s %-10s %s%s" % (
             row.get("kind", ""), action_label(row.get("action", "")),
             _fmt(row["bytes"]) if row.get("bytes") is not None else "",
             row.get("path", ""), " — %s" % row["detail"] if row.get("detail") else ""))
-    for note in report.get("skipped") or ():
-        print("  skipped   %s" % note)
+    if not skipped_pass:  # #2173: the reason is already in the banner, once
+        for note in report.get("skipped") or ():
+            print("  skipped   %s" % note)
     conteneurs = report.get("containers") or {}
+    volumes = report.get("volumes") or {}
     docker = (report.get("measure") or {}).get("docker_storage")
     if docker:
-        print("  Docker storage (reported only, cleanup requires owner approval): "
+        print("  Docker storage (orphan count reported; only volumes this mesh DECLARED "
+              "DISPOSABLE are reaped, after a measured idle delay): "
               "%s orphan volumes; %s private reclaimable build cache" % (
                   docker.get("orphan_volumes"), _fmt(docker.get("build_cache_reclaimable_bytes"))))
+        if docker.get("build_cache_unsupported"):
+            print("    build cache not measured: the docker buildx plugin is absent "
+                  "(finding, not an alert)")
         for error in docker.get("errors") or ():
             print("    %s" % error)
     for c in conteneurs.get("ameesh") or ():
         if c["action"] != "suppression":
             print("  container %-12s %s — %s" % (action_label(c["action"]), c["path"],
                                                  c.get("detail") or ""))
+    vus = {row.get("path") for row in rows}
+    for v in volumes.get("ameesh") or ():
+        # les états déjà listés dans `plan` (essai) ou `entries` (réalisation)
+        # ne sont pas répétés ici : la section dit ce qui reste (attente,
+        # signalement sans suppression)
+        if v["path"] in vus:
+            continue
+        print("  volume %-12s %s — %s" % (action_label(v["action"]), v["path"],
+                                          v.get("detail") or ""))
     autres = conteneurs.get("others") or []
     if autres:
         print("  containers not started by an ameesh turn (never deleted by ameesh):")
@@ -3352,6 +3742,16 @@ def print_report(report: dict) -> None:
     reste = (conteneurs.get("others_total") or len(autres)) - len(autres)
     if reste > 0:
         print("    … %d more not listed (report bounded to %d)" % (reste, OTHERS_TOP))
+    volumes_autres = volumes.get("others") or []
+    if volumes_autres:
+        print("  Docker volumes without a container, not declared disposable by this mesh "
+              "(never deleted by ameesh):")
+        for v in volumes_autres:
+            print("    %s  (%s)  →  %s" % (v.get("path"), v.get("detail") or "?",
+                                           v.get("command") or ""))
+        reste = (volumes.get("others_total") or len(volumes_autres)) - len(volumes_autres)
+        if reste > 0:
+            print("    … %d more not listed (report bounded to %d)" % (reste, VOLUMES_TOP))
     orphans = report.get("orphans") or []
     if orphans:
         print("  /tmp entries that appeared during a turn (never deleted by ameesh, except an "
