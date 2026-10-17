@@ -162,3 +162,31 @@ button:disabled {
   color: var(--approve);
   font-weight: 600;
 }
+
+/* défi de connexion (L232d) : la vue privée n'apparaît qu'après assertion */
+.private {
+  border: 2px solid var(--warn);
+  border-radius: 8px;
+  background: var(--code-bg);
+  padding: 0.25rem 1rem 1rem;
+  margin: 1rem 0;
+}
+
+.private h2 {
+  color: var(--warn);
+  text-transform: uppercase;
+}
+
+.private code {
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+ol.steps {
+  padding-left: 1.25rem;
+}
+
+ol.steps li {
+  margin: 0.35rem 0;
+}

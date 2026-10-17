@@ -126,10 +126,13 @@ class Housekeeping(interface.Housekeeping):
             clauses.append("status IN (SELECT jsonb_array_elements_text(%s::jsonb))")
             params.append(json.dumps(list(statuses)))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        params.append(int(limit))
+        bound = ""
+        if limit is not None:
+            bound = " LIMIT %s"
+            params.append(int(limit))
         return self.db.query(
             "SELECT " + WORKTREE_COLUMNS + " FROM managed_worktrees" + where +
-            " ORDER BY created_at, id LIMIT %s", tuple(params))
+            " ORDER BY created_at, id" + bound, tuple(params))
 
     def set_worktree_status(self, worktree_id, status, detail) -> dict | None:
         rows = self.db.query(
