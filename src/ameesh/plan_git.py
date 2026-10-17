@@ -861,9 +861,11 @@ CLAUSE_SPLIT_RE = re.compile(r"[;/|—–]|\s+-\s+|\(|\)|,")
 #: #2259 : mots qui nient les `#<id>` de leur proposition — « recomposition
 #: sans #598 » (commit 84c68e9d4, Nexlink) désignait #598 et fermait son lot
 #: alors que sa PR était ouverte et sa tête hors de la cible. Une préposition
-#: ne nie que ce qui la suit (« #2221 sans #598 » garde 2221) ; un participe
-#: nie toute la proposition (« #598 retiré », « (#598) exclu »).
-PREFIX_NEGATED_REF_RE = re.compile(r"\b(?:sans|ni|hors|without)\b", re.IGNORECASE)
+#: ne nie que ce qui la suit (« #2221 sans #598 » garde 2221, « sauf #598 »
+#: exclut 598) ; un participe nie toute la proposition (« #598 retiré »,
+#: « (#598) exclu »).
+PREFIX_NEGATED_REF_RE = re.compile(r"\b(?:sans|sauf|ni|hors|without|except)\b",
+                                   re.IGNORECASE)
 POSTFIX_NEGATED_REF_RE = re.compile(
     r"\b(?:retir[ée]e?s?|exclue?s?|exclu[ea]nt|reverts?|reverted)\b",
     re.IGNORECASE)

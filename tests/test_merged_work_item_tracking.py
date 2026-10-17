@@ -811,6 +811,8 @@ class MergeSweepTest(_Base):
             "Merge #12 sans #13": {12: "#id"},
             "Merge #12 without #13": {12: "#id"},
             "Merge #12 hors #13": {12: "#id"},
+            "paquet : tout sauf #12": {},
+            "Merge #12 except #13": {12: "#id"},
             "Merge x\n\nameesh-work: #12\n  ameesh-work: 13": {12: "ameesh-work",
                                                                13: "ameesh-work"},
             "Merge x\n\nvoir ameesh-work: 14 plus tard": {},
