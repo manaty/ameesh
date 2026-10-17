@@ -4,7 +4,7 @@ builds) on a lending VM instead of the workstation (lot L159b, mode b1 of the
 L159 study).
 
   ameesh offload run [--host H] [--profile P] [--repo NAME] [--timeout S]
-        [--env K=V]... [--fallback local|none] -- <command...>
+        [--snapshot SHA] [--env K=V]... [--fallback local|none] -- <command...>
   ameesh offload status [--host H] [<job>]
   ameesh offload cancel [--host H] <job>
 
@@ -17,6 +17,12 @@ L159 study).
    lack;
 3. runs the command there, in a throwaway checkout of the snapshot, in the
    same subdirectory. Output and exit code come back unchanged.
+
+`--snapshot SHA` fige le contenu envoyé : le commit donné (déjà présent ici)
+part tel quel au lieu d'une photographie de l'arbre de travail. Un appelant
+qui doit garantir le contenu exécuté — la prévalidation du gel (#1770) — le
+construit avec `snapshot_with()` puis le nomme, au lieu de dépendre de l'état
+local (fichiers non suivis, flags `assume-unchanged`/`skip-worktree`).
 
 The host is `--host` or `AMEESH_OFFLOAD_HOST` (an SSH destination, an alias
 of ~/.ssh/config being the simplest). Without a host, when the VM is
@@ -101,6 +107,29 @@ def snapshot(top: str) -> str:
         tree = _git(top, *full, "write-tree", env=env)
     # no parent: the history (a secret deleted since, or now ignored) never
     # travels; fixed date: the same tree always gives the same snapshot
+    env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
+               **SNAP_ENV)
+    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env)
+
+
+def snapshot_with(top: str, commit: str, files: dict[str, str]) -> str:
+    """Commit id de l'arbre de `commit` plus `files` (chemin dépôt -> contenu).
+
+    Même identité que `snapshot()` : aucun parent, mêmes auteur et dates figés,
+    donc le même commit pour le même contenu. Là où `snapshot()` photographie
+    l'arbre de travail, celle-ci **construit** l'arbre voulu : un appelant qui
+    doit garantir ce qui part sur la VM (prévalidation du gel, #1770) calcule
+    ici « SHA candidat + ses propres fichiers » puis le passe à
+    `run --snapshot`. Rien de l'état local ne peut s'y glisser — ni fichier non
+    suivi, ni flag `assume-unchanged`/`skip-worktree` que `git status` masque."""
+    with tempfile.TemporaryDirectory(prefix="ameesh-offload-") as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"), **SNAP_ENV)
+        _git(top, "read-tree", commit, env=env)
+        for rel, content in files.items():
+            blob = _git(top, "hash-object", "-w", "--stdin", env=env, input=content)
+            _git(top, "update-index", "--add", "--cacheinfo",
+                 "100644,%s,%s" % (blob, rel), env=env)
+        tree = _git(top, "write-tree", env=env)
     env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
                **SNAP_ENV)
     return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env)
@@ -303,7 +332,13 @@ def cmd_run(opts: dict, argv: list[str]) -> int:
         top = _git(os.getcwd(), "rev-parse", "--show-toplevel")
         rel = os.path.relpath(os.getcwd(), top)
         repo = opts["repo"] or repo_name(top)
-        snap = snapshot(top)
+        if opts.get("snapshot"):
+            # contenu figé par l'appelant : il doit exister ici, et c'est lui
+            # qui part — pas une photographie de l'arbre de travail
+            snap = opts["snapshot"]
+            _git(top, "cat-file", "-e", "%s^{commit}" % snap)
+        else:
+            snap = snapshot(top)
         remote = Remote(host)
         push(remote, top, repo, snap)
     except OffloadError as exc:
@@ -361,7 +396,7 @@ def cmd_cancel(host: str, args: list[str]) -> int:
 
 def parse(args: list[str]) -> tuple[dict, list[str]]:
     opts = {"host": os.environ.get("AMEESH_OFFLOAD_HOST", ""), "profile": "default",
-            "repo": "", "timeout": 0, "env": [], "fallback": "local"}
+            "repo": "", "timeout": 0, "env": [], "fallback": "local", "snapshot": ""}
     rest: list[str] = []
     i = 0
     while i < len(args):
@@ -369,7 +404,7 @@ def parse(args: list[str]) -> tuple[dict, list[str]]:
         if arg == "--":
             return opts, rest + args[i + 1:]
         key = arg[2:] if arg.startswith("--") else None
-        if key in ("host", "profile", "repo", "timeout", "env", "fallback"):
+        if key in ("host", "profile", "repo", "timeout", "env", "fallback", "snapshot"):
             if i + 1 >= len(args):
                 raise ValueError("%s needs a value" % arg)
             val = args[i + 1]
