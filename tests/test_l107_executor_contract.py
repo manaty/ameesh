@@ -105,13 +105,14 @@ class TableTest(unittest.TestCase):
         # contrat 1.2 : expiration médiée des fils (#499, threads.recount)
         # contrat 1.1 : + operations.assigned_open_lots (lot du tour, #476)
         #              + agents.runner_seen (preuve de vie, #508)
-        self.assertEqual(len(self.c.operations), 65)
+        # #897 : + agents.resolve_name (nom primaire résolu)
+        self.assertEqual(len(self.c.operations), 66)
         self.assertEqual(sum(o.write for o in ops), 40)
-        self.assertEqual(sum(not o.write for o in ops), 25)
+        self.assertEqual(sum(not o.write for o in ops), 26)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
         self.assertEqual(sorted(o.name for o in ops if o.session),
-                         ["mailbox.deliver", "mailbox.release", "mailbox.reserve",
+                         ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
                           "mailbox.unread", "threads.index", "threads.recount"])
         self.assertEqual(self.c.version, "1.2.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])

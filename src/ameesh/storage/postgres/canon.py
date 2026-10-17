@@ -202,7 +202,7 @@ class Canon(interface.Canon):
     def host_rows(self, host, names) -> list[dict]:
         sql = """
             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, projects,
-                   roles,
+                   roles, aliases,
                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
                    admitted_hosts, admitted_tags, memory_repository,
                    visibility_ok, visibility_diagnostic,
@@ -233,6 +233,7 @@ class Canon(interface.Canon):
         atags = _caps_param(values.get("admitted_tags"))
         projects = _caps_param(values.get("projects"))
         roles = _caps_param(values.get("roles"))
+        aliases = _caps_param(values.get("aliases"))
         rows = self.db.query(
             """
             __LOCK__
@@ -242,10 +243,10 @@ class Canon(interface.Canon):
                  priority, admitted_hosts, admitted_tags, memory_repository,
                  visibility_ok, visibility_diagnostic,
                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon,
-                 projects, roles)
+                 projects, roles, aliases)
             SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
-                   __PROJECTS__, __ROLES__
+                   __PROJECTS__, __ROLES__, __ALIASES__
               FROM l
             ON CONFLICT (name) DO UPDATE SET
                 harness         = excluded.harness,
@@ -257,6 +258,7 @@ class Canon(interface.Canon):
                 team            = excluded.team,
                 projects        = excluded.projects,
                 roles           = excluded.roles,
+                aliases         = excluded.aliases,
                 provider        = excluded.provider,
                 credential_mode = excluded.credential_mode,
                 capabilities    = excluded.capabilities,
@@ -286,6 +288,7 @@ class Canon(interface.Canon):
                .replace("__ATAGS__", _CAPS_SQL)
                .replace("__PROJECTS__", _CAPS_SQL)
                .replace("__ROLES__", _CAPS_SQL)
+               .replace("__ALIASES__", _CAPS_SQL)
                .replace("__PROFILE__", PROFILE_PARAMS_SQL),
             (name_lock_key(name),
              name, values["harness"], values["host"], values["cwd"], values["model"],
@@ -296,7 +299,7 @@ class Canon(interface.Canon):
              values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
             + profile_params(values) + (values.get("canon"), projects, projects,
-                                       roles, roles,
+                                       roles, roles, aliases, aliases,
                                        values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
         return bool(rows)
