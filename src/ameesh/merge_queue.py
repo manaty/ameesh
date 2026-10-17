@@ -421,6 +421,29 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     return tips[branch], where
 
 
+def target_tip(repo: str, target: str, clone=None) -> tuple[str | None, str]:
+    """(tip, repository holding it) of the target branch, read fresh
+    (`fetch_fresh`).
+
+    A target that origin no longer has raises QueueError at admission: without
+    it, the class was read from the clone's cached `QUEUE_REF` ref and a light
+    lot entered, only to be deferred at every pass (`run_pass`: target not
+    found) — no merge ever happened, but the queue said otherwise (#2278).
+    Without an `origin`, the repository's local branches are the only copy: a
+    missing local branch is a missing target too."""
+    if not target:
+        raise QueueError("no target branch known: the merge queue cannot admit a lot "
+                         "without a target (set the lot's target or the project's)")
+    tips, where = fetch_fresh(repo, [target], clone)
+    if tips[target] is None:
+        place = "origin" if where != repo else "the repository"
+        raise QueueError("target %s not found on %s: the merge queue refuses a lot whose "
+                         "target no longer exists (deleted or renamed). Push the target, point "
+                         "the lot at an existing branch, then ameesh work queue add the lot "
+                         "again" % (_remote_branch(target), place))
+    return tips[target], where
+
+
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
               commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
@@ -438,7 +461,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     absent) leaves the verdict requirement in place; the class and its reason
     are traced in the queue note. The target resolved here (`branch_target`,
     then the project's, then the repository's default) carries through the
-    classification and the admission (revue #544 r2).
+    classification and the admission (revue #544 r2), and must exist **fresh**
+    on origin: an absent target is refused here, not deferred at every pass
+    (#2278, `target_tip`).
 
     L756 (#566): a lot of class **release** must additionally certify its
     frozen head with a **full-suite** run — a push or a manual dispatch,
@@ -505,6 +530,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
+    # #2278 : la cible doit exister fraîchement, sinon `_class_of` relit la
+    # ref gardée dans le clone et admet le lot pour un report éternel.
+    target_tip(repo, target, clone)
     klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
     # #1374 : la même porte que le feu — avis comptés par classe, indépendants
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
