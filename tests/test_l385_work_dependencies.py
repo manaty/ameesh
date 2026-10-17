@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import threading
 import time
 import unittest
@@ -582,12 +583,12 @@ class LandingTest(PgTestCase):
         today = datetime.date.today()
         for day, needle in (
                 (today - datetime.timedelta(days=1), "already past"),
-                (today + datetime.timedelta(days=dependencies.LANDING_MAX_DAYS + 1), "too far")):
+                (today + datetime.timedelta(days=dependencies.DEFAULT_MAX_DAYS + 1), "too far")):
             self.assertIn(needle, self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
                                            "--until", day.isoformat(), ok=False).stderr)
         # la borne haute exacte est admise
         self.cli(str(self.waiting), "--vehicle", str(self.vehicle), "--until",
-                 (today + datetime.timedelta(days=dependencies.LANDING_MAX_DAYS)).isoformat())
+                 (today + datetime.timedelta(days=dependencies.DEFAULT_MAX_DAYS)).isoformat())
 
     def test_new_unreviewed_freeze_before_landing_is_rejected_atomically(self):
         transaction = self.db.transaction
@@ -650,9 +651,23 @@ class ResolverTest(unittest.TestCase):
         """#2171 N4 : ni un jour passé, ni une échéance invraisemblable."""
         today = datetime.date.today()
         for day in ((today - datetime.timedelta(days=1)).isoformat(),
-                    (today + datetime.timedelta(days=dependencies.LANDING_MAX_DAYS + 1)).isoformat()):
+                    (today + datetime.timedelta(days=dependencies.DEFAULT_MAX_DAYS + 1)).isoformat()):
             with self.assertRaises(work.WorkError):
                 dependencies.land(None, 1, 2, until_on=day, actor="test")
+
+    def test_landing_term_is_an_operating_parameter_not_a_canon_rule(self):
+        """#2171 N4 : le terme vient de `AMEESH_LANDING_MAX_DAYS` (§7)."""
+        self.assertEqual(dependencies.max_days({}), dependencies.DEFAULT_MAX_DAYS)
+        self.assertEqual(dependencies.max_days(
+            {dependencies.LANDING_MAX_ENV: "7"}), 7)
+        for raw in ("0", "-1", "soon"):
+            with self.assertRaises(work.WorkError):
+                dependencies.max_days({dependencies.LANDING_MAX_ENV: raw})
+        today = datetime.date.today()
+        with mock.patch.dict(os.environ, {dependencies.LANDING_MAX_ENV: "7"}):
+            with self.assertRaisesRegex(work.WorkError, "at most 7 days ahead"):
+                dependencies.land(None, 1, 2, actor="test",
+                                  until_on=(today + datetime.timedelta(days=8)).isoformat())
 
     def test_landing_head_breaks_freeze_ties_on_id_not_reading_order(self):
         """#2171 N2 : même (at, id) maximal que set_landing, quel que soit l'ordre."""

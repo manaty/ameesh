@@ -48,7 +48,8 @@ A lot is stale when it is open and inactive beyond the configured threshold
   later leaves `qa` (rework, blocked, waiting for a human), the declared
   landing stops deferring the alert — it only replaces the merge wait. The
   deadline is a short, finite day: `--until`
-  must be today or later and at most 90 days ahead (`LANDING_MAX_DAYS`),
+  must be today or later and at most `AMEESH_LANDING_MAX_DAYS` ahead
+  (an operating bound, 90 days by default, like `AMEESH_STALE_AFTER`),
   refused otherwise.
   While the vehicle is open, not `blocked`, its last freeze is exactly that
   pinned head **and** the day is not past (its day counts in full, like a

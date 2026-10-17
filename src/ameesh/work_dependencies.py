@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 
 from . import storage, work
 
@@ -52,7 +53,28 @@ def grouped(db, item_ids):
 
 #: #2171 N4 : une déclaration reste une échéance courte et finie. Une borne
 #: haute empêche un `--until 2099-12-31` de parquer un lot sans terme crédible.
-LANDING_MAX_DAYS = 90
+#: C'est un terme d'EXPLOITATION, pas une règle de processus neuve : le défaut
+#: est réglable par `AMEESH_LANDING_MAX_DAYS`, comme le seuil stale
+#: (`AMEESH_STALE_AFTER`, `stagnation.py`). Le canon §7 refuse un paramètre
+#: mécanique codé en dur ; le geste lit donc son terme dans l'environnement.
+DEFAULT_MAX_DAYS = 90
+LANDING_MAX_ENV = "AMEESH_LANDING_MAX_DAYS"
+
+
+def max_days(env=None):
+    """Le terme maximal d'une déclaration, en jours : env, sinon 90."""
+    env = os.environ if env is None else env
+    raw = (env.get(LANDING_MAX_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_DAYS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise work.WorkError("unreadable %s: %r (whole days ahead)"
+                             % (LANDING_MAX_ENV, raw))
+    if value <= 0:
+        raise work.WorkError("%s must be positive" % LANDING_MAX_ENV)
+    return value
 
 
 def _require_frozen_with_verdict(db, item_id):
@@ -106,9 +128,10 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
     if day < today:
         raise work.WorkError("--until %s is already past: the deadline must be "
                              "today or later" % day.isoformat())
-    if (day - today).days > LANDING_MAX_DAYS:
+    limit = max_days()
+    if (day - today).days > limit:
         raise work.WorkError("--until %s is too far: at most %d days ahead"
-                             % (day.isoformat(), LANDING_MAX_DAYS))
+                             % (day.isoformat(), limit))
     with db.transaction() as tx:
         result = storage.of(tx).work_dependencies.set_landing(
             item_id, vehicle_id, until_on=day.isoformat(), actor=actor)
