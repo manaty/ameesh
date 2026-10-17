@@ -243,7 +243,7 @@ jobs:
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #2175 : l'assemblage d'une carte complète (10 parts) coûte ~11 min à 100 % CPU
     # localement ; à 15 min il a été annulé à 15m20 au run 38985327391 alors que les
-    # 10 parts étaient vertes, rendant une carte partielle. Plafond porté à 30 min,
+    # 10 parts étaient vertes, sans publier de carte. Plafond porté à 30 min,
     # sous la borne de 60 de #755 ; matrice 6/4 et plafond 40 min des mesures inchangés.
     timeout-minutes: 30
     steps:
