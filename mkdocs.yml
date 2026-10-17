@@ -110,6 +110,7 @@ nav:
       - Budgets and cost: concepts/budgets.md
   - Guides:
       - guides/index.md
+      - Install on a workstation: guides/install.md
       - Write a canon: guides/write-a-canon.md
       - Run the demo: guides/run-the-demo.md
       - Switch from a v0 setup: guides/switch-from-v0.md

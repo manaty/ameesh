@@ -25,14 +25,14 @@ class ProofHelperTest(unittest.TestCase):
             with self.subTest(fields=fields), mock.patch.object(it, "prove") as prove:
                 with self.assertRaisesRegex(ValueError, "execution inputs only"):
                     proof_service.produce(mock.Mock(), dict(self.payload(), **fields),
-                                          actor="uid:1000", execution_user="worker")
+                                          invoker="uid:1000", execution_user="worker")
                 prove.assert_not_called()
 
     def test_unapproved_runner_cannot_turn_true_into_execution_evidence(self):
         with mock.patch.object(it, "prove") as prove:
             with self.assertRaisesRegex(ValueError, "not approved"):
                 proof_service.produce(mock.Mock(), dict(self.payload(), runner="/bin/true"),
-                                      actor="uid:1000", execution_user="worker",
+                                      invoker="uid:1000", execution_user="worker",
                                       allowed_runners=["/usr/bin/python3"])
         prove.assert_not_called()
 
@@ -40,14 +40,17 @@ class ProofHelperTest(unittest.TestCase):
         with mock.patch.object(it, "item", return_value={"app": "other"}), \
                 mock.patch.object(it, "prove") as prove:
             with self.assertRaisesRegex(ValueError, "does not own"):
-                proof_service.produce(mock.Mock(), self.payload(), actor="uid:1000", execution_user="worker")
+                proof_service.produce(mock.Mock(), self.payload(), invoker="uid:1000", execution_user="worker")
             prove.assert_not_called()
+        db = mock.Mock()
+        db.query.return_value = []          # no QA policy installed: the legacy proof stays allowed
         with mock.patch.object(it, "item", return_value={"app": "acme"}), \
                 mock.patch.object(it, "prove", return_value={"id": 17}) as prove:
-            result = proof_service.produce(mock.Mock(), self.payload(), actor="uid:1000", execution_user="worker")
+            result = proof_service.produce(db, self.payload(), invoker="uid:1000", execution_user="worker")
         self.assertEqual(result, {"id": 17})
         prove.assert_called_once_with(mock.ANY, 1, "/artifact", actor="uid:1000", runner=None,
-                                      arguments=[], timeout=60., execution_user="worker", snapshot_root=None, snapshot_limits=None)
+                                      arguments=[], timeout=60., execution_user="worker", snapshot_root=None,
+                                      snapshot_limits=None, identity=None, invoker="uid:1000")
 
     def test_cli_uses_fixed_privileged_entry_without_evidence_or_config_arguments(self):
         process = mock.Mock(returncode=0, stdout=json.dumps({"milestone": {"id": 17}}))

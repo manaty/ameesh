@@ -23,7 +23,7 @@ import unicodedata
 import uuid
 from typing import Any, Sequence
 
-from . import fil, storage
+from . import fastmail, fil, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import mailbox as _pg
@@ -82,6 +82,14 @@ def send(
         signed_payload=signed_payload, nonce=nonce, created_us=created_us,
         expires_us=expires_us)
     message_id = int(row["id"])
+    # #1689 (N1) : tout dépôt local réveille le chemin rapide du destinataire
+    # (#1604), pas seulement `mail send` : approbations, exécuteur, veille,
+    # notifications système passent aussi par ici. Le marqueur ne se crée
+    # jamais : un destinataire d'un autre hôte, ou jamais vu sur celui-ci, n'a
+    # pas de chemin rapide à invalider et reste lu par les événements complets.
+    cfg = getattr(db, "cfg", None)
+    if cfg is not None:
+        fastmail.bump(cfg, recipient)
     if thread:
         # Le message est déposé : à partir d'ici, rien ne doit le faire perdre
         # (fil.record ne lève jamais).
@@ -131,6 +139,21 @@ def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dic
 def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     """Messages non remis marqués `payload.urgent` (interruption de tour, 0018)."""
     return storage.of(db).mailbox.unread_urgent(recipient, limit)
+
+
+def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
+    """L514/#885 : les non-lus qu'une remise mi-tour peut livrer — verdict,
+    arbitrage, message d'un humain, urgent (`mid_turn`) —, filtrés DANS la
+    requête : un verdict derrière plus de `UNREAD_LIMIT` non-lus est vu.
+
+    Chemin médié : `mailbox.unread_mid_turn` n'est pas dans le contrat 1.1, il
+    lit `mailbox.unread` (admis) et filtre ici, comme `unread_active` — au plus
+    les `UNREAD_LIMIT` premiers non-lus, la limite du contrat."""
+    st = storage.of(db)
+    if getattr(st, "driver", None) == "mediated":
+        rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
+        return [row for row in rows if mid_turn(row)][:int(limit)]
+    return st.mailbox.unread_mid_turn(recipient, limit)
 
 
 def get(db: Db, message_id: int) -> dict | None:
@@ -430,6 +453,21 @@ def passive_reason(row: Any) -> str:
 def is_human(row: Any) -> bool:
     """L125 : message d'un humain, marqué à l'envoi — il réveille tout de suite."""
     return bool(_payload(row).get("human"))
+
+
+#: L514: payload keys of a message the sender marked as a review verdict
+#: (`agent-mail send --verdict`) or an arbitration (`--arbitration`)
+MID_TURN_KEYS = ("verdict", "arbitration")
+
+
+def mid_turn(row: Any) -> bool:
+    """L514: delivered DURING a dsh or codex turn, at its next safe point
+    (PostToolUse hook): a verdict, an arbitration, a human's message (a
+    decision answer included) or an urgent one. Anything else waits for the
+    end of the turn (L125)."""
+    payload = _payload(row)
+    return bool(payload.get("urgent") or payload.get("human")
+                or any(payload.get(key) for key in MID_TURN_KEYS))
 
 
 def passive_label(row: Any) -> str:

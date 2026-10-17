@@ -15,7 +15,7 @@ import time
 import unittest
 
 from ameesh import db as db_mod
-from ameesh import storage
+from ameesh import registry, storage
 from ameesh.mediated_executor import contract as C
 from ameesh.mediated_executor import events as E
 from ameesh.storage.remote import RemoteDb, RemoteStorage, RemoteSubscription
@@ -109,6 +109,23 @@ class EnveloppeDeBailTest(unittest.TestCase):
         self.assertFalse(storage.of(db).pending_spend.clear("inge-front"))
         self.assertEqual(storage.of(db).mailbox.release("inge-front", "tok", [1]), 0)
         self.assertEqual(transport.calls, [], "aucun appel réseau sans bail détenu")
+
+    def test_capture_marqueur_medie_garde_les_operations_fencees(self):
+        responder = Responder()
+        db = make_db(GoldenTransport(responder))
+        responder.script["pending_spend.put"] = True
+        responder.script["pending_spend.get"] = {
+            "agent": "inge-front", "start_index": 7, "turn": "tour",
+            "model": "m", "created_ts": 123.0,
+        }
+        # A refused write must never read and adopt an existing marker.
+        self.assertIsNone(registry.pending_spend_begin(db, "inge-front", 7, "tour", "m"))
+        self.assertEqual(responder.ops(), [])
+        db.book.hold("inge-front", OWNER, 42)
+        marker = registry.pending_spend_begin(db, "inge-front", 7, "tour", "m")
+        self.assertEqual((marker["start"], marker["created_ts"]), (7, 123.0))
+        self.assertEqual(responder.ops(), ["pending_spend.put", "pending_spend.get"])
+        self.assertEqual(responder.calls[0][1]["fence"]["epoch"], 42)
 
     def test_bail_perdu_valeur_de_refus_et_carnet_vide(self):
         responder = Responder()

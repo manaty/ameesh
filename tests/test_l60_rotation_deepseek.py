@@ -148,11 +148,11 @@ class GrandLivreDeepSeekTest(_Base):
         vrai_clear = registry.pending_spend_clear
         appels = []
 
-        def clear_en_panne(db, name):
+        def clear_en_panne(db, name, *reste):
             appels.append(name)
             if len(appels) == 1:
                 raise db_mod.DbError("connexion perdue après l'écriture")
-            return vrai_clear(db, name)
+            return vrai_clear(db, name, *reste)  # #1469 : effacement conditionnel
 
         with self._env(PETIT_TOUR), \
                 mock.patch.object(registry, "pending_spend_clear", clear_en_panne):

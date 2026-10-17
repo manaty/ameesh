@@ -91,7 +91,9 @@ class PaceCapTest(unittest.TestCase):
 
 
 class IntegratedReleaseTest(unittest.TestCase):
-    """#1112 : #777 conserve sa marge et libère au rythme du profil #1075."""
+    """#1112 : #777 conserve sa marge et libère au rythme du profil #1075.
+    #1028 N2 : la libération reste l'inverse exact du seuil pour toute réserve,
+    y compris sous `PACE_MARGIN` (le plancher mort de `free_at` est retiré)."""
 
     def test_reserve_floor_survives_multiplier(self):
         now = 1_800_000_000.0
@@ -103,12 +105,34 @@ class IntegratedReleaseTest(unittest.TestCase):
     def test_release_matches_threshold_for_every_multiplier(self):
         now = 1_800_000_000.0
         for multiplier in (0.5, 1.0, 2.0):
-            for reserve in (0.0, 0.1):
+            # 0.02 < PACE_MARGIN : le témoin du plancher sans effet (#1028 N2)
+            for reserve in (0.0, 0.02, 0.1):
                 for used in (0.1, 0.25, 0.7):
                     gauge = _gauge(used, now, elapsed=0.01)
                     free = gauge.free_at(now, reserve, multiplier)
-                    self.assertTrue(gauge.exceeded(free - 1, reserve, multiplier))
-                    self.assertFalse(gauge.exceeded(free + 1, reserve, multiplier))
+                    self.assertTrue(gauge.exceeded(free - 1, reserve, multiplier),
+                                    (multiplier, reserve, used, free))
+                    self.assertFalse(gauge.exceeded(free + 1, reserve, multiplier),
+                                     (multiplier, reserve, used, free))
+
+    def test_release_is_exact_when_the_reserve_is_under_the_margin(self):
+        """Témoin de la revue du paquet #1112, gardé par #1028 N2 : réserve
+        0.02, multiplicateur 2, 13 % utilisés à 2 % d'écoulé sur 7 jours. Le
+        seuil vaut 0.12 (bloqué) ; la libération réelle est à 2,5 % d'écoulé,
+        soit 0,84 h. Le plancher `max(share, PACE_MARGIN)` publiait 5 % — 
+        5,04 h, six fois trop tard."""
+        now = 1_800_000_000.0
+        window = 7 * 24 * HOUR
+        gauge = _gauge(0.13, now, elapsed=0.02, key="codex-10080min", window=window)
+        self.assertAlmostEqual(gauge.held_cap(now, 0.02, 2.0), 0.12)
+        self.assertTrue(gauge.exceeded(now, 0.02, 2.0))
+        free = gauge.free_at(now, 0.02, 2.0)
+        self.assertAlmostEqual(free - now, 0.005 * window, places=3)   # 0,84 h
+        self.assertTrue(gauge.exceeded(free - 1, 0.02, 2.0))
+        self.assertFalse(gauge.exceeded(free + 1, 0.02, 2.0))
+        # le seuil, lui, garde son plancher de début de fenêtre
+        self.assertAlmostEqual(_gauge(0.05, now, elapsed=0.01).held_cap(now, 0.02, 2.0),
+                               0.1)
 
     def test_ceiling_still_waits_for_reset(self):
         now = 1_800_000_000.0
@@ -217,6 +241,31 @@ class EvaluateTest(unittest.TestCase):
         # la part écoulée reste la vraie (10 %), seul le plafond vise plus haut
         self.assertIn("35% used with 10% of the window elapsed (pace cap 30%)", ev.reason)
         self.assertEqual(ev.held, ("codex-300min", 0.35))
+
+
+class ReportMultiplierTest(unittest.TestCase):
+    """#1028 P3 : `CostBook.report` affiche le plafond du compte actif, pas le
+    rythme nominal — le multiplicateur du profil lui est passé avec ses jauges
+    (`accounts.report`)."""
+
+    def setUp(self):
+        self.now = 1_800_000_000.0
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-1028-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        os.makedirs(os.path.join(self.tmp, "a1"))
+        self.book = cost.CostBook(state_dir=self.tmp, db=None, tools={"a1": "codex"},
+                                  clock=lambda: self.now)
+        self.gauge = _gauge(0.25, self.now, 0.10)
+
+    def test_le_plafond_affiche_suit_le_multiplicateur_du_compte_actif(self):
+        rows = self.book.report(accounts={"codex": ("primaire", [self.gauge])},
+                                multipliers={"codex": 2.0})
+        self.assertEqual((rows[0]["account"], rows[0]["harness"]), ("primaire", "codex"))
+        self.assertAlmostEqual(rows[0]["gauges"][0]["cap"], 0.30)
+
+    def test_sans_multiplicateur_le_rythme_reste_nominal(self):
+        rows = self.book.report(accounts={"codex": ("secondaire", [self.gauge])})
+        self.assertAlmostEqual(rows[0]["gauges"][0]["cap"], 0.20)
 
 
 if __name__ == "__main__":

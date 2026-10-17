@@ -111,6 +111,23 @@ def get(db: Db, name: str) -> dict | None:
     return storage.of(db).agents.get(name)
 
 
+def live_harness(row: dict | None) -> str:
+    """#1037 : le harnais de la session VIVANTE d'un agent.
+
+    `session_harness` (0384) est le harnais d'ouverture de la session active,
+    tenu égal à `session_origin` par déclencheur ; `harness`, lui, est
+    DÉCLARÉ (canon, `agent-runner register`, `adopt`) et ne dit pas sous
+    lequel la session tourne (L242b : harnais emprunté). Sans session ouverte
+    — origine inconnue — le harnais déclaré reste le seul connu.
+
+    C'est le harnais de la session courante. La porte §2 « autre famille de
+    modèle » ne l'utilise plus telle quelle : #1053/#1777 relit les tours du
+    gel (`review_lot._author_at_freeze`), qui seuls prouvent une famille
+    historique ; ce lecteur reste l'API du registre pour l'état courant."""
+    row = row or {}
+    return str(row.get("session_harness") or row.get("harness") or "")
+
+
 def overview(db: Db) -> list[dict]:
     """Vue d'observabilité (`mesh list --json`).
 
@@ -120,6 +137,11 @@ def overview(db: Db) -> list[dict]:
     réclamation liée au canon est remplie).
     """
     return storage.of(db).agents.overview()
+
+
+def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> None:
+    """Preuve de vie du runner, indépendante du bail (#508)."""
+    storage.of(db).agents.runner_seen(host, owner, names)
 
 
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
@@ -144,6 +166,29 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
         name, owner, ttl_seconds, require_responsible=_responsible_required(db))
 
 
+def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+    """Bail vivant et détenu par ce runner, AVEC la ligne lue au passage.
+
+    #811 : le hook a besoin des projets de l'agent (mono/multi) pour son
+    budget de remise (L61) ; la lecture du bail les ramène déjà (`state` porte
+    `projects`, `team`, `chantier`), le troisième élément évite une seconde
+    lecture du registre. `None` quand le backend ne les porte pas.
+    """
+    row = storage.of(db).leases.state(name)
+    if row is None:
+        return False, "agent %s not in the registry" % name, None
+    if row.get("status") == "stopped":
+        return False, "agent stopped", row
+    if (row.get("lease_owner") or "") != owner:
+        return False, "lease held by %s" % (row.get("lease_owner") or "nobody"), row
+    if int(row.get("lease_epoch") or 0) != int(epoch):
+        return (False, "epoch %s in the registry, %s in the session"
+                % (row.get("lease_epoch"), epoch), row)
+    if not row.get("live"):
+        return False, "lease expired", row
+    return True, "", row
+
+
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
     """Le bail est-il vivant et détenu par ce runner à cet epoch ?
 
@@ -151,18 +196,8 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     une session dont le bail a expiré ou a changé de main ne peut plus
     consommer le courrier de l'agent.
     """
-    row = storage.of(db).leases.state(name)
-    if row is None:
-        return False, "agent %s not in the registry" % name
-    if row.get("status") == "stopped":
-        return False, "agent stopped"
-    if (row.get("lease_owner") or "") != owner:
-        return False, "lease held by %s" % (row.get("lease_owner") or "nobody")
-    if int(row.get("lease_epoch") or 0) != int(epoch):
-        return False, "epoch %s in the registry, %s in the session" % (row.get("lease_epoch"), epoch)
-    if not row.get("live"):
-        return False, "lease expired"
-    return True, ""
+    ok, reason, _ = lease_agent(db, name, owner, epoch)
+    return ok, reason
 
 
 def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
@@ -274,6 +309,22 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     return storage.of(db).leases.clear_session(name, owner, epoch)
 
 
+def adopt_session_origin(db: Db, name: str, session_id: str, lot: str, owner: str,
+                         epoch: int, *, harness: str | None = None,
+                         cwd: str | None = None) -> bool:
+    """#1900 B1 : note l'origine d'une session sans origine, **fencé**.
+
+    Sous verrou de ligne et bail vivant (owner, epoch, échéance recontrôlée
+    après l'attente), et seulement si la ligne porte encore `session_id` et
+    `lot` : une session remplacée entre-temps (rotation, remplaçant, autre lot)
+    n'est jamais réécrite. N'écrit que l'origine, le dossier et le harnais.
+    Renvoie False si le bail n'est plus le nôtre, s'il a expiré pendant
+    l'attente du verrou, ou si la session/le lot ont changé.
+    """
+    return storage.of(db).leases.adopt_session_origin(
+        name, owner, epoch, session_id, lot, harness=harness, cwd=cwd)
+
+
 def record_session_history(db: Db, name: str, session_id: str,
                            account: str | None = None) -> None:
     """Record an accepted session after runner or hook session filtering."""
@@ -313,9 +364,37 @@ def release_hold(db: Db, name: str, owner: str, epoch: int, status_text: str,
 
 
 def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = None,
-                      model: str | None = None) -> bool:
-    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne."""
-    return storage.of(db).pending_spend.put(name, start_index, turn, model)
+                      model: str | None = None,
+                      work_item_id: int | str | None = None,
+                      turn_id: str | None = None) -> bool:
+    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne.
+
+    `work_item_id` (#796) : le lot du tour, écrit avec le marqueur pour que la
+    ligne du grand livre — y compris réparée par un autre worker — porte la
+    même attribution. `turn_id` : l'identifiant du tour
+    (`turn_resources.turn_id`), pour la même raison."""
+    return storage.of(db).pending_spend.put(name, start_index, turn, model, work_item_id,
+                                            turn_id)
+
+
+def pending_spend_begin(db: Db, name: str, start_index: int, turn: str | None = None,
+                        model: str | None = None,
+                        work_item_id: int | str | None = None,
+                        turn_id: str | None = None) -> dict | None:
+    """Write and capture one marker atomically on PostgreSQL (#1469).
+
+    The mediated backend keeps its fenced write; its operations are separate.
+    `work_item_id`/`turn_id` (#796) partent avec le marqueur, comme
+    `pending_spend_put`.
+    """
+    api = storage.of(db).pending_spend
+    if hasattr(api, "put_get"):
+        return _pending_spend_row(api.put_get(name, start_index, turn, model,
+                                              work_item_id=work_item_id,
+                                              turn_id=turn_id))
+    if not api.put(name, start_index, turn, model, work_item_id, turn_id):
+        return None
+    return pending_spend_get(db, name)
 
 
 def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
@@ -331,7 +410,10 @@ def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
 
 def pending_spend_get(db: Db, name: str) -> dict | None:
     """Le marqueur comptable en attente, ou None (aucun travail suspendu)."""
-    row = storage.of(db).pending_spend.get(name)
+    return _pending_spend_row(storage.of(db).pending_spend.get(name))
+
+
+def _pending_spend_row(row: dict | None) -> dict | None:
     if row is None:
         return None
     return {
@@ -340,11 +422,27 @@ def pending_spend_get(db: Db, name: str) -> dict | None:
         "turn": row.get("turn") or "",
         "model": row.get("model"),
         "created_ts": row.get("created_ts"),
+        # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
+        "work_item_id": row.get("work_item_id"),
+        # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
+        "turn_id": row.get("turn_id"),
     }
 
 
-def pending_spend_clear(db: Db, name: str) -> bool:
-    return storage.of(db).pending_spend.clear(name)
+def pending_spend_clear(db: Db, name: str, created_ts: float | None = None) -> bool:
+    """Efface le marqueur ; avec `created_ts` (#1469), seulement s'il est encore
+    celui de ce tour — un worker en retard n'efface pas celui de son remplaçant."""
+    api = storage.of(db).pending_spend
+    if created_ts is None:
+        return api.clear(name)
+    if hasattr(api, "clear_if"):
+        return api.clear_if(name, created_ts)
+    # backend médié : pas d'opération conditionnelle, le bail est fencé au serveur
+    row = api.get(name)
+    if row is None or row.get("created_ts") is None \
+            or abs(float(row["created_ts"]) - float(created_ts)) >= 0.0000005:
+        return False
+    return api.clear(name)
 
 
 def cwd_used(db: Db, cwd: str, exclude: str) -> bool:
@@ -392,7 +490,14 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         return False, "%s has no human owner (required with a canon)" % name, ""
     if not row.get("placement_admitted"):
         if row.get("placement_ok") is True:
-            why = "profile diverged since evaluation (next canon sync)"
+            # #1219 : nommer la divergence (profils évalué et courant) — le même
+            # diagnostic que `ameesh list`/`canon check`, au lieu d'un texte
+            # court qui cache la cause et promet un canon sync qui ne corrige
+            # pas une inscription qui re-divergera.
+            from .placement import recorded as _recorded  # import tardif : pas de cycle
+            verdict = (_recorded(db, row.get("host")) or {}).get(name) or {}
+            why = verdict.get("placement_diagnostic") or (
+                "profile diverged since evaluation (next canon sync)")
         else:
             why = row.get("placement_diagnostic") or (
                 "placement not evaluated" if row.get("placement_ok") is None
@@ -422,6 +527,13 @@ def wakeable(db: Db, cfg, name: str) -> tuple[bool, str]:
     momentanément invalide ne doit pas bloquer une attribution ; la
     réclamation, elle, reste fermée tant qu'il n'est pas `ok` (`claim`).
     `wake_status` rend en plus la remarque correspondante.
+
+    #1021 : la tenue budget/rythme n'entre pas ici — elle se juge là où la
+    garde de l'exécuteur la calcule (`account_turn.turn_hold`, sur la ligne du
+    registre et les comptes de l'hôte) et `work.check_assignee` la refuse :
+    un agent réveillable peut être en pause budget, et un lot ne doit pas lui
+    être confié pour autant. `resume`, lui, reste permis (c'est le geste de
+    reprise, la pause se lèvera d'elle-même).
     """
     ok, why, _note = wake_status(db, cfg, name)
     return ok, why

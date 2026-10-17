@@ -349,7 +349,12 @@ selected mode. See [Claude authentication](https://code.claude.com/docs/en/authe
 GitHub CLI normally uses a credential store, but can fall back to a plaintext
 file on a headless host. Preflight the intended storage and enforce a private
 account directory and permissions; never send `gh auth token` output to the
-report. See [GitHub CLI login](https://cli.github.com/manual/gh_auth_login).
+report. Run `gh auth setup-git` on the target host itself: it writes the
+absolute path of the `gh` binary that runs it, so a `~/.gitconfig` copied
+from another host (or a `gh` moved since) breaks every HTTPS credential
+while `gh auth status` stays healthy (incident #1063; repair in
+[COMPTES.md](../../COMPTES.md)). See
+[GitHub CLI login](https://cli.github.com/manual/gh_auth_login).
 
 The adapter is a supervised process with an expiry and a private output
 channel. Only allowlisted URL/code fields reach an authenticated, expiring

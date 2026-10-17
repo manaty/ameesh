@@ -203,7 +203,11 @@ local files). The lease is the only authorization to run.
   that hangs (lock, slow query) is cancelled by the server; the `psql` driver
   adds a client delay (the same + 5 s) that abandons the subprocess if the
   server no longer responds at all. Migrations, for their part, lift the timeout for
-  the duration of their transaction (`SET LOCAL statement_timeout = 0`).
+  the duration of their transaction (`SET LOCAL statement_timeout = 0`) and bound their
+  wait for a table lock (`SET LOCAL lock_timeout = 5 s`; a migration that must wait
+  longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
+  lock fails in seconds and stays pending, instead of holding every reader and writer
+  of the table behind it.
 * **Robust heartbeat** — a database outage during a turn does not leave the
   harness running without a lease: the heartbeat counts failures
   (`max(3, ttl/3)` second interval), and stops the process as soon as the
@@ -307,17 +311,22 @@ test (three messages → three notifications) caught the bug.
   renewed as long as the session lives, the harness is killed if the lease is lost, and
   the lease is returned on exit.
 * **Priority interrupt (0018, R19)**: an undelivered message marked
-  `payload.urgent` from an **authorized sender** (`AMEESH_INTERRUPT_SENDERS`
-  without canon; the "interrupt" capability of a canon card will be added) stops the
+  `payload.urgent` from an **authorized sender** stops the
   running turn (brief SIGTERM then SIGKILL), puts the turn's prompt back as
   pending, and `pick()` serves the priority message **first** on the next turn,
-  on the same session. An urgent message from an unauthorized sender interrupts nothing
+  on the same session. Authorized senders (#795): the owner (`human:*`) always;
+  `ameesh` only for an event **verified in the database** (the end of CI of one
+  of the agent's work items — the run is recorded, the lot is assigned to the
+  agent, and the mail is the one CI posted for that run), so an imitated
+  `--from ameesh` does not interrupt; agents declared in
+  `AMEESH_INTERRUPT_SENDERS` (the "interrupt" capability of a canon card will be
+  added). An urgent message from an unauthorized sender interrupts nothing
   (this is logged): it is delivered like a message — since L125, without
   waiting for the batching window; the thread keeps a record of
   the interruption and its reason.
 * **Session rotation (0018)**: when the session exceeds
   `AMEESH_SESSION_MAX_TOKENS` (default 150,000) or a turn lasted more than
-  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 900 s), after at least
+  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3,600 s), after at least
   `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**, a
   summary turn is played in the session, the summary is written to the thread
   (R12), the old session id is kept in
@@ -329,6 +338,12 @@ test (three messages → three notifications) caught the bug.
   within the bound, states the cut. An empty final answer (for Codex: the
   agent's last message empty) is not a summary: the rotation is
   cancelled, and the account cutover uses the deterministic brief (L39).
+  The latency threshold has a floor of **twice the effective turn cap**
+  (`turn_max_seconds`, the agent's own setting included): a turn allowed to
+  last 1,800 s does not, by itself, make the session be forgotten; a higher
+  explicitly configured threshold is kept, and with no turn cap
+  (`turn_max_seconds=0`) the configured threshold applies alone
+  ([EXPLOITATION.md](EXPLOITATION.md#plafonds-pendant-le-tour-l105)).
   The size is read
   from the usage in each harness's stream (keys normalized by
   `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
@@ -383,6 +398,20 @@ and the cap of 3 nudges, counted locally in
 `~/.local/state/agent-mesh/hooks/<nom>.stops`): a test compares the output of the
 v0 script and that of v1 for the four events.
 
+**Fast path of the hooks and the status line (#1604).** The `agent-mail`
+console script goes through `ameesh.entry`, which serves `statusline` and
+`hook <harness>` without importing `ameesh.cli` (database, psycopg). A local
+mailbox marker (`<state_dir>/mail/<agent>.json`) records the outcome of the
+last COMPLETE read: a `PostToolUse` hook skips the database only when the
+marker is fresh (`AMEESH_HOOK_FAST_TTL`, 15 s by default) and says there is
+nothing to deliver. `Stop`, `SessionStart` and `UserPromptSubmit` always go
+through the database; a local send (`send`, `forward`, `sweep`) invalidates the
+recipient's marker; the status line is cached for a few seconds
+(`AMEESH_STATUSLINE_TTL`, 5 s). The fast path delivers no mail and writes no
+registry: it cannot confuse an identity or a session, at worst it delays a
+delivery, which the next complete pass (at the latest the `Stop` hook) catches
+up.
+
 **Identity tied to the lease, never to the directory (mesh-design incident of 2026-10-09).**
 A session only has an identity if `AGENT_MAIL_NAME` is set; if
 `AMEESH_RUNNER_ID` and `AMEESH_LEASE_EPOCH` are set too (it is the
@@ -394,6 +423,16 @@ only a display name for the status bar and `whoami --cwd`
 (explicitly marked "diagnostic, non autoritaire" (diagnostic, not authoritative)). `send` then requires
 `--from`, `status` and `whoami` refuse, and `inbox <nom>` remains a read
 without consumption.
+
+**Git identity of a session (#834).** The runner sets the four variables
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and
+`GIT_COMMITTER_EMAIL` for every turn, and for an `attach` session, from the agent
+name of the lease (`<name>@ameesh.invalid`, the address the mediated device
+already uses). Git environment variables override configuration, so a repository
+whose `.git/config` is shared by all its worktrees can no longer attribute one
+agent's commit to another (incident of 2026-10-13, where a resumed session
+without these variables committed under the name of the agent that had written
+`user.name` first). No git configuration is read or written for this.
 
 **External sessions: explicit binding (L41, decision 0030).** An interactive
 session launched by a human has neither a lease nor `AGENT_MAIL_NAME`. It only has
@@ -437,7 +476,11 @@ registers an unknown agent as `externe`.
 the identity bound to the session, `whoami`); "all" skips stopped agents.
 Undeliverable mail raises the `mail_undeliverable` alert, and `ameesh
 mail forward <ancien> <nouveau>` re-delivers a dead mailbox to a live agent,
-keeping the original sender and date. Details:
+keeping the original sender and date. The executor's cleanup also sweeps dead
+mailboxes (`ameesh mail sweep`, L976): a stopped agent's mail goes to its bound
+successor, and mail nobody can read expires after `mail_dead_letter_days`
+(7 by default), with a thread trace — the alert clears without a human.
+Details:
 [EXPLOITATION.md](EXPLOITATION.md), "Courrier en souffrance" (undeliverable mail).
 
 **Hooks: write first, mark after.** The JSON is written to stdout and

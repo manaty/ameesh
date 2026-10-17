@@ -2,6 +2,7 @@
 """Explicit planned waits for lots (L368); never infer dependencies from prose."""
 from __future__ import annotations
 
+import datetime
 import re
 import time
 
@@ -9,6 +10,23 @@ from . import plan, storage
 
 _LOT = re.compile(r"^(?:(?:task|lot)\s*#?\s*|#)?([0-9]{1,18})$", re.I)
 _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
+#: external hold: the commitment names the gate it waits for (`gate:<name>`,
+#: or `external:<name>`), and holds the lot until the end of its due day.
+_GATE = re.compile(r"^(?:gate|external):(\S+)$", re.I)
+
+
+def hold_end(due_on):
+    """End of the due day (the day counts in full), or None without a date.
+
+    A hold always ends: past this instant the ordinary inactivity rule
+    applies again, like `engagement_overdue`, which also counts the due day
+    in full and only fires the next day.
+    """
+    try:
+        day = datetime.date.fromisoformat(str(due_on)[:10])
+        return plan.day_start_ts((day + datetime.timedelta(days=1)).isoformat())
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def ancestors(package_id, packages):
@@ -30,6 +48,11 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     (including descendants). Dependencies are an anchored numeric lot
     reference or an exact WorkPackage identifier. Unknown and self references
     cannot suppress an alert. Proposed/cancelled/done commitments are ignored.
+
+    An open commitment whose `depends_on` names an external gate
+    (`gate:<name>` or `external:<name>`) *holds* its lot until the end of the
+    commitment's due day: the gate is not a lot, so nothing else can release
+    it, and the date is what makes the hold end by itself.
     """
     open_ids = {int(r["id"]) for r in open_items
                 if r.get("state") not in ("merged", "promoted", "closed")}
@@ -40,6 +63,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         for package_id in ancestors(row.get("package_id"), packages):
             package_lots.setdefault(package_id, set()).add(int(row["id"]))
     direct, by_package = {}, {}
+    gate_item, gate_package = {}, {}
     for edge in dependencies:
         if edge.get("blocking"):
             direct.setdefault(int(edge["work_item_id"]), set()).add(int(edge["blocker_id"]))
@@ -47,10 +71,15 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         if commitment.get("status") != "open":
             continue
         blockers = set()
+        gate = None
         for reference in commitment.get("depends_on") or []:
             if not isinstance(reference, str):
                 continue
             reference = reference.strip()
+            match = _GATE.fullmatch(reference)
+            if match:
+                gate = gate or match[1]
+                continue
             match = _LOT.fullmatch(reference)
             if match:
                 blockers.update({int(match[1])} & open_ids)
@@ -61,6 +90,15 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
             direct.setdefault(int(commitment["work_item_id"]), set()).update(blockers)
         elif commitment.get("package_id"):
             by_package.setdefault(commitment["package_id"], set()).update(blockers)
+        end = hold_end(commitment.get("due_on")) if gate else None
+        if end is not None and now < end:
+            held = {"gate": gate, "until": str(commitment.get("due_on"))[:10]}
+            if commitment.get("id") is not None:
+                held["commitment"] = commitment["id"]
+            if commitment.get("work_item_id") is not None:
+                gate_item.setdefault(int(commitment["work_item_id"]), held)
+            elif commitment.get("package_id"):
+                gate_package.setdefault(commitment["package_id"], held)
     waits = {}
     for row in rows:
         ident = int(row["id"])
@@ -86,6 +124,15 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         blockers.discard(ident)
         if blockers:
             waits[ident] = {"what": "dependency", "lots": sorted(blockers)}
+            continue
+        held = gate_item.get(ident)
+        if held is None:
+            for package_id in ancestors(row.get("package_id"), packages):
+                held = gate_package.get(package_id)
+                if held:
+                    break
+        if held:
+            waits[ident] = dict(held, what="hold")
     return waits
 
 

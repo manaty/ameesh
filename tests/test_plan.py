@@ -164,6 +164,16 @@ class PlanUnitTest(unittest.TestCase):
         self.assertEqual(plan.package_status([{"state": "closed"}, {"state": "merged"}]),
                          "merged")
         self.assertEqual(plan.package_status([{"state": "merged"}, {"state": "build"}]), "open")
+        # #988 : un lot livré hors cible compte comme livré, pas comme abandonné
+        self.assertEqual(plan.item_unit_status("closed", "delivered"), "merged")
+        self.assertEqual(plan.item_unit_status("closed", "abandoned"), "abandoned")
+        self.assertEqual(
+            plan.package_status([{"state": "closed", "close_reason": "delivered"}]),
+            "merged")
+        self.assertEqual(
+            plan.package_status([{"state": "closed", "close_reason": "delivered"},
+                                 {"state": "closed", "close_reason": "superseded"}]),
+            "merged")
 
     def test_stagnation(self):
         now = 100_000.0
@@ -438,23 +448,40 @@ class GithubTest(_PlanDb):
         self.gh.state["prs"]["%s#5" % REPO] = {"state": "OPEN", "headRefName": "lot/cat-export"}
         dry = plan_github.sync_github(self.db, self.gh, REPO, dry_run=True)
         self.assertEqual(work.get(self.db, a["id"])["state"], "build")
+        dry_item = {r["work_item"]: r for r in dry["results"]}
         self.assertIn("would-merge", [r["result"] for r in dry["results"]])
+        # #759 : la PR ouverte #5 porte encore cat-export — le relevé à blanc le
+        # dit, sans rien écrire au journal.
+        self.assertEqual(dry_item[b["id"]]["result"], "stage-merged")
+        self.assertEqual([e for e in work.events(self.db, b["id"])
+                          if (e["note"] or "").startswith("stage merged")], [])
         report = plan_github.sync_github(self.db, self.gh, REPO)
         by_item = {r["work_item"]: r for r in report["results"]}
         self.assertEqual(by_item[a["id"]]["result"], "merged")
-        self.assertEqual(by_item[b["id"]]["result"], "merged")
+        self.assertEqual(by_item[b["id"]]["result"], "stage-merged")
+        self.assertIn("PR ouverte %s#5" % REPO, by_item[b["id"]]["detail"])
         self.assertEqual(by_item[d["id"]]["result"], "merged")
         self.assertEqual(by_item[c["id"]]["result"], "later")
         self.assertEqual(by_item[e["id"]]["result"], "refused")
         self.assertEqual(work.get(self.db, c["id"])["state"], "intake")
         self.assertEqual(work.get(self.db, e["id"])["state"], "closed")
+        # #759 : le lot multi-étapes reste ouvert, et le constat est au journal
+        self.assertEqual(work.get(self.db, b["id"])["state"], "intake")
+        self.assertEqual([e["note"] for e in work.events(self.db, b["id"])
+                          if (e["note"] or "").startswith("stage merged")],
+                         ["stage merged: PR ouverte %s#5 — lot non fermé" % REPO])
         ms = [m for m in work.milestones(self.db, a["id"]) if m["kind"] == "merged"][0]
         self.assertEqual((ms["sha"], ms["actor"]), (SHA, "github:alice"))
         self.assertEqual(work.get(self.db, a["id"])["pr_ref"], "%s#1" % REPO)
-        # idempotent ; et GitHub n'est que LU
+        # idempotent ; et GitHub n'est que LU (les PR ouvertes en REST paginé,
+        # exhaustives, #759)
         again = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual(again["merged"], 0)
-        self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()}, {"pr list"})
+        # #759 : un relevé répété ne répète pas le constat dans le journal
+        self.assertEqual(sum(1 for e in work.events(self.db, b["id"])
+                             if (e["note"] or "").startswith("stage merged")), 1)
+        self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()},
+                         {"pr list", "api --paginate"})
 
     def test_sync_github_branche_lot_numero_et_pr_partielle(self):
         # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> ; une PR
@@ -487,6 +514,99 @@ class GithubTest(_PlanDb):
         del self.gh.state["prs"]["%s#21" % REPO]["isCrossRepository"]
         report = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual(work.get(self.db, a["id"])["state"], "intake")
+
+    # --- #759 : un lot multi-étapes ne se ferme pas à la première PR --------
+
+    def test_759_pr_finale_ferme_malgre_une_pr_ouverte(self):
+        # La PR se déclare dernière étape du lot : elle ferme, même si une
+        # autre PR du lot est encore ouverte.
+        a = work.add(self.db, title="parapluie")
+        n = a["id"]
+        self.merged_pr(31, "lot/%d-un" % n,
+                       body="Étape 1.\n\nameesh-work: %d final" % n)
+        self.gh.state["prs"]["%s#32" % REPO] = {"state": "OPEN",
+                                                "headRefName": "lot/%d-deux" % n}
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {n: "merged"})
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        ms = [m for m in work.milestones(self.db, n) if m["kind"] == "merged"][0]
+        self.assertEqual(ms["sha"], SHA)
+
+    def test_759_pr_finale_d_une_branche_differente_ferme_aussi(self):
+        # La branche déclarée du lot est celle d'une autre étape : `final` est
+        # justement la déclaration qui lève cette retenue.
+        a = work.add(self.db, title="dernière étape")
+        n = a["id"]
+        work.set_branch(self.db, n, "agent/etape-2", actor="orch", source="test")
+        self.merged_pr(41, "agent/etape-1",
+                       body="Étape 1.\n\nameesh-work: %d final" % n)
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {n: "merged"})
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+
+    def test_759_branche_declaree_autre_etape_retient_le_lot(self):
+        a = work.add(self.db, title="deux PR")
+        n = a["id"]
+        work.set_branch(self.db, n, "agent/etape-2", actor="orch", source="test")
+        self.merged_pr(51, "agent/etape-1", body="Étape 1.\n\nameesh-work: %d" % n)
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(report["results"][0]["result"], "stage-merged")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertIn("branche déclarée agent/etape-2", report["results"][0]["detail"])
+        # la PR qui porte la branche déclarée, elle, ferme le lot
+        self.merged_pr(52, "agent/etape-2", body="Fin.\n\nameesh-work: %d" % n)
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["pr"]: r["result"] for r in report["results"]},
+                         {"%s#51" % REPO: "stage-merged", "%s#52" % REPO: "merged"})
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+
+    def test_759_pr_partielle_ne_ferme_pas_meme_declaree_finale(self):
+        # `ameesh-work-partial:` l'emporte : la PR ne livre qu'une partie du
+        # lot, la déclaration `final` de la même PR ne la ferme pas.
+        a = work.add(self.db, title="parapluie")
+        n = a["id"]
+        self.merged_pr(61, "lot/%d-un" % n,
+                       body="Part.\n\nameesh-work-partial: %d\n\nameesh-work: %d final" % (n, n))
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(report["results"], [])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_759_pr_partielle_ouverte_retient_le_lot(self):
+        # R1 codex3 P2 : une PR ouverte qui ne se déclare que
+        # `ameesh-work-partial:` (branche d'étape `agent/…`, pas `lot/<id>`)
+        # n'apparaît pas dans les lignes `ameesh-work:` — elle doit pourtant
+        # retenir le lot, sinon l'incident #147 se reproduit.
+        a = work.add(self.db, title="parapluie")
+        n = a["id"]
+        self.merged_pr(71, "agent/etape-1", body="Étape 1.\n\nameesh-work: %d" % n)
+        self.gh.state["prs"]["%s#72" % REPO] = {
+            "state": "OPEN", "headRefName": "agent/etape-2",
+            "body": "Part.\n\nameesh-work-partial: %d" % n}
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {n: "stage-merged"})
+        self.assertIn("PR ouverte %s#72" % REPO, report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_759_pr_ouverte_au_dela_du_plafond_retient_le_lot(self):
+        # R1 codex3 P2 : la liste des PR ouvertes ne se tronque pas au
+        # `--limit` du relevé des fusions (ici 1) : une PR liée au-delà du
+        # plafond reste vue, sinon le lot se ferme à tort.
+        a = work.add(self.db, title="plafond")
+        n = a["id"]
+        self.merged_pr(81, "agent/etape-1", body="Étape 1.\n\nameesh-work: %d" % n)
+        self.gh.state["prs"]["%s#82" % REPO] = {
+            "state": "OPEN", "headRefName": "agent/bruyante", "body": "rien"}
+        self.gh.state["prs"]["%s#83" % REPO] = {
+            "state": "OPEN", "headRefName": "agent/etape-2",
+            "body": "Part.\n\nameesh-work: %d" % n}
+        report = plan_github.sync_github(self.db, self.gh, REPO, limit=1)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {n: "stage-merged"})
+        self.assertIn("PR ouverte %s#83" % REPO, report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
 
     def issue(self, prefix: str) -> dict:
         found = self.gh.issue(REPO, prefix)
@@ -841,6 +961,16 @@ class ContentMergeTest(_PlanDb):
         report = plan_git.sync_merges(self.db, self.repo, target="main", **kwargs)
         return {r["work_item"]: r for r in report["results"]}
 
+    def dependent(self, blocker_id: int, assignee: str = "dev-a") -> dict:
+        """Un dépendant assigné du lot : une fermeture refusée ne lui doit
+        aucun courrier (B1, R1 #1319)."""
+        from ameesh import work_dependencies
+        waiting = work.add(self.db, title="dépendant")
+        self.db.execute("UPDATE work_items SET assignee = %s WHERE id = %s",
+                        (assignee, waiting["id"]))
+        work_dependencies.add(self.db, waiting["id"], blocker_id, actor="test")
+        return waiting
+
     def test_nom_change_mais_gel_ancetre_de_la_cible(self):
         # gelé sur « revue-garde-acces », fusionné depuis « GARDE-ACCES » (commit de fusion)
         git(self.repo, "checkout", "-q", "-b", "revue-garde-acces")
@@ -860,6 +990,26 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual((ms["sha"], ms["actor"]), (sha, "git:main"))
         # idempotent
         self.assertEqual(self.run_sync(), {})
+
+    def test_le_releve_qui_ferme_le_bloqueur_reveille_le_dependant(self):
+        """L385 suite : la fermeture par contenu dépose le courrier du dépendant
+        — le relevé réel (`sync_merges`) est le chemin, pas seulement le CLI."""
+        from ameesh import mail, work_dependencies
+        git(self.repo, "checkout", "-q", "-b", "lot/bloqueur")
+        sha = self.commit("src/bloqueur.py", "b = 1\n", "bloqueur")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion bloqueur", "lot/bloqueur")
+        blocker = self.frozen("bloqueur", sha)
+        waiting = work.add(self.db, title="dépendant")
+        self.db.execute("UPDATE work_items SET assignee = 'dev-a' WHERE id = %s",
+                        (waiting["id"],))
+        work_dependencies.add(self.db, waiting["id"], blocker["id"], actor="test")
+        self.assertEqual(self.run_sync()[blocker["id"]]["result"], "merged")
+        [row] = mail.unread(self.db, "dev-a")
+        self.assertEqual((row["kind"], row["recipient"]), ("event", "dev-a"))
+        self.assertIn("lot #%d is merged" % blocker["id"], row["body"])
+        self.assertEqual(mail.message_payload(row)["dependency"]["dependent"],
+                         waiting["id"])
 
     def test_rebase_cherry_pick_et_squash_par_patch_id(self):
         git(self.repo, "checkout", "-q", "-b", "lot/a")
@@ -945,16 +1095,23 @@ class ContentMergeTest(_PlanDb):
 
     def test_nouveau_gel_concurrent_empeche_la_fermeture(self):
         """La fermeture est conditionnée au gel examiné (P2-1, course)."""
+        from ameesh import mail
         git(self.repo, "checkout", "-q", "-b", "lot/y")
         sha = self.commit("src/y.py", "y=1\n", "y")
         git(self.repo, "checkout", "-q", "main")
         git(self.repo, "merge", "-q", "--ff-only", "lot/y")
         item = self.frozen("y", sha)
+        self.dependent(item["id"])
         examined = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "frozen"][0]
         work.milestone(self.db, item["id"], "frozen", sha="d" * 40, actor="ouvrier")
         done = work.close_merged(self.db, item["id"], sha=sha, frozen_id=int(examined["id"]))
         self.assertEqual(done["result"], "refrozen")
+        # B1 (R1 #1319) : le refus ne doit laisser AUCUNE trace committée —
+        # ni état, ni jalon, ni courrier — même sous la transaction englobante.
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+        self.assertEqual([m["kind"] for m in work.milestones(self.db, item["id"])
+                          if m["kind"] == "merged"], [])
+        self.assertEqual(mail.unread(self.db, "dev-a"), [])
 
     def _wait_lock(self, needle: str) -> None:
         """Attend qu'une autre connexion soit RÉELLEMENT bloquée sur un verrou."""
@@ -977,6 +1134,7 @@ class ContentMergeTest(_PlanDb):
         git(self.repo, "checkout", "-q", "main")
         git(self.repo, "merge", "-q", "--ff-only", "lot/course")
         item = self.frozen("course", sha)
+        self.dependent(item["id"])
         examined = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "frozen"][0]
         blocker, closer = db_mod.connect(self.cfg), db_mod.connect(self.cfg)
         result, errors = [], []
@@ -994,16 +1152,19 @@ class ContentMergeTest(_PlanDb):
                 tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                          (item["id"],))
                 thread.start()
-                self._wait_lock("SET state = 'merged'")
+                self._wait_lock("FOR UPDATE")
                 tx.query("INSERT INTO work_item_milestones (work_item_id, kind, sha)"
                          " VALUES (%s, 'frozen', %s) RETURNING id", (item["id"], "d" * 40))
             thread.join(10)
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(result[0]["result"], "refrozen", result)
+            # B1 (R1 #1319) : refus = rien de committé (état, jalon, courrier).
+            from ameesh import mail
             self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
             self.assertEqual([m["kind"] for m in work.milestones(self.db, item["id"])
                               if m["kind"] == "merged"], [])
+            self.assertEqual(mail.unread(self.db, "dev-a"), [])
         finally:
             thread.join(10)
             blocker.close()

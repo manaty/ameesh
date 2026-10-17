@@ -35,7 +35,9 @@ def main() -> int:
         time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
     if os.environ.get("AMEESH_TEST_KILL_SELF"):
         os.kill(os.getpid(), signal.SIGKILL)
-    session = "dsh-session-1"
+    # #786 : l'id annoncé par le flux est réglable (le vrai dsh rend un id
+    # préfixé, `session-<uuid>`), pour le témoin de reprise du tour complet.
+    session = os.environ.get("AMEESH_TEST_DSH_SESSION") or "dsh-session-1"
     if "--session-id" in args:
         session = args[args.index("--session-id") + 1]
         # L166 : session fille refusée, comme `assertAdoptable` du vrai dsh

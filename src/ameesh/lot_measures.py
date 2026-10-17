@@ -7,8 +7,8 @@ L157 measures one actual duration per lot (merge − start); L157b asks the
 estimators to estimate by phase. This module measures the phases, once,
 after the merge, and stores them in `work_item_measures` (migration 0056):
 
-* **Phases** (minutes of wall-clock time, adding up to merge − start). Each
-  instant belongs to ONE phase, by priority:
+* **Phases** (minutes of wall-clock time; each instant belongs to ONE phase,
+  by priority):
 
   1. `human`  — the lot is in state `waiting_human`;
   2. `review` — waiting for review and merge: from a freeze (milestone
@@ -16,7 +16,17 @@ after the merge, and stores them in `work_item_measures` (migration 0056):
   3. `ci`     — a CI run of the lot's branch is in progress (GitHub Actions
      runs read with `gh run list --branch`); unknown (None) when the runs
      cannot be read, that time then stays in `agent`;
-  4. `agent`  — the rest: the agent works.
+  4. `agent`  — the agent's own work on the lot: the union of the turn spans
+     the ledger attributes to it (`turn_costs.work_item_id` + `started_at`,
+     #796), clipped to the window and to the priority phases. Only when no
+     turn carries the lot — lots worked before migration 0423 — is it the
+     rest of the timeline, as before.
+
+  With attributed turns the phases no longer add up to the total: an instant
+  in `build` that no turn covers is unattended (waiting, another lot, an
+  idle host), not agent time. `agent_source` ('turns' or 'states') says which
+  rule the measure used, so a series is never read across the change without
+  knowing it.
 
 * **Size of the change**: the merged diff (`diff_range`: first parent →
   the real merge commit, found from the recorded commit — merge commit,
@@ -44,6 +54,7 @@ import subprocess
 import time
 
 from . import storage
+from .canon import NO_LAZY_FETCH
 
 PHASES = ("agent", "ci", "review", "human")
 #: priority of the phases when they overlap (first wins)
@@ -131,11 +142,20 @@ def review_windows(events: list[dict], milestones: list[dict], end: float
 
 
 def split(start: float, end: float, *, events: list[dict], milestones: list[dict],
-          ci_runs: list[dict] | None) -> dict:
+          ci_runs: list[dict] | None, turns: list[tuple[float, float]] | None = None) -> dict:
     """The phases of a lot between its start and its merge: `{total_minutes,
-    agent_minutes, ci_minutes, review_minutes, human_minutes, ci_runs}`.
+    agent_minutes, ci_minutes, review_minutes, human_minutes, ci_runs,
+    agent_source}`.
     `ci_runs`: `[{start_ts, end_ts}]`, or None when unknown (`ci_minutes` is
-    then None and that time counts as agent time)."""
+    then None and that time counts as agent time).
+    `turns` (#796): the `(start_ts, end_ts)` spans of the turns the ledger
+    attributes to the lot, or None when the attribution is unknown (no turn
+    carries the lot). When they are known, agent time is the union of those
+    spans — clipped to the window and to the priority phases — and not the
+    rest of the timeline: what no turn covers stays unattended. `total_minutes`
+    is then the sum of the four phases, as it is under the states rule: it no
+    longer counts the time no turn and no priority phase claims. `agent_source`
+    says which rule was used: 'turns' or 'states'."""
     start, end = float(start), max(float(start), float(end))
     spans = state_spans(events, start, end)
     marks = {
@@ -146,19 +166,33 @@ def split(start: float, end: float, *, events: list[dict], milestones: list[dict
                      if r.get("start_ts") is not None and r.get("end_ts") is not None],
                     start, end),
     }
-    cuts = sorted({start, end} | {t for iv in marks.values() for pair in iv for t in pair})
+    covered = (None if turns is None
+               else _clip([(float(lo), float(hi)) for lo, hi in turns], start, end))
+    cuts = {start, end} | {t for iv in marks.values() for pair in iv for t in pair}
+    if covered is not None:
+        cuts |= {t for pair in covered for t in pair}
+    cuts = sorted(cuts)
     seconds = dict.fromkeys(PHASES, 0.0)
     for lo, hi in zip(cuts, cuts[1:]):
         mid = (lo + hi) / 2.0
         phase = next((p for p in PRIORITY[:-1]
-                      if any(a <= mid < b for a, b in marks[p])), "agent")
+                      if any(a <= mid < b for a, b in marks[p])), None)
+        if phase is None:
+            if covered is not None and not any(a <= mid < b for a, b in covered):
+                continue  # unattended: no turn attributed to the lot
+            phase = "agent"
         seconds[phase] += hi - lo
-    out = {"total_minutes": round((end - start) / 60.0, 1)}
+    # total = agent + ci + review + human (bureau, #796) : sous la règle des
+    # états, les phases couvrent toute la fenêtre ; sous celle des tours, le
+    # temps qu'aucun tour ne couvre n'est compté nulle part — le total est
+    # alors le temps couvert, et les quatre phases y additionnent toujours.
+    out = {"total_minutes": round(sum(seconds.values()) / 60.0, 1)}
     for phase in PHASES:
         out["%s_minutes" % phase] = round(seconds[phase] / 60.0, 1)
     if ci_runs is None:
         out["ci_minutes"] = None
     out["ci_runs"] = None if ci_runs is None else len(marks["ci"])
+    out["agent_source"] = "turns" if covered is not None else "states"
     return out
 
 
@@ -175,18 +209,23 @@ def size_class(changed_lines: int | None) -> str | None:
     return "m" if changed_lines <= SIZE_M_MAX else "l"
 
 
-def _git(repo: str, *args: str) -> str | None:
+def _git(repo: str, *args: str, env_extra: dict | None = None) -> str | None:
+    env = {**os.environ, **env_extra} if env_extra else None
     try:
         proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
-                              timeout=CALL_TIMEOUT_S)
+                              timeout=CALL_TIMEOUT_S, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.stdout if proc.returncode == 0 else None
 
 
 def has_commit(repo: str, sha: str) -> bool:
+    # #1749 : sonde de présence — pas de fetch paresseux dans un clone
+    # partiel (chaque échec laissait un `git <defunct>` adopté par
+    # l'exécuteur).
     return bool(sha and _SHA_RE.match(sha)
-                and _git(repo, "cat-file", "-e", "%s^{commit}" % sha) is not None)
+                and _git(repo, "cat-file", "-e", "%s^{commit}" % sha,
+                         env_extra=NO_LAZY_FETCH) is not None)
 
 
 def parse_shortstat(text: str) -> dict:
@@ -198,19 +237,22 @@ def parse_shortstat(text: str) -> dict:
 
 
 def _parents(repo: str, sha: str) -> list[str]:
-    out = _git(repo, "rev-list", "--parents", "-n", "1", sha)
+    out = _git(repo, "rev-list", "--parents", "-n", "1", sha,
+               env_extra=NO_LAZY_FETCH)
     return out.split()[1:] if out else []
 
 
 def _is_ancestor(repo: str, a: str, b: str) -> bool:
-    return _git(repo, "merge-base", "--is-ancestor", a, b) is not None
+    return _git(repo, "merge-base", "--is-ancestor", a, b,
+                env_extra=NO_LAZY_FETCH) is not None
 
 
 def _target(repo: str, target: str | None) -> str | None:
     from . import plan_git
 
     for name in (target, plan_git.default_target(repo)):
-        if name and _git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % name):
+        if name and _git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % name,
+                         env_extra=NO_LAZY_FETCH):
             return name
     return None
 
@@ -236,14 +278,15 @@ def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str
     tgt = _target(repo, target)
     if tgt and _is_ancestor(repo, sha, tgt):
         merges = (_git(repo, "rev-list", "--ancestry-path", "--merges", "--reverse",
-                       "%s..%s" % (sha, tgt)) or "").split()
+                       "%s..%s" % (sha, tgt), env_extra=NO_LAZY_FETCH) or "").split()
         for merge in merges:
             first = _parents(repo, merge)[:1]
             if first and not _is_ancestor(repo, sha, first[0]):
                 return first[0], merge
         return (parents[0] if parents else empty), sha
     if tgt:
-        base = (_git(repo, "merge-base", tgt, sha) or "").strip()
+        base = (_git(repo, "merge-base", tgt, sha,
+                     env_extra=NO_LAZY_FETCH) or "").strip()
         if base:
             return base, sha
     return (parents[0] if parents else empty), sha
@@ -333,9 +376,22 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs) -> dict:
     repo = _repo_for(cand.get("merge_sha"), repos)
     # the CI runs are read in the repository that holds the merge commit
     runs = ci(repo, cand.get("branch")) if ci and repo else None
-    out = split(cand["started_ts"], cand["merged_ts"], events=events,
-                milestones=milestones, ci_runs=runs)
-    out.update(started_ts=cand["started_ts"], merged_ts=cand["merged_ts"],
+    # #796 : les tours que le grand livre attribue au lot ; vide = inconnu
+    # (lots travaillés avant la migration 0423), la chronologie d'états sert
+    # alors de mesure.
+    spans = [(r["start_ts"], r["end_ts"]) for r in st.turn_spans(item_id)
+             if r.get("start_ts") is not None and r.get("end_ts") is not None]
+    # #796 : le début du lot est celui du premier tour attribué (le marqueur
+    # est posé avant le lancement, la ressource du tour juste après) — une
+    # date déclarée tardivement, à la prise en main, est ainsi corrigée. Une
+    # date déclarée plus tôt (le lot attendait avant son premier tour) est
+    # gardée : le début retenu est le plus tôt connu.
+    debut = float(cand["started_ts"])
+    if spans:
+        debut = min(debut, min(lo for lo, _ in spans))
+    out = split(debut, cand["merged_ts"], events=events,
+                milestones=milestones, ci_runs=runs, turns=spans or None)
+    out.update(started_ts=debut, merged_ts=cand["merged_ts"],
                merge_sha=cand.get("merge_sha") or None,
                declared_size=cand.get("change_size") or None)
     if repo:
@@ -411,22 +467,30 @@ def view(row: dict | None) -> dict | None:
     out = {k: row.get(k) for k in (
         "measured_ts", "total_minutes", "agent_minutes", "ci_minutes", "review_minutes",
         "human_minutes", "ci_runs", "merge_sha", "diff_files", "diff_insertions",
-        "diff_deletions", "measured_size", "declared_size")}
+        "diff_deletions", "measured_size", "declared_size", "agent_source")}
     out["size_match"] = (None if not out["measured_size"] or not out["declared_size"]
                          else out["measured_size"] == out["declared_size"])
     return out
 
 
 def describe_phases(v: dict) -> str:
-    """« agent 1 h 10 · CI 12 min · review 35 min · human 0 min »."""
+    """« agent 1 h 10 (turns) · CI 12 min · review 35 min · human 0 min ».
+
+    Le temps d'agent porte sa source (#796) : `turns` = union des tours
+    attribués au lot, `states` = reste de la chronologie d'états. Sans source
+    connue (mesure d'avant 0423 non renseignée), rien n'est ajouté."""
     from . import estimates
 
+    source = v.get("agent_source")
     parts = []
     for phase, name in (("agent", "agent"), ("ci", "CI"), ("review", "review"),
                         ("human", "human")):
         value = v.get("%s_minutes" % phase)
-        parts.append("%s %s" % (name, "unknown" if value is None
-                                else estimates.label(value) if value else "0 min"))
+        text = ("unknown" if value is None
+                else estimates.label(value) if value else "0 min")
+        if phase == "agent" and source in ("turns", "states"):
+            text += " (%s)" % source
+        parts.append("%s %s" % (name, text))
     return " · ".join(parts)
 
 

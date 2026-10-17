@@ -200,7 +200,7 @@ class CliCompatTest(PgTestCase):
 
         proc = self.cli("send", "beta", "avec expéditeur", "--from", "gamma", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
+        self.assertEqual(proc.stdout.strip(), "delivered to beta")
 
         # diagnostic de dossier : explicitement non autoritaire
         proc = self.cli("whoami", "--cwd", self.tmp, env=env)
@@ -287,7 +287,7 @@ class CliCompatTest(PgTestCase):
         registry.upsert(self.db, "alpha", harness="claude", host=self.cfg.host)
         proc = self.cli("send", "alpha", "bonjour alpha", env=self.env(AGENT_MAIL_NAME="beta"))
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "dropped for: alpha")
+        self.assertEqual(proc.stdout.strip(), "delivered to alpha")
 
         proc = self.cli("inbox", "alpha")
         self.assertEqual(proc.stdout.strip(), "from beta: bonjour alpha")
