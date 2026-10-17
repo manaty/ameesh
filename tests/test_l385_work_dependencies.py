@@ -7,6 +7,7 @@ import json
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 from ameesh import db as D, mail, plan, planned_waits, progress, stagnation, storage, work
@@ -489,7 +490,8 @@ class LandingTest(PgTestCase):
         return proc
 
     def test_declare_renew_clear_and_read_back(self):
-        until = "2026-10-18"
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        renewed = (datetime.date.fromisoformat(until) + datetime.timedelta(days=2)).isoformat()
         payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
                                       "--until", until, "--json").stdout)
         self.assertTrue(payload["changed"])
@@ -503,14 +505,14 @@ class LandingTest(PgTestCase):
         other_sha = "b" * 40
         work.milestone(self.db, other, "frozen", sha=other_sha, actor="test")
         payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(other),
-                                      "--until", "2026-10-20", "--json").stdout)
+                                      "--until", renewed, "--json").stdout)
         self.assertEqual(payload["landing"]["vehicle_id"], other)
         self.assertEqual(payload["landing"]["pinned_sha"], other_sha)
         self.assertEqual(len(storage.of(self.db).work_dependencies.landings_for([self.waiting])), 1)
         notes = [e["note"] for e in work.events(self.db, self.waiting)
                  if e["note"].startswith("Landing")]
         self.assertEqual(notes, [
-            "Landing declared: vehicle #%d until 2026-10-20 (frozen %s)" % (other, other_sha[:12]),
+            "Landing declared: vehicle #%d until %s (frozen %s)" % (other, renewed, other_sha[:12]),
             "Landing declared: vehicle #%d until %s (frozen %s)" % (self.vehicle, until, self.sha[:12])])
         text = self.mesh("work", "show", str(self.waiting))
         self.assertEqual(text.returncode, 0, text.stderr)
@@ -586,6 +588,28 @@ class LandingTest(PgTestCase):
         # la borne haute exacte est admise
         self.cli(str(self.waiting), "--vehicle", str(self.vehicle), "--until",
                  (today + datetime.timedelta(days=dependencies.LANDING_MAX_DAYS)).isoformat())
+
+    def test_new_unreviewed_freeze_before_landing_is_rejected_atomically(self):
+        transaction = self.db.transaction
+        injected = False
+
+        @contextmanager
+        def racing_transaction():
+            nonlocal injected
+            if not injected:
+                injected = True
+                work.milestone(self.db, self.waiting, "frozen", sha="e" * 40, actor="test")
+            with transaction() as tx:
+                yield tx
+
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        with mock.patch.object(self.db, "transaction", side_effect=racing_transaction):
+            with self.assertRaisesRegex(work.WorkError, "acquired ok verdict"):
+                dependencies.land(self.db, self.waiting, self.vehicle,
+                                  until_on=until, actor="test")
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertFalse(any(e["note"].startswith("Landing")
+                             for e in work.events(self.db, self.waiting)))
 
 
 class ResolverTest(unittest.TestCase):

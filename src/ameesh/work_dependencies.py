@@ -109,9 +109,14 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
     if (day - today).days > LANDING_MAX_DAYS:
         raise work.WorkError("--until %s is too far: at most %d days ahead"
                              % (day.isoformat(), LANDING_MAX_DAYS))
-    _require_frozen_with_verdict(db, item_id)
-    result = storage.of(db).work_dependencies.set_landing(
-        item_id, vehicle_id, until_on=day.isoformat(), actor=actor)
+    with db.transaction() as tx:
+        result = storage.of(tx).work_dependencies.set_landing(
+            item_id, vehicle_id, until_on=day.isoformat(), actor=actor)
+        # The storage call retains the graph and endpoint locks until this
+        # outer transaction ends. Recheck under those locks; a refused verdict
+        # rolls back both the declaration and its journal before any commit.
+        if not result.get("error"):
+            _require_frozen_with_verdict(tx, item_id)
     errors = {"self_landing": "a lot cannot land on itself",
               "unknown_lot": "landing endpoints must be existing lots",
               "not_in_review": "the landing lot must be in review (qa)",
