@@ -1,4 +1,4 @@
-# Paquet integration/paquet-h-20261017-0500 — composition
+# Paquet integration/paquet-h-20261017-0500 — composition et réparation #2199
 
 Base : `main` après atterrissage de PR1577 (`integration/paquet-h-20261017-0400`),
 merge réel **`18859e0664c291f199bc88b8c98abd7e68b1222f`** (04:49:02Z, arbre identique à la tête
@@ -13,8 +13,10 @@ maintenue au prochain paquet compatible, remise `91df05dac` sur la tête 0400),
 `4ff178510`), #2157 (04:29, R1 Codex favorable sur `1ee9af5c`, « admis
 prochain paquet compatible »). Transports : #2190 confié par mesh-design
 (#94841/#94861) ; #1677 remise poussée par mty-amh-impl-07 ; #1152/#1343
-signalés prêts par mty-amh-impl-04 mais différés (voir Hors périmètre). Aucune
-CI de lot.
+signalés prêts par mty-amh-impl-04 mais différés (voir Hors périmètre).
+Réparation d'incident CI : #2199 (revue Codex mesh-design sur `96da5b62`,
+transport exclusif impl-01), ajoutée après l'échec du run `39006173443` sans
+relance identique de `c8d960af`. Aucune CI de lot.
 
 ## Composition
 
@@ -25,16 +27,20 @@ CI de lot.
 | 3 | #2177 | `4ff178510492b742259218892432fa1a0358fbbb` (`lot/2177-carte-fichier-vide`) | `497cd68f6` | GO Codex (mesh-design) 04:29 ; fusion propre (`tests/fake_acp_agent.py`, nouveau témoin SIGTERM) |
 | 4 | #2157 | `1ee9af5c10e662176a43067e76324bd4fb5ebfed` (`lot/2157-composition-ameesh-work`) | `e26883b43` | R1 Codex favorable 04:29, léger ; outil de composition + convention `ameesh-work` ; fusion propre |
 | 5 | #1677 | `5b208e277d16` (tête gelée ; remise `91df05dac`, `refs/ameesh/resolutions/1677/paquet-h-20261017-0400`) | `fa961a70a` | priorité 1, prise automatique ; GO dev7 7023 conservé, remise fraîche sur la tête 0400 ; fusion propre, 16 fichiers |
+| 6 | #2199 | `96da5b62cee3` (`lot/2199-isolation-threads-attach`) | `96da5b62` (reprise directe, ff) | réparation d'incident CI du run `39006173443` : isolation du fil `attach`, test-only (`tests/test_events_attach.py`, +97/−21), base `c8d960af` ; revue Codex mesh-design ; 51 ciblés psql + 51 psycopg (auteur et transporteur) |
 
 Chaque commit de composition porte le trailer `ameesh-work: <lot>` (convention
-#2157) ; les commits de fusion portent le lot comme second parent.
+#2157) ; les commits de fusion portent le lot comme second parent. L'unité 6
+est une reprise directe (fast-forward) du correctif auteur : son lien est le
+manifeste et son sujet `#2199`, aucun delta sémantique n'est introduit.
 
 ## Résolutions de composition (preuve)
 
-- Aucun conflit : les cinq unités touchent des fichiers disjoints sur la base
-  `f2be9d0f4` (deploy staging, `resolutions.py`, témoins de mesure, outillage
-  de composition, prise automatique). Aucune résolution manuelle, aucun delta
-  sémantique.
+- Aucun conflit : les cinq unités initiales touchent des fichiers disjoints
+  sur la base `f2be9d0f4` (deploy staging, `resolutions.py`, témoins de
+  mesure, outillage de composition, prise automatique) ; #2199 ne touche
+  qu'un fichier de test et entre en fast-forward sans conflit. Aucune
+  résolution manuelle, aucun delta sémantique.
 - #2190 est la première unité (priorité 1) ; aucun code relu de #2190 n'est
   modifié par la composition : ses trois fichiers propres sont identiques à
   `62b37ebd7`, et `docs/DEPLOIEMENT-HOTE-AGENTS.md` ne reçoit en plus que la
@@ -43,8 +49,10 @@ Chaque commit de composition porte le trailer `ameesh-work: <lot>` (convention
 - #1677 : la remise `91df05dac` (parents `f2be9d0f4` + `2b5ef81f`) porte le
   delta #1677 seul (16 fichiers, +955/−61) ; sa fusion sur le paquet est
   propre et ne réintroduit aucun contenu du 0400.
-- `git diff f2be9d0f4..HEAD` = 28 fichiers, +2334/−182, exactement la somme
-  des cinq deltas ; `git diff --check` propre.
+- Totaux hors manifeste : cinq unités initiales = 28 fichiers, +2334/−182 ;
+  correctif L804 = 1 fichier, +8/−3 ; #2199 = 1 fichier, +97/−21 ; soit
+  **30 fichiers, +2439/−206** au total. `git diff c8d960af..96da5b62` =
+  `tests/test_events_attach.py` seul (+97/−21) ; `git diff --check` propre.
 
 ## Preuves locales (arbre composé)
 
@@ -55,7 +63,11 @@ Chaque commit de composition porte le trailer `ameesh-work: <lot>` (convention
 - `tests.test_2157_paquet_compose` (cible #2157) : **5 OK**.
 - `tests.test_1677_prise_empilee` + `tests.test_l119_backlog` +
   `tests.test_l234_auditor` (cible #1677, banc psql 55432) : **63 OK**.
-- Total **236 tests ciblés OK**, `bash -n` sur `staging.sh`, `py_compile` sur
+- `tests.test_events_attach` + `tests.test_l109_mediated_mode` (cible #2199,
+  arbre de réparation) : **51 OK psql + 51 OK psycopg** (transporteur),
+  après les 51 + 51 de l'auteur ; log local du transporteur.
+- Total **236 tests ciblés OK** sur les cinq unités initiales, plus la
+  réparation #2199 ; `bash -n` sur `staging.sh`, `py_compile` sur
   `sante-courrier.py` et `paquet-compose.py`, `diff --check` propre.
 - Aucune CI de lot, aucune suite complète locale : une seule CI complète
   tourne sur la tête de la PR du paquet (§12).
@@ -75,13 +87,20 @@ La CI psycopg 1/4 et 2/4 (runs `39004127666`, flux `117313147491` /
   l'interrupteur `idle_s=0`. Aucun code de production modifié ; après
   correction, `tests.test_l804_prise_executeur` = **14 OK**.
 - `tests.test_l109_mediated_mode.SessionTest.test_foreign_harness_hook_leaves_mediated_mail_pending`
-  (psycopg 1/4) : la sortie du hook a reçu une ligne de journal d'une session
-  `attach` (`harness stopped (lease ...)`). Non reproduit localement (module
-  complet : **35 OK**) ; à surveiller au rerun. Si l'échec revient, c'est un
-  défaut d'isolation du test (sortie d'un processus de fond), pas le paquet.
+  (psycopg 1/4) : **confirmé en CI** sur `c8d960af` (run `39006173443`, job
+  `117319211444` : 1 échec sur 2251, les 9 parts psql et les 3 autres parts
+  psycopg vertes). Diagnostic #2199 : la fixture
+  `test_attach_coupe_sans_journal_sur_le_chemin_d_arret` patchait le `log`
+  global avec un `sleep(30)` ; le fil démon `journal` restait bloqué dans ce
+  puits après le test et écrivait au réveil dans le `redirect_stdout` de
+  l109. **Correctif test-only `96da5b62`** : puits confiné au test, sentinelle
+  FIFO prouvant la vidange de la file, contrat d'arrêt borné d'`attach` et
+  assertion stdout vide de l109 conservés. Ciblés : 51 OK psql + 51 OK
+  psycopg (auteur), 51 OK psql + 51 OK psycopg (transporteur).
 
-Le correctif change la tête de la branche : l'auto-fusion doit être réarmée
-sur la nouvelle tête exacte par le pilote (§2, tête changée).
+La réparation change la tête de la branche (`c8d960af` → nouvelle tête) :
+l'auto-fusion a été **désarmée** avant la poussée ; elle ne sera réarmée que
+sur la nouvelle tête exacte, après le nouveau GO du pilote (§2, tête changée).
 
 ## Hors périmètre (différé, non retenu à ce cutoff)
 
@@ -104,9 +123,10 @@ sur la nouvelle tête exacte par le pilote (§2, tête changée).
 ## CI et fusion
 
 - Une seule CI complète sur la tête gelée de la branche (PR, suite
-  psql+psycopg) ; aucune CI de lot.
-- Fusion automatique au vert sur la tête exacte (`--match-head-commit`) ;
-  ne pas rebaser.
+  psql+psycopg) ; aucune CI de lot, aucune relance de `c8d960af`.
+- Fusion automatique **désarmée** sur `c8d960af` ; réarmement seulement sur la
+  nouvelle tête exacte (`--match-head-commit`) après le GO du pilote ; ne pas
+  rebaser.
 - #2190 et #1677 sont reliés à ce manifeste et au run de la PR ; après
   fusion, rattachement des cinq lots aux commits réels et confirmation à
   mesh-design. L'activation staging du correctif #2190 reste coordonnée par
