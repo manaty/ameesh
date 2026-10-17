@@ -626,6 +626,36 @@ class Relecture424r8Test(_Cache):
         self.assertEqual(su._FOREIGN_WARNED, set())
 
 
+class RepliSansExecuteurTest(unittest.TestCase):
+    """#1904 (N du bureau sur #414) : le repli de `account_turn._is_critical`
+    suit le fail-closed de #424 r6 — rôles illisibles vaut critique, comme
+    `auditor.is_critical` et `Runner.is_critical`."""
+
+    def juger(self, name, load_all):
+        from ameesh import account_turn, auditor, sous_utilisation as su_mod
+        cfg = types.SimpleNamespace(canon_entries=("A",))
+        with mock.patch.object(auditor, "load_all", load_all), \
+                mock.patch.object(su_mod, "declared_orchestrators", return_value=()):
+            return account_turn._is_critical(cfg, None, name, {"name": name, "canon": "A"})
+
+    def test_roles_lisibles_inchange(self):
+        def canons(cfg, strict=False):
+            return [_Canon("A", CARTES)]
+        self.assertTrue(self.juger("codex1", canons))
+        self.assertFalse(self.juger("dev7", canons))
+
+    def test_chargement_illisible_replie_critique(self):
+        def illisible(cfg, strict=False):
+            raise OSError("canon illisible")
+        self.assertTrue(self.juger("dev7", illisible))
+
+    def test_verdict_illisible_replie_critique(self):
+        from ameesh import auditor
+        with mock.patch.object(auditor, "is_critical",
+                               side_effect=RuntimeError("état illisible")):
+            self.assertTrue(self.juger("dev7", lambda cfg, strict=False: [_Canon("A", CARTES)]))
+
+
 class Relecture921Test(_Cache):
     """#921 (N de la R8 #414) : sur un hôte sans canon configuré,
     `Runner.is_critical` rend « non critique » (persona auditeur seule) mais

@@ -138,9 +138,9 @@ test("an event during a request schedules a fresh snapshot after that request", 
   assert.equal(calls, 2);
 });
 
-test("the app assembles all seven screens and navigates project → lot thread internally", async () => {
+test("the app assembles all eight screens and navigates project → lot thread internally", async () => {
   const { client } = fixture(); const app = await mount("ameesh-app", client);
-  assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 7);
+  assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 8);
   let view = app.shadowRoot.querySelector("ameesh-projects"); await settle(view);
   view.shadowRoot.querySelector(".link").click(); await settle(app);
   view = app.shadowRoot.querySelector("ameesh-timeline"); await settle(view);
@@ -157,7 +157,7 @@ test("an alert link with no project keeps the selected project; an explicit empt
   assert.equal(app.project, "ameesh");
   // the alerts fixture names an agent but no project: the link must not wipe
   // the project the user is working in (#1697)
-  app.shadowRoot.querySelectorAll("nav button")[3].click(); await settle(app);
+  app.shadowRoot.querySelectorAll("nav button")[4].click(); await settle(app);
   const alerts = app.shadowRoot.querySelector("ameesh-alerts"); await settle(alerts);
   alerts.shadowRoot.querySelector(".link").click(); await settle(app);
   assert.equal(app.project, "ameesh");

@@ -12,7 +12,9 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
    depuis la base commune avec la cible ;
 2. chaque paire de lots de même cible qui touchent un même fichier : une
    fusion d'essai `git merge-tree --write-tree` (état `conflict` ou
-   `overlap`) ; chaque lot contre sa cible (`conflict` ou `clean`) ;
+   `overlap`), puis attribution par fusions témoins si les bases diffèrent
+   (`target-conflict`, `superseded` ou `unclassified` pour les conflits
+   hérités ou incertains, #2104) ; chaque lot contre sa cible (`conflict` ou `clean`) ;
 3. la sonde des migrations (si le projet déclare `migrations`) : un même
    numéro `NNNN_` ajouté par deux lots, ou par un lot alors que la cible l'a
    déjà sous un autre nom. Seules les migrations du **delta propre** du lot
@@ -22,7 +24,7 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
 Les fusions d'essai n'écrivent rien dans le dépôt des agents : leurs objets
 vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
 alternates), aucun worktree, aucun `fetch`. Une paire n'est recalculée que si
-l'une de ses deux pointes a bougé (cache en mémoire de l'exécuteur).
+l'une de ses deux pointes ou la cible a bougé (cache en mémoire de l'exécuteur).
 
 Une cible qui nomme une branche — `develop`, `origin/develop`,
 `refs/remotes/origin/develop`, `refs/heads/develop`, `release/1.x`, ou
@@ -701,6 +703,7 @@ class Cache:
     def __init__(self) -> None:
         self.merges: dict = {}
         self.diffs: dict = {}
+        self.attributions: dict = {}
         # L160d: change sizes for the resolver, replays of prepared resolutions
         self.sizes: dict = {}
         self.replays: dict = {}
@@ -709,7 +712,8 @@ class Cache:
         self.locks: dict = {}
 
     def trim(self) -> None:
-        for table in (self.merges, self.diffs, self.sizes, self.replays, self.stacks):
+        for table in (self.merges, self.diffs, self.attributions,
+                      self.sizes, self.replays, self.stacks):
             while len(table) > MAX_CACHE:
                 table.pop(next(iter(table)))
 
@@ -820,6 +824,24 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
                     repo, objects, scratch, a, b, attributes_tree=attributes_tree)
             return cache.merges[key]
 
+        def attribution(one: dict, other: dict, raw_files: list[str]):
+            from . import radar_attribution
+            if one["target_head"] != other["target_head"]:
+                return {"native": [], "inherited": [], "uncertain": raw_files}
+            if one["base"] == other["base"]:
+                # Both sides diverge from the same target base: no differing
+                # target history can be responsible for their raw conflict.
+                return {"native": raw_files, "inherited": [], "uncertain": []}
+            head = one["target_head"]
+            key = (head, one["tip"], one["base"], other["tip"], other["base"])
+            if key not in cache.attributions:
+                def probe(a, b):
+                    return radar_attribution.read_merge(_scratch_git(
+                        repo, objects, scratch, "-c", "attr.tree=%s" % head,
+                        "merge-tree", "--write-tree", "-z", "--messages", a, b))
+                cache.attributions[key] = radar_attribution.classify(one, other, probe)
+            return cache.attributions[key]
+
         for one in branches:
             conflicts = merge(one["target_head"], one["tip"], one["target_head"])
             against.append({"work_item": one["work_item"], "branch": one["branch"],
@@ -828,6 +850,7 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
                             "state": "error" if conflicts is None
                             else "conflict" if conflicts else "clean",
                             "files": conflicts or []})
+        target_states = {item["work_item"]: item["state"] for item in against}
         for i, one in enumerate(branches):
             for other in branches[i + 1:]:
                 if one["target"] != other["target"]:
@@ -837,12 +860,31 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
                 if not shared:
                     continue
                 conflicts = merge(one["tip"], other["tip"], one["target_head"])
-                pairs.append({"lots": [one["work_item"], other["work_item"]],
-                              "branches": [one["branch"], other["branch"]],
-                              "tips": [one["tip"], other["tip"]], "target": one["target"],
-                              "state": "error" if conflicts is None
-                              else "conflict" if conflicts else "overlap",
-                              "shared": shared, "files": conflicts or []})
+                pair = {"lots": [one["work_item"], other["work_item"]],
+                        "branches": [one["branch"], other["branch"]],
+                        "tips": [one["tip"], other["tip"]], "target": one["target"],
+                        "state": "error" if conflicts is None
+                        else "conflict" if conflicts else "overlap",
+                        "shared": shared, "files": conflicts or []}
+                if conflicts:
+                    evidence = attribution(one, other, conflicts)
+                    uncertain = ((set(conflicts) - set(evidence["native"])
+                                  - set(evidence["inherited"]))
+                                 | set(evidence["uncertain"] or ()))
+                    pair.update(raw_files=conflicts, target_head=one["target_head"],
+                                bases=[one["base"], other["base"]],
+                                inherited_files=evidence["inherited"],
+                                uncertain_files=sorted(uncertain))
+                    pair["files"] = evidence["native"]
+                    pair["attribution_pending"] = bool(pair["inherited_files"]
+                                                       or pair["uncertain_files"])
+                    if not pair["files"]:
+                        pair["state"] = ("unclassified" if pair["uncertain_files"]
+                                         else "target-conflict")
+                        if (pair["state"] == "target-conflict"
+                                and all(target_states[n] == "clean" for n in pair["lots"])):
+                            pair["state"] = "superseded"
+                pairs.append(pair)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     cache.trim()
@@ -929,6 +971,9 @@ def summary(report: dict) -> dict:
             "conflict": sum(1 for p in pairs if p["state"] == "conflict"),
             "prepared": sum(1 for p in pairs if p["state"] == "prepared"),
             "stale": sum(1 for p in pairs if p["state"] == "stale"),
+            "inherited": sum(1 for p in pairs if p["state"] == "target-conflict"),
+            "superseded": sum(1 for p in pairs if p["state"] == "superseded"),
+            "unclassified": sum(1 for p in pairs if p["state"] == "unclassified"),
             "target_conflict": sum(1 for a in report.get("against_target") or ()
                                    if a["state"] == "conflict"),
             "migration_duplicates": len(report.get("migrations") or ()),
@@ -1015,7 +1060,8 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
     resolutions (`ameesh.resolutions.annotate`). Never raises: an error is
     noted in the report and the pairs stay `conflict`."""
     from . import resolutions, storage
-    conflicted = sorted({n for p in report.get("pairs") or () if p["state"] == "conflict"
+    conflicted = sorted({n for p in report.get("pairs") or ()
+                         if p["state"] in ("conflict", "target-conflict", "unclassified", "superseded")
                          for n in p["lots"]})
     if not conflicted:
         return
@@ -1518,10 +1564,12 @@ def conflicts_of(report: dict) -> dict:
     leur cible, numéros de migration en double (mêmes clés que `_states`)."""
     out = {}
     for pair in report.get("pairs") or ():
-        if pair["state"] == "conflict":
+        if pair["state"] in ("conflict", "unclassified"):
             out["pair:%d-%d" % tuple(pair["lots"])] = {
-                "kind": "pair", "lots": list(pair["lots"]), "files": pair["files"],
-                "target": pair["target"], "resolver": pair.get("resolver")}
+                "kind": "pair", "lots": list(pair["lots"]),
+                "files": pair["files"] or pair.get("uncertain_files") or [],
+                "target": pair["target"], "resolver": pair.get("resolver"),
+                "attribution_pending": pair.get("attribution_pending", False)}
         elif pair["state"] == "stale":
             # L160d: only the lot that prepared the resolution is told
             resolution = pair["resolution"]
@@ -1573,7 +1621,11 @@ def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
     if conflict["kind"] == "pair":
         other = [n for n in conflict["lots"] if n != lot][0]
         resolver = conflict.get("resolver") or {}
-        if resolver.get("lot") == lot:
+        if conflict.get("attribution_pending"):
+            todo = ("The raw merge also contains inherited or unclassified conflicts. "
+                    "No resolver is assigned. Consult each branch's target diagnostics; "
+                    "pair attribution will be retried when the branches or target change.")
+        elif resolver.get("lot") == lot:
             todo = ("You prepare the resolution (%s), as you go: "
                     "`ameesh work resolve %d --with %d`; your branch does not change."
                     % (RESOLVER_REASONS.get(resolver.get("reason"), resolver.get("reason")),
@@ -1738,9 +1790,13 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
            "%d overlapping, %d in conflict (%d prepared, %d stale), "
            "%d lot(s) in conflict with their target, %d duplicate migration number(s)"
            % (report.get("project"), when, report.get("duration_s") or 0, s["branches"],
-              s["pairs_checked"], s["overlap"] + s["conflict"] + s["prepared"] + s["stale"],
+              s["pairs_checked"], len(report.get("pairs") or ()),
               s["conflict"] + s["prepared"] + s["stale"], s["prepared"], s["stale"],
               s["target_conflict"], s["migration_duplicates"])]
+    if s["inherited"] or s["unclassified"] or s["superseded"]:
+        out.append("  pair attribution: %d inherited target conflict(s), %d unclassified pair(s), "
+                   "%d superseded raw conflict(s)"
+                   % (s["inherited"], s["unclassified"], s["superseded"]))
     if report.get("error"):
         out.append("  error: %s" % report["error"])
     if report.get("resolution_error"):
@@ -1755,7 +1811,8 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue
-        files = pair["shared"] if pair["state"] == "overlap" else pair["files"]
+        files = (pair["shared"] if pair["state"] == "overlap" else
+                 pair["files"] or pair.get("uncertain_files") or pair.get("inherited_files") or [])
         resolver = pair.get("resolver") or {}
         resolution = pair.get("resolution") or {}
         out.append("  %-8s %s %s  %s%s%s" % (
@@ -1770,6 +1827,10 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                 ", replay %s" % resolution["replay"]
                 if resolution.get("replay") not in ("prepared", "stale") else "")
             if resolution else ""))
+        if pair.get("attribution_pending"):
+            out.append("    attribution pending; inherited: %s; unclassified: %s"
+                       % (_files(pair.get("inherited_files")),
+                          _files(pair.get("uncertain_files"))))
     for one in report.get("against_target") or ():
         if one["state"] == "clean" and not everything:
             continue

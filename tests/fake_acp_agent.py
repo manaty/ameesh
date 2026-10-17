@@ -24,6 +24,7 @@ chose sur la sortie standard (le protocole l'interdit).
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import signal
@@ -45,6 +46,34 @@ def trace(entry: dict) -> None:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError:
         pass
+
+
+def _save_coverage() -> None:
+    """Écrit la mesure coverage du processus avant une sortie par SIGTERM.
+
+    Le pont ACP termine son agent (SIGTERM, puis SIGKILL après la grâce) ; un
+    processus instrumenté tué pendant l'écriture de sa couverture laisse un
+    fichier de 0 octet, qui rend la carte entière partielle (#2177). Le faux
+    agent est un processus de test : il sauve sa mesure avant de sortir. Les
+    agents réels et le pont ne changent pas ; sans coverage, l'import échoue
+    et rien n'est fait.
+    """
+    try:
+        coverage = importlib.import_module(
+            os.environ.get("FAKE_ACP_COVERAGE_MODULE", "coverage"))
+        collector = coverage.Coverage.current()
+        if collector is not None:
+            collector.save()
+    except Exception:  # la mesure ne doit jamais empêcher la sortie du faux agent
+        pass
+
+
+def _on_sigterm(signum, frame) -> None:
+    _save_coverage()
+    if os.environ.get("FAKE_ACP_IGNORE_SIGTERM") == "1":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        return
+    raise SystemExit(0)
 
 
 class FakeAgent:
@@ -241,8 +270,10 @@ class FakeAgent:
                   "error": {"code": -32601, "message": "méthode inconnue : %s" % method}})
 
     def run(self) -> None:
-        if os.environ.get("FAKE_ACP_IGNORE_SIGTERM") == "1":
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, _on_sigterm)
+        if os.environ.get("FAKE_ACP_READY"):
+            sys.stderr.write("ready\n")
+            sys.stderr.flush()
         if self.mode == "garbage":
             longueur = int(os.environ.get("FAKE_ACP_GARBAGE_LEN", "0"))
             texte = "ceci n'est pas du JSON"

@@ -179,7 +179,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0403 : attente de bail depuis (un instant)
         'lease_wait_since',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
-        'workstream'
+        'workstream',
+        -- #508 (0411) : la vue est recréée avec `r.*` et expose les mêmes
+        -- colonnes que `agent_registry` ; preuve de vie du runner, sans
+        -- contenu ni secret, accordée à l'identique de la table
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
@@ -192,6 +196,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_by', 'canon_ref', 'capabilities', 'last_event_at',
         'placement_ok', 'placement_diagnostic', 'placement_ref',
         'placement_profile',
+        -- #508 (0411) : preuve de vie du runner, sans contenu ni secret
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner',
         -- L232a (0371) : clôture de passage entre hôtes
         'handoff_fenced',
         -- #1521 (0446) : début du motif de statut, sans contenu
@@ -245,7 +251,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'last_good_at', 'diagnostic', 'checked_at', 'auth_status',
         'auth_diagnostic', 'auth_checked_at',
         -- L42 (0032) : état par (hôte, canon)
-        'canon', 'canon_id'
+        'canon', 'canon_id',
+        -- #793 (0425) : repère des envois Process
+        'process_commit'
     ]),
     ('mesh_approvals', ARRAY[
         'id', 'approver', 'action', 'artifact_kind', 'artifact_hash',
@@ -326,7 +334,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('quota_gauge_readings', ARRAY[
         'id', 'harness', 'gauge_key', 'used', 'resets_at', 'window_s', 'observed_at',
-        'account'
+        'account', 'produced_at', 'source'
     ]),
     ('provider_balances', ARRAY[
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
@@ -374,7 +382,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159e6 (0361): the guard's last restart (unit names and reasons)
         'guard_restart',
         -- L159f (0069): host gate state, seq and the guard's short reason
-        'gate_state', 'gate_seq', 'gate_reason'
+        'gate_state', 'gate_seq', 'gate_reason',
+        -- #2022 (0455): process and zombie counts, the publishing runner
+        'procs_total', 'procs_zombie', 'runner_id', 'runner_procs', 'runner_zombies'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',

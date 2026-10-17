@@ -34,7 +34,8 @@ LINEAGE_MAX = 32
 AGENT_COLUMNS = """
     name, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
-    lease_owner, lease_epoch,
+    lease_owner, lease_epoch, runner_seen_host, runner_seen_owner,
+    extract(epoch from runner_seen_at)::float8 as runner_seen_ts,
     extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
@@ -174,6 +175,31 @@ def placement_admitted_sql(alias: str = "agent_registry") -> str:
         "governed": canon_governed_sql(a), "a": a}
 
 
+def write_runner_seen(db, host, owner, names, *, admission_sql=None, admission_params=()):
+    """#508 : une écriture groupée, verrous ordonnés comme le cycle de vie hôte.
+
+    Le chemin médié fournit un prédicat d'admission revérifié par l'UPDATE,
+    après l'attente éventuelle d'une révocation concurrente du placement.
+    """
+    if names is not None and not names:
+        return
+    selected = "host = %s AND mode = 'execute' AND status <> 'stopped'"
+    if names is not None:
+        selected += " AND name IN (%s)" % name_list(names)
+    sql = f"""UPDATE agent_registry r
+                SET runner_seen_at = clock_timestamp(),
+                    runner_seen_host = %s, runner_seen_owner = %s
+               FROM (SELECT name FROM agent_registry WHERE {selected}
+                     ORDER BY name FOR UPDATE) s
+              WHERE r.name = s.name AND r.host = %s
+                AND r.mode = 'execute' AND r.status <> 'stopped'"""
+    params = [host, owner, host, host]
+    if admission_sql is not None:
+        sql += " AND (" + admission_sql + ")"
+        params.extend(admission_params)
+    db.execute(sql, tuple(params))
+
+
 # --------------------------------------------------------------------------
 # verrou par nom (L976)
 # --------------------------------------------------------------------------
@@ -206,7 +232,17 @@ def name_lock_key(name: str) -> str:
 
 class Agents(interface.Agents):
 
-    def operator_pause(self, name, *, paused, reason, actor, principal) -> dict | None:
+    def operator_pause(self, name, *, paused, reason, actor, principal,
+                       expect_reason=None) -> dict | None:
+        # #2152 : reprise conditionnelle (une seule instruction SQL, verrou de
+        # ligne) ; `expect_reason` n'a de sens que pour LEVER une pause.
+        if expect_reason is not None:
+            if paused:
+                raise ValueError("expect_reason only lifts an operator pause")
+            rows = self.db.query(
+                "SELECT * FROM ameesh_operator_resume_if(%s, %s, %s, %s, %s)",
+                (name, reason, actor, principal, expect_reason))
+            return rows[0] if rows else None
         rows = self.db.query(
             "SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",
             (name, paused, reason, actor, principal))
@@ -324,6 +360,12 @@ class Agents(interface.Agents):
                    canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
+                   (SELECT extract(epoch from r.runner_seen_at)::float8
+                      FROM agent_registry r WHERE r.name = o.name) AS runner_seen_ts,
+                   (SELECT r.runner_seen_host FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_host,
+                   (SELECT r.runner_seen_owner FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_owner,
                    p.operator_paused, p.operator_pause_reason, p.operator_pause_by,
                    p.operator_pause_for, p.operator_pause_ts,
                    __GOVERNED__ AS canon_governed,
@@ -377,6 +419,9 @@ class Agents(interface.Agents):
             sql += " AND name IN (%s)" % name_list(names)
         sql += " ORDER BY last_seen"
         return self.db.query(sql, tuple(params))
+
+    def runner_seen(self, host, owner, names) -> None:
+        write_runner_seen(self.db, host, owner, names)
 
     def note_unleased(self, name, host, error) -> bool:
         if not error.startswith("lease_not_taken: "):
@@ -650,7 +695,8 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             SELECT lease_owner, lease_epoch, status,
-                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
+                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live,
+                   projects, team, chantier
               FROM agent_registry WHERE name = %s
             """,
             (name,),
@@ -749,6 +795,38 @@ class Leases(interface.Leases):
             RETURNING r.name
             """,
             (name, owner, epoch),
+        )
+        return bool(rows)
+
+    def adopt_session_origin(self, name, owner, epoch, session, lot, *,
+                             harness=None, cwd=None) -> bool:
+        """#1900 B1 : origine d'une session sans origine, sous verrou.
+
+        Verrou de ligne d'abord, puis recontrôle dans l'écriture : bail vivant
+        (owner, epoch, échéance recontrôlée après l'attente du verrou), et
+        ligne portant encore la session ET le lot attendus. Seuls
+        `session_origin`, `session_cwd` et `session_harness` sont écrits —
+        jamais `session_id`, qu'une rotation ou un remplaçant a pu poser
+        pendant l'attente."""
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, session_id, session_work_item, lease_owner, lease_epoch,
+                       lease_expires_at
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET session_origin = %s, session_cwd = %s, session_harness = %s,
+                   updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+               AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.session_id = %s
+               AND verrou.session_work_item = %s
+            RETURNING r.name
+            """,
+            (name, session, cwd, harness, owner, int(epoch), session, str(lot)),
         )
         return bool(rows)
 

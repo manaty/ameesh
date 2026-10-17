@@ -781,6 +781,60 @@ class MenageDbTest(PgTestCase):
         journal = storage.of(self.db).housekeeping.recent("pc", 3600)
         self.assertIn(str(fini), [str(r.get("lot")) for r in journal])
 
+    def test_worktrees_suivis_sans_plafond_pour_le_menage(self):
+        """#2174 : `limit=None` rend tous les worktrees suivis de l'hôte (le
+        ménage), le plafond par défaut reste pour les autres lectures."""
+        hk = storage.of(self.db).housekeeping
+        for i in range(3):
+            hk.register_worktree(host="pc", path=os.path.join(self.tmp, "w%d" % i),
+                                 repo="r", agent="a1", lot=None, turn_id="t",
+                                 branch="b%d" % i, head="")
+        self.assertEqual(len(hk.worktrees("pc", ("active",), limit=2)), 2)
+        self.assertEqual(len(hk.worktrees("pc", ("active",), limit=None)), 3)
+
+    def test_lot_nomme_d_un_autre_agent_fini_suit_la_regle_des_orphelins(self):
+        """#2174 : un worktree dont la branche nomme le lot d'un AUTRE agent
+        (copie de relecture, lot réassigné) n'est plus gardé à vie une fois ce
+        lot fini : il part comme un orphelin (24 h d'inactivité, propre,
+        poussé) ; sale, il reste ; lot encore ouvert, il reste gardé."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        fini, ouvert = self._lot("fini de a2"), self._lot("ouvert de a2")
+        work.assign(self.db, fini, "a2")
+        work.assign(self.db, ouvert, "a2")
+        propre = self._orphelin(main, "relecture-propre", "lot/%d-relecture" % fini)
+        sale = self._orphelin(main, "relecture-sale", "lot/%d-relecture-b" % fini)
+        _write(os.path.join(sale, "wip.txt"), 3)
+        encours = self._orphelin(main, "relecture-ouverte", "lot/%d-relecture" % ouvert)
+        work.close(self.db, fini, abandoned=True)
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        tot = plan(now=time.time() + 2 * 3600)
+        self.assertEqual(tot[propre]["action"], "attend")       # moins de 24 h
+        self.assertIn("24 h", tot[propre]["detail"])
+        loin = time.time() + 30 * 24 * 3600
+        p = plan(now=loin)
+        self.assertEqual(p[propre]["action"], "retrait")
+        self.assertEqual(p[propre]["lot"], str(fini))
+        self.assertIn("assigned to another agent", p[propre]["detail"])
+        self.assertEqual(p[sale]["action"], "garde")
+        self.assertEqual(p[encours]["action"], "garde")
+        self.assertIn("not attributable", p[encours]["detail"])
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(propre))
+        self.assertTrue(os.path.isdir(sale))
+        self.assertTrue(os.path.isdir(encours))
+        self.assertIn("lot/%d-relecture" % fini,
+                      _git("branch", "--list", "lot/%d-relecture" % fini, cwd=main))
+
     def test_orphelin_propre_pousse_inactif_24h_puis_retire(self):
         """#1665 : propre, poussé et inactif depuis 24 h, un orphelin part ;
         sale, non poussé ou tenu par un agent, il reste et il est signalé."""

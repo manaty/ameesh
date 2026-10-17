@@ -209,18 +209,46 @@ class IdleCapacityTest(_Base):
         return _types(exploitation.alerts(self.cfg, self.db, now=self.now, **_seuils(**kw)),
                       "idle_capacity", "orchestrator_held")
 
+    def test_lot_planifie_suit_l_horloge_de_l_alerte(self):
+        from ameesh import plan
+        self.agent("claude1")
+        lot = work.add(self.db, title="lot planifie")
+        jour = time.strftime("%Y-%m-%d", time.localtime(self.now + 3 * JOUR))
+        self.db.execute("UPDATE work_items SET planned_start = %s WHERE id = %s",
+                        (jour, lot["id"]))
+        debut = plan.day_start_ts(jour)
+        listing = self.listing()
+        # L'horloge du passage franchit la date, celle du poste reste avant :
+        # le lot est retenu par son début prévu (#1625), donc pas démarrable ;
+        # #1608 : l'alerte le dit et nomme l'attente au lieu de se taire.
+        with mock.patch("ameesh.planned_waits.time.time", return_value=debut - JOUR):
+            avant = sous_utilisation.idle_capacity(
+                self.db, listing, debut - JOUR, [], paid=("deepseek",))
+            self.assertEqual([a["lots"] for a in avant], [[lot["id"]]])
+            self.assertEqual(avant[0]["startable_lots"], [])
+            self.assertEqual(avant[0]["blocked_lots"],
+                             {str(lot["id"]): {"what": "scheduled", "start": jour}})
+            out = sous_utilisation.idle_capacity(
+                self.db, listing, debut, [], paid=("deepseek",))
+        self.assertEqual([a["lots"] for a in out], [[lot["id"]]])
+        self.assertEqual(out[0]["startable_lots"], [lot["id"]])
+        self.assertEqual(out[0]["blocked_lots"], {})
+
     def test_lots_sans_assigne(self):
         self.agent("claude1")
         self.agent("codex2", "codex")
-        self.agent("frais", since_s=60)                     # au repos depuis 1 min
+        self.agent("frais", since_s=60)                     # sans lot actionnable
         self.agent("arrete", status="stopped", owner="")    # pas réveillable
         self.assertEqual(self.alertes(), [])                # rien n'attend
         lot = work.add(self.db, title="à prendre")
         out = self.alertes()
         self.assertEqual(len(out), 1)
         alerte = out[0]
+        # #1677 (b) : `frais` n'a aucun lot actionnable — le temps depuis son
+        # dernier tour (1 min) ne l'écarte plus du repos.
         self.assertEqual((alerte["reason"], alerte["agents"], alerte["lots"]),
-                         ("travail_en_attente", ["claude1", "codex2"], [lot["id"]]))
+                         ("travail_en_attente", ["claude1", "codex2", "frais"],
+                          [lot["id"]]))
         self.assertIn("Action: dispatch", alerte["detail"])
         self.assertEqual(alerte["responsible"], "human:proprio")
         # un agent avec un lot assigné ou du courrier n'est pas « au repos sans lot »
@@ -356,6 +384,54 @@ class IdleCapacityTest(_Base):
         work.assign(self.db, autre["id"], "orch", actor="orch")
         self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing()),
                          ["orch"])
+
+    def test_destinataires_d_alerte_sans_role_par_historique(self):
+        # #1114 : l'historique des lots confiés (30 j) ne confère pas le rôle
+        # de destinataire d'alerte ; le modèle de rôle (`orchestrators`) le
+        # garde pour l'autorité (correction, plan, analyse).
+        self.agent("claude1")
+        self.agent("autre")
+        self.agent("orch", status="running", owner="attach:proprio@poste", since_s=3 * HEURE)
+        lot = work.add(self.db, title="lot")
+        work.assign(self.db, lot["id"], "autre", actor="agent:orch")
+        work.add(self.db, title="à prendre")       # lot ouvert sans agent : idle_capacity
+
+        class Fiche:
+            def __init__(self, data):
+                self.data = data
+
+        class Agent:
+            def __init__(self, title, roles):
+                self.title, self.fiche = title, Fiche({"roles": roles})
+
+        class Canon:
+            agents = [Agent("orch", ["implementation"])]
+
+        class CanonOrch:
+            agents = [Agent("orch", ["orchestrateur"])]
+
+        # L242c (#424 r1) : un rôle déclaré (même non orchestrateur) coupe la
+        # déduction par l'historique des lots confiés.
+        self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing(),
+                                                        canons=[Canon()]), [])
+        # sans aucun rôle déclaré, le modèle de rôle garde l'historique (L94) ;
+        # le chemin d'alerte ne le fait pas (#1114).
+        self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing(),
+                                                        canons=[]), ["orch"])
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[]), [])
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[Canon()]), [])
+        # le rôle déclaré au canon, lui, reste admis
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[CanonOrch()]), ["orch"])
+        # claude1 est au repos sans lot : l'alerte ne prend pas l'assigneur
+        repos = _types(self.alertes(), "idle_capacity")
+        self.assertEqual(len(repos), 1)
+        self.assertEqual(repos[0]["orchestrators"], [])
+        # déclaré explicitement (hub sans équipe) : destinataire, et pas par historique
+        repos = _types(self.alertes(orchestrators_declared=("orch",)), "idle_capacity")
+        self.assertEqual(repos[0]["orchestrators"], ["orch"])
 
 
 class HostUnderusedTest(_Base):

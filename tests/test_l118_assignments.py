@@ -266,7 +266,7 @@ class MailLinksLotsTest(_Base):
         """#858/R1 : un lot fermé/fusionné n'est pas un destinataire non
         réveillable ; le rattachement refuse avant tout dépôt."""
         lot = work.add(self.db, title="RT-9 : cercle de confiance")
-        work.merged(self.db, lot["id"], sha="a" * 40)
+        work.close_merged(self.db, lot["id"], sha="a" * 40)
         proc = self.send("dev1", "Reprends ce lot.", "--from", "orch",
                          "--lot", str(lot["id"]))
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
@@ -462,6 +462,20 @@ class BranchMergeTest(_Base):
         report = self.sync()
         self.assertEqual(report["results"][0]["how"], "vu-ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_show_etiquette_la_tete_vue_au_balayage(self):
+        """#1899 : la tête en avance affichée vient du dernier balayage, pas de
+        la forge — deux triages faux le 16/10 l'ont lue comme la tête réelle."""
+        self.branch("agent/dev1-cache", "c1")
+        lot = self.lot("agent/dev1-cache")
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        tete = work.get(self.db, lot["id"])["branch_head"]
+        self.assertTrue(tete)
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("tête en avance vue au dernier balayage : %s" % tete[:12], proc.stdout)
+        self.assertIn("vérifier à la forge", proc.stdout)
+        self.assertNotIn("last commit seen ahead", proc.stdout)
 
     def test_squash_puis_branche_supprimee(self):
         self.branch("agent/dev1-sq", "s1", "s2")

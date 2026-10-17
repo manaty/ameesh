@@ -128,6 +128,46 @@ class AttachTest(PgTestCase):
         self.assertIn("new82", self.turns()[0]["argv"])
         self.assertIsNotNone(lease)
 
+    def test_handoff_budget_starts_at_the_first_lock_conflict(self):
+        """#1686 N1 : le budget de passation court à partir du premier conflit
+        de verrou de session, pas de l'entrée dans l'attente. Le résident a fini
+        son tour (`end_turn`), mais tient encore `session-use` le temps du
+        post-tour (`_backup_session`, `_sync_memory`) : un `--wait` plus long
+        que le budget ne doit plus faire refuser (3) ce résident."""
+        registry.claim(self.db, "att82", "runner-before", 30)
+        self.db.execute("UPDATE agent_registry SET status = 'running', "
+                        "session_id = 'old82' WHERE name = 'att82'")
+        horloge = {"t": 1000.0}
+        etat = {"verrou": None}
+        original_sleep = time.sleep
+        self.addCleanup(lambda: etat["verrou"] and etat["verrou"].close())
+
+        def faux_sommeil(seconds):
+            if seconds == 2.0:  # l'attente `--wait` du tour en cours
+                self.db.execute("UPDATE agent_registry SET status = 'idle', "
+                                "session_id = 'post82' WHERE name = 'att82'")
+                if etat["verrou"] is None:
+                    # le post-tour du résident tient encore son verrou
+                    etat["verrou"] = session_lock.try_lock(
+                        self.cfg.agent_dir("att82"), "session-use")
+                    self.assertIsNotNone(etat["verrou"])
+                # l'attente a duré bien plus que le budget de passation
+                horloge["t"] += 10.0
+                return
+            if seconds == 0.1 and etat["verrou"] is not None:
+                etat["verrou"].close()  # le résident rend la session
+                etat["verrou"] = None
+                horloge["t"] += 0.1
+                return
+            original_sleep(min(seconds, 0.01))
+
+        with mock.patch("ameesh.runner.time.monotonic",
+                        side_effect=lambda: horloge["t"]), \
+                mock.patch("ameesh.runner.time.sleep", side_effect=faux_sommeil), \
+                mock.patch.object(attach, "HANDOFF_TIMEOUT", 0.5):
+            self.assertEqual(run_attach(self.cfg, self.db, "att82", wait=True), 0)
+        self.assertIn("post82", self.turns()[0]["argv"])
+
     def test_waiting_input_is_reported_without_being_delivered(self):
         mail.send(self.db, "source", "att82", "pending input")
         self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '11 minutes' "

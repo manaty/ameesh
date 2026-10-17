@@ -152,12 +152,20 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         )
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
+        # #508 : `sweep` publie la preuve de vie avant la moisson ; ce témoin
+        # L790 n'a ni horloge ni registre, la doublure la neutralise.
+        fake.report_liveness = lambda *args, **kwargs: None
         # L85 (#373) : `sweep` prune le journal d'événements après la moisson
         # des baux — la doublure doit fournir le point d'entrée, borné ici.
         fake.prune_events_once = lambda *args, **kwargs: None
+        # #1425 (N2, suite #753) : le dessaisissement des agents arrêtés vient
+        # APRÈS les gardes — sous code périmé, l'exécuteur ne touche pas la
+        # file. Seule la reprise est arrêtée ici, et le dessaisissement aussi.
+        fake.release_stopped_lots_once = mock.Mock(return_value=[])
         with mock.patch.object(registry, "reap", return_value=[]), \
                 mock.patch.object(registry, "claimable") as claimable:
             runner_mod.Runner.sweep(fake)
+        fake.release_stopped_lots_once.assert_not_called()
         claimable.assert_not_called()
 
 
@@ -179,7 +187,10 @@ class SelectedTurnRefusedTest(unittest.TestCase):
         worker = types.SimpleNamespace(
             runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
             _attach_pending=lambda: False, _session_lock=mock.Mock(),
-            resident=object(), state_dir=state_dir.name)
+            resident=object(), state_dir=state_dir.name,
+            # #2096 : `run_turn` rend la mémoire du tour dans son `finally` ;
+            # la doublure n'a pas d'allocateur, le rappel est inerte.
+            _release_turn_memory=lambda *a, **k: None)
         # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
         # la doublure porte la vraie logique de tour et une enveloppe inerte.
         worker._run_guarded_turn = types.MethodType(

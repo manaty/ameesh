@@ -54,9 +54,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    clear_model count
    leases          claim attach_claim state renew release turn_in_progress
                    reap clear_session take_pending_prompt begin_turn
-                   restore_prompt end_turn
+                   restore_prompt end_turn adopt_session_origin
    pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
-   turn_costs      last_reading insert spent ledger correct
+   turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
                    pending_recipients_sorted unread_total dead_letters forward
@@ -97,8 +97,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
-                   open_lots_activity turns record_gauges gauge_history
-                   latest_gauges assigners record_balance balances
+                   open_lots_activity state_lots_activity turns record_gauges
+                   gauge_history latest_gauges gauge_latest assigners
+                   record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
@@ -158,6 +159,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 from __future__ import annotations
 
 from .conversations import Conversations
+from .provenance import Provenance
 from .work_dependencies import WorkDependencies
 
 import abc
@@ -215,11 +217,18 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
-                       actor: str, principal: str) -> dict | None:
+                       actor: str, principal: str,
+                       expect_reason: str | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
         External agents are returned unchanged. Not exposed to executors.
+
+        `expect_reason` (#2152) : ne lève que la pause dont la raison est
+        exactement celle-là. La comparaison et la levée restent dans la même
+        instruction, sous le verrou de ligne : une pause étrangère posée entre
+        la lecture et la reprise n'est jamais levée. Refusé pour POSER une
+        pause (`paused=True`).
         """
 
     @abc.abstractmethod
@@ -234,6 +243,12 @@ class Agents(Domain):
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
+
+    @abc.abstractmethod
+    def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
+        """Une écriture groupée, à l'heure de la base, pour les personas execute
+        placées sur host, limitées par names si fourni. Aucun test de bail ou
+        d'éligibilité. Ne modifie ni placement, ni statut, ni last_seen."""
 
     @abc.abstractmethod
     def note_unleased(self, name: str, host: str, error: str) -> bool:
@@ -339,6 +354,16 @@ class Leases(Domain):
         """Oublie la session, fencé par un bail valide ; l'oubli est durable
         (`session_reset_at` posé dans la même écriture), pour qu'un fichier
         local non retiré ne ressuscite pas la session (#794)."""
+
+    @abc.abstractmethod
+    def adopt_session_origin(self, name: str, owner: str, epoch: int, session: str,
+                             lot: str, *, harness: str | None, cwd: str | None) -> bool:
+        """#1900 B1 : note l'origine d'une session sans origine, sous un bail
+        VIVANT (owner, epoch, échéance recontrôlée après l'attente du verrou)
+        et seulement si la ligne porte encore `session` et `lot` : une session
+        remplacée entre-temps (rotation, remplaçant, autre lot) n'est jamais
+        réécrite. N'écrit que l'origine, le dossier et le harnais — la session
+        et son compte restent ceux de la ligne. Faux sinon."""
 
     @abc.abstractmethod
     def hold_note(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
@@ -508,6 +533,20 @@ class TurnCosts(Domain):
         cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
 
     @abc.abstractmethod
+    def last_before(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la dernière ligne écrite de `agent` à `ts` (epoch) ou avant :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. Lecture seule,
+        pour relire le harnais qui tournait avant un instant donné (le gel d'un
+        lot)."""
+
+    @abc.abstractmethod
+    def first_after(self, agent: str, ts: float) -> dict | None:
+        """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
+        `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
+        écrit la ligne d'un tour à sa fin : le tour qui a posé un gel est le
+        premier écrit APRÈS l'instant du gel. Lecture seule."""
+
+    @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
                session: str | None, usd: float, input_tokens: int,
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
@@ -636,13 +675,17 @@ class AlertAcknowledgements(Domain):
 
     @abc.abstractmethod
     def live(self) -> list[dict]:
-        """Active rows: id, alert_key, severity, observation_host, actor, principal,
-        acknowledged_ts."""
+        """Active rows: id, alert_key, severity, observation_host, perimeter,
+        actor, principal, acknowledged_ts."""
 
     @abc.abstractmethod
     def acknowledge(self, key: str, severity: str, actor: str, principal: str, *,
-                    observation_host: str | None = None) -> dict:
-        """Atomically acknowledge once per key/principal/severity; row + changed."""
+                    observation_host: str | None = None,
+                    perimeter: str | None = None) -> dict:
+        """Atomically acknowledge once per key/principal/severity; row + changed.
+
+        `perimeter` (#1473): canonical thresholds of the observation that
+        raised the alert; NULL when unknown (row predating the column)."""
 
     @abc.abstractmethod
     def invalidate(self, id: int, *, reason: str, observed_ts: float) -> bool:
@@ -1381,6 +1424,22 @@ class WorkItems(Domain):
         None si le lot n'est plus ouvert."""
 
     @abc.abstractmethod
+    def attach_implicit_branch(self, item_id: int, branch: str, *, detached_prefix: str,
+                               note: str, actor: str) -> dict | None:
+        """#2102 : pose la branche implicite (L118b) d'un lot ouvert, sans
+        cible, avec une ligne de journal, seulement s'il n'a pas de branche et
+        qu'aucune ligne de son journal ne commence par `detached_prefix`
+        (détachement), vérifiés sous le verrou de la ligne du lot ; None sinon."""
+
+    @abc.abstractmethod
+    def detach_branch(self, item_id: int, expected: str | None, *, note: str,
+                      actor: str) -> dict | None:
+        """#2102 : retire la branche (et la cible, le dernier commit vu) d'un
+        lot ouvert, avec une ligne de journal, seulement si sa branche est
+        encore `expected` (None : aucune), vérifié sous le verrou de la ligne
+        du lot ; None sinon (lot fermé, ou branche changée entre-temps)."""
+
+    @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:
@@ -1492,6 +1551,21 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def open_for(self, assignee: str) -> list[dict]:
         """L118 : les lots ouverts d'un assigné."""
+
+    @abc.abstractmethod
+    def release_agent(self, agent: str, *, reason: str, actor: str,
+                      measure_actor: str = "", measure_reason: str = "",
+                      dry_run: bool = False,
+                      stopped_with: tuple[str, ...] = ()) -> list[dict]:
+        """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+        d'équipe (assigné effacé, journal au lot avec la raison), et ses lots
+        promus dont la mesure reste à refaire allaient à ``measure_actor``
+        (l'auditeur, ``measure_reason`` au journal), en une transaction. Rend
+        les lots touchés. Idempotent : un lot dont l'assigné a changé
+        entre-temps n'est pas touché. ``dry_run`` : ce qui serait fait, rien
+        n'est écrit. ``stopped_with`` : si non vide, la transaction revérifie
+        que l'agent est encore ``stopped`` pour l'une de ces raisons avant de
+        rendre un lot (course fermée entre le relevé du registre et le geste)."""
 
     @abc.abstractmethod
     def open_by_ref(self, ref: str) -> list[dict]:
@@ -1652,9 +1726,16 @@ class WorkItems(Domain):
         """Journal du lot, du plus récent au plus ancien."""
 
     @abc.abstractmethod
-    def events_noted(self, prefix: str, since_ts: float) -> list[dict]:
-        """L317c : les lignes de journal, tous lots, dont la note commence par
-        `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
+    def events_noted(self, prefix: str, since_ts: float, *,
+                     ids: Sequence[int] | None = None) -> list[dict]:
+        """L317c : les lignes de journal dont la note commence par `prefix`,
+        écrites depuis `since_ts` (les plus anciennes d'abord).
+
+        `ids` borne la lecture à ces éléments (#2162, `backlog._DirNotes`) :
+        sans lui, tous les lots ; avec lui, l'historique des lots clos n'est
+        pas lu. Le filtre porte sur les ids, jamais sur une fenêtre
+        temporelle : une note ancienne d'un élément candidat reste lue, donc
+        dédupliquée exactement."""
 
     @abc.abstractmethod
     def milestones(self, item_id: int, limit: int) -> list[dict]:
@@ -1663,14 +1744,21 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
                       verdict: str | None, note: str, on_frozen=None,
-                      after_commit: list | None = None) -> dict:
+                      after_commit: list | None = None,
+                      proof: dict | None = None) -> dict:
         """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
 
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
         transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
         `after_commit` reçoit les écritures de fil différées, que **l'appelant**
         vide après le commit qu'il tient (un `with` imbriqué ne commite pas).
-        Absents, rien ne change."""
+        Absents, rien ne change.
+
+        `proof` (facultatif, #1465) : l'identité exacte du tour qui déclare
+        (`actor`, `session`, `turn`, `harness`, `sha` complet), écrite DANS LA
+        MÊME TRANSACTION que le jalon sous le sujet `milestone:<id>`. Absent,
+        le jalon s'écrit sans preuve : l'origine reste inconnue, jamais
+        devinée. Les deux options sont indépendantes et se composent."""
 
     @abc.abstractmethod
     def delays(self, limit: int, *, ids: Sequence[int] | None = None) -> list[dict]:
@@ -1768,6 +1856,21 @@ class WorkItems(Domain):
         the ready intake never offers a lot that cannot be started."""
 
     @abc.abstractmethod
+    def review_proposals(self, limit: int, *, proposal_prefix: str,
+                         window_s: float = 21600.0) -> list[dict]:
+        """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
+        sans verdict COURANT (une relecture est due) ou à verdict courant
+        bloquant (une correction est due) — avec leur auteur, leur branche,
+        leur tête gelée, leur équipe résolue (`lot_team`) et les colonnes du
+        lot dont la prise a besoin.
+
+        Un lot déjà muni d'un relecteur désigné, ou sans tête gelée, est
+        écarté ; un lot dont une proposition (`proposal_prefix` au journal) a
+        moins de `window_s` n'est pas reproposé. Le verdict retenu est celui
+        qui nomme le dernier gel (#1677 B1) : un `ok` périmé par un regel ne
+        dispense pas de la relecture."""
+
+    @abc.abstractmethod
     def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
         """L233b : la dernière ligne de journal du lot dont la note commence
         par l'un des `prefixes` (une attribution), puis sa ligne la plus
@@ -1786,11 +1889,14 @@ class WorkItems(Domain):
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod
     def issue_feed(self, limit: int) -> list[dict]:
-        """Les lots que la projection en issues examine : ouverts, ou qui
-        portent une `issue_ref` (les `limit` plus récents), par id croissant.
-        Chaque ligne ajoute l'équipe de la fiche du plan (`package_team`) et
-        l'équipe, le chantier et l'hôte de l'assigné au registre
-        (`assignee_team`, `assignee_chantier`, `assignee_host`). Une
+        """Les lots que la projection en issues examine : ouverts, porteurs
+        d'une `issue_ref`, ou pinnés sur une révision Process (#2130/D : un
+        cœur `merged` reste projeté ouvert), les `limit` plus récents, par id
+        croissant. Chaque ligne ajoute l'équipe de la fiche du plan
+        (`package_team`), l'équipe, le chantier et l'hôte de l'assigné au
+        registre (`assignee_team`, `assignee_chantier`, `assignee_host`), et
+        la révision Process du lot (`workflow_ref`, `workflow_stage`,
+        `workflow_version` ; `''`, NULL, 0 sur une base pré-0452). Une
         instruction."""
 
     @abc.abstractmethod
@@ -1989,6 +2095,14 @@ class Canon(Domain):
         """Tous les états enregistrés pour l'hôte, un par canon (L42)."""
 
     @abc.abstractmethod
+    def claim_commit(self, host: str, old: str, new: str, canon: str = "") -> bool:
+        """#793 : avance le repère d'envoi `process_commit` de `old` à `new`,
+        si aucune autre synchronisation ne l'a fait ; False sinon. NULL :
+        initialiser depuis `last_good_commit`. `record_state` ne touche jamais
+        ce repère. Dans la transaction de l'appelant, la ligne reste verrouillée
+        jusqu'à son commit."""
+
+    @abc.abstractmethod
     def key_for_root(self, host: str, root: str) -> str | None:
         """Clé (non vide) d'un canon non par défaut déjà enregistré pour l'hôte
         avec cette racine, ou None (L42 : identité d'un canon illisible)."""
@@ -2025,7 +2139,10 @@ class Canon(Domain):
         l'hôte (et les paquets sans canon) reçoivent l'identifiant `previous`.
         L44 : les actions aussi ('' → `previous`, puis `new_default` → '').
         L46 : les lignes (agents, éphémères compris, et paquets) du nouveau
-        canon par défaut `new_default` repassent à NULL."""
+        canon par défaut `new_default` repassent à NULL.
+        #1464 (N2 #793) : l'état recopié sous la clé `previous` emporte le
+        repère d'envoi `process_commit` — sans lui, les règles déjà poussées
+        repartent une fois (repli sur `last_good_commit`)."""
 
     @abc.abstractmethod
     def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:
@@ -2609,13 +2726,13 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def items(self, *, since_ts: float, limit: int,
-              done_states: Sequence[str]) -> list[dict]:
+              done_states: Sequence[str], project: str | None = None) -> list[dict]:
         """Les tâches de la feuille de route : ouvertes (état hors de
         `done_states`, fourni par l'appelant), ou datées, ou portant un
         engagement en cours, ou modifiées depuis `since_ts` — colonnes de `work_items` utiles à la
         frise (id, title, state, app, workstream, assignee, package_id,
         created_ts, updated_ts, closed_ts) et dates prévues ; `total` avant
-        la borne."""
+        la borne. Le filtre projet est appliqué avant la borne et le total."""
 
     @abc.abstractmethod
     def commitments(self, *, statuses: Sequence[str] | None = None,
@@ -2635,10 +2752,11 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def set_commitment(self, ident: int, *, current: Sequence[str],
-                       values: dict) -> dict | None:
+                       values: dict, expect: dict | None = None) -> dict | None:
         """Change un engagement (`status`, `due_on`, `note`…) s'il est dans
         l'un des statuts `current` ; None sinon (inconnu ou déjà changé).
-        Un statut `done` ou `cancelled` pose `closed_at`."""
+        Un statut `done` ou `cancelled` pose `closed_at`. Avec `expect`, les
+        champs éditables doivent être inchangés depuis leur lecture."""
 
 
 # --------------------------------------------------------------------------
@@ -2762,10 +2880,19 @@ class Operations(Domain):
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee, `package_id`, type et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
-        son relecteur désigné), `workflow_ref` (#1922/N13 : la révision Process
-        qui pinne le lot, '' sur une base d'avant la 0452). Les plus
+        son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
+        celle de son paquet ou du parent, sinon son `app`), `workflow_ref`
+        (#1922/N13 : la révision Process qui pinne le lot, '' sur une base
+        d'avant la 0452). Les plus
         anciennement actifs d'abord. `limit=None` lit toute la vérité avant le
         filtrage des attentes planifiées (L368)."""
+
+    @abc.abstractmethod
+    def state_lots_activity(self, state: str, limit: int | None) -> list[dict]:
+        """Lots d'un état donné (`promoted`, …), même forme que
+        `open_lots_activity` — qui exclut `merged`, `promoted` et `closed` :
+        un lot promu qu'un agent arrêté garde doit rester visible (#753, R1
+        auditeur). `limit=None` : toute la vérité."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
@@ -2779,22 +2906,36 @@ class Operations(Domain):
     @abc.abstractmethod
     def record_gauges(self, readings: Sequence[dict]) -> int:
         """Ajoute les relevés de jauge (harness, key, used, resets_at,
-        window_s, et `account` facultatif — L30, 0028) qui CHANGENT le dernier
-        relevé de leur jauge (du même compte), ou dont le dernier relevé a plus
-        de dix minutes. Rend le nombre de lignes."""
+        window_s, `account` facultatif — L30, 0028, `produced_at` et `source`
+        facultatifs — #1132, 0434) qui CHANGENT le dernier relevé de leur jauge
+        (du même compte), ou dont le dernier relevé a plus de dix minutes. Rend
+        le nombre de lignes. `produced_at` (epoch) est l'instant de PRODUCTION
+        du relevé, NULL quand le flux ne le date pas ; `source` nomme le
+        journal d'origine."""
 
     @abc.abstractmethod
     def gauge_history(self, *, since_s: float, harness: str | None,
                       account: str | None = None) -> list[dict]:
         """Relevés des `since_s` dernières secondes, dans l'ordre
-        chronologique : harness, key, used, resets_at_ts, window_s,
-        observed_ts, account (L30 ; None sans comptes). `account` filtre."""
+        chronologique d'insertion : harness, key, used, resets_at_ts, window_s,
+        observed_ts, produced_ts (#1132 ; None si non daté), source (#1132) et
+        account (L30 ; None sans comptes). `account` filtre."""
 
     @abc.abstractmethod
     def latest_gauges(self, *, since_s: float) -> list[dict]:
         """L94 : le DERNIER relevé de chaque jauge (harness, account, key)
-        observé dans les `since_s` dernières secondes : harness, key, used,
-        resets_at_ts, window_s, observed_ts, account (None sans comptes)."""
+        observé dans les `since_s` dernières secondes, choisi par instant de
+        PRODUCTION (#1132 : `produced_at` d'abord, NULL en dernier, puis
+        `observed_at`) : harness, key, used, resets_at_ts, window_s,
+        observed_ts, produced_ts, source, account (None sans comptes)."""
+
+    @abc.abstractmethod
+    def gauge_latest(self, *, harness: str, account: str) -> list[dict]:
+        """#1132 : le dernier relevé CONNU de chaque jauge d'un compte nommé,
+        sans limite d'âge : le plus récent par instant de production
+        (`produced_at` d'abord, NULL en dernier), puis par insertion — harness,
+        key, used, resets_at_ts, window_s, observed_ts, produced_ts, source,
+        account. Aucune ligne pour un compte inconnu."""
 
     @abc.abstractmethod
     def assigners(self, *, since_s: float) -> list[str]:
@@ -2937,6 +3078,11 @@ class HostResources(Domain):
     def current(self, host: str | None) -> list[dict]:
         """Le dernier relevé de CHAQUE hôte connu (celui de `host` seulement
         s'il est donné), trié par nom d'hôte."""
+
+    @abc.abstractmethod
+    def runners(self, host: str, since_s: float) -> list[dict]:
+        """#2022: the last reading of each runner of `host` (`runner_id`)
+        within `since_s` seconds, the most zombies first."""
 
     @abc.abstractmethod
     def turns_in_progress(self, host: str) -> int:
@@ -3135,9 +3281,10 @@ class Housekeeping(Domain):
 
     @abc.abstractmethod
     def worktrees(self, host: str | None, statuses: Sequence[str] | None = None,
-                  limit: int = 500) -> list[dict]:
+                  limit: int | None = 500) -> list[dict]:
         """Worktrees suivis (de l'hôte, des statuts donnés), les plus anciens
-        d'abord ; instants en `created_ts`, `checked_ts`, `ended_ts`."""
+        d'abord ; instants en `created_ts`, `checked_ts`, `ended_ts`.
+        `limit=None` : tous (#2174, le ménage de l'hôte)."""
 
     @abc.abstractmethod
     def set_worktree_status(self, worktree_id: int, status: str, detail: str) -> dict | None:
@@ -3305,11 +3452,6 @@ class CiResults(Domain):
         `started_at` prend l'heure du relevé (la fin de l'attente d'un runner)."""
 
     @abc.abstractmethod
-    def queued(self) -> list[dict]:
-        """#747 : les exécutions `running` jamais vues démarrées, de la plus
-        ancienne à la plus récente, tous dépôts."""
-
-    @abc.abstractmethod
     def reopen_run(self, repo: str, run_id: int, *, run_attempt: int) -> dict | None:
         """Une exécution conclue que GitHub dit de nouveau en cours (relance,
         #901 : même `run_id`, `run_attempt` strictement supérieur) repasse
@@ -3365,11 +3507,13 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def base_failures(self, repo: str, branch: str, *, workflow: str = "") -> dict:
-        """Dernière exécution conclue (verte ou rouge) de `branch` **pour ce
-        workflow** : `{run_id, head_sha, tests}` (tests en échec de son attempt
-        courant), ou {} sans exécution. Le workflow évite de comparer deux
-        suites étrangères ; les lignes antérieures à la migration 0433, toutes
-        de l'ancien filtre global `tests.yml`, y sont nommées."""
+        """Dernière exécution conclue (verte ou rouge) de la **tête la plus récemment
+        poussée** de `branch`, pour ce workflow (#1683 : la conclusion la plus
+        récente peut être celle d'une tête plus ancienne) : `{run_id, head_sha,
+        tests}` (tests en échec de son attempt courant), ou {} sans exécution.
+        Le workflow évite de comparer deux suites étrangères ; les lignes
+        antérieures à la migration 0433, toutes de l'ancien filtre global
+        `tests.yml`, y sont nommées."""
 
     @abc.abstractmethod
     def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
@@ -3434,11 +3578,6 @@ class CiResults(Domain):
                           covered: int, complete: bool, reason: str | None = None) -> None:
         """Clôt le relevé : appels réellement consommés, exécutions listées et
         couvertes, et raison d'un relevé incomplet (qui n'a rien publié)."""
-
-    @abc.abstractmethod
-    def guard_runs(self, repo: str) -> dict:
-        """Le cache des relevés par exécution, clé `(run_id, attempt)` :
-        `{run_id, attempt, status, queued, oldest_id, oldest_at, runners}`."""
 
     @abc.abstractmethod
     def observe_guard_run(self, repo: str, *, run_id: int, attempt: int, status: str,
@@ -3561,6 +3700,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    provenance: Provenance
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
