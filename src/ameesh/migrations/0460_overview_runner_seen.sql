@@ -65,6 +65,18 @@ do $$
 declare
     g record;
 begin
+    -- CREATE VIEW applique les ACL par défaut actuelles, qui peuvent différer
+    -- de celles de la vue supprimée : les retirer avant la restitution.
+    for g in
+        select distinct x.grantee
+          from pg_class c, aclexplode(c.relacl) x
+         where c.oid = 'agent_mesh_overview'::regclass
+           and x.grantee <> c.relowner
+    loop
+        execute format('revoke all on agent_mesh_overview from %s',
+                       case when g.grantee = 0 then 'public'
+                            else quote_ident(pg_get_userbyid(g.grantee)) end);
+    end loop;
     for g in
         select a.col, a.privilege_type, a.is_grantable,
                case when a.grantee = 0 then 'public'

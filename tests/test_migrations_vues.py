@@ -103,6 +103,10 @@ class VueOverviewBaseExistanteTest(PgTestCase):
                        % db_mod.quote_ident(lecteur))
             db.execute("GRANT REFERENCES ON agent_mesh_overview TO %s"
                        % db_mod.quote_ident(lecteur))
+            # La vue existante reste limitée aux colonnes accordées ci-dessus.
+            # Une politique par défaut ne doit pas élargir ces droits à sa recréation.
+            db.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT, UPDATE ON TABLES TO %s"
+                       % (db_mod.quote_ident(schema), db_mod.quote_ident(lecteur)))
             passe(lambda v: True)
             # mêmes colonnes, même ordre, que sur une base neuve
             self.assertEqual(self.colonnes(db, "agent_mesh_overview"),
@@ -111,9 +115,13 @@ class VueOverviewBaseExistanteTest(PgTestCase):
             droits = db.query(
                 "SELECT has_column_privilege(%s, 'agent_mesh_overview', 'name', 'SELECT') AS nom, "
                 "has_column_privilege(%s, 'agent_mesh_overview', 'turns', 'SELECT') AS hors, "
-                "has_table_privilege(%s, 'agent_mesh_overview', 'REFERENCES') AS ref",
-                (lecteur, lecteur, lecteur))[0]
+                "has_table_privilege(%s, 'agent_mesh_overview', 'REFERENCES') AS ref, "
+                "has_column_privilege(%s, 'agent_mesh_overview', 'pending_prompt', 'SELECT') AS contenu, "
+                "has_table_privilege(%s, 'agent_mesh_overview', 'UPDATE') AS ecrit",
+                (lecteur, lecteur, lecteur, lecteur, lecteur))[0]
             self.assertEqual((droits["nom"], droits["hors"], droits["ref"]), (True, False, True))
+            self.assertFalse(droits["contenu"])
+            self.assertFalse(droits["ecrit"])
             # le contrat du superviseur est tenu, et lit la preuve de vie
             ok = self.contrat(schema, role)
             self.assertEqual(ok.returncode, 0, ok.stderr)
