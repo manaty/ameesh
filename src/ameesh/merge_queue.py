@@ -105,11 +105,15 @@ CRITICAL_SCOPE = (
     re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
                r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
                r"(^|/)(keys?|secrets?)(/|$)"),
-    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
+    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion et
+    # tout ce qui peut en calculer la classe, désigner les relecteurs ou
+    # rapporter l'état de CI (#1515 N2) : un lot qui ne touche que ces
+    # fichiers peut affaiblir la porte sans être vu comme critique.
     re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
                r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
                r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
-               r"relocation|placement|merge_queue|land|fire)\.py$"),
+               r"relocation|placement|merge_queue|land|fire|lot_class|review_lot|radar|"
+               r"work)\.py$"),
 )
 #: le nombre d'avis d'un lot sensible hors de ces domaines
 SENSITIVE_REVIEWS = 1
@@ -202,6 +206,62 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
                   key=_mark_order)
 
 
+def _assignees(db, row) -> list[str]:
+    """Tous les assignés connus d'un lot (#1515 N1) : l'actuel, puis les
+    précédents lus dans le journal (`assigned to X (before: Y)`). Un lot
+    réassigné ne peut pas compter l'avis de son auteur d'origine : l'assigné
+    courant n'est pas le seul auteur du travail gelé."""
+    names: list[str] = []
+
+    def add(name) -> None:
+        name = str(name or "").strip()
+        if name and name.lower() not in {n.lower() for n in names}:
+            names.append(name)
+
+    add((row or {}).get("assignee"))
+    item_id = (row or {}).get("id")
+    if db is None or item_id in (None, ""):
+        return names
+    try:
+        events = work.events(db, int(item_id), 500)
+    except Exception:  # noqa: BLE001 - journal illisible : l'actuel seulement
+        return names
+    for event in events or ():
+        note = str((event or {}).get("note") or "")
+        if not note.startswith("assigned to "):
+            continue
+        add(note[len("assigned to "):].split(None, 1)[0])
+        before = re.search(r"\(before: (.+?)\)", note)
+        if before and before.group(1).strip().lower() != "nobody":
+            add(before.group(1))
+    return names
+
+
+def _delta_authors(repo, row, frozen) -> list[str]:
+    """Les auteurs Git des commits du delta gelé (#1515 N1) : le relecteur qui
+    a corrigé lui-même (§2) est auteur de sa correction et ne peut plus
+    compter comme relecteur indépendant de la tête. Best-effort : sans dépôt,
+    cible ou commit résolvable, aucun nom n'est ajouté — la porte garde son
+    comportement d'avant, elle n'invente pas un auteur. Les commits de fusion
+    sont ignorés : leur auteur est le plus souvent le composeur, pas l'auteur
+    du contenu."""
+    if not repo or not frozen:
+        return []
+    target = str((row or {}).get("branch_target") or "origin/main").strip()
+    base = plan_git._commit(repo, target)
+    head = plan_git._commit(repo, frozen)
+    if not base or not head or base == head:
+        return []
+    text = plan_git._out(repo, "log", "--no-merges", "--format=%an",
+                         "%s..%s" % (base, head))
+    names: list[str] = []
+    for name in (text or "").splitlines():
+        name = name.strip()
+        if name and name.lower() not in {n.lower() for n in names}:
+            names.append(name)
+    return names
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
@@ -215,23 +275,28 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
     normal et pour un lot sensible hors SQL/sécurité/prod, 2 pour un lot
     sensible qui touche ces domaines ou dont la classe reste un doute. Les avis
-    comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
-    classe sensible, une famille de modèle connue et autre que celle de
-    l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
-    suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
-    décision 18855a).
+    comptés sont **indépendants** : jamais le travail d'un auteur du lot —
+    assigné courant, assignés précédents et auteurs des commits du delta
+    (#1515, §2 : un relecteur qui corrige devient auteur de sa correction) ;
+    pour une classe sensible, une famille de modèle connue et autre que celle
+    de chacun de ces auteurs ; pour deux avis, deux familles distinctes.
+    L'indépendance ne se suppose jamais : une famille d'auteur inconnue refuse
+    la porte (canon §2, décision 18855a).
 
-    Rend `{ok, why, class, required, accepted, blocked, author, author_family,
-    on_freeze}` ; ne lève jamais.
+    Rend `{ok, why, class, required, accepted, blocked, author, authors,
+    author_family, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     frozen = str(frozen or "").strip().lower()
     row = item or {}
-    author = str(row.get("assignee") or "").strip()
+    assignees = _assignees(db, row)
+    authors = list(assignees)
+    author = authors[0] if authors else ""
     out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
-           "blocked": [], "author": author, "author_family": "", "on_freeze": 0}
+           "blocked": [], "author": author, "authors": authors, "author_family": "",
+           "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -258,35 +323,58 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
-    author_family = actor_family(db, author)
-    out["author_family"] = author_family
+    # Un lot léger n'a pas d'avis à compter : l'historique Git du delta n'est
+    # lu que pour les lots qui en exigent un.
+    for name in _delta_authors(repo, row, frozen):
+        if name.lower() not in {a.lower() for a in authors}:
+            authors.append(name)
+    out["authors"] = authors
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
     # sécurité ou la prod — n'accepte que des familles connues et autres que
-    # celle de l'auteur. Famille d'auteur inconnue (agent absent du registre,
-    # harnais non reconnu) : aucun avis ne peut être prouvé indépendant, la
-    # porte refuse et le dit. Un auteur humain n'a pas de famille de modèle :
-    # il n'y a rien à comparer, seules les familles des relecteurs comptent.
+    # celles de **tous** les auteurs du lot. Famille d'auteur inconnue (agent
+    # absent du registre, harnais non reconnu) : aucun avis ne peut être prouvé
+    # indépendant, la porte refuse et le dit. Un auteur humain n'a pas de
+    # famille de modèle : il n'y a rien à comparer pour lui, seules les
+    # familles des relecteurs comptent (un relecteur humain n'a pas non plus de
+    # famille : il ne compte pas dans une classe sensible, cf. dev4 #1515).
     strict = required >= 2 or cls == lot_class.SENSITIVE
-    author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
-    if strict and not author_family and not author_human:
+    author_families: dict = {}
+    unknown_author = ""
+    # Un assigné inconnu au registre reste un refus : on ne peut pas prouver
+    # son indépendance. Un auteur de commit hors registre (outil, humain,
+    # composeur) n'est que nommé, jamais supposé d'une famille : il ne fait
+    # pas refuser la porte, mais son nom reste exclu des relecteurs.
+    assignee_names = {name.lower() for name in assignees}
+    for name in authors:
+        if name.lower().startswith(work.HUMAN_PREFIX) or ":" in name:
+            continue
+        family = actor_family(db, name)
+        if family:
+            author_families.setdefault(name.lower(), family)
+        elif not unknown_author and name.lower() in assignee_names:
+            unknown_author = name
+    out["author_family"] = author_families.get(author.lower(), "")
+    if strict and (not assignees or unknown_author):
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
                       "no known model family, so no verdict can be proven independent "
                       "(canon §2: independence is never assumed)"
-                      % (frozen[:12], cls, author or "(none)"))
+                      % (frozen[:12], cls, unknown_author or "(none)"))
         return out
+    author_names = {name.lower() for name in authors}
+    author_family_set = set(author_families.values())
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
-        if author and actor and actor.lower() == author.lower():
+        if actor and actor.lower() in author_names:
             continue                      # on ne relit pas son propre travail
         family = actor_family(db, actor)
         if strict:
             if not family:
                 continue                  # famille du relecteur inconnue : non prouvée
-            if family == author_family:
-                continue                  # la famille de l'auteur ne compte pas
+            if family in author_family_set:
+                continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
     if required >= 2:

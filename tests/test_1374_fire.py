@@ -16,6 +16,9 @@ et autorité pilote déclarée. Tests sans base (routage, jalons, GitHub simulé
 puis sur Postgres (règles de `give`/`withdraw`, bail, CLI, garde de `land`)."""
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -122,13 +125,13 @@ class ReviewGateTest(unittest.TestCase):
     GATE = {"path": "src/ameesh/merge_queue.py", "class": "sensitive",
             "rule": ["src/ameesh/merge_queue.py"]}
 
-    def gate(self, marks, klass=None, frozen=A, item=None):
+    def gate(self, marks, klass=None, frozen=A, item=None, db=None):
         if isinstance(klass, str):
             klass = {"class": klass, "doubt": False}
             if klass["class"] == "sensitive":
                 klass["files"] = [self.PLAIN]
         with mock.patch.object(merge_queue, "actor_family", side_effect=_family):
-            return merge_queue.review_gate(None, marks, frozen,
+            return merge_queue.review_gate(db, marks, frozen,
                                            klass=klass or {"class": "sensitive",
                                                            "doubt": False,
                                                            "files": [self.PLAIN]},
@@ -188,6 +191,74 @@ class ReviewGateTest(unittest.TestCase):
                         klass=klass)
         self.assertFalse(out["ok"], "l'avis de la famille de l'auteur ne compte pas")
         self.assertEqual([a["actor"] for a in out["accepted"]], ["rev1"])
+
+    def test_a_reassigned_lot_excludes_its_previous_author(self):
+        # #1515 N1 : le journal dit les assignés précédents ; un lot réassigné
+        # ne peut pas compter l'avis de l'auteur d'origine (rev2, famille
+        # claude : sans la lecture du journal, son avis passerait en normal).
+        item = {"assignee": "author", "id": 42}
+        events = [{"note": "assigned to author (before: rev2)"}]
+        with mock.patch.object(merge_queue.work, "events", return_value=events):
+            out = self.gate(_marks(_mark("frozen", A), _verdict("rev2")),
+                            klass="normal", item=item, db=object())
+        self.assertFalse(out["ok"], "un ancien assigné reste auteur")
+        self.assertEqual(out["authors"], ["author", "rev2"])
+        with mock.patch.object(merge_queue.work, "events", return_value=events):
+            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                            klass="normal", item=item, db=object())
+        self.assertTrue(out["ok"], out["why"])
+
+    def test_assignees_reads_the_whole_journal(self):
+        events = [{"note": "assigned to b (before: a)"},
+                  {"note": "assigned to a (before: nobody)"},
+                  {"note": "note sans rapport"}]
+        with mock.patch.object(merge_queue.work, "events", return_value=events):
+            self.assertEqual(merge_queue._assignees(object(), {"assignee": "c", "id": 7}),
+                             ["c", "b", "a"])
+
+    def test_a_corrector_is_an_author_not_a_reviewer(self):
+        # #1515 N1 : le relecteur qui corrige lui-même (§2) devient auteur du
+        # delta ; son avis ne relit pas sa propre correction.
+        item = {"assignee": "author", "id": 43}
+        with mock.patch.object(merge_queue, "_delta_authors", return_value=["rev1"]):
+            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                            klass="normal", item=item)
+        self.assertFalse(out["ok"], "le correcteur relit sa propre correction")
+        self.assertEqual(out["authors"], ["author", "rev1"])
+        with mock.patch.object(merge_queue, "_delta_authors", return_value=["rev1"]):
+            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                            klass="normal", item=item)
+        self.assertTrue(out["ok"], out["why"])
+
+    def test_a_human_reviewer_has_no_model_family_to_count(self):
+        # #1515 (dev4) : une famille humaine n'existe pas. En classe sensible,
+        # l'avis d'un humain ne prouve pas une famille de modèle indépendante ;
+        # il ne remplace pas l'un des deux avis requis (canon §2).
+        out = self.gate(_marks(_mark("frozen", A), _verdict("human:alice")),
+                        klass="sensitive", item={"assignee": "author"})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["accepted"], [])
+
+    def test_an_unknown_commit_author_does_not_block_the_gate(self):
+        # Un outil ou un humain peut signer un commit du delta : son nom est
+        # exclu des relecteurs, mais il n'a pas de famille à comparer et ne
+        # doit pas refuser la porte (contrairement à un assigné hors registre).
+        item = {"assignee": "author", "id": 44}
+        with mock.patch.object(merge_queue, "_delta_authors", return_value=["ameesh"]):
+            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                            klass="sensitive", item=item)
+        self.assertTrue(out["ok"], out["why"])
+
+    def test_the_gate_participants_need_two_reviews(self):
+        # #1515 N2 : lot_class/review_lot/radar/work peuvent affaiblir la
+        # porte (classe, relecteurs, état CI, correcteur) : ils sont critiques.
+        for path in ("src/ameesh/lot_class.py", "src/ameesh/review_lot.py",
+                     "src/ameesh/radar.py", "src/ameesh/work.py"):
+            klass = {"class": "sensitive", "files": [
+                {"path": path, "class": "sensitive", "rule": [path]}]}
+            one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+            self.assertFalse(one["ok"], path)
+            self.assertEqual(one["required"], 2, path)
 
     def test_a_doubt_never_supposes_a_family_and_needs_two(self):
         # B/P1 cx1 (57812f9b..979f2e2b) : un doute (politique ou diff illisible)
@@ -271,6 +342,40 @@ class ReviewGateTest(unittest.TestCase):
         self.assertIn("class: release", out["why"])
         ok = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass="release")
         self.assertTrue(ok["ok"], ok["why"])
+
+
+class DeltaAuthorsTest(unittest.TestCase):
+    """#1515 N1 : les auteurs des commits non-fusion du delta gelé, cible
+    exclue ; un correcteur qui pousse sur la branche devient auteur."""
+
+    def test_a_corrector_commit_is_an_author(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args, name=None):
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
+                if name:
+                    env.update(GIT_AUTHOR_NAME=name,
+                               GIT_AUTHOR_EMAIL=name + "@example.invalid",
+                               GIT_COMMITTER_NAME=name,
+                               GIT_COMMITTER_EMAIL=name + "@example.invalid")
+                proc = subprocess.run(["git", "-C", tmp, *args], check=True,
+                                      capture_output=True, text=True, env=env)
+                return proc.stdout.strip()
+
+            git("init", "-q", "-b", "main")
+            path = os.path.join(tmp, "a")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("a\n")
+            git("add", "a")
+            git("commit", "-qm", "a", name="author")
+            git("checkout", "-qb", "lot")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("b\n")
+            git("commit", "-qam", "b", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            self.assertEqual(
+                merge_queue._delta_authors(tmp, {"branch_target": "main"}, frozen),
+                ["rev1"])
 
 
 class ReadyTest(unittest.TestCase):
