@@ -68,6 +68,29 @@ class OpenForMergeRuleTest(unittest.TestCase):
         self.assertEqual(out["class"], "sensitive")
         add.assert_not_called()
 
+    def test_un_avis_ne_rouvre_pas_la_relecture_d_un_avis(self):
+        """R codex3 #1280 B2 : `open_for_merge` sur un avis (même déclaré
+        `merged`) ne crée pas la relecture de cet avis, et ne lit même pas sa
+        classe — un avis n'a pas de code à relire."""
+        ops = mock.Mock()
+        ops.by_issue_ref.return_value = []
+        ops.open_by_ref.return_value = []
+        ops.events.return_value = []
+        review = {"id": 5, "title": "REVUE #9 : relecture après fusion",
+                  "source": "review-after-merge:#9",
+                  "issue_ref": "review-after-merge:#9", "state": "merged"}
+        with mock.patch.object(review_lot.storage, "of",
+                               return_value=mock.Mock(work=ops)), \
+                mock.patch.object(review_lot.work, "get", return_value=review), \
+                mock.patch.object(review_lot, "class_at_merge",
+                                  return_value={"class": "light"}) as klass, \
+                mock.patch.object(review_lot.work, "add") as add:
+            out = review_lot.open_for_merge(None, 5)
+        self.assertFalse(out["created"])
+        self.assertIn("avis", out["why"])
+        klass.assert_not_called()
+        add.assert_not_called()
+
     def test_une_lecture_impossible_ne_leve_pas(self):
         with mock.patch.object(review_lot.storage, "of",
                                side_effect=RuntimeError("base injoignable")):

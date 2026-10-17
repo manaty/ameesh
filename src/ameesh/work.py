@@ -1979,9 +1979,11 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     introuvable, et ne ferme un `merged` sans branche que si c'est un avis
     rattaché (les fausses fusions historiques). Le titre rattache, il ne
     prouve pas : la clôture `done` d'un avis exige le jalon `verdict` sur le
-    parent relu — quel qu'en soit le verdict, un `blocked` compris, qui est
-    une relecture livrée et pas un GO produit — sans verdict enregistré, la
-    relecture n'a pas eu lieu (arbitrage mesh-design 34598, 14/10). Sur un
+    parent relu, rendu par le lecteur de la mission (son assigné, ou un
+    relecteur désigné) — quel qu'en soit le verdict, un `blocked` compris, qui
+    est une relecture livrée et pas un GO produit — sans ce verdict, la
+    relecture n'a pas eu lieu (arbitrage mesh-design 34598, 14/10 ; lecteur
+    lié à la mission, R codex3 #1280 B1). Sur un
     avis déjà fermé « superseded by » son propre parent (#1043, #1218, #1249,
     #1269), `done` rectifie la raison sans rouvrir : la fermeture, sa date et
     son jalon restent, la rectification est journalisée. Jalon `closed` ; rien
@@ -2034,11 +2036,12 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
                 item.get("issue_ref") or item.get("source") or "?")
             raise WorkError("review #%s not attached to its parent (%s): nothing "
                             "to close done" % (item_id, where))
-        if review and not _parent_verdict(db, parent):
-            raise WorkError("review #%s: no verdict milestone on its parent #%s — "
-                            "the title attaches, it does not prove; record the "
-                            "verdict on the parent first (ameesh work milestone %s "
-                            "verdict ok --sha <sha>)" % (item_id, parent, parent))
+        if review and not _parent_verdict(db, parent, item):
+            raise WorkError("review #%s: no verdict milestone on its parent #%s from its "
+                            "reader (%s) — the title attaches, it does not prove; record "
+                            "the verdict on the parent first (ameesh work milestone %s "
+                            "verdict ok --sha <sha>)"
+                            % (item_id, parent, _reader_label(item), parent))
         if state in MERGED_STATES and not review:
             raise WorkError("lot %s already %s, without branch or review parent: "
                             "nothing to close done" % (item_id, state))
@@ -2103,10 +2106,10 @@ def _rectify_done(db: Db, item: dict, *, review: bool, parent: int | None, done:
     if (str(item.get("close_reason") or "") != "superseded" or current is None
             or int(current) != int(parent)):
         return None
-    if not _parent_verdict(db, parent):
-        raise WorkError("review #%s: no verdict milestone on its parent #%s — the "
-                        "rectification to done requires the delivered verdict"
-                        % (item["id"], parent))
+    if not _parent_verdict(db, parent, item):
+        raise WorkError("review #%s: no verdict milestone on its parent #%s from its "
+                        "reader (%s) — the rectification to done requires the delivered "
+                        "verdict" % (item["id"], parent, _reader_label(item)))
     item_id = int(item["id"])
     text = ("done (rectification: closed `superseded by #%d`, the reviewed parent, "
             "not a replacement)" % parent)
@@ -2133,13 +2136,39 @@ def close_how(reason: str | None, superseded_by: int | None = None) -> str:
     return "abandoned"
 
 
-def _parent_verdict(db: Db, parent: int | None) -> bool:
-    """Le parent relu porte-t-il un jalon `verdict` ? Le titre d'un avis
-    rattache le parent ; il ne prouve pas que la relecture a été rendue. La
-    régularisation `done` d'un avis exige donc ce jalon (arbitrage 34598)."""
+def _mission_readers(item: dict) -> list[str]:
+    """Les lecteurs qui peuvent prouver une mission : son assigné, puis les
+    relecteurs désignés (#2076). L'ensemble est la preuve ; un verdict d'un
+    autre agent ne prouve pas que *cette* mission a été rendue (R codex3
+    #1280, B1 : mission assignée à un lecteur, verdict d'un autre)."""
+    names = []
+    assignee = str(item.get("assignee") or "").strip()
+    if assignee:
+        names.append(assignee)
+    from .work_reviewers import designated
+    names.extend(designated(item))
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def _reader_label(item: dict) -> str:
+    """Le(s) lecteur(s) attendu(s) d'une mission, pour un message de refus."""
+    return ", ".join(_mission_readers(item)) or "aucun lecteur assigné"
+
+
+def _parent_verdict(db: Db, parent: int | None, item: dict | None = None) -> bool:
+    """Le parent relu porte-t-il un jalon `verdict` **du lecteur de cette
+    mission** ? Le titre d'un avis rattache le parent, il ne prouve pas que
+    la relecture a été rendue ; et un verdict d'un autre lecteur ne prouve pas
+    la mission de celui-ci (R codex3 #1280, B1). Sans lecteur, pas de preuve :
+    la mission doit être assignée (ou ses relecteurs désignés) avant `done`."""
     if parent is None:
         return False
-    return any(m.get("kind") == "verdict" for m in milestones(db, parent))
+    readers = set(_mission_readers(item or {}))
+    if not readers:
+        return False
+    return any(m.get("kind") == "verdict"
+               and str(m.get("actor") or "").strip() in readers
+               for m in milestones(db, parent))
 
 
 def _review_parent(item: dict) -> tuple[bool, int | None]:
@@ -2163,6 +2192,13 @@ def _review_parent(item: dict) -> tuple[bool, int | None]:
         match = MANUAL_REVIEW_TITLE_RE.match(title)
         return True, (int(match.group(1)) if match else None)
     return False, None
+
+
+def is_review(item: dict) -> bool:
+    """Ce lot est-il un avis (relecture après fusion, `REVUE #N`, mission
+    `R1`/`R2`) ? Sert à ne pas ouvrir la relecture d'une relecture (garde
+    anti-récursion, #1280 B2)."""
+    return _review_parent(item)[0]
 
 
 def get(db: Db, item_id: int) -> dict | None:
