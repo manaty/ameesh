@@ -1919,9 +1919,6 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
     if idle < policy.orphan_idle:
         return "attend", "modified %s ago (deleted after %s without change)" % (
             fmt_idle(max(0.0, idle)), fmt_idle(policy.orphan_idle))
-    work = unsaved_git_work(path)
-    if work:
-        return "garde", "git work to keep — %s" % work
     holder = tmp_holder(path)
     if holder.startswith(HOLDERS_UNREADABLE) and policy.unreadable_ok:
         # L230 : la première lecture est muette (processus non dumpable) ;
@@ -1930,6 +1927,9 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
         holder = tmp_holder(path, allow=policy.unreadable_ok)
     if holder:
         return "attend", holder
+    work = unsaved_git_work(path)
+    if work:
+        return "garde", "git work to keep — %s" % work
     return "suppression", "left by turn %s of %s, unchanged for %s, held by no " \
         "process" % (str(data.get("turn") or "?")[:8], agent, fmt_idle(idle))
 
@@ -2715,6 +2715,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                              detail="%s; created or modified less than %s ago" % (
                                  why, "24 h" if orphan else "an hour")))
             continue
+        # #2167: holders (including unreadable processes) can retain the
+        # whole host's worktrees; do not pay for Git before that decision.
+        if worktree_in_use(path, allow=allow):
+            plan.append(dict(base, action="attend",
+                             detail="%s; a process is working in it" % why))
+            continue
         st = worktree_state(path)
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
@@ -2726,10 +2732,6 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             continue
         if st["locked"]:
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
-            continue
-        if worktree_in_use(path, allow=allow):
-            plan.append(dict(base, action="attend",
-                             detail="%s; a process is working in it" % why))
             continue
         detail = "%s: kept — %s" % (why, st["reason"])
         # L230: a worktree kept although its lot is merged goes once kept
@@ -3238,7 +3240,59 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
-             runtime=None, artifact_scan: bool = True) -> dict:
+             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0) -> dict:
+    """One host pass across all runners and the CLI, without waiting.
+
+    Periodic callers share the last completed pass's timestamp, under the
+    same stable OS lock. An explicit or pressure-triggered pass bypasses the
+    interval; dry runs never postpone real cleanup. Nothing is cached about
+    whether a path may be deleted.
+    """
+    from .platform import session_lock
+
+    def skipped(reason):
+        return {"host": host, "dry_run": dry_run, "entries": [], "plan": [],
+                "skipped": [reason], "orphans": [], "measure": None}
+
+    lock = session_lock.try_lock(os.path.join(cfg.state_dir, MANAGED_DIR), "host-pass")
+    if lock is None:
+        return skipped("another housekeeping pass is running on this host")
+    try:
+        tick = time.time() if now is None else float(now)
+        key = mesh_key(cfg)
+        try:
+            lock.seek(0)
+            completed_passes = json.loads(lock.read())
+            if not isinstance(completed_passes, dict):
+                completed_passes = {}
+        except ValueError:
+            completed_passes = {}
+        if min_interval_s > 0:
+            try:
+                elapsed = tick - float(completed_passes[key])
+            except (KeyError, TypeError, ValueError):  # new or interrupted timestamp
+                elapsed = -1.0
+            if 0 <= elapsed < min_interval_s:
+                return skipped("housekeeping already ran on this host less than %gs ago"
+                               % min_interval_s)
+        report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
+                           busy=busy, agents_in_turn=agents_in_turn, now=now,
+                           runtime=runtime, artifact_scan=artifact_scan)
+        if not dry_run and not report.get("disabled"):
+            completed_passes[key] = time.time() if now is None else float(now)
+            lock.seek(0)
+            lock.truncate()
+            lock.write(json.dumps(completed_passes).encode("ascii"))
+            lock.flush()
+        return report
+    finally:
+        lock.close()
+
+
+def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
+              busy: bool = False, agents_in_turn: set | None = None,
+              now: float | None = None,
+              runtime=None, artifact_scan: bool = True) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
