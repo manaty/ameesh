@@ -25,8 +25,9 @@ repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
 pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
 plan de repli le demande par `pilot_list` ; une PR de release garde la suite
 complète, scripts/test-plan.py). La liste
-est additive (L160a) : noms en ordre alphabétique et sans doublon, sinon
-refusée.
+est additive (L160a) : on écrit un nom par ligne, en ordre alphabétique et
+sans doublon ; la lecture range et dédoublonne ce qu'une fusion `union`
+(.gitattributes) produit, et refuse toujours un nom inconnu.
 
 `run` exécute la part dans ce processus (`unittest`, verbeux) et mesure la
 durée de chaque module ; `durations` fusionne ces mesures dans la table.
@@ -76,6 +77,11 @@ workflow, ex. `mesure-psycopg-1 …`) ; chaque part le lit ensuite
 recalculait son découpage : deux jobs pouvaient lire deux cartes différentes
 (cache écrit entre-temps) et produire des parts disjointes — un module omis,
 un autre doublé — toutes avec des `durees.json` non vides.
+
+#2224 — avec `--plafond-min N` (le `timeout-minutes` du job de mesure), le plan
+signale (`::warning::`) une part dont l'estimation × `SURCOUT_CHARGE` dépasse
+le plafond : la carte source est mesurée dans un autre contexte et sous-estime
+une part chargée (psycopg 3/6 annulée à 40m46, aucune carte publiée).
 """
 from __future__ import annotations
 
@@ -107,6 +113,10 @@ PLAN_SCHEMA = "ameesh-test-plan/1"
 PART_MESURE = re.compile(r"mesure-(psycopg|psql)-(\d+)$")
 #: lignes de trace gardées dans l'extrait d'un échec
 EXCERPT_LINES = 40
+#: #2224 — surcoût de charge d'une part de mesure : run 39015105210, psycopg
+#: 3/6 estimée 1 588,7 s, 2 316 s de tests réels (×1,46) ; une part dont
+#: l'estimation × ce facteur dépasse le plafond du job est signalée par le plan
+SURCOUT_CHARGE = 1.5
 
 
 def modules(tests: pathlib.Path = TESTS) -> list[str]:
@@ -123,11 +133,11 @@ def read_list(chemin: str | os.PathLike, connus: list[str]) -> list[str]:
     inconnus = sorted(set(noms) - set(connus))
     if inconnus:
         raise SystemExit(f"{chemin} : module(s) inconnu(s) : {', '.join(inconnus)}")
-    # L160a: kept sorted and unique so that two additions never touch the same line
-    if noms != sorted(set(noms)):
-        raise SystemExit(f"{chemin} : liste non rangée (ordre alphabétique, sans doublon) ; "
-                         f"attendu : {', '.join(sorted(set(noms)))}")
-    return noms
+    # L160a : on écrit une entrée par ligne, à sa place alphabétique. #1517 :
+    # la fusion `union` (.gitattributes) de deux ajouts au même endroit garde
+    # les deux lignes dans l'ordre des côtés, ou deux fois la même : la
+    # lecture range et dédoublonne au lieu de refuser.
+    return sorted(set(noms))
 
 
 def test_count(module: str, tests: pathlib.Path = TESTS) -> int:
@@ -346,6 +356,14 @@ def plan(args) -> int:
         lignes.append(f"* {pilote} : {infos['modules']} module(s) en {n} parts "
                       f"(poids {infos['source']}, {infos['repli']} en repli), "
                       f"max ~{max(charges):.0f} s")
+        for entree in sortie["parts"][pilote] if args.plafond_min else ():
+            if entree["estimate_s"] * SURCOUT_CHARGE > args.plafond_min * 60:
+                print(f"::warning::mesure {entree['label']} estimée "
+                      f"{entree['estimate_s']:.0f} s : ×{SURCOUT_CHARGE} sous charge, "
+                      f"au-delà du plafond de {args.plafond_min} min", flush=True)
+                lignes.append(f"  * ⚠ {entree['label']} : ~{entree['estimate_s']:.0f} s, "
+                              f"marge ×{SURCOUT_CHARGE} au-delà du plafond "
+                              f"{args.plafond_min} min")
     texte = "\n".join(lignes) + "\n"
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as fh:
@@ -723,6 +741,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--map", help="carte (carte.json.gz) : durées sous mesure ; "
                    "tests/parts/durees.json en repli")
     p.add_argument("--summary", help="écrit aussi le résumé Markdown dans ce fichier")
+    p.add_argument("--plafond-min", type=int,
+                   help="timeout-minutes du job de mesure : signale une part trop "
+                   "proche du plafond (#2224)")
     args = ap.parse_args(argv)
     if args.commande == "run" and not args.parts and not args.plan:
         ap.error("run: --parts or --plan required")

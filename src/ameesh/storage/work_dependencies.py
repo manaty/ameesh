@@ -36,6 +36,8 @@ class WorkDependencies(abc.ABC):
         The caller supplies candidates with no remaining planned wait, in
         the closure transaction while holding the dependency-graph lock.
         Recheck state and assignee when writing; return only changed ids.
+        A lot pinned to a Process workflow is never released here: its hold
+        is lifted only by a `release` command of the registry (#1922/B4).
         """
 
     @abc.abstractmethod

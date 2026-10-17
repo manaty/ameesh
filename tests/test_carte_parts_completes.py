@@ -71,7 +71,7 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_le_miroir_couvre_la_matrice_de_mesure(self):
         matrice = sorted(f"mesure-{p}-{n}" for p, n, _ in INCLUDE.findall(WORKFLOW))
-        self.assertEqual(len(matrice), 6, "matrice de mesure inattendue")
+        self.assertEqual(len(matrice), 10, "matrice de mesure inattendue")
         m = MIROIR.search(WORKFLOW)
         self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
         miroir = sorted(m.group(2).split())
@@ -80,9 +80,24 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_la_mesure_psql_est_decoupee(self):
         # B : une seule part de 45 modules pesait 38 min de mur pour 40 de
-        # plafond, annulée deux fois.
+        # plafond, annulée deux fois ; le run 38845518821 (16/10) a annulé
+        # psql 1/2 et 2/2, psycopg 2/4 et 3/4 à 40m30 : 4 parts psql et 6
+        # parts psycopg (arbitrage pilote ; plafond porté à 60 min par #2224).
         psql = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW) if p == "psql"]
-        self.assertEqual(psql, [("psql", "1", "2"), ("psql", "2", "2")])
+        self.assertEqual(psql, [("psql", str(n), "4") for n in range(1, 5)])
+        psycopg = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW)
+                   if p == "psycopg"]
+        self.assertEqual(psycopg, [("psycopg", str(n), "6") for n in range(1, 7)])
+
+    def test_le_plafond_des_mesures_est_celui_que_le_plan_verifie(self):
+        # #2224 : psycopg 3/6 annulée à 40m46 (run 39015105210), aucune carte.
+        # Plafond à la borne de #755, et le plan vérifie sa marge sur la même
+        # valeur.
+        plafond = re.search(r"^    timeout-minutes:\s*(\d+)", _job("mesure"), re.M)
+        self.assertEqual(plafond.group(1), "60")
+        verifie = re.search(r"--plafond-min (\d+)", _job("plan-mesure"))
+        self.assertIsNotNone(verifie, "le plan ne vérifie pas le plafond des mesures")
+        self.assertEqual(verifie.group(1), plafond.group(1))
 
     def test_le_decoupage_sous_mesure_lit_la_carte(self):
         # A : le surcoût de la mesure varie de 1,2× à 9,3× selon les modules ;
@@ -238,15 +253,30 @@ class TemoinCacheChangeTest(unittest.TestCase):
 class PlanMesureTest(unittest.TestCase):
     """La commande `test-parts.py plan` : les parts attendues, une fois."""
 
-    def _plan(self, *noms: str) -> dict:
+    def _plan(self, *noms: str, options: tuple = ()) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp) / "plan.json"
             proc = subprocess.run(
                 [sys.executable, str(REPO / "scripts" / "test-parts.py"), "plan",
-                 "--out", str(out), "--parts", " ".join(noms)],
+                 "--out", str(out), "--parts", " ".join(noms), *options],
                 capture_output=True, text=True, cwd=REPO)
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.sortie = proc.stdout
             return json.loads(out.read_text(encoding="utf-8"))
+
+    def test_le_plan_signale_une_part_proche_du_plafond(self):
+        # #2224 : une part dont l'estimation × SURCOUT_CHARGE dépasse le
+        # plafond est signalée ; sous la marge, rien.
+        plan = self._plan("mesure-psycopg-1", "mesure-psycopg-2",
+                          options=("--plafond-min", "1"))
+        lourdes = [e["label"] for e in plan["parts"]["psycopg"]
+                   if e["estimate_s"] * parts.SURCOUT_CHARGE > 60]
+        self.assertTrue(lourdes)
+        for label in lourdes:
+            self.assertIn(f"::warning::mesure {label} estimée", self.sortie)
+        self._plan("mesure-psycopg-1", "mesure-psycopg-2",
+                   options=("--plafond-min", "100000"))
+        self.assertNotIn("::warning::", self.sortie)
 
     def test_le_plan_partitionne_les_modules(self):
         plan = self._plan("mesure-psycopg-1", "mesure-psycopg-2")

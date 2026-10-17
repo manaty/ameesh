@@ -19,12 +19,14 @@ Quatre types d'alerte, levés par `ameesh alerts` et poussés par
   fenêtre si rien ne change (même définition que les « pertes à la remise à
   zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ;
 * `idle_capacity` : des agents réveillables (mode `execute`, exécuteur
-  vivant, au repos, sous leur budget, sans lot ni courrier) depuis plus du
-  seuil, alors que du travail attend (lots ouverts sans assigné, courrier en
+  vivant, au repos, sous leur budget, sans lot actionnable ni courrier)
+  alors que du travail attend (lots ouverts sans assigné, courrier en
   souffrance chez un agent occupé) ou que des agents payés au token
   travaillent pendant que des agents au forfait dorment (`forfait_au_repos`,
-  le cas aggravant). Le message propose l'action : répartir, ou réveiller
-  l'orchestrateur ;
+  le cas aggravant). #1677 : le repos se lit sur les lots actionnables
+  (`actionable_lots`), pas sur le temps depuis le dernier tour — le seuil ne
+  sert plus que de repli sans ce relevé. Le message propose l'action :
+  répartir, ou réveiller l'orchestrateur ;
 * `orchestrator_held` : un orchestrateur tenu par une session interactive
   (`ameesh attach`) depuis plus du seuil, avec du courrier non lu — il ne
   répartit plus (prolonge 0030) ;
@@ -78,7 +80,8 @@ PLAN_PACE_MIN_WINDOW_S = 86400.0
 PLAN_PACE_MIN_ELAPSED = 0.25
 #: âge maximal des relevés de jauge lus (une fenêtre de 7 jours + marge)
 PLAN_GAUGES_SINCE_S = 8 * 86400.0
-#: `idle_capacity` : au repos depuis 30 min
+#: `idle_capacity` : seuil (repli quand le relevé ne porte pas
+#: `actionable_lots` ; #1677)
 DEFAULT_IDLE_CAPACITY_S = 1800.0
 #: `orchestrator_held` : tenu par `attach` depuis 30 min
 DEFAULT_ORCHESTRATOR_HELD_S = 1800.0
@@ -101,6 +104,17 @@ LOTS_WAITING_ON_OTHERS = ("qa", "waiting_human", "blocked")
 ORCHESTRATOR_ROLES = ("orchestrateur", "orchestrator")
 #: L165b : rôles de l'agent de conception, prévenu aussi d'`idle_capacity`
 DESIGN_ROLES = ("conception", "design")
+#: L242c : rôles qui rendent un agent critique (jamais en pause budget tant
+#: qu'un compte a de la marge), par défaut ; une organisation les règle par
+#: `critical_roles` dans son federation.yaml (manaty/home#25)
+CRITICAL_ROLES = ("orchestrateur", "conception", "auditeur", "relecture")
+#: L242c : les autres noms reconnus d'un rôle dans `roles`/`role` d'une fiche
+ROLE_SYNONYMS = {"orchestrateur": ("orchestrator",), "conception": ("design",),
+                 "auditeur": ("auditor",), "relecture": ("review", "reviewer")}
+_ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in aliases}
+#: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
+#: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
+READ_ERRORS = ("canon-git-error", "frontmatter-invalid", "federation-invalid")
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -188,9 +202,17 @@ def _common_responsible(rows) -> str | None:
 # --------------------------------------------------------------------------
 
 def _gauge(row: dict) -> cost_mod.Gauge:
-    return cost_mod.Gauge(row["harness"], row["key"], float(row.get("used") or 0.0),
+    """La jauge d'une ligne d'historique, portée par modèle restituée.
+
+    #1789/N6 : la clé d'un seau propre à un modèle porte sa portée
+    (`seven_day@fable`, #1580) — l'historique ne stocke pas le `scope` ; le
+    relire ici évite qu'un seau de modèle soit pris pour la fenêtre générale
+    du compte (alertes de sous-utilisation, `plan_underused`)."""
+    key = row["key"]
+    _, _, scope = key.partition("@")
+    return cost_mod.Gauge(row["harness"], key, float(row.get("used") or 0.0),
                           row.get("resets_at_ts"), float(row.get("window_s") or 0.0)
-                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]))
+                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]), scope=scope)
 
 
 def expiring(gauge, now: float) -> tuple | None:
@@ -279,9 +301,13 @@ def plan_underused(db, listing: list, now: float, *,
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
+        # #1789/N6 : un seau propre à un modèle (#1580 tranche 3) ne rend pas
+        # la capacité générale du compte inutilisable — seules les fenêtres
+        # générales se taisent entre elles ; un seau de modèle reste alerte.
+        blocking = [(g, seen) for g, seen in live if not getattr(g, "scope", "")]
         for gauge, seen in live:
             if any(other.exceeded(now, 0.0, multiplier, ceiling)
-                   for other, _ in live if other is not gauge):
+                   for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
@@ -363,17 +389,357 @@ def _bare(name: str) -> str:
 def role_orchestrators(canons, roles=None) -> set:
     """Les agents dont la fiche Agent du canon nomme un rôle d'orchestrateur
     (`roles` ou `role` : `orchestrateur`, `orchestrator`), ou l'un des
-    `roles` donnés."""
-    wanted = {str(r).strip().lower() for r in (roles or ORCHESTRATOR_ROLES)}
+    `roles` donnés (synonymes dans les deux sens, L242c)."""
+    wanted = {_canonical(r) for r in (roles or ORCHESTRATOR_ROLES)}
     found = set()
     for canon in canons or []:
         for agent in getattr(canon, "agents", None) or []:
-            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
-            fiche_roles = data.get("roles") or data.get("role") or []
-            if isinstance(fiche_roles, str):
-                fiche_roles = [fiche_roles]
-            if any(str(r).strip().lower() in wanted for r in fiche_roles):
+            if wanted & set(_card_roles(agent)):
                 found.add(agent.title)
+    return found
+
+
+def _canonical(role) -> str:
+    """Le nom d'un rôle, en minuscules, synonyme ramené au rôle (L242c,
+    #424 r1 : `review` et `relecture` se reconnaissent dans les deux sens)."""
+    role = str(role).strip().lower()
+    return _ROLE_OF.get(role, role)
+
+
+def _card_roles(agent) -> list:
+    """Les rôles d'une fiche Agent tels que le canon les a validés (`roles`
+    analysé : une valeur invalide n'en donne aucun, #424 r1), sinon `role:`
+    s'il est un texte ; ramenés à leur nom (`_canonical`). Une fiche sans
+    analyse (objet factice) : le frontmatter, liste de textes ou texte."""
+    data = getattr(getattr(agent, "fiche", None), "data", None) or {}
+    if hasattr(agent, "roles"):
+        named = agent.roles
+    else:
+        named = data.get("roles")
+        if isinstance(named, str):
+            named = [named]
+        elif not (isinstance(named, list) and all(isinstance(r, str) for r in named)):
+            named = None
+    if named is None:
+        single = data.get("role")
+        named = [single] if isinstance(single, str) else []
+    return [role for role in (_canonical(r) for r in named) if role]
+
+
+def roles_declared(canons) -> bool:
+    """L242c : une fiche Agent d'un des canons déclare-t-elle des rôles ?
+    Alors seuls les rôles désignent ses orchestrateurs (plus de déduction par
+    les lots confiés)."""
+    return any(_card_roles(agent)
+               for canon in canons or [] for agent in getattr(canon, "agents", None) or [])
+
+
+def _owners(row, canons) -> list:
+    """Les canons propriétaires de `row` (un canon sans `owns` : tous)."""
+    return [c for c in canons or []
+            if getattr(c, "owns", None) is None or c.owns((row or {}).get("canon"))]
+
+
+def _card(canon, name):
+    return next((a for a in getattr(canon, "agents", None) or [] if a.title == name), None)
+
+
+def deduces(row, canons) -> bool:
+    """L242c (#424 r1) : la déduction par les lots confiés vaut pour un agent
+    dont l'organisation (son canon propriétaire) ne déclare aucun rôle."""
+    return not roles_declared(_owners(row, canons))
+
+
+def card_role(row, canons, roles) -> bool:
+    """La fiche de l'agent `row`, dans son canon propriétaire seulement, nomme-
+    t-elle l'un des `roles` ? Une fiche homonyme d'un autre canon ne compte
+    jamais (#324 r1, #424 r1)."""
+    wanted = {_canonical(r) for r in roles}
+    for canon in _owners(row, canons):
+        if not getattr(canon, "readable", True):
+            continue
+        definition = _card(canon, row["name"])
+        if definition is not None and wanted & set(_card_roles(definition)):
+            return True
+    return False
+
+
+def critical_roles(canon) -> tuple:
+    """L242c : les rôles critiques d'une organisation (`critical_roles` de son
+    federation.yaml, liste ; vide : aucun), sinon `CRITICAL_ROLES` ; chacun
+    ramené à son nom (`_canonical`)."""
+    declared = (getattr(canon, "federation", None) or {}).get("critical_roles")
+    if isinstance(declared, str):
+        declared = [declared]
+    if not isinstance(declared, (list, tuple)):
+        declared = CRITICAL_ROLES
+    return tuple(dict.fromkeys(role for role in (_canonical(r) for r in declared
+                                                 if isinstance(r, str)) if role))
+
+
+def fully_read(canon) -> bool:
+    """L242c (#424 r2) : le canon s'est-il lu en entier ? Pas s'il est
+    illisible, ni si une fiche ou son manifeste n'a pu être lu (`READ_ERRORS`
+    de niveau erreur dans `load_findings`) : une fiche manquante ne doit pas
+    faire perdre un rôle en silence."""
+    if not getattr(canon, "readable", True):
+        return False
+    return not any(getattr(f, "code", None) in READ_ERRORS
+                   and getattr(f, "severity", None) == "error"
+                   for f in getattr(canon, "load_findings", None) or ())
+
+
+#: L242c (#424 r3) : verdict perdu (cache absent, illisible, corrompu, valeur
+#: invalide, fichier ou dossier dont on ne peut se fier) — « inconnu » vaut
+#: critique
+UNKNOWN = "unknown"
+#: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
+#: relus par un exécuteur redémarré et par `ameesh resume` (#424 r4 : dans
+#: leur dossier, `CRITICAL_DIR`)
+#: #424 r4 : le dossier du cache (0700, à nous ; verrouillé lui-même) et ses
+#: données (renommées seules)
+CRITICAL_DIR, CRITICAL_DATA = "critical-known", "known.json"
+
+
+class _Untrusted(OSError):
+    """#424 r4 : le dossier du cache n'est pas digne de confiance."""
+
+
+def _memory_path(cfg) -> str | None:
+    state = getattr(cfg, "state_dir", None)
+    return os.path.join(state, CRITICAL_DIR) if state else None
+
+
+def _memory_dir(cfg, *, create: bool) -> int | None:
+    """#424 r4 : le dossier du cache, ouvert sans suivre de lien
+    (`O_DIRECTORY|O_NOFOLLOW`, relatif au dossier d'état), à nous et en 0700 —
+    tout le reste s'ouvre relativement à lui (`dir_fd`) : un parent remplacé ou
+    lié ne redirige rien. None s'il n'existe pas (et `create` faux) ;
+    `_Untrusted` s'il n'est pas digne de confiance.
+
+    Résiduel accepté (#424 r5, mesh-design) : le dossier d'état lui-même
+    s'ouvre en suivant les liens, sans contrôle de propriétaire. Le détourner
+    suppose une action malveillante sous le même UID dans le dossier d'état
+    de l'exécuteur, hors de notre modèle de menace."""
+    import stat
+    state = os.open(cfg.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        if create:
+            try:
+                os.mkdir(CRITICAL_DIR, 0o700, dir_fd=state)
+            except FileExistsError:
+                pass
+        try:
+            fd = os.open(CRITICAL_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, dir_fd=state)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:      # ELOOP / ENOTDIR : un lien, un fichier
+            raise _Untrusted("critical cache dir: %s" % exc) from exc
+    finally:
+        os.close(state)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        os.close(fd)
+        raise _Untrusted("critical cache dir: not ours, or not 0700")
+    return fd
+
+
+def _read_memory(folder: int):
+    """#424 r4 : `(état, données)` du cache dans le dossier `folder` : `missing`,
+    `ok` (le dict tel qu'écrit, valeurs invalides comprises) ou `corrupt`
+    (illisible, pas du JSON objet, lien, pas un fichier ordinaire, pas à nous,
+    lisible par d'autres)."""
+    import json
+    import stat
+    try:
+        fd = os.open(CRITICAL_DATA, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=folder)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "corrupt", None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
+                or st.st_mode & 0o077:
+            return "corrupt", None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return "corrupt", None
+    finally:
+        os.close(fd)
+    return ("ok", data) if isinstance(data, dict) else ("corrupt", None)
+
+
+def critical_memory(cfg) -> dict | None:
+    """Les derniers verdicts lus : {agent: True|False|None}, None pour une
+    valeur invalide. {} sans dossier d'état configuré (la mémoire du processus
+    seule). None (fail-closed, tout y est inconnu) : cache absent (#424 r4 :
+    effacé ou masqué, jamais « rien n'a été lu »), illisible, corrompu, ou
+    dont on ne peut se fier (`_memory_dir`, `_read_memory`)."""
+    if _memory_path(cfg) is None:
+        return {}
+    try:
+        folder = _memory_dir(cfg, create=False)
+    except OSError:
+        return None
+    if folder is None:
+        return None
+    try:
+        state, data = _read_memory(folder)
+    finally:
+        os.close(folder)
+    if state != "ok":
+        return None
+    return {str(k): v if isinstance(v, bool) else None for k, v in data.items()}
+
+
+def remembered(memory: dict | None, name: str):
+    """Le dernier verdict lu de `name` : True, False, ou `UNKNOWN` (vaut
+    critique, `critical_verdict`) — cache perdu, valeur invalide, ou nom
+    absent du cache (#424 r6 : jamais lu, ou cache recréé depuis par un
+    agent d'un autre canon ; aucun « non » faute de lecture)."""
+    if memory is None or name not in memory:
+        return UNKNOWN
+    value = memory[name]
+    return value if isinstance(value, bool) else UNKNOWN
+
+
+def remember_critical(cfg, name: str, verdict: bool) -> bool:
+    """Retient le verdict lu de `name` ; vrai quand le disque le porte (déjà,
+    ou une fois écrit) — comparé au disque, jamais à la mémoire du processus
+    (#424 r4). Sous un verrou (`flock` sur le dossier lui-même, ouvert une
+    fois : aucun chemin de verrou à remplacer) : relecture, mise à jour, fichier temporaire exclusif, fsync, renommage des
+    seules données, fsync du dossier, mode 0600. Un cache corrompu n'est
+    jamais réécrit (il reste « inconnu », critique) ; ses valeurs invalides
+    sont gardées telles quelles. Ne lève jamais : l'appelant réessaie.
+
+    Résiduel accepté (#424 r5, mesh-design) : le dossier du cache remplacé
+    entre son ouverture et le `flock` : l'écriture va dans le dossier
+    détaché, la lecture suivante voit le nouveau (absent ou corrompu :
+    critique). Cela suppose une action malveillante sous le même UID dans le
+    dossier d'état de l'exécuteur, hors de notre modèle de menace."""
+    import fcntl
+    import json
+    if _memory_path(cfg) is None:
+        return False
+    try:
+        folder = _memory_dir(cfg, create=True)
+    except OSError:
+        return False
+    if folder is None:
+        return False
+    tmp = None
+    try:
+        fcntl.flock(folder, fcntl.LOCK_EX)
+        state, known = _read_memory(folder)
+        if state == "corrupt":
+            return False
+        known = dict(known or {})
+        if known.get(name) is verdict:
+            return True
+        known[name] = verdict
+        tmp = ".%s.%d.%s" % (CRITICAL_DATA, os.getpid(), os.urandom(6).hex())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o600, dir_fd=folder)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(known, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CRITICAL_DATA, src_dir_fd=folder, dst_dir_fd=folder)
+        tmp = None
+        os.fsync(folder)
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp, dir_fd=folder)
+            except OSError:
+                pass
+        os.close(folder)
+
+
+def critical_by_role(row, canons) -> bool | None:
+    """L242c : l'agent du registre `row` porte-t-il un rôle critique de son
+    organisation, dans la fiche de son canon propriétaire ? La persona
+    `auditeur` l'est sans fiche tant que le rôle auditeur est critique.
+    None (#424 r1) : son canon propriétaire n'est pas chargé ou illisible —
+    inconnu, jamais « non » (`critical_verdict`) ; de même s'il n'a été lu
+    qu'en partie (#424 r2, `fully_read`)."""
+    from .alert_briefs import AUDITOR_NAME
+    owners = _owners(row, canons)
+    if not owners or not all(fully_read(c) for c in owners):
+        return None
+    for canon in owners:
+        roles = critical_roles(canon)
+        if row.get("name") == AUDITOR_NAME and "auditeur" in roles:
+            return True
+        if card_role(row, [canon], roles):
+            return True
+    return False
+
+
+#: #424 r7 : les agents d'un canon étranger déjà signalés par ce processus
+_FOREIGN_WARNED: set = set()
+
+
+def foreign_canon(row, canons, *, complete: bool) -> str | None:
+    """#424 r7 (mesh-design) : le canon de `row` quand AUCUN canon de l'hôte ne
+    le possède, tous les canons configurés chargés (`complete`) ET lus en
+    entier (`fully_read`, #424 r8) — un état connu et permanent, pas une
+    panne : l'agent garde le verdict d'avant L242c (non critique). Un canon
+    configuré mais illisible ou pas encore chargé, ou dont le manifeste n'a
+    pas pu être lu, n'est pas étranger : son identité peut être restée le nom
+    du dossier (`canon.py`, `_identify` avant manifeste), donc rien ne prouve
+    que l'agent n'est d'aucun canon — le verdict connu/cache puis la règle
+    fail-safe s'appliquent (#424 r8). None sinon."""
+    if (not complete or not canons
+            or not all(fully_read(c) for c in canons)     # #424 r8
+            or _owners(row, canons)):
+        return None
+    return (row or {}).get("canon") or "?"
+
+
+def warn_foreign(name: str) -> bool:
+    """#424 r7 : vrai la première fois seulement (un avertissement par
+    processus et par agent d'un canon étranger)."""
+    if name in _FOREIGN_WARNED:
+        return False
+    _FOREIGN_WARNED.add(name)
+    return True
+
+
+def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
+    """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
+    l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire
+    illisible (#424 r1) : le dernier verdict lu (`known`, `remembered`) ;
+    sinon — perdu, invalide, jamais lu (#424 r6) — critique (fail-safe).
+    Jamais une baisse silencieuse ; la surcharge `critical_agents` se juge
+    avant."""
+    from .alert_briefs import AUDITOR_NAME
+    if not configured and not canons:
+        return row.get("name") == AUDITOR_NAME, False
+    verdict = critical_by_role(row, canons)
+    if verdict is not None:
+        return verdict, False
+    if isinstance(known, bool):
+        return known, True
+    return True, True
+
+
+def critical_candidates(canons) -> set:
+    """Les noms qui PEUVENT être critiques par leur rôle (toute fiche, tout
+    canon) : un nom hors de cet ensemble évite la lecture du registre."""
+    from .alert_briefs import AUDITOR_NAME
+    found = {AUDITOR_NAME}
+    for canon in canons or []:
+        roles = critical_roles(canon)
+        if roles:
+            found |= role_orchestrators([canon], roles)
     return found
 
 
@@ -388,9 +754,16 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
                   roles=ORCHESTRATOR_ROLES, history: bool = True) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
-    `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
-    a confié des lots (délégation ou `work assign`) dans les 30 derniers
-    jours, sauf avec `history=False` (#740). Seulement des agents du registre."""
+    `role`) nomme un orchestrateur (ou l'un des `roles` donnés) dans le canon
+    propriétaire de l'agent (#424 r1), ou agent qui a confié des lots
+    (délégation ou `work assign`) dans les 30 derniers jours — tant que son
+    organisation ne déclare aucun rôle (L242c, `deduces`) — sauf avec
+    `history=False` (#740). Seulement des agents du registre.
+
+    Modèle de rôle (autorité : correction, plan, analyse) : il inclut
+    l'historique. Pour les **destinataires d'alerte**, l'historique ne confère
+    pas le rôle : `alert_orchestrators` (#1114), qui exclut les assigneurs
+    récents non déclarés."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -399,17 +772,36 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    found |= role_orchestrators(canons, roles)
-    try:
-        if history:
-            found |= {_bare(n) for n in storage.of(db).operations.assigners(
-                since_s=ASSIGNERS_SINCE_S)}
-    except Exception:
-        pass
+    found |= {row["name"] for row in listing if card_role(row, canons, roles)}
+    if history:
+        deducing = [row for row in listing if deduces(row, canons)]
+        if deducing:
+            try:
+                assigners = {_bare(n) for n in storage.of(db).operations.assigners(
+                    since_s=ASSIGNERS_SINCE_S)}
+            except Exception:
+                assigners = set()
+            found |= {row["name"] for row in deducing if row["name"] in assigners}
     # L123 : le chat du propriétaire transmet, il ne répartit pas
     from .chat import is_chat_agent
     chats = {row["name"] for row in listing if is_chat_agent(row)}
     return sorted(n for n in found if n in names and n not in chats)
+
+
+def alert_orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
+    """Les orchestrateurs qui peuvent recevoir une alerte : déclarés
+    (`--orchestrators`, `AMEESH_ALERT_ORCHESTRATORS`) ou rôle `orchestrateur`
+    d'une fiche Agent du canon. L'historique des lots confiés (30 jours) ne
+    confère pas ce rôle (#1114) : un agent qui a seulement assigné récemment
+    n'est pas un destinataire, et ne peut donc pas entrer dans la boucle
+    « recevoir l'alerte pousse à assigner, ce qui entretient la liste ».
+
+    Le repli « sans équipe » d'`alert_briefs._of_teams` ne s'applique plus
+    qu'aux agents présents ici : un hub sans équipe (bureau) est donc admis
+    seulement par déclaration explicite — rôle au canon ou
+    `AMEESH_ALERT_ORCHESTRATORS` —, jamais par le seul historique."""
+    return orchestrators(cfg, db, listing, declared=declared, canons=canons,
+                         history=False)
 
 
 def orchestrator_held(listing: list, now: float, orchestras: list, *,
@@ -468,14 +860,24 @@ def session_lot_busy(row: dict, *, waiting_free: bool = False) -> bool:
 
 
 def idle_agents(listing: list, now: float, idle_s: float, *,
-                waiting_free: bool = False) -> list:
-    """Les agents réveillables au repos sans lot ni courrier depuis au moins
-    `idle_s` : mode `execute`, exécuteur vivant (pas une session attachée),
-    au repos (ni en tour, ni en pause de budget, ni arrêtés). Partagé par
-    `idle_capacity`, `backlog_empty` et la prise automatique (L119) ;
-    `waiting_free` : voir `free_of_lots` (L165b) ; une consigne en attente
-    et un lot de session qui l'occupe (`session_lot_busy`) occupent l'agent,
-    comme pour la prise (`backlog._awaited`)."""
+                waiting_free: bool = False, actionable_idle: bool = False) -> list:
+    """Les agents réveillables au repos : mode `execute`, exécuteur vivant (pas
+    une session attachée), au repos (ni en tour, ni en pause de budget, ni
+    arrêtés). Partagé par `idle_capacity`, `backlog_empty` et la prise
+    automatique (L119) ; `waiting_free` : voir `free_of_lots` (L165b) ; une
+    consigne en attente et un lot de session qui l'occupe
+    (`session_lot_busy`) occupent l'agent, comme pour la prise
+    (`backlog._awaited`).
+
+    #1677 : `actionable_idle` lit le repos sur les lots **actionnables**
+    (`actionable_lots`, lu par `operations.listing` : rien qui l'occupe,
+    aucune correction attendue d'un verdict bloquant) au lieu du temps depuis
+    le dernier tour — un agent sans lot prend des tours de courrier toutes les
+    quelques minutes et ne serait donc jamais « au repos » (N9). La **prise**
+    de lots et les alertes de sous-utilisation s'en servent ; la remise
+    (`handoff.hand`, L233b) garde son contrat d'origine, « au repos depuis au
+    moins `idle_s` », qu'un relevé sans `actionable_lots` (bancs, appels
+    anciens) impose de toute façon."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -489,9 +891,12 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
         if waiting_free and (row.get("has_pending_prompt")
                              or session_lot_busy(row, waiting_free=True)):
             continue
-        since = idle_since(row)
-        if not since or now - since < idle_s:
+        if int(row.get("actionable_lots") or 0) > 0:
             continue
+        if not (actionable_idle and "actionable_lots" in row):
+            since = idle_since(row)
+            if not since or now - since < idle_s:
+                continue
         idle.append(row)
     return idle
 
@@ -503,21 +908,31 @@ def is_backlog_item(lot: dict) -> bool:
             and lot.get("state") == "intake")
 
 
-def waiting_project_lots(lots: list, *, db=None) -> list:
+def waiting_project_lots(lots: list, *, db=None, now: float | None = None) -> list:
     """Les lots du projet ouverts sans assigné (hors file d'amélioration) : du
     travail demandé qui attend qu'on le confie. Tant qu'il y en a, la prise
     automatique s'abstient (0037) et `idle_capacity` le signale. Quand la base
-    est fournie, seuls les lots sans dependance explicite ouverte attendent
-    un preneur ; les autres attendent leurs amonts."""
+    est fournie, seuls les lots **démarrables** attendent un preneur : un lot
+    qu'une attente planifiée retient (L368 : dépendance explicite ouverte,
+    engagement `depends_on` d'un lot ou d'un paquet ouvert, début prévu à
+    venir) attend son prérequis, pas un agent (#1625).
+
+    Une lecture des attentes en échec est conservatrice : le lot reste compté,
+    la porte reste fermée — jamais une amélioration prise sur un doute."""
     waiting = [lot for lot in lots
                if not (lot.get("assignee") or "").strip()
                and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
     if not waiting or db is None:
         return waiting
-    blocked = {int(edge["work_item_id"]) for edge in
-               storage.of(db).work_dependencies.for_items([lot["id"] for lot in waiting])
-               if edge["blocking"]}
-    return [lot for lot in waiting if int(lot["id"]) not in blocked]
+    from . import db as db_mod
+    from . import planned_waits
+    try:
+        waits = planned_waits.read(db, waiting, now=now)
+    except db_mod.Unavailable:
+        raise
+    except Exception:  # noqa: BLE001 - attentes illisibles : on ne devine pas
+        return waiting
+    return [lot for lot in waiting if int(lot["id"]) not in waits]
 
 
 def _budget_held(cfg, db, rows: list) -> dict:
@@ -587,7 +1002,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     pressured = pressured or {}
     # L165b : un agent dont tous les lots attendent un autre est au repos
-    idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True)
+    idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True,
+                                       actionable_idle=True)
             if row["name"] not in held]
     on_hold = sorted((row["name"], row.get("host")) for row in idle
                      if row.get("host") in held_hosts)
@@ -621,8 +1037,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if not (waiting_lots or backlog or aggravating):
         return []
     names = sorted(row["name"] for row in idle)
-    parts = ["%d wakeable agent(s) idle without a lot in progress for more than %s: %s"
-             % (len(names), _duration(idle_s), ", ".join(names))]
+    # #1677 (b) : le repos se lit sur les lots actionnables, plus sur le temps
+    # depuis le dernier tour (N9) — le texte ne promet plus une durée.
+    parts = ["%d wakeable agent(s) idle without an actionable lot: %s"
+             % (len(names), ", ".join(names))]
     if waiting_lots:
         parts.append("%d open lot(s) without an assignee (%s)" % (
             len(waiting_lots), ", ".join("#%d" % int(l["id"]) for l in waiting_lots[:8])
@@ -732,7 +1150,7 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
         if startable or not lots:
             parts.append("Give them work tied to a lot: ameesh mail send <agent> "
                          "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
-                         "<agent>.")
+                         "<agent> --claim.")
         else:
             parts.append("Do not assign a lot that waits (its blocker is named above): clear the "
                          "blocker, or create a startable lot (ameesh work add, or --new-lot \"title\").")
@@ -921,23 +1339,25 @@ def backlog_empty(db, listing: list, now: float, *,
     invité à remplir la file (`ameesh work backlog add`)."""
     if idle_s <= 0:
         return []
-    idle = idle_agents(listing, now, idle_s)
+    idle = idle_agents(listing, now, idle_s, actionable_idle=True)
     if not idle:
         return []
     # #1696 (N2 de #1242) : une file dont tous les éléments sont bloqués n'est
     # pas prenable — même filtre `ready_only` que la prise automatique (L165).
     if storage.of(db).work.backlog(open_only=True, limit=1, ready_only=True):
         return []
-    # des lots du projet attendent un preneur : c'est `idle_capacity` qui parle
-    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db):
+    # des lots du projet démarrables attendent un preneur : c'est
+    # `idle_capacity` qui parle ; des lots tous retenus par une attente
+    # planifiée ne taisent pas une file vide (#1625)
+    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db, now=now):
         return []
     names = sorted(row["name"] for row in idle)
     return [_alert(
         "backlog_empty", None, None, len(names), idle_s,
-        "%d wakeable agent(s) idle without a lot for more than %s (%s) and the improvement "
+        "%d wakeable agent(s) idle without an actionable lot (%s) and the improvement "
         "backlog is empty. Action: add items with expected value "
         "(ameesh work backlog add), or assign a lot (ameesh work assign)"
-        % (len(names), _duration(idle_s), ", ".join(names)),
+        % (len(names), ", ".join(names)),
         agents=names, responsible=_common_responsible(idle))]
 
 
@@ -971,8 +1391,8 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     paid = paid_harnesses(getattr(cfg, "host", None))
     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
                          pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held, cfg=cfg)
-    orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
-                               canons=canons)
+    orchestras = alert_orchestrators(cfg, db, listing, declared=orchestrators_declared,
+                                     canons=canons)
     for alert in out:
         # L132 : `plan_underused` part aussi aux orchestrateurs (alert_briefs)
         alert["orchestrators"] = list(orchestras)

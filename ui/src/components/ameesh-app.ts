@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // <ameesh-app>: the default assembly of the components, full screen (the
 // standalone page /ui/), with internal navigation (study §2.2). L88 gives
-// the frame and the seven read screens (L89). Outputs are DOM events (`ameesh:*`), never navigation.
+// the frame and the seven read screens (L89); L90 adds the decisions queue,
+// which files an approval request and emits `ameesh:approval-requested`.
+// Per the contract (§2.2) nothing here opens a link or navigates the host:
+// the event goes to the host, and the standalone page shows the link for
+// the human to click. Outputs are DOM events (`ameesh:*`), never navigation.
 import { LitElement, css, html } from "lit";
 import { ApiError, type Client, type Schemas } from "../api/client";
 import { languageOf, pick, translate, type Params } from "../i18n/index";
@@ -138,6 +142,7 @@ export class AmeeshApp extends LitElement {
   #screen() {
     const client = this.#client;
     switch (this.section) {
+      case "decisions": return html`<ameesh-decisions .client=${client} theme=${this.theme}></ameesh-decisions>`;
       case "timeline": return html`<ameesh-timeline .client=${client} project=${this.project} theme=${this.theme}></ameesh-timeline>`;
       case "agent": return html`<ameesh-agent .client=${client} project=${this.project} agent=${this.agent} theme=${this.theme}></ameesh-agent>`;
       case "alerts": return html`<ameesh-alerts .client=${client} theme=${this.theme}></ameesh-alerts>`;
@@ -168,7 +173,7 @@ export class AmeeshApp extends LitElement {
             version: ready.discovery.version, mode: ready.discovery.mode })}</span>` : ""}
       </header>
       <nav aria-label=${this.#t("app.nav")}>
-        <ul>${["projects", "timeline", "agent", "alerts", "hosts", "budget", "thread"].map((section) => html`
+        <ul>${["projects", "decisions", "timeline", "agent", "alerts", "hosts", "budget", "thread"].map((section) => html`
           <li><button type="button" aria-current=${this.section === section ? "page" : "false"}
             @click=${() => { this.section = section; }}>${this.#t(section === "projects" ? "app.home" : "view." + section)}</button></li>`)}</ul>
       </nav>

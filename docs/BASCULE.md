@@ -1036,9 +1036,11 @@ The `installer` step follows the same practice.
    exists**. On the server, as local superuser, over SSH. A missing
    role is not created: that is a separate decision.
 6. `poste.sh redemarrer`: each active `ameesh-runner-agent@<p>` is
-   restarted **one by one**, as soon as `ameesh show <p>` no longer says `running`.
-   A persona in a long turn does not block the others: the script goes back
-   over the list (at most `ATTENTE_MAX`, 2 h). Then `ameesh-notify`, then the
+   restarted **one by one**: the unit is stopped first (SIGTERM closes
+   admission; the turn in progress drains, bounded by `TimeoutStopSec`), the
+   safe point is proven (`ActiveState=inactive` and `MainPID=0`), then it is
+   started. No idle window is awaited: a persona in a long turn no longer
+   blocks or starves the update. Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
    A unit that does not stay active stops the script. So does a runner that
    held its persona's lease before the restart and does not take it again
@@ -1251,11 +1253,14 @@ migrated database, which every update since L60 already verifies. So we migrate
 for the content of each version):
 
 1. `poste.sh verifier`, `poste.sh sauvegarder`.
-2. `poste.sh migrer [REF]`: extracts the `src-<sha>` snapshot of REF and runs
+2. `poste.sh migrer [REF]` (REF defaults to HEAD, as for `installer`, #1245;
+   the L232b release controller always migrates the snapshot of its pinned
+   commit): extracts the `src-<sha>` snapshot of REF and runs
    **its** `ameesh migrate --additive-only`, without installing it
    (`PYTHONPATH=<instantané>/src`, with the venv's Python). Mesh database, only
    once, then the old database. `migrate --dry-run` first displays each
    missing migration, "additive" or "NON additive" (NOT additive) with the reason.
+   Both preview and execution retain `--additive-only` even if REF is installed.
 3. `poste.sh installer [REF]`: refuses as long as `doctor --probe` of the new
    code reports a missing migration, on the mesh database or the old one.
 4. `poste.sh role`, `poste.sh redemarrer`, then `vm.sh installer [REF]` and
@@ -1278,18 +1283,53 @@ migrations delivered up to 0051 are additive (verified by
 `tests/test_migrations_additives.py`).
 
 **Non-additive migration: separate procedure.** `poste.sh migrer` stops
-before writing. We then go back to the old order, in one go and without delay,
-knowing the window during which the agents' commands fail:
-`MIGRER_APRES=1 poste.sh installer REF`, `poste.sh migrer REF` (REF installed:
-all its migrations apply), `poste.sh redemarrer`. Such a migration
-is prepared and proposed to the owner (orchestrator prompt,
-"Livraison et déploiements" (Delivery and deployments)); rollback then requires
-the database backup.
+before writing, even when REF is installed or `MIGRER_APRES=1` is set.
+A separate owner-approved migration plan must name its exact commit, backup,
+drain and recovery procedure. An installed symlink cannot authorise a
+non-additive migration; this command never disables its additive guard.
+Rollback of such a separately approved operation requires the database backup.
 
 **New dependency.** The new code is run with the packages of the venv
 in place. If REF adds a dependency that `ameesh migrate` needs,
 `migrer` fails at import: first install that dependency in the venv
 (`pip install <paquet>`), then resume at `migrer`.
+
+## Atomic venv switch (#1969)
+
+`poste.sh installer` and `vm.sh installer` (server and agents) no longer run
+`pip` in the **live** venv: they prepare a **versioned** venv next to it
+(`venv-<sha7>`, with its own pip, dependencies and controls), then switch in a
+single rename. A concurrent command (`agent-mail send`, `ameesh work`, a
+runner's import) therefore sees either the whole old code or the whole new
+code — never the incomplete state of the 16/10 incident
+(`ModuleNotFoundError ameesh.platform.process`, missing `ameesh`/code 127).
+Controls run **before** the switch: imports (`psycopg`, `ameesh`),
+`ameesh --version`, and the console script's shebang pointing at the
+versioned venv's Python.
+
+The live `venv` is **not** a venv that a switch rewrites under running
+processes: it holds stable **launchers** (`bin/python`, `bin/ameesh`, and a
+refusing `bin/pip`). Each launcher reads the `venv-courant` symlink at start
+and `exec`s the versioned venv's binary, so the interpreter sees a concrete
+path (`venv-<sha7>/lib/pythonX/site-packages`) — a process already running
+keeps importing from **its** version, whatever a later switch does (review
+B1 of 16/10: a process launched through a symlinked venv kept the symlink
+path and could mix old and new submodules).
+
+`activer` only replaces the `venv-courant` symlink (temp + `rename()`), so
+there is no window without a live version. The **first** conversion of a real
+venv does not move or rewrite it: its `lib/` is reused by link as the
+previous version `venv-<sha7>` (adopted without pip), only the Python interpreters in `bin/` and
+`bin/ameesh` become launchers — a running process imports from `lib/`, not
+from `bin/`. `retour` points the symlink back to the recorded previous
+version, **without pip**, including that first conversion (review B2: the
+agents' rollback used to re-run `preparer`/pip); it is idempotent, and a
+rollback before any switch is a no-op. A preparation failure removes its
+partial directory and leaves the active version untouched. `src-current` and
+`previous-sha` keep their meaning. The helper is
+`deploy/mise-a-jour/bascule.py` (`preparer`, `activer --precedent`, `retour`,
+`etat`), copied to the VM (server and agents) so that install and rollback use
+the same version whatever commit is deployed.
 
 ## Update to 1.10.0 (path B, mediated executor)
 

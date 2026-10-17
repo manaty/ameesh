@@ -412,6 +412,30 @@ def gh_store(environ=None) -> str:
                         "hosts.yml")
 
 
+def gh_credential_fingerprint(environ=None, run=None) -> str | None:
+    """#2178 N2/B2 : empreinte de la credential EFFECTIVE de github.com.
+
+    `gh auth token --hostname github.com` rend le jeton que `gh` présenterait,
+    qu'il vienne de `hosts.yml` ou du keyring ; seule son empreinte tronquée
+    est gardée (aucun secret journalisé). None = pas de preuve possible
+    (aucun jeton, keyring verrouillé, sonde en échec) : l'appelant refuse de
+    conclure « credential neuve » plutôt que d'hasher le fichier, qu'un simple
+    commentaire suffit à changer (B2 de la relecture Codex).
+    """
+    run = _run if run is None else run
+    env = os.environ if environ is None else environ
+    argv = ["gh", "auth", "token", "--hostname", "github.com"]
+    if run is _run:
+        code, out = run(argv, env=env, whole=True)
+    else:
+        # `run` fourni : son environnement est déjà lié (`probe_gh`), ne pas
+        # le repasser en double
+        code, out = run(argv, whole=True)
+    if code != 0:
+        return None
+    return _digest((out or "").strip())
+
+
 def scw_store(environ=None) -> str:
     environ = os.environ if environ is None else environ
     return environ.get("SCW_CONFIG_PATH") or os.path.expanduser("~/.config/scw/config.yaml")
@@ -440,18 +464,30 @@ GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 SCW_KEY_VARS = ("SCW_SECRET_KEY",)
 
 
+#: `probe_cli(credential=...)`: la fingerprint de la credential réellement
+#: présentée, même quand elle est inconnue (None). Distingue « non fournie »
+#: (lire le magasin comme avant) de « fournie et inconnue » (ne jamais
+#: retomber sur le fichier : le fichier n'est pas la credential, cf. #2178 B2).
+_NO_CREDENTIAL = object()
+
+
 def probe_cli(harness: str, argv: list, fix: str, run=_run,
-              store: str | None = None, override: str | None = None) -> Verdict | None:
+              store: str | None = None, override: str | None = None,
+              credential=_NO_CREDENTIAL) -> Verdict | None:
     """`override`: the fingerprint of a variable that overrides `store`
     (`env_override`); without one, the store is the credential in effect,
-    fingerprinted once, before the probe (#313 r1)."""
+    fingerprinted once, before the probe (#313 r1). `credential` (#2178 B2):
+    the fingerprint of the credential actually presented (e.g. the `gh` token,
+    from `hosts.yml` or the keyring); when supplied it wins, even at None, and
+    the store-file replacement check does not apply."""
     if not shutil.which(argv[0]):
         return None
-    held = override or file_fingerprint(store)
+    known = credential is not _NO_CREDENTIAL
+    held = credential if known else (override or file_fingerprint(store))
     code, out = run(argv, output=True)
     if code is None:
         return Verdict(harness, "", "unknown", "probe failed: %s" % out)
-    if not override and file_fingerprint(store) != held:
+    if not known and not override and file_fingerprint(store) != held:
         return Verdict(harness, "", "unknown", REPLACED)
     if code != 0:
         why = refused(out)
@@ -477,7 +513,12 @@ def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Ver
         elif harness == "gcloud":
             out.append(probe_gcloud(conf, now, run, environ))
         elif harness == "gh":
-            out.append(probe_cli("gh", ["gh", "auth", "status"], "gh auth login -h github.com",
+            # N5 (#2178) : la sonde vise github.com comme l'adaptateur de
+            # connexion ; sans cela, GH_HOST peut faire lire un autre hôte et
+            # rendre un faux « healthy ».
+            out.append(probe_cli("gh", ["gh", "auth", "status",
+                                        "--hostname", "github.com"],
+                                 "gh auth login -h github.com",
                                  run, gh_store(environ),
                                  env_override(environ, GH_TOKEN_VARS)))
         elif harness == "scw":

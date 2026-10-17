@@ -16,7 +16,8 @@ from ameesh import land, merge_pr
 from .test_1003_merge_pr import FakeGh as MergeGh
 from .test_1003_merge_pr import _Base as MergePrBase
 from .test_1003_merge_pr import view as merge_view
-from .test_l160e2_land import FakeGh, PrLandTest, _git
+from . import test_l160e2_land as _land
+from .test_l160e2_land import FakeGh, _git
 
 
 class AutoGh(FakeGh):
@@ -53,7 +54,7 @@ class AutoGh(FakeGh):
         return super().__call__(args, timeout=timeout)
 
 
-class AutoMergeTest(PrLandTest):
+class AutoMergeTest(_land.PrLandTest):
     def test_pr_status_exposes_the_armed_auto_merge(self):
         gh = AutoGh()
         self.queued(4)
@@ -207,7 +208,7 @@ class AutoMergeDirectTest(MergePrBase):
         self.assertEqual(self.tip(), self.base)      # rien n'a été poussé
 
 
-class AutoMergeEarlyEjectTest(PrLandTest):
+class AutoMergeEarlyEjectTest(_land.PrLandTest):
     def test_an_ejection_before_the_push_still_disarms(self):
         """Relecture dev1 : un lot éjecté avant la poussée (porte, conflit, CI)
         ne laisse pas l'auto-merge armé pour la prochaine tête de l'auteur."""

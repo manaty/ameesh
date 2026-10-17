@@ -22,12 +22,17 @@ class PauseRefused(ValueError):
 
 
 def change(db, name: str, *, paused: bool, reason: str, actor: str,
-           principal: str | None = None) -> dict:
+           principal: str | None = None, expect_reason: str | None = None) -> dict:
     """Change the hold and record by whom/for whom, once per transition.
 
     Native operator operation, absent from the mediated executor contract.
     Authorization belongs to the authenticated caller, never a request body
     or the server's agent identity.
+
+    `expect_reason` (#2152) : avec paused=False, ne lève que la pause dont la
+    raison est exactement celle-là (reprise conditionnelle, atomique côté
+    base) : une pause étrangère qui aurait remplacé la nôtre n'est jamais
+    levée. Refusé pour poser une pause.
     """
     principal = actor if principal is None else principal
     if (not isinstance(actor, str) or not HUMAN_RE.fullmatch(actor)
@@ -39,10 +44,18 @@ def change(db, name: str, *, paused: bool, reason: str, actor: str,
         raise PauseRefused("bad_pause", "paused must be a boolean")
     if not isinstance(reason, str) or not reason.strip() or len(reason) > REASON_MAX:
         raise PauseRefused("bad_reason", "reason: 1 to %d characters required" % REASON_MAX)
+    if expect_reason is not None:
+        if paused:
+            raise PauseRefused("bad_expect", "expect_reason only lifts a pause")
+        if (not isinstance(expect_reason, str) or not expect_reason.strip()
+                or len(expect_reason) > REASON_MAX):
+            raise PauseRefused(
+                "bad_expect", "expect_reason: 1 to %d characters required" % REASON_MAX)
     if storage.is_remote(db):
         raise PauseRefused("native_only", "operator pause needs a native operator connection")
     result = storage.of(db).agents.operator_pause(
-        name, paused=paused, reason=reason.strip(), actor=actor, principal=principal)
+        name, paused=paused, reason=reason.strip(), actor=actor, principal=principal,
+        expect_reason=expect_reason.strip() if expect_reason is not None else None)
     if result is None:
         raise PauseRefused("unknown_agent", "unknown agent: %s" % name)
     if result.get("mode") != "execute":
@@ -64,13 +77,27 @@ def cmd_cli(cfg, args, *, paused: bool) -> int:
             if binding.name or binding.ok:
                 raise PauseRefused("bad_actor", "an agent session cannot act as the local human")
             human = serve.owner(cfg, args.human)
+            expect = getattr(args, "expect_reason", None)
             out = change(db, args.agent, paused=paused, reason=args.reason,
-                         actor=human, principal=human)
+                         actor=human, principal=human, expect_reason=expect)
         except (PauseRefused, ValueError) as exc:
-            print("ameesh operator pause: %s" % exc, file=sys.stderr)
+            # Le même chemin sert « resume --operator » : nommer le geste
+            # réellement demandé (N3 de la R2 sur #1462).
+            print("ameesh operator %s: %s" % ("pause" if paused else "resume", exc),
+                  file=sys.stderr)
             return 1
         if args.json:
             print(json.dumps(out, ensure_ascii=False))
+        elif not paused and expect is not None:
+            # #2152 : dire ce qui a réellement été levé — une pause étrangère
+            # reste en place et le script de drain le lit.
+            if out["changed"]:
+                print("%s: operator pause cleared (expected reason matched)" % args.agent)
+            elif out["operator_paused"]:
+                print("%s: operator pause kept: the pause in place is not the "
+                      "expected one" % args.agent)
+            else:
+                print("%s: operator pause already cleared" % args.agent)
         else:
             print("%s: operator pause %s%s" % (
                 args.agent, "set" if out["operator_paused"] else "cleared",

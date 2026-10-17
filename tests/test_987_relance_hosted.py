@@ -122,6 +122,18 @@ class DecisionTest(unittest.TestCase):
             [PLAN, MACOS_ANNULE, flux, AGREGAT], 1)
         self.assertTrue(relancer, raison)
 
+    def test_appel_du_paquet_rouge_ne_bloque_pas_la_relance(self):
+        # #2119 : dans un run « paquet », le job d'appel
+        # `suite complète du paquet` est rouge quand un job du workflow appelé
+        # l'est ; il ne porte aucune étiquette (relevé : run 38847866227,
+        # job 116802402917) et `job_reel` l'écarte, comme un check run de flux.
+        # La décision ne voit donc que les jobs réels du run appelé.
+        appel = job("suite complète du paquet", "failure")
+        self.assertFalse(ci_relance.job_reel(appel))
+        relancer, raison = ci_relance.decision(
+            [appel, PLAN, MACOS_ANNULE, AGREGAT], 1)
+        self.assertTrue(relancer, raison)
+
 
 class CliTest(unittest.TestCase):
     """Le mode hors ligne (--jobs) : ce que le workflow appelle à travers
@@ -180,16 +192,32 @@ class WorkflowTest(unittest.TestCase):
         texte = TESTS.read_text(encoding="utf-8")
         self.assertIn('test "${{ needs.platform-macos.result }}" = success', texte)
 
+    def ligne_declencheurs(self):
+        """La ligne `workflows:` de la garde : le contrat du déclencheur."""
+        for ligne in GARDE.read_text(encoding="utf-8").splitlines():
+            if ligne.strip().startswith("workflows:"):
+                return ligne
+        self.fail("relance-hosted.yml : aucune ligne `workflows:`")
+
     def test_garde_declenchee_apres_la_conclusion_de_tests(self):
         # l'API refuse de rejouer un job tant que l'exécution tourne : la
         # reprise ne peut venir que d'un workflow_run « completed »
         texte = GARDE.read_text(encoding="utf-8")
         self.assertIn("workflow_run:", texte)
-        self.assertIn('workflows: ["tests"]', texte)
+        self.assertIn('"tests"', self.ligne_declencheurs())
         self.assertIn("types: [completed]", texte)
         self.assertIn("github.event.workflow_run.id", texte)
         self.assertIn("github.event.workflow_run.run_attempt", texte)
         self.assertIn("conclusion == 'failure'", texte)
+
+    def test_garde_declenchee_aussi_pour_un_paquet(self):
+        # #2119 : paquet.yml appelle tests.yml par `workflow_call` ; GitHub
+        # n'émet pas d'événement workflow_run pour le workflow réutilisable
+        # appelé, l'exécution terminée est celle de « paquet ». Sans ce nom
+        # dans la liste, le job hébergé `plateforme macOS` d'un paquet annulé
+        # faute de runner n'est jamais relancé : le check requis y reste rouge
+        # par capacité, pas par code (community 72631).
+        self.assertIn('"paquet"', self.ligne_declencheurs())
 
     def test_garde_privilegiee_et_hors_flotte(self):
         # jeton minimal (actions: write), code de la branche par défaut, et un

@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import ci, cli, hostcheck, mail, registry, storage, work
@@ -62,6 +63,21 @@ class _Base(PgTestCase):
             "SELECT body FROM agent_mailbox WHERE recipient = %s AND delivered_at IS NULL "
             "ORDER BY id", (name,))]
 
+    def _touched(self, name: str) -> int:
+        """#885 : les non-lus qu'une réservation a touchés (posée puis rendue,
+        ou soldée) — le témoin du churn : `consigne` ou `deja_consigne`."""
+        return self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox"
+            " WHERE recipient = %s AND delivered_at IS NULL"
+            "   AND (meta ? 'consigne' OR meta ? 'deja_consigne')", (name,))[0]["n"]
+
+    def _backlog(self, name: str, n: int) -> None:
+        """#885 : `n` non-lus ordinaires d'un coup (sans passer par `mail.send`)."""
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " SELECT 'bulk', %s, 'Ordinary backlog ' || i, 'notify', '{}'::jsonb"
+            "   FROM generate_series(1, %s) i", (name, n))
+
 
 class MidTurnHookTest(_Base):
     def _mail(self, name: str) -> None:
@@ -92,6 +108,62 @@ class MidTurnHookTest(_Base):
                 self.assertEqual(stop["decision"], "block")
                 self.assertIn("Ordinary progress note.", stop["reason"])
                 self.assertEqual(self._pending(name), [])
+
+    def test_verdict_behind_two_hundred_unread_is_seen_mid_turn(self):
+        """#885 : le verdict est derrière plus de `UNREAD_LIMIT` non-lus ; il
+        est vu au point sûr, et le retard ordinaire n'est pas touché (aucune
+        réservation, aucune libération : pas de churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "deep-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 250)
+                mail.send(self.db, "codex-review", name, "Verdict beyond 200.",
+                          payload={"verdict": True})
+                context = json.loads(self._hook(worker, harness, "PostToolUse")
+                                     )["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("Verdict beyond 200.", context)
+                self.assertNotIn("Ordinary backlog", context)
+                self.assertEqual(len(self._pending(name)), 250)
+                self.assertEqual(self._touched(name), 0)
+
+    def test_ordinary_mail_does_not_churn_the_reservation(self):
+        """#885 : deux points sûrs sans rien d'urgent n'écrivent RIEN — l'ancien
+        chemin réservait jusqu'à 200 non-lus puis les relâchait (le churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "churn-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 3)
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._touched(name), 0)
+                self.assertEqual(len(self._pending(name)), 3)
+
+    def test_active_reservations_do_not_hide_the_next_eligible_message(self):
+        worker = self._leased("reserved-codex", "codex")
+        ids = [int(row["id"]) for row in self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, payload)"
+            " SELECT 'review', %s, 'Reserved verdict ' || i, '{\"verdict\":true}'::jsonb"
+            " FROM generate_series(1, 200) i RETURNING id", (worker.name,))]
+        mail.reserve(self.db, worker.name, worker.runner.runner_id, worker.epoch,
+                     "other-token", ids=ids, porteur="consigne", ttl_seconds=3600)
+        last = mail.send(self.db, "review", worker.name, "Verdict after reservations",
+                         payload={"verdict": True})
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=1)], [last])
+        out = self._hook(worker, "codex", "PostToolUse")
+        self.assertIn("Verdict after reservations", out)
+        self.assertNotIn("Reserved verdict", out)
+        self.assertEqual(len(self._pending(worker.name)), 200)
+        # A reservation from an old lease or an expired one is reclaimable.
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,epoch}', to_jsonb(%s::bigint)) WHERE id = %s",
+                        (worker.epoch - 1, ids[0]))
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,expire}', '0'::jsonb) WHERE id = %s", (ids[1],))
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=2)], ids[:2])
 
     def test_owner_mail_alone_interrupts_a_dsh_turn(self):
         for harness in ("deepseek", "codex"):
@@ -205,11 +277,12 @@ class DoctorHooksTest(unittest.TestCase):
     binaire n'existe pas — l'incident du 2026-10-12 (`/usr/local/bin/agent-mail`
     absent, tous les hooks dsh en 127 : aucune remise, aucun Stop)."""
 
-    def _home(self, *, binary=False) -> str:
+    def _home(self, *, binary=False, rel="agent-mail") -> str:
         home = tempfile.mkdtemp(prefix="l514-hooks-")
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         if binary:
-            path = os.path.join(home, "agent-mail")
+            path = os.path.join(home, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("#!/bin/sh\nexit 0\n")
             os.chmod(path, 0o755)
@@ -226,15 +299,17 @@ class DoctorHooksTest(unittest.TestCase):
                           for event, command in events.items()}}
 
     def _lines(self, home: str, harness: str = "deepseek",
-               manager_path: str = "") -> dict:
+               manager_path: str = "", environ: dict | None = None) -> dict:
         """Les lignes du doctor ; `manager_path` remplace le PATH du
         gestionnaire systemd (vide : celui de la session du doctor, le
-        comportement d'avant #514 N2)."""
+        comportement d'avant #514 N2) ; `environ` s'ajoute à l'environnement
+        du harnais (HOME, pour les chemins `$HOME` des hooks)."""
         variable = {"deepseek": "DSH_HOME", "codex": "CODEX_HOME",
                     "claude": "CLAUDE_CONFIG_DIR"}[harness]
+        env = {variable: home, **(environ or {})}
         with mock.patch.object(hostcheck.adapters, "systemd_manager_path",
                                return_value=manager_path):
-            return hostcheck.hook_lines(None, [harness], environ={variable: home})
+            return hostcheck.hook_lines(None, [harness], environ=env)
 
     def test_hook_commands_reads_the_nested_format(self):
         document = self._document({"PostToolUse": "bin/agent-mail hook deepseek"})
@@ -254,6 +329,103 @@ class DoctorHooksTest(unittest.TestCase):
         texte = "\n".join(out["lines"])
         self.assertIn(missing, texte)
         self.assertIn("127", texte)
+
+    def test_hook_binaire_sous_home_variable_est_trouve(self):
+        """Incident staging b9a2 (16/10) : un hook écrit `$HOME/.local/bin/
+        agent-mail` ; `expanduser` seul ne développe pas la variable, le
+        binaire passait pour absent (faux KO). Le chemin est résolu sans
+        exécuter de shell."""
+        home = self._home(binary=True, rel=os.path.join(".local", "bin", "agent-mail"))
+        for command in ("$HOME/.local/bin/agent-mail hook deepseek",
+                        "${HOME}/.local/bin/agent-mail hook deepseek"):
+            with self.subTest(command=command):
+                self._write(home, self._document({"PostToolUse": command,
+                                                  "Stop": command}))
+                out = self._lines(home, environ={"HOME": home})
+                self.assertTrue(out["ok"], out["lines"])
+                self.assertNotIn("127", "\n".join(out["lines"]))
+
+    def test_hook_binaire_sous_home_variable_absent_reste_ko(self):
+        """La variable développée vers un chemin absent reste un KO : la
+        résolution ne masque jamais un vrai binaire manquant."""
+        home = self._home(binary=True, rel=os.path.join(".local", "bin", "agent-mail"))
+        self._write(home, self._document(
+            {"PostToolUse": "$HOME/.local/bin/missing-agent-mail hook deepseek"}))
+        out = self._lines(home, environ={"HOME": home})
+        self.assertFalse(out["ok"])
+        self.assertIn("127", "\n".join(out["lines"]))
+
+    def test_dollar_litteral_absent_ne_devient_pas_un_hook_present(self):
+        home = self._home(binary=True, rel=".local/bin/agent-mail")
+        for word in ("'$HOME/.local/bin/agent-mail'",
+                     r"\$HOME/.local/bin/agent-mail",
+                     r'"\$HOME/.local/bin/agent-mail"',
+                     "'~/.local/bin/agent-mail'",
+                     '"~/.local/bin/agent-mail"'):
+            with self.subTest(word=word):
+                self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
+                out = self._lines(home, environ={"HOME": home})
+                self.assertFalse(out["ok"], out["lines"])
+                self.assertIn("127", "\n".join(out["lines"]))
+
+    def test_variable_dont_le_nom_commence_par_un_chiffre(self):
+        """#1981/N2 : `$1abc` vaut `$1` puis `abc` (le shell), pas la variable
+        `1abc` ; `$1` seul reste développé et un nom normal aussi ; `${1abc}`
+        reste littéral (substitution invalide)."""
+        self.assertEqual(hostcheck._hook_path("$1abc", {"1abc": "/mauvais"}),
+                         "$1abc")
+        self.assertEqual(hostcheck._hook_path("${1abc}", {"1abc": "/mauvais"}),
+                         "${1abc}")
+        self.assertEqual(hostcheck._hook_path("$1", {"1": "/bon"}), "/bon")
+        self.assertEqual(hostcheck._hook_path("$a1", {"a1": "/bon"}), "/bon")
+
+    def test_home_entre_guillemets_doubles_reste_developpe(self):
+        home = self._home(binary=True, rel=".local/bin/agent-mail")
+        for word in ('"$HOME/.local/bin/agent-mail"',
+                     '"${HOME}"/.local/bin/agent-mail'):
+            with self.subTest(word=word):
+                self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
+                self.assertTrue(self._lines(home, environ={"HOME": home})["ok"])
+
+    def test_chemin_existant_avec_dollar_litteral_reste_trouve(self):
+        home = self._home(binary=True, rel="$HOME/agent-mail")
+        path = os.path.join(home, "$HOME", "agent-mail")
+        for word in ("'%s'" % path, path.replace("$", r"\$")):
+            with self.subTest(word=word):
+                self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
+                self.assertTrue(self._lines(home, environ={"HOME": home})["ok"])
+
+    def test_hook_variable_non_definie_reste_litterale_et_ko(self):
+        """Une variable non définie n'est pas remplacée en silence : le chemin
+        littéral `$VAR/...` reste contrôlé et signalé absent."""
+        home = self._home()
+        self._write(home, self._document(
+            {"PostToolUse": "$AMEESH_L514_ABSENT/agent-mail hook deepseek"}))
+        out = self._lines(home, environ={"HOME": home})
+        self.assertFalse(out["ok"])
+        self.assertIn("AMEESH_L514_ABSENT", "\n".join(out["lines"]))
+
+    def test_binary_missing_developpe_les_variables_du_hook(self):
+        """Le contrôle unitaire résout `$HOME` et `${HOME}` avec
+        l'environnement reçu ; absent ou non définie reste manquant."""
+        home = self._home(binary=True, rel=os.path.join(".local", "bin", "agent-mail"))
+        environ = {"HOME": home}
+        self.assertFalse(hostcheck._binary_missing(
+            "$HOME/.local/bin/agent-mail", environ=environ))
+        self.assertFalse(hostcheck._binary_missing(
+            "${HOME}/.local/bin/agent-mail", environ=environ))
+        self.assertTrue(hostcheck._binary_missing(
+            "$HOME/.local/bin/absent-agent-mail", environ=environ))
+        self.assertTrue(hostcheck._binary_missing(
+            "$AMEESH_L514_ABSENT/agent-mail", environ=environ))
+
+    def test_chemins_litteraux_existants_restent_ok(self):
+        """Un chemin littéral existant n'est pas touché par la résolution."""
+        home = self._home(binary=True)
+        command = os.path.join(home, "agent-mail") + " hook deepseek"
+        self._write(home, self._document({"PostToolUse": command}))
+        out = self._lines(home)
+        self.assertTrue(out["ok"], out["lines"])
 
     def test_binary_missing_sous_le_path_du_gestionnaire_est_ko(self):
         """#514 N2 : le gestionnaire systemd peut lancer les harnais avec SON
@@ -341,6 +513,34 @@ class DoctorHooksTest(unittest.TestCase):
         out = self._lines(home)
         self.assertFalse(out["ok"])
         self.assertIn("unreadable", "\n".join(out["lines"]))
+
+
+class SenderVeilleTest(unittest.TestCase):
+    """Incident staging b9a2 : le registre portait une ligne `veille` —
+    l'identité d'ENVOI de la consigne de veille (`watch.SENDER`), mode
+    `execute`, jamais de session ni de tour — que le doctor servait comme un
+    agent, d'où un harnais `other` inconnu en KO. La ligne est écartée
+    nommément ; un vrai agent à harnais inconnu garde son KO."""
+
+    @staticmethod
+    def _row(name: str, harness: str) -> dict:
+        return {"name": name, "harness": harness, "host": "vm", "mode": "execute",
+                "status": "idle"}
+
+    def test_le_sender_de_veille_n_est_pas_un_agent_servi(self):
+        rows = [self._row("veille", "other"), self._row("impl-x", "deepseek")]
+        with mock.patch.object(hostcheck.registry, "overview", return_value=rows):
+            served = hostcheck.served_agents(SimpleNamespace(host="vm"), None)
+        self.assertEqual([row["name"] for row in served], ["impl-x"])
+
+    def test_un_harnais_inconnu_reel_reste_ko(self):
+        rows = [self._row("veille", "other"), self._row("impl-inconnu", "other")]
+        with mock.patch.object(hostcheck.registry, "overview", return_value=rows):
+            served = hostcheck.served_agents(SimpleNamespace(host="vm"), None)
+            items = hostcheck.harness_report(served)
+        self.assertEqual([item["harness"] for item in items], ["other"])
+        self.assertEqual(items[0]["agents"], ["impl-inconnu"])
+        self.assertFalse(items[0]["ok"])
 
 
 if __name__ == "__main__":
