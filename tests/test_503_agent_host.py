@@ -111,7 +111,8 @@ elif sys.argv[1] == 'show':
                                        'pause-coupee', 'pause-coupee-etat-perdu',
                                        'pause-perdue-sans-pose',
                                        'drain-refuse-identite',
-                                       'mode-change-apres-drain') \
+                                       'mode-change-apres-drain',
+                                       'pause-expiree-tardive') \
             and not pause.exists():
         row['status'] = 'running'
     if name == 'dev9' and scenario in ('chaines-toujours', 'chaines-relance'):
@@ -125,6 +126,11 @@ elif sys.argv[1] == 'show':
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
+    # #2184 R orchestrateur B1 : la pause expirée côté client aboutit côté
+    # serveur juste après la relecture, qui l'a vue absente.
+    tardive = state / ('pause-tardive-' + name)
+    if scenario == 'pause-expiree-tardive' and tardive.exists():
+        motif.write_text(tardive.read_text()); pause.touch(); tardive.unlink()
 elif sys.argv[1] in ('pause', 'resume'):
     # #2152 : les gestes du drain, avec le « changed » que lit le script.
     name = sys.argv[2]
@@ -142,6 +148,10 @@ elif sys.argv[1] in ('pause', 'resume'):
             print('ameesh operator pause: bad_actor: an agent session cannot act '
                   'as the local human', file=sys.stderr)
             sys.exit(1)
+        if scenario == 'pause-expiree-tardive':
+            # Timeout de l'appel (rc 124) : la pose n'est pas encore commitée.
+            (state / ('pause-tardive-' + name)).write_text(args[args.index('--reason') + 1])
+            sys.exit(124)
         if scenario == 'pause-perdue-sans-pose':
             # R1 B2 : réponse perdue, la pose n'a PAS abouti.
             print('{bad-json')
@@ -455,6 +465,21 @@ class AgentHostTest(unittest.TestCase):
         self.assertFalse((self.state / 'pause-dev9').exists())
         self.assertIn('resume dev9 --operator', self.operateur())
         self.assertIn('--expect-reason', self.operateur())
+
+    def test_timed_out_pause_committed_late_is_still_lifted(self):
+        """#2184 R orchestrateur B1 : un appel pause expiré (rc 124) peut
+        aboutir après la relecture ; l'intention reste suivie et EXIT lève."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        p = self.run_vm(scenario='pause-expiree-tardive')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse((self.state / 'pause-tardive-dev9').exists())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertIn('resume dev9 --operator', self.operateur())
+        self.assertIn('--expect-reason', self.operateur())
+        self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_operator_gesture_refused_in_an_agent_session_stops_safely(self):
         """Périmètre annoncé : le drain est un geste d'opérateur. Un refus
