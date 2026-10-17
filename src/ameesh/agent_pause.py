@@ -58,7 +58,11 @@ def change(db, name: str, *, paused: bool, reason: str, actor: str,
         expect_reason=expect_reason.strip() if expect_reason is not None else None)
     if result is None:
         raise PauseRefused("unknown_agent", "unknown agent: %s" % name)
-    if result.get("mode") != "execute":
+    # #2184/N1 : une levée conditionnelle doit encore aboutir si l'agent est
+    # devenu `externe` pendant l'attente du drain (0459). La pose, elle, reste
+    # interdite sur un agent non-execute.
+    levee_conditionnelle = not paused and expect_reason is not None
+    if result.get("mode") != "execute" and not levee_conditionnelle:
         raise PauseRefused("external_agent", "an external session cannot be paused by the runner")
     return result
 

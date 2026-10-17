@@ -1526,7 +1526,9 @@ def cmd_resume(cfg: Config, args) -> int:
                   file=sys.stderr)
             return 1
         return agent_pause.cmd_cli(cfg, args, paused=False)
-    if getattr(args, "expect_reason", None):
+    # #2184/N7 : un motif vide explicite n'est pas « absent » ; la présence
+    # du drapeau suffit à exiger --operator (même règle qu'agent_pause.py).
+    if getattr(args, "expect_reason", None) is not None:
         print("ameesh resume: --expect-reason requires --operator", file=sys.stderr)
         return 1
     try:
