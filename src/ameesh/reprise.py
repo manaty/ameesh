@@ -1526,6 +1526,9 @@ def cmd_resume(cfg: Config, args) -> int:
                   file=sys.stderr)
             return 1
         return agent_pause.cmd_cli(cfg, args, paused=False)
+    if getattr(args, "expect_reason", None):
+        print("ameesh resume: --expect-reason requires --operator", file=sys.stderr)
+        return 1
     try:
         brief = _read_brief(args.brief)
     except OSError as exc:
@@ -1591,6 +1594,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_re.add_argument("--json", action="store_true")
     p_re.add_argument("--operator", action="store_true", help="lift only an operator pause")
     p_re.add_argument("--reason", default="", help="required with --operator")
+    p_re.add_argument("--expect-reason", default=None, metavar="TEXT",
+                      help="with --operator: lift only the pause whose reason is "
+                           "exactly TEXT, atomically (#2152)")
     p_re.add_argument("--human", default=None, help="local human for --operator")
     p_re.set_defaults(func=cmd_resume)
     return parser
