@@ -1829,6 +1829,15 @@ class WatcherTest(PgTestCase):
         reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
         self.assertEqual((reference["run_id"], reference["head_sha"]), (2202, recente))
         self.assertEqual(reference["tests"], [])
+        # Une nouvelle exécution sur l'ancienne tête ne la rajeunit pas,
+        # même quand les premières observations des deux têtes sont égales.
+        st.ci.open_run(repo, 2203, head_sha=ancienne, branch="main", event="push",
+                       base="main", work_item_id=None, url=None,
+                       workflow="tests.yml", created_at="2026-01-01T10:01:00Z")
+        st.ci.conclude(repo, 2203, "failure")
+        reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+        self.assertEqual((reference["run_id"], reference["head_sha"]), (2202, recente))
+        self.assertEqual(reference["tests"], [])
 
     def test_reference_garde_le_dernier_resultat_de_la_tete_recente(self):
         """Une reprise actualise le résultat, jamais l'âge de sa tête."""
