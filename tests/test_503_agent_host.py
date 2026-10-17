@@ -100,7 +100,7 @@ elif sys.argv[1] == 'show':
                                        'chaines-resume-error', 'pause-concurrente',
                                        'drain-remplace', 'pause-reponse-perdue',
                                        'pause-coupee', 'pause-coupee-etat-perdu',
-                                       'pause-perdue-sans-pose',
+                                       'pause-perdue-sans-pose', 'drain-puis-stop-error',
                                        'drain-refuse-identite') \
             and not pause.exists():
         row['status'] = 'running'
@@ -138,6 +138,8 @@ elif sys.argv[1] in ('pause', 'resume'):
             sys.exit(0)
         motif.write_text(args[args.index('--reason') + 1])
         pause.touch()
+        with (state / 'sequence.log').open('a') as f:
+            f.write('pause %s\n' % name)
         if scenario == 'pause-concurrente':
             # Posée entre notre lecture et notre pause : elle n'est pas de nous.
             motif.write_text('pause humaine etrangere')
@@ -179,17 +181,35 @@ state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
 assert args[0] == '--user', args
 unit = args[-1]
+name = unit.split('@')[1].removesuffix('.service')
 with (state / 'units.log').open('a') as f: f.write(' '.join(args) + '\n')
 scenario = (state / 'scenario').read_text()
-if 'restart' in args:
+def stopped():
+    return (state / ('stopped-' + name)).exists()
+if 'stop' in args:
+    with (state / 'sequence.log').open('a') as f:
+        f.write('stop %s\n' % name)
+    if scenario == 'stop-error' or (scenario == 'drain-puis-stop-error' and name == 'dev9'):
+        sys.exit(1)
+    if scenario != 'stop-unproven': (state / ('stopped-' + name)).touch()
+elif 'start' in args:
     if scenario == 'restart-error': sys.exit(1)
-    (state / ('restart-' + unit.split('@')[1].removesuffix('.service'))).touch()
+    (state / ('restart-' + name)).touch()
+    (state / ('stopped-' + name)).unlink(missing_ok=True)
+elif 'restart' in args:
+    # old path, forbidden by #1152: the fakes below keep it visible
+    if scenario == 'restart-error': sys.exit(1)
+    (state / ('restart-' + name)).touch()
 elif 'show' in args:
-    if 'MainPID' in args: print('123')
+    if 'ActiveState' in args:
+        if scenario == 'stop-failed' and stopped(): print('failed')
+        else: print('inactive' if stopped() else 'active')
+    elif 'MainPID' in args:
+        print('0' if stopped() else '123')
     elif scenario == 'bad-execstart': print('unreadable')
     elif scenario == 'execstart-error': sys.exit(1)
     else:
-        owner = 'runner-' + unit.split('@')[1].removesuffix('.service') + '@host-agents'
+        owner = 'runner-' + name + '@host-agents'
         option = '--runner-id ' + owner
         if scenario == 'equals-owner': option = '--runner-id=' + owner
         if scenario == 'abbreviated-owner': option = '--r=' + owner
@@ -197,7 +217,7 @@ elif 'show' in args:
         if scenario == 'default-owner': option = ''
         print('{ path=/bin/runner ; argv[]=/bin/runner run ' + option + ' ; }')
 elif 'is-active' in args:
-    if scenario == 'inactive': sys.exit(3)
+    if scenario == 'inactive' or stopped(): sys.exit(3)
     if scenario == 'inactive-dev9' and '@dev9.' in args[-1]: sys.exit(3)
     if (state / ('inactive-' + unit.split('@')[1].removesuffix('.service'))).exists(): sys.exit(3)
     print('active')
@@ -231,17 +251,9 @@ scenario = (Path(os.environ['FAKE_STATE']) / 'scenario').read_text()
 print(time.time() + (60 if scenario == 'db-ahead' else 0))
 '''
 
-#: #2152 : le drain se décide sur l'horloge réelle (SECONDS de bash). Seule
-#: l'attente de la boucle de redémarrage (15 s) fait avancer le banc d'une
-#: demi-seconde ; les attentes de bail (5 s) restent instantanées.
-SLEEP = ('#!/bin/sh\n'
-         'if [ "$1" = 15 ]; then\n'
-         '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
-         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
-         '  fi\n'
-         '  exec %s 0.5\n'
-         'fi\n'
-         'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
+#: #2152 : plus aucune attente de créneau « idle » (DRAIN_ATTENTE est un
+#: interrupteur) ; les attentes de bail (5 s) restent instantanées.
+SLEEP = '#!/bin/sh\nexit 0\n'
 
 
 class AgentHostTest(unittest.TestCase):
@@ -288,6 +300,16 @@ class AgentHostTest(unittest.TestCase):
         path = self.state / 'operateur.log'
         return path.read_text() if path.exists() else ''
 
+    def starts(self):
+        """Démarrages (`start`) d'unités observés ; l'ancien `restart` ne doit
+        plus apparaître (#1152)."""
+        return [l for l in self.units().splitlines()
+                if l.startswith('--user start ameesh-runner-agent@')]
+
+    def stops(self):
+        return [l for l in self.units().splitlines()
+                if l.startswith('--user stop ameesh-runner-agent@')]
+
     def test_missing_runner_env_fails_before_any_execution(self):
         (self.state / 'runner.env').unlink()
         p = self.run_vm()
@@ -314,13 +336,15 @@ class AgentHostTest(unittest.TestCase):
     def test_restart_uses_remote_registry_and_user_units(self):
         p = self.run_vm()
         self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.starts(), ['--user start ameesh-runner-agent@dev8.service',
+                                         '--user start ameesh-runner-agent@dev9.service'])
+        # #1152 : les personas actives prouvent leur arrêt puis redémarrent,
+        # jamais par `restart`. #1633 : la persona arrêtée du registre est du
+        # lot — son unité active est seulement rechargée sur le nouveau code
+        # (aucun bail exigé) ; l'observateur et l'agent d'un autre hôte restent
+        # ignorés.
         restarts = [l for l in self.units().splitlines() if 'restart' in l]
-        # #1633 : la persona arrêtée du registre est du lot — son unité active
-        # est rechargée sur le nouveau code (aucun bail exigé) ; l'observateur
-        # et l'agent d'un autre hôte restent ignorés.
-        self.assertEqual(restarts, ['--user restart ameesh-runner-agent@dev8.service',
-                                    '--user restart ameesh-runner-agent@dev9.service',
-                                    '--user restart ameesh-runner-agent@stopped.service'])
+        self.assertEqual(restarts, ['--user restart ameesh-runner-agent@stopped.service'])
         self.assertIn('dev9 : redémarré', p.stdout)
         self.assertIn('stopped : arrêté dans le registre', p.stdout)
         self.assertNotIn('stopped : redémarré (était', p.stdout)
@@ -336,10 +360,38 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('stopped : arrêté dans le registre', p.stdout)
         self.assertIn('déjà arrêtée', p.stdout)
 
-    def test_restart_waits_for_agent_out_of_turn(self):
+    def test_restart_stops_proves_then_starts(self):
+        """#1152 : l'arrêt (SIGTERM, drainage) précède la preuve du point sûr
+        (ActiveState=inactive ET MainPID=0), elle-même avant le démarrage ;
+        `restart`, qui ne prouve rien, n'est jamais utilisé."""
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        log = self.units().splitlines()
+        for name in ('dev8', 'dev9'):
+            unite = 'ameesh-runner-agent@' + name + '.service'
+            stop = log.index('--user stop ' + unite)
+            actif = log.index('--user show -p ActiveState --value ' + unite)
+            pid = log.index('--user show -p MainPID --value ' + unite)
+            start = log.index('--user start ' + unite)
+            self.assertLess(stop, actif, unite)
+            self.assertLess(actif, start, unite)
+            self.assertLess(pid, start, unite)
+        # `restart` ne prouve rien pour une persona active (#1152) ; seule la
+        # persona arrêtée du registre recharge son unité par `restart` (#1633).
+        for unite in ('ameesh-runner-agent@dev8.service',
+                      'ameesh-runner-agent@dev9.service'):
+            self.assertNotIn('--user restart ' + unite, self.units())
+
+    def test_restart_gates_agent_in_turn_without_idle_wait(self):
+        # #1152/R1 : un agent vu `running` n'est plus différé — il est arrêté
+        # (SIGTERM, drainage borné), prouvé au point sûr, puis démarré.
         p = self.run_vm(scenario='busy-once')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertTrue((self.state / 'busy-seen').exists())
+        self.assertIn('--user stop ameesh-runner-agent@dev9.service', self.units())
+        self.assertIn('--user start ameesh-runner-agent@dev9.service', self.units())
+        self.assertNotIn('--user restart ameesh-runner-agent@dev9.service', self.units())
+
         # Un tour qui finit tout seul ne déclenche aucun drain.
         self.assertEqual(self.operateur(), '')
 
@@ -445,35 +497,52 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('resume dev9', self.operateur())
         self.assertFalse((self.state / 'pause-dev9').exists())
 
-    def test_drain_lifts_the_pause_when_the_timeout_is_reached(self):
-        """N4 : le drain ne survit pas à l'échéance ; celle-ci vient de
-        l'horloge injectée (aucun budget de temps réel)."""
+    def test_drain_does_not_wait_out_a_turn_that_never_ends(self):
+        """#2152 : le drain ne bloque plus l'arrêt. Un agent qui reste en tour
+        reçoit la pause, puis l'arrêt prouvé #1152 prend la suite sans attendre
+        une échéance ; la pause est levée après le démarrage."""
         self.env['DRAIN_ATTENTE'] = '1'
-        self.env['ATTENTE_MAX'] = '5'
-        (self.state / 'horloge').write_text('0')
-        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
         p = self.run_vm(scenario='chaines-toujours')
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn('toujours en tour', p.stderr)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('toujours en tour', p.stderr)
         self.assertIn('pause dev9', self.operateur())
         self.assertIn('resume dev9', self.operateur())
-        self.assertIn('drain levé (sortie du script)', p.stdout)
+        self.assertIn('--user stop ameesh-runner-agent@dev9.service', self.units())
+        self.assertIn('--user start ameesh-runner-agent@dev9.service', self.units())
+        self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
         self.assertFalse((self.state / 'pause-dev9').exists())
 
-    def test_second_drain_after_a_human_lift_tracks_the_live_pause(self):
-        """N5 B2 : après une levée humaine, le re-drain ne garde pas le motif
-        périmé ; c'est la pause vivante qui est levée à la sortie."""
+    def test_pause_is_posed_before_the_stop(self):
+        """#2152 x #1152 : la pause ferme l'admission AVANT le SIGTERM."""
         self.env['DRAIN_ATTENTE'] = '1'
-        self.env['ATTENTE_MAX'] = '10'
-        (self.state / 'horloge').write_text('0')
-        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
-        p = self.run_vm(scenario='chaines-relance')
+        p = self.run_vm(scenario='chaines-toujours')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        seq = (self.state / 'sequence.log').read_text().splitlines()
+        self.assertLess(seq.index('pause dev9'), seq.index('stop dev9'))
+
+    def test_drain_is_lifted_when_the_proven_stop_fails(self):
+        """Pose réussie puis `stop` en échec : le trap EXIT lève NOTRE pause."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='drain-puis-stop-error')
         self.assertNotEqual(p.returncode, 0)
-        self.assertIn('toujours en tour', p.stderr)
+        self.assertIn('drain posé', p.stdout)
+        self.assertIn('ne redémarre pas', p.stderr)
+        self.assertIn('resume dev9 --operator', self.operateur())
+        self.assertIn('--expect-reason', self.operateur())
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_human_lift_before_the_resume_leaves_no_stale_drain(self):
+        """N5 B2 : notre drain est levé par un humain après la pose ; la levée
+        conditionnelle ne retrouve plus la nôtre et ne pose rien de périmé."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='chaines-relance')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('toujours en tour', p.stderr)
         self.assertTrue((self.state / 'levee-humaine').exists())
         poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev9')]
-        self.assertEqual(len(poses), 2)
-        self.assertIn('drain levé (sortie du script)', p.stdout)
+        self.assertEqual(len(poses), 1)
+        self.assertIn('stop ameesh-runner-agent@dev9.service', self.units())
+        self.assertIn('start ameesh-runner-agent@dev9.service', self.units())
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_resume_failure_is_named_and_the_hold_stays_visible(self):
@@ -492,7 +561,10 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('pause dev9', self.operateur())
         self.assertNotIn('resume dev9', self.operateur())
         self.assertTrue((self.state / 'pause-dev9').exists())
-        self.assertIn('restart ameesh-runner-agent@dev9.service', self.units())
+        # La pause étrangère n'empêche pas l'arrêt prouvé #1152.
+        self.assertIn('--user stop ameesh-runner-agent@dev9.service', self.units())
+        self.assertIn('--user start ameesh-runner-agent@dev9.service', self.units())
+        self.assertNotIn('--user restart ameesh-runner-agent@dev9.service', self.units())
 
     def test_concurrent_pause_is_left_in_place(self):
         """Posée entre notre lecture et notre pause : elle n'est pas de nous."""
@@ -506,11 +578,12 @@ class AgentHostTest(unittest.TestCase):
 
     def test_drain_disabled_by_zero(self):
         self.env['DRAIN_ATTENTE'] = '0'
-        self.env['ATTENTE_MAX'] = '0'
         p = self.run_vm(scenario='chaines-toujours')
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn('toujours en tour', p.stderr)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('toujours en tour', p.stderr)
         self.assertEqual(self.operateur(), '')
+        self.assertIn('--user stop ameesh-runner-agent@dev9.service', self.units())
+        self.assertIn('--user start ameesh-runner-agent@dev9.service', self.units())
 
     def test_restart_rejects_unchanged_lease(self):
         for scenario in ['stale-lease']:
@@ -526,7 +599,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('WARNING dev8: not checked', p.stdout)
         self.assertIn('WARNING: 2 persona(s) not checked', p.stdout)
-        self.assertIn('restart ameesh-runner-agent@dev8.service', self.units())
+        self.assertIn('start ameesh-runner-agent@dev8.service', self.units())
 
     def test_runner_id_forms_and_default_are_accepted(self):
         for scenario in ['equals-owner', 'abbreviated-owner', 'last-owner', 'default-owner']:
@@ -539,7 +612,8 @@ class AgentHostTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 p = self.run_vm(scenario=scenario)
                 self.assertNotEqual(p.returncode, 0)
-                self.assertNotIn('restart ', self.units())
+                self.assertNotIn(' stop ', self.units())
+                self.assertNotIn(' start ', self.units())
 
     def test_check_rejects_foreign_owner(self):
         p = self.run_vm('controler', 'foreign-owner')
@@ -556,6 +630,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('bail', p.stderr)
         self.assertNotIn('restart', self.units())
+        self.assertNotIn('start', self.units())
 
     def test_check_rejects_expired_lease(self):
         p = self.run_vm('controler', 'expired')
@@ -567,6 +642,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('contrôles verts', p.stdout)
         self.assertNotIn('restart', self.units())
+        self.assertNotIn('start', self.units())
 
     def test_check_visits_every_registered_agent(self):
         """#1455: the client must not eat the list shared with the `while read`."""
@@ -586,7 +662,8 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('contrôles en échec', p.stderr)
 
     def test_unit_failures_do_not_report_success(self):
-        for scenario in ['restart-error', 'inactive']:
+        for scenario in ['stop-error', 'stop-unproven', 'stop-failed',
+                         'restart-error', 'inactive']:
             with self.subTest(scenario=scenario):
                 p = self.run_vm(scenario=scenario)
                 self.assertNotEqual(p.returncode, 0)
@@ -604,13 +681,20 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('bail', p.stderr)
 
-    def test_long_turn_times_out_without_restart(self):
-        self.env['ATTENTE_MAX'] = '0'
+    def test_long_turn_is_drained_not_waited_out(self):
+        # #1152/R1 (starvation impl07) : `running` à chaque lecture ne fait
+        # plus expirer la mise à jour — chaque unité est arrêtée (drainage
+        # borné par TimeoutStopSec), prouvée, puis démarrée.
         p = self.run_vm(scenario='always-busy')
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn('toujours en tour', p.stderr)
-        self.assertEqual(self.units(), '')
-        # Le délai global tombe avant DRAIN_ATTENTE (300 s) : aucun drain.
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('toujours en tour', p.stderr)
+        for name in ('dev8', 'dev9'):
+            self.assertIn('--user stop ameesh-runner-agent@%s.service' % name,
+                          self.units())
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % name,
+                          self.units())
+        self.assertNotIn('restart', self.units())
+        # DRAIN_ATTENTE vaut 0 par défaut (#1152) : aucun drain n'est posé.
         self.assertEqual(self.operateur(), '')
 
     def test_registry_errors_fail_before_restart(self):
@@ -639,14 +723,15 @@ class AgentHostTest(unittest.TestCase):
                                 for n in names])
         self.assertEqual(p.returncode, 0, p.stderr)
         for name in names:
-            self.assertIn('restart ameesh-runner-agent@' + name + '.service', self.units())
+            self.assertIn('stop ameesh-runner-agent@' + name + '.service', self.units())
+            self.assertIn('start ameesh-runner-agent@' + name + '.service', self.units())
 
     def test_invalid_name_is_named_and_skipped_without_blocking_valid_agents(self):
         bad = dict(name='bad;touch injected', host='host-agents', mode='execute', status='idle')
         p = self.run_vm(agents=self.agents + [bad])
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("agent 'bad;touch injected' : nom invalide", p.stderr)
-        self.assertIn('restart ameesh-runner-agent@dev9.service', self.units())
+        self.assertIn('start ameesh-runner-agent@dev9.service', self.units())
         self.assertNotIn('injected', self.units())
 
     def test_mode_refuses_unsupported_action(self):
