@@ -51,8 +51,10 @@ Declare new critical paths here when adding them. The review gate uses this
 declaration even when its fallback path patterns do not yet recognize a new
 module. Those fallback patterns remain a minimum: a recognized SQL, security
 or production path still requires two reviews if the canon omits it or calls
-it `light` or `normal`. Ordinary light changes still require no review before
-merge; other sensitive paths require one independent review.
+it `light` or `normal`, except Markdown documentation (`*.md`) classed `light`
+or `normal`, such as `docs/design/decisions/`: only `critical: true` makes it
+critical. Ordinary light changes still require no review before merge; other
+sensitive paths require one independent review.
 
 ## Computing the class of a change
 

@@ -116,6 +116,10 @@ CRITICAL_SCOPE = (
                # preuve de famille indépendante des avis (#2265)
                r"^src/ameesh/(review_lot|registry)\.py$"),
 )
+#: la documentation Markdown que le canon classe léger ou normal : les motifs
+#: de secours, larges, y verraient un domaine (`docs/design/decisions/`). Seul
+#: `critical: true` au canon la rend critique.
+_PROSE = re.compile(r"\.(md|markdown)$", re.IGNORECASE)
 #: le nombre d'avis d'un lot sensible hors de ces domaines
 SENSITIVE_REVIEWS = 1
 #: le nombre d'avis d'un lot sensible qui touche SQL, la sécurité ou la prod
@@ -126,7 +130,8 @@ def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
     Le canon peut le déclarer explicitement sur chaque chemin classé. Les
-    motifs de secours s'appliquent aussi aux chemins classés légers.
+    motifs de secours s'appliquent aussi aux chemins classés légers, sauf à la
+    documentation Markdown classée légère ou normale.
     Un doute de classe (politique ou diff illisible, `files` vide) ne se
     suppose jamais rassurant : `required_verdicts` le compte alors comme un
     domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
@@ -135,8 +140,12 @@ def critical_scope(klass) -> bool:
         return True
     for entry in files:
         path = str(entry.get("path") or "")
-        if entry.get("critical") is True or not path or any(
-                rx.search(path) for rx in CRITICAL_SCOPE):
+        if entry.get("critical") is True or not path:
+            return True
+        if (str(entry.get("class") or "") in ("light", "normal")
+                and _PROSE.search(path)):
+            continue
+        if any(rx.search(path) for rx in CRITICAL_SCOPE):
             return True
     return False
 

@@ -82,6 +82,23 @@ class CriticalPolicyDriftTest(ReviewPolicyFixture, unittest.TestCase):
                 self.assertEqual(one["required"], expected)
                 self.assertTrue(one["ok"], one["why"])
 
+    def test_light_markdown_is_not_caught_by_fallback_patterns(self):
+        # `docs/design/decisions/` matche le motif `decisions` de sécurité :
+        # une documentation légère ne demande pas deux avis pour autant.
+        for default in ("light", "normal"):
+            for path in ("docs/design/decisions/0042-x.md",
+                         "site/docs/guides/host-ameesh-approve.md"):
+                with self.subTest(default=default, path=path):
+                    klass = self.classify([path], default=default)
+                    self.assertEqual(merge_queue.required_verdicts(klass),
+                                     0 if default == "light" else 1)
+        klass = self.classify(["docs/design/decisions/0042-x.md"], rules=[{
+            "paths": ["docs/design/decisions/**"], "class": "sensitive",
+            "critical": True}])
+        self.assertEqual(merge_queue.required_verdicts(klass), 2)
+        klass = self.classify(["scripts/ci-queue-wait.py"])
+        self.assertEqual(merge_queue.required_verdicts(klass), 2)
+
 
 class DeclaredCriticalScopeTest(ReviewPolicyFixture, unittest.TestCase):
     """#2263 : le canon déclare les nouveaux domaines sans regex parallèle."""
