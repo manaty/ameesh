@@ -276,6 +276,10 @@ class MessageTest(unittest.TestCase):
         self.assertIn("git diff %s..%s" % (SHA_B[:12], SHA_A[:12]), text)
         self.assertIn("canon@deadbeef", text)
         self.assertIn("you then become the author", text)
+        # #1534 N6 : le courrier de désignation couvre la règle home#81 entière
+        self.assertIn("~50 lines", text)
+        self.assertIn("second family", text)
+        self.assertIn("ameesh provenance show", text)
 
     def test_capacity_message_refuses_implicit_admission(self):
         text = rd.capacity_message(LOT, freeze={"id": 42, "sha": SHA_A}, required=2,
