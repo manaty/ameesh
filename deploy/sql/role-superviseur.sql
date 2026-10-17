@@ -145,7 +145,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'credential_mode', 'ephemeral', 'ephemeral_expires_at',
         'created_by', 'canon_ref', 'capabilities', 'last_event_at',
         'placement_ok', 'placement_diagnostic', 'placement_ref',
-        'placement_profile', 'lease_expires_ts', 'last_seen_ts',
+        'placement_profile',
+        -- #508 (0411) : preuve de vie du runner, sans contenu ni secret
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner',
+        'lease_expires_ts', 'last_seen_ts',
         'last_turn_ts', 'key_ready', 'has_owner_key',
         'ephemeral_expires_ts', 'responsible_ok', 'unread',
         -- L26 (0027), désormais exposés par la vue : réglages sans contenu
