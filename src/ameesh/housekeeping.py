@@ -3280,8 +3280,12 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     from .platform import session_lock
 
     def skipped(reason):
-        return {"host": host, "dry_run": dry_run, "entries": [], "plan": [],
-                "skipped": [reason], "orphans": [], "measure": None}
+        # #2173: a pass that did not run must not read as executed. The
+        # dedicated `status` lets the report (and `--json`) tell a skipped
+        # pass from an empty one, without touching the lock itself.
+        return {"host": host, "dry_run": dry_run, "status": "skipped",
+                "entries": [], "plan": [], "skipped": [reason], "orphans": [],
+                "measure": None}
 
     lock = session_lock.try_lock(os.path.join(cfg.state_dir, MANAGED_DIR), "host-pass")
     if lock is None:
@@ -3633,8 +3637,15 @@ def _fmt(value) -> str:
 
 
 def print_report(report: dict) -> None:
-    mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
-        else "executed"
+    # #2173: a pass skipped by the host lock ran nothing; it must not print
+    # "executed" (nor "nothing to do": the concurrent pass is doing the work).
+    skipped_pass = report.get("status") == "skipped"
+    if skipped_pass:
+        reason = next(iter(report.get("skipped") or ()), "")
+        mode = "skipped" + (" — %s" % reason if reason else "")
+    else:
+        mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
+            else "executed"
     print("housekeeping of %s — %s" % (report["host"] or "?", mode))
     m = report.get("measure") or {}
     if m:
@@ -3652,15 +3663,16 @@ def print_report(report: dict) -> None:
     # en essai, les entrées de /tmp ont leur propre section (avec la commande)
     rows = [p for p in report["plan"] if p.get("kind") != "orphan"] if report["dry_run"] \
         else [e for e in report["entries"] if e["kind"] != "mesure"]
-    if not rows:
+    if not rows and not skipped_pass:
         print("  nothing to do")
     for row in rows:
         print("  %-9s %-12s %-10s %s%s" % (
             row.get("kind", ""), action_label(row.get("action", "")),
             _fmt(row["bytes"]) if row.get("bytes") is not None else "",
             row.get("path", ""), " — %s" % row["detail"] if row.get("detail") else ""))
-    for note in report.get("skipped") or ():
-        print("  skipped   %s" % note)
+    if not skipped_pass:  # #2173: the reason is already in the banner, once
+        for note in report.get("skipped") or ():
+            print("  skipped   %s" % note)
     conteneurs = report.get("containers") or {}
     volumes = report.get("volumes") or {}
     docker = (report.get("measure") or {}).get("docker_storage")
