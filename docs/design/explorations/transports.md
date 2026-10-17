@@ -1,23 +1,23 @@
 ---
 type: Exploration
 status: exploration
-title: "Transports supplémentaires pour les fils"
+title: "Additional transports for threads"
 ---
 
-# Transports supplémentaires pour les fils
+# Additional transports for threads
 
-## Problème
+## Problem
 
-Les équipes utilisent aussi le chat et l’e-mail. Ajouter ces transports pose des questions de lisibilité, de doublons et de provenance sans changer le sens du fil de référence.
+Teams also use chat and e-mail. Adding these transports raises questions of readability, duplicates and provenance without changing the meaning of the reference thread.
 
 ## Intuitions
 
-Une interface commune pourrait préserver les mêmes garanties pour chaque transport. L’identité de plateforme pourrait rester un indice distinct de la preuve de provenance et d’autorité.
+A common interface could preserve the same guarantees for every transport. Platform identity could remain a clue distinct from the proof of provenance and authority.
 
-## Questions ouvertes
+## Open questions
 
-- Comment préserver l’ordre et reconnaître une remise en double ?
-- Que faire des contenus ou pièces jointes illisibles ?
-- Comment rattacher une réponse à son fil sans faire de la plateforme la source d’autorité ?
+- How can order be preserved and a duplicate delivery recognized?
+- What should be done with unreadable contents or attachments?
+- How can a reply be attached to its thread without making the platform the source of authority?
 
-Contexte existant : [Étude messagerie et annuaire](../etudes/messagerie-annuaire.md), [Décision sur les connecteurs courants](../decisions/0004-open-source-et-outils-courants.md). Ces références éclairent la question ; elles ne promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Study of messaging and the directory](../etudes/messagerie-annuaire.md), [Decision on open connectors](../decisions/0004-open-source-et-outils-courants.md). These references inform the question; they do not promote this card to a study or to decided work.

@@ -1,0 +1,19 @@
+# #2022 — host reading of a host that runs no agent (CI VMs, the mesh
+# server): memory, disks, zombies, published to `host_resources` like a
+# runner's, so `ameesh alerts` (host_disk_soon_full, host_zombies) and
+# `ameesh hosts --fleet` see it. Needs only the host name and the database
+# access of `~/.config/ameesh/env`. Started every 5 minutes by
+# ameesh-host-publish.timer; never install it next to a runner (the runner
+# already publishes).
+[Unit]
+Description=ameesh host reading of a host without a runner (#2022)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/ameesh/env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh hosts --publish
+Nice=10
+NoNewPrivileges=yes

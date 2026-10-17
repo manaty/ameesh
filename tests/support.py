@@ -86,6 +86,11 @@ TEST_DSN = os.environ.get(
 )
 REQUIRE_DB = os.environ.get(
     "AMEESH_REQUIRE_DB", os.environ.get("AGENT_MESH_REQUIRE_DB", "1")) != "0"
+#: L142 : le banc ne dépend pas non plus de l'umask de la session appelante
+#: (0002 sur certains hôtes, 0022 en CI). Les fixtures d'arbres de confiance
+#: créent répertoires 0700 et fichiers 0644 et les vérifient ; un umask
+#: permissif rendait leurs sous-répertoires groupables et la suite rouge.
+os.umask(0o022)
 
 #: #749 : préfixe des sorties négatives volontaires qu'un test surface dans le
 #: journal. Le bilan de la suite complète (`scripts/test-parallele.sh`) cherche
@@ -165,6 +170,11 @@ os.environ["AMEESH_SYSTEMCTL"] = ""
 os.environ["AMEESH_SESSION_STORE_CHECK"] = "0"
 EMPTY_POWER_SUPPLY = tempfile.mkdtemp(prefix="ameesh-test-power-")
 os.environ["AMEESH_POWER_SUPPLY_DIR"] = EMPTY_POWER_SUPPLY
+#: #1580 (tranche 3) : jamais les jauges du widget omarchy du poste (pc-smichea
+#: en a de fraîches, dans ~/.local/state/omarchy/agents/usage) ; un test qui en
+#: veut pointe la variable sur son propre dossier
+EMPTY_USAGE_WIDGET = tempfile.mkdtemp(prefix="ameesh-test-usage-")
+os.environ["AMEESH_USAGE_WIDGET_DIR"] = EMPTY_USAGE_WIDGET
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
                  "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
     os.environ.pop(_bin_var, None)
