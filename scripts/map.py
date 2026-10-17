@@ -33,9 +33,11 @@ de son fichier (il les a importés).
 
     commit, genere, outils     commit mesuré, date, versions (Python, coverage)
     measure, mesure            parts, processus mesurés (dont sans contexte),
-                               sous-processus Python lancés sans la mesure,
-                               surcoût (L148 stage 6 : les deux graphies,
-                               l'anglaise d'abord, une release)
+                               artefacts de mesure illisibles (jamais comptés
+                               comme mesure valide), sous-processus Python
+                               lancés sans la mesure, surcoût (L148 stage 6 :
+                               les deux graphies, l'anglaise d'abord, une
+                               release)
     modules.<m>                durations et durees (mêmes valeurs), échecs sous
                                mesure (14 jours)
     blocs.<fichier>.<bloc>     empreinte, lignes [début, fin], modules
@@ -68,6 +70,7 @@ import os
 import pathlib
 import platform
 import re
+import sqlite3
 import subprocess
 import sys
 import sysconfig
@@ -288,11 +291,12 @@ def _entete_sqlite(fichier: str) -> str | None:
     return None
 
 
-def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
+def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dict]]:
     """{fichier relatif: {ligne: {modules}}}, le nombre de processus mesurés,
     celui des processus sans contexte (environnement remplacé par le test :
-    leurs lignes ne sont attribuées à aucun module) et les couvertures
-    illisibles ignorées ({part, fichier, raison}).
+    leurs lignes ne sont attribuées à aucun module), les couvertures
+    illisibles ignorées ({part, fichier, raison}, #1257) et les artefacts de
+    mesure incomplets ({fichier, erreur}, #1690).
 
     Une couverture perdue est nommée, jamais silencieuse, et ne fait pas
     échouer la carte entière : un artefact corrompu ne rougit plus un check
@@ -303,32 +307,47 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
     contribution, construite à part, n'est versée qu'une fois le fichier
     entièrement exploité (aucune ligne partielle d'un fichier corrompu).
 
-    Un fichier de 0 octet (processus tué avant d'écrire sa mesure) se lit sans
-    erreur mais ne porte aucune mesure : il est écarté comme une perte, jamais
-    compté comme un processus mesuré à zéro (R1 B3 #1257) — sinon la carte
-    paraîtrait complète alors que la contribution du processus manque."""
+    Un fichier de 0 octet (processus tué avant d'écrire sa mesure) est écarté
+    avant tout import et toute lecture (#1707) : il ne porte aucune mesure, et
+    le compter comme un processus mesuré à zéro ferait paraître la carte
+    complète alors que sa contribution manque (R1 B3 #1257).
+
+    Une même perte alimente les deux projections sans double compteur : le
+    résumé (#1257) et le repli du plan (#1690/#1716) la voient tous les deux."""
     lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
     processus = sans_contexte = 0
     ignorees: list[dict] = []
+    incomplets: list[dict] = []
     for dossier in dossiers:
         part = os.path.basename(os.path.normpath(dossier)) or dossier
         for fichier in sorted(glob.glob(os.path.join(dossier, "cov", ".coverage*"))):
+            # #1707 : un fichier de 0 octet n'a jamais reçu son schéma SQLite :
+            # la part a été interrompue avant d'écrire (un processus réellement
+            # mesuré écrit toujours le schéma, même sans ligne tracée). Le
+            # constat précède l'import et la lecture : CoverageData.read()
+            # initialiserait le fichier et masquerait le vide.
+            try:
+                vide = os.path.getsize(fichier) == 0
+            except OSError:
+                vide = False  # disparu entre le glob et ici : la lecture tranchera
+            if vide:
+                # #1257 x #1690 : la perte alimente les deux projections.
+                raison = ("DataError: fichier de couverture vide (0 octet) : "
+                          "écriture interrompue avant le schéma")
+                ignorees.append({"part": part, "fichier": os.path.basename(fichier),
+                                 "raison": raison})
+                incomplets.append({"fichier": os.path.relpath(fichier, dossier),
+                                   "erreur": raison})
+                continue
             import sqlite3
 
             from coverage import CoverageData
-            from coverage.exceptions import DataError
+            from coverage.exceptions import CoverageException
 
             diagnostic = _entete_sqlite(fichier)
             contribution: dict = collections.defaultdict(
                 lambda: collections.defaultdict(set))
             try:
-                if os.path.getsize(fichier) == 0:
-                    # R1 B3 (#1257) : un fichier vide ne fait lever aucune
-                    # erreur à coverage et ne rend aucune mesure ; le compter
-                    # comme processus mesuré rendrait la carte complète alors
-                    # que sa contribution est perdue. Perte conservatrice,
-                    # nommée comme les autres.
-                    raise DataError("fichier de couverture vide (0 octet)")
                 donnees = CoverageData(basename=fichier)
                 donnees.read()
                 contextes = donnees.measured_contexts()
@@ -342,12 +361,26 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
                         modules = {m for m in map(context_module, ctx) if m}
                         if modules:
                             contribution[relatif][ligne] |= modules
-            except (DataError, sqlite3.DatabaseError, OSError) as exc:
+            except (CoverageException, sqlite3.DatabaseError, OSError) as exc:
+                # #1257 x #1690 : la perte alimente les deux projections, sans
+                # double compteur ; le diagnostic d'en-tête nomme la panne.
                 raison = f"{type(exc).__name__}: {exc}"
                 if diagnostic:
                     raison = f"{raison} ({diagnostic})"
                 ignorees.append({"part": part, "fichier": os.path.basename(fichier),
                                  "raison": raison})
+                incomplets.append({"fichier": os.path.relpath(fichier, dossier),
+                                   "erreur": raison})
+                # #1716 : un `read()` en échec laisse la connexion SQLite
+                # ouverte dans `CoverageData._dbs` (le `with` de coverage n'est
+                # jamais entré) ; on la ferme ici plutôt que de la laisser au
+                # ramasse-miettes (ResourceWarning, relecture du test L161e).
+                fermer = getattr(donnees, "close", None)
+                if fermer is not None:
+                    try:
+                        fermer(force=True)
+                    except Exception:  # noqa: BLE001 — la mesure reste illisible
+                        pass
                 continue
             processus += 1
             if sans_attribution:
@@ -355,7 +388,7 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
             for relatif, par_ligne in contribution.items():
                 for ligne, modules in par_ligne.items():
                     lignes[relatif][ligne] |= modules
-    return lignes, processus, sans_contexte, ignorees
+    return lignes, processus, sans_contexte, ignorees, incomplets
 
 
 def _version_coverage() -> str:
@@ -381,7 +414,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
               table_durees: dict | None = None) -> dict:
     """Les mesures des parts → la carte."""
     maintenant = maintenant or datetime.datetime.now(datetime.timezone.utc)
-    lignes, processus, sans_contexte, couverture_ignoree = _coverage(dossiers)
+    lignes, processus, sans_contexte, couverture_ignoree, incomplets = _coverage(dossiers)
 
     # blocs de tout src/, exécutés ou non
     carte_blocs: dict[str, dict] = {}
@@ -476,6 +509,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
     measure = {"parts": len(dossiers), "processus": processus,
                "processus_sans_contexte": sans_contexte,
                "couverture_ignoree": couverture_ignoree,
+               "artefacts_incomplets": incomplets,
                "sous_processus_sans_mesure": _per_module(sans_mesure),
                "surcout": surcout}
     return {
@@ -613,6 +647,10 @@ def summary(carte: dict) -> str:
         f"* {mesure['processus']} processus mesurés en {mesure['parts']} parts, dont "
         f"{mesure['processus_sans_contexte']} sans contexte de test",
     ]
+    if mesure.get("artefacts_incomplets"):
+        lignes.append("* artefacts de mesure illisibles, jamais comptés comme mesure valide : "
+                      + ", ".join(f"{i['fichier']} ({i['erreur']})"
+                                  for i in mesure["artefacts_incomplets"]))
     if mesure["surcout"]:
         lignes.append("* surcoût de la mesure : " + ", ".join(
             f"{p} ×{r}" for p, r in sorted(mesure["surcout"].items())))

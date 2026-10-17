@@ -2,6 +2,16 @@
 """Échecs de tests remontés en temps réel au courrier de l'agent du lot (L161c).
 
     ameesh ci status <lot> [--limit N] [--json]
+    ameesh ci run <lot> [--avis N] [--exception incident|unblock --reason …]
+                        [--full --reason …] [--sha S] [--force] [--dry-run] [--json]
+    ameesh ci cancel <lot> [--all] [--dry-run] [--json]
+
+`ci status` lit les exécutions suivies ; `ci run` est le déclencheur du gel
+(#1343, canon §3 : la relecture passe avant la CI) — il vérifie le gel, les
+verdicts requis et la composition de la PR, puis pose sur elle l'étiquette
+`ci-lot-<40hex>` / `ci-full-<40hex>` qui déclenche `tests.yml`
+(`pull_request` `types: [labeled]`) sur la tête gelée ; `ci cancel` annule les
+runs périmés d'un lot.
 
 Étude L161 (docs/design/etudes/l161-tests-par-impact.md, section 3), voie A :
 pendant les tests, chaque part de la CI publie un check run « tests (flux) »
@@ -14,23 +24,48 @@ chaque passage un relevé (`Watcher.tick`) :
    de `github.projects` (une requête par dépôt) ; les workflows suivis d'un
    dépôt sont ceux que déclare `github.projects.<projet>.workflows`, sinon —
    quand le dépôt ne publie pas `tests.yml` — les workflows actifs découverts
-   (`actions/workflows`) : un dépôt dont les suites portent d'autres noms
-   (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est plus ignoré en
-   silence (#1110). Chaque exécution porte son fichier de workflow, pour que
-   le verdict nomme la suite concernée ; chacune est rattachée à un lot : par
+   (`actions/workflows`) qui ont la forme d'une suite (#1483 : les workflows
+   d'exploitation — déploiement, sonde — ne rendent pas de verdict de bruit ;
+   s'ils sont écartés, ils sont journalisés) : un dépôt dont les suites portent
+   d'autres noms (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est
+   plus ignoré en silence (#1110). Chaque exécution porte son fichier de
+   workflow, pour que le verdict nomme la suite concernée ; chacune est
+   rattachée à un lot : par
    sa branche (`work_items.branch`, L118), sinon par la ligne
    `ameesh-work: <id>` de son commit de tête (une fusion dans main) ; une
    exécution courte peut naître et finir entre deux passages sans jamais être
    vue « en cours » : un rattrapage borné des exécutions récemment terminées
    les découvre, rend leur verdict et réveille l'agent — une seule fois, et
-   jamais pour une tête déjà remplacée (#1110) ;
+   jamais pour une tête déjà remplacée (sauf sur une branche de base, où
+   chaque tête porte un lot différent : #1110, #1483) ; une ligne restée sans
+   lot (branche du lot posée après sa première vue, #1321) est rattrapée par
+   ce même relevé, verdict compris, tant qu'elle est encore récente (#2021) ;
+   tous les états non conclus sont lus, `pending` compris (#1161) : une
+   exécution qui attend un groupe de concurrence derrière une exécution
+   supplantée n'a sinon ni ligne, ni verdict, ni réveil ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
-   reste, car l'agent a pu agir ;
+   reste, car l'agent a pu agir ; les exécutions non démarrées (`queued`,
+   `pending`) de la même PR, du même dépôt source et du même workflow
+   (périmètre prudent du veilleur), dont l'essai est prouvé antérieur à celui
+   de la tête courante sont annulées : jamais sur `main`, sur `release/…`, sur la tête
+   courante, ni sur un essai plus récent (un rerun garde son `id` et augmente
+   `run_attempt` ; sans date d'essai, rien n'est annulé) (#1161) ; une
+   exécution de PR restée `pending` plus de cinq minutes est signalée à
+   l'assigné ;
 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
    chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ;
-4. une exécution qui n'est plus en cours est conclue : verdict.
+4. une exécution qui n'est plus en cours est conclue : verdict ;
+5. une exécution relancée (`gh run rerun`, geste courant sous saturation)
+   garde son `run_id` et change d'`run_attempt` (#901) : si GitHub la dit de
+   nouveau en cours, sa ligne est rouverte et suivie jusqu'à son verdict ; un
+   échec de l'attempt précédent qui n'est pas re-vu à la relance n'est plus
+   imputé à l'exécution, et un échec qui revient compte comme nouveau. Chaque
+   ligne publiée par `scripts/ci-flow.py` porte son attempt : tant que la
+   relance n'a pas republié son check run, celui de l'attempt précédent reste
+   le dernier de la tête et n'est pas relu ; une ligne sans marque vaut
+   attempt 1 et n'est jamais imputée à une relance.
 
 Courrier, de `ameesh` à l'assigné du lot, rangé dans le fil du lot, selon
 L125 :
@@ -41,16 +76,21 @@ L125 :
   hérité ;
 * échecs suivants : un événement ordinaire par relevé (regroupé par la
   fenêtre de 90 s du courrier) ;
-* verdict (vert, ou rouge avec la liste) : un événement ordinaire ; rien pour
-  une exécution annulée ou remplacée ; le verdict nomme le workflow et, quand
-  d'autres workflows de la même tête tournent encore, le dit — un vert de
-  `backend-suite.yml` n'est pas « la CI est verte » ;
+* verdict (vert, ou rouge avec la liste) : un événement ordinaire (#514 : la
+  fin de CI réveille l'agent, elle ne perce pas le tour en cours ; le rouge
+  perce déjà par la première alerte d'échec) ; le courrier et la référence qui
+  le rend vérifiable (`ci_runs.verdict_message_id`) sont publiés dans la même
+  transaction (#795 N2) ; rien pour une exécution annulée ou remplacée ; le
+  verdict nomme le workflow et, quand d'autres workflows de la même tête
+  tournent encore, le dit — un vert de `backend-suite.yml` n'est pas « la CI
+  est verte » ;
 * **rouge hérité** : un test qui échouait déjà à la dernière exécution conclue
-  de la base (la cible de la PR, sinon main ; pour main, l'exécution
-  précédente de main) n'est jamais imputé à l'auteur : pas d'urgent, une ligne
-  dans le verdict.
+  de la base (la cible de la PR, sinon la base du dépôt —
+  `github.projects.<projet>.base`, `main` par défaut, `develop` pour Nexlink :
+  #1483 ; pour une base, l'exécution précédente de la même suite) n'est jamais
+  imputé à l'auteur : pas d'urgent, une ligne dans le verdict.
 
-Une exécution rouge sur main lève aussi l'alerte `ci_main_red`
+Une exécution rouge sur une branche de base lève aussi l'alerte `ci_main_red`
 (`exploitation`, poussée par `ameesh notify` au responsable humain) : #846,
 dès qu'un échec est relevé sur une exécution de main encore en cours, sans
 attendre ses jobs agrégateurs — un job rouge sans événement de test publié
@@ -61,7 +101,10 @@ Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas enco
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import re
+import secrets
 import time
 from datetime import datetime
 
@@ -75,10 +118,30 @@ WORKFLOWS = ("tests.yml",)
 #: avant de réessayer après un échec de l'API
 DISCOVERY_TTL = 3600.0
 DISCOVERY_RETRY = 300.0
+#: #1483 : un workflow *découvert* n'est suivi que s'il a la forme d'une suite
+#: de tests. Sans liste déclarée, la découverte suivait tous les workflows
+#: actifs : sur un dépôt comme Nexlink (déploiements, sondes, synchronisation),
+#: chaque exécution terminée rendait un verdict de bruit à l'auteur du lot. La
+#: liste déclarée (`github.projects.<projet>.workflows`) reste le moyen
+#: explicite de suivre un workflow au nom inhabituel, et les workflows écartés
+#: sont journalisés une fois — aucun n'est ignoré en silence.
+SUITE_RE = re.compile(r"(?:^|[-_.])(?:suites?|tests?|invariants?|e2e)(?:[-_.]|$)",
+                      re.IGNORECASE)
 #: états GitHub d'une exécution pas encore conclue que le relevé lit : une
 #: exécution en attente d'un runner est vue dès la poussée, avant que
-#: l'exécution qu'elle remplace soit annulée
-LIVE_STATUSES = ("in_progress", "queued")
+#: l'exécution qu'elle remplace soit annulée. `pending` — l'exécution attend
+#: son groupe de concurrence (#1161) — est un état non conclu comme les
+#: autres : sans lui, un run bloqué derrière une exécution supplantée reste
+#: invisible, et n'a ni ligne, ni supersession, ni verdict, ni réveil. Les
+#: filtres `requested` et `waiting` sont acceptés par l'API (relevé du
+#: 14/10/2026 : aucun run dans ces états) ; ils sont lus comme les autres.
+LIVE_STATUSES = ("in_progress", "queued", "requested", "waiting", "pending")
+#: états GitHub d'une exécution qui n'a pas démarré : les seuls que le relevé
+#: annule quand une tête plus récente l'a supplantée (#1161)
+CANCELLABLE_STATUSES = ("queued", "pending")
+#: délai au-delà duquel une exécution de PR restée `pending` est signalée à
+#: l'assigné du lot (#1161)
+PENDING_ALERT = 300.0
 #: rattrapage borné des exécutions terminées entre deux passages (#1110) : on
 #: ne remonte pas plus loin que cette fenêtre, pour ne pas rendre de verdicts
 #: anciens après une longue interruption du veilleur
@@ -86,9 +149,16 @@ CATCHUP_WINDOW = 3600.0
 #: préfixe du nom des check runs publiés par `scripts/ci-flow.py publish`
 CHECK_PREFIX = "tests (flux)"
 SCHEMA = "ameesh-test-event/1"
-#: branches de base : une exécution n'y est jamais remplacée, et ses échecs
-#: servent de référence au rouge hérité
+#: branches de base par défaut : une exécution n'y est jamais remplacée, et ses
+#: échecs servent de référence au rouge hérité. Un dépôt dont la base n'est pas
+#: `main` — Nexlink, dont la base est `develop` — la déclare dans
+#: `github.projects.<projet>.base` (#1483).
 BASE_BRANCHES = ("main",)
+#: #1483 : taille des pages de listes d'exécutions du veilleur (l'API GitHub
+#: plafonne à 100). À 50, une file de plus de 50 exécutions — tous workflows
+#: confondus — pouvait cacher une exécution suivie, que seul le rattrapage
+#: rendait, une heure plus tard.
+LIST_PER_PAGE = 100
 ECHECS = ("echec", "erreur")
 #: conclusion GitHub → état de `ci_runs`
 _CONCLUSIONS = {"success": "success", "neutral": "success", "skipped": "success",
@@ -104,12 +174,12 @@ EXCERPT_LINES = 40
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
 #: #845 (arbitrage A du pilote, 14/10) : le relevé « runner busy sans job »
-#: coûte un appel par exécution non conclue (en plus des deux listes et de
+#: coûte un appel par exécution non conclue (en plus des listes par état et de
 #: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
 #: jamais à chaque passage. La fenêtre est écrite dans la base avant le premier
 #: appel HTTP (`ci_guard_scan`) : deux `notify --once` concurrents, ou deux
-#: hôtes, ne la mènent pas deux fois. À 600 s et 63 appels au plus par relevé,
-#: cette garde seule consomme au plus 378 appels/h et par dépôt (hors appels du
+#: hôtes, ne la mènent pas deux fois. À 600 s et 66 appels au plus par relevé,
+#: cette garde seule consomme au plus 396 appels/h et par dépôt (hors appels du
 #: suivi des échecs) ; la durée d'un relevé n'est pas bornée globalement, donc
 #: aucune détection en « <= 10 min » n'est promise.
 GUARD_SCAN_S = 600.0
@@ -124,15 +194,16 @@ GUARD_SCAN_MAX_RUNS = 60
 #: `carte.yml`, et 43 exécutions non conclues ont été mesurées le 13/10)
 GUARD_PER_PAGE = 100
 #: #845 (revue N/P2 2328 ; arbitrage A) : budget d'appels GitHub d'un relevé de
-#: la garde — les deux listes d'exécutions, un appel par exécution non conclue
-#: (chacune est relue : un run resté `queued` peut porter un job déjà
-#: `in_progress`, R1 cx3 B1), et la liste des runners. Le plafond couvre
-#: exactement `GUARD_SCAN_MAX_RUNS` exécutions : 2 + 60 + 1 = 63. Au-delà, le
-#: relevé est déclaré incomplet et RIEN n'est publié : un relevé partiel ne vaut
-#: pas un relevé complet, et les relevés précédents vieillissent jusqu'à ce que
-#: la fraîcheur (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre
-#: d'appels réellement consommés est journalisé dans `ci_guard_scan`.
-GUARD_SCAN_MAX_CALLS = 63
+#: la garde — une liste d'exécutions par état non conclu (`LIVE_STATUSES`,
+#: #1161 en lit cinq), un appel par exécution non conclue (chacune est relue :
+#: un run resté `queued` peut porter un job déjà `in_progress`, R1 cx3 B1), et
+#: la liste des runners. Le plafond couvre exactement `GUARD_SCAN_MAX_RUNS`
+#: exécutions : len(LIVE_STATUSES) + 60 + 1. Au-delà, le relevé est déclaré
+#: incomplet et RIEN n'est publié : un relevé partiel ne vaut pas un relevé
+#: complet, et les relevés précédents vieillissent jusqu'à ce que la fraîcheur
+#: (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre d'appels
+#: réellement consommés est journalisé dans `ci_guard_scan`.
+GUARD_SCAN_MAX_CALLS = len(LIVE_STATUSES) + GUARD_SCAN_MAX_RUNS + 1
 
 
 class _GuardBudget(RuntimeError):
@@ -152,10 +223,9 @@ def workflow_of(path: str | None) -> str:
     return str(path or "").rsplit("/", 1)[-1].strip()
 
 
-def updated_ts(run: dict) -> float | None:
-    """L'horodatage de dernière mise à jour d'une exécution (ISO 8601), ou
-    `None` s'il est absent ou illisible."""
-    text = str(run.get("updated_at") or run.get("created_at") or "").strip()
+def _iso_ts(text: str | None) -> float | None:
+    """Un horodatage ISO 8601 GitHub en secondes epoch, ou `None`."""
+    text = str(text or "").strip()
     if not text:
         return None
     try:
@@ -164,9 +234,133 @@ def updated_ts(run: dict) -> float | None:
         return None
 
 
-def events_of(check_runs, run_id: int) -> list[dict]:
+def event_attempt(ev: dict) -> int:
+    """L'attempt qui a publié une ligne d'échec (#901) ; 1 si la ligne n'a pas
+    de marque (publiée avant le marquage) ou si elle est illisible : elle n'est
+    jamais imputée à une relance."""
+    try:
+        return max(1, int(ev.get("attempt") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def updated_ts(run: dict) -> float | None:
+    """L'horodatage de dernière mise à jour d'une exécution (ISO 8601), ou
+    `None` s'il est absent ou illisible."""
+    return _iso_ts(run.get("updated_at") or run.get("created_at") or "")
+
+
+def attempt_ts(run: dict) -> float | None:
+    """L'horodatage du dernier essai d'une exécution (ISO 8601), ou `None` :
+    l'âge d'une exécution qui attend, et la seule preuve d'antériorité entre
+    deux exécutions (#1161). `run_started_at` date l'essai courant — un rerun
+    garde son `run_id`, augmente `run_attempt` et repart à cette date ;
+    `created_at` ne date que le premier essai, donc pour un rerun sans
+    `run_started_at` la date est incertaine et rend `None`."""
+    if int(run.get("run_attempt") or 1) > 1:
+        return _iso_ts(run.get("run_started_at") or "")
+    return _iso_ts(run.get("run_started_at") or run.get("created_at") or "")
+
+
+def protected_branch(branch: str) -> bool:
+    """Une branche que le relevé ne supplante ni n'annule jamais : branche de
+    base (`main`) ou branche de release (`release/…`, canon §2) — #1161."""
+    branch = (branch or "").strip()
+    return branch in BASE_BRANCHES or branch.startswith("release/")
+
+
+def pull_request_run(run: dict) -> bool:
+    """Une exécution de PR : les seules que le relevé annule ou signale
+    (#1161) — une poussée sur la branche de base d'un autre dépôt (`develop`)
+    ou sur une étiquette n'est jamais une PR."""
+    return bool(run.get("pull_requests")) \
+        or (run.get("event") or "").startswith("pull_request")
+
+
+def pr_identity(run: dict) -> tuple[str, tuple[int, ...]] | None:
+    """(dépôt source, numéro(s) de PR) d'une exécution de PR, ou `None` sans
+    preuve. Le groupe de concurrence des workflows d'ameesh est
+    `format('pr-{0}', pull_request.number)` : deux PR de même nom de branche,
+    dans deux dépôts source distincts, ne se supplantent pas (#1161)."""
+    prs = [pr for pr in (run.get("pull_requests") or ()) if isinstance(pr, dict)]
+    numbers = tuple(sorted({int(pr["number"]) for pr in prs
+                            if pr.get("number") is not None}))
+    if not numbers:
+        return None
+    source = str((run.get("head_repository") or {}).get("full_name") or "").strip()
+    if not source:
+        for pr in prs:
+            source = str(((pr.get("head") or {}).get("repo") or {}).get("full_name")
+                         or "").strip()
+            if source:
+                break
+    if not source:
+        return None
+    return (source, numbers)
+
+
+def run_group(run: dict) -> tuple | None:
+    """Le périmètre prudent d'annulation : (dépôt source, PR, workflow).
+
+    Les groupes GitHub peuvent être partagés entre workflows d'un dépôt.
+    Exiger le même workflow est une garde volontaire du veilleur, qui ne
+    reconstitue pas l'expression `concurrency.group`. `None` sans preuve :
+    le relevé n'annule alors rien (#1161).
+    """
+    identity = pr_identity(run)
+    if identity is None:
+        return None
+    path = str(run.get("path") or "").strip()
+    return identity + (path or workflow_of(run.get("path")),)
+
+
+def proven_older(candidate: dict, successor: dict) -> bool:
+    """Le candidat est-il **prouvé** antérieur au successeur (#1161) ? L'ordre
+    des `id` ne le prouve pas : un rerun garde son `id` et augmente
+    `run_attempt`, si bien qu'une exécution d'`id` plus petit peut être le
+    dernier essai lancé. Seules deux dates d'essai strictement ordonnées le
+    prouvent ; une date incertaine conserve l'exécution."""
+    before, after = attempt_ts(candidate), attempt_ts(successor)
+    return before is not None and after is not None and before < after
+
+
+def proof_of(run: dict, successor: dict) -> dict:
+    """La preuve d'annulation d'une exécution, calculée sur la liste du relevé
+    (#1161, R1) : l'essai qualifié, sa tête, son groupe de concurrence et la
+    date d'essai du successeur. `cancel_run` la confronte à la relecture
+    fraîche avant tout POST."""
+    return {"run_attempt": int(run.get("run_attempt") or 1),
+            "head_sha": run.get("head_sha") or "",
+            "group": run_group(run),
+            "successor_ts": attempt_ts(successor)}
+
+
+def proof_holds(run: dict, proof: dict) -> bool:
+    """La relecture fraîche confirme-t-elle la preuve calculée sur la liste
+    (#1161, R1) ? Un essai qui a changé (`run_attempt`), une autre tête, un
+    autre groupe de concurrence ou une date d'essai qui n'est plus antérieure
+    au successeur rendent faux : l'exécution est conservée."""
+    if int(run.get("run_attempt") or 1) != int(proof.get("run_attempt") or 0):
+        return False
+    if (run.get("head_sha") or "") != (proof.get("head_sha") or ""):
+        return False
+    if run_group(run) != proof.get("group"):
+        return False
+    ts, successor_ts = attempt_ts(run), proof.get("successor_ts")
+    return ts is not None and successor_ts is not None and ts < successor_ts
+
+
+def events_of(check_runs, run_id: int, attempt: int | None = None) -> list[dict]:
     """Les événements `test` en échec, pour l'exécution `run_id`, portés par
-    la sortie des check runs « tests (flux) » d'une tête."""
+    la sortie des check runs « tests (flux) » d'une tête.
+
+    #901 : `ci-flow.py` marque chaque ligne publiée de son attempt GitHub.
+    Une relance garde le `run_id` : pendant qu'elle est en file, le dernier
+    check run publié est encore celui de l'attempt précédent. `attempt=None`
+    (le relevé) rend les lignes de tous les attempts, chacune avec sa
+    provenance (`event_attempt`) : le relevé les enregistre sous leur propre
+    attempt et n'impute à la relance que les lignes de l'attempt courant. Un
+    entier ne rend que les lignes de cet attempt."""
     out, seen = [], set()
     for check in check_runs or ():
         if not str(check.get("name") or "").startswith(CHECK_PREFIX):
@@ -186,39 +380,64 @@ def events_of(check_runs, run_id: int) -> list[dict]:
                 continue
             if ev.get("execution") is not None and str(ev["execution"]) != str(run_id):
                 continue
-            key = (str(ev.get("part") or ""), ev["test"])
+            if attempt is not None and event_attempt(ev) != int(attempt):
+                continue
+            # la clé porte l'attempt : un check de l'attempt précédent et celui
+            # de la relance peuvent coexister dans la réponse, aucun ne masque
+            # l'autre (#901)
+            key = (event_attempt(ev), str(ev.get("part") or ""), ev["test"])
             if key not in seen:
                 seen.add(key)
                 out.append(ev)
     return out
 
 
-def failed_jobs_of(check_runs, run_id: int) -> list[str]:
-    """#846 : les jobs de l'exécution `run_id` déjà en échec, d'après les check
-    runs natifs de GitHub — les seuls publiés même quand aucun événement de
-    test ne l'est (panne d'installation, délai dépassé). Un check run d'un
-    autre workflow, ou d'une autre exécution du même commit, est écarté par le
-    lien vers son job (`/actions/runs/<run_id>/job/<job_id>`)."""
+def failed_jobs_of(jobs) -> list[str]:
+    """#846 : les jobs déjà en échec d'une **tentative** d'exécution, d'après
+    la liste des jobs de cette tentative (`actions/runs/<id>/attempts/<n>/jobs`)
+    — les seuls publiés même quand aucun événement de test ne l'est (panne
+    d'installation, délai dépassé). La tentative est explicite (#901 B1) : les
+    check runs d'une tête ne portent que le `run_id`, celui d'une tentative
+    antérieure encore publié serait imputé à la relance."""
     out = set()
-    for check in check_runs or ():
-        name = str(check.get("name") or "").strip()
-        if not name or name.startswith(CHECK_PREFIX):
+    for job in jobs or ():
+        name = str(job.get("name") or "").strip()
+        if not name:
             continue
-        if (check.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
-            continue
-        link = str(check.get("details_url") or check.get("url") or "")
-        if "/actions/runs/%d/job/" % int(run_id) not in link:
+        if (job.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
             continue
         out.add(name)
     return sorted(out)
 
 
-def lot_of_run(run: dict, lots: list[dict]) -> int | None:
+def _base_set(branches) -> frozenset:
+    """Les branches de base, en minuscules : la comparaison d'une branche
+    GitHub ne dépend pas de la casse (#1483)."""
+    return frozenset(str(b).casefold() for b in (branches or BASE_BRANCHES))
+
+
+def bases_for_repo(settings, repo: str) -> tuple:
+    """Les branches de base d'un dépôt (#1483) : celles que déclare
+    `github.projects.<projet>.base`, en tête (la première est la référence d'un
+    push hors PR), puis `BASE_BRANCHES` — `main` reste une base même quand le
+    dépôt déclare `develop` : traitée en branche de lot, chaque tête de main y
+    remplacerait la précédente et retirerait son verdict, comme `ci_main_red`
+    la lit déjà.
+
+    #1683 : source unique du veilleur (`Watcher.bases`) et de l'alerte
+    (`main_red`) — une branche d'un autre dépôt qui porterait le même nom
+    n'est pas lue comme une base."""
+    declared = settings.bases_for(repo) if settings is not None else None
+    return tuple(dict.fromkeys(tuple(declared or ()) + BASE_BRANCHES))
+
+
+def lot_of_run(run: dict, lots: list[dict], bases=BASE_BRANCHES) -> int | None:
     """Le lot d'une exécution : par sa branche (lots ouverts), sinon par la
-    ligne `ameesh-work:` de son commit de tête."""
+    ligne `ameesh-work:` de son commit de tête. `bases` : les branches de base
+    du dépôt (#1483), sur lesquelles aucune branche de lot n'est cherchée."""
     from .plan_git import WORK_TRAILER_RE
     branch = (run.get("head_branch") or "").casefold()
-    if branch and branch not in BASE_BRANCHES:
+    if branch and branch not in _base_set(bases):
         for lot in lots:
             if (lot.get("branch") or "").casefold() == branch:
                 return int(lot["id"])
@@ -227,13 +446,28 @@ def lot_of_run(run: dict, lots: list[dict]) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def base_of(run: dict) -> str:
-    """La branche de référence du rouge hérité : la cible de la PR, sinon main."""
+def base_of(run: dict, default: str = BASE_BRANCHES[0]) -> str:
+    """La branche de référence du rouge hérité : la cible de la PR, sinon la
+    base du dépôt (`default`, #1483 : `develop` pour Nexlink)."""
     for pr in run.get("pull_requests") or ():
         ref = ((pr.get("base") or {}).get("ref")) or ""
         if ref:
             return ref
-    return BASE_BRANCHES[0]
+    return default
+
+
+def _obsolete_head(run: dict, lot: dict | None, bases=BASE_BRANCHES) -> bool:
+    """#1161 : la branche du lot connaît une tête plus récente (`branch_head`,
+    posé par le relevé des branches) que celle de l'exécution — son verdict
+    porterait sur une tête remplacée, et l'exécution de remplacement peut être
+    `pending`, invisible au veilleur. Le silence vaut mieux qu'un faux vert.
+    Jamais sur une branche de base (#1483) : chaque tête y a son lot, et le
+    relevé normal n'y remplace jamais rien."""
+    branch = run.get("head_branch") or ""
+    if not branch or branch.casefold() in _base_set(bases):
+        return False
+    known = (lot or {}).get("branch_head") or ""
+    return bool(known) and (run.get("head_sha") or "") != known
 
 
 # --------------------------------------------------------------------------
@@ -340,10 +574,30 @@ def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
     return first
 
 
+def pending_text(run: dict, lot: dict | None, waited: float, cancelled: list[int]) -> str:
+    """Le message d'une exécution de PR restée `pending` : elle attend son
+    groupe de concurrence. `cancelled` : les exécutions supplantées non
+    démarrées que le relevé vient d'annuler pour le libérer (#1161)."""
+    head = _head(run, lot)
+    lines = ["%s: pending for %d min — the run is waiting for its concurrency "
+             "group." % (head, max(1, int(waited // 60)))]
+    if cancelled:
+        lines.append("Superseded run(s) of an earlier head were holding it: %s "
+                     "cancelled." % ", ".join(str(i) for i in cancelled))
+    else:
+        lines.append("No superseded run of this pull request can be cancelled: the "
+                     "group is held elsewhere; the run starts when it frees.")
+    lines += ["", "No need to wait for the CI in your turn (gh pr checks --watch): "
+                  "ameesh tells you."]
+    return "\n".join(lines)
+
+
 def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
-          urgent: bool) -> int:
+          urgent: bool, after_commit: list | None = None) -> int:
     """Envoie ; un texte refusé comme illisible (extrait binaire ou encodé)
-    part sans ses extraits."""
+    part sans ses extraits. `after_commit` (une liste) : l'écriture du fil y
+    est ajoutée, à exécuter par l'appelant après le commit de sa transaction
+    (#795 N2)."""
     from . import mail, work
     from .fil import UnreadableBody
     body = dict(payload)
@@ -351,10 +605,43 @@ def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
         body["urgent"] = True
     try:
         return mail.send(db, work.SYSTEM_SENDER, to, text, kind="event",
-                         work_item_id=str(lot) if lot else None, payload=body)
+                         work_item_id=str(lot) if lot else None, payload=body,
+                         after_commit=after_commit)
     except UnreadableBody:
         return mail.send(db, work.SYSTEM_SENDER, to, short, kind="event",
-                         work_item_id=str(lot) if lot else None, payload=body)
+                         work_item_id=str(lot) if lot else None, payload=body,
+                         after_commit=after_commit)
+
+
+@contextlib.contextmanager
+def _atomic(db):
+    """#795 N2 : la transaction qui porte le courrier et sa preuve.
+
+    Le trigger `agent_mailbox` n'émet son `pg_notify` qu'au commit : un
+    lecteur ne voit donc le courrier qu'une fois `ci_runs.urgent_message_id`
+    ou `verdict_message_id` écrit, et `_system_event_interrupt` l'accepte.
+    Un exécuteur médié (L109) n'a pas de transaction : ses opérations restent
+    séquentielles (pas de NOTIFY local à intercaler)."""
+    if storage.is_remote(db):
+        yield db
+        return
+    with db.transaction() as tx:
+        yield tx
+
+
+def _send_posed(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
+                urgent: bool, pose) -> int:
+    """Dépose le courrier de l'événement et pose sa preuve dans la même
+    transaction : `pose(stockage, message_id)` écrit la référence relue par
+    l'exécuteur. Le fil externe n'est écrit qu'après le commit."""
+    threads: list = []
+    with _atomic(db) as tx:
+        message_id = _send(tx, to, text, short, lot=lot, payload=payload,
+                           urgent=urgent, after_commit=threads)
+        pose(storage.of(tx), message_id)
+    for record in threads:
+        record(db.cfg, db)
+    return message_id
 
 
 def recipient_of(lot: dict | None) -> str | None:
@@ -382,6 +669,107 @@ def gh_api(gh=None, *, cache_dir=None, ttl=None, clock=None):
         raise plan_github.GithubError("no GitHub token (%s) and no local gh"
                                       % ", ".join(plan_github.TOKEN_VARS))
     return client.get
+
+
+#: les marqueurs canon d'un message de fusion (`plan_git.WORK_TRAILER_RE`,
+#: `ameesh-work: <id>`). Le commit composé du train #1467 en porte **un par
+#: membre** : le message entier ne désigne donc pas un lot unique.
+def _message_lots(message: str) -> list:
+    from . import plan_git
+    out = []
+    for match in plan_git.WORK_TRAILER_RE.finditer(message or ""):
+        try:
+            out.append(int(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _files_of(entry: dict) -> list:
+    return [str(f.get("filename")) for f in (entry.get("files") or ()) if f.get("filename")]
+
+
+def _author_of(entry: dict) -> str:
+    author = entry.get("author") or {}
+    if author.get("login"):
+        return str(author["login"])
+    return str(((entry.get("commit") or {}).get("author") or {}).get("name") or "")
+
+
+def _summary_of(entry: dict) -> str:
+    message = ((entry.get("commit") or {}).get("message") or "").splitlines()
+    return " ".join(message[0].split())[:160] if message else ""
+
+
+def landed_commits(repo: str, head_sha: str, api=None, *, max_lots: int = 12) -> list:
+    """#1681 : les commits de l'atterrissage qui a produit `head_sha`.
+
+    Rend `[{sha, lot, author, summary, files}]`, la forme attendue par
+    `incident.attribute` : le premier parent de la tête ouvre la comparaison
+    (`repos/<repo>/compare/<parent>...<head>`, le même client `gh api` que le
+    veilleur), et chaque commit porteur du marqueur canon `ameesh-work: <id>`
+    nomme un lot.
+
+    Trois cas, du plus précis au plus prudent :
+
+    * un seul lot — un candidat, avec les fichiers de la comparaison entière ;
+    * un paquet dont chaque lot porte **son** commit de fusion (un marqueur par
+      commit) — un candidat par lot, fichiers de son commit (lus au détail) ;
+    * un paquet composé (**plusieurs marqueurs dans un même message**, le
+      commit final multiparent du train #1467) — les lots sont nommés, mais
+      aucun fichier ne leur est attribué : l'agrégat ne se découpe pas sans la
+      preuve du manifeste (`plan.proof.members[]`), et l'agrégat donnerait à
+      chaque lot les changements des autres. Un candidat sans fichier ne fonde
+      aucune accusation (`incident.attribute`).
+
+    Sans marqueur, un candidat sans lot est rendu : il porte les fichiers, mais
+    ne peut pas fonder une accusation.
+    """
+    if not repo or not head_sha:
+        return []
+    api = api or gh_api()
+    head = api("repos/%s/commits/%s" % (repo, head_sha)) or {}
+    parents = [str(p.get("sha") or "") for p in (head.get("parents") or ()) if p.get("sha")]
+    if not parents:
+        return []
+    compare = api("repos/%s/compare/%s...%s" % (repo, parents[0], head_sha)) or {}
+    commits = list(compare.get("commits") or ())
+    by_lot: dict = {}
+    composed: list = []
+    for entry in commits:
+        lots = _message_lots((entry.get("commit") or {}).get("message") or "")
+        if len(lots) > 1:
+            composed.append((entry, lots))
+        elif lots:
+            by_lot.setdefault(lots[0], []).append(entry)
+    if composed:
+        out = []
+        for entry, lots in composed:
+            for lot in lots[:max_lots]:
+                out.append(dict(sha=str(entry.get("sha") or head_sha), lot=lot,
+                                author=_author_of(entry), summary=_summary_of(entry), files=[]))
+                max_lots -= 1
+                if max_lots <= 0:
+                    return out
+        return out
+    if not by_lot:
+        if not commits:
+            return []
+        last = commits[-1]
+        return [dict(sha=str(last.get("sha") or head_sha), lot=None, author=_author_of(last),
+                     summary=_summary_of(last), files=_files_of(compare))]
+    if len(by_lot) == 1:
+        lot, entries = next(iter(by_lot.items()))
+        last = entries[-1]
+        return [dict(sha=str(last.get("sha") or head_sha), lot=lot, author=_author_of(last),
+                     summary=_summary_of(last), files=_files_of(compare))]
+    out = []
+    for lot, entries in list(by_lot.items())[:max_lots]:
+        last = entries[-1]
+        detail = api("repos/%s/commits/%s" % (repo, last.get("sha"))) or {}
+        out.append(dict(sha=str(last.get("sha") or ""), lot=lot, author=_author_of(last),
+                        summary=_summary_of(last), files=_files_of(detail)))
+    return out
 
 
 def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
@@ -413,10 +801,13 @@ class Watcher:
     partagé (#848) : une lecture identique n'est pas repayée à chaque
     passage, et un quota épuisé arrête le passage sans boucle."""
 
-    def __init__(self, cfg, *, api=None, log=None, clock=None, dry_run: bool = False,
-                 ttl=None):
+    def __init__(self, cfg, *, api=None, cancel=None, log=None, clock=None,
+                 dry_run: bool = False, ttl=None):
         self.cfg = cfg
         self.api = api
+        #: l'écriture d'annulation GitHub (`repos/<repo>/actions/runs/<id>/cancel`) ;
+        #: None : `gh api -X POST` en production, jamais en test sans le dire
+        self.cancel = cancel
         self.log = log or (lambda _text: None)
         self.clock = clock or time.time
         self.dry_run = bool(dry_run)
@@ -425,6 +816,15 @@ class Watcher:
         #: avertissements déjà journalisés par ce passage de service
         self._warned_workflows: set = set()
         self.ttl = None if ttl is None else float(ttl)
+        #: #1483 : workflows découverts écartés (pas une suite), listes
+        #: d'exécutions tronquées — journalisés une fois par passage
+        self._warned_skipped: set = set()
+        self._warned_truncated: set = set()
+        #: têtes de branche déjà en échec de lecture (une fois par service)
+        self._warned_branches: set = set()
+        #: exécutions `pending` déjà signalées (une fois par service : la
+        #: mémoire de `ci_runs` ne porte pas ce message, additif sans migration)
+        self._pending_alerted: set = set()
 
     def _cache_ttl(self) -> float:
         """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
@@ -452,10 +852,17 @@ class Watcher:
             return []
         return sorted(set(settings.projects.values()))
 
+    def bases(self, repo: str) -> tuple:
+        """Les branches de base d'un dépôt (#1483, #1683) : `bases_for_repo`,
+        la même lecture que `ci.main_red` — le veilleur et l'alerte ne
+        divergent pas."""
+        return bases_for_repo(self.settings(), repo)
+
     def discovered_workflows(self, repo: str) -> tuple[str, ...] | None:
         """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
         l'API ne répond pas. Le résultat est gardé : une découverte par heure,
         une nouvelle tentative après un échec."""
+        from . import plan_github
         now = float(self.clock())
         cached = self._workflows_cache.get(repo)
         if cached is not None and now - cached[0] < cached[1]:
@@ -471,6 +878,10 @@ class Watcher:
                 if name and name not in files:
                     files.append(name)
             found = tuple(sorted(files))
+        except plan_github.GithubRateLimited:
+            # N5 #848 : le quota épuisé n'est pas une panne de découverte ; il
+            # remonte au passage, qui s'arrête et le journalise comme tel.
+            raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
             ttl = DISCOVERY_RETRY
             self.log("CI %s: workflow discovery failed (%s)"
@@ -482,8 +893,18 @@ class Watcher:
         """Les workflows suivis d'un dépôt : la liste déclarée
         (`github.projects.<projet>.workflows`) si elle existe, sinon le défaut
         L161 tant que le dépôt publie `tests.yml`, sinon les workflows actifs
-        découverts — un dépôt dont les suites portent d'autres noms n'est
-        jamais ignoré en silence (#1110)."""
+        découverts qui ont la forme d'une suite de tests (#1110, #1483 : un
+        workflow d'exploitation — déploiement, sonde, synchronisation — ne rend
+        pas de verdict de bruit à l'auteur du lot). Les workflows écartés sont
+        journalisés, et la liste déclarée les suit explicitement ; si aucun
+        workflow découvert ne ressemble à une suite, le comportement de #1110
+        est conservé (tous suivis) pour qu'aucune suite au nom inhabituel ne
+        soit perdue.
+
+        #1683 : un `ci.yml` générique ne porte aucun marqueur de suite
+        (`SUITE_RE`) — il est donc écarté **dès qu'une autre suite est
+        reconnue**, comportement assumé, journalisé une fois, et la liste
+        déclarée reste le moyen de le suivre. Aucun n'est ignoré en silence."""
         settings = self.settings()
         declared = settings.workflows_for(repo) if settings else None
         found = self.discovered_workflows(repo)
@@ -498,53 +919,139 @@ class Watcher:
             return WORKFLOWS
         if WORKFLOWS[0] in found:
             return WORKFLOWS
-        return found
+        suites = tuple(w for w in found if SUITE_RE.search(w))
+        if not suites:
+            if (repo, "") not in self._warned_skipped:
+                self._warned_skipped.add((repo, ""))
+                self.log("CI %s: no discovered workflow looks like a test suite, "
+                         "following all of them (#1110)" % repo)
+            return found
+        skipped = tuple(w for w in found if w not in suites)
+        if skipped and (repo, skipped) not in self._warned_skipped:
+            self._warned_skipped.add((repo, skipped))
+            self.log("CI %s: discovered workflow(s) not followed (not a test suite): %s; "
+                     "declare them in github.projects to follow them"
+                     % (repo, ", ".join(skipped)))
+        return suites
+
+    def _listed(self, repo: str, status: str) -> list[dict]:
+        """La liste des exécutions d'un état (#1483), page `LIST_PER_PAGE`.
+        Une liste tronquée est journalisée une fois : au-delà, une exécution
+        suivie peut rester cachée derrière une file d'autres workflows."""
+        data = self.api("repos/%s/actions/runs?status=%s&per_page=%d"
+                        % (repo, status, LIST_PER_PAGE)) or {}
+        runs = list(data.get("workflow_runs") or ())
+        total = int(data.get("total_count") or 0)
+        if total > len(runs) and (repo, status) not in self._warned_truncated:
+            self._warned_truncated.add((repo, status))
+            self.log("CI %s: %s run list truncated (%d of %d), a followed run may "
+                     "be seen late" % (repo, status, len(runs), total))
+        return runs
+
+    def branch_head(self, repo: str, branch: str) -> str | None:
+        """La tête de `branch` selon GitHub, ou None (API muette, branche
+        disparue) : elle prouve quelle exécution de la branche n'est pas
+        supplantée, avant toute annulation (#1161)."""
+        try:
+            data = self.api("repos/%s/branches/%s" % (repo, branch)) or {}
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            if (repo, branch) not in self._warned_branches:
+                self._warned_branches.add((repo, branch))
+                self.log("CI %s: head of branch %s unreadable (%s)"
+                         % (repo, branch, " ".join(str(exc).split())[:200]))
+            return None
+        sha = str(((data.get("commit") or {}).get("sha")) or "").strip()
+        return sha or None
+
+    def cancel_run(self, repo: str, run_id: int, *, proof: dict | None = None) -> bool:
+        """Annule une exécution GitHub **non démarrée** (`queued`/`pending`)
+        dont l'essai est prouvé antérieur à celui de la tête courante du même
+        groupe de concurrence : elle retient la tête courante (#1161).
+        Idempotent : une exécution déjà conclue n'est pas annulée ; une erreur
+        de l'API est journalisée et rend False, sans toucher à la base ni
+        rendre de verdict.
+
+        `proof` est la preuve calculée sur la liste du relevé (essai, tête,
+        groupe, date du successeur) : la relecture fraîche doit la confirmer
+        avant le POST. Un essai plus récent (`run_attempt`), une autre tête, un
+        autre groupe ou une date d'essai qui n'est plus antérieure au
+        successeur conservent l'exécution — le POST ne vise jamais un essai que
+        la liste n'avait pas qualifié (#1161, R1)."""
+        try:
+            run = self.api("repos/%s/actions/runs/%s" % (repo, run_id)) or {}
+            if (run.get("status") or "") not in CANCELLABLE_STATUSES:
+                return False
+            if proof is not None and not proof_holds(run, proof):
+                return False
+            if self.cancel is None:
+                from . import plan_github
+                plan_github._json(plan_github.Gh(), [
+                    "api", "-X", "POST", "repos/%s/actions/runs/%s/cancel" % (repo, run_id)])
+            else:
+                self.cancel(repo, int(run_id))
+            return True
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            self.log("CI %s: cancel of run %s failed (%s)"
+                     % (repo, run_id, " ".join(str(exc).split())[:200]))
+            return False
 
     def tick(self, db) -> list[dict]:
-        """Un relevé de chaque dépôt ; rend les envois et retraits."""
+        """Un relevé de chaque dépôt ; rend les envois et retraits.
+
+        #1813 : les compteurs du cache de lectures partent à la fin du
+        passage (`flush_reads`), même si le quota a coupé la boucle — le
+        client du runner vit toute la vie du processus, une suite de hits
+        restait sinon invisible sur disque jusqu'à la requête suivante."""
         from . import plan_github
 
-        repos = self.repos()
-        if not repos or self.dry_run:
-            return []
-        if self.api is None:
-            self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
-                              ttl=self._cache_ttl(), clock=self.clock)
-        out: list[dict] = []
-        for repo in repos:
-            try:
-                out += self.watch(db, repo)
-            except plan_github.GithubRateLimited as exc:
-                # quota épuisé : aucun autre appel ne part avant le reset
-                when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) \
-                    if exc.reset else "unknown"
-                self.log("CI %s: GitHub quota exhausted (reset at %s): pass stopped"
-                         % (repo, when))
-                break
-            except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
-                self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
-        return out
+        try:
+            repos = self.repos()
+            if not repos or self.dry_run:
+                return []
+            if self.api is None:
+                self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
+                                  ttl=self._cache_ttl(), clock=self.clock)
+            out: list[dict] = []
+            for repo in repos:
+                try:
+                    out += self.watch(db, repo)
+                except plan_github.GithubRateLimited as exc:
+                    # quota épuisé : aucun autre appel ne part avant le reset
+                    when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) \
+                        if exc.reset else "unknown"
+                    self.log("CI %s: GitHub quota exhausted (reset at %s): pass stopped"
+                             % (repo, when))
+                    break
+                except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
+                    self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
+            return out
+        finally:
+            plan_github.flush_reads(getattr(self.cfg, "state_dir", None))
 
     # -- un dépôt --------------------------------------------------------------
     def watch(self, db, repo: str) -> list[dict]:
         st = storage.of(db)
         followed = set(self.followed_workflows(repo))
+        bases = self.bases(repo)
         live = {}
         for status in LIVE_STATUSES:
-            data = self.api("repos/%s/actions/runs?status=%s&per_page=50" % (repo, status)) or {}
-            for r in data.get("workflow_runs") or ():
+            for r in self._listed(repo, status):
                 if workflow_of(r.get("path")) in followed:
                     live.setdefault(int(r["id"]), r)
         lots = [r for r in st.work.open_for_sweep(500) if r.get("branch")]
         out: list[dict] = []
         for run_id in sorted(live):
-            out += self._follow(db, repo, live[run_id], lots)
+            out += self._follow(db, repo, live[run_id], lots, bases)
+        # les exécutions de PR bloquées en `pending` : les exécutions non
+        # démarrées d'une tête supplantée retiennent le groupe de concurrence,
+        # elles sont annulées ; la tête courante qui attend est signalée (#1161)
+        out += self._unblock(db, repo, live, lots)
         # #747 : fin de l'attente d'un runner, distincte de la durée des tests
         st.ci.mark_started(repo, [i for i, r in live.items()
                                   if r.get("status") == "in_progress"])
         # les exécutions courtes, nées et finies entre deux passages, n'ont
         # jamais été vues « en cours » : rattrapage borné (#1110)
-        out += self._catch_up(db, repo, lots, followed)
+        out += self._catch_up(db, repo, lots, followed, bases)
         # les lignes que ce passage conclut sont figées AVANT les envois : le
         # verdict d'un workflow ne cite pas comme « encore en cours » un
         # workflow conclu dans le même passage (#1110)
@@ -557,7 +1064,7 @@ class Watcher:
             if (run.get("status") or "") == "completed":
                 finishing[int(row["run_id"])] = run
         for row in running:
-            out += self._failures(db, repo, row)
+            out += self._failures(db, repo, row, bases)
             run = finishing.get(int(row["run_id"]))
             if run is None:
                 continue
@@ -572,15 +1079,25 @@ class Watcher:
         self._guard(db, repo)
         return out
 
-    def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str]) -> list[dict]:
+    def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str],
+                  bases=BASE_BRANCHES) -> list[dict]:
         """Les exécutions terminées entre deux passages (#1110) : une exécution
         courte n'est jamais vue « en cours », donc jamais conclue sans ce
-        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
-        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
-        la même branche est ignorée (pas de verdict périmé)."""
+        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue au
+        même attempt est laissée au relevé normal (pas de doublon) — sauf si
+        elle est restée sans lot : le rattachement tardif (#1321) est retenté
+        ici, car une ligne terminale n'est plus revue vivante et son verdict se
+        perdrait (#2021).
+        Une ligne connue dont l'attempt a augmenté est une **relance** finie
+        entre deux passages (#1573 N1) : rouverte comme au relevé, puis suivie
+        par la queue existante (échecs + verdict).
+        Une tête déjà remplacée sur la même branche est ignorée (pas de verdict
+        périmé) — **sauf sur une branche de base** (#1483) : chaque tête de
+        `main` porte un lot différent, le relevé normal n'y remplace jamais
+        rien, et écarter la tête M1 quand M2 est déjà relevée perdait le verdict
+        et le réveil du lot fusionné avec M1."""
         st = storage.of(db)
-        data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
-        runs = list(data.get("workflow_runs") or ())
+        runs = self._listed(repo, "completed")
         # les exécutions que ce passage conclut (relevé normal compris) sont
         # figées AVANT les envois : un verdict du rattrapage ne cite pas comme
         # « encore en cours » un workflow conclu dans le même passage (#1110)
@@ -591,25 +1108,101 @@ class Watcher:
             if workflow_of(run.get("path")) not in followed:
                 continue
             run_id = int(run["id"])
-            if st.ci.run(repo, run_id) is not None:
-                continue
             updated = updated_ts(run)
             if updated is None or not 0 <= now - updated <= CATCHUP_WINDOW:
                 continue
             head = run.get("head_sha") or ""
             branch = run.get("head_branch") or ""
-            if st.ci.head_replaced(repo, branch, head, run_id):
-                continue
-            out += self._follow(db, repo, run, lots)
-            row = st.ci.run(repo, run_id)
+            known = st.ci.run(repo, run_id)
+            if known is not None:
+                attempt = int(run.get("run_attempt") or 1)
+                if known["status"] != "superseded" \
+                        and attempt > int(known.get("run_attempt") or 1):
+                    # #1573 N1 : la relance est déjà finie ; `_follow` rouvre la
+                    # ligne (et rattache le lot si la branche a été posée après),
+                    # la queue ci-dessous rend ses échecs et son verdict
+                    out += self._follow(db, repo, run, lots, bases)
+                    row = st.ci.run(repo, run_id)
+                    if row is None or row.get("status") != "running" \
+                            or int(row.get("run_attempt") or 1) != attempt:
+                        continue  # tête remplacée, ou ligne non rouverte
+                else:
+                    # même attempt : la liste en retard (#828) redit terminée
+                    # une exécution déjà conclue — la rouvrir renverrait son
+                    # verdict à chaque passe. #2021 : une ligne restée sans lot
+                    # est rattachée tardivement et son verdict délivré une fois.
+                    out += self._late_link(db, repo, run, known, lots, settled, bases)
+                    continue
+            else:
+                if branch.casefold() not in _base_set(bases) \
+                        and st.ci.head_replaced(repo, branch, head, run_id):
+                    continue
+                # #1161/#1483 : une tête du lot déjà remplacée (`branch_head`) ne
+                # rend pas de verdict — la même garde que `_follow` sur une ligne
+                # connue ; l'exécution de remplacement peut être `pending`.
+                lot = lot_of_run(run, lots, bases)
+                row_lot = next((l for l in lots if int(l["id"]) == lot), None) if lot else None
+                if _obsolete_head(run, row_lot, bases):
+                    continue
+                out += self._follow(db, repo, run, lots, bases)
+                row = st.ci.run(repo, run_id)
             if row is None or (run.get("status") or "") != "completed":
                 continue
-            out += self._failures(db, repo, row)
+            out += self._failures(db, repo, row, bases)
             pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
                        and r.get("branch") == branch
                        and int(r["run_id"]) not in settled]
             out += self._conclude(db, repo, row, run=run, pending=pending)
         return out
+
+    def _late_link(self, db, repo: str, run: dict, row: dict, lots: list[dict],
+                   settled: set, bases=BASE_BRANCHES) -> list[dict]:
+        """#2021 : rattache une ligne restée sans lot et, si elle est déjà
+        terminale, délivre son verdict une seule fois.
+
+        Les runs d'un paquet (`integration/**`) sont vus avant que la
+        composition ne déclare sa branche : ceux qui se concluent entre-temps
+        ne sont plus revus vivants par `_follow` (#1321), et leur verdict
+        partait à personne. Le rattrapage les ramène ici, sous les mêmes
+        gardes qu'un rattachement vivant : une tête plus récente déjà vue sur
+        la branche (`head_replaced`, `branch_head` du lot) laisse la ligne sans
+        lot, car son verdict porterait sur une tête remplacée."""
+        st = storage.of(db)
+        run_id = int(run["id"])
+        status = row.get("status") or "running"
+        if status not in ("running", "success", "failure"):
+            return []
+        if row.get("work_item_id") is not None or row.get("verdict_message_id"):
+            return []
+        head = run.get("head_sha") or ""
+        branch = run.get("head_branch") or ""
+        if not branch or branch.casefold() in _base_set(bases):
+            return []
+        if (run.get("status") or "") != "completed":
+            return []
+        if st.ci.head_replaced(repo, branch, head, run_id):
+            return []
+        lot_id = lot_of_run(run, lots, bases)
+        lot = next((l for l in lots if lot_id is not None and int(l["id"]) == int(lot_id)), None)
+        if lot is None or not recipient_of(lot):
+            return []
+        known_head = lot.get("branch_head") or ""
+        if known_head and head != known_head:
+            return []
+        st.ci.open_run(repo, run_id, head_sha=head, branch=branch,
+                       event=run.get("event") or "", base=base_of(run),
+                       work_item_id=int(lot["id"]), url=run.get("html_url"),
+                       workflow=workflow_of(run.get("path")),
+                       created_at=run.get("created_at"))
+        self.log("CI %s run %s: lot #%s linked late (branch set after the run)"
+                 % (repo, run_id, lot["id"]))
+        row = st.ci.run(repo, run_id) or row
+        if status == "running" or row.get("verdict_message_id"):
+            return []  # le relevé normal la conclura et enverra le verdict
+        pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
+                   and r.get("branch") == branch
+                   and int(r["run_id"]) not in settled]
+        return self._verdict(db, repo, row, run, status, pending=pending)
 
     # -- #845 : la garde de la CI ---------------------------------------------
     def _guard(self, db, repo: str) -> None:
@@ -624,8 +1217,8 @@ class Watcher:
         Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
         la fenêtre de 600 s est écrite dans la base avant le premier appel
         (`ci_guard_scan`, atomique par dépôt), chaque exécution non conclue est
-        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 63 appels
-        (2 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
+        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 66 appels
+        (5 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
         relue : un run resté `queued` peut porter un job déjà `in_progress`
         quand un autre attend (mesure fondatrice #828), donc aucun instantané de
         jobs ne peut être réutilisé sur le seul statut `queued` (R1 finale cx3,
@@ -637,8 +1230,13 @@ class Watcher:
         Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
         journalisée et n'empêche ni les échecs, ni les verdicts.
         """
+        from . import plan_github
         try:
             self._guard_state(db, repo)
+        except plan_github.GithubRateLimited:
+            # N5 #848 : un quota épuisé arrête le passage (tick le rattrape),
+            # il n'est pas journalisé comme un échec de la garde.
+            raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
             self.log("CI %s: guard failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
 
@@ -771,23 +1369,31 @@ class Watcher:
                 self.log("CI %s: guard scan incomplete (%s): %d/%d runs, %d calls, "
                          "nothing published" % (repo, reason, covered, runs_seen, calls))
 
-    def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
+    def _follow(self, db, repo: str, run: dict, lots: list[dict],
+                bases=BASE_BRANCHES) -> list[dict]:
         """Une exécution en cours : enregistrée si nouvelle ; une exécution
         connue sans lot rattaché l'est dès que la branche du lot est posée
-        (#1321), tant que sa tête est encore celle de la branche ; elle
-        remplace les exécutions d'une autre tête sur la même branche (hors
-        base)."""
+        (#1321), tant que sa tête est encore celle de la branche ; une
+        exécution connue que GitHub dit de nouveau en cours est une **relance**
+        (#901 : `run_id` inchangé, `run_attempt` suivant) : sa ligne est
+        rouverte et suivie, sauf si une tête plus récente de la branche l'a
+        remplacée ou si l'attempt n'a pas augmenté (liste en retard, #828).
+        Elle remplace les exécutions d'une autre tête sur la même
+        branche (hors base)."""
         st = storage.of(db)
         run_id = int(run["id"])
+        attempt = int(run.get("run_attempt") or 1)
         known = st.ci.run(repo, run_id)
         if known is not None:
+            if known["status"] == "superseded":
+                return []  # la tête de la branche a bougé : la relance est sans objet
             if known.get("work_item_id") is None:
                 # #1321 : la branche du lot peut être posée après la première
                 # vue du run ; sans ce rattachement, `_conclude` lit
                 # `recipient_of(None)` et le verdict part à personne.
                 # `open_run` est idempotent (coalesce côté stockage) : il ne
                 # remplit que le lien encore vide.
-                lot = lot_of_run(run, lots)
+                lot = lot_of_run(run, lots, bases)
                 row = None
                 if lot is not None:
                     row = next((l for l in lots if int(l["id"]) == lot), None)
@@ -798,24 +1404,37 @@ class Watcher:
                 # l'exécution de remplacement peut être `pending`, invisible
                 # au veilleur (#1161). Le silence vaut mieux qu'un faux vert.
                 known_head = (row or {}).get("branch_head") or ""
-                if lot is not None and (not known_head or head == known_head):
+                if lot is not None and not _obsolete_head(run, row, bases):
                     st.ci.open_run(repo, run_id, head_sha=head,
                                    branch=run.get("head_branch") or "",
-                                   event=run.get("event") or "", base=base_of(run),
+                                   event=run.get("event") or "",
+                                   base=base_of(run, default=bases[0]),
                                    work_item_id=lot, url=run.get("html_url"))
                     self.log("CI %s run %s: lot #%s linked (branch set later)"
                              % (repo, run_id, lot))
                 elif lot is not None:
                     self.log("CI %s run %s: obsolete head %s (branch head %s), not linked"
                              % (repo, run_id, _short(head), _short(known_head)))
-            return []
+            known_attempt = int(known.get("run_attempt") or 1)
+            if attempt <= known_attempt:
+                # même attempt : soit la ligne est déjà suivie, soit une liste
+                # d'exécutions en retard (#828) redit en cours une exécution
+                # conclue sans qu'elle ait été relancée — la rouvrir renverrait
+                # son verdict à chaque passe.
+                return []
+            reopened = st.ci.reopen_run(repo, run_id, run_attempt=attempt)
+            if reopened is None:
+                return []
+            return [{"action": "rerun", "repo": repo, "run_id": run_id, "attempt": attempt,
+                     "branch": reopened.get("branch"), "to": None}]
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
-                       base=base_of(run), work_item_id=lot_of_run(run, lots),
+                       base=base_of(run, default=bases[0]),
+                       work_item_id=lot_of_run(run, lots, bases),
                        url=run.get("html_url"), workflow=workflow_of(run.get("path")),
-                       created_at=run.get("created_at"))
+                       created_at=run.get("created_at"), run_attempt=attempt)
         branch = run.get("head_branch") or ""
-        if not branch or branch in BASE_BRANCHES:
+        if not branch or branch.casefold() in _base_set(bases):
             return []
         out = []
         old = st.ci.supersede(repo, branch, run.get("head_sha") or "", run_id)
@@ -829,17 +1448,118 @@ class Watcher:
                             "by": run.get("head_sha"), "withdrawn": withdrawn})
         return out
 
-    def _failures(self, db, repo: str, row: dict) -> list[dict]:
-        """Les échecs nouveaux d'une exécution suivie, et leur message."""
+    def _unblock(self, db, repo: str, live: dict[int, dict], lots: list[dict]) -> list[dict]:
+        """Les exécutions de PR qui attendent leur groupe de concurrence
+        (#1161). Dans son périmètre prudent (même PR, même dépôt source,
+        même workflow), le relevé annule les exécutions non démarrées d'un
+        essai antérieur, jamais `main`, `release/…`, jamais la tête courante,
+        jamais un essai dont l'antériorité n'est pas prouvée (un rerun reste,
+        #901). La tête courante restée `pending` au-delà de PENDING_ALERT est
+        signalée à l'assigné du lot."""
+        groups: dict[tuple, list[dict]] = {}
+        for run in live.values():
+            branch = run.get("head_branch") or ""
+            if not branch or protected_branch(branch) or not pull_request_run(run):
+                continue
+            key = run_group(run)
+            if key is None:
+                continue  # PR, dépôt source ou workflow non prouvés : jamais annulé
+            groups.setdefault(key, []).append(run)
+        now = float(self.clock())
+        out: list[dict] = []
+        heads: dict[str, str | None] = {}
+        for key in sorted(groups):
+            runs = groups[key]
+            branch = runs[0].get("head_branch") or ""
+            if len({r.get("head_sha") or "" for r in runs}) < 2 \
+                    and not any((r.get("status") or "") == "pending" for r in runs):
+                continue  # une seule tête visible : rien à libérer ni à signaler
+            if branch not in heads:
+                heads[branch] = self.branch_head(repo, branch)
+            head = heads[branch]
+            if not head:
+                continue  # tête courante non prouvée : ni annulation, ni signal
+            successors = [r for r in runs if (r.get("head_sha") or "") == head]
+            if not successors:
+                continue  # aucun essai de la tête courante dans ce groupe
+            successor = max(successors,
+                            key=lambda r: (attempt_ts(r) or 0.0, int(r["id"])))
+            cancelled: list[int] = []
+            for run in sorted(runs, key=lambda r: int(r["id"])):
+                if (run.get("head_sha") or "") == head:
+                    continue
+                if (run.get("status") or "") not in CANCELLABLE_STATUSES:
+                    continue
+                if not proven_older(run, successor):
+                    continue  # antériorité non prouvée : l'exécution est conservée
+                run_id = int(run["id"])
+                # la preuve est calculée sur la liste ; `cancel_run` la
+                # revérifie sur la relecture fraîche avant le POST (#1161, R1)
+                if self.cancel_run(repo, run_id, proof=proof_of(run, successor)):
+                    cancelled.append(run_id)
+                    out.append({"action": "cancelled", "repo": repo, "run_id": run_id,
+                                "head_sha": run.get("head_sha"), "branch": branch,
+                                "for": int(successor["id"]), "by": head})
+            for run in sorted(runs, key=lambda r: int(r["id"])):
+                if (run.get("status") or "") != "pending" \
+                        or (run.get("head_sha") or "") != head:
+                    continue  # une tête supplantée qui attend : annulée ci-dessus
+                out += self._alert_pending(db, repo, run, lots, cancelled, now)
+        return out
+
+    def _alert_pending(self, db, repo: str, run: dict, lots: list[dict],
+                       cancelled: list[int], now: float) -> list[dict]:
+        """Signale à l'assigné une exécution de la tête courante restée
+        `pending` plus de PENDING_ALERT (groupe de concurrence, #1161) : une
+        fois par exécution et par vie du service — `ci_runs` ne porte pas ce
+        message, l'additif #1161 reste sans migration."""
+        from . import work
+        key = (repo, int(run["id"]))
+        if key in self._pending_alerted:
+            return []
+        started = attempt_ts(run)
+        if started is None or now - started < PENDING_ALERT:
+            return []
+        self._pending_alerted.add(key)
+        waited = now - started
+        item_id = lot_of_run(run, lots)
+        lot = work.get(db, int(item_id)) if item_id else None
+        to = recipient_of(lot)
+        if not to:
+            return [{"action": "pending", "repo": repo, "run_id": int(run["id"]),
+                     "to": None, "waited_s": int(waited), "cancelled": list(cancelled)}]
+        # la forme des lignes `ci_runs` : `branch`, `run_id`, `url` — les textes
+        # lisent l'exécution comme le reste du relevé
+        view = dict(run, run_id=int(run["id"]), branch=run.get("head_branch") or "",
+                    url=run.get("html_url") or run.get("url"),
+                    workflow=workflow_of(run.get("path")))
+        text = pending_text(view, lot, waited, cancelled)
+        payload = {"ci": {"repo": repo, "run_id": int(run["id"]),
+                          "head_sha": run.get("head_sha"), "branch": run.get("head_branch"),
+                          "kind": "pending", "workflow": workflow_of(run.get("path")),
+                          "waited_s": int(waited), "cancelled": list(cancelled)}}
+        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
+        return [{"action": "pending", "repo": repo, "run_id": int(run["id"]), "to": to,
+                 "waited_s": int(waited), "cancelled": list(cancelled),
+                 "message_id": message_id}]
+
+    def _failures(self, db, repo: str, row: dict, bases=BASE_BRANCHES) -> list[dict]:
+        """Les échecs nouveaux d'une exécution suivie, et leur message.
+
+        Un événement de l'attempt courant enregistré pendant que la ligne était
+        encore à l'attempt précédent (liste en retard, #828) n'est pas
+        réinséré par `add_failure` quand la ligne est ensuite rouverte : il est
+        signalé ici tant qu'aucun message ne l'a porté (#1573 N2)."""
         from . import work
         st = storage.of(db)
+        run_id, attempt = int(row["run_id"]), int(row.get("run_attempt") or 1)
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
-        self._record_failed_jobs(st, repo, row, checks.get("check_runs"))
+        self._record_failed_jobs(st, repo, row, bases)
         if not events:
             return []
-        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0],
+        reference = st.ci.base_failures(repo, row.get("base") or bases[0],
                                         workflow=row.get("workflow")
                                         or workflow_of(row.get("path")))
         if reference and int(reference["run_id"]) == int(row["run_id"]):
@@ -849,26 +1569,46 @@ class Watcher:
         # qu'on le sache, il n'est pas imputé par un urgent
         unknown_base = not reference
         before = set(reference.get("tests") or ())
-        new = []
+        # les lignes déjà enregistrées pour l'attempt courant, avec leur
+        # message : `add_failure` ne les réinsère pas (même attempt), mais
+        # celles qu'aucun message n'a portées restent à signaler (#1573 N2)
+        recorded = {(f["part"], f["test"]): f
+                    for f in st.ci.failures(repo, int(run_id))}
+        new, fresh = [], set()
         for ev in events:
+            source = event_attempt(ev)
             failure = {"part": str(ev.get("part") or ""), "test": ev["test"],
                        "module": ev.get("module") or "", "status": ev.get("statut"),
                        "inherited": ev["test"] in before,
                        "excerpt": ev.get("extrait") or "", "replay": ev.get("rejouer") or "",
                        "duration_s": ev.get("duree_s"), "failed_at": ev.get("ts")}
-            if st.ci.add_failure(repo, int(row["run_id"]), **failure):
-                new.append(failure)
+            added = st.ci.add_failure(repo, run_id, run_attempt=source, **failure)
+            if source == attempt:
+                # une ligne de l'attempt précédent (check run pas encore
+                # republié par la relance) est enregistrée sous le sien, jamais
+                # imputée à l'attempt courant (#901)
+                seen = recorded.get((failure["part"], failure["test"]))
+                if added or (seen is not None and not seen.get("message_id")):
+                    new.append(failure)
+                if added:
+                    fresh.add((failure["part"], failure["test"]))
         own = [f for f in new if not f["inherited"]]
         if not own:
             return []
         lot = work.get(db, int(row["work_item_id"])) if row.get("work_item_id") else None
         to = recipient_of(lot)
         if not to:
+            # sans destinataire, aucun message ne portera jamais ces lignes :
+            # seules les nouvelles sont journalisées, pas toutes à chaque passe.
+            # #1612 : une ligne préinscrite sous l'attempt suivant n'est donc
+            # pas rejournalisée à sa réouverture sans destinataire. Elle reste
+            # en base pour ci.main_red ; aucun marqueur de courrier n'est créé.
+            own = [f for f in own if (f["part"], f["test"]) in fresh]
             return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
-                     "tests": [f["test"] for f in own], "to": None}]
+                     "tests": [f["test"] for f in own], "to": None}] if own else []
         # premier message de l'exécution (un passif sans base compte aussi)
         first = not row.get("urgent_message_id") and not any(
-            f.get("message_id") for f in st.ci.failures(repo, int(row["run_id"])))
+            f.get("message_id") for f in recorded.values())
         urgent = first and not unknown_base
         text = failure_text(row, lot, own, first=first, unknown_base=unknown_base)
         short = failure_text(row, lot, own, first=first, unknown_base=unknown_base,
@@ -879,26 +1619,42 @@ class Watcher:
                           "tests": [f["test"] for f in own]}}
         if unknown_base:
             payload["ci_passif"] = True
-        message_id = _send(db, to, text, short, lot=lot["id"], payload=payload, urgent=urgent)
-        if urgent:
-            st.ci.set_message(repo, int(row["run_id"]), "urgent", message_id)
-            row["urgent_message_id"] = message_id
-        st.ci.set_failure_message(repo, int(row["run_id"]),
-                                  [(f["part"], f["test"]) for f in own], message_id)
+        def pose(st, message_id: int) -> None:
+            if urgent:
+                st.ci.set_message(repo, int(row["run_id"]), "urgent", message_id)
+                row["urgent_message_id"] = message_id
+            st.ci.set_failure_message(repo, run_id, attempt,
+                                      [(f["part"], f["test"]) for f in own], message_id)
+
+        # #795 N2 : le courrier et sa preuve (`urgent_message_id`, `message_id`
+        # des échecs) dans la même transaction : le NOTIFY du courrier n'est
+        # délivré qu'au commit, quand l'exécuteur peut déjà le vérifier.
+        message_id = _send_posed(db, to, text, short, lot=lot["id"], payload=payload,
+                                 urgent=urgent, pose=pose)
         return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
-    def _record_failed_jobs(self, st, repo: str, row: dict, check_runs) -> None:
-        """#846 : sur une branche de base, un job déjà en échec est un main
-        rouge, même sans événement de test publié (panne d'installation, délai
+    def _record_failed_jobs(self, st, repo: str, row: dict,
+                            bases=BASE_BRANCHES) -> None:
+        """#846 : sur une branche de base, un job déjà en échec est un rouge de
+        la base, même sans événement de test publié (panne d'installation, délai
         dépassé). Relevé ici pour que `ci.main_red` alerte sans attendre la
         conclusion de l'exécution. Aucun courrier n'en part : `_failures` ne
-        signale que les événements de test (part `job` mise à part)."""
-        if row.get("branch") not in BASE_BRANCHES:
+        signale que les événements de test (part `job` mise à part). `bases` :
+        les branches de base du dépôt (#1483).
+        #901 B1 : les jobs sont ceux de l'attempt suivi, pas ceux de la tête —
+        un échec de l'attempt précédent encore publié n'est jamais inscrit sous
+        la relance, un vrai échec de l'attempt courant l'est."""
+        if (row.get("branch") or "").casefold() not in _base_set(bases):
             return
-        for job in failed_jobs_of(check_runs, int(row["run_id"])):
-            st.ci.add_failure(repo, int(row["run_id"]), part=JOB_PART, test=job,
+        run_id = int(row["run_id"])
+        attempt = int(row.get("run_attempt") or 1)
+        jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
+                        % (repo, run_id, attempt)) or {}
+        for job in failed_jobs_of(jobs.get("jobs")):
+            st.ci.add_failure(repo, run_id, run_attempt=attempt,
+                              part=JOB_PART, test=job,
                               module="", status="echec", inherited=False,
                               excerpt="", replay="", duration_s=None, failed_at=None)
 
@@ -907,18 +1663,37 @@ class Watcher:
         """Une exécution qui n'est plus en cours : son verdict. `run` : son
         dernier état GitHub, déjà relevé ; `pending` : les autres workflows de
         la même tête encore en cours, que le verdict nomme."""
-        from . import work
         st = storage.of(db)
         if run is None:
             run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
         if (run.get("status") or "") != "completed":
             return []  # en attente d'un runner, ou relancée : au prochain relevé
+        # Le détail GitHub porte le dernier attempt, même si la réouverture
+        # a été refusée (tête plus récente sur la branche, #1612). Son verdict
+        # ne doit jamais conclure une autre tentative encore suivie en base :
+        # la ligne est conclue par l'état de son propre attempt, sans quoi
+        # elle resterait `running` sans fin et son verdict serait perdu.
+        attempt = int(row.get("run_attempt") or 1)
+        if int(run.get("run_attempt") or 1) != attempt:
+            run = self.api("repos/%s/actions/runs/%s/attempts/%s"
+                           % (repo, row["run_id"], attempt)) or {}
+            if (run.get("status") or "") != "completed" \
+                    or int(run.get("run_attempt") or 0) != attempt:
+                return []
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
         if not st.ci.conclude(repo, int(row["run_id"]), status):
             return []
         if status == "cancelled":
             return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
                      "status": status, "to": None}]
+        return self._verdict(db, repo, row, run, status, pending=pending)
+
+    def _verdict(self, db, repo: str, row: dict, run: dict, status: str, *,
+                 pending: list[dict] | None = None) -> list[dict]:
+        """Le verdict d'une exécution conclue, à l'assigné du lot rattaché
+        (#2021 : délivré aussi pour une ligne terminale rattachée tardivement)."""
+        from . import work
+        st = storage.of(db)
         failures = st.ci.failures(repo, int(row["run_id"]))
         lot = work.get(db, int(row["work_item_id"])) if row.get("work_item_id") else None
         to = recipient_of(lot)
@@ -936,8 +1711,16 @@ class Watcher:
                           "attempt": int(view.get("run_attempt") or 1),
                           "failures": len([f for f in failures if not f.get("inherited")]),
                           "inherited": len([f for f in failures if f.get("inherited")])}}
-        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
-        st.ci.set_message(repo, int(row["run_id"]), "verdict", message_id)
+        # #514 : la fin de CI réveille l'agent (événement ordinaire), elle ne
+        # perce pas le tour en cours ; le rouge perce déjà par la première
+        # alerte d'échec, urgente et vérifiable en base (`interrupt_allowed`).
+        # #795 N2 : le courrier du verdict et `verdict_message_id` restent
+        # publiés dans la même transaction (un relevé intercalé ne voit jamais
+        # l'un sans l'autre).
+        message_id = _send_posed(
+            db, to, text, text, lot=lot["id"], payload=payload, urgent=False,
+            pose=lambda st, mid: st.ci.set_message(repo, int(row["run_id"]),
+                                                   "verdict", mid))
         return [{"action": "verdict", "repo": repo, "run_id": row["run_id"], "status": status,
                  "to": to, "message_id": message_id}]
 
@@ -948,10 +1731,17 @@ def describe(record: dict) -> str:
     if record["action"] == "superseded":
         return "%s superseded by %s; %d unread message(s) withdrawn" % (
             where, _short(record.get("by") or ""), len(record.get("withdrawn") or ()))
+    if record["action"] == "rerun":
+        return "%s re-run attempt %s: tracking reopened" % (where, record.get("attempt"))
+    if record["action"] == "cancelled":
+        return "%s: superseded run cancelled to free the concurrency group (for run %s)" % (
+            where, record.get("for"))
     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
         if record.get("to") else "(no recipient)"
     if record["action"] == "failures":
         return "%s: %d failure(s) %s" % (where, len(record.get("tests") or ()), to)
+    if record["action"] == "pending":
+        return "%s: pending %d min %s" % (where, int(record.get("waited_s") or 0) // 60, to)
     return "%s: verdict %s %s" % (where, record.get("status"), to)
 
 
@@ -959,7 +1749,7 @@ def describe(record: dict) -> str:
 # alerte ci_main_red
 # --------------------------------------------------------------------------
 
-def main_red(db) -> list[dict]:
+def main_red(db, bases=BASE_BRANCHES, *, bases_for=None) -> list[dict]:
     """Les exécutions des branches de base qui sont rouges : la dernière
     exécution conclue de chaque workflow (un succès d'une suite ne masque pas
     l'échec d'une autre, #1110), et une exécution encore en cours dont un échec
@@ -969,17 +1759,34 @@ def main_red(db) -> list[dict]:
     workflow est écartée : une exécution supprimée ou introuvable (l'API rend
     `{}`) n'est jamais conclue, et son job rouge garderait l'alerte, qui bloque
     les déploiements, sans fin (#1453).
+    `bases` : toutes les branches de base configurables des dépôts (#1483 ;
+    `Settings.all_bases`, le défaut `BASE_BRANCHES` restant à la charge de
+    l'appelant).
+    `bases_for(repo)` : les branches de base propres à un dépôt (#1683,
+    `bases_for_repo`) ; sans lui, `bases` s'applique à tous les dépôts (appel
+    historique) — une branche d'un dépôt qui porte le nom de la base d'un autre
+    serait alors lue comme une base.
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
+
+    def on_base(row) -> bool:
+        if bases_for is None:
+            return True
+        return (row.get("branch") or "").casefold() in _base_set(bases_for(row["repo"]))
+
     out, newest = [], {}
-    for row in st.ci.latest_concluded(BASE_BRANCHES):
+    for row in st.ci.latest_concluded(bases):
+        if not on_base(row):
+            continue
         key = (row["repo"], row["branch"], row.get("workflow"))
         newest[key] = max(newest.get(key, 0), int(row["run_id"]))
         if row.get("status") != "failure":
             continue
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
-    for row in st.ci.running_on(BASE_BRANCHES):
+    for row in st.ci.running_on(bases):
+        if not on_base(row):
+            continue
         if int(row["run_id"]) < newest.get(
                 (row["repo"], row["branch"], row.get("workflow")), 0):
             continue
@@ -1039,6 +1846,9 @@ def render_status(report: dict) -> list[str]:
                      "named by github.host)")
     for run in report["runs"]:
         state = _STATUS_FR.get(run["status"], run["status"])
+        attempt = int(run.get("run_attempt") or 1)
+        if attempt > 1:
+            state += " (attempt %d)" % attempt
         if run["status"] == "superseded" and run.get("superseded_by"):
             state += " by %s" % _short(run["superseded_by"])
         own = [f for f in run["failures"] if not f.get("inherited")]
@@ -1092,16 +1902,1053 @@ def quota_line(state_dir, *, now=None) -> str | None:
             parts.append("exhausted until %s%s"
                          % (time.strftime("%H:%M:%SZ", time.gmtime(blocked)), suffix))
     return "GitHub reads (shared): " + ", ".join(parts) if parts else None
+# --------------------------------------------------------------------------
+# ameesh ci run / ameesh ci cancel — la CI d'un lot part au gel (#1343)
+# --------------------------------------------------------------------------
+#
+# canon §3 (manaty/home#66, owner 14/10 21:45) : sur ameesh, la relecture passe
+# avant la CI. Une poussée sur une PR de lot ne lance plus rien ; la CI du lot
+# (impactés + contrat) ne tourne qu'une fois, sur la tête gelée, quand les
+# verdicts requis sont acquis. `ameesh ci run <lot>` porte ce déclencheur :
+#
+#   * le lot porte un gel (`ameesh work milestone <lot> frozen --sha S`), sa
+#     branche distante ET la tête de sa PR ouverte sont encore sur S — une
+#     tête changée est refusée, jamais un vert sur une autre tête ;
+#   * `--avis N` verdicts `ok` sur S, d'acteurs distincts et hors de l'assigné
+#     (0 pour un lot léger, 1 pour un lot sensible, 2 pour SQL/sécurité/prod) ;
+#   * la PR doit exister : le déclencheur est l'étiquette `ci-lot-<S>` (impactés
+#     + contrat) ou `ci-full-<S>` (suite complète), posée par la commande sur
+#     la PR (`pull_request` `types: [labeled]`). Le job `plan` compare
+#     exactement ce SHA à `pull_request.head.sha`, vérifie que le checkout est
+#     le merge-ref composé de la base du payload et de cette tête (ses deux
+#     parents), et sélectionne contre la base du payload ;
+#   * le jeton `gh` doit produire l'événement `pull_request: labeled` : un
+#     `GITHUB_TOKEN` d'Actions (acteur `github-actions[bot]`) ne déclenche
+#     aucun workflow et est refusé ;
+#   * idempotence bornée au parcours PR et à la composition courante (numéro
+#     de PR, tête gelée S, base du payload, mode) : un vert ou un run en vol de
+#     cette composition rend la main sans rien toucher ; un push vert de la
+#     même tête ne remplace pas le check de la PR, pas plus qu'un ancien
+#     dispatch ; une base qui a bougé demande une nouvelle demande ;
+#   * un terminal rouge ou annulé de la composition, ou un check requis rouge
+#     laissé par une demande non applicable (étiquette étrangère), demande
+#     `--force` (reprise explicite) : la commande retire alors l'étiquette et
+#     la repose pour produire un nouvel événement. Jamais de retrait/repose sur
+#     un vert applicable ou un run en vol, ni pour rejouer automatiquement.
+#
+# La commande est seule à retirer/reposer ses étiquettes ; une pose à la main
+# (propriétaire, pilote) demande de vrais tests, elle ne prouve ni gel ni avis
+# et ne dispense pas des gardes de fusion. Une étiquette étrangère (ni
+# `ci-lot-*` ni `ci-full-*`) fait échouer le plan : le check requis rougit sans
+# exécuter de tests, et sa concurrency est distincte pour ne pas annuler un run
+# gelé valide.
+#
+# Avant de reposer, les runs non conclues de la branche qui ne portent pas la
+# composition courante sont annulés (canon §3 : un run lancé sur un lot qui
+# attend encore un verdict ou une correction est annulé) ; un échec
+# d'annulation est dit, jamais fatal.
+#
+# Exceptions (canon §3) : un lot qui débloque la CI ou corrige un incident
+# demande sa CI en parallèle de sa relecture, `--exception incident|unblock
+# --reason …` ; le motif et la marque restent dans la trace du lot. `--full
+# --reason …` demande la suite complète sur une PR ordinaire ; une source ou
+# une cible `release/**` ou `integration/**` l'impose et refuse `ci-lot`.
+#
+# `ameesh ci cancel <lot>` fait la même annulation seule (`--all` : tout, y
+# compris le run de la composition gelée).
+
+GEL_SCHEMA = "ameesh-ci-gel/1"
+CANCEL_SCHEMA = "ameesh-ci-cancel/1"
+#: exceptions du canon §3 : la CI part en parallèle de la relecture, marquée
+EXCEPTIONS = ("incident", "unblock")
+#: états GitHub d'un run qui n'a pas conclu (LIVE_STATUSES en est un sous-ensemble)
+OPEN_STATUSES = ("queued", "in_progress", "requested", "waiting", "pending")
+#: conclusions d'un check requis considéré vert (règles GitHub)
+CHECK_GREEN = ("success", "neutral", "skipped")
+#: nombre d'avis que `--avis` accepte (léger, sensible, SQL/sécurité/prod)
+MAX_AVIS = 2
+#: durée pendant laquelle une étiquette posée mais pas encore visible dans
+#: l'API GitHub tient la clé : au-delà, un nouvel essai est permis (le run ne
+#: viendra plus, ou GitHub l'a perdu).
+RESERVE_TTL_S = 15 * 60
+#: l'étiquette qui demande la CI d'un gel : mode et SHA complet (#1343)
+LABEL_RE = re.compile(r"^ci-(?P<mode>lot|full)-(?P<sha>[0-9a-f]{40})$")
+#: le titre du run (run-name de tests.yml) : PR, étiquette, base du payload
+PR_RUN_RE = re.compile(
+    r"\[PR #(?P<number>\d+) (?P<label>ci-(?:lot|full)-[0-9a-f]{40}) "
+    r"base (?P<base>[0-9a-f]{40})\]")
+#: la marque de demande dans le journal du lot : `reserve` prend le verrou de
+#: la ligne, `applied` la referme sur une étiquette posée, `released` sur un
+#: refus. Le motif ne dépend pas du texte qui suit. Une marque `applied` porte
+#: `seen=<id>` (P2-3) : le plus grand identifiant d'exécution connu avant sa
+#: pose, seule corrélation fiable avec le run qu'elle a produit (les horloges
+#: de la base et de GitHub ne se comparent pas : la seconde contre la fraction).
+REQUEST_RE = re.compile(
+    r"^ci-label (?P<state>reserve|applied|released) pr=(?P<pr>\d+) "
+    r"label=(?P<label>ci-(?:lot|full)-[0-9a-f]{40}) sha=(?P<sha>[0-9a-f]{40}) "
+    r"base=(?P<base>[0-9a-f]{40}) mode=(?P<mode>lot|full) token=(?P<token>[0-9a-f]{16})"
+    r"(?: seen=(?P<seen>\d+))?\b")
+#: l'acteur du `GITHUB_TOKEN` d'Actions : ses étiquettes ne déclenchent rien
+ACTIONS_BOT = "github-actions[bot]"
+
+
+class GelError(CiError):
+    """Demande de gel : refus actionnable, jamais un run silencieux."""
+
+
+def _q(value: str) -> str:
+    """Une valeur de chemin ou de requête GitHub (une branche `lot/x` incluse)."""
+    from urllib.parse import quote
+    return quote(value or "", safe="")
+
+
+def _sha_ok(sha: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{40}", sha or ""))
+
+
+def label_name(mode: str, sha: str) -> str:
+    """L'étiquette d'une demande : `ci-lot-<40hex>` ou `ci-full-<40hex>`."""
+    if mode not in ("lot", "full"):
+        raise GelError("label mode: %r (lot or full)" % mode)
+    if not _sha_ok(sha):
+        raise GelError("label sha: full 40-hex expected, not %r" % sha)
+    return "ci-%s-%s" % (mode, sha)
+
+
+def repo_of(cfg, item: dict, *, repo: str = "") -> str:
+    """`owner/repo` du lot : `--repo`, son `issue_ref`, sinon `github.projects`."""
+    from . import plan_github
+    if repo.strip():
+        return repo.strip()
+    parts = plan_github._ref_parts(item.get("issue_ref"))
+    if parts and parts[0]:
+        return parts[0]
+    try:
+        found = plan_github.settings_of(cfg).repo_for(item.get("app"))
+    except plan_github.SettingsError as exc:
+        raise GelError(str(exc)) from exc
+    if found:
+        return found
+    raise GelError("lot #%s: no issue_ref and no github.projects entry for %r: "
+                   "pass --repo owner/name" % (item.get("id"), item.get("app")))
+
+
+def frozen_of(db, item_id: int) -> dict | None:
+    """Le dernier jalon `frozen` du lot, ou None (le lot n'est pas gelé)."""
+    from . import work
+    return next((m for m in work.milestones(db, int(item_id))
+                 if m["kind"] == "frozen"), None)
+
+
+def latest_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
+    """Le dernier verdict de chaque acteur sur `sha`, du plus récent au plus ancien.
+
+    Un verdict `ok` ancien ne survit jamais au `blocked` plus récent du même
+    acteur sur la même tête (P1 R1) : c'est le dernier mot de chaque relecteur
+    qui vaut, pas le meilleur. L'assigné ne compte pas : son verdict n'est pas
+    un avis indépendant.
+    """
+    from . import work
+    who = (assignee or "").strip().casefold()
+    out, seen = [], set()
+    for m in work.milestones(db, int(item_id)):      # du plus récent au plus ancien
+        if m["kind"] != "verdict":
+            continue
+        if (m.get("sha") or "").strip().casefold() != (sha or "").casefold():
+            continue
+        actor = (m.get("actor") or "").strip()
+        key = actor.casefold()
+        if not actor or key == who or key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return out
+
+
+def independent_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
+    """Les verdicts `ok` retenus : le dernier de chaque acteur, hors assigné."""
+    return [m for m in latest_verdicts(db, item_id, sha, assignee)
+            if (m.get("verdict") or "") == "ok"]
+
+
+def blocked_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
+    """Les têtes refusées : le dernier verdict de l'acteur est `blocked`."""
+    return [m for m in latest_verdicts(db, item_id, sha, assignee)
+            if (m.get("verdict") or "") == "blocked"]
+
+
+def release_refs(head_ref: str, base_ref: str) -> bool:
+    """Source ou cible `release/**`/`integration/**` : la suite complète."""
+    return any((ref or "").strip().startswith(("release/", "integration/"))
+               for ref in (head_ref, base_ref))
+
+
+def _head_of(api, repo: str, branch: str) -> str:
+    data = api("repos/%s/branches/%s" % (repo, _q(branch))) or {}
+    sha = ((data.get("commit") or {}).get("sha") or "").strip().lower()
+    if not _sha_ok(sha):
+        raise GelError("branch %s not found in %s" % (branch, repo))
+    return sha
+
+
+def _runs_of(api, repo: str, *, sha: str = "", branch: str = "",
+             event: str = "") -> list[dict]:
+    query = "per_page=50"
+    if sha:
+        query += "&head_sha=%s" % _q(sha)
+    if branch:
+        query += "&branch=%s" % _q(branch)
+    if event:
+        query += "&event=%s" % _q(event)
+    data = api("repos/%s/actions/workflows/tests.yml/runs?%s" % (repo, query)) or {}
+    return list(data.get("workflow_runs") or ())
+
+
+def pr_run(row: dict) -> dict | None:
+    """Une exécution de PR étiquetée #1343 : PR, mode, tête gelée, base.
+
+    Le titre (run-name de tests.yml) porte la demande ; `head_sha` doit nommer
+    la même tête (à défaut, le payload de la PR listé par l'API). Tout autre
+    run de PR — d'avant #1343, sans étiquette lisible, ou dont la tête ne
+    correspond pas — ne prouve rien : le doute ne verdit pas un check requis.
+    """
+    if (row.get("event") or "").strip() != "pull_request":
+        return None
+    m = PR_RUN_RE.search(str(row.get("display_title") or ""))
+    if not m:
+        return None
+    label = m.group("label")
+    lm = LABEL_RE.match(label)
+    if not lm:
+        return None
+    sha = lm.group("sha")
+    if (row.get("head_sha") or "").strip().lower() != sha:
+        heads = [((pr.get("head") or {}).get("sha") or "").strip().lower()
+                 for pr in row.get("pull_requests") or ()]
+        if sha not in heads:
+            return None
+    return {"row": row, "number": int(m.group("number")), "label": label,
+            "mode": lm.group("mode"), "sha": sha, "base": m.group("base"),
+            "status": (row.get("status") or "").strip().lower(),
+            "conclusion": (row.get("conclusion") or "").strip().lower()}
+
+
+def _pr_runs(api, repo: str, number: int, sha: str, branch: str) -> list[dict]:
+    """Les demandes de gel déjà vues pour cette PR et cette tête."""
+    out = []
+    for row in _runs_of(api, repo, branch=branch, event="pull_request"):
+        info = pr_run(row)
+        if info and info["number"] == number and info["sha"] == sha:
+            out.append(info)
+    return out
+
+
+def _current_run(row: dict, frozen: str, number: int, base: str) -> bool:
+    """Un run de la composition courante : ni périmé, ni à annuler.
+
+    Avec `number`/`base` (une demande de gel), un run de PR de la même tête
+    mais d'une autre base est périmé : la composition a bougé. Sans eux
+    (`ameesh ci cancel` seul), tout run qui porte le SHA gelé est conservé,
+    comme avant (#1343).
+    """
+    info = pr_run(row)
+    if number and info is not None:
+        return (info["number"] == number and info["sha"] == frozen
+                and (not base or info["base"] == base))
+    return (row.get("head_sha") or "").strip().lower() == frozen
+
+
+def _pr_of(api, repo: str, branch: str) -> dict:
+    """La PR ouverte de la branche : numéro, tête, base, refs, étiquettes."""
+    owner = repo.split("/", 1)[0]
+    rows = api("repos/%s/pulls?state=open&head=%s:%s&per_page=10"
+               % (repo, _q(owner), _q(branch)))
+    if not isinstance(rows, list):
+        raise GelError("pull requests of %s: unreadable response" % repo)
+    if not rows:
+        raise GelError("branch %s has no open pull request in %s: open the PR before "
+                       "requesting the frozen CI (#1343)" % (branch, repo))
+    if len(rows) > 1:
+        raise GelError("branch %s has %d open pull requests in %s: one only"
+                       % (branch, len(rows), repo))
+    pr = rows[0]
+    labels = [(lab.get("name") if isinstance(lab, dict) else str(lab))
+              for lab in pr.get("labels") or ()]
+    return {"number": int(pr.get("number") or 0),
+            "head": ((pr.get("head") or {}).get("sha") or "").strip().lower(),
+            "base": ((pr.get("base") or {}).get("sha") or "").strip().lower(),
+            "head_ref": ((pr.get("head") or {}).get("ref") or ""),
+            "base_ref": ((pr.get("base") or {}).get("ref") or ""),
+            "labels": [name for name in labels if name]}
+
+
+def _carries_freeze_request(api, repo: str, sha: str) -> bool:
+    """Le workflow du SHA gelé porte-t-il le déclencheur #1343 ?
+
+    Sans ce contrôle, un lot dont la branche précède la bascule serait refusé
+    par GitHub sans dire quoi faire (aucun run ne partirait) ; ici le refus est
+    explicite : refusionner la branche sur main avant de demander la CI.
+    """
+    import base64
+    data = api("repos/%s/contents/.github/workflows/tests.yml?ref=%s"
+               % (repo, _q(sha))) or {}
+    content = (data.get("content") or "").replace("\n", "")
+    if not content:
+        return False
+    try:
+        text = base64.b64decode(content).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return False
+    return "types: [labeled]" in text and "ci-(lot|full)-" in text
+
+
+def _short_run(row: dict) -> dict:
+    run = {"id": row.get("id"), "status": row.get("status"),
+           "conclusion": row.get("conclusion"), "event": row.get("event"),
+           "url": row.get("html_url")}
+    info = pr_run(row) if row else None
+    if info:
+        run.update({"mode": info["mode"], "pr": info["number"], "base": info["base"]})
+    elif (row.get("event") or "") == "push":
+        run["mode"] = "full"
+    return run
+
+
+def _covers(have: str, want: str) -> bool:
+    """`have` couvre-t-il la CI demandée ? La suite complète couvre le lot."""
+    return have == want or (want == "lot" and have == "full")
+
+
+def _latest_check(api, repo: str, sha: str) -> dict | None:
+    """Le dernier check run `tests` de la tête : ce que la fusion regarderait.
+
+    `filter=latest` rend le dernier état par nom ; à défaut on garde le plus
+    grand identifiant. None quand aucun check n'existe encore.
+    """
+    data = api("repos/%s/commits/%s/check-runs?filter=latest&per_page=100"
+               % (repo, _q(sha))) or {}
+    rows = [c for c in data.get("check_runs") or ()
+            if str(c.get("name") or "") == "tests"]
+    if not rows:
+        return None
+    row = max(rows, key=lambda c: int(c.get("id") or 0))
+    return {"id": row.get("id"), "status": (row.get("status") or "").strip().lower(),
+            "conclusion": (row.get("conclusion") or "").strip().lower(),
+            "url": row.get("details_url") or row.get("html_url") or ""}
+
+
+def _request_note(state: str, number: int, label: str, sha: str, base: str,
+                  mode: str, token: str, text: str = "",
+                  seen: int | None = None) -> str:
+    marker = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
+              % (state, number, label, sha, base, mode, token))
+    if seen is not None:
+        marker += " seen=%d" % seen
+    return "%s: %s" % (marker, text.strip()) if text.strip() else marker
+
+
+def request_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
+    """Les marques de demande du lot, de la plus ancienne à la plus récente."""
+    from . import work
+    out = []
+    for ev in work.events(db, int(item_id), limit=limit):
+        m = REQUEST_RE.match((ev.get("note") or "").strip())
+        if not m:
+            continue
+        out.append({"id": int(ev.get("id") or 0), "state": m.group("state"),
+                    "pr": int(m.group("pr")), "label": m.group("label"),
+                    "sha": m.group("sha"), "base": m.group("base"),
+                    "mode": m.group("mode"), "token": m.group("token"),
+                    "seen": int(m.group("seen")) if m.group("seen") is not None else None,
+                    "ts": float(ev.get("created_ts") or 0.0)})
+    return sorted(out, key=lambda e: e["id"])
+
+
+def _run_id(row: dict) -> int:
+    """L'identifiant entier d'une exécution, 0 s'il est illisible (P2-3)."""
+    try:
+        return int(row.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _materialized(mark: dict, runs) -> bool:
+    """Une exécution visible matérialise-t-elle cette marque (P2-3) ?
+
+    Chaque marque `applied` enregistre `seen=` : le plus grand identifiant
+    d'exécution connu avant sa pose. Les identifiants des exécutions GitHub
+    croissent avec le temps : un run d'identifiant supérieur n'a pu naître
+    qu'après elle, donc la demande a produit son exécution et ne tient plus la
+    clé. `runs` porte des couples (identifiant, mode) : la couverture des modes
+    suit celle des exécutions (§ `_covers`) — un run de lot ne matérialise pas
+    une demande de suite complète, seul un `full` le fait (P2-3, cx2). Une
+    marque sans `seen=` (écrite avant #1343) n'est pas corrélable : elle tient
+    la clé jusqu'au `ttl`, jamais libérée par une comparaison entre l'horloge
+    de la base (marque, fractionnaire) et celle de GitHub (run, à la seconde) —
+    c'est cette comparaison qui bloquait la reprise d'un run rouge né dans la
+    même seconde que sa marque.
+    """
+    seen = mark.get("seen")
+    if seen is None:
+        return False
+    return any(ident > seen and _covers(run_mode, mark["mode"])
+               for ident, run_mode in runs)
+
+
+def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token: str, *,
+                       now: float, ttl: float = RESERVE_TTL_S,
+                       runs: tuple = ()) -> dict | None:
+    """La marque `applied` fraîche d'un autre porteur, ou None (P2 R1/P2-3).
+
+    Une étiquette posée mais pas encore visible comme exécution dans l'API
+    GitHub tient la clé le temps du `ttl` ; `released` (demande refusée), les
+    marques périmées et celles que matérialise une exécution visible
+    (`_materialized`) ne tiennent pas. `runs` porte les couples (identifiant,
+    mode) des exécutions visibles de la composition : la marque est libérée par
+    corrélation d'identifiants et de mode, jamais par une comparaison
+    d'horloges. La couverture des modes suit celle des exécutions (§ `_covers`) :
+    un `full` réservé couvre une demande `lot` de la même composition, l'inverse
+    non — et seul un run `full` matérialise une marque `full`.
+    Appelé sous le verrou de la ligne du lot, il lit les marques commitées des
+    autres processus ; le porteur courant est exclu (`token`).
+    """
+    key = [e for e in events
+           if e["sha"] == sha and e["base"] == base and _covers(e["mode"], mode)
+           and e["state"] == "applied" and e["token"] != token]
+    held = [e for e in key
+            if now - e["ts"] < ttl and not _materialized(e, runs)]
+    return held[-1] if held else None
+
+
+def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
+             exception: str = "", reason: str = "", full: bool = False,
+             force: bool = False, repo: str = "") -> dict:
+    """La décision de `ameesh ci run <lot>`, sans aucune écriture.
+
+    Rend `{schema, action: request|green|running|refuse, …}` : `request` est le
+    seul cas qui écrit (`cmd_ci_run` pose l'étiquette). Un refus est une
+    `GelError` dont le message dit le geste à faire (geler, refusionner,
+    relire, refaire la demande).
+    """
+    from . import work
+    item = work.get(db, int(item_id))
+    if item is None:
+        raise GelError("lot #%s unknown" % item_id)
+    if exception and exception not in EXCEPTIONS:
+        raise GelError("--exception: %s (one of %s)" % (exception, ", ".join(EXCEPTIONS)))
+    if exception and not reason.strip():
+        raise GelError("--exception %s requires --reason: the exception is marked "
+                       "(canon §3)" % exception)
+    if full and not reason.strip():
+        raise GelError("--full requires --reason: the full suite is an explicit "
+                       "gesture (release, package, hand request)")
+    if avis < 0 or avis > MAX_AVIS:
+        raise GelError("--avis: 0 (lot léger), 1 (sensible) or 2 (SQL/sécurité/prod)")
+    name = repo_of(cfg, item, repo=repo)
+    branch = (item.get("branch") or "").strip()
+    if not branch:
+        raise GelError("lot #%s has no branch: push the lot first" % item_id)
+    target = (item.get("branch_target") or "main").strip() or "main"
+    freeze = frozen_of(db, item_id)
+    frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    asked = (sha or "").strip().lower()
+    exempt = bool(exception or full)
+    if asked and not _sha_ok(asked):
+        raise GelError("--sha: the frozen commit (40 hex), not %r" % sha)
+    if asked and frozen and asked != frozen:
+        raise GelError("--sha %s is not the freeze of lot #%s (%s): refreeze first, "
+                       "a correction needs a new review" % (asked[:12], item_id, frozen[:12]))
+    if not frozen and not exempt:
+        # le gel est un jalon, pas un drapeau : `--sha` seul ne le remplace pas,
+        # sinon un lot jamais gelé obtiendrait sa CI sans trace de gel.
+        raise GelError("lot #%s is not frozen: ameesh work milestone %s frozen --sha <sha>"
+                       % (item_id, item_id))
+    head = _head_of(api, name, branch)
+    #: la tête demandée : le gel pour une demande normale ; pour une exception
+    #: ou la suite complète, le `--sha` nommé ou la tête de la branche (le
+    #: correctif d'un incident arrive après le gel et n'attend pas un nouveau gel).
+    tested = (asked or head) if exempt else frozen
+    if not _sha_ok(tested):
+        raise GelError("lot #%s: the frozen milestone carries no usable sha (%r): "
+                       "refreeze with --sha" % (item_id, tested))
+    if head != tested:
+        raise GelError("branch %s is on %s, %s is %s: the ref moved — refreeze and "
+                       "re-review, nothing requested"
+                       % (branch, head[:12], "--sha" if exempt else "the freeze",
+                          tested[:12]))
+    frozen_sha = tested
+    mode = "full" if full else "lot"
+    verdicts = latest_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
+    reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
+    blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
+    if not (exception or full):
+        # un `blocked` est le dernier mot d'un relecteur sur cette tête : la
+        # corriger demande une nouvelle tête, donc un nouveau gel (P1 R1).
+        if blocked:
+            raise GelError("lot #%s: %s blocked %s (last verdict of that reviewer): "
+                           "fix the head, refreeze and re-review; nothing requested"
+                           % (item_id, blocked[0].get("actor") or "a reviewer",
+                              frozen_sha[:12]))
+        if len(reviews) < avis:
+            raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
+                           "(ameesh work milestone %s verdict ok --sha %s --actor <relecteur>); "
+                           "an incident or a CI unblock uses --exception incident|unblock "
+                           "--reason …" % (item_id, len(reviews), frozen_sha[:12], avis,
+                                           item_id, frozen_sha[:12]))
+    pr = _pr_of(api, name, branch)
+    if pr["head"] != frozen_sha:
+        raise GelError("pull request #%d head is %s, the freeze is %s: the PR moved — "
+                       "refreeze and re-review, nothing requested"
+                       % (pr["number"], pr["head"][:12], frozen_sha[:12]))
+    if not _sha_ok(pr["base"]):
+        raise GelError("pull request #%d: unusable base commit (%r): the composition "
+                       "cannot be checked" % (pr["number"], pr["base"]))
+    if release_refs(pr["head_ref"], pr["base_ref"]) and mode == "lot":
+        raise GelError("pull request #%d: source %s or target %s is release/** or "
+                       "integration/**: request the full suite (--full --reason …); a lot "
+                       "request never covers a release"
+                       % (pr["number"], pr["head_ref"] or "—", pr["base_ref"] or "—"))
+    base = pr["base"]
+    label = label_name(mode, frozen_sha)
+    runs = _pr_runs(api, name, pr["number"], frozen_sha, branch)
+    #: P1 R1 : la composition compte — même tête mais autre base, ou mode
+    #: insuffisant (`lot` ne prouve pas le `full`), ne verdit pas.
+    applicable = [r for r in runs if r["base"] == base and _covers(r["mode"], mode)]
+    live = [r for r in applicable if r["status"] in OPEN_STATUSES]
+    green = [r for r in applicable if r["status"] == "completed"
+             and r["conclusion"] == "success"]
+    decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
+                "branch": branch, "target": target, "sha": frozen_sha, "base": base,
+                "mode": mode, "label": label, "path": "pr-label", "pr": pr["number"],
+                "exception": exception, "reason": reason.strip(), "avis": avis,
+                "verdicts": sorted((m.get("actor") or "") for m in reviews),
+                "frozen": bool(freeze), "runs": len(runs),
+                "requested": [{"id": r["row"].get("id"), "mode": r["mode"],
+                               "base": r["base"],
+                               "conclusion": r["conclusion"] or r["status"]}
+                              for r in applicable]}
+    if live:
+        return {**decision, "action": "running",
+                "why": "a %s request of this composition (PR #%d, %s, base %s) is already "
+                       "in flight: nothing posed"
+                       % (live[0]["mode"], pr["number"], frozen_sha[:12], base[:12]),
+                "run": _short_run(live[0]["row"])}
+    if green:
+        #: le vert applicable ne suffit pas si le dernier check requis de la
+        #: tête est rouge (une étiquette étrangère a pu le laisser ainsi) : la
+        #: reprise est alors explicite (`--force`), jamais automatique.
+        check = _latest_check(api, name, frozen_sha)
+        if check is None or (check["status"] == "completed"
+                             and check["conclusion"] in CHECK_GREEN):
+            return {**decision, "action": "green",
+                    "why": "already green on this composition (PR #%d, %s, base %s, "
+                           "mode %s): nothing posed"
+                           % (pr["number"], frozen_sha[:12], base[:12], mode),
+                    "run": _short_run(green[-1]["row"])}
+        if check["status"] != "completed":
+            return {**decision, "action": "running",
+                    "why": "the required `tests` check of %s is %s (run %s): nothing posed"
+                           % (frozen_sha[:12], check["status"] or "?",
+                              check.get("id") or "?"),
+                    "check": check}
+        if not force:
+            raise GelError("lot #%s: the required `tests` check on %s is %s (run %s), not "
+                           "green although a %s request of this composition succeeded: "
+                           "--force to request the CI again on this composition (explicit "
+                           "resumption of a red or cancelled check)"
+                           % (item_id, frozen_sha[:12], check["conclusion"] or "?",
+                              check.get("id") or "?", mode))
+    if applicable and not green and not force:
+        raise GelError("lot #%s: %d request(s) already ran on PR #%d for %s (base %s), "
+                       "none green (%s): --force to request the CI again (explicit "
+                       "resumption of a red or cancelled run)"
+                       % (item_id, len(applicable), pr["number"], frozen_sha[:12],
+                          base[:12],
+                          ", ".join(sorted({r["conclusion"] or r["status"] or "?"
+                                            for r in applicable}))))
+    if not applicable:
+        #: P2 R1 : GitHub ne montre pas un run aussitôt ; une étiquette déjà
+        #: posée par un autre processus est dite, jamais reposée.
+        held = reservation_holder(request_events(db, item_id), frozen_sha, base, mode, "",
+                                  now=time.time())
+        if held:
+            return {**decision, "action": "running",
+                    "why": "a request of this composition was already reserved (token %s): "
+                           "nothing posed" % held["token"]}
+    if not _carries_freeze_request(api, name, frozen_sha):
+        raise GelError("the workflow at %s does not carry the freeze request trigger "
+                       "(#1343, ci-lot/ci-full label): rebase the lot on main before "
+                       "requesting the CI" % frozen_sha[:12])
+    return {**decision, "action": "request",
+            "why": ("%s verdict(s) on %s" % (len(reviews), frozen_sha[:12])
+                    if not (exception or full) else
+                    ("exception %s: %s" % (exception, reason.strip()) if exception
+                     else "full suite: %s" % reason.strip()))}
+
+
+def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
+                repo: str = "", number: int = 0, base: str = "") -> dict:
+    """Les runs d'un lot à annuler : non conclues, hors de la composition gardée.
+
+    `all_runs` annule aussi le run du SHA gelé (geste explicite). Un lot non
+    gelé n'a pas de SHA de référence : tous ses runs ouverts sont périmés.
+    Avec `number`/`base` (une demande de gel), un run de PR de la même tête
+    mais d'une autre base est périmé lui aussi : sa composition a bougé.
+    """
+    from . import work
+    item = work.get(db, int(item_id))
+    if item is None:
+        raise GelError("lot #%s unknown" % item_id)
+    name = repo_of(cfg, item, repo=repo)
+    branch = (item.get("branch") or "").strip()
+    if not branch:
+        raise GelError("lot #%s has no branch: nothing to cancel" % item_id)
+    freeze = frozen_of(db, item_id)
+    frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    rows = [r for r in _runs_of(api, name, branch=branch)
+            if (r.get("status") or "").strip().lower() in OPEN_STATUSES]
+    if frozen and not all_runs:
+        rows = [r for r in rows if not _current_run(r, frozen, number, base)]
+    return {"schema": CANCEL_SCHEMA, "work_item": int(item_id), "repo": name,
+            "branch": branch, "frozen": frozen, "all": bool(all_runs),
+            "runs": [_short_run(r) for r in rows],
+            "why": ("every open run of the branch" if all_runs or not frozen else
+                    "open runs that do not carry the frozen composition %s" % frozen[:12])}
+
+
+def _cancel_runs(gh, repo: str, runs: list[dict], *, say=print) -> int:
+    """Annule les runs (POST …/cancel) ; rend le nombre d'échecs, jamais fatal."""
+    failed = 0
+    for row in runs:
+        path = "repos/%s/actions/runs/%s/cancel" % (repo, row.get("id"))
+        code, out, err = gh.run(["api", "-X", "POST", path])
+        if code != 0:
+            failed += 1
+            say("cancel run %s: %s" % (row.get("id"),
+                                       " ".join((err or out or "failed").split())[:200]))
+        else:
+            say("cancel run %s (%s) requested" % (row.get("id"),
+                                                  (row.get("url") or "")[:80]))
+    return failed
+
+
+def _gh_error(out: str, err: str) -> str:
+    return " ".join((err or out or "failed").split())[:300]
+
+
+def _check_label_actor(gh) -> str:
+    """L'acteur du jeton `gh` : refuse le `GITHUB_TOKEN` d'Actions (#1343).
+
+    L'événement `pull_request: labeled` produit par le `GITHUB_TOKEN` d'une
+    Action ne déclenche aucun workflow : l'étiquette serait posée et rien ne
+    partirait. Un jeton d'utilisateur ou d'application GitHub, lui, déclenche.
+    """
+    code, out, err = gh.run(["api", "user", "--jq", ".login"])
+    if code != 0:
+        raise GelError("cannot read the gh token identity (%s): the label event of a "
+                       "GITHUB_TOKEN starts no workflow — use a user or GitHub App token"
+                       % _gh_error(out, err))
+    actor = out.strip()
+    if not actor or actor.casefold() == ACTIONS_BOT:
+        raise GelError("the gh token authenticates as %s: its label events start no "
+                       "workflow — use a user or GitHub App token" % (actor or ACTIONS_BOT))
+    return actor
+
+
+def _label_exists(gh, repo: str, name: str) -> bool:
+    code, _out, _err = gh.run(["api", "repos/%s/labels/%s" % (repo, _q(name))])
+    return code == 0
+
+
+def _ensure_label(gh, repo: str, name: str, mode: str, sha: str) -> None:
+    """Crée l'étiquette du dépôt si elle manque (une par demande, #1343)."""
+    if _label_exists(gh, repo, name):
+        return
+    payload = json.dumps({"name": name,
+                          "color": "0e8a16" if mode == "lot" else "1d76db",
+                          "description": "CI #1343 %s sur %s" % (mode, sha[:12])})
+    code, out, err = gh.run(["api", "-X", "POST", "repos/%s/labels" % repo,
+                             "--input", "-"], payload)
+    if code != 0:
+        raise GelError("cannot create the label %s in %s: %s"
+                       % (name, repo, _gh_error(out, err)))
+
+
+def _drop_label(gh, repo: str, number: int, name: str, *, delete_label: bool) -> list[str]:
+    """Retire l'étiquette de la PR ; `delete_label` la supprime du dépôt."""
+    failed = []
+    code, out, err = gh.run(["api", "-X", "DELETE",
+                             "repos/%s/issues/%d/labels/%s" % (repo, number, _q(name))])
+    if code != 0:
+        failed.append("remove %s: %s" % (name, _gh_error(out, err)))
+    if delete_label:
+        code, out, err = gh.run(["api", "-X", "DELETE", "repos/%s/labels/%s"
+                                 % (repo, _q(name))])
+        if code != 0:
+            failed.append("delete %s: %s" % (name, _gh_error(out, err)))
+    return failed
+
+
+def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> dict:
+    """Retire les étiquettes de demande périmées de la PR, puis pose la nôtre.
+
+    Rend `{ok, dropped, failed, error}` ; ne lève pas : un refus est dit. Une
+    étiquette étrangère n'est jamais touchée ; la nôtre est retirée avant
+    d'être reposée, seul moyen de produire un nouvel événement `labeled`.
+    """
+    number = int(pr["number"])
+    dropped, failed = [], []
+    for old in pr["labels"]:
+        if not LABEL_RE.match(old) or old == label:
+            continue                      # périmée (autre SHA/mode) : retirée
+        failed += _drop_label(gh, repo, number, old, delete_label=True)
+        dropped.append(old)
+    if label in pr["labels"]:
+        #: reprise explicite : sans retrait, reposer la même étiquette ne
+        #: produirait aucun événement.
+        failed += _drop_label(gh, repo, number, label, delete_label=False)
+        if failed:
+            return {"ok": False, "dropped": dropped, "failed": failed,
+                    "error": "cannot remove the label %s before posing it again" % label}
+    try:
+        _ensure_label(gh, repo, label, mode, sha)
+    except GelError as exc:
+        return {"ok": False, "dropped": dropped, "failed": failed, "error": str(exc)}
+    code, out, err = gh.run(["api", "-X", "POST",
+                             "repos/%s/issues/%d/labels" % (repo, number),
+                             "--input", "-"], json.dumps({"labels": [label]}))
+    if code != 0:
+        return {"ok": False, "dropped": dropped, "failed": failed,
+                "error": "cannot pose the label %s on PR #%d: %s"
+                         % (label, number, _gh_error(out, err))}
+    return {"ok": True, "dropped": dropped, "failed": failed, "error": ""}
+
+
+def _revalidate(db, item_id: int, decision: dict) -> None:
+    """Relit le gel et les verdicts sous le verrou, avant la pose (avis delta R1).
+
+    `gel_plan` décide hors transaction : un relecteur peut retirer son `ok`
+    (dernier verdict `blocked`) ou un nouveau gel être enregistré avant que la
+    réservation n'obtienne le verrou de la ligne du lot. Cette relecture refait
+    les gardes de `gel_plan` dans la transaction qui tient cette ligne, donc
+    après toute écriture concurrente ; les exceptions explicites
+    (`--exception`, `--full`), gestes marqués et motivés, ne dépendent pas des
+    verdicts et gardent leur cours.
+    """
+    from . import work
+    item = work.get(db, int(item_id))
+    if item is None:
+        raise GelError("lot #%s unknown" % item_id)
+    if decision.get("exception") or decision.get("mode") == "full":
+        return
+    sha = decision["sha"]
+    freeze = frozen_of(db, item_id)
+    frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    if frozen != sha:
+        if not frozen:
+            raise GelError("lot #%s is no longer frozen (the freeze milestone moved while "
+                           "the request was prepared): nothing posed" % item_id)
+        raise GelError("the freeze of lot #%s moved to %s while the request was prepared "
+                       "(%s requested): refreeze and re-review, nothing posed"
+                       % (item_id, frozen[:12], sha[:12]))
+    assignee = (item.get("assignee") or "")
+    verdicts = latest_verdicts(db, item_id, sha, assignee)
+    blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
+    if blocked:
+        raise GelError("lot #%s: %s blocked %s (last verdict of that reviewer, read under "
+                       "the lock): fix the head, refreeze and re-review; nothing posed"
+                       % (item_id, blocked[0].get("actor") or "a reviewer", sha[:12]))
+    reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
+    avis = int(decision.get("avis") or 0)
+    if len(reviews) < avis:
+        raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required (a "
+                       "verdict changed while the request was prepared): nothing posed"
+                       % (item_id, len(reviews), sha[:12], avis))
+
+
+def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> dict:
+    """La demande, sous le verrou de la ligne du lot (#1343, P2 R1).
+
+    `work.note` (marque `reserve`) prend le verrou `FOR NO KEY UPDATE` de
+    `work_items` dans la transaction : sur une connexion directe, deux `ci run`
+    concurrents, même d'hôtes différents, se sérialisent ; le second relit les
+    exécutions, la composition
+    de la PR, les marques, puis le gel et les derniers verdicts (`_revalidate`,
+    avis delta R1), et recule si un run est visible, si la PR a bougé, si un
+    autre a déjà posé l'étiquette ou si l'autorisation a changé. Le verrou ne
+    survit pas au processus tué (ROLLBACK) : le suivant reprend, sans attente
+    ni marque périmée. La marque `applied` enregistre `seen=` (plus grand
+    identifiant d'exécution connu avant la pose) : c'est cette corrélation, et
+    non une comparaison d'horloges, qui libère la reprise d'un run rouge dès
+    que son exécution est visible (P2-3).
+
+    La sérialisation par verrou de ligne vaut pour une connexion directe. Sur
+    une connexion d'exécuteur médiée (`storage.is_remote`, L109), la phase
+    critique s'exécute sans transaction : la marque `applied` ne détecte
+    qu'une demande déjà commitée avant sa lecture, et deux poses simultanées
+    peuvent se croiser — aucune garantie inter-hôtes n'est annoncée sur ce
+    chemin.
+
+    Rend `{requested, action, why?, run?}` ; `action` vaut `request` quand
+    l'étiquette a été posée, sinon `green`, `running` ou `refuse`.
+    """
+    from . import storage, work
+    token = secrets.token_hex(8)
+    sha, base, mode = decision["sha"], decision["base"], decision["mode"]
+    number, label = decision["pr"], decision["label"]
+
+    def critical(tx) -> dict:
+        def note(state: str, text: str = "", seen: int | None = None) -> None:
+            work.note(tx, int(item_id),
+                      _request_note(state, number, label, sha, base, mode, token, text,
+                                    seen=seen))
+
+        note("reserve", "freeze CI requested")
+        known = _pr_runs(api, decision["repo"], number, sha, decision["branch"])
+        #: P2-3 : le plus grand identifiant d'exécution déjà connu avant la pose
+        #: est la marque de l'instant ; le run de cette demande, créé après,
+        #: portera un identifiant supérieur. La marque `applied` l'enregistre
+        #: (`seen=`) et la reprise d'un run rouge se libère par cette
+        #: corrélation, sans jamais comparer l'horodatage (base, fractionnaire)
+        #: au `created_at` du run (GitHub, à la seconde).
+        watermark = max((_run_id(r["row"]) for r in known), default=0)
+        runs = [r for r in known if r["base"] == base and _covers(r["mode"], mode)]
+        live = [r for r in runs if r["status"] in OPEN_STATUSES]
+        green = [r for r in runs if r["status"] == "completed" and r["conclusion"] == "success"]
+        if live:
+            return {"requested": False, "action": "running",
+                    "why": "a %s request is already in flight: nothing posed"
+                           % live[0]["mode"], "run": _short_run(live[0]["row"])}
+        if green:
+            #: avis delta R1 : la phase critique refait la même décision que `gel_plan`
+            #: — un vert applicable ne suffit pas si le dernier check requis
+            #: est rouge ; `--force` répare, sans lui rien ne part.
+            check = _latest_check(api, decision["repo"], sha)
+            if check is None or (check["status"] == "completed"
+                                 and check["conclusion"] in CHECK_GREEN):
+                return {"requested": False, "action": "green",
+                        "why": "a green %s request of this composition is visible: nothing "
+                               "posed" % green[-1]["mode"],
+                        "run": _short_run(green[-1]["row"])}
+            if check["status"] != "completed":
+                return {"requested": False, "action": "running",
+                        "why": "the required `tests` check of %s is %s (run %s): nothing "
+                               "posed" % (sha[:12], check["status"] or "?",
+                                          check.get("id") or "?"),
+                        "check": check}
+            if not force:
+                return {"requested": False, "action": "refuse",
+                        "why": "the required `tests` check of this composition is %s "
+                               "(run %s), not green although a %s request succeeded: "
+                               "--force to request the CI again"
+                               % (check["conclusion"] or "?", check.get("id") or "?",
+                                  green[-1]["mode"])}
+        if runs and not force:
+            return {"requested": False, "action": "refuse",
+                    "why": "a %s request of this composition already ran, none green: "
+                           "--force to request the CI again" % runs[-1]["mode"]}
+        #: P2 R1/P2-3 : une marque que matérialise une exécution visible (run
+        #: rouge court) ne tient plus la clé ; seule une demande encore
+        #: invisible tient, et la corrélation est le couple (identifiant, mode)
+        #: du run, pas l'horloge — un run de lot ne matérialise pas un `full`.
+        held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
+                                  now=time.time(),
+                                  runs=tuple((_run_id(r["row"]), r["mode"]) for r in runs))
+        if held:
+            note("released", "another request (token %s) already holds this composition"
+                 % held["token"])
+            return {"requested": False, "action": "running",
+                    "why": "a request of this composition was already reserved (token %s): "
+                           "nothing posed" % held["token"]}
+        try:
+            _revalidate(tx, int(item_id), decision)
+        except GelError as exc:
+            note("released", str(exc))
+            return {"requested": False, "action": "refuse", "why": str(exc)}
+        try:
+            _check_label_actor(gh)
+        except GelError as exc:
+            note("released", str(exc))
+            return {"requested": False, "action": "refuse", "why": str(exc)}
+        pr = _pr_of(api, decision["repo"], decision["branch"])
+        if pr["head"] != sha:
+            why = ("the pull request head moved to %s (freeze %s): nothing posed"
+                   % (pr["head"][:12] or "?", sha[:12]))
+            note("released", why)
+            return {"requested": False, "action": "refuse", "why": why}
+        if pr["base"] != base:
+            why = ("the pull request base moved from %s to %s: the composition changed, "
+                   "run `ameesh ci run %d` again" % (base[:12], pr["base"][:12], item_id))
+            note("released", why)
+            return {"requested": False, "action": "refuse", "why": why}
+        posed = _pose_request(gh, decision["repo"], pr, label, mode, sha)
+        if not posed["ok"]:
+            note("released", posed["error"])
+            return {"requested": False, "action": "refuse", "why": posed["error"]}
+        text = "CI requested on %s (PR #%d, base %s, mode %s)%s" % (
+            sha, number, base, mode,
+            ", exception %s: %s" % (decision["exception"], decision["reason"])
+            if decision["exception"] else
+            (", full suite: %s" % decision["reason"] if mode == "full" else ""))
+        if posed["dropped"]:
+            text += " — replaced %s" % ", ".join(posed["dropped"])
+        if posed["failed"]:
+            text += " — warnings: %s" % "; ".join(posed["failed"])
+        note("applied", text, seen=watermark)
+        return {"requested": True, "action": "request", "run": {},
+                "dropped": posed["dropped"], "warnings": posed["failed"]}
+
+    if storage.is_remote(db):
+        # connexion d'exécuteur médiée : ni transaction ni verrou de ligne ; la
+        # marque reste et le second recule devant elle, sans atomicité d'hôte —
+        # la garantie de sérialisation est bornée aux connexions directes.
+        return critical(db)
+    with db.transaction() as tx:
+        return critical(tx)
+
+
+def _render_gel(decision: dict) -> list[str]:
+    lines = ["lot #%d  %s  %s  %s" % (decision["work_item"], decision["repo"],
+                                    decision["branch"], decision["sha"][:12])]
+    lines.append("  %s: %s" % (decision["action"], decision.get("why") or ""))
+    if decision.get("base"):
+        lines.append("  PR #%s  base %s  mode %s  label %s"
+                     % (decision.get("pr"), decision["base"][:12], decision["mode"],
+                        decision.get("label") or "—"))
+    if decision.get("exception"):
+        lines.append("  exception %s (canon §3): %s" % (decision["exception"],
+                                                        decision["reason"]))
+    if decision.get("verdicts"):
+        lines.append("  verdict(s): %s" % ", ".join(decision["verdicts"]))
+    if decision.get("requested"):
+        lines.append("  request(s) seen: %s" % ", ".join(
+            "%s %s" % (r["mode"], r["conclusion"] or "?") for r in decision["requested"]))
+    run = decision.get("run") or {}
+    if run.get("id"):
+        lines.append("  run %s %s %s" % (run.get("id"), run.get("status"),
+                                         run.get("url") or ""))
+    return lines
+
+
+def cmd_ci_run(cfg, args) -> int:
+    """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois."""
+    from . import plan_github
+    from .db import open_db
+    db = open_db(cfg)
+    gh = plan_github.Gh()
+
+    def api(path: str):
+        return plan_github._json(gh, ["api", path])
+
+    try:
+        decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
+                            avis=args.avis, exception=args.exception or "",
+                            reason=args.reason or "", full=args.full, force=args.force,
+                            repo=args.repo or "")
+    except (GelError, plan_github.GithubError) as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                              "action": "refuse", "why": str(exc)}, ensure_ascii=False,
+                             indent=1))
+        else:
+            print("ameesh ci run: %s" % exc)
+        return 1
+    if args.dry_run or decision["action"] != "request":
+        if args.json:
+            print(json.dumps({**decision, "ok": True, "requested": False},
+                             ensure_ascii=False, indent=1))
+        else:
+            print("\n".join(_render_gel(decision)))
+        return 0
+    # canon §3 : un run de la branche hors de la composition courante (autre
+    # SHA, autre base) est périmé ; jamais celui de la composition demandée.
+    stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "",
+                        number=decision["pr"], base=decision["base"])["runs"]
+    if stale:
+        _cancel_runs(gh, decision["repo"], stale,
+                     say=lambda text: print("  %s" % text))
+    try:
+        result = _request_once(db, args.id, decision, api=api, gh=gh, force=args.force)
+    except (GelError, plan_github.GithubError) as exc:
+        print("ameesh ci run: %s" % exc)
+        return 1
+    if not result["requested"]:
+        if result["action"] == "refuse":
+            if args.json:
+                print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                                  "action": "refuse", "why": result["why"]},
+                                 ensure_ascii=False, indent=1))
+            else:
+                print("ameesh ci run: %s" % result["why"])
+            return 1
+        decision = {**decision, "action": result["action"], "why": result["why"],
+                    "run": result.get("run")}
+        if args.json:
+            print(json.dumps({**decision, "ok": True, "requested": False},
+                             ensure_ascii=False, indent=1))
+        else:
+            print("\n".join(_render_gel(decision)))
+        return 0
+    if result.get("warnings"):
+        print("ameesh ci run: posed, with warnings: %s" % "; ".join(result["warnings"]))
+    if args.json:
+        print(json.dumps({**decision, "ok": True, "requested": True,
+                          "run": result.get("run") or {}}, ensure_ascii=False, indent=1))
+    else:
+        print("\n".join(_render_gel(decision)))
+        print("  requested: the run on PR #%d will appear shortly (`ameesh ci status %d`)"
+              % (decision["pr"], args.id))
+    return 0
+
+
+def cmd_ci_cancel(cfg, args) -> int:
+    """`ameesh ci cancel <lot>` : annule les runs périmés de la branche."""
+    from . import plan_github
+    from .db import open_db
+    db = open_db(cfg)
+    gh = plan_github.Gh()
+
+    def api(path: str):
+        return plan_github._json(gh, ["api", path])
+
+    try:
+        report = cancel_plan(db, cfg, args.id, api=api, all_runs=args.all,
+                             repo=args.repo or "")
+    except (GelError, plan_github.GithubError) as exc:
+        print("ameesh ci cancel: %s" % exc)
+        return 1
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=1))
+    else:
+        print("lot #%d  %s  %s" % (report["work_item"], report["repo"], report["branch"]))
+        print("  %s: %d run(s)" % (report["why"], len(report["runs"])))
+    if not report["runs"]:
+        return 0
+    if args.dry_run:
+        for row in report["runs"]:
+            print("  would cancel run %s (%s)" % (row["id"], row["url"] or ""))
+        return 0
+    failed = _cancel_runs(gh, report["repo"], report["runs"])
+    return 1 if failed else 0
 
 
 def cmd_ci(cfg, args) -> int:
+    from . import plan_github
     from .db import open_db
+    command = getattr(args, "ci_command", "status")
+    if command == "run":
+        return cmd_ci_run(cfg, args)
+    if command == "cancel":
+        return cmd_ci_cancel(cfg, args)
     db = open_db(cfg)
     try:
         report = status_of(db, args.id, limit=args.limit)
     except CiError as exc:
         print("ameesh ci: %s" % exc)
         return 1
+    # N2 #848 : la vue JSON dit les lectures GitHub partagées de l'hôte, comme
+    # la vue texte (`quota_line`) ; sans état, la projection est vide.
+    report["github_reads"] = plan_github.quota_stats(getattr(cfg, "state_dir", None))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 0

@@ -71,7 +71,7 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_le_miroir_couvre_la_matrice_de_mesure(self):
         matrice = sorted(f"mesure-{p}-{n}" for p, n, _ in INCLUDE.findall(WORKFLOW))
-        self.assertEqual(len(matrice), 6, "matrice de mesure inattendue")
+        self.assertEqual(len(matrice), 10, "matrice de mesure inattendue")
         m = MIROIR.search(WORKFLOW)
         self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
         miroir = sorted(m.group(2).split())
@@ -80,9 +80,14 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_la_mesure_psql_est_decoupee(self):
         # B : une seule part de 45 modules pesait 38 min de mur pour 40 de
-        # plafond, annulée deux fois.
+        # plafond, annulée deux fois ; le run 38845518821 (16/10) a annulé
+        # psql 1/2 et 2/2, psycopg 2/4 et 3/4 à 40m30 : 4 parts psql et 6
+        # parts psycopg, plafond de 40 min conservé (arbitrage pilote).
         psql = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW) if p == "psql"]
-        self.assertEqual(psql, [("psql", "1", "2"), ("psql", "2", "2")])
+        self.assertEqual(psql, [("psql", str(n), "4") for n in range(1, 5)])
+        psycopg = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW)
+                   if p == "psycopg"]
+        self.assertEqual(psycopg, [("psycopg", str(n), "6") for n in range(1, 7)])
 
     def test_le_decoupage_sous_mesure_lit_la_carte(self):
         # A : le surcoût de la mesure varie de 1,2× à 9,3× selon les modules ;
@@ -101,10 +106,26 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_rien_n_est_publie_si_la_fusion_echoue(self):
         # l'artefact `carte` et le cache ne s'écrivent qu'après une fusion
-        # réussie : aucune étape du job `carte` ne tourne sur échec.
+        # réussie : aucune étape de publication du job `carte` ne tourne sur
+        # échec. Un ménage tolérant (`continue-on-error`) peut, lui, tourner
+        # sur échec : il ne publie rien (quota d'artefacts).
         section = WORKFLOW.split("\n  carte:\n", 1)[1]
         etapes = section.split("    steps:\n", 1)[1]
-        self.assertNotIn("if: always()", etapes)
+        # la première étape suit `steps:` sans saut de ligne : on le remet
+        blocs = ("\n" + etapes).split("\n      - ")[1:]
+        publication = [b for b in blocs
+                       if "actions/upload-artifact" in b or "actions/cache/save" in b]
+        self.assertTrue(publication, "aucune étape de publication dans le job carte")
+        # toute condition qui fait tourner une étape après un échec, pas
+        # seulement la graphie `if: always()`
+        sur_echec = re.compile(r"^\s*if:.*(\b(always|failure)\(\)|!\s*cancelled\(\))", re.M)
+        for bloc in publication:
+            self.assertNotRegex(bloc, sur_echec,
+                                "une étape de publication ne tourne pas sur échec")
+        for bloc in blocs:
+            if sur_echec.search(bloc):
+                self.assertIn("continue-on-error: true", bloc,
+                              "seul un ménage tolérant tourne sur échec")
         self.assertIn("actions/cache/save@v4", etapes)
 
 

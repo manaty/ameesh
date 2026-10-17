@@ -20,7 +20,7 @@ from unittest import mock
 
 from ameesh import merge_pr, merge_queue, radar, work
 
-from .test_l160b_radar import _git
+from .test_l160b_radar import _git, git_env
 
 
 def _write(repo, path, text):
@@ -66,6 +66,10 @@ def view(**over):
 class _Base(unittest.TestCase):
     LOT = 1003
     BRANCH = "lot/7-work"
+    #: familles simulées : ces bancs n'ont pas de base (`db=None`) et la porte
+    #: lit le registre ; l'indépendance des avis reste vérifiée, sur ce
+    #: dictionnaire (#1374 : la classe est un doute ici, deux avis distincts).
+    FAMILIES = {"aut1": "deepseek", "rev1": "codex", "rev2": "claude"}
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1003-test-")
@@ -81,7 +85,7 @@ class _Base(unittest.TestCase):
         self.base = _git(self.repo, "rev-parse", "main")
         self.origin = os.path.join(self.tmp, "origin.git")
         subprocess.run(["git", "clone", "-q", "--bare", self.repo, self.origin],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, env=git_env())
         # la branche de la PR : un fichier de workflow ET un fichier de code
         _git(self.repo, "checkout", "-q", "-b", "lot/7-work")
         _write(self.repo, ".github/workflows/ci.yml", "on: push\njobs:\n  t:\n    steps: []\n")
@@ -110,25 +114,33 @@ class _Base(unittest.TestCase):
                 mock.patch("ameesh.packet_reservation.WriterLease", return_value=self.writer),
                 mock.patch.object(work, "get", side_effect=self._lot_row),
                 mock.patch.object(work, "milestones",
-                                  side_effect=lambda db, n, *a, **kw: list(self.lot_marks))):
+                                  side_effect=lambda db, n, *a, **kw: list(self.lot_marks)),
+                mock.patch.object(merge_queue, "actor_family",
+                                  side_effect=lambda db, n: self.FAMILIES.get(
+                                      str(n or "").strip(), ""))):
             patch.start()
             self.addCleanup(patch.stop)
 
     def _lot_row(self, db, lot, *a, **kw):
         row = {"id": int(lot), "state": "build", "branch": self.lot_branch,
-               "branch_target": self.lot_target, "title": "le lot", "app": "ameesh"}
+               "branch_target": self.lot_target, "title": "le lot", "app": "ameesh",
+               "assignee": "aut1"}
         if getattr(self, "lot_state", None):
             row["state"] = self.lot_state
             row["close_reason"] = "abandoned"
         return row
 
     def ready_marks(self, head=None, *, verdict="ok", sha=None):
-        """Le lot gelé sur `head` et son verdict ; `sha` déplace le verdict."""
+        """Le lot gelé sur `head` et ses deux avis indépendants (`verdict` porte
+        sur le premier, `sha` déplace les deux) : la classe est un doute ici
+        (cfg absent), donc deux avis de familles distinctes (#1374)."""
         head = head or self.head
         self.lot_marks = [
             {"id": 1, "kind": "frozen", "sha": head, "at_ts": 1.0},
             {"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha or head,
-             "at_ts": 2.0},
+             "at_ts": 2.0, "actor": "rev1"},
+            {"id": 3, "kind": "verdict", "verdict": "ok", "sha": sha or head,
+             "at_ts": 3.0, "actor": "rev2"},
         ]
 
     def tip(self, ref="main"):
@@ -156,7 +168,7 @@ class _Base(unittest.TestCase):
         mover = os.path.join(self.tmp, "mover")
         if not os.path.isdir(mover):
             subprocess.run(["git", "clone", "-q", self.origin, mover], check=True,
-                           capture_output=True)
+                           capture_output=True, env=git_env())
         _write(mover, "README.md", "moved %f\n" % time.time())
         _git(mover, "add", "-A")
         _git(mover, "commit", "-q", "-m", "moved")
@@ -181,6 +193,25 @@ class GuardTest(_Base):
             self.merge(self.gh())
         self.assertEqual(self.tip(), self.base)
         self.writer.release.assert_called_once()
+
+    def test_dry_run_takes_no_writer_lease_and_succeeds_while_reserved(self):
+        # #1703 N1: the dry run writes nothing (it stops before the push); it
+        # must neither take, hold nor refuse on the target lease, so it runs
+        # while a packet train holds that lease.
+        from ameesh.packet_reservation import ReservationError
+        self.writer.acquire.side_effect = ReservationError("target main is reserved")
+        out = self.merge(self.gh(), dry_run=True)
+        self.assertEqual(out["state"], "dry-run", out)
+        self.assertEqual(out["reservation"], "not taken (dry-run)")
+        self.writer.acquire.assert_not_called()
+        self.writer.release.assert_not_called()
+        self.assertEqual(self.tip(), self.base)
+
+    def test_the_held_reservation_is_visible_in_the_evidence(self):
+        # #1703 N2: the identity actually held is readable, so an operator can
+        # compare it with the key the train holds on the same target.
+        out = self.merge(self.gh())
+        self.assertEqual(out["reservation"], self.writer.key)
 
     def test_dry_run_builds_the_merge_commit_without_pushing(self):
         gh = self.gh()
@@ -308,7 +339,7 @@ class IdentityTest(_Base):
         """Un dépôt B avec les MÊMES commits (base et gel) que A."""
         twin = os.path.join(self.tmp, "twin.git")
         subprocess.run(["git", "clone", "-q", "--bare", self.repo, twin],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, env=git_env())
         _git(twin, "update-ref", "refs/pull/7/head", self.head)
         return twin
 
@@ -576,7 +607,7 @@ class RunTest(unittest.TestCase):
         data.update(over)
         return argparse.Namespace(**data)
 
-    def run_with(self, out, args=None, **patches):
+    def run_with(self, out, args=None, db=None, **patches):
         import contextlib
         import io
         args = args or self.args()
@@ -585,14 +616,14 @@ class RunTest(unittest.TestCase):
              mock.patch.object(merge_pr.plan_git, "_out", return_value=""), \
              mock.patch.object(merge_pr.migrations, "origin_repo", return_value="o/r"), \
              contextlib.redirect_stdout(buf):
-            code = merge_pr.run(None, None, args)
+            code = merge_pr.run(None, db, args)
         return code, buf.getvalue()
 
     def test_a_verified_merge_is_declared_on_the_lot(self):
         out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
                "tip": "d" * 40}
-        with mock.patch.object(merge_pr.work, "merged",
+        with mock.patch.object(merge_pr.work, "close_merged",
                                return_value={"result": "merged"}) as recorded:
             code, text = self.run_with(out, args=self.args(lot=1003, json=False))
         self.assertEqual(code, 0)
@@ -604,7 +635,7 @@ class RunTest(unittest.TestCase):
         out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
                "tip": "d" * 40}
-        patcher = mock.patch.object(merge_pr.work, "merged",
+        patcher = mock.patch.object(merge_pr.work, "close_merged",
                                     side_effect=RuntimeError("lot closed"))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -621,7 +652,10 @@ class RunTest(unittest.TestCase):
                "tip": "d" * 40}
         for actor in ("", work.UNKNOWN_ACTOR):
             with self.subTest(actor=actor):
-                with mock.patch.object(merge_pr.work, "merged") as recorded:
+                # #2094: intercept the function the #1286 path really records
+                # with, `work.close_merged` — mocking `work.merged` left
+                # `assert_not_called` trivially true.
+                with mock.patch.object(merge_pr.work, "close_merged") as recorded:
                     code, text = self.run_with(out, args=self.args(actor=actor, json=False))
                 self.assertEqual(code, 0)
                 recorded.assert_not_called()
@@ -631,7 +665,7 @@ class RunTest(unittest.TestCase):
     def test_an_already_merged_pr_is_declared_on_its_lot(self):
         out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tip": "d" * 40, "target": "main"}
-        with mock.patch.object(merge_pr.work, "merged",
+        with mock.patch.object(merge_pr.work, "close_merged",
                                return_value={"result": "merged"}) as recorded:
             code, _ = self.run_with(out, args=self.args(lot=1003, json=True))
         self.assertEqual(code, 0)
@@ -641,10 +675,43 @@ class RunTest(unittest.TestCase):
         # N1 (#1003): `--dry-run` never declares, `already` included.
         out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tip": "d" * 40, "target": "main"}
-        with mock.patch.object(merge_pr.work, "merged") as recorded:
+        with mock.patch.object(merge_pr.work, "close_merged") as recorded:
             code, _ = self.run_with(out, args=self.args(dry_run=True, json=True))
         self.assertEqual(code, 0)
         recorded.assert_not_called()
+
+    def test_verified_remote_merge_records_without_a_local_commit_or_issue(self):
+        # #1286: direct_merge removed its scratch clone. Neither an issue_ref
+        # nor the merge object in the caller's checkout is needed to record
+        # the result it already proved. Exercise the real close_merged path.
+        from types import SimpleNamespace
+        item = {"id": 1003, "state": "qa", "app": "ameesh",
+                "title": "reviewed workflow", "issue_ref": None}
+        done = dict(item, state="merged")
+        store_close = mock.Mock(return_value=done)
+        store = SimpleNamespace(work=SimpleNamespace(close_merged=store_close))
+        # Current main closes the lot and wakes its dependents in one
+        # transaction. Keep those unrelated DB ports explicit in this unit
+        # witness; close_merged itself still runs, without any Git proof.
+        database = mock.MagicMock()
+        from ameesh import work_dependencies
+        for state in ("merged", "already"):
+            with self.subTest(state=state):
+                store_close.reset_mock()
+                out = {"state": state, "pr": 7, "merge": "b" * 40,
+                       "frozen": "a" * 40, "tree": "c" * 40,
+                       "frozen_tree": "c" * 40, "target": "main", "tip": "d" * 40}
+                with mock.patch.object(work, "get", return_value=item), \
+                     mock.patch.object(work.storage, "of", return_value=store), \
+                     mock.patch.object(work_dependencies, "lock"), \
+                     mock.patch.object(work, "_notify_released"):
+                    code, text = self.run_with(out, db=database)
+                self.assertEqual(code, 0)
+                self.assertNotIn("record_warning", text)
+                self.assertEqual(json.loads(text)["recorded"]["result"], "merged")
+                self.assertEqual(store_close.call_args.kwargs["sha"], "b" * 40)
+                self.assertEqual(store_close.call_args.kwargs["pr_ref"], "o/r#7")
+                self.assertIn("merge seen by merge-pr", store_close.call_args.kwargs["note"])
 
     def test_exit_codes_name_the_uncertainty(self):
         for state, expected in (("pushed-unverified", 2), ("already-unverified", 1)):

@@ -3,9 +3,9 @@
 
 Chaque fichier est immuable : son empreinte SHA-256 est enregistrée dans
 `schema_migrations`. Modifier une migration déjà appliquée est une erreur, pas
-une mise à jour silencieuse. L'application d'un fichier est atomique
-(`psql -1` / transaction psycopg) et protégée par un verrou consultatif, pour
-que deux exécuteurs qui démarrent en même temps ne se marchent pas dessus.
+une mise à jour silencieuse. Une passe entière est atomique et protégée par
+un verrou consultatif de la base, acquis avant la lecture de l'inventaire.
+Le verrou et les écritures partagent la même transaction et connexion.
 """
 from __future__ import annotations
 
@@ -262,7 +262,7 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
 
 
 def applied(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
-    db.script(BOOTSTRAP)
+    db.execute(BOOTSTRAP)
     rows = db.query("SELECT version, checksum, name FROM schema_migrations ORDER BY version")
     return {int(row["version"]): row["checksum"] for row in rows}
 
@@ -282,39 +282,44 @@ def pending(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR) -> 
     return out
 
 
-def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR, log=None) -> list[Migration]:
-    """Applique les migrations manquantes ; renvoie celles qui viennent de l'être."""
-    if db.cfg.schema != "public":
-        # `SET search_path` accepte un schéma inexistant : on le crée ici,
-        # explicitement, plutôt que d'échouer sur un « no schema has been
-        # selected to create in ».
-        db.execute("CREATE SCHEMA IF NOT EXISTS %s" % quote_ident(db.cfg.schema))
-    todo = pending(db, directory)
-    for migration in todo:
-        script = (
-            # Une migration peut être longue : on lève le délai le temps de la
-            # transaction (SET LOCAL retombe au commit), sinon le
-            # statement_timeout par défaut la couperait.
-            "SET LOCAL statement_timeout = 0;\n"
-            "select pg_advisory_xact_lock(hashtext('%s'));\n"
-            # ... puis on borne l'attente des verrous de table (L835) : sans
-            # cela une migration qui attend ACCESS EXCLUSIVE bloque derrière
-            # elle tous les lecteurs et écrivains de la table. Posé après le
-            # verrou consultatif : celui-ci doit pouvoir attendre son tour
-            # aussi longtemps que la migration qui le tient.
-            "SET LOCAL lock_timeout = '%s';\n%s\n"
-            "insert into schema_migrations (version, name, checksum) values (%d, %s, %s);\n"
-            % (
-                _LOCK,
-                LOCK_TIMEOUT,
-                migration.sql,
-                migration.version,
-                _lit(migration.name),
-                _lit(migration.checksum),
-            )
-        )
-        db.script(script)
-        if log:
+class NonAdditiveMigration(DbError):
+    """The elected release worker found a migration outside its guard."""
+
+
+def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
+            log=None, *, additive_only: bool = False) -> list[Migration]:
+    """Elect one database worker, re-read inventory and commit the whole pass.
+
+    PostgreSQL scopes the existing lock key to the actual database, regardless
+    of schema, host or DSN alias. Retaining this key also excludes older workers
+    while they execute their individually locked migrations. Those older
+    workers must still be upgraded before relying on inventory reconciliation.
+    A separate lock connection could disappear while its writer continued;
+    this transaction owns both the lock and every migration write instead.
+    """
+    with db.transaction() as tx:
+        # The configured statement timeout bounds election. Only the elected
+        # worker lifts it for migration SQL, as the previous implementation did.
+        tx.query("SELECT pg_advisory_xact_lock(hashtext(%s))", (_LOCK,))
+        tx.execute("SET LOCAL statement_timeout = 0")
+        # ... puis on borne l'attente des verrous de table (L835) : sans cela
+        # une migration qui attend ACCESS EXCLUSIVE bloque derrière elle tous
+        # les lecteurs et écrivains de la table. Posé après le verrou
+        # consultatif : celui-ci doit pouvoir attendre son tour aussi longtemps
+        # que la migration qui le tient (LOCK_TIMEOUT ne le borne donc pas).
+        tx.execute("SET LOCAL lock_timeout = '%s'" % LOCK_TIMEOUT)
+        if db.cfg.schema != "public":
+            tx.execute("CREATE SCHEMA IF NOT EXISTS %s" % quote_ident(db.cfg.schema))
+        todo = pending(tx, directory)
+        if additive_only and any(non_additive(migration) for migration in todo):
+            raise NonAdditiveMigration("nothing applied (--additive-only)")
+        for migration in todo:
+            tx.script(migration.sql)
+            tx.execute("INSERT INTO schema_migrations (version, name, checksum) VALUES (%s,%s,%s)",
+                       (migration.version, migration.name, migration.checksum))
+    # Neither a failed SQL statement nor an uncertain COMMIT publishes success.
+    if log:
+        for migration in todo:
             log("%s applied" % migration.label)
     return todo
 

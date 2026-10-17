@@ -91,6 +91,9 @@ class Essai:
         self.env.update({
             "AMEESH_PG_NAME": PG, "AMEESH_PG_PORT": str(PG_PORT),
             "AMEESH_PG_VOLUME": "ameesh-pg-data-" + NOM, "AMEESH_PG_PASSWORD": "banc-" + NOM,
+            # #2003 : l'essai DÉCLARE son banc jetable — le ménage peut alors
+            # récolter son volume après `docker_volume_idle` sans conteneur.
+            "AMEESH_PG_DISPOSABLE": "1",
             "PGPASSWORD": "banc-" + NOM,
             "AMEESH_DSN": "postgresql://agent_mesh@127.0.0.1:%d/agent_mesh" % PG_PORT,
             "AMEESH_CONFIG": self.config_vide,
