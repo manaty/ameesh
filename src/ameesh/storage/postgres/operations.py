@@ -109,6 +109,11 @@ class Operations(interface.Operations):
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   -- #2200 : la pause opérateur, portée par la lecture partagée
+                   -- des alertes (état « paused », jamais « idle »)
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+                   r.operator_pause_for,
+                   extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause

@@ -1070,6 +1070,12 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
         if mode == "externe":
             hint = (" — its owner can force it with --externe" if responsible
                     else " — set its human owner first, then --externe")
+        elif row.get("operator_paused"):
+            # #2200 : ce n'est pas une inscription à réparer — la pause
+            # humaine se lève nommément, ou le lot va à un autre agent.
+            hint = (" — lift the operator pause (ameesh resume %s --operator "
+                    "--reason <reason>), or assign another agent (the team queue "
+                    "takes an unassigned lot)" % name)
         else:
             hint = (" — fix its registration or admission (agent-runner register "
                     "…, canon sync), or assign to a human (human:<id>)")

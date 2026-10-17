@@ -505,6 +505,26 @@ def agent_state(row: dict) -> str:
     return "idle"                       # idle, queued
 
 
+def operator_pause_of(row: dict) -> dict | None:
+    """#2200 : la pause opérateur d'une ligne, projetée une seule fois.
+
+    `ameesh show`, `ameesh projects`/`progress` et les alertes lisent la même
+    pause (raison, auteur, principal, début) : une projection partagée évite
+    que l'un l'affiche et que l'autre la perde en route. `after_turn` dit que
+    le tour en cours finit avant que la pause ne prenne effet (`running`,
+    comme `ameesh list` : le statut suffit, la lecture `show` n'a pas de
+    `lease_live`)."""
+    if not row.get("operator_paused"):
+        return None
+    return {
+        "reason": row.get("operator_pause_reason"),
+        "by": row.get("operator_pause_by"),
+        "for": row.get("operator_pause_for"),
+        "since_ts": _round(row.get("operator_pause_ts")),
+        "after_turn": row.get("status") == "running",
+    }
+
+
 def paused_on_budget(row: dict) -> bool:
     """#1070 : is the agent in a BUDGET pause? Delegates to `handoff.paused`
     (L233b), the single definition, so no second rule is kept here."""
@@ -569,13 +589,7 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
-        "operator_pause": ({
-            "reason": row.get("operator_pause_reason"),
-            "by": row.get("operator_pause_by"),
-            "for": row.get("operator_pause_for"),
-            "since_ts": _round(row.get("operator_pause_ts")),
-            "after_turn": state == "working",
-        } if row.get("operator_paused") else None),
+        "operator_pause": operator_pause_of(row),
     }
 
 

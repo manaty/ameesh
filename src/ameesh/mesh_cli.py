@@ -931,6 +931,7 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
 
 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
+    from . import progress
     db = _open(cfg)
     try:
         row = agent_detail(db, args.agent)
@@ -940,10 +941,17 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0
+        # #2200 : la pause opérateur se lit dans le résumé texte, pas seulement
+        # dans le JSON — un `idle` avec bail vivant ne dit pas « ne reprendra
+        # pas » et a fait router des lots vers un agent pausé.
+        pause = progress.operator_pause_of(row)
+        status = row.get("status")
+        if pause and status not in ("stopped", "dead", "blocked"):
+            status = "pause-next" if pause.get("after_turn") else "op-paused"
         print("agent    : %s" % row["name"])
         print("workspace: %s" % (row.get("chantier") or "—"))
         print("harness  : %-9s host: %-12s status: %s%s" % (
-            row.get("harness") or "?", row.get("host") or "—", row.get("status"),
+            row.get("harness") or "?", row.get("host") or "—", status,
             (" (%s)" % row["status_text"]) if row.get("status_text") else ""))
         # L242b/#1250 : le harnais DÉCLARÉ ne dit pas sous lequel la session
         # tourne (harnais emprunté) ; quand la session vivante en a un autre,
@@ -953,6 +961,18 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             print("session harness: %s" % live)
         if row.get("stop_reason"):
             print("stopped  : %s" % row["stop_reason"])
+        if pause:
+            who = pause.get("by") or "?"
+            if pause.get("for") and pause["for"] != who:
+                who += " for %s" % pause["for"]
+            print("paused   : operator pause since %s by %s — %s" % (
+                _fmt_moment(pause.get("since_ts")), who,
+                pause.get("reason") or "(no reason given)"))
+            if pause.get("after_turn"):
+                print("           this turn finishes, then no new turn starts")
+            else:
+                print("           no new turn starts until it is lifted "
+                      "(ameesh resume %s --operator --reason <reason>)" % row["name"])
         # L37 (0030) : mode explicite ; un agent externe exige un responsable
         if row.get("mode") == "externe":
             print("mode     : externe (human session, cannot be woken)%s" % (
