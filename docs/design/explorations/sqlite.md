@@ -1,23 +1,23 @@
 ---
 type: Exploration
 status: exploration
-title: "Pilote SQLite pour un profil personnel"
+title: "SQLite driver for a personal profile"
 ---
 
-# Pilote SQLite pour un profil personnel
+# SQLite driver for a personal profile
 
-## Problème
+## Problem
 
-Un service Postgres peut alourdir une installation personnelle sur une seule machine. L’interface de stockage existe, mais les garanties de Postgres ne se transposent pas automatiquement à SQLite.
+A Postgres service can weigh down a personal installation on a single machine. The storage interface exists, but Postgres guarantees do not transpose automatically to SQLite.
 
 ## Intuitions
 
-Un profil local à un seul exécuteur pourrait remplacer certains réveils et verrous par des mécanismes locaux. La décision sur le stockage conditionne déjà cette piste à la confirmation du besoin.
+A local profile with a single executor could replace some wake-ups and locks with local mechanisms. The storage decision already makes this lead conditional on confirming the need.
 
-## Questions ouvertes
+## Open questions
 
-- Quels usages personnels justifient un deuxième pilote ?
-- Comment préserver les baux, les transactions et la consommation unique des reçus ?
-- Quelles limites du profil doivent rester visibles quand plusieurs processus accèdent à la base ?
+- Which personal uses justify a second driver?
+- How can leases, transactions and single consumption of receipts be preserved?
+- Which profile limits must stay visible when several processes access the database?
 
-Contexte existant : [Décision sur le stockage et la piste personnelle](../decisions/0016-stockage.md), [Spécification de l’interface de stockage](../specification.md). Ces références éclairent la question ; elles ne promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Decision on storage and the personal lead](../decisions/0016-stockage.md), [Specification of the storage interface](../specification.md). These references inform the question; they do not promote this card to a study or to decided work.

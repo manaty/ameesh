@@ -27,6 +27,7 @@ from ameesh.storage import interface as SI
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN_DIR = os.path.join(REPO, "tests", "golden", "mediated_executor")
+CONTRACT_FILE = os.path.join(REPO, "src", "ameesh", "mediated_executor", "contract.json")
 HINTS = typing.get_type_hints(SI.Storage)
 
 
@@ -101,10 +102,12 @@ class TableTest(unittest.TestCase):
 
     def test_comptes(self):
         ops = self.c.operations.values()
-        # contrat 1.2 : expiration médiée des fils (#499, threads.recount) ;
+        # contrat 1.2 : expiration médiée des fils (#499, threads.recount)
+        # contrat 1.1 : + operations.assigned_open_lots (lot du tour, #476)
+        #              + agents.runner_seen (preuve de vie, #508)
         # #423 ajoute agents.resolve_name, septième ligne servie par session/op
-        self.assertEqual(len(self.c.operations), 65)
-        self.assertEqual(sum(o.write for o in ops), 39)
+        self.assertEqual(len(self.c.operations), 66)
+        self.assertEqual(sum(o.write for o in ops), 40)
         self.assertEqual(sum(not o.write for o in ops), 26)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
@@ -143,6 +146,11 @@ class TableTest(unittest.TestCase):
         self.assertFalse(admitted & refused)
         self.assertEqual(admitted | refused, _interface_ops())
         self.assertEqual(self.c.interface_total, len(_interface_ops()))
+        # #1517 : le total est dérivé ; un compteur réintroduit dans la table
+        # (résolution de fusion qui l'aurait gardé) redeviendrait la ligne que
+        # tous les lots se disputent.
+        with open(CONTRACT_FILE, encoding="utf-8") as fh:
+            self.assertNotIn("interface_total", json.load(fh)["refused"])
         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
 
     def test_les_compteurs_du_doc_suivent_le_contrat(self):

@@ -22,7 +22,7 @@ Postgres n'est jamais exposé sur Internet.
 | `cloud-init.yaml` | premier démarrage : paquets, clone d'ameesh, lance l'installation |
 | `installer-serveur.sh` | installation idempotente : WireGuard, Postgres TLS, utilisateur `ameesh`, ameesh, gabarits systemd, sauvegardes |
 | `ameesh-runner@.service` | un exécuteur par persona, service système sous `ameesh` |
-| `ameesh-sauvegarde.{service,timer}`, `sauvegarder-base.sh` | `pg_dump` quotidien (répertoire 0700, dumps 0600), 14 jours en local, copie hors de la VM si configurée |
+| `ameesh-sauvegarde.{service,timer}`, `sauvegarder-base.sh` | `pg_dump` quotidien (répertoire 0700, dumps 0600), rétention locale par catalogue privé et protection rollback, copie hors de la VM si configurée ; les sauvegardes non inscrites sont conservées |
 | `ajouter-appareil.sh` | déclare un appareil dans WireGuard et affiche sa configuration |
 
 ## Mise en place (actes de l'opérateur)

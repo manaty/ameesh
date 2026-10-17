@@ -65,12 +65,14 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `AGENT_MESH_CONFIG` vers un fichier **vide mais existant** (`{}`) : ni
   `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus,
   et un chemin explicite absent est refusé avant toute connexion (#1127).
-  `HOME` reste celui du poste (le banc lit `~/.pgpass`). Les caches de
-  gestionnaires de paquets du poste (`npm_config_*`, `pnpm_config_*`,
-  `YARN_CACHE_FOLDER`, `XDG_CACHE_HOME`) sont retirés de même (L73) : le
-  ménage les redirige et respecte un choix déjà posé, donc la suite ne doit
-  pas les hériter. Un test qui a besoin d'une config, d'un canon ou d'une
-  variable la pose lui-même ;
+  `HOME` reste celui du poste (le banc lit `~/.pgpass`) ; les bases jetables
+  (`agent_mesh_test_*`, #1992) sont couvertes par une entrée éphémère dérivée
+  de ce profil par `scripts/pgpass-banc.py`, sans modifier le fichier
+  (#2170). Les caches de gestionnaires de paquets du poste
+  (`npm_config_*`, `pnpm_config_*`, `YARN_CACHE_FOLDER`, `XDG_CACHE_HOME`)
+  sont retirés de même (L73) : le ménage les redirige et respecte un choix
+  déjà posé, donc la suite ne doit pas les hériter. Un test qui a besoin
+  d'une config, d'un canon ou d'une variable la pose lui-même ;
   `tests/test_l142_env_isole.py` vérifie qu'un poste « pollué » voit la même
   chose qu'un poste propre. Tout module de test qui touche à l'environnement
   importe donc `tests.support`.
@@ -106,14 +108,14 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
 
-Les idées qui ne sont pas décidées vont dans le [sas d’explorations](docs/design/explorations/index.md) :
-un fichier par idée, `type: Exploration`, `status: exploration`, avec problème,
-intuitions et questions ouvertes. Ni lots proposés, ni dates, ni estimations,
-ni critère « fait » ; aucun lot, WorkPackage, backlog ou ligne de roadmap ne
-se déduit d’une exploration. Seule une décision explicite de l’owner,
-consignée dans `docs/design/decisions/`, permet la promotion en étude puis en
-lots. Les fiches de plan et de lot pointent vers l’étude décidée. La garde
-`tests.test_l1124_explorations` vérifie cette séparation dans le dépôt.
+Undecided ideas go to the [exploration inbox](docs/design/explorations/index.md):
+one file per idea, `type: Exploration`, `status: exploration`, with a problem,
+intuitions and open questions. No proposed lots, no dates, no estimates, no
+"done" criterion; no lot, WorkPackage, backlog entry or roadmap line is
+derived from an exploration. Only an explicit owner decision, recorded in
+`docs/design/decisions/`, allows promotion to a study and then to lots. Plan
+and lot cards point to the decided study. The `tests.test_l1124_explorations`
+guard verifies this separation in the repository.
 
 ## Numérotation des versions
 

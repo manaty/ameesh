@@ -10,6 +10,11 @@ utilisateur Unix que les agents, et son état reste chez lui.
                                          consommation du lien
     <état>/enroll/<sha256(jeton)>.json  un jeton d'enrôlement
     <état>/enroll-used/<sha256(jeton)>  marque d'usage d'un jeton d'enrôlement
+    <état>/login-requests/<login_id>.json  la demande de défi (sans URL ni code)
+    <état>/login-links/<sha256(jeton)>     → login_id
+    <état>/login-private/<login_id>.json   l'URL et le code (0600, jamais signés)
+    <état>/login-views/<login_id>          marque « vue ouverte par assertion »
+    <état>/login-receipts/<login_id>.json  le reçu signé (done | cancel)
 
 Les jetons de lien ne sont jamais écrits en clair : seul leur SHA-256 l'est
 (nom de fichier), et la valeur relue est comparée à temps constant.
@@ -20,6 +25,8 @@ simultanés sur le même lien ne peuvent donc pas produire deux reçus.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import hmac
 import json
@@ -33,9 +40,12 @@ from .config import ensure_private_dir
 
 _CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz"
 REQUEST_ID_RE = re.compile(r"^req_[0-9a-z]{26}$")
+LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
-_SUBDIRS = ("requests", "links", "receipts", "enroll", "enroll-used")
+_SUBDIRS = ("requests", "links", "receipts", "enroll", "enroll-used",
+            "login-requests", "login-links", "login-private", "login-views",
+            "login-receipts", "login-live", "login-closed")
 
 #: rétention après échéance (élagage opportuniste)
 KEEP_REQUESTS = 86400
@@ -53,6 +63,11 @@ def token_hash(token: str) -> str:
 
 def new_request_id() -> str:
     return "req_" + "".join(secrets.choice(_CROCKFORD) for _ in range(26))
+
+
+def new_login_id() -> str:
+    """Identifiant d'un défi de connexion (L232d) — même alphabet que les demandes."""
+    return "lgn_" + "".join(secrets.choice(_CROCKFORD) for _ in range(26))
 
 
 class Store:
@@ -174,6 +189,209 @@ class Store:
     def has_receipt(self, request_id: str) -> bool:
         return os.path.exists(self._path("receipts", request_id + ".json"))
 
+    # -- défis de connexion (L232d, lot #366) --------------------------------
+    #
+    # Un défi a DEUX états distincts : la demande signable (`login-requests`,
+    # qui ne porte ni URL ni code) et le charge utile privé (`login-private`,
+    # 0600, URL + code à usage unique). La vue n'est ouverte qu'après
+    # assertion ; le marqueur `login-views` est distinct du reçu, sinon le
+    # premier affichage consommerait le lien avant la signature.
+    def save_login(self, record: dict, token: str, private: dict) -> None:
+        login_id = record["login_id"]
+        if not LOGIN_ID_RE.fullmatch(login_id):
+            raise ValueError("invalid login_id")
+        digest = token_hash(token)
+        record = dict(record, token_hash=digest)
+        private = dict(private, login_id=login_id)
+        paths = [
+            (self._path("login-private", login_id + ".json"), self._dump(private)),
+            (self._path("login-requests", login_id + ".json"), self._dump(record)),
+            (self._path("login-links", digest), login_id.encode("ascii")),
+        ]
+        written = []
+        try:
+            for path, data in paths:
+                if not self._write(path, data, exclusive=True):
+                    raise ValueError("login_id or token already used")
+                written.append(path)
+        except Exception:
+            for path in written:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            raise
+
+    def get_login(self, login_id: str) -> dict | None:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return None
+        return self._read_json(self._path("login-requests", login_id + ".json"))
+
+    def login_by_token(self, token: str) -> dict | None:
+        if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
+            return None
+        digest = token_hash(token)
+        raw = self._read(self._path("login-links", digest))
+        if raw is None:
+            return None
+        login_id = raw.decode("ascii", "replace")
+        record = self.get_login(login_id)
+        if record is None or not hmac.compare_digest(
+                str(record.get("token_hash", "")).encode(), digest.encode()):
+            return None
+        return record
+
+    def login_private(self, login_id: str) -> dict | None:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return None
+        return self._read_json(self._path("login-private", login_id + ".json"))
+
+    def drop_login_private(self, login_id: str) -> bool:
+        """Efface l'URL et le code (expiration, annulation, erreur) — le
+        marqueur de vue et la demande restent, eux, dans l'état du service."""
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return False
+        try:
+            os.unlink(self._path("login-private", login_id + ".json"))
+            return True
+        except FileNotFoundError:
+            return False
+
+    def mark_login_viewed(self, login_id: str) -> bool:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return False
+        return self._write(self._path("login-views", login_id),
+                           str(int(time.time())).encode("ascii"), exclusive=True)
+
+    def login_viewed(self, login_id: str) -> bool:
+        return os.path.exists(self._path("login-views", login_id))
+
+    def save_login_receipt_once(self, login_id: str, receipt: dict) -> bool:
+        if not LOGIN_ID_RE.fullmatch(login_id):
+            raise ValueError("login_id invalide")
+        written = self._write(self._path("login-receipts", login_id + ".json"),
+                              jcs.canonicalize(receipt), exclusive=True)
+        if written:
+            record = self.get_login(login_id)
+            if record is not None:
+                self.release_login(record)
+        return written
+
+    def login_receipt_bytes(self, login_id: str) -> bytes | None:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return None
+        return self._read(self._path("login-receipts", login_id + ".json"))
+
+    def has_login_receipt(self, login_id: str) -> bool:
+        return os.path.exists(self._path("login-receipts", login_id + ".json"))
+
+    # -- un seul défi vivant par (hôte, fournisseur, compte) (L232d #366/B3) --
+    #
+    # La réservation est un fichier par tuple, créé par `os.link` (exclusif) et
+    # protégé par un verrou `flock` : deux invocations concurrentes, même dans
+    # deux processus, ne peuvent pas la prendre ensemble. Une réservation dont
+    # l'échéance est passée, dont le défi a un reçu humain ou a été clos
+    # techniquement est reprise sous le verrou. Elle porte son `login_id` et
+    # son `exp` : une réservation orpheline (processus tué entre la réservation
+    # et l'écriture publique) tient la place jusqu'à son échéance, jamais
+    # au-delà.
+    @staticmethod
+    def _login_live_name(host: str, provider: str, account: str) -> str:
+        key = "ameesh-approve-login-live/1\x00" + "\x00".join(
+            (str(host), str(provider), str(account)))
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def _login_live_path(self, record: dict) -> str:
+        request = record.get("request") or {}
+        return self._path("login-live", self._login_live_name(
+            request.get("host", ""), request.get("provider", ""), request.get("account", "")))
+
+    @contextlib.contextmanager
+    def _login_live_lock(self, path: str):
+        """Verrou exclusif par tuple : « lire l'ancienne, reprendre, écrire »."""
+        fd = os.open(path + ".lock",
+                     os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def login_reservation_live(self, current: dict, now: float) -> bool:
+        """Une réservation tient tant que son échéance court et que le défi
+        n'a ni reçu humain ni clôture technique."""
+        login_id = str(current.get("login_id") or "")
+        if not LOGIN_ID_RE.fullmatch(login_id) or now >= float(current.get("exp") or 0):
+            return False
+        return not (self.has_login_receipt(login_id) or self.login_closed(login_id))
+
+    def reserve_login(self, record: dict, *, now: float | None = None) -> bool:
+        """Réserve le tuple du défi ; False si un autre y est encore vivant."""
+        login_id = str(record.get("login_id") or "")
+        if not LOGIN_ID_RE.fullmatch(login_id):
+            return False
+        now = time.time() if now is None else now
+        path = self._login_live_path(record)
+        payload = self._dump({"login_id": login_id, "exp": int(record.get("exp") or 0)})
+        with self._login_live_lock(path):
+            current = self._read_json(path)
+            if current is not None and self.login_reservation_live(current, now):
+                return False
+            if current is not None:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            return self._write(path, payload, exclusive=True)
+
+    def release_login(self, record: dict) -> bool:
+        """Libère la réservation du tuple si elle appartient encore à ce défi."""
+        login_id = str(record.get("login_id") or "")
+        path = self._login_live_path(record)
+        with self._login_live_lock(path):
+            current = self._read_json(path)
+            if not current or current.get("login_id") != login_id:
+                return False
+            try:
+                os.unlink(path)
+                return True
+            except FileNotFoundError:
+                return False
+
+    def login_transition(self, login_id: str):
+        """Sérialise assertion et clôture sur un verrou stable du défi.
+
+        Distinct du verrou du tuple : écrire un reçu libère ce dernier.
+        """
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            raise ValueError("login_id invalide")
+        return self._login_live_lock(self._path("login-closed", login_id))
+
+    def close_login(self, login_id: str) -> bool:
+        """Clôture TECHNIQUE : marque clos, efface le privé, libère la place.
+
+        N'écrit aucun reçu — le reçu reste la signature humaine ; un lien ou
+        une assertion tardifs sont refusés par le service (`login_closed`).
+        """
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return False
+        record = self.get_login(login_id)
+        if record is None:
+            return False
+        with self.login_transition(login_id):
+            written = self._write(self._path("login-closed", login_id), b"1", exclusive=True)
+            self.drop_login_private(login_id)
+            self.release_login(record)
+        return written
+
+    def login_closed(self, login_id: str) -> bool:
+        if not isinstance(login_id, str) or not LOGIN_ID_RE.fullmatch(login_id):
+            return False
+        return os.path.exists(self._path("login-closed", login_id))
+
     # -- enrôlement ----------------------------------------------------------
     def save_enroll(self, record: dict, token: str) -> None:
         digest = token_hash(token)
@@ -243,4 +461,30 @@ class Store:
                     except FileNotFoundError:
                         pass
                 removed += 1
+        for name in os.listdir(self._path("login-requests", "")):
+            if not name.endswith(".json"):
+                continue
+            login_id = name[:-5]
+            record = self.get_login(login_id)
+            if record is None:
+                continue
+            exp = float(record.get("exp") or 0)
+            if exp + KEEP_RECEIPTS < now:
+                try:
+                    os.unlink(self._path("login-receipts", name))
+                except FileNotFoundError:
+                    pass
+            if exp + KEEP_REQUESTS < now and not self.has_login_receipt(login_id):
+                self.release_login(record)
+                for path in (self._path("login-links", str(record.get("token_hash", "x"))),
+                             self._path("login-private", name),
+                             self._path("login-views", login_id),
+                             self._path("login-closed", login_id),
+                             self._path("login-closed", login_id + ".lock"),
+                             self._path("login-requests", name)):
+                    try:
+                        os.unlink(path)
+                        removed += 1
+                    except (FileNotFoundError, IsADirectoryError):
+                        pass
         return removed

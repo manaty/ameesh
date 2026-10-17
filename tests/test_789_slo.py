@@ -159,6 +159,27 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(after["started_ts"], before["started_ts"])
         self.assertEqual(after["elapsed_s"], before["elapsed_s"])
 
+    def test_intake_passee_sans_evenement_build_n_est_pas_un_retard(self):
+        # #1982 : un lot en build ou en qa sans événement `build` a franchi
+        # intake ; la durée est non mesurable — on ne fabrique ni date de build
+        # ni retard (cas réel #377).
+        events = [_ev("intake", T0), _ev("qa", T0 + 900)]
+        for state, at in (("build", T0 + 900), ("qa", T0 + 900)):
+            with self.subTest(state=state):
+                item = _item(state=state, assignee="executant", updated_ts=at)
+                rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7200)
+                self.assertEqual([r for r in rows if r["step"] == "intake_started"], [])
+
+    def test_intake_hors_intake_sans_evenement_build_n_est_pas_un_retard(self):
+        # #1982/#1658 : un lot volontairement bloqué ou en attente d'un humain
+        # n'est pas « prêt, pas démarré » — pas de retard intake inventé.
+        events = [_ev("intake", T0)]
+        for state in ("blocked", "waiting_human"):
+            with self.subTest(state=state):
+                item = _item(state=state, assignee="executant", updated_ts=T0)
+                rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7200)
+                self.assertEqual([r for r in rows if r["step"] == "intake_started"], [])
+
     def test_build_sans_evenement(self):
         events = [_ev("intake", T0), _ev("build", T0 + 600)]
         item = _item(state="build", assignee="executant", updated_ts=T0 + 600)
@@ -213,6 +234,126 @@ class MesureTest(unittest.TestCase):
                 {"step": "d", "level": 2, "overdue_s": 99}]
         got = [r["step"] for r in slo.breaches(rows)]
         self.assertEqual(got, ["b", "d", "a"])
+
+
+class GracePriseTest(unittest.TestCase):
+    """#2217 : une prise en charge récente suspend l'escalade, sans effacer la mesure.
+
+    Cas réels du 17/10 (heures locales) : #2180 réassigné cx3→dev7 à 10:50,
+    alerte de niveau 3 à 10:53 demandant de réassigner « --if-holder
+    ameesh-dev7 » alors que dev7 venait de prendre le lot ; même chose sur
+    #660, pris dans la file d'équipe par rel-01 à 10:39, alerte à 10:42.
+    Le retard de l'étape court depuis le jalon, pas depuis la prise du porteur
+    actuel : le nouveau porteur n'a pas à recevoir aussitôt une demande de
+    réassignation.
+    """
+
+    def _lot_qa(self, *, verdict_age_s, handover_age_s, note=None):
+        handover = T0 + 10 * 86400
+        verdict = handover - verdict_age_s
+        events = [_ev("intake", T0), _ev("build", T0 + 600),
+                  _ev("qa", T0 + 1200),
+                  _ev("qa", handover,
+                      note or "assigned to nouveau (before: ancien)")]
+        item = _item(state="qa", assignee="nouveau", updated_ts=handover)
+        jalons = _jalons(item, events)
+        jalons["verdict"], jalons["verdict_kind"] = verdict, "ok"
+        jalons["verdict_current"] = True
+        return slo.lot_steps(item, jalons, events, now=handover + handover_age_s)
+
+    def test_prise_recente_suspend_l_escalade(self):
+        rows = self._lot_qa(verdict_age_s=3 * 86400, handover_age_s=10 * 60)
+        row = [r for r in rows if r["step"] == "verdict_merge"][0]
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["targets"], ())
+        self.assertEqual(row["overdue_s"], 0)
+        self.assertEqual(row["handover_grace_s"],
+                         int(slo.HANDOVER_GRACE_S) - 600)
+        # le retard reste mesuré, il n'est pas effacé
+        self.assertEqual(row["elapsed_s"], 3 * 86400 + 600)
+        self.assertGreater(row["elapsed_s"], row["target_s"])
+        # aucune escalade ne part pendant la grâce
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_prise_ancienne_laisse_l_escalade(self):
+        rows = self._lot_qa(verdict_age_s=3 * 86400, handover_age_s=1860)
+        row = [r for r in rows if r["step"] == "verdict_merge"][0]
+        self.assertEqual(row["level"], 3)
+        self.assertEqual(row["targets"], ("bureau", "auditeur"))
+        self.assertNotIn("handover_grace_s", row)
+        self.assertEqual([r["step"] for r in slo.breaches(rows)],
+                         ["verdict_merge"])
+
+    def test_prise_automatique_suspend_l_escalade(self):
+        # #660 : le lot a été pris dans la file d'équipe, pas par `work
+        # assign` ; la note de prise doit ouvrir la grâce comme une
+        # assignation.
+        from ameesh import backlog
+
+        note = "%s par rel-01, au repos" % backlog.LOT_TAKE_NOTE
+        rows = self._lot_qa(verdict_age_s=3 * 86400, handover_age_s=180,
+                            note=note)
+        row = [r for r in rows if r["step"] == "verdict_merge"][0]
+        self.assertEqual(row["level"], 0)
+        self.assertIn("handover_grace_s", row)
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_prise_automatique_date_l_attribution(self):
+        # #2217 : sans la note de prise, `assigned_ts` retombait sur la
+        # création — `signal_assigned` restait ouvert et courait depuis la
+        # création, ce qui produisait l'alerte de réassignation de #660.
+        from ameesh import backlog
+
+        events = [_ev("intake", T0),
+                  _ev("intake", T0 + 7200,
+                      "%s par executant, au repos" % backlog.LOT_TAKE_NOTE)]
+        item = _item(assignee="executant")
+        self.assertEqual(slo.assigned_ts(item, events), T0 + 7200)
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7300)
+        signal = [r for r in rows if r["step"] == "signal_assigned"][0]
+        self.assertEqual(signal["level"], 0)
+        self.assertEqual(signal["done_ts"], T0 + 7200)
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_derniere_prise_en_compte(self):
+        events = [_ev("intake", T0, "assigned to a (before: nobody)"),
+                  _ev("qa", T0 + 100, "assigned to b (before: a)"),
+                  _ev("qa", T0 + 200, "assigned to c (before: b)")]
+        self.assertEqual(slo.handover_ts(_item(assignee="c"), events), T0 + 200)
+
+    def test_toutes_les_prises_datent_le_porteur(self):
+        from ameesh import backlog, handoff
+
+        cases = {
+            "prise équipe": "%s par b, au repos" % backlog.LOT_TAKE_NOTE,
+            "prise file": "%s par b (valeur 30) : attendu" % backlog.AUTO_TAKE_NOTE,
+            "reprise pause": "%s par b : a est en pause budget (plafond). Lot en "
+                             "build." % handoff.HANDOFF_NOTE,
+            "délégation": "delegated to b by a, due in 2h (before: a)",
+        }
+        for label, note in cases.items():
+            with self.subTest(label):
+                events = [_ev("intake", T0, "assigned to a (before: nobody)"),
+                          _ev("build", T0 + 100, note)]
+                self.assertEqual(slo.handover_ts(_item(assignee="b"), events),
+                                 T0 + 100)
+
+    def test_rendu_a_la_file_n_ouvre_pas_de_grace(self):
+        from ameesh import handoff
+
+        # un retour à la file laisse le lot sans porteur : pas de prise à
+        # dater, donc pas de grâce.
+        events = [_ev("intake", T0, "assigned to a (before: nobody)"),
+                  _ev("intake", T0 + 100,
+                      "%s : a est en pause budget (plafond)" % handoff.RETURN_NOTE)]
+        self.assertIsNone(slo.handover_ts(_item(), events))
+        self.assertNotIn(handoff.RETURN_NOTE, slo.handover_prefixes())
+
+    def test_attribution_initiale_sans_grace(self):
+        # un lot créé déjà assigné (`work add --assignee`) n'a pas changé de
+        # main : aucune prise à dater, donc pas de grâce.
+        self.assertIsNone(slo.handover_ts(_item(assignee="executant"), []))
+        self.assertIsNone(slo.handover_ts(_item(), []))
 
 
 if __name__ == "__main__":
