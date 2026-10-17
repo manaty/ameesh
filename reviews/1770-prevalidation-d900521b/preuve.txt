@@ -1,0 +1,73 @@
+#1770 — prévalidation refusée sur la tête candidate bedcbd41 (base main d900521b)
+mty-amh-impl-08 (auteur), 2026-10-17 ~04:2xZ
+
+## Tête candidate
+- bedcbd417ff54d7ddeecd65fbc1ecae058639e62, branche publiée `remise/1770-rebase-main-d900521b`.
+- Ré-ancrage du candidat sur main d900521b1c3e68668c1cf573814c8ddedd23bbe9
+  (merge de la PR #1564 : paquet h-0115 6f5de7e8 + transport incident T=90de1a20, #2167+#2175).
+- Conflits résolus en union : mechanics.py (packets de main + bloc prevalidation) ;
+  contract.json suit main (`agents.runner_seen` admis) + refus `prevalidation` :
+  65 opérations, 370 refusées, interface 435 ; docs/EXECUTEUR-MEDIEE.md aligné ;
+  témoin additif IDENTICAL ajusté (`packets`).
+- Diff vs main : 15 fichiers, +2794/−12. Tests ciblés : 117 OK sur la tête exacte,
+  pilotes psql ET psycopg (test_1770_mechanics_prevalidation, test_1770_prevalidation,
+  test_1770_prevalidation_cli, test_1770_prevalidation_store, test_l107_executor_contract).
+
+## Mesure carte (L161e)
+- Run 38997082120 (workflow_dispatch, headSha d900521b, dispatché 03:00:10Z) :
+  `plan de mesure` et les 10/10 parts de mesure SUCCESS (mesure-psycopg-1..6,
+  mesure-psql-1..4). Job `carte` : SUCCESS de 03:38:44Z à 03:54:29Z, soit 15m45s —
+  le plafond `timeout-minutes: 15` d'avant #2175 l'aurait annulé ; le correctif
+  porté par #2175 a donc joué exactement son rôle.
+- Carte publiée (artefact `carte`, 367831 octets, sha256
+  f14eb0155b1092c74a1f5dbc1247e9f04a646afc0e17089247e4dfc437d577ed) :
+  schéma ameesh-carte/1, commit d900521b1c3e, 10 parts, 404 modules, 265 fichiers,
+  7599 blocs, 8582 processus mesurés, 0 sans contexte.
+- MAIS 3 couvertures illisibles écartées, toutes dans `mesure-psycopg-2` :
+  - `cov/.coverage.ameesh-ci-2.pid1116865.XQA3GNnx` — DataError: isn't a coverage
+    data file (fichier tronqué ou vide) ;
+  - `cov/.coverage.ameesh-ci-2.pid1117170.XCQaGENx` — idem ;
+  - `cov/.coverage.ameesh-ci-2.pid1117842.XfV0vRTx` — 0 octet, « écriture
+    interrompue avant le schéma ».
+- Les fichiers de mesure ont été supprimés par le job `carte` après publication
+  (nettoyage normal du workflow) : la carte nomme les erreurs, les fichiers
+  eux-mêmes ne sont plus récupérables. Le run porte la trace des 3 erreurs.
+- Signature identique au cas déjà diagnostiqué (PID 3271010, 0 octet, run
+  38985327391) : processus tué pendant/avant le save de coverage (pont ACP,
+  SIGTERM puis SIGKILL après 3 s de grâce), pas un défaut du produit. Ici trois
+  occurrences dans la même part, dont deux fichiers tronqués de la même fenêtre.
+- Conséquence : carte PARTIELLE au sens #1257 R1 B3 / #1690/#1707 → inutilisable
+  pour une sélection. Aucune garde n'est assouplie, aucun fichier n'est retiré.
+
+## Plan (L161f)
+    PYTHONPATH=src python3 scripts/test-plan.py plan \
+      --map carte.json.gz --event pull_request --base d900521b \
+      --base-ref main --head-ref remise/1770-rebase-main-d900521b
+- head bedcbd41, map.commit d900521b, **mode full**, `sure=false`,
+  `phase2_safe=false` ; 407 modules sélectionnés (impacted 27, contract 7).
+- why : « map measured with 3 ignored coverage file(s) (partial measure) ».
+
+## Prévalidation (commande du lot, sur le candidat)
+    ameesh work prevalidate 1770 --sha bedcbd417ff54d7ddeecd65fbc1ecae058639e62 \
+      --plan plan-1770-d900521b.json --host ameesh-agents-1 \
+      --base d900521b1c3e68668c1cf573814c8ddedd23bbe9 \
+      --canon-repo /home/ameesh/canon \
+      --canon-commit e86003737725ccc9aa5cca60288e980958ba91ca --json
+- Résultat : rc=1, `refus.json` joint — causes `["card-stale"]`, why « map measured
+  with 3 ignored coverage file(s) (partial measure) ; map not usable ; sélection
+  non sûre ; phase 2 non sûre ».
+- **Aucun envoi VM, aucun run, aucun repli local, aucun faux vert** : `selection()`
+  refuse avant `run_offload` (prevalidation.py). Rien n'a été persisté en base.
+- Le refus antérieur 766e34db reste valable pour sa propre tête ; celui-ci le
+  remplace pour la tête bedcbd41.
+
+## Suite
+- La carte partielle ne se répare pas (couvertures perdues) : il faut une mesure
+  complète sur un main porteur, ou corriger la course de mesure avant de re-mesurer.
+- Le correctif #2175 (plafond 30 min) a fonctionné : l'assemblage a duré 15m45s et
+  a publié la carte. Le blocage restant est la robustesse de la mesure
+  (course SIGKILL / save coverage), suivi au backlog #2177 : sortie propre du faux
+  agent avant la grâce du pont, traçage des PID enfants dans le harnais, ou save
+  coverage robuste à SIGTERM.
+- Aucune fusion, aucun verdict, aucune activation du canon ; le lot reste en build
+  et attend la modalité suivante du pilote.

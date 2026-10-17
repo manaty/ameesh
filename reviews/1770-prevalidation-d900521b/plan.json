@@ -1,0 +1,2248 @@
+{
+ "schema": "ameesh-test-plan/1",
+ "event": "pull_request",
+ "generated": "2026-10-17T04:20:20+00:00",
+ "head": "bedcbd417ff54d7ddeecd65fbc1ecae058639e62",
+ "tested": "bedcbd417ff54d7ddeecd65fbc1ecae058639e62",
+ "release": "",
+ "refs": {
+  "base": "main",
+  "head": "remise/1770-rebase-main-d900521b"
+ },
+ "version_only": false,
+ "docs_only": false,
+ "why": "hors documentation : src/ameesh/mechanics.py, src/ameesh/mediated_executor/contract.json, src/ameesh/mesh_cli.py, src/ameesh/migrations/0450_prevalidation_reports.sql, src/ameesh/offload.py",
+ "files": [
+  "docs/EXECUTEUR-MEDIEE.md",
+  "docs/design/etudes/1770-prevalidation-au-gel.md",
+  "src/ameesh/mechanics.py",
+  "src/ameesh/mediated_executor/contract.json",
+  "src/ameesh/mesh_cli.py",
+  "src/ameesh/migrations/0450_prevalidation_reports.sql",
+  "src/ameesh/offload.py",
+  "src/ameesh/prevalidation.py",
+  "src/ameesh/storage/interface.py",
+  "src/ameesh/storage/postgres/__init__.py",
+  "src/ameesh/storage/postgres/prevalidation.py",
+  "tests/test_1770_mechanics_prevalidation.py",
+  "tests/test_1770_prevalidation.py",
+  "tests/test_1770_prevalidation_cli.py",
+  "tests/test_1770_prevalidation_store.py"
+ ],
+ "map": {
+  "commit": "d900521b1c3e68668c1cf573814c8ddedd23bbe9",
+  "generated": "2026-10-17T03:39:02+00:00",
+  "age_h": null,
+  "used": false,
+  "problem": "map measured with 3 ignored coverage file(s) (partial measure)"
+ },
+ "sure": false,
+ "phase2_safe": false,
+ "phase2_why": "map measured with 3 ignored coverage file(s) (partial measure)",
+ "unsure": [
+  "map measured with 3 ignored coverage file(s) (partial measure)"
+ ],
+ "contract": [
+  "test_339_orphan_settle",
+  "test_cluster",
+  "test_events_attach",
+  "test_l31_orphans",
+  "test_l50_group_orphan_work_items",
+  "test_l72_panne_de_base",
+  "test_migrations"
+ ],
+ "untested": [],
+ "unknown_blocks": [],
+ "foundation": [],
+ "removed": [],
+ "importers": {},
+ "certified": {},
+ "uncovered": [],
+ "changed": 15,
+ "always": [
+  "test_339_orphan_settle",
+  "test_cluster",
+  "test_events_attach",
+  "test_l31_orphans",
+  "test_l50_group_orphan_work_items",
+  "test_l72_panne_de_base",
+  "test_migrations"
+ ],
+ "classes": {
+  "test_1002_relance_perimee": [
+   "P3",
+   ""
+  ],
+  "test_1003_merge_pr": [
+   "P3",
+   ""
+  ],
+  "test_1021_tenue_attribution": [
+   "P3",
+   ""
+  ],
+  "test_1037_bascule_harnais": [
+   "P3",
+   ""
+  ],
+  "test_1053_famille_au_gel": [
+   "P3",
+   ""
+  ],
+  "test_1060_alert_types": [
+   "P3",
+   ""
+  ],
+  "test_1070_pause_budget_visible": [
+   "P3",
+   ""
+  ],
+  "test_1075_pace_multiplier": [
+   "P3",
+   ""
+  ],
+  "test_1127_config_explicite": [
+   "P3",
+   ""
+  ],
+  "test_1132_jauges_perimees": [
+   "P3",
+   ""
+  ],
+  "test_1155_staging": [
+   "P3",
+   ""
+  ],
+  "test_1176_pace_ceiling": [
+   "P3",
+   ""
+  ],
+  "test_1179_sonde_pgbouncer": [
+   "P3",
+   ""
+  ],
+  "test_1190_dryrun_cross_cache_inode": [
+   "P3",
+   ""
+  ],
+  "test_1193_suite_dependency": [
+   "P3",
+   ""
+  ],
+  "test_1227_suite_1176": [
+   "P3",
+   ""
+  ],
+  "test_1252_vm_agents_install": [
+   "P3",
+   ""
+  ],
+  "test_1256_ci_runners": [
+   "P3",
+   ""
+  ],
+  "test_1266_unreadable_turn_window": [
+   "P3",
+   ""
+  ],
+  "test_1268_critical_turn_failures": [
+   "P3",
+   ""
+  ],
+  "test_1270_rate_limit_retry": [
+   "P3",
+   ""
+  ],
+  "test_1277_rebase_sujet": [
+   "P3",
+   ""
+  ],
+  "test_1286_declared_merge_proof": [
+   "P3",
+   ""
+  ],
+  "test_1305_sauvegardes_modes": [
+   "P3",
+   ""
+  ],
+  "test_1314_carte_concurrency": [
+   "P3",
+   ""
+  ],
+  "test_1316_carte_dispatch": [
+   "P3",
+   ""
+  ],
+  "test_1318_verdict_perime": [
+   "P3",
+   ""
+  ],
+  "test_1323_actif": [
+   "P3",
+   ""
+  ],
+  "test_1333_radar_cible": [
+   "P3",
+   ""
+  ],
+  "test_1374_fire": [
+   "P3",
+   ""
+  ],
+  "test_1391_backlog_route": [
+   "P3",
+   ""
+  ],
+  "test_1393_flux_external_id": [
+   "P3",
+   ""
+  ],
+  "test_1410_paquet_ci_unique": [
+   "P3",
+   ""
+  ],
+  "test_1437_rebase_plage": [
+   "P3",
+   ""
+  ],
+  "test_1462_operator_pause": [
+   "P3",
+   ""
+  ],
+  "test_1468_ci_prio": [
+   "P3",
+   ""
+  ],
+  "test_1469_account_budget": [
+   "P3",
+   ""
+  ],
+  "test_1516_rebase_lot_options": [
+   "P3",
+   ""
+  ],
+  "test_1561_fraicheur_releves": [
+   "P3",
+   ""
+  ],
+  "test_1566_fraicheur_l226b": [
+   "P3",
+   ""
+  ],
+  "test_1580_budget_perdu": [
+   "P3",
+   ""
+  ],
+  "test_1580_marge_forfait": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_1580_widget_forfait": [
+   "P3",
+   ""
+  ],
+  "test_1604_hook_rapide": [
+   "P3",
+   ""
+  ],
+  "test_1617_review_designation": [
+   "P3",
+   ""
+  ],
+  "test_1617_review_designation_pg": [
+   "P3",
+   ""
+  ],
+  "test_1635_dispatch_porte": [
+   "P3",
+   ""
+  ],
+  "test_1644_paquet_inclusion": [
+   "P3",
+   ""
+  ],
+  "test_1645_github_identity": [
+   "P3",
+   ""
+  ],
+  "test_1647_liste_lots_journal": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_1651_ci_parts": [
+   "P3",
+   ""
+  ],
+  "test_1656_auto_merge": [
+   "P3",
+   ""
+  ],
+  "test_1672_placement_releve_perime": [
+   "P3",
+   ""
+  ],
+  "test_1680_packet_reservation": [
+   "P3",
+   ""
+  ],
+  "test_1681_incident": [
+   "P3",
+   ""
+  ],
+  "test_1682_auto_merge_constat": [
+   "P3",
+   ""
+  ],
+  "test_1703_writer_identity": [
+   "P3",
+   ""
+  ],
+  "test_1718_land_eject_unreadable": [
+   "P3",
+   ""
+  ],
+  "test_1737_wake_deadline": [
+   "P3",
+   ""
+  ],
+  "test_1749_zombies_git": [
+   "P3",
+   ""
+  ],
+  "test_1770_mechanics_prevalidation": [
+   "P0",
+   "tests/test_1770_mechanics_prevalidation.py"
+  ],
+  "test_1770_prevalidation": [
+   "P0",
+   "tests/test_1770_prevalidation.py"
+  ],
+  "test_1770_prevalidation_cli": [
+   "P0",
+   "tests/test_1770_prevalidation_cli.py"
+  ],
+  "test_1770_prevalidation_store": [
+   "P0",
+   "tests/test_1770_prevalidation_store.py"
+  ],
+  "test_1822_classe_legere": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_1883_overage_boucle": [
+   "P3",
+   ""
+  ],
+  "test_1901_gate_unreadable": [
+   "P3",
+   ""
+  ],
+  "test_1928_vm_personas_vide": [
+   "P3",
+   ""
+  ],
+  "test_1969_bascule": [
+   "P3",
+   ""
+  ],
+  "test_2003_reap_volumes": [
+   "P3",
+   ""
+  ],
+  "test_2009_sigterm_demarrage": [
+   "P3",
+   ""
+  ],
+  "test_2022_disk_early_warning": [
+   "P3",
+   ""
+  ],
+  "test_2022_fleet": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_2022_host_zombies": [
+   "P3",
+   ""
+  ],
+  "test_2096_runner_memoire": [
+   "P3",
+   ""
+  ],
+  "test_2102_detacher_branche": [
+   "P3",
+   ""
+  ],
+  "test_2128_registre_illisible": [
+   "P3",
+   ""
+  ],
+  "test_2129_ligne_malformee": [
+   "P3",
+   ""
+  ],
+  "test_2130_d_projection": [
+   "P3",
+   ""
+  ],
+  "test_2134_portier_permissions": [
+   "P3",
+   ""
+  ],
+  "test_2167_host_housekeeping": [
+   "P3",
+   ""
+  ],
+  "test_246_btrfs_guard": [
+   "P3",
+   ""
+  ],
+  "test_254_host_hold": [
+   "P3",
+   ""
+  ],
+  "test_330_owner_key": [
+   "P3",
+   ""
+  ],
+  "test_339_orphan_settle": [
+   "P1",
+   "always list (src/ameesh/migrations/0450_prevalidation_reports.sql)"
+  ],
+  "test_420_qa_role": [
+   "P3",
+   ""
+  ],
+  "test_435_agent_projects": [
+   "P3",
+   ""
+  ],
+  "test_453_pause_pression": [
+   "P3",
+   ""
+  ],
+  "test_468_agent_naming": [
+   "P3",
+   ""
+  ],
+  "test_472_zombie_turn_close": [
+   "P3",
+   ""
+  ],
+  "test_476_background_signals": [
+   "P3",
+   ""
+  ],
+  "test_476_cleanup_limits": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_476_job_reaping": [
+   "P3",
+   ""
+  ],
+  "test_476_mediated_signals": [
+   "P3",
+   ""
+  ],
+  "test_476_ownership_races": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_500_eviction_irremovable": [
+   "P3",
+   ""
+  ],
+  "test_501_native_gate_check": [
+   "P3",
+   ""
+  ],
+  "test_501_native_host_gate": [
+   "P3",
+   ""
+  ],
+  "test_501_unleased_registry": [
+   "P3",
+   ""
+  ],
+  "test_502_restart_lease": [
+   "P3",
+   ""
+  ],
+  "test_503_agent_host": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_508_runner_liveness": [
+   "P3",
+   ""
+  ],
+  "test_518_dsn_argv": [
+   "P3",
+   ""
+  ],
+  "test_530_housekeeping_followups": [
+   "P3",
+   ""
+  ],
+  "test_532_pgbouncer_pool": [
+   "P3",
+   ""
+  ],
+  "test_653_db_connections": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_705_reviewer_designated": [
+   "P3",
+   ""
+  ],
+  "test_706_rotation_latency": [
+   "P3",
+   ""
+  ],
+  "test_743_exec_only_serve": [
+   "P1",
+   "docs/EXECUTEUR-MEDIEE.md"
+  ],
+  "test_762_menage_dryrun_episode": [
+   "P3",
+   ""
+  ],
+  "test_789_slo": [
+   "P3",
+   ""
+  ],
+  "test_789_slo_alerts": [
+   "P3",
+   ""
+  ],
+  "test_802_canon_sync_concurrency": [
+   "P3",
+   ""
+  ],
+  "test_803_classes_famille": [
+   "P3",
+   ""
+  ],
+  "test_810_multi_project_consumers": [
+   "P3",
+   ""
+  ],
+  "test_811_lot_workdirs": [
+   "P3",
+   ""
+  ],
+  "test_831_packages_lock_scope": [
+   "P3",
+   ""
+  ],
+  "test_856_ci_flux_orphelins": [
+   "P3",
+   ""
+  ],
+  "test_898_pause_rythme": [
+   "P3",
+   ""
+  ],
+  "test_899_alerte_plafond": [
+   "P3",
+   ""
+  ],
+  "test_940_agregat_bash": [
+   "P3",
+   ""
+  ],
+  "test_987_relance_hosted": [
+   "P3",
+   ""
+  ],
+  "test_actions": [
+   "P3",
+   ""
+  ],
+  "test_adapters": [
+   "P3",
+   ""
+  ],
+  "test_approve": [
+   "P3",
+   ""
+  ],
+  "test_approve_equipes": [
+   "P3",
+   ""
+  ],
+  "test_authority": [
+   "P3",
+   ""
+  ],
+  "test_bin_launchers": [
+   "P3",
+   ""
+  ],
+  "test_bout_en_bout": [
+   "P3",
+   ""
+  ],
+  "test_canon": [
+   "P3",
+   ""
+  ],
+  "test_carte_parts_completes": [
+   "P3",
+   ""
+  ],
+  "test_catalog": [
+   "P3",
+   ""
+  ],
+  "test_catalog_events": [
+   "P3",
+   ""
+  ],
+  "test_catalog_store": [
+   "P3",
+   ""
+  ],
+  "test_cli_compat": [
+   "P3",
+   ""
+  ],
+  "test_cluster": [
+   "P1",
+   "always list (src/ameesh/migrations/0450_prevalidation_reports.sql)"
+  ],
+  "test_cost": [
+   "P3",
+   ""
+  ],
+  "test_discovery_sources": [
+   "P3",
+   ""
+  ],
+  "test_discovery_transport": [
+   "P3",
+   ""
+  ],
+  "test_events_attach": [
+   "P1",
+   "always list (src/ameesh/migrations/0450_prevalidation_reports.sql)"
+  ],
+  "test_expected_output": [
+   "P3",
+   ""
+  ],
+  "test_fallback": [
+   "P3",
+   ""
+  ],
+  "test_gitpush": [
+   "P3",
+   ""
+  ],
+  "test_hermeticity_lint": [
+   "P3",
+   ""
+  ],
+  "test_jcs": [
+   "P3",
+   ""
+  ],
+  "test_l105_plafonds_du_tour": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_l106_host_cutoff": [
+   "P3",
+   ""
+  ],
+  "test_l107_executor_contract": [
+   "P1",
+   "docs/EXECUTEUR-MEDIEE.md"
+  ],
+  "test_l108_executor_server": [
+   "P3",
+   ""
+  ],
+  "test_l109_mediated_mode": [
+   "P3",
+   ""
+  ],
+  "test_l109_remote_client": [
+   "P1",
+   "src/ameesh/storage/interface.py"
+  ],
+  "test_l110_enrollment": [
+   "P3",
+   ""
+  ],
+  "test_l111_relay": [
+   "P3",
+   ""
+  ],
+  "test_l1124_explorations": [
+   "P3",
+   ""
+  ],
+  "test_l112_host_gate": [
+   "P3",
+   ""
+  ],
+  "test_l113_work_repo": [
+   "P3",
+   ""
+  ],
+  "test_l114_executor_image": [
+   "P3",
+   ""
+  ],
+  "test_l116_parts": [
+   "P3",
+   ""
+  ],
+  "test_l1170_test_script_selection": [
+   "P3",
+   ""
+  ],
+  "test_l117_account_spread": [
+   "P3",
+   ""
+  ],
+  "test_l118_assignments": [
+   "P3",
+   ""
+  ],
+  "test_l118c_mail_projects": [
+   "P3",
+   ""
+  ],
+  "test_l119_backlog": [
+   "P3",
+   ""
+  ],
+  "test_l11_speed": [
+   "P3",
+   ""
+  ],
+  "test_l120_harness_versions": [
+   "P3",
+   ""
+  ],
+  "test_l121_watch": [
+   "P3",
+   ""
+  ],
+  "test_l122_numeros_de_migration": [
+   "P3",
+   ""
+  ],
+  "test_l124_decisions": [
+   "P3",
+   ""
+  ],
+  "test_l125_courrier_regroupe": [
+   "P3",
+   ""
+  ],
+  "test_l126_issues": [
+   "P3",
+   ""
+  ],
+  "test_l1293_l1294_venv_cache": [
+   "P3",
+   ""
+  ],
+  "test_l130_demandes_sans_lot": [
+   "P3",
+   ""
+  ],
+  "test_l131_suites_lourdes": [
+   "P3",
+   ""
+  ],
+  "test_l132_alert_briefs": [
+   "P3",
+   ""
+  ],
+  "test_l133_subagent_hook": [
+   "P3",
+   ""
+  ],
+  "test_l1372_projection_brief": [
+   "P3",
+   ""
+  ],
+  "test_l138_publication": [
+   "P3",
+   ""
+  ],
+  "test_l13_budget": [
+   "P3",
+   ""
+  ],
+  "test_l142_env_isole": [
+   "P3",
+   ""
+  ],
+  "test_l148_english_identifiers": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage1a1_alias": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage1a2_alias": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_l148_stage2b_scripts": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage2c_renames": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage3_workstream": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage3b_workstream_readers": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage3c_workstream_free_files": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage5b_test_names": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage6_json_keys": [
+   "P3",
+   ""
+  ],
+  "test_l1511_ci_pyyaml": [
+   "P3",
+   ""
+  ],
+  "test_l157_estimations": [
+   "P3",
+   ""
+  ],
+  "test_l157b_reference": [
+   "P3",
+   ""
+  ],
+  "test_l157c_dates_mesures": [
+   "P3",
+   ""
+  ],
+  "test_l158_version_level": [
+   "P3",
+   ""
+  ],
+  "test_l159a_capacity_guard": [
+   "P3",
+   ""
+  ],
+  "test_l159b_offload": [
+   "P1",
+   "src/ameesh/offload.py"
+  ],
+  "test_l159c_plafonds_memoire": [
+   "P3",
+   ""
+  ],
+  "test_l159d_host_measure": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_l159e6_guard_restart_alert": [
+   "P3",
+   ""
+  ],
+  "test_l159e_guard": [
+   "P3",
+   ""
+  ],
+  "test_l159f2_pg_up": [
+   "P3",
+   ""
+  ],
+  "test_l159f_host_gate": [
+   "P3",
+   ""
+  ],
+  "test_l159g_pilot": [
+   "P3",
+   ""
+  ],
+  "test_l159g_volume": [
+   "P3",
+   ""
+  ],
+  "test_l159i_vm_recipe": [
+   "P3",
+   ""
+  ],
+  "test_l159i_vm_supervisor": [
+   "P3",
+   ""
+  ],
+  "test_l160b_radar": [
+   "P3",
+   ""
+  ],
+  "test_l160c_radar_mail": [
+   "P3",
+   ""
+  ],
+  "test_l160d_resolutions": [
+   "P3",
+   ""
+  ],
+  "test_l160e2_land": [
+   "P3",
+   ""
+  ],
+  "test_l160e_merge_queue": [
+   "P3",
+   ""
+  ],
+  "test_l160f_versions": [
+   "P3",
+   ""
+  ],
+  "test_l160g_migration_reservations": [
+   "P3",
+   ""
+  ],
+  "test_l160g_nexlink": [
+   "P3",
+   ""
+  ],
+  "test_l1616_mechanics": [
+   "P1",
+   "src/ameesh/mechanics.py"
+  ],
+  "test_l161a_ci_sans_code": [
+   "P3",
+   ""
+  ],
+  "test_l161b_flow": [
+   "P3",
+   ""
+  ],
+  "test_l161c_failures_realtime": [
+   "P3",
+   ""
+  ],
+  "test_l161e_map": [
+   "P3",
+   ""
+  ],
+  "test_l161f_plan": [
+   "P3",
+   ""
+  ],
+  "test_l162_tmpfs": [
+   "P3",
+   ""
+  ],
+  "test_l165_prise_lots": [
+   "P3",
+   ""
+  ],
+  "test_l165b_agents_libres": [
+   "P3",
+   ""
+  ],
+  "test_l165c_sessions_par_lot": [
+   "P3",
+   ""
+  ],
+  "test_l166_child_session": [
+   "P3",
+   ""
+  ],
+  "test_l16_acp": [
+   "P3",
+   ""
+  ],
+  "test_l16_harnais": [
+   "P3",
+   ""
+  ],
+  "test_l1757_paquets_horaires": [
+   "P1",
+   "src/ameesh/mechanics.py"
+  ],
+  "test_l1958_fs_class_venv": [
+   "P3",
+   ""
+  ],
+  "test_l1992_banc_isolation": [
+   "P3",
+   ""
+  ],
+  "test_l217_plafond_sous_agents": [
+   "P3",
+   ""
+  ],
+  "test_l218_resume_rotation_entier": [
+   "P3",
+   ""
+  ],
+  "test_l219_housekeeping_tmp": [
+   "P3",
+   ""
+  ],
+  "test_l221_cout_result_sans_usage": [
+   "P3",
+   ""
+  ],
+  "test_l223_interactive_permissions": [
+   "P3",
+   ""
+  ],
+  "test_l224_session_harnais": [
+   "P3",
+   ""
+  ],
+  "test_l225_prix_claude": [
+   "P3",
+   ""
+  ],
+  "test_l226a_sentinel": [
+   "P3",
+   ""
+  ],
+  "test_l226b_auth_failure": [
+   "P3",
+   ""
+  ],
+  "test_l230_build_artifacts": [
+   "P3",
+   ""
+  ],
+  "test_l231_deps": [
+   "P3",
+   ""
+  ],
+  "test_l232a_handoffs": [
+   "P3",
+   ""
+  ],
+  "test_l232b_account": [
+   "P3",
+   ""
+  ],
+  "test_l232b_backup_restore": [
+   "P3",
+   ""
+  ],
+  "test_l232b_bootstrap": [
+   "P3",
+   ""
+  ],
+  "test_l232b_bootstrap_files": [
+   "P3",
+   ""
+  ],
+  "test_l232b_bootstrap_installer": [
+   "P3",
+   ""
+  ],
+  "test_l232b_delegation": [
+   "P3",
+   ""
+  ],
+  "test_l232b_entree_operateur": [
+   "P3",
+   ""
+  ],
+  "test_l232b_health_turn": [
+   "P3",
+   ""
+  ],
+  "test_l232b_host_factory": [
+   "P3",
+   ""
+  ],
+  "test_l232b_migration_worker": [
+   "P3",
+   ""
+  ],
+  "test_l232b_private_backup": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_authority": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_configuration": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_controller": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_fence": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_health": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_recovery": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_scripts": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_service": [
+   "P3",
+   ""
+  ],
+  "test_l232b_release_verification": [
+   "P3",
+   ""
+  ],
+  "test_l232b_restart_helper": [
+   "P3",
+   ""
+  ],
+  "test_l232b_retention": [
+   "P3",
+   ""
+  ],
+  "test_l232b_retention_provider": [
+   "P3",
+   ""
+  ],
+  "test_l232b_runtime": [
+   "P3",
+   ""
+  ],
+  "test_l232b_scaleway_retention": [
+   "P3",
+   ""
+  ],
+  "test_l232b_ssh_transport": [
+   "P3",
+   ""
+  ],
+  "test_l232b_versioned_environment": [
+   "P3",
+   ""
+  ],
+  "test_l232c_cablage": [
+   "P3",
+   ""
+  ],
+  "test_l232c_coffre": [
+   "P3",
+   ""
+  ],
+  "test_l232e_drain_handoffs": [
+   "P3",
+   ""
+  ],
+  "test_l232e_host_lifecycle": [
+   "P3",
+   ""
+  ],
+  "test_l232e_loss_recovery": [
+   "P3",
+   ""
+  ],
+  "test_l232e_preflight": [
+   "P3",
+   ""
+  ],
+  "test_l233_decide_only": [
+   "P3",
+   ""
+  ],
+  "test_l233b_budget_handoff": [
+   "P3",
+   ""
+  ],
+  "test_l234_auditor": [
+   "P3",
+   ""
+  ],
+  "test_l234a_auditor_canon_guard": [
+   "P3",
+   ""
+  ],
+  "test_l242b2_budget": [
+   "P2",
+   "failed under measure 2026-10-12"
+  ],
+  "test_l242b3_fallback": [
+   "P3",
+   ""
+  ],
+  "test_l242b_critical_accounts": [
+   "P3",
+   ""
+  ],
+  "test_l242c_critical_roles": [
+   "P3",
+   ""
+  ],
+  "test_l244_idle_gauge_cache": [
+   "P3",
+   ""
+  ],
+  "test_l248b_deps_packagers": [
+   "P3",
+   ""
+  ],
+  "test_l253_disk_volumes": [
+   "P3",
+   ""
+  ],
+  "test_l26_exploitation": [
+   "P3",
+   ""
+  ],
+  "test_l30_accounts": [
+   "P3",
+   ""
+  ],
+  "test_l317_project_modules": [
+   "P3",
+   ""
+  ],
+  "test_l317_proof_helper": [
+   "P3",
+   ""
+  ],
+  "test_l317_snapshot_limits": [
+   "P3",
+   ""
+  ],
+  "test_l317b_module_audit": [
+   "P3",
+   ""
+  ],
+  "test_l317c_deep_analysis": [
+   "P3",
+   ""
+  ],
+  "test_l31_admission": [
+   "P3",
+   ""
+  ],
+  "test_l31_orphans": [
+   "P1",
+   "always list (src/ameesh/migrations/0450_prevalidation_reports.sql)"
+  ],
+  "test_l31_pressure": [
+   "P3",
+   ""
+  ],
+  "test_l31_relocation": [
+   "P3",
+   ""
+  ],
+  "test_l31_resources": [
+   "P3",
+   ""
+  ],
+  "test_l31_visibility": [
+   "P3",
+   ""
+  ],
+  "test_l33_chatbot": [
+   "P2",
+   "failed under measure 2026-10-11"
+  ],
+  "test_l35_dossier_de_travail": [
+   "P3",
+   ""
+  ],
+  "test_l361_thread_expiry": [
+   "P3",
+   ""
+  ],
+  "test_l368_planned_waits": [
+   "P3",
+   ""
+  ],
+  "test_l36_vivacite": [
+   "P3",
+   ""
+  ],
+  "test_l37_mode_et_alertes": [
+   "P3",
+   ""
+  ],
+  "test_l385_work_dependencies": [
+   "P3",
+   ""
+  ],
+  "test_l38_notify": [
+   "P3",
+   ""
+  ],
+  "test_l39_adoption_reprise": [
+   "P3",
+   ""
+  ],
+  "test_l40_delegation": [
+   "P3",
+   ""
+  ],
+  "test_l411_docker_storage": [
+   "P3",
+   ""
+  ],
+  "test_l41_bindings": [
+   "P3",
+   ""
+  ],
+  "test_l42_plusieurs_canons": [
+   "P3",
+   ""
+  ],
+  "test_l43_perimetre_hote": [
+   "P3",
+   ""
+  ],
+  "test_l44_authentificateurs_par_canon": [
+   "P3",
+   ""
+  ],
+  "test_l46_corrections": [
+   "P3",
+   ""
+  ],
+  "test_l48_fast_failures": [
+   "P3",
+   ""
+  ],
+  "test_l490_deepseek_cgroup": [
+   "P3",
+   ""
+  ],
+  "test_l498_doctor": [
+   "P3",
+   ""
+  ],
+  "test_l498_turn_cgroup": [
+   "P3",
+   ""
+  ],
+  "test_l50_group_orphan_work_items": [
+   "P1",
+   "always list (src/ameesh/migrations/0450_prevalidation_reports.sql)"
+  ],
+  "test_l513_deepseek_offpeak": [
+   "P3",
+   ""
+  ],
+  "test_l514_wake_on_event": [
+   "P3",
+   ""
+  ],
+  "test_l51_persona": [
+   "P3",
+   ""
+  ],
+  "test_l52_persona_sessions": [
+   "P2",
+   "failed under measure 2026-10-15"
+  ],
+  "test_l538_process_inject": [
+   "P3",
+   ""
+  ],
+  "test_l539_review_lot": [
+   "P3",
+   ""
+  ],
+  "test_l53_restore_guard": [
+   "P3",
+   ""
+  ],
+  "test_l53_session_backup": [
+   "P3",
+   ""
+  ],
+  "test_l540_team_queue": [
+   "P3",
+   ""
+  ],
+  "test_l54_memory_runner": [
+   "P3",
+   ""
+  ],
+  "test_l54_persona_memory": [
+   "P3",
+   ""
+  ],
+  "test_l56_role_executor": [
+   "P3",
+   ""
+  ],
+  "test_l59_activity": [
+   "P3",
+   ""
+  ],
+  "test_l60_rotation_deepseek": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_l61_allers_retours": [
+   "P3",
+   ""
+  ],
+  "test_l62_projects": [
+   "P3",
+   ""
+  ],
+  "test_l63_platform": [
+   "P3",
+   ""
+  ],
+  "test_l64_unmeasured": [
+   "P3",
+   ""
+  ],
+  "test_l66_desktop": [
+   "P3",
+   ""
+  ],
+  "test_l70_budget": [
+   "P3",
+   ""
+  ],
+  "test_l71_comptabilite": [
+   "P3",
+   ""
+  ],
+  "test_l72_panne_de_base": [
+   "P1",
+   "always list (src/ameesh/migrations/0450_prevalidation_reports.sql)"
+  ],
+  "test_l73_housekeeping": [
+   "P3",
+   ""
+  ],
+  "test_l744_ci_entrypoint": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_l748_fs_classes": [
+   "P3",
+   ""
+  ],
+  "test_l74_comptes_a_echeance": [
+   "P3",
+   ""
+  ],
+  "test_l750_release": [
+   "P3",
+   ""
+  ],
+  "test_l755_workflow_timeouts": [
+   "P3",
+   ""
+  ],
+  "test_l756_full_suite": [
+   "P3",
+   ""
+  ],
+  "test_l75_resident": [
+   "P3",
+   ""
+  ],
+  "test_l76_resident_runner": [
+   "P3",
+   ""
+  ],
+  "test_l780_outdated_runner": [
+   "P3",
+   ""
+  ],
+  "test_l78_conversations": [
+   "P3",
+   ""
+  ],
+  "test_l790_outdated_restart": [
+   "P3",
+   ""
+  ],
+  "test_l795_preemption_evenement": [
+   "P3",
+   ""
+  ],
+  "test_l79_chat_terminal": [
+   "P3",
+   ""
+  ],
+  "test_l804_prise_executeur": [
+   "P3",
+   ""
+  ],
+  "test_l81_resident_rotation": [
+   "P3",
+   ""
+  ],
+  "test_l82_attach": [
+   "P3",
+   ""
+  ],
+  "test_l83_chat_api": [
+   "P3",
+   ""
+  ],
+  "test_l848_github_quota": [
+   "P3",
+   ""
+  ],
+  "test_l84_serve": [
+   "P1",
+   "src/ameesh/mesh_cli.py"
+  ],
+  "test_l85_events": [
+   "P3",
+   ""
+  ],
+  "test_l860_github_read": [
+   "P3",
+   ""
+  ],
+  "test_l87_serve_actions": [
+   "P3",
+   ""
+  ],
+  "test_l87c_alert_ack": [
+   "P3",
+   ""
+  ],
+  "test_l88_ui": [
+   "P3",
+   ""
+  ],
+  "test_l932_ci_venv_cache": [
+   "P3",
+   ""
+  ],
+  "test_l94_underuse": [
+   "P3",
+   ""
+  ],
+  "test_l953_image_approve": [
+   "P3",
+   ""
+  ],
+  "test_l95_budget_juste": [
+   "P3",
+   ""
+  ],
+  "test_l96_roadmap": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_mail": [
+   "P3",
+   ""
+  ],
+  "test_mail_instruction": [
+   "P3",
+   ""
+  ],
+  "test_merged_work_item_tracking": [
+   "P3",
+   ""
+  ],
+  "test_mesh_cli": [
+   "P3",
+   ""
+  ],
+  "test_migrations": [
+   "P1",
+   "always list (src/ameesh/migrations/0450_prevalidation_reports.sql)"
+  ],
+  "test_migrations_additives": [
+   "P3",
+   ""
+  ],
+  "test_models_entrypoint": [
+   "P3",
+   ""
+  ],
+  "test_p256": [
+   "P3",
+   ""
+  ],
+  "test_path_b_assembly": [
+   "P3",
+   ""
+  ],
+  "test_placement": [
+   "P3",
+   ""
+  ],
+  "test_plan": [
+   "P3",
+   ""
+  ],
+  "test_plan_git": [
+   "P3",
+   ""
+  ],
+  "test_pressure_orchestrator": [
+   "P3",
+   ""
+  ],
+  "test_process_registry": [
+   "P3",
+   ""
+  ],
+  "test_process_verifiers": [
+   "P3",
+   ""
+  ],
+  "test_process_verifiers_seam": [
+   "P3",
+   ""
+  ],
+  "test_process_workflow": [
+   "P3",
+   ""
+  ],
+  "test_progress": [
+   "P3",
+   ""
+  ],
+  "test_progress_serve": [
+   "P3",
+   ""
+  ],
+  "test_receipts": [
+   "P3",
+   ""
+  ],
+  "test_registry_lease": [
+   "P3",
+   ""
+  ],
+  "test_relay_credentials": [
+   "P3",
+   ""
+  ],
+  "test_rename": [
+   "P3",
+   ""
+  ],
+  "test_resume_without_authority": [
+   "P3",
+   ""
+  ],
+  "test_review": [
+   "P3",
+   ""
+  ],
+  "test_runner": [
+   "P3",
+   ""
+  ],
+  "test_runner_drain": [
+   "P3",
+   ""
+  ],
+  "test_signing": [
+   "P3",
+   ""
+  ],
+  "test_site_art": [
+   "P3",
+   ""
+  ],
+  "test_thread_log": [
+   "P3",
+   ""
+  ],
+  "test_tube_ferme": [
+   "P3",
+   ""
+  ],
+  "test_turn_grace": [
+   "P3",
+   ""
+  ],
+  "test_undeliverable": [
+   "P3",
+   ""
+  ],
+  "test_version": [
+   "P3",
+   ""
+  ],
+  "test_work": [
+   "P3",
+   ""
+  ]
+ },
+ "doc_readers": [],
+ "parts": {
+  "psycopg": [
+   {
+    "part": 1,
+    "of": 4,
+    "label": "psycopg 1/4",
+    "modules": [
+     "test_l50_group_orphan_work_items",
+     "test_1822_classe_legere",
+     "test_339_orphan_settle",
+     "test_events_attach",
+     "test_l52_persona_sessions",
+     "test_1070_pause_budget_visible",
+     "test_1252_vm_agents_install",
+     "test_1266_unreadable_turn_window",
+     "test_1268_critical_turn_failures",
+     "test_1270_rate_limit_retry",
+     "test_1333_radar_cible",
+     "test_1469_account_budget",
+     "test_1516_rebase_lot_options",
+     "test_1580_budget_perdu",
+     "test_1604_hook_rapide",
+     "test_1617_review_designation_pg",
+     "test_1635_dispatch_porte",
+     "test_1656_auto_merge",
+     "test_2003_reap_volumes",
+     "test_2102_detacher_branche",
+     "test_2130_d_projection",
+     "test_330_owner_key",
+     "test_435_agent_projects",
+     "test_476_background_signals",
+     "test_476_mediated_signals",
+     "test_501_native_host_gate",
+     "test_532_pgbouncer_pool",
+     "test_762_menage_dryrun_episode",
+     "test_789_slo_alerts",
+     "test_803_classes_famille",
+     "test_adapters",
+     "test_bin_launchers",
+     "test_gitpush",
+     "test_l106_host_cutoff",
+     "test_l110_enrollment",
+     "test_l117_account_spread",
+     "test_l118_assignments",
+     "test_l122_numeros_de_migration",
+     "test_l130_demandes_sans_lot",
+     "test_l133_subagent_hook",
+     "test_l142_env_isole",
+     "test_l148_english_identifiers",
+     "test_l148_stage3b_workstream_readers",
+     "test_l158_version_level",
+     "test_l159a_capacity_guard",
+     "test_l159c_plafonds_memoire",
+     "test_l159e_guard",
+     "test_l159i_vm_supervisor",
+     "test_l160b_radar",
+     "test_l160c_radar_mail",
+     "test_l160d_resolutions",
+     "test_l160e2_land",
+     "test_l160f_versions",
+     "test_l160g_nexlink",
+     "test_l161c_failures_realtime",
+     "test_l162_tmpfs",
+     "test_l165b_agents_libres",
+     "test_l165c_sessions_par_lot",
+     "test_l217_plafond_sous_agents",
+     "test_l226a_sentinel",
+     "test_l230_build_artifacts",
+     "test_l232b_backup_restore",
+     "test_l232b_host_factory",
+     "test_l232b_migration_worker",
+     "test_l232b_restart_helper",
+     "test_l232b_retention",
+     "test_l232b_retention_provider",
+     "test_l232b_versioned_environment",
+     "test_l232c_cablage",
+     "test_l232c_coffre",
+     "test_l232e_drain_handoffs",
+     "test_l244_idle_gauge_cache",
+     "test_l253_disk_volumes",
+     "test_l317b_module_audit",
+     "test_l31_relocation",
+     "test_l385_work_dependencies",
+     "test_l40_delegation",
+     "test_l41_bindings",
+     "test_l43_perimetre_hote",
+     "test_l46_corrections",
+     "test_l498_turn_cgroup",
+     "test_l51_persona",
+     "test_l538_process_inject",
+     "test_l53_restore_guard",
+     "test_l59_activity",
+     "test_l73_housekeeping",
+     "test_l88_ui",
+     "test_p256",
+     "test_placement",
+     "test_process_verifiers",
+     "test_process_workflow",
+     "test_relay_credentials",
+     "test_resume_without_authority",
+     "test_runner_drain",
+     "test_site_art"
+    ],
+    "estimate_s": 2359.1
+   },
+   {
+    "part": 2,
+    "of": 4,
+    "label": "psycopg 2/4",
+    "modules": [
+     "test_1770_prevalidation_store",
+     "test_1770_prevalidation_cli",
+     "test_1647_liste_lots_journal",
+     "test_l31_orphans",
+     "test_l72_panne_de_base",
+     "test_l105_plafonds_du_tour",
+     "test_1002_relance_perimee",
+     "test_1003_merge_pr",
+     "test_1053_famille_au_gel",
+     "test_1075_pace_multiplier",
+     "test_1179_sonde_pgbouncer",
+     "test_1190_dryrun_cross_cache_inode",
+     "test_1193_suite_dependency",
+     "test_1286_declared_merge_proof",
+     "test_1314_carte_concurrency",
+     "test_1316_carte_dispatch",
+     "test_1318_verdict_perime",
+     "test_1374_fire",
+     "test_1566_fraicheur_l226b",
+     "test_1617_review_designation",
+     "test_1644_paquet_inclusion",
+     "test_1651_ci_parts",
+     "test_1680_packet_reservation",
+     "test_1703_writer_identity",
+     "test_1737_wake_deadline",
+     "test_1749_zombies_git",
+     "test_1883_overage_boucle",
+     "test_1901_gate_unreadable",
+     "test_2009_sigterm_demarrage",
+     "test_2096_runner_memoire",
+     "test_2128_registre_illisible",
+     "test_2134_portier_permissions",
+     "test_246_btrfs_guard",
+     "test_420_qa_role",
+     "test_468_agent_naming",
+     "test_476_job_reaping",
+     "test_501_native_gate_check",
+     "test_789_slo",
+     "test_811_lot_workdirs",
+     "test_856_ci_flux_orphelins",
+     "test_898_pause_rythme",
+     "test_899_alerte_plafond",
+     "test_bout_en_bout",
+     "test_carte_parts_completes",
+     "test_catalog",
+     "test_catalog_events",
+     "test_cost",
+     "test_discovery_sources",
+     "test_expected_output",
+     "test_hermeticity_lint",
+     "test_jcs",
+     "test_l108_executor_server",
+     "test_l114_executor_image",
+     "test_l118c_mail_projects",
+     "test_l120_harness_versions",
+     "test_l126_issues",
+     "test_l132_alert_briefs",
+     "test_l148_stage3c_workstream_free_files",
+     "test_l148_stage5b_test_names",
+     "test_l148_stage6_json_keys",
+     "test_l159e6_guard_restart_alert",
+     "test_l159f2_pg_up",
+     "test_l159g_pilot",
+     "test_l161b_flow",
+     "test_l161f_plan",
+     "test_l166_child_session",
+     "test_l1958_fs_class_venv",
+     "test_l1992_banc_isolation",
+     "test_l219_housekeeping_tmp",
+     "test_l226b_auth_failure",
+     "test_l232b_bootstrap",
+     "test_l232b_health_turn",
+     "test_l232b_release_health",
+     "test_l232b_release_recovery",
+     "test_l232b_release_scripts",
+     "test_l232b_runtime",
+     "test_l232b_ssh_transport",
+     "test_l234_auditor",
+     "test_l242b_critical_accounts",
+     "test_l248b_deps_packagers",
+     "test_l317_project_modules",
+     "test_l31_resources",
+     "test_l368_planned_waits",
+     "test_l36_vivacite",
+     "test_l37_mode_et_alertes",
+     "test_l38_notify",
+     "test_l39_adoption_reprise",
+     "test_l411_docker_storage",
+     "test_l44_authentificateurs_par_canon",
+     "test_l498_doctor",
+     "test_l514_wake_on_event",
+     "test_l54_persona_memory",
+     "test_l56_role_executor",
+     "test_l62_projects",
+     "test_l64_unmeasured",
+     "test_l66_desktop",
+     "test_l748_fs_classes",
+     "test_l750_release",
+     "test_l756_full_suite",
+     "test_l75_resident",
+     "test_l790_outdated_restart",
+     "test_l795_preemption_evenement",
+     "test_l804_prise_executeur",
+     "test_l81_resident_rotation",
+     "test_l848_github_quota",
+     "test_l85_events",
+     "test_l87_serve_actions",
+     "test_l932_ci_venv_cache",
+     "test_mail_instruction",
+     "test_migrations_additives",
+     "test_plan",
+     "test_plan_git",
+     "test_pressure_orchestrator",
+     "test_progress_serve",
+     "test_runner",
+     "test_signing",
+     "test_thread_log"
+    ],
+    "estimate_s": 2359.0
+   },
+   {
+    "part": 3,
+    "of": 4,
+    "label": "psycopg 3/4",
+    "modules": [
+     "test_1770_mechanics_prevalidation",
+     "test_1770_prevalidation",
+     "test_l1757_paquets_horaires",
+     "test_l107_executor_contract",
+     "test_743_exec_only_serve",
+     "test_l1616_mechanics",
+     "test_l744_ci_entrypoint",
+     "test_l159d_host_measure",
+     "test_l109_remote_client",
+     "test_migrations",
+     "test_cluster",
+     "test_l60_rotation_deepseek",
+     "test_l159b_offload",
+     "test_476_ownership_races",
+     "test_l242b2_budget",
+     "test_l96_roadmap",
+     "test_503_agent_host",
+     "test_1021_tenue_attribution",
+     "test_1060_alert_types",
+     "test_1277_rebase_sujet",
+     "test_1305_sauvegardes_modes",
+     "test_1323_actif",
+     "test_1393_flux_external_id",
+     "test_1462_operator_pause",
+     "test_1468_ci_prio",
+     "test_1561_fraicheur_releves",
+     "test_1580_widget_forfait",
+     "test_1672_placement_releve_perime",
+     "test_2022_disk_early_warning",
+     "test_2022_host_zombies",
+     "test_2129_ligne_malformee",
+     "test_2167_host_housekeeping",
+     "test_254_host_hold",
+     "test_500_eviction_irremovable",
+     "test_502_restart_lease",
+     "test_508_runner_liveness",
+     "test_518_dsn_argv",
+     "test_530_housekeeping_followups",
+     "test_940_agregat_bash",
+     "test_l1124_explorations",
+     "test_l116_parts",
+     "test_l11_speed",
+     "test_l124_decisions",
+     "test_l131_suites_lourdes",
+     "test_l138_publication",
+     "test_l148_stage1a1_alias",
+     "test_l148_stage2b_scripts",
+     "test_l148_stage3_workstream",
+     "test_l1511_ci_pyyaml",
+     "test_l157_estimations",
+     "test_l157b_reference",
+     "test_l159i_vm_recipe",
+     "test_l160g_migration_reservations",
+     "test_l161a_ci_sans_code",
+     "test_l161e_map",
+     "test_l165_prise_lots",
+     "test_l16_acp",
+     "test_l16_harnais",
+     "test_l218_resume_rotation_entier",
+     "test_l225_prix_claude",
+     "test_l232a_handoffs",
+     "test_l232b_bootstrap_installer",
+     "test_l232b_delegation",
+     "test_l232b_entree_operateur",
+     "test_l232b_release_controller",
+     "test_l232b_release_fence",
+     "test_l232b_scaleway_retention",
+     "test_l232e_host_lifecycle",
+     "test_l232e_loss_recovery",
+     "test_l233_decide_only",
+     "test_l233b_budget_handoff",
+     "test_l242b3_fallback",
+     "test_l242c_critical_roles",
+     "test_l30_accounts",
+     "test_l317c_deep_analysis",
+     "test_l31_pressure",
+     "test_l35_dossier_de_travail",
+     "test_l490_deepseek_cgroup",
+     "test_l53_session_backup",
+     "test_l54_memory_runner",
+     "test_l63_platform",
+     "test_l71_comptabilite",
+     "test_l755_workflow_timeouts",
+     "test_l76_resident_runner",
+     "test_l780_outdated_runner",
+     "test_l82_attach",
+     "test_l87c_alert_ack",
+     "test_l94_underuse",
+     "test_l953_image_approve",
+     "test_l95_budget_juste",
+     "test_mail",
+     "test_models_entrypoint",
+     "test_path_b_assembly",
+     "test_progress",
+     "test_receipts",
+     "test_turn_grace",
+     "test_version"
+    ],
+    "estimate_s": 2359.1
+   },
+   {
+    "part": 4,
+    "of": 4,
+    "label": "psycopg 4/4",
+    "modules": [
+     "test_2022_fleet",
+     "test_l148_stage1a2_alias",
+     "test_1580_marge_forfait",
+     "test_l84_serve",
+     "test_653_db_connections",
+     "test_476_cleanup_limits",
+     "test_l33_chatbot",
+     "test_1037_bascule_harnais",
+     "test_1127_config_explicite",
+     "test_1132_jauges_perimees",
+     "test_1155_staging",
+     "test_1176_pace_ceiling",
+     "test_1227_suite_1176",
+     "test_1256_ci_runners",
+     "test_1391_backlog_route",
+     "test_1410_paquet_ci_unique",
+     "test_1437_rebase_plage",
+     "test_1645_github_identity",
+     "test_1681_incident",
+     "test_1682_auto_merge_constat",
+     "test_1718_land_eject_unreadable",
+     "test_1928_vm_personas_vide",
+     "test_1969_bascule",
+     "test_453_pause_pression",
+     "test_472_zombie_turn_close",
+     "test_501_unleased_registry",
+     "test_705_reviewer_designated",
+     "test_706_rotation_latency",
+     "test_802_canon_sync_concurrency",
+     "test_810_multi_project_consumers",
+     "test_831_packages_lock_scope",
+     "test_987_relance_hosted",
+     "test_actions",
+     "test_approve",
+     "test_approve_equipes",
+     "test_authority",
+     "test_canon",
+     "test_catalog_store",
+     "test_cli_compat",
+     "test_discovery_transport",
+     "test_fallback",
+     "test_l109_mediated_mode",
+     "test_l111_relay",
+     "test_l112_host_gate",
+     "test_l113_work_repo",
+     "test_l1170_test_script_selection",
+     "test_l119_backlog",
+     "test_l121_watch",
+     "test_l125_courrier_regroupe",
+     "test_l1293_l1294_venv_cache",
+     "test_l1372_projection_brief",
+     "test_l13_budget",
+     "test_l148_stage2c_renames",
+     "test_l157c_dates_mesures",
+     "test_l159f_host_gate",
+     "test_l159g_volume",
+     "test_l160e_merge_queue",
+     "test_l221_cout_result_sans_usage",
+     "test_l223_interactive_permissions",
+     "test_l224_session_harnais",
+     "test_l231_deps",
+     "test_l232b_account",
+     "test_l232b_bootstrap_files",
+     "test_l232b_private_backup",
+     "test_l232b_release_authority",
+     "test_l232b_release_configuration",
+     "test_l232b_release_service",
+     "test_l232b_release_verification",
+     "test_l232e_preflight",
+     "test_l234a_auditor_canon_guard",
+     "test_l26_exploitation",
+     "test_l317_proof_helper",
+     "test_l317_snapshot_limits",
+     "test_l31_admission",
+     "test_l31_visibility",
+     "test_l361_thread_expiry",
+     "test_l42_plusieurs_canons",
+     "test_l48_fast_failures",
+     "test_l513_deepseek_offpeak",
+     "test_l539_review_lot",
+     "test_l540_team_queue",
+     "test_l61_allers_retours",
+     "test_l70_budget",
+     "test_l74_comptes_a_echeance",
+     "test_l78_conversations",
+     "test_l79_chat_terminal",
+     "test_l83_chat_api",
+     "test_l860_github_read",
+     "test_merged_work_item_tracking",
+     "test_mesh_cli",
+     "test_process_registry",
+     "test_process_verifiers_seam",
+     "test_registry_lease",
+     "test_rename",
+     "test_review",
+     "test_tube_ferme",
+     "test_undeliverable",
+     "test_work"
+    ],
+    "estimate_s": 2359.1
+   }
+  ],
+  "psql": [
+   {
+    "part": 1,
+    "of": 3,
+    "label": "psql 1/3",
+    "modules": [
+     "test_l50_group_orphan_work_items",
+     "test_653_db_connections",
+     "test_789_slo_alerts",
+     "test_810_multi_project_consumers",
+     "test_catalog_store",
+     "test_l118c_mail_projects",
+     "test_l148_stage3b_workstream_readers",
+     "test_l157_estimations",
+     "test_l160d_resolutions",
+     "test_l160g_migration_reservations",
+     "test_l161c_failures_realtime",
+     "test_l162_tmpfs",
+     "test_l165_prise_lots",
+     "test_l232e_drain_handoffs",
+     "test_l317_project_modules",
+     "test_l368_planned_waits",
+     "test_l53_restore_guard",
+     "test_l59_activity",
+     "test_l87c_alert_ack",
+     "test_process_registry",
+     "test_registry_lease",
+     "test_undeliverable"
+    ],
+    "estimate_s": 1836.6
+   },
+   {
+    "part": 2,
+    "of": 3,
+    "label": "psql 2/3",
+    "modules": [
+     "test_migrations",
+     "test_l31_orphans",
+     "test_339_orphan_settle",
+     "test_events_attach",
+     "test_cluster",
+     "test_1060_alert_types",
+     "test_1132_jauges_perimees",
+     "test_508_runner_liveness",
+     "test_802_canon_sync_concurrency",
+     "test_831_packages_lock_scope",
+     "test_l108_executor_server",
+     "test_l110_enrollment",
+     "test_l111_relay",
+     "test_l160e2_land",
+     "test_l165c_sessions_par_lot",
+     "test_l232a_handoffs",
+     "test_l232b_bootstrap",
+     "test_l232b_release_fence",
+     "test_l514_wake_on_event",
+     "test_l54_memory_runner",
+     "test_l78_conversations"
+    ],
+    "estimate_s": 1834.4
+   },
+   {
+    "part": 3,
+    "of": 3,
+    "label": "psql 3/3",
+    "modules": [
+     "test_l72_panne_de_base",
+     "test_l52_persona_sessions",
+     "test_1037_bascule_harnais",
+     "test_420_qa_role",
+     "test_472_zombie_turn_close",
+     "test_705_reviewer_designated",
+     "test_811_lot_workdirs",
+     "test_l112_host_gate",
+     "test_l122_numeros_de_migration",
+     "test_l124_decisions",
+     "test_l130_demandes_sans_lot",
+     "test_l148_stage3_workstream",
+     "test_l157c_dates_mesures",
+     "test_l160e_merge_queue",
+     "test_l165b_agents_libres",
+     "test_l232b_migration_worker",
+     "test_l232e_host_lifecycle",
+     "test_l232e_loss_recovery",
+     "test_l317b_module_audit",
+     "test_l385_work_dependencies",
+     "test_l56_role_executor",
+     "test_l61_allers_retours",
+     "test_l82_attach"
+    ],
+    "estimate_s": 1836.6
+   }
+  ]
+ },
+ "selection": {
+  "mode": "full",
+  "why": "map not usable (map measured with 3 ignored coverage file(s) (partial measure))",
+  "modules": 407,
+  "impacted": 27,
+  "contract": 7,
+  "selected": 407,
+  "skipped": 0,
+  "impacted_estimate_s": 605.8,
+  "total_estimate_s": 9436.3
+ }
+}
