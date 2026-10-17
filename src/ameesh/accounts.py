@@ -2297,9 +2297,13 @@ def _mention_non_datee(row: dict, gauge: dict) -> str:
     la valeur reste lisible, mais porte « non daté : provenance inconnue ».
     La mention ne conclut pas « périmé » : aucune preuve de péremption n'est
     inventée (ni âge maximal, ni mtime, ni plafond). Codex ne publie pas
-    d'instant de production ; ses jauges ne portent pas la mention.
+    d'instant de production ; ses jauges ne portent pas la mention. Le widget
+    omarchy (#1580) non plus, mais il date lui-même son relevé (`updatedAt`,
+    fraîcheur vérifiée par `widget_usage.read`) : ses jauges ne la portent pas.
     """
-    if row.get("harness") != "claude" or gauge.get("produced_at") is not None:
+    from . import widget_usage
+    if row.get("harness") != "claude" or gauge.get("produced_at") is not None \
+            or gauge.get("source") == widget_usage.SOURCE:
         return ""
     return " [non daté : provenance inconnue]"
 

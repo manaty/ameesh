@@ -18,8 +18,9 @@ import os
 import unittest
 from unittest import mock
 
-from ameesh import accounts, cost
+from ameesh import accounts, cost, widget_usage
 
+from .test_1580_widget_forfait import WidgetUsageTest, _profil
 from .test_cost import Sandbox
 from .test_l30_accounts import _dossier
 
@@ -89,3 +90,31 @@ class RejeuSeulAfficheTest(Sandbox, unittest.TestCase):
             " [non daté : provenance inconnue]")
         self.assertEqual(
             accounts._mention_non_datee({"harness": "claude"}, {"produced_at": 1.0}), "")
+        # le widget omarchy (#1580) date lui-même son relevé : pas de mention
+        self.assertEqual(
+            accounts._mention_non_datee({"harness": "claude"}, {"source": "widget"}), "")
+
+
+class WidgetNonMentionneTest(unittest.TestCase):
+    """Le widget omarchy (#1580) date lui-même son relevé : pas de mention."""
+
+    setUp = WidgetUsageTest.setUp
+    tearDown = WidgetUsageTest.tearDown
+    _ecrit = WidgetUsageTest._ecrit
+    _instantane = WidgetUsageTest._instantane
+
+    def test_un_releve_du_widget_ne_porte_pas_la_mention(self):
+        self._ecrit("claude-secondary.json", self._instantane())
+        gauges = widget_usage.read(_profil(self.compte, "secondaire"),
+                                   now=self.now, directory=self.dossier)
+        self.assertIsNotNone(gauges)
+        self.assertTrue(all(g.produced_at is None and g.source == widget_usage.SOURCE
+                            for g in gauges))
+        ligne = {"harness": "claude", "account": "secondaire", "forced": False,
+                 "active": False, "ok": True, "problems": [], "reason": "",
+                 "gauges": [{"key": g.key, "used": g.used, "cap": 0.9,
+                             "produced_at": g.produced_at, "source": g.source}
+                            for g in gauges]}
+        texte = accounts.format_rows([ligne])
+        self.assertIn("seven_day 13% (pace ", texte)
+        self.assertNotIn("non daté", texte)
