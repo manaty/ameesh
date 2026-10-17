@@ -43,6 +43,41 @@ class ProbeHealthTest(unittest.TestCase):
         self.assertEqual(seen.get("GH_CONFIG_DIR"), self.home)
         self.assertEqual(verdict.state, "failing")
 
+    def test_gh_empreinte_suit_le_jeton_effectif_pas_le_fichier(self):
+        """B2 : un commentaire dans hosts.yml ne change pas la credential."""
+        profile = accounts_mod.Profile(harness="gh", name="", path=self.home,
+                                       declared=True)
+        token = {"value": "gho_first"}
+        def run(argv, **kwargs):
+            if list(argv)[2] == "token":
+                return 0, token["value"] + "\n"
+            return 0, "Logged in to github.com"
+        with mock.patch("ameesh.sentinel._run", side_effect=run):
+            first = login_cli.credential_fingerprint("gh", profile, environ={})
+            with open(os.path.join(self.home, "hosts.yml"), "w", encoding="utf-8") as fh:
+                fh.write("# unrelated comment\ngithub.com:\n  oauth_token: gho_first\n")
+            same = login_cli.credential_fingerprint("gh", profile, environ={})
+            token["value"] = "gho_second"
+            second = login_cli.credential_fingerprint("gh", profile, environ={})
+        self.assertEqual(first, sentinel._digest("gho_first"))
+        self.assertEqual(same, first)        # le fichier a changé, pas la credential
+        self.assertNotEqual(second, first)   # la credential a changé
+
+    def test_gh_sans_jeton_effectif_le_verdict_ne_porte_aucune_empreinte(self):
+        """B2 : sans jeton lisible (keyring verrouillé, aucun jeton), pas de
+        repli sur le fichier ; la preuve de credential neuve est refusée."""
+        profile = accounts_mod.Profile(harness="gh", name="", path=self.home,
+                                       declared=True)
+        def run(argv, **kwargs):
+            if list(argv)[2] == "token":
+                return 1, "no oauth token found for github.com"
+            return 0, "Logged in to github.com"
+        with mock.patch("ameesh.sentinel.shutil.which", return_value="gh"):
+            verdict = login_cli.probe_health(self.cfg, profile, "gh",
+                                             environ={}, run=run)
+        self.assertEqual(verdict.state, "healthy")
+        self.assertIsNone(verdict.fingerprint)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="l232d-health-")
         self.addCleanup(self.temp.cleanup)
@@ -235,6 +270,25 @@ class HealthReportTest(unittest.TestCase):
         with mock.patch.object(login_cli, "probe_health", return_value=verdict):
             state = login_cli.health_report(self.store, self.cfg, None, self.request,
                                             credential_before=None)
+        self.assertEqual(state, "failing")
+        self.assertEqual(self.credentials.calls, [])
+
+    def test_gh_commentaire_du_fichier_ne_prouve_pas_une_credential_neuve(self):
+        """B2 : hosts.yml change (commentaire) sans que le jeton change → la
+        sonde porte la même empreinte et la connexion n'est pas « neuve »."""
+        profile = accounts_mod.Profile(harness="gh", name="", path=self.home,
+                                       declared=True)
+        def run(argv, **kwargs):
+            if list(argv)[2] == "token":
+                return 0, "gho_same\n"
+            return 0, "Logged in to github.com"
+        with open(os.path.join(self.home, "hosts.yml"), "w", encoding="utf-8") as fh:
+            fh.write("# unrelated comment\ngithub.com: {}\n")
+        request = SimpleNamespace(harness="gh", account="")
+        with mock.patch("ameesh.sentinel.shutil.which", return_value="gh"):
+            state = login_cli.health_report(
+                self.store, self.cfg, profile, request, environ={}, run=run,
+                credential_before=sentinel._digest("gho_same"))
         self.assertEqual(state, "failing")
         self.assertEqual(self.credentials.calls, [])
 

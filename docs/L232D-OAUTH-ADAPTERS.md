@@ -146,7 +146,12 @@ none changes the activation preconditions of #366.
   SHA-256, never a secret) is read **before** the CLI starts. A healthy probe
   only becomes `healthy` when the post-login fingerprint is present and
   differs (or no credential existed before); the same fingerprint never
-  proves a new login, and no row is overwritten in that case.
+  proves a new login, and no row is overwritten in that case. For `gh` the
+  fingerprint is that of the **effective github.com token**
+  (`gh auth token --hostname github.com`, so `hosts.yml` or the keyring), not
+  of the `hosts.yml` file: a comment in the file no longer fakes a new
+  credential. When no token can be read (locked keyring, no token), the
+  verdict carries no fingerprint and the fresh-credential proof is refused.
 - **`gh` probe pinned to github.com (N5).** `probe_health("gh")` and the
   sentinel's `gh` pass run `gh auth status --hostname github.com`, and
   `login_env` drops `GH_HOST`; another host can no longer make the
@@ -179,8 +184,9 @@ Targeted tests of the slice, no full suite:
 - `tests/test_l232d_accounts_login.py` — CLI helpers (identity, profile,
   private home, version pinning with the cleaned environment, refusals).
 - `tests/test_l232d_credential_health.py` — post-login health writing, the
-  fresh-credential fingerprint proof (N2), and the `gh` probe bound to
-  `--hostname github.com` (N5).
+  fresh-credential fingerprint proof (N2) including the `gh` effective-token
+  fingerprint (keyring included, no fallback to `hosts.yml` on a comment or a
+  missing token), and the `gh` probe bound to `--hostname github.com` (N5).
 - `tests/test_l232d_login_e2e.py` — the whole chain against the **real**
   service on loopback with a migrated database: fake codex CLI → real
   `POST /login-requests` → WebAuthn assertion → private view → `done` → real

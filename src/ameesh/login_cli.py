@@ -170,9 +170,11 @@ def credential_fingerprint(harness: str, profile, *, environ=None) -> str | None
         return None
     env = login_mod.login_env(adapter, profile.home(environ), environ)
     if harness == "gh":
-        # le foyer de la connexion est `GH_CONFIG_DIR` (posé par login_env) ;
-        # les jetons ambiants ont été retirés, le fichier fait foi
-        return sentinel.file_fingerprint(sentinel.gh_store(env))
+        # la credential effective est le jeton que gh présente pour
+        # github.com (hosts.yml ou keyring), pas le fichier hosts.yml : un
+        # commentaire changerait l'empreinte du fichier sans changer la
+        # credential (B2 de la relecture Codex)
+        return sentinel.gh_credential_fingerprint(env)
     return sentinel.fingerprint(harness, profile, environ)
 
 
@@ -203,10 +205,15 @@ def probe_health(cfg: Config, profile, harness: str, *, environ=None, run=None,
         env = login_mod.login_env(login_mod.ADAPTERS["gh"], profile.home(environ), environ)
         def probe_gh(argv, **kwargs):
             return (run or sentinel._run)(argv, env=env, **kwargs)
+        # B2 : l'empreinte du verdict est celle de la credential effective
+        # (jeton github.com, keyring compris), jamais celle du fichier ; si
+        # elle est inconnue, le verdict n'en porte aucune et la preuve est
+        # refusée par `health_report`.
+        held = sentinel.gh_credential_fingerprint(env, run=probe_gh)
         return sentinel.probe_cli("gh", ["gh", "auth", "status",
                                          "--hostname", "github.com"],
                                   "gh auth login -h github.com", probe_gh,
-                                  sentinel.gh_store(env))
+                                  sentinel.gh_store(env), credential=held)
     return None
 
 
