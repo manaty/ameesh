@@ -14,9 +14,10 @@ maintenue au prochain paquet compatible, remise `91df05dac` sur la tête 0400),
 prochain paquet compatible »). Transports : #2190 confié par mesh-design
 (#94841/#94861) ; #1677 remise poussée par mty-amh-impl-07 ; #1152/#1343
 signalés prêts par mty-amh-impl-04 mais différés (voir Hors périmètre).
-Réparation d'incident CI : #2199 (revue Codex mesh-design sur `96da5b62`,
-transport exclusif impl-01), ajoutée après l'échec du run `39006173443` sans
-relance identique de `c8d960af`. Aucune CI de lot.
+Réparation d'incident CI : #2199 — GO Codex mesh-design **enregistré** sur
+`96da5b62cee30c8f10e87aa06922bedce9026536` (**0 B / 0 N**, désignation native),
+diff test-only relu, transport exclusif impl-01 ; ajoutée après l'échec du run
+`39006173443` sans relance identique de `c8d960af`. Aucune CI de lot.
 
 ## Composition
 
@@ -27,7 +28,7 @@ relance identique de `c8d960af`. Aucune CI de lot.
 | 3 | #2177 | `4ff178510492b742259218892432fa1a0358fbbb` (`lot/2177-carte-fichier-vide`) | `497cd68f6` | GO Codex (mesh-design) 04:29 ; fusion propre (`tests/fake_acp_agent.py`, nouveau témoin SIGTERM) |
 | 4 | #2157 | `1ee9af5c10e662176a43067e76324bd4fb5ebfed` (`lot/2157-composition-ameesh-work`) | `e26883b43` | R1 Codex favorable 04:29, léger ; outil de composition + convention `ameesh-work` ; fusion propre |
 | 5 | #1677 | `5b208e277d16` (tête gelée ; remise `91df05dac`, `refs/ameesh/resolutions/1677/paquet-h-20261017-0400`) | `fa961a70a` | priorité 1, prise automatique ; GO dev7 7023 conservé, remise fraîche sur la tête 0400 ; fusion propre, 16 fichiers |
-| 6 | #2199 | `96da5b62cee3` (`lot/2199-isolation-threads-attach`) | `96da5b62` (reprise directe, ff) | réparation d'incident CI du run `39006173443` : isolation du fil `attach`, test-only (`tests/test_events_attach.py`, +97/−21), base `c8d960af` ; revue Codex mesh-design ; 51 ciblés psql + 51 psycopg (auteur et transporteur) |
+| 6 | #2199 | `96da5b62cee3` (`lot/2199-isolation-threads-attach`) | `96da5b62` (reprise directe, ff) | réparation d'incident CI du run `39006173443` : isolation du fil `attach`, test-only (`tests/test_events_attach.py`, +97/−21), base `c8d960af` ; GO Codex mesh-design 0 B / 0 N sur `96da5b62` (désignation native), diff relu ; 51 ciblés psql + 51 psycopg (auteur et transporteur) |
 
 Chaque commit de composition porte le trailer `ameesh-work: <lot>` (convention
 #2157) ; les commits de fusion portent le lot comme second parent. L'unité 6
