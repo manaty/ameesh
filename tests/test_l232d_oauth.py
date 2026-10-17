@@ -210,8 +210,9 @@ class SupervisorTest(FakeCliTest):
         kill.assert_any_call(proc.pid, login.signal.SIGKILL)
 
     def test_gh_publie_le_flux_prive_puis_done(self):
+        # la fin fournisseur est prouvee par la sortie propre du CLI (code 0)
         self.cli("gh", "printf 'First copy your one-time code: WXYZ-9876\\n"
-                       "Open this URL: https://github.com/login/device\\n'; sleep 30")
+                       "Open this URL: https://github.com/login/device\\n'; exit 0")
         sink = Sink()
         sup = self.supervisor(publish=sink)
         request = self.begin(sup)
@@ -292,10 +293,36 @@ class SupervisorTest(FakeCliTest):
         self.assertTrue(wait_for(lambda: self.dead(self.spawned[0])))
 
     def test_done_sans_sante_est_un_refus(self):
-        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; exit 0")
         sup = self.supervisor(health=lambda request: "failing")
         request = self.begin(sup)
         self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        done = sup.finish(request.id, "done")
+        self.assertEqual((done.state, done.category), (login.DONE, "provider_refused"))
+
+    def test_done_refuse_un_cli_encore_vivant_meme_avec_ancien_cache_sain(self):
+        # Temoin du verdict Codex (#366, B2) : un CLI encore vivant n'a pas
+        # prouve la fin fournisseur ; une sonde qui lit un ancien auth.json
+        # (ici `health` repond toujours healthy) ne doit pas rendre `healthy`.
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        sup = self.supervisor(health=lambda request: "healthy", grace=0.2)
+        sup.settle = 0.2
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        done = sup.finish(request.id, "done")
+        self.assertEqual((done.state, done.category), (login.DONE, "provider_refused"))
+        self.assertTrue(wait_for(lambda: self.dead(self.spawned[0])))
+        self.assertEqual(self.spawned[0].returncode, -15)
+
+    def test_done_refuse_un_cli_interrompu_meme_avec_ancien_cache_sain(self):
+        # Temoin du verdict Codex (#366, B2) : processus interrompu (-15),
+        # auth inchange, sonde healthy -> la demande ne doit pas etre healthy.
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        sup = self.supervisor(health=lambda request: "healthy", grace=0.2)
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        self.spawned[0].terminate()
+        self.assertTrue(wait_for(lambda: self.spawned[0].poll() is not None))
         done = sup.finish(request.id, "done")
         self.assertEqual((done.state, done.category), (login.DONE, "provider_refused"))
 
@@ -367,7 +394,7 @@ class SupervisorTest(FakeCliTest):
             sup.finish(request.id, "cancel")
 
     def test_attente_du_recu_puis_decision(self):
-        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; exit 0")
         sup = self.supervisor()
         request = self.begin(sup)
         self.assertTrue(wait_for(lambda: request.state == login.VIEWING))

@@ -105,8 +105,15 @@ The approver's signature covers a summary without URL or code; the receipt is
 bound to `login_id`, `host`, `provider`, `account`, `scope` and `exp`, all
 **recomputed from our own request** — never read from the receipt. `ameesh`
 verifies the signature, consumes the nonce once (a second acceptance is
-refused `REPLAY`), then kills the process group (SIGTERM, SIGKILL after the
-grace delay) and probes the account.
+refused `REPLAY`).
+
+On `cancel`, the process group is killed (SIGTERM, SIGKILL after the grace
+delay). On `done`, the supervisor first waits, bounded by `settle`
+(`PROVIDER_END_S`), for the **provider end**: the CLI must exit by itself with
+code 0. A CLI that had to be killed, was interrupted, or exited non-zero stays
+`provider_refused` — health is never probed on it, so an old `auth.json` cannot
+be mistaken for proof of this attempt. Only after a clean provider end are the
+account probes run.
 
 A `done` receipt does not prove the grant: after the decision, the same probes
 as `sentinel` / `ameesh accounts check` are run on the account's home and their

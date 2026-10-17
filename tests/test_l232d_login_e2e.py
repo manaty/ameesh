@@ -77,7 +77,8 @@ class LoginEndToEndTest(ApproveBase):
                 "mkdir -p \"$CODEX_HOME\"\n"
                 "printf '{\"tokens\": {\"refresh_token\": \"rt\"}}' > \"$CODEX_HOME/auth.json\"\n"
                 "printf 'Open this URL: %s\\nEnter this code: %s\\n'\n"
-                "sleep 30\n" % (URL, CODE))
+                "sleep 1\n"
+                "exit 0\n" % (URL, CODE))
         os.chmod(self.cli_path, stat.S_IRWXU)
 
     def reap(self) -> None:
