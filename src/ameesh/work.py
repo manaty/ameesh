@@ -678,6 +678,63 @@ def open_lots(db: Db, assignee: str) -> list[dict]:
     return storage.of(db).work.open_for(assignee)
 
 
+#: #753 (B1, R2 Claude) : seuls les arrêts DÉLIBÉRÉS rendent les lots. Un arrêt
+#: automatique et réversible (`erreur` de `stop_after_failures`, `retire_du_canon`
+#: que `canon.revive` annule, `bail_expire`, `externe`) laisse l'agent reprendre
+#: ses lots à la reprise : sinon une panne fournisseur dessaisirait en rafale
+#: tous ses agents. Le pilote peut y ajouter `retire_du_canon` s'il le juge
+#: délibéré.
+RELEASABLE_STOP_REASONS = ("manuel",)
+
+
+def release_lots(db: Db, agent: str, *, reason: str, actor: str = "",
+                 measure_actor: str = "", measure_reason: str = "",
+                 dry_run: bool = False,
+                 stopped_with: tuple[str, ...] = ()) -> list[dict]:
+    """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+    d'équipe — assigné effacé (assignee = NULL), journal au lot avec la raison,
+    délégation en cours annulée —, et ses lots promus (un déploiement porte
+    toujours sa mesure post-déploiement à refaire) vont à `measure_actor`
+    (l'auditeur), avec `measure_reason`. Rend les lots rendus ; idempotent (un
+    lot repris ou fermé entre-temps n'est pas touché). `dry_run` : ce qui
+    serait fait, rien n'est écrit. `stopped_with` : si non vide, la transaction
+    revérifie que l'agent est encore `stopped` pour l'une de ces raisons avant
+    de rendre un lot — sans quoi une reprise (`ameesh resume`) entre le relevé
+    du registre et le geste dessaisirait un agent qui travaille de nouveau."""
+    name = (agent or "").strip()
+    if not name:
+        return []
+    return storage.of(db).work.release_agent(
+        name, reason=reason, actor=actor, measure_actor=measure_actor,
+        measure_reason=measure_reason, dry_run=dry_run,
+        stopped_with=stopped_with)
+
+
+def measurement_actor(db: Db, cfg=None, *, listing=None) -> str:
+    """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
+    l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent
+    du canon porte le rôle). Un auditeur arrêté ou mort n'est pas un acteur :
+    on ne réassigne pas un lot à un agent arrêté, ce serait le mal que ce lot
+    corrige. Chaîne vide s'il n'y a aucun auditeur vivant, ou plusieurs sans
+    choix évident : les lots promus restent alors en place. Jamais
+    d'exception."""
+    from . import alert_briefs, registry
+
+    try:
+        if listing is None:
+            listing = registry.overview(db)
+    except Exception:  # noqa: BLE001 - jamais fatal à l'arrêt d'un agent
+        return ""
+    living = {row.get("name") for row in listing
+              if row.get("name")
+              and (row.get("status") or "") not in ("stopped", "dead")}
+    if alert_briefs.AUDITOR_NAME in living:   # le nom suffit : pas de canon
+        return alert_briefs.AUDITOR_NAME
+    names = [name for name in alert_briefs.auditors(listing, configured_canons(cfg))
+             if name in living]
+    return names[0] if len(names) == 1 else ""
+
+
 # --------------------------------------------------------------------------
 # attribution gardée (L37, règle 2 de la décision 0030)
 # --------------------------------------------------------------------------
