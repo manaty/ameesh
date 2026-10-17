@@ -1081,12 +1081,17 @@ class Notifier:
         #: n'est pas résolue pour autant.
         unreadable: list[str] = []
         if current is None:
+            # #2105 : without explicit thresholds, observe and declare the same
+            # perimeter — the parser's defaults (`default_thresholds`,
+            # environment included), as the CLI and the API do, not the bare
+            # defaults of `alerts`, which may differ. The perimeter declared
+            # below is then exactly the one observed here.
+            thresholds = thresholds or alert_ack.default_thresholds()
             # #1179 : la console du pool local n'est pas lue par la passe
             # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
             # seul juge de ses alertes. Une console illisible n'y échoue plus.
             current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
-                                          unreadable=unreadable,
-                                          **(thresholds or {}))
+                                          unreadable=unreadable, **thresholds)
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
