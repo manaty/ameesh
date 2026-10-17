@@ -270,6 +270,51 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual(0, retour(self.venv))
         self.assertEqual((0, "v1"), lire(self.venv))
 
+    def test_ecriture_echouee_retire_le_temporaire_et_preserve_la_cible(self):
+        cible = self.base / "bin" / "ameesh"
+        cible.parent.mkdir()
+        cible.write_text("ancien")
+        vrai_open = open
+        erreur = OSError("disque plein")
+
+        class FichierPlein:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.handle.close()
+
+            def write(self, data):
+                self.handle.write(data[:2])
+                self.handle.flush()
+                raise erreur
+
+        for etape in ("write", "chmod", "replace"):
+            with self.subTest(etape=etape):
+                if etape == "write":
+                    patch = mock.patch.object(
+                        bascule, "open", create=True,
+                        side_effect=lambda path, mode: FichierPlein(vrai_open(path, mode)))
+                else:
+                    patch = mock.patch.object(bascule.os, etape, side_effect=erreur)
+                with patch, self.assertRaises(OSError) as levee:
+                    bascule._write(str(cible), "nouveau")
+                self.assertIs(erreur, levee.exception)
+                self.assertEqual("ancien", cible.read_text())
+                self.assertEqual([], list(cible.parent.glob("*.tmp.*")))
+
+    def test_echec_du_nettoyage_ne_masque_pas_lechec_decriture(self):
+        cible = self.base / "ameesh"
+        erreur = OSError("rename impossible")
+        with mock.patch.object(bascule.os, "replace", side_effect=erreur), \
+             mock.patch.object(bascule.os, "remove", side_effect=PermissionError("nettoyage")), \
+             self.assertRaises(OSError) as levee:
+            bascule._write(str(cible), "nouveau")
+        self.assertIs(erreur, levee.exception)
+
     def test_bascule_concurrente_voit_ancien_ou_nouveau_entier(self):
         faux_venv(self.base, "v1")
         os.rename(self.base / "venv-v1", self.venv)
@@ -380,6 +425,75 @@ class BasculeTest(unittest.TestCase):
         # la troisième ligne ferme la chaîne qui rend le script valide en Python
         with self.assertRaises(RuntimeError):
             controler(cible / "bin" / "python3", fermeture="'''")
+
+    def test_controles_diagnostiquent_lexec_fautif_avant_de_lexecuter(self):
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        (cible / "bin" / "ameesh").write_text(
+            '#!/bin/sh\n\'\'\'exec\' /autre/venv/bin/python3 "$0" "$@"\n\' \'\'\'\n')
+        with mock.patch.object(bascule, "_run") as run, \
+             self.assertRaises(RuntimeError) as levee:
+            bascule._controles(str(cible))
+        message = str(levee.exception)
+        self.assertIn("ligne 2", message)
+        self.assertIn("/autre/venv/bin/python3", message)
+        self.assertIn("interpréteur attendu", message)
+        self.assertIn(str(cible / "bin" / "python"), message)
+        run.assert_not_called()
+
+    def test_controles_bornent_chacune_des_trois_lignes_du_preambule(self):
+        cible = self.base / "venv-v2"
+        python = cible / "bin" / "python3"
+        prefixe = [b"#!/bin/sh\n", ("'''exec' %s \"$0\" \"$@\"\n" % python).encode()]
+
+        class LectureBornee(io.BytesIO):
+            def readline(handle, size=-1):
+                self.assertGreater(size, 0, "lecture sans borne")
+                self.assertLessEqual(size, 8193)
+                return super().readline(size)
+
+        for ligne in (1, 2, 3):
+            with self.subTest(ligne=ligne):
+                source = LectureBornee(b"".join(prefixe[:ligne - 1]) + b"x" * 65536 + b"\n")
+                with mock.patch.object(bascule, "open", create=True, return_value=source), \
+                     mock.patch.object(bascule, "_run") as run, \
+                     self.assertRaisesRegex(RuntimeError, "ligne %d.*8192" % ligne):
+                    bascule._controles(str(cible))
+                run.assert_not_called()
+
+    def test_shebang_direct_ne_lit_pas_le_corps_python(self):
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        (cible / "bin" / "ameesh").write_text(
+            "#!%s\n#%s\n" % (cible / "bin" / "python3", "x" * 65536))
+        with mock.patch.object(bascule, "_run"):
+            bascule._controles(str(cible))
+
+    def test_apostrophe_acceptee_en_shebang_direct_ou_wrapper_quote(self):
+        court = vrai_venv(self.base / "l'owner", "v2", "v2", "new_only")
+        long = vrai_venv(self.base / ("l'owner avec espace " + "x" * 120),
+                         "v2", "v2", "new_only")
+        for cible in (court, long):
+            with self.subTest(cible=cible):
+                python = cible / "bin" / "python3"
+                preambule = ("#!%s\n" % python if cible == court else
+                             '#!/bin/sh\n\'\'\'exec\' "%s" "$0" "$@"\n\' \'\'\'\n' % python)
+                (cible / "bin" / "ameesh").write_text(
+                    preambule + "import pkg1969\nprint(pkg1969.VALUE)\n")
+                with mock.patch.object(bascule, "_run"):
+                    bascule._controles(str(cible))
+                self.assertEqual((0, "v2"), lire(cible))
+
+    def test_wrapper_avec_apostrophe_non_quotee_est_refuse_explicitement(self):
+        cible = self.base / "l'owner" / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        (cible / "bin" / "ameesh").write_text(
+            '#!/bin/sh\n\'\'\'exec\' %s "$0" "$@"\n\' \'\'\'\n' %
+            (cible / "bin" / "python3"))
+        with mock.patch.object(bascule, "_run") as run, \
+             self.assertRaisesRegex(RuntimeError, "ligne 2.*quotage shell invalide"):
+            bascule._controles(str(cible))
+        run.assert_not_called()
 
     def test_activer_refuse_un_venv_non_prepare(self):
         faux_venv(self.base, "v1")
