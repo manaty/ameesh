@@ -47,8 +47,25 @@ TERMINAL = ("promoted", "closed")
 #: déjà fusionnés : une fusion constatée n'y change rien
 MERGED_STATES = ("merged", "promoted")
 #: raisons d'une fermeture explicite (`ameesh work close`) : abandonné,
-#: remplacé par un autre lot, ou livré hors cible avec sa tête relue (#988)
-CLOSE_REASONS = ("abandoned", "superseded", "delivered")
+#: remplacé par un autre lot, livré hors cible avec sa tête relue (#988),
+#: ou livré sans fusion (`done`, #1280)
+CLOSE_REASONS = ("abandoned", "superseded", "delivered", "done")
+#: la source d'un lot de relecture après fusion (review_lot.PREFIX) : un lot
+#: sans branche, dont l'identité est le parent relu. work.py ne peut pas
+#: importer review_lot (cycle), la constante est la même chaîne.
+REVIEW_SOURCE_PREFIX = "review-after-merge:"
+#: le titre d'un lot de relecture après fusion (review_lot.title_of), repris
+#: par les relectures ouvertes à la main : `REVUE #<parent> : …`.
+REVIEW_TITLE_RE = re.compile(r"^\s*REVUE\s*#\s*(\d+)\b", re.IGNORECASE)
+#: #1280 : les missions de relecture ouvertes à la main hors convention
+#: `REVUE #N` : `R1 <harnais> #<parent> …` (cas #1249), et ses variantes
+#: observées `R1 delta Codex #1037 r2`, `R1 Codex de #1066`. La forme est
+#: ancrée en tête (`R1`/`R2`) et le parent est le premier `#<id>` de
+#: l'en-tête, avant le `:` ou le tiret de la description : un titre qui
+#: commence par `R1`/`R2` sans `#<id>` reste une mission (parent inconnu,
+#: donc refusée), jamais un lot ordinaire.
+MANUAL_REVIEW_START_RE = re.compile(r"^\s*R[12]\b", re.IGNORECASE)
+MANUAL_REVIEW_TITLE_RE = re.compile(r"^\s*R[12]\b[^:—–#]*#\s*(\d+)\b", re.IGNORECASE)
 MAX_QA_LOOPS = 2
 FORWARD = {
     "intake": ("build",),
@@ -1873,17 +1890,15 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         if item["state"] != "closed":
             raise WorkError(done["detail"])
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
-                        % (item_id, close_label(item), item_id))
+                        % (item_id, close_how(item.get("close_reason"),
+                                              item.get("superseded_by")), item_id))
     return done
 
 
 def close_label(item: dict) -> str:
     """Le libellé d'une fermeture (`closed`), pour les messages : abandonné,
-    remplacé par #N, ou livré hors cible (#988)."""
-    reason = item.get("close_reason")
-    if reason == "superseded":
-        return "superseded by #%s" % item.get("superseded_by")
-    return {"delivered": "delivered outside the target"}.get(reason, reason or "closed")
+    remplacé par #N, livré hors cible (#988), ou `done` (#1280)."""
+    return close_how(item.get("close_reason"), item.get("superseded_by"))
 
 
 def _landed_number(number) -> int:
@@ -1947,25 +1962,42 @@ def _record_landed(db: Db, item: dict, landed: tuple[int, str], *, actor: str,
 
 
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
-          delivered: bool = False, sha: str = "", note: str = "", actor: str = "") -> dict:
-    """Ferme un lot qui ne sera pas fusionné : abandonné, remplacé par un autre
-    lot, ou **livré hors cible** (#988 : un rapport, une note, un livrable dont
-    la tête relue reste sur sa branche, sans fusion dans la cible).
+          delivered: bool = False, done: bool = False, sha: str = "", note: str = "",
+          actor: str = "") -> dict:
+    """Ferme un lot qui ne sera pas fusionné : abandonné, remplacé par un
+    autre lot, **livré hors cible** (#988 : un rapport, une note, un livrable
+    dont la tête relue reste sur sa branche) ou `done` — livré sans fusion
+    (un avis, une analyse).
 
-    Les trois portes sont exclusives. `--delivered` exige `--sha <tête relue>`
+    Les quatre portes sont exclusives. `--delivered` exige `--sha <tête relue>`
     (7 à 64 caractères hexadécimaux) : le jalon `delivered` porte ce SHA et
-    compte comme livraison dans `estimates`. Un jalon `closed` est écrit dans
-    tous les cas ; rien ne reste ouvert par oubli.
+    compte comme livraison dans `estimates`. `done` refuse un lot qui porte
+    une branche ou une PR : un lot de code se fusionne, il ne se clôt pas. Il
+    refuse aussi un avis (`review-after-merge:#N`,
+    le titre `REVUE #N` des relectures ouvertes à la main, ou la mission
+    manuelle `R1`/`R2 <harnais> #<parent>`, cas #1249) dont le parent est
+    introuvable, et ne ferme un `merged` sans branche que si c'est un avis
+    rattaché (les fausses fusions historiques). Le titre rattache, il ne
+    prouve pas : la clôture `done` d'un avis exige le jalon `verdict` sur le
+    parent relu — quel qu'en soit le verdict, un `blocked` compris, qui est
+    une relecture livrée et pas un GO produit — sans verdict enregistré, la
+    relecture n'a pas eu lieu (arbitrage mesh-design 34598, 14/10). Sur un
+    avis déjà fermé « superseded by » son propre parent (#1043, #1218, #1249,
+    #1269), `done` rectifie la raison sans rouvrir : la fermeture, sa date et
+    son jalon restent, la rectification est journalisée. Jalon `closed` ; rien
+    ne reste ouvert par oubli.
 
     Dans la MÊME transaction, les agents des lots qui déclarent ce lot en
     prérequis explicite et dont c'était la dernière attente reçoivent un
-    courrier durable (L385 suite) : l'abandon libère
-    l'attente sans prouver la livraison, le dépendant doit réévaluer son
-    prérequis. Un échec du courrier annule la fermeture (reprise) ; le verrou
-    de graphe empêche deux fermetures de se doubler."""
-    if sum((bool(abandoned), superseded_by is not None, bool(delivered))) != 1:
+    courrier durable (L385 suite) : l'abandon libère l'attente sans prouver la
+    livraison, le dépendant doit réévaluer son prérequis. Un échec du courrier
+    annule la fermeture (reprise) ; le verrou de graphe empêche deux
+    fermetures de se doubler."""
+    picks = sum((int(bool(abandoned)), int(superseded_by is not None),
+                 int(bool(delivered)), int(bool(done))))
+    if picks != 1:
         raise WorkError("pass one of --abandoned, --superseded-by <id>, "
-                        "--delivered --sha <reviewed head>")
+                        "--delivered --sha <reviewed head>, --done")
     head = (sha or "").strip().lower()
     if delivered and not _SHA_RE.match(head):
         raise WorkError("--delivered: the reviewed head (--sha, 7 to 64 hex characters), "
@@ -1985,14 +2017,41 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
         if get(db, superseded_by) is None:
             raise WorkError("superseding lot %s not found" % superseded_by)
     state = item["state"]
-    if state in MERGED_STATES or state == "closed":
+    review, parent = _review_parent(item)
+    if state == "closed":
+        row = _rectify_done(db, item, review=review, parent=parent, done=done,
+                            note=note, actor=actor)
+        if row is not None:
+            return row
+        raise WorkError("lot %s already closed: nothing to close" % item_id)
+    if done:
+        artifact = _code_artifact(item)
+        if artifact:
+            raise WorkError("lot %s carries %s: a code lot is merged, not closed "
+                            "done" % (item_id, artifact))
+        if review and (parent is None or get(db, parent) is None):
+            where = ("#%s" % parent) if parent is not None else (
+                item.get("issue_ref") or item.get("source") or "?")
+            raise WorkError("review #%s not attached to its parent (%s): nothing "
+                            "to close done" % (item_id, where))
+        if review and not _parent_verdict(db, parent):
+            raise WorkError("review #%s: no verdict milestone on its parent #%s — "
+                            "the title attaches, it does not prove; record the "
+                            "verdict on the parent first (ameesh work milestone %s "
+                            "verdict ok --sha <sha>)" % (item_id, parent, parent))
+        if state in MERGED_STATES and not review:
+            raise WorkError("lot %s already %s, without branch or review parent: "
+                            "nothing to close done" % (item_id, state))
+    elif state in MERGED_STATES:
         raise WorkError("lot %s already %s: nothing to close" % (item_id, state))
     if abandoned:
         reason, base = "abandoned", "abandoned"
     elif superseded_by is not None:
         reason, base = "superseded", "superseded by #%s" % superseded_by
-    else:
+    elif delivered:
         reason, base = "delivered", "delivered (head %s)" % head[:12]
+    else:
+        reason, base = "done", "done"
     text = base + (" — %s" % note.strip() if note and note.strip() else "")
     from . import work_dependencies
     threads: list = []
@@ -2016,6 +2075,94 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
             raise _pinned_close_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
+
+
+def _code_artifact(item: dict) -> str:
+    """#1280 : ce qui rattache un lot au code — `branch <nom>` ou `PR <réf>` —
+    ou "" : un lot qui en porte un se fusionne, il ne se clôt pas `done`."""
+    branch = str(item.get("branch") or "").strip()
+    if branch:
+        return "branch %s" % branch
+    pr = str(item.get("pr_ref") or "").strip()
+    return "PR %s" % pr if pr else ""
+
+
+def _rectify_done(db: Db, item: dict, *, review: bool, parent: int | None, done: bool,
+                  note: str, actor: str) -> dict | None:
+    """#1280 : régularise en `done` un avis fermé « superseded by » son propre
+    parent relu — le parent n'est pas un remplaçant (#1043, #1269). Rend la
+    ligne rectifiée, ou None si le lot n'est pas dans ce cas exact : la
+    fermeture, sa date et son jalon restent en place, seule la raison change."""
+    if not done or not review or parent is None:
+        return None
+    artifact = _code_artifact(item)
+    if artifact:
+        raise WorkError("lot %s carries %s: a code lot is merged, not closed done"
+                        % (item["id"], artifact))
+    current = item.get("superseded_by")
+    if (str(item.get("close_reason") or "") != "superseded" or current is None
+            or int(current) != int(parent)):
+        return None
+    if not _parent_verdict(db, parent):
+        raise WorkError("review #%s: no verdict milestone on its parent #%s — the "
+                        "rectification to done requires the delivered verdict"
+                        % (item["id"], parent))
+    item_id = int(item["id"])
+    text = ("done (rectification: closed `superseded by #%d`, the reviewed parent, "
+            "not a replacement)" % parent)
+    if note and note.strip():
+        text += " — %s" % note.strip()
+    row = storage.of(db).work.rectify_close(
+        item_id, current_reason="superseded", reason="done", actor=actor, note=text)
+    if row is None:
+        raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    return row
+
+
+def close_how(reason: str | None, superseded_by: int | None = None) -> str:
+    """Le libellé d'une fermeture : `done` (livré sans fusion), `superseded by
+    #N`, `delivered outside the target` (#988), ou `abandoned` — jamais
+    « superseded by #None »."""
+    if reason == "done":
+        return "done (delivered without merge)"
+    if reason == "delivered":
+        return "delivered outside the target"
+    if reason == "superseded":
+        return ("superseded by #%s" % superseded_by) if superseded_by is not None \
+            else "superseded"
+    return "abandoned"
+
+
+def _parent_verdict(db: Db, parent: int | None) -> bool:
+    """Le parent relu porte-t-il un jalon `verdict` ? Le titre d'un avis
+    rattache le parent ; il ne prouve pas que la relecture a été rendue. La
+    régularisation `done` d'un avis exige donc ce jalon (arbitrage 34598)."""
+    if parent is None:
+        return False
+    return any(m.get("kind") == "verdict" for m in milestones(db, parent))
+
+
+def _review_parent(item: dict) -> tuple[bool, int | None]:
+    """(est-ce un avis après fusion, id du parent relu). L'id est None quand
+    la source nomme un avis sans id lisible ; (False, None) sinon. Les avis
+    ouverts à la main (`source=mail`, cas #1043/#1218) ne portent que le titre
+    `REVUE #<parent> : …`, la convention de `review_lot.title_of` ; les
+    missions `R1`/`R2 <harnais> #<parent>` (#1249) sont reconnues par
+    `MANUAL_REVIEW_TITLE_RE`. Le titre rattache le parent, il ne le prouve
+    pas : la clôture `done` exige en plus le jalon `verdict` (voir `close`)."""
+    for field in ("issue_ref", "source"):
+        text = str(item.get(field) or "")
+        if text.startswith(REVIEW_SOURCE_PREFIX):
+            tail = text[len(REVIEW_SOURCE_PREFIX):].strip().lstrip("#").strip()
+            return True, int(tail) if tail.isdigit() else None
+    title = str(item.get("title") or "")
+    match = REVIEW_TITLE_RE.match(title)
+    if match:
+        return True, int(match.group(1))
+    if MANUAL_REVIEW_START_RE.match(title):
+        match = MANUAL_REVIEW_TITLE_RE.match(title)
+        return True, (int(match.group(1)) if match else None)
+    return False, None
 
 
 def get(db: Db, item_id: int) -> dict | None:
@@ -2087,7 +2234,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
-                        "--superseded-by <id> | --delivered --sha <reviewed head>")
+                        "--superseded-by <id> | --delivered --sha <reviewed head> | --done")
     reviewer = (reviewer or "").strip() or None
     reviewer_warning = ""
     if reviewer is not None:

@@ -1094,9 +1094,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             state = "STALE %s (%s)" % (_duration(stale["idle_s"]), state)
         closed = lot.get("closed")
         if closed:
-            state = ("delivered outside the target" if closed.get("reason") == "delivered"
-                     else "abandoned" if closed.get("reason") == "abandoned"
-                     else "superseded by #%s" % closed.get("superseded_by"))
+            state = work_mod.close_how(closed.get("reason"), closed.get("superseded_by"))
         line("#%s %s — %s%s" % (lot["id"], state, lot["title"],
                                 " [%s]" % lot["epic"] if lot.get("epic") else ""), "  ")
         line("requested %s · frozen %s · verdict %s%s · merged %s%s" % (
