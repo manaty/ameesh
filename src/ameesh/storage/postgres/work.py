@@ -20,6 +20,10 @@ from .. import interface
 from . import catalog as _catalog
 from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
                                 _UNPINNED)
+from .work_dependencies import current_verdict as _current_verdict
+from .work_dependencies import last_freeze_sha as _last_freeze_sha
+from .work_dependencies import not_blocking as _not_blocking
+from .work_dependencies import reviewed_head as _reviewed_head
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -464,16 +468,20 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor, event)
 
-    def _designate_reviewer(self, item_id, reviewer, actor, event=None) -> dict | None:
+    def _designate_reviewer(self, item_id, reviewer, actor, event=None, *,
+                            vacant=False) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
-        avant, un `assign` a pu la changer entre-temps."""
+        avant, un `assign` a pu la changer entre-temps. #1738 R1 (B1) :
+        `vacant` en fait un compare-and-set — un relecteur posé entre-temps
+        (par le pilote, hors verrou) n'est pas écrasé."""
         rows = self.db.query(
             "UPDATE work_items SET reviewer = %%s, updated_at = now()"
             " WHERE id = %%s AND state = 'qa'"
-            "   AND assignee IS DISTINCT FROM %%s"
-            " RETURNING %s" % item_columns(self.db),
+            "   AND assignee IS DISTINCT FROM %%s%s"
+            " RETURNING %s" % (" AND coalesce(reviewer, '') = ''" if vacant else "",
+                               item_columns(self.db)),
             (reviewer, int(item_id), reviewer))
         if not rows:
             return None
@@ -502,16 +510,26 @@ class WorkItems(interface.WorkItems):
                 # aussi les amonts empêche leur réouverture pendant la prise.
                 tx.execute(_DEPENDENCIES_LOCK)
                 rows = tx.query(
-                    "SELECT id, state, assignee FROM work_items"
-                    " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
-                    "                         WHERE work_item_id = %s)"
-                    " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
+                    "SELECT w.id, w.state, w.assignee FROM work_items w"
+                    " WHERE w.id = %s OR w.id IN (SELECT blocker_id FROM work_item_dependencies"
+                    "                              WHERE work_item_id = %s)"
+                    " ORDER BY w.id FOR UPDATE", (int(item_id), int(item_id)))
                 item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
                 if item is None or item["state"] != "intake" \
                         or item["assignee"] is not None:
                     return None
-                if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
-                       for r in rows):
+                # #1677 : un bloqueur en `qa` à verdict COURANT favorable (et à
+                # tête relue) n'empêche plus la prise — il attend sa fusion, le
+                # lot pris s'empile sur cette tête. Le verdict est relu par une
+                # requête POSTÉRIEURE au verrou (N4) : en READ COMMITTED, la
+                # sous-requête d'un `SELECT … FOR UPDATE` lit l'instantané pris
+                # avant l'attente du verrou, donc un verdict `blocked` validé
+                # pendant cette attente y serait invisible. Le prédicat est le
+                # même que celui de `unassigned_lots` (une seule règle).
+                if tx.query("SELECT 1 FROM work_item_dependencies d"
+                            " JOIN work_items b ON b.id = d.blocker_id"
+                            " WHERE d.work_item_id = %s AND NOT " + _not_blocking("b") +
+                            " LIMIT 1", (int(item_id),)):
                     return None
             behind = None
             if (queued_note is not None or take) and assignee:
@@ -1550,6 +1568,21 @@ class WorkItems(interface.WorkItems):
         return int(rows[0]["n"]) if rows else 0
 
     def unassigned_lots(self, limit) -> list[dict]:
+        # #1677 : les lots dont tous les bloqueurs sont terminés **ou** en `qa`
+        # à verdict courant favorable sont prenables ; `stack_on` décrit ces
+        # bloqueurs (lot, branche, tête relue) pour le courrier de prise. La
+        # tête est celle que le verdict nomme, sinon celle du dernier gel (B2) :
+        # un bloqueur sans tête relue reste bloquant.
+        stack_on = (
+            "(SELECT string_agg('#' || b.id::text || ' ('"
+            "                    || coalesce(nullif(btrim(b.branch), ''), '—')"
+            "                    || ', gel ' || coalesce(" + _reviewed_head("b") + ", '—') || ')',"
+            "                  ', ' ORDER BY b.id)"
+            "   FROM work_item_dependencies d"
+            "   JOIN work_items b ON b.id = d.blocker_id"
+            "  WHERE d.work_item_id = work_items.id AND b.state = 'qa'"
+            "    AND " + _current_verdict("b") + " = 'ok'"
+            "    AND " + _reviewed_head("b") + " IS NOT NULL)")
         return self.db.query(
             ("SELECT w.*,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
@@ -1564,20 +1597,107 @@ class WorkItems(interface.WorkItems):
             "  FROM (SELECT %s,"
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
-            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
+            "               " + stack_on + " AS stack_on"
             "          FROM work_items"
             "         WHERE state = 'intake' AND assignee IS NULL"
             "           AND type <> 'improvement'"
             "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
             "                             JOIN work_items b ON b.id = d.blocker_id"
             "                            WHERE d.work_item_id = work_items.id"
-            "                              AND b.state NOT IN " + _CLOSED + ")) w"
+            "                              AND NOT " + _not_blocking("b") + ")) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
             " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
             " LIMIT %%s") % item_columns(self.db), (int(limit),))
+
+    def review_proposals(self, limit, *, proposal_prefix, window_s=21600.0) -> list[dict]:
+        """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
+        sans verdict COURANT (une relecture est due) ou à verdict courant
+        bloquant (une correction est due) — avec leur auteur, leur branche,
+        leur tête gelée, leur équipe résolue (`lot_team`, même règle que
+        `unassigned_lots`) et les colonnes du lot dont la prise a besoin
+        (`required_capabilities`, `type`, …).
+
+        La prise y apparie un agent au repos d'une autre famille que l'auteur
+        (canon §2). Un lot déjà muni d'un relecteur désigné (0421) a un
+        destinataire : il n'est pas proposé. Un lot sans tête gelée n'a rien à
+        relire. Un lot dont la proposition date de moins de `window_s` (note
+        `proposal_prefix…` au journal) est écarté : deux passages ne proposent
+        pas le même lot deux fois. B1 : le verdict lu est le verdict courant —
+        un `ok` portant sur une tête regelée depuis ne dispense plus de la
+        relecture."""
+        return self._proposal_rows(limit, proposal_prefix, window_s)
+
+    def _proposal_rows(self, limit, proposal_prefix, window_s, item_id=None):
+        """`review_proposals`, restreint à un lot si `item_id` (#1738 R1 B1 :
+        la prise revalide le même prédicat sous son verrou)."""
+        only = "   AND w.id = %d" % int(item_id) if item_id is not None else ""
+        reviewer_guard = "   AND coalesce(w.reviewer, '') = ''" if has_reviewer(self.db) else ""
+        frozen_sha = _last_freeze_sha("w")
+        current = _current_verdict("w")
+        return self.db.query(
+            "SELECT w.*,"
+            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+            "       " + frozen_sha + " AS frozen_sha,"
+            "       " + current + " AS last_verdict"
+            "  FROM work_items w"
+            "  LEFT JOIN work_packages k ON k.id = w.package_id"
+            "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+            " WHERE w.state = 'qa'" + only +
+            "   AND w.assignee IS NOT NULL AND btrim(w.assignee) <> ''"
+            "   AND left(w.assignee, 6) <> 'human:'"
+            "   AND " + frozen_sha + " IS NOT NULL"
+            + reviewer_guard +
+            "   AND coalesce(" + current + ", '') <> 'ok'"
+            "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+            "                    WHERE e.work_item_id = w.id"
+            "                      AND starts_with(e.note, %s)"
+            "                      AND e.created_at > now() - make_interval(secs => %s))"
+            " ORDER BY coalesce(w.priority, 2), w.id"
+            " LIMIT %s",
+            (str(proposal_prefix), float(window_s), int(limit)))
+
+    def claim_review_proposal(self, item_id, *, agent, kind, proposal_prefix,
+                              window_s, actor) -> bool:
+        """#1738 (N5/N7) : voir l'interface."""
+        item = int(item_id)
+        with self.db.transaction() as tx:
+            # Un verrou consultatif par lot : deux passages (hôtes distincts)
+            # sérialisent ici, et le second relit la fenêtre APRÈS le premier.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                     ("review proposal:%d" % item,))
+            # Les jalons et la désignation du pilote prennent ce verrou de
+            # ligne, pas le verrou consultatif. Le prédicat est relu APRÈS
+            # l'attente : il voit les verdicts/gels validés entre-temps, et
+            # aucun ne peut s'insérer entre cette lecture et la proposition.
+            if not tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                            (item,)):
+                return False
+            # #1738 R1 (B1) : sous le verrou, le lot est relu avec le prédicat
+            # de `review_proposals` (qa, gel, relecteur vide, verdict courant,
+            # fenêtre) et le `kind` doit être celui qu'il donne aujourd'hui.
+            me = WorkItems(tx)
+            rows = me._proposal_rows(1, proposal_prefix, window_s, item_id=item)
+            if not rows or (rows[0].get("assignee") or "").strip() == agent:
+                return False
+            if kind != ("correction" if rows[0].get("last_verdict") == "blocked"
+                        else "review"):
+                return False
+            if kind == "review" and has_reviewer(tx):
+                # N7 : une relecture désigne son relecteur (#705) — le lot sort
+                # des propositions suivantes et `stale_lot` s'adresse à lui.
+                # B1 : compare-and-set, le pilote ne prend pas ce verrou.
+                if me._designate_reviewer(item, agent, actor, vacant=True) is None:
+                    return False
+            me._event(item, "qa",
+                      "%s: lot #%d to %s (%s)" % (proposal_prefix, item, agent, kind),
+                      actor)
+            tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (item,))
+            return True
 
     def assignment_events(self, item_id, prefixes) -> list[dict]:
         return self.db.query(

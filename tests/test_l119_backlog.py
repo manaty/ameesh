@@ -247,11 +247,13 @@ class PriseTest(_Base):
         # l'agent a maintenant un lot (et du courrier) : il ne prend plus rien
         self.assertEqual(self.take(), [])
 
-    def test_repos_trop_court_et_seuil_nul(self):
+    def test_seuil_nul_desactive_la_prise(self):
+        # #1677 (b) : le temps depuis le dernier tour ne borne plus la prise
+        # (l'agent sans lot actionnable est au repos) ; zéro la désactive.
         self.agent("claude1", since_s=60)
-        self.element("dette", 50)
-        self.assertEqual(self.take(), [])
+        dette = self.element("dette", 50)
         self.assertEqual(self.take(idle_s=0), [])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [dette["id"]])
 
     def test_debit_par_heure(self):
         for name in ("a1", "a2", "a3"):
@@ -436,6 +438,11 @@ class AlerteEtNotifyTest(_Base):
         self.assertEqual(work.get(self.db, item["id"])["assignee"], "claude1")
         args = notify.build_parser().parse_args(["--take-idle", "0", "--take-lot-idle", "0"])
         self.assertIsNone(notify.take_settings(args))
+        # #1738 R1 (B2) : les propositions suivent une prise active ; leur
+        # interrupteur à 0 les coupe en plus, la prise restant active.
+        args = notify.build_parser().parse_args(["--take-review-max-per-hour", "0"])
+        self.assertEqual(notify.take_settings(args)["review_max_per_hour"], 0)
+        self.assertTrue(notify.take_settings(args)["max_per_hour"])
 
 
 if __name__ == "__main__":
