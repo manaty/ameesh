@@ -322,6 +322,35 @@ class BasculeTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 controler(faux)
 
+    def test_controles_acceptent_le_wrapper_bin_sh_de_pip_chemin_long(self):
+        """#2156 : au-delà de 127 octets, pip préfixe le script d'un /bin/sh."""
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        ameesh = cible / "bin" / "ameesh"
+
+        def controler(executable, fermeture="' '''"):
+            # Forme écrite par pip 24 (distlib) quand le shebang dépasse 127
+            # octets, reproduite avec un interpréteur de 148 caractères.
+            preambule = ("#!/bin/sh\n"
+                         "'''exec' %s \"$0\" \"$@\"\n"
+                         "%s\n" % (executable, fermeture))
+            ameesh.write_text(preambule + "import sys\n")
+            with mock.patch.object(bascule, "_run"):
+                bascule._controles(str(cible))
+
+        for nom in ("python", "python3", "python3.14"):
+            controler(cible / "bin" / nom)
+        # chemin contenant une espace : distlib met l'exécutable entre guillemets
+        controler('"%s"' % (cible / "bin" / "python3"))
+        for faux in (self.venv / "bin" / "python3",
+                     "/usr/bin/python3",
+                     cible / "bin" / "pythonx"):
+            with self.assertRaises(RuntimeError):
+                controler(faux)
+        # la troisième ligne ferme la chaîne qui rend le script valide en Python
+        with self.assertRaises(RuntimeError):
+            controler(cible / "bin" / "python3", fermeture="'''")
+
     def test_activer_refuse_un_venv_non_prepare(self):
         faux_venv(self.base, "v1")
         os.rename(self.base / "venv-v1", self.venv)
