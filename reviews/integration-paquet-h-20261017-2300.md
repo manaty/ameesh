@@ -41,8 +41,9 @@ prochain paquet par le pilote depuis 22:34Z.
 | 9 | #2182 | `b1e5a72d880351ba1c438b0c17e78fafb18d4a47` (`lot/2182-menage-copie-etrangere-chiffre`) | `854ea1e2d40b` | avis Codex `ameesh-cx1` sur la tête ; classe light (`src/ameesh/housekeeping.py`) ; composition propre |
 
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot et il
-porte le trailer `ameesh-work: #<lot>`. Aucun contenu nouveau : total vs M2
-**35 fichiers, +2033/−321**, dont la migration `0461_review_catch_up_acl.sql` et
+porte le trailer `ameesh-work: #<lot>`. Aucun contenu nouveau : les 9 unités ajoutent
+**35 fichiers, +2033/−321** vs `734a0825b` ; avec ce manifeste, `fde44e51c..HEAD` fait
+**36 fichiers, +2129/−321**, dont la migration `0461_review_catch_up_acl.sql` et
 `deploy/sql/role-executor.sql` (unité 2, SQL revisé deux familles), aucun `.github/**`.
 
 ## Conflits et résolution
