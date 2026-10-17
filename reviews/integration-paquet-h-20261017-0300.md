@@ -1,10 +1,10 @@
 # Paquet integration/paquet-h-20261017-0300 — composition
 
-Base : `main` après atterrissage de PR1564 (`transport/incident-20261017-0220`,
-tête `90de1a20c49c8f6fc69a4406b498f7d433feea65`, merge réel à relever à la
-notification). La branche est construite sur cette tête exacte, qui devient un
-ancêtre de `main` par la fusion de PR1564 : le diff de la PR ne porte que les
-unités ci-dessous.
+Base : `main` après atterrissage de PR1564 (`transport/incident-20261017-0220`),
+merge réel **`d900521b1c3e68668c1cf573814c8ddedd23bbe9`** (02:59:20Z, même arbre
+`add10dc06` que la tête de PR `90de1a20c49c8f6fc69a4406b498f7d433feea65`). La
+branche est construite sur `90de1a20c`, ancêtre de `main` : le diff de la PR ne
+porte que les unités ci-dessous.
 
 Exécuteur : **mty-amh-impl-01** (composition, CI et fusion). Cutoff mesh-design
 17/10 02:48Z : réception de la notification de fusion réelle de PR1564, aucune
@@ -24,7 +24,7 @@ référence ; une seule CI complète sur la tête gelée, puis fusion au vert.
 | 6 | #1600 | `f62472cbdceb` (`remise/1600-main-edf2bf3d`) | `1c22582f4` | remise union `1280d07c`, GO Codex ; fusion propre |
 | 7 | #1859 | `2c9943db5d8d` (`lot/1859-auteur-gel-detenteurs`) | `c54c9b22a` | GO dev4 (courrier 92824) ; fusion propre |
 | 8 | #2104 | `68df8f013248` (`lot/2104-radar-conflict-attribution`) | `6e5a9fbf2` | GO autre famille (courrier 92822) ; fusion propre, `resolutions.py` compatible avec #2165 |
-| 9 | #1425 | `a2804c84736a` (`lot/1425-suites-753`) | `1e79656c1` | conflits avec #1900/main : `runner.py` (ordre : dessaisissement #1425 avant prise #804), `storage/interface.py` (union), `operations.py` (`_LOTS_ACTIVITY` commun + `workflow_ref`/#1922 conservés), `contract.json` (pas d'`interface_total`, dérivé), doc 65 ops / 370 refusées / 435 interface |
+| 9 | #1425 | `a2804c84736a` (`lot/1425-suites-753`) | `1e79656c1` | conflits avec #1900/main : `runner.py` (ordre : dessaisissement #1425 avant prise #804), `storage/interface.py` (union), `operations.py` (`_LOTS_ACTIVITY` commun + `workflow_ref`/#1922 conservés), `contract.json` (pas d'`interface_total`, dérivé), doc 65 ops / 370 refusées / 435 interface ; le faux runner de `test_1425_stop_sweep_suites` reçoit `report_liveness` (ajout h-0115) — 9/9 OK |
 | 10 | #2165 | `f28c268f4a57` (`agent/deepseek2-2165-rr-preimage`) | `b24690f90` | GO cx1, cache v3 ; fusion propre, paire #1349 `a105ab60` disponible |
 | 11 | #2164 | `d235a7711e5c` (`agent/deepseek4-2164-approval-expiry`) | `57b117369` | après #379, GO croisés ; fusion propre |
 | 12 | #2174 | `2ba6d2f8be54` (`lot/2174-disque-vm-agents`) | `2fb167eca` | PR1566, lectures croisées ; conflit avec #2167/PR1564 sur `housekeeping.py` — union : garde tôt `worktree_in_use` (#2167), puis `foreign and not pushed` (#2174) et re-contrôle `worktree_in_use` |
@@ -42,6 +42,9 @@ référence ; une seule CI complète sur la tête gelée, puis fusion au vert.
   autre conflit.
 - #2104 et #2165 touchent tous deux `resolutions.py` : fusion automatique
   propre, pas de résolution manuelle.
+- #1425 : correction de composition test-only (faux runner de `sweep`
+  complété de `report_liveness`, ajouté à `main` par h-0115), sans effet
+  production ; preuves ciblées 9/9 puis 60/60 sur `753`/`l37`/`l790`.
 
 ## Hors périmètre (non retenus à ce cutoff)
 
