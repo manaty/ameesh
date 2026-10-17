@@ -1124,8 +1124,8 @@ def negated_hash_positions(title: str) -> set[int]:
     positions (et non les numéros) laissent compter une citation positive du
     même lot dans une autre proposition.
     """
-    # R Codex #2259 : une négation extérieure vaut aussi pour un groupe
-    # (« sans (#12) », « (#12) retiré »), tandis que « #14 (sans #12) » garde
+    # R Codex #2259 : une négation vaut aussi pour un groupe qui la suit
+    # (« sans (#12) »), tandis que « #14 (sans #12) » garde
     # #14. Les niveaux sont traités sans récursion, même si le titre imbrique
     # beaucoup de parenthèses ; chaque groupe masque ses mots au parent.
     title = title or ""
@@ -1147,9 +1147,12 @@ def negated_hash_positions(title: str) -> set[int]:
             left, right = child["begin"] - 1 - begin, min(child["end"] + 1, end) - begin
             text = text[:left] + " " * (right - left) + text[right:]
         for left, right in _title_clauses(text):
-            if NEGATED_REF_RE.search(text[left:right]):
+            negative = NEGATED_REF_RE.search(text[left:right])
+            if negative:
+                # « #14 livré sans #12 » livre #14 : seuls les numéros
+                # APRÈS le mot de négation sont niés (précision impl-08).
                 negated.update(m.start() for m in HASH_REF_RE.finditer(
-                    title, begin + left, begin + right))
+                    title, begin + left + negative.end(), begin + right))
     return negated
 
 

@@ -421,6 +421,16 @@ class MergeSweepTest(_Base):
         self.assertEqual(work.get(self.db, n)["state"], "intake")
         self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
 
+    def test_lot_livre_avant_sans_reste_cite(self):
+        # Précision impl-08 : « #N livré sans (#M) » livre N, jamais M.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        livre, exclu = self.lot(), self.lot()
+        self.merge("feature/paquet-positif-avant-sans", "paquet : #%d livré sans (#%d)"
+                   % (livre["id"], exclu["id"]))
+        self.sync()
+        self.assertEqual(work.get(self.db, livre["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, exclu["id"])["state"], "intake")
+
     # --- L118b : la fusion d'une branche lot/<id>-… ferme le lot -----------
 
     def test_fusion_github_d_une_branche_lot_ferme_le_lot(self):
@@ -778,7 +788,10 @@ class MergeSweepTest(_Base):
             "Merge sans (#12)": {},
             "Merge without (#12, (#13)), #14 livré": {14: "#id"},
             "Merge #14 (sans #12)": {14: "#id"},
-            "Merge (#12) retiré": {},
+            "paquet : #2221 sans #598": {2221: "#id"},
+            "#598 livré sans #601": {598: "#id"},
+            "Merge #14 sans (#12 ni (#13))": {14: "#id"},
+            "Merge sans #12 ni #13": {},
             "Merge exclues #12": {},
             "Merge x\n\nameesh-work: #12\n  ameesh-work: 13": {12: "ameesh-work",
                                                                13: "ameesh-work"},
