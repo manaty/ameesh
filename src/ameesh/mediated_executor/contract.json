@@ -4250,6 +4250,7 @@
     "resume",
     "set_dormant",
     "set_settings",
+    "state_lots_activity",
     "turns"
    ],
    "packages": [
@@ -4385,6 +4386,7 @@
     "record_resolution",
     "reference",
     "refresh_package_parents",
+    "release_agent",
     "reserve_migration",
     "resolutions",
     "resolve_delegation",
