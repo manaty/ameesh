@@ -206,56 +206,205 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
                   key=_mark_order)
 
 
+#: entrées de journal lues par page pour établir tous les détenteurs d'un lot
+JOURNAL_PAGE = 500
+#: au-delà, le journal n'est pas lu : la provenance est dite incomplète (refus)
+JOURNAL_MAX = 50_000
+
+#: #1859/#1515 : les notes du journal qui nomment un détenteur du lot. Une
+#: délégation (`delegated to X by Y, due in … (before: Z)`) nomme le délégataire
+#: X et l'ancien détenteur Z ; le délégant Y est l'auteur du geste, pas un
+#: détenteur de plus. `(before: …)` n'est lu que dans ces notes : les autres
+#: lignes du journal (`branch … (before: none)`, migration réservée) ne
+#: nomment pas un détenteur.
+_HOLDER = re.compile(r"(?:^|; )(?:assigned to|delegated to) ([^\s,;()]+)")
+_BEFORE = re.compile(r"\(before: ([^\s,;()]+)\)")
+
+
+class _ProvenanceError(RuntimeError):
+    """Les auteurs complets d'un lot ne peuvent pas être établis (#1515)."""
+
+
+def _journal(db, item_id: int) -> list[dict]:
+    """Tout le journal du lot, du plus récent au plus ancien (#1515 B1).
+
+    `work.events` borne chaque lecture ; on élargit tant que la page est
+    pleine, pour ne jamais accepter une liste partielle. Au-delà de
+    `JOURNAL_MAX`, la provenance est déclarée incomplète : la porte refuse au
+    lieu de lire en silence moins de détenteurs que le journal n'en nomme."""
+    limit = JOURNAL_PAGE
+    while True:
+        try:
+            events = work.events(db, item_id, limit)
+        except Exception as exc:  # noqa: BLE001 - journal illisible : refus
+            raise _ProvenanceError("the journal of lot #%d is unreadable (%s)"
+                                   % (item_id, exc)) from exc
+        if events is None:
+            raise _ProvenanceError("the journal of lot #%d is unreadable (no rows)"
+                                   % item_id)
+        events = list(events)
+        if len(events) < limit:
+            return events
+        if limit >= JOURNAL_MAX:
+            raise _ProvenanceError(
+                "the journal of lot #%d has at least %d entries: its complete list of "
+                "holders cannot be established" % (item_id, JOURNAL_MAX))
+        limit = min(limit * 4, JOURNAL_MAX)
+
+
 def _assignees(db, row) -> list[str]:
-    """Tous les assignés connus d'un lot (#1515 N1) : l'actuel, puis les
-    précédents lus dans le journal (`assigned to X (before: Y)`). Un lot
-    réassigné ne peut pas compter l'avis de son auteur d'origine : l'assigné
-    courant n'est pas le seul auteur du travail gelé."""
+    """Tous les détenteurs connus d'un lot (#1515 N1/B1) : l'actuel, puis les
+    précédents lus dans **tout** le journal (`assigned to X (before: Y)` et
+    `delegated to X by Y (before: Z)`). Un lot réassigné ou délégué ne peut
+    pas compter l'avis de son auteur d'origine : l'assigné courant n'est pas
+    le seul auteur du travail gelé.
+
+    Lève `_ProvenanceError` quand le journal ne peut pas être lu en entier :
+    la porte refuse, elle ne suppose jamais l'indépendance sur une liste
+    partielle."""
     names: list[str] = []
 
     def add(name) -> None:
         name = str(name or "").strip()
-        if name and name.lower() not in {n.lower() for n in names}:
+        if not name or name.lower() == "nobody":
+            return
+        if name.lower() not in {n.lower() for n in names}:
             names.append(name)
 
-    add((row or {}).get("assignee"))
-    item_id = (row or {}).get("id")
-    if db is None or item_id in (None, ""):
+    row = row or {}
+    add(row.get("assignee"))
+    if db is None:
+        # Sans magasin de journal, seul l'assigné courant est connu : la
+        # porte ne peut pas inventer des détenteurs. Les appels de production
+        # (`readiness`, feu) fournissent toujours le magasin ; un banc qui
+        # simule toutes les lectures passe `None` et injecte `work.events`.
         return names
     try:
-        events = work.events(db, int(item_id), 500)
-    except Exception:  # noqa: BLE001 - journal illisible : l'actuel seulement
-        return names
-    for event in events or ():
+        item_id = int(row.get("id"))
+    except (TypeError, ValueError):
+        raise _ProvenanceError("the lot has no id: its journal cannot be read") from None
+    for event in _journal(db, item_id):
         note = str((event or {}).get("note") or "")
-        if not note.startswith("assigned to "):
+        found = _HOLDER.search(note)
+        if not found:
             continue
-        add(note[len("assigned to "):].split(None, 1)[0])
-        before = re.search(r"\(before: (.+?)\)", note)
-        if before and before.group(1).strip().lower() != "nobody":
+        add(found.group(1))
+        before = _BEFORE.search(note)
+        if before:
             add(before.group(1))
     return names
 
 
-def _delta_authors(repo, row, frozen) -> list[str]:
-    """Les auteurs Git des commits du delta gelé (#1515 N1) : le relecteur qui
-    a corrigé lui-même (§2) est auteur de sa correction et ne peut plus
-    compter comme relecteur indépendant de la tête. Best-effort : sans dépôt,
-    cible ou commit résolvable, aucun nom n'est ajouté — la porte garde son
-    comportement d'avant, elle n'invente pas un auteur. Les commits de fusion
-    sont ignorés : leur auteur est le plus souvent le composeur, pas l'auteur
-    du contenu."""
+def _target_commit(repo: str, row, target: str | None = None, *,
+                   other: str | None = None) -> tuple[str, str, str]:
+    """(commit, ref, dépôt) de la cible effective du delta gelé (#1515 B2).
+
+    `target` est la cible que l'appelant a réellement contrôlée (`readiness`,
+    feu) ; à défaut celle du lot, puis la cible du dépôt — jamais `origin/main`
+    en dur. La ref privée de la file (`refs/ameesh/queue/<branche>`, fraîche)
+    est honorée avant `target`, `origin/<branche>` et la branche locale.
+    `other` est l'autre dépôt à interroger quand la tête gelée vit dans le
+    clone de la file et pas dans le checkout de l'auteur (`readiness`)."""
+    target = str(target or (row or {}).get("branch_target") or "").strip()
+    if not target:
+        try:
+            target = plan_git.default_target(repo) or ""
+        except plan_git.MergeProbeError as exc:
+            raise _ProvenanceError("no effective target for the frozen delta: %s"
+                                   % exc) from exc
+        except GitError as exc:
+            raise _ProvenanceError("no effective target for the frozen delta: %s"
+                                   % exc) from exc
+    if not target:
+        raise _ProvenanceError("no effective target for the frozen delta (branch_target, "
+                               "project target and repository default are all empty)")
+    short = _remote_branch(target)
+    places = [repo] + ([other] if other and other != repo else [])
+    # Les refs privées de la file d'abord : ce sont les seules fraîches, et
+    # elles vivent dans le clone, pas dans le checkout de l'auteur.
+    private = QUEUE_REF + short
+    for place in places:
+        try:
+            found = plan_git._commit(place, private)
+        except GitError as exc:
+            raise _ProvenanceError("target %s is unreadable in %s (%s)"
+                                   % (private, place, exc)) from exc
+        if found:
+            return found, private, place
+    for place in places:
+        for candidate in (target, "origin/" + short, short):
+            if not candidate:
+                continue
+            try:
+                found = plan_git._commit(place, candidate)
+            except GitError as exc:
+                raise _ProvenanceError("target %s is unreadable in %s (%s)"
+                                       % (candidate, place, exc)) from exc
+            if found:
+                return found, candidate, place
+    raise _ProvenanceError("target %s is not readable in %s"
+                           % (target, " or ".join(places)))
+
+
+def _delta_authors(repo, row, frozen, *, target: str | None = None,
+                   target_repo: str | None = None) -> list[str]:
+    """Les auteurs Git du delta gelé (#1515 N1/B2/B3).
+
+    Le delta est lu depuis la **cible effective** (`target`, sinon celle du
+    lot, sinon celle du dépôt), refs privées de la file comprises. `repo`
+    porte la tête gelée (le clone de la file dans `readiness`) ; `target_repo`
+    est l'autre dépôt où la cible peut vivre (le checkout de l'auteur).
+    **Toutes** les fusions du delta sont incluses : une fusion peut ajouter du
+    contenu (résolution de conflit) et son auteur est alors un auteur du lot,
+    qui ne peut plus compter comme relecteur indépendant (§2). Lève
+    `_ProvenanceError` quand le gel, la cible ou la journalisation Git ne peut
+    pas être lue : la porte refuse, elle n'invente pas une liste partielle."""
     if not repo or not frozen:
         return []
-    target = str((row or {}).get("branch_target") or "origin/main").strip()
-    base = plan_git._commit(repo, target)
-    head = plan_git._commit(repo, frozen)
-    if not base or not head or base == head:
+    places = [repo] + ([target_repo] if target_repo and target_repo != repo else [])
+    head = head_repo = None
+    for place in places:
+        try:
+            head = plan_git._commit(place, str(frozen))
+        except GitError as exc:
+            raise _ProvenanceError("the repository %s is unreadable (%s)"
+                                   % (place, exc)) from exc
+        if head:
+            head_repo = place
+            break
+    if not head:
+        raise _ProvenanceError("the frozen head %s is not readable in %s"
+                               % (str(frozen)[:12], " or ".join(places)))
+    base, base_ref, base_repo = _target_commit(repo, row, target, other=target_repo)
+    if base == head:
         return []
-    text = plan_git._out(repo, "log", "--no-merges", "--format=%an",
-                         "%s..%s" % (base, head))
+    try:
+        proc = plan_git._git(head_repo, "log", "--format=%an", "%s..%s" % (base, head))
+    except GitError as exc:
+        raise _ProvenanceError("the delta %s..%s is unreadable (%s)"
+                               % (base[:12], head[:12], exc)) from exc
+    if proc.returncode != 0 and base_repo != head_repo:
+        # Objets non partagés (banc, clone incomplet) : la tête peut aussi
+        # vivre dans le dépôt de la cible.
+        try:
+            has_head = plan_git._commit(base_repo, str(frozen))
+        except GitError as exc:
+            raise _ProvenanceError("the repository %s is unreadable (%s)"
+                                   % (base_repo, exc)) from exc
+        if has_head:
+            try:
+                proc = plan_git._git(base_repo, "log", "--format=%an",
+                                     "%s..%s" % (base, head))
+            except GitError as exc:
+                raise _ProvenanceError("the delta %s..%s is unreadable (%s)"
+                                       % (base[:12], head[:12], exc)) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr.decode("utf-8", "replace").strip()
+                  or "code %d" % proc.returncode)
+        raise _ProvenanceError("the delta %s..%s is unreadable (%s)"
+                               % (base[:12], head[:12], detail))
     names: list[str] = []
-    for name in (text or "").splitlines():
+    for name in proc.stdout.decode("utf-8", "replace").splitlines():
         name = name.strip()
         if name and name.lower() not in {n.lower() for n in names}:
             names.append(name)
@@ -263,7 +412,8 @@ def _delta_authors(repo, row, frozen) -> list[str]:
 
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
-                item=None) -> dict:
+                item=None, target: str | None = None,
+                target_repo: str | None = None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
@@ -276,12 +426,26 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     normal et pour un lot sensible hors SQL/sécurité/prod, 2 pour un lot
     sensible qui touche ces domaines ou dont la classe reste un doute. Les avis
     comptés sont **indépendants** : jamais le travail d'un auteur du lot —
-    assigné courant, assignés précédents et auteurs des commits du delta
-    (#1515, §2 : un relecteur qui corrige devient auteur de sa correction) ;
-    pour une classe sensible, une famille de modèle connue et autre que celle
-    de chacun de ces auteurs ; pour deux avis, deux familles distinctes.
-    L'indépendance ne se suppose jamais : une famille d'auteur inconnue refuse
-    la porte (canon §2, décision 18855a).
+    assigné courant, détenteurs précédents du journal et auteurs des commits du
+    delta gelé, fusions comprises (#1515, §2 : un relecteur qui corrige devient
+    auteur de sa correction) ; pour une classe sensible, une famille de modèle
+    connue et autre que celle de chacun de ces auteurs ; pour deux avis, deux
+    familles distinctes. L'indépendance ne se suppose jamais : une famille
+    d'auteur inconnue refuse la porte (canon §2, décision 18855a).
+
+    `target` est la **cible effective** déjà résolue par l'appelant
+    (`readiness`, feu) : elle fixe la base du delta gelé, avec la ref privée de
+    la file (`refs/ameesh/queue/…`). Sans elle, la cible du lot puis celle du
+    dépôt sont lues ; `origin/main` n'est jamais un défaut codé en dur (#1515
+    B2). Un dépôt absent, ou une lecture de provenance illisible — journal,
+    gel, cible, `git log` — refuse la porte au lieu d'accepter une liste
+    partielle d'auteurs (#1515 B1). Sans magasin de journal (banc), seul
+    l'assigné courant est connu ; `readiness` et le feu fournissent toujours
+    le magasin.
+
+    `target_repo` est l'autre dépôt où la cible peut vivre quand `repo` est
+    le clone de la file et que la tête gelée n'y partage pas ses refs
+    (`readiness` passe le checkout de l'auteur).
 
     Rend `{ok, why, class, required, accepted, blocked, author, authors,
     author_family, on_freeze}` ; ne lève jamais.
@@ -291,12 +455,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     frozen = str(frozen or "").strip().lower()
     row = item or {}
-    assignees = _assignees(db, row)
-    authors = list(assignees)
-    author = authors[0] if authors else ""
+    current = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
-           "blocked": [], "author": author, "authors": authors, "author_family": "",
-           "on_freeze": 0}
+           "blocked": [], "author": current,
+           "authors": [current] if current and current.lower() != "nobody" else [],
+           "author_family": "", "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -323,12 +486,32 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
-    # Un lot léger n'a pas d'avis à compter : l'historique Git du delta n'est
-    # lu que pour les lots qui en exigent un.
-    for name in _delta_authors(repo, row, frozen):
-        if name.lower() not in {a.lower() for a in authors}:
-            authors.append(name)
+    # #1515 B1/B2/B3 : les auteurs complets du lot — détenteurs du journal et
+    # auteurs du delta gelé (fusions comprises) — sont la condition de
+    # l'indépendance. Une source absente ou illisible refuse la porte : on ne
+    # déduit jamais l'ensemble des auteurs d'une lecture partielle.
+    if not repo:
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the complete authors "
+                      "of the lot cannot be established (no repository for the frozen delta), "
+                      "so no verdict can be proven independent (canon §2: independence is "
+                      "never assumed)" % (frozen[:12], cls))
+        return out
+    try:
+        assignees = _assignees(db, row)
+        authors = list(assignees)
+        for name in _delta_authors(repo, row, frozen, target=target,
+                                   target_repo=target_repo):
+            if name.lower() not in {a.lower() for a in authors}:
+                authors.append(name)
+    except _ProvenanceError as exc:
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the complete authors "
+                      "of the lot cannot be established (%s), so no verdict can be proven "
+                      "independent (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
     out["authors"] = authors
+    out["author"] = authors[0] if authors else ""
+    author = out["author"]
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
     # sécurité ou la prod — n'accepte que des familles connues et autres que
@@ -597,7 +780,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # #1374 : la même porte que le feu — avis comptés par classe, indépendants
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
     # `blocked` d'un autre relecteur (P1-1).
-    gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row)
+    gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row,
+                       target=target, target_repo=repo)
     if not gate["ok"]:
         raise QueueError("lot #%d: %s" % (lot, gate["why"]))
     # L756 (#566): un lot de classe release ne se contente pas du check de sa

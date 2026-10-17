@@ -462,6 +462,12 @@ class TargetResolutionTest(_Base):
     porte la classification et l'admission ; le défaut du dépôt ne l'écrase
     plus."""
 
+    def setUp(self):
+        super().setUp()
+        # la porte des avis lit le delta depuis la cible effective ; une
+        # cible déclarée doit exister dans le dépôt (#1515 B2)
+        _git(self.repo, "branch", "-f", "develop", "main")
+
     def project(self):
         return radar.Project(name="p", repo=self.repo, target="develop", github="o/r")
 

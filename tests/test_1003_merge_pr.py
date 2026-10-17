@@ -545,6 +545,9 @@ class AdmissionGuardTest(_Base):
         self.assertEqual(self.tip(), self.base)
 
     def test_a_target_the_lot_is_not_queued_for_is_refused(self):
+        # la cible du lot doit exister pour que la porte des avis puisse lire
+        # le delta (la provenance refuse une cible introuvable, #1515 B2)
+        _git(self.repo, "branch", "develop", self.base)
         self.lot_target = "develop"
         with self.assertRaisesRegex(merge_pr.MergePrError, "queued for"):
             self.merge(self.gh())

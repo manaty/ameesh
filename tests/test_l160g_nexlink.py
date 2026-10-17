@@ -132,6 +132,9 @@ class ProtectedQueueTest(_Land):
     def test_configured_default_is_checked_before_repository_default(self):
         self.ready(4)
         self.fake.lots[4]["branch_target"] = None
+        # la cible déclarée doit exister : la porte des avis y lit le delta
+        # gelé (#1515 B2)
+        _git(self.repo, "branch", "-f", "develop", "main")
         self.project = dataclasses.replace(self.project, target="develop", protected=("main",))
         clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
         # admission requires an explicit green CI (revue #544 r1); this test

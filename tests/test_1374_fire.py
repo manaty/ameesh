@@ -115,7 +115,7 @@ class ReviewGateTest(unittest.TestCase):
     (SQL/sécurité/prod = deux avis), indépendants, aucun blocage masqué par un
     `ok` plus récent d'un AUTRE relecteur."""
 
-    ITEM = {"assignee": "author"}
+    ITEM = {"assignee": "author", "id": 42}
     #: un fichier sensible hors SQL/sécurité/prod : un avis d'une autre famille
     PLAIN = {"path": "docs/design/notes.md", "class": "sensitive", "rule": ["docs/**"]}
     #: un fichier SQL : deux avis, familles distinctes
@@ -125,13 +125,32 @@ class ReviewGateTest(unittest.TestCase):
     GATE = {"path": "src/ameesh/merge_queue.py", "class": "sensitive",
             "rule": ["src/ameesh/merge_queue.py"]}
 
-    def gate(self, marks, klass=None, frozen=A, item=None, db=None):
+    def gate(self, marks, klass=None, frozen=A, item=None, db=None, repo="/fake/repo",
+             events=None, delta=()):
+        """La porte avec ses sources simulées : un journal vide, aucun auteur
+        de delta, un dépôt factice (la provenance réelle est testée à part).
+
+        `events` et `delta` remplacent les lectures correspondantes : le
+        helper patche `work.events` et `_delta_authors`, donc un test qui les
+        remplace le fait ici, pas par un patch extérieur (qui serait écrasé).
+        """
         if isinstance(klass, str):
             klass = {"class": klass, "doubt": False}
             if klass["class"] == "sensitive":
                 klass["files"] = [self.PLAIN]
-        with mock.patch.object(merge_queue, "actor_family", side_effect=_family):
-            return merge_queue.review_gate(db, marks, frozen,
+
+        def resolve(_repo, sha):
+            sha = str(sha or "").strip().lower()
+            return sha if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha) else None
+
+        with mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
+                mock.patch.object(merge_queue, "pinned", side_effect=resolve), \
+                mock.patch.object(merge_queue.work, "events",
+                                  return_value=list(events or [])), \
+                mock.patch.object(merge_queue, "_delta_authors",
+                                  return_value=list(delta)):
+            return merge_queue.review_gate(db if db is not None else object(), marks, frozen,
+                                           repo=repo,
                                            klass=klass or {"class": "sensitive",
                                                            "doubt": False,
                                                            "files": [self.PLAIN]},
@@ -198,15 +217,51 @@ class ReviewGateTest(unittest.TestCase):
         # claude : sans la lecture du journal, son avis passerait en normal).
         item = {"assignee": "author", "id": 42}
         events = [{"note": "assigned to author (before: rev2)"}]
-        with mock.patch.object(merge_queue.work, "events", return_value=events):
-            out = self.gate(_marks(_mark("frozen", A), _verdict("rev2")),
-                            klass="normal", item=item, db=object())
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev2")),
+                        klass="normal", item=item, events=events)
         self.assertFalse(out["ok"], "un ancien assigné reste auteur")
         self.assertEqual(out["authors"], ["author", "rev2"])
-        with mock.patch.object(merge_queue.work, "events", return_value=events):
-            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
-                            klass="normal", item=item, db=object())
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                        klass="normal", item=item, events=events)
         self.assertTrue(out["ok"], out["why"])
+
+    def test_delegation_notes_name_the_delegate_and_the_previous_holder(self):
+        # #1515 B1 : une délégation est un changement de détenteur comme une
+        # assignation ; le délégataire et l'ancien détenteur sont auteurs.
+        events = [{"note": "delegated to rev1 by author, due in 30 min (before: rev2)"}]
+        with mock.patch.object(merge_queue.work, "events", return_value=events):
+            self.assertEqual(merge_queue._assignees(object(), {"assignee": "author", "id": 7}),
+                             ["author", "rev1", "rev2"])
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev2")),
+                        klass="normal", item={"assignee": "author", "id": 7},
+                        events=events)
+        self.assertFalse(out["ok"], "l'ancien détenteur délégué ne relit pas le travail")
+        self.assertIn("rev1", out["authors"])
+        self.assertIn("rev2", out["authors"])
+        ok = self.gate(_marks(_mark("frozen", A), _verdict("rev3")),
+                       klass="normal", item={"assignee": "author", "id": 7},
+                       events=events)
+        self.assertTrue(ok["ok"], ok["why"])
+
+    def test_journal_is_read_whole_beyond_the_first_page(self):
+        # #1515 B1 : un ancien détenteur au-delà de la première page ne doit
+        # pas disparaître ; la lecture élargit tant que la page est pleine.
+        filler = [{"note": "note sans rapport"} for _ in range(merge_queue.JOURNAL_PAGE)]
+        old = {"note": "assigned to rev2 (before: nobody)"}
+        seen = []
+
+        def events(_db, _item, limit):
+            seen.append(limit)
+            return filler + [old] if limit > merge_queue.JOURNAL_PAGE else filler
+
+        with mock.patch.object(merge_queue.work, "events", side_effect=events):
+            self.assertEqual(merge_queue._assignees(object(), {"assignee": "author", "id": 7}),
+                             ["author", "rev2"])
+        self.assertGreater(len(seen), 1, "la première page pleine doit être élargie")
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev2")),
+                        klass="normal", item={"assignee": "author", "id": 7},
+                        events=filler + [old])
+        self.assertFalse(out["ok"], "un détenteur de la deuxième page reste auteur")
 
     def test_assignees_reads_the_whole_journal(self):
         events = [{"note": "assigned to b (before: a)"},
@@ -216,18 +271,94 @@ class ReviewGateTest(unittest.TestCase):
             self.assertEqual(merge_queue._assignees(object(), {"assignee": "c", "id": 7}),
                              ["c", "b", "a"])
 
+    def test_unreadable_journal_refuses_the_gate(self):
+        # #1515 B1 : un journal illisible ne vaut pas « aucun ancien
+        # détenteur » : la provenance est incomplète, la porte refuse.
+        with mock.patch.object(merge_queue.work, "events",
+                               side_effect=RuntimeError("journal down")):
+            out = merge_queue.review_gate(
+                object(), _marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                A, repo="/fake/repo",
+                klass={"class": "sensitive", "files": [self.SQL]},
+                item={"assignee": "author", "id": 42}, target="main")
+        self.assertFalse(out["ok"])
+        self.assertIn("complete authors", out["why"])
+        self.assertIn("unreadable", out["why"])
+
+    def test_a_missing_repository_refuses_a_verdict_class(self):
+        # #1515 B1 : sans dépôt, les auteurs des commits du delta ne sont pas
+        # établis ; l'indépendance ne se suppose pas.
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass={"class": "sensitive", "files": [self.SQL]}, repo=None)
+        self.assertFalse(out["ok"])
+        self.assertIn("complete authors", out["why"])
+        self.assertIn("no repository", out["why"])
+
+    def test_an_unreadable_frozen_head_refuses_the_gate(self):
+        # #1515 B1 : un gel absent du dépôt n'est pas un delta vide.
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "-C", tmp, "init", "-q", "-b", "main"], check=True)
+            with mock.patch.object(merge_queue.work, "events", return_value=[]):
+                out = merge_queue.review_gate(
+                    object(), _marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                    A, repo=tmp,
+                    klass={"class": "sensitive", "files": [self.SQL]},
+                    item={"assignee": "author", "id": 42}, target="main")
+        self.assertFalse(out["ok"])
+        self.assertIn("complete authors", out["why"])
+        self.assertIn("frozen head", out["why"])
+
+    def test_an_unreadable_git_log_refuses_the_gate(self):
+        # #1515 B1 : `git log` en échec ne rend pas une liste d'auteurs vide.
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args, name="author"):
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
+                env.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=name + "@example.invalid",
+                           GIT_COMMITTER_NAME=name,
+                           GIT_COMMITTER_EMAIL=name + "@example.invalid")
+                return subprocess.run(["git", "-C", tmp, *args], check=True,
+                                      capture_output=True, text=True, env=env).stdout.strip()
+
+            git("init", "-q", "-b", "main")
+            with open(os.path.join(tmp, "a"), "w", encoding="utf-8") as fh:
+                fh.write("a\n")
+            git("add", "a")
+            git("commit", "-qm", "a")
+            git("checkout", "-qb", "lot")
+            with open(os.path.join(tmp, "a"), "w", encoding="utf-8") as fh:
+                fh.write("b\n")
+            git("commit", "-qam", "b", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            real = merge_queue.plan_git._git
+
+            def failing(repo, *args, **kwargs):
+                if args and args[0] == "log":
+                    return subprocess.CompletedProcess(["git", "log"], 1, b"", b"log broke")
+                return real(repo, *args, **kwargs)
+
+            with mock.patch.object(merge_queue.plan_git, "_git", side_effect=failing), \
+                    mock.patch.object(merge_queue.work, "events", return_value=[]):
+                out = merge_queue.review_gate(
+                    object(), _marks(_mark("frozen", frozen), _verdict("rev1"),
+                                     _verdict("rev2")),
+                    frozen, repo=tmp,
+                    klass={"class": "sensitive", "files": [self.SQL]},
+                    item={"assignee": "author", "id": 42}, target="main")
+        self.assertFalse(out["ok"])
+        self.assertIn("complete authors", out["why"])
+        self.assertIn("unreadable", out["why"])
+
     def test_a_corrector_is_an_author_not_a_reviewer(self):
         # #1515 N1 : le relecteur qui corrige lui-même (§2) devient auteur du
         # delta ; son avis ne relit pas sa propre correction.
         item = {"assignee": "author", "id": 43}
-        with mock.patch.object(merge_queue, "_delta_authors", return_value=["rev1"]):
-            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
-                            klass="normal", item=item)
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                        klass="normal", item=item, delta=["rev1"])
         self.assertFalse(out["ok"], "le correcteur relit sa propre correction")
         self.assertEqual(out["authors"], ["author", "rev1"])
-        with mock.patch.object(merge_queue, "_delta_authors", return_value=["rev1"]):
-            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
-                            klass="normal", item=item)
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass="normal", item=item, delta=["rev1"])
         self.assertTrue(out["ok"], out["why"])
 
     def test_a_human_reviewer_has_no_model_family_to_count(self):
@@ -235,7 +366,7 @@ class ReviewGateTest(unittest.TestCase):
         # l'avis d'un humain ne prouve pas une famille de modèle indépendante ;
         # il ne remplace pas l'un des deux avis requis (canon §2).
         out = self.gate(_marks(_mark("frozen", A), _verdict("human:alice")),
-                        klass="sensitive", item={"assignee": "author"})
+                        klass="sensitive", item={"assignee": "author", "id": 46})
         self.assertFalse(out["ok"])
         self.assertEqual(out["accepted"], [])
 
@@ -244,9 +375,8 @@ class ReviewGateTest(unittest.TestCase):
         # exclu des relecteurs, mais il n'a pas de famille à comparer et ne
         # doit pas refuser la porte (contrairement à un assigné hors registre).
         item = {"assignee": "author", "id": 44}
-        with mock.patch.object(merge_queue, "_delta_authors", return_value=["ameesh"]):
-            out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
-                            klass="sensitive", item=item)
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                        klass="sensitive", item=item, delta=["ameesh"])
         self.assertTrue(out["ok"], out["why"])
 
     def test_the_gate_participants_need_two_reviews(self):
@@ -283,7 +413,7 @@ class ReviewGateTest(unittest.TestCase):
         # B/P1 cx1 : quand la famille de l'auteur n'est pas connue, l'ancien
         # code sautait la comparaison et acceptait n'importe quelle famille.
         klass = {"class": "sensitive", "files": [self.SQL]}
-        item = {"assignee": "inconnu"}       # famille absente du registre simulé
+        item = {"assignee": "inconnu", "id": 45}       # famille absente du registre simulé
         out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
                         klass=klass, item=item)
         self.assertFalse(out["ok"], "l'indépendance ne se suppose jamais")
@@ -299,7 +429,7 @@ class ReviewGateTest(unittest.TestCase):
         # comparer, seules les familles des relecteurs comptent (l'exemption
         # ne vaut que pour `human:`, jamais pour un agent au registre muet).
         klass = {"class": "sensitive", "files": [self.SQL]}
-        item = {"assignee": "human:alice"}
+        item = {"assignee": "human:alice", "id": 47}
         one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass, item=item)
         self.assertFalse(one["ok"], "deux avis restent requis pour SQL")
         two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
@@ -313,7 +443,7 @@ class ReviewGateTest(unittest.TestCase):
         # hors classe sensible, un lot normal garde un avis d'un autre agent,
         # même de famille inconnue : la famille n'y est pas exigée.
         out = self.gate(_marks(_mark("frozen", A), _verdict("ghost")),
-                        klass="normal", item={"assignee": "inconnu"})
+                        klass="normal", item={"assignee": "inconnu", "id": 48})
         self.assertTrue(out["ok"], out["why"])
 
     def test_a_newer_ok_from_another_reviewer_does_not_mask_a_block(self):
@@ -345,37 +475,139 @@ class ReviewGateTest(unittest.TestCase):
 
 
 class DeltaAuthorsTest(unittest.TestCase):
-    """#1515 N1 : les auteurs des commits non-fusion du delta gelé, cible
-    exclue ; un correcteur qui pousse sur la branche devient auteur."""
+    """#1515 N1/B2/B3 : les auteurs du delta gelé, lus depuis la cible
+    effective (refs privées comprises), fusions qui ajoutent du contenu
+    incluses ; un correcteur qui pousse sur la branche devient auteur."""
+
+    @staticmethod
+    def _git(tmp):
+        def git(*args, name="author"):
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
+            env.update(GIT_AUTHOR_NAME=name,
+                       GIT_AUTHOR_EMAIL=name + "@example.invalid",
+                       GIT_COMMITTER_NAME=name,
+                       GIT_COMMITTER_EMAIL=name + "@example.invalid")
+            proc = subprocess.run(["git", "-C", tmp, *args], check=True,
+                                  capture_output=True, text=True, env=env)
+            return proc.stdout.strip()
+        return git
+
+    @staticmethod
+    def _write(tmp, name: str, text: str) -> None:
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def _base(self, tmp, git):
+        git("init", "-q", "-b", "main")
+        self._write(tmp, "a", "a\n")
+        git("add", "a")
+        git("commit", "-qm", "a", name="author")
 
     def test_a_corrector_commit_is_an_author(self):
         with tempfile.TemporaryDirectory() as tmp:
-            def git(*args, name=None):
-                env = {k: v for k, v in os.environ.items()
-                       if not k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
-                if name:
-                    env.update(GIT_AUTHOR_NAME=name,
-                               GIT_AUTHOR_EMAIL=name + "@example.invalid",
-                               GIT_COMMITTER_NAME=name,
-                               GIT_COMMITTER_EMAIL=name + "@example.invalid")
-                proc = subprocess.run(["git", "-C", tmp, *args], check=True,
-                                      capture_output=True, text=True, env=env)
-                return proc.stdout.strip()
-
-            git("init", "-q", "-b", "main")
-            path = os.path.join(tmp, "a")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("a\n")
-            git("add", "a")
-            git("commit", "-qm", "a", name="author")
+            git = self._git(tmp)
+            self._base(tmp, git)
             git("checkout", "-qb", "lot")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("b\n")
+            self._write(tmp, "a", "b\n")
             git("commit", "-qam", "b", name="rev1")
             frozen = git("rev-parse", "HEAD")
             self.assertEqual(
                 merge_queue._delta_authors(tmp, {"branch_target": "main"}, frozen),
                 ["rev1"])
+
+    def test_a_merge_commit_that_adds_content_is_an_author(self):
+        # #1515 B3 : le correcteur qui résout un conflit dans le commit de
+        # fusion ajoute du contenu ; il est auteur du delta et ne peut pas
+        # compter son propre avis.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "lot\n")
+            git("commit", "-qam", "lot", name="author")
+            git("checkout", "-q", "main")
+            self._write(tmp, "a", "main\n")
+            git("commit", "-qam", "main", name="other")
+            git("checkout", "-q", "lot")
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
+            env.update(GIT_AUTHOR_NAME="rev1", GIT_AUTHOR_EMAIL="rev1@example.invalid",
+                       GIT_COMMITTER_NAME="rev1",
+                       GIT_COMMITTER_EMAIL="rev1@example.invalid")
+            subprocess.run(["git", "-C", tmp, "merge", "main"], capture_output=True,
+                           text=True, env=env, check=False)
+            self._write(tmp, "a", "resolved\n")
+            git("add", "a")
+            git("commit", "-qm", "merge main", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            authors = merge_queue._delta_authors(tmp, {"branch_target": "main"}, frozen)
+            self.assertIn("rev1", authors, "l'auteur de la résolution est un auteur")
+            self.assertIn("author", authors)
+
+    def test_the_effective_target_is_the_base_not_origin_main(self):
+        # #1515 B2 : projet develop, lot sans cible ; main porte déjà le gel.
+        # La cible effective develop doit rendre rev1 auteur, main ne le fait
+        # pas — c'est la cible du feu/readiness qui compte, jamais origin/main.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            git("checkout", "-qb", "develop")
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "b\n")
+            git("commit", "-qam", "b", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            git("checkout", "-q", "main")
+            git("merge", "--ff-only", "-q", "lot")
+            self.assertEqual(
+                merge_queue._delta_authors(tmp, {"branch_target": "main"}, frozen,
+                                           target="develop"),
+                ["rev1"])
+            self.assertEqual(
+                merge_queue._delta_authors(tmp, {"branch_target": "main"}, frozen),
+                [], "main porte déjà le gel : le delta y est vide")
+            marks = _marks(_mark("frozen", frozen), _verdict("rev1", sha=frozen))
+            item = {"assignee": "author", "id": 42, "branch_target": "main"}
+            klass = {"class": "sensitive", "files": [
+                {"path": "docs/x.md", "class": "sensitive", "rule": ["docs/**"]}]}
+            with mock.patch.object(merge_queue.work, "events", return_value=[]), \
+                    mock.patch.object(merge_queue, "actor_family", side_effect=_family):
+                wrong = merge_queue.review_gate(object(), marks, frozen, repo=tmp,
+                                                klass=klass, item=item)
+                right = merge_queue.review_gate(object(), marks, frozen, repo=tmp,
+                                                klass=klass, item=item, target="develop")
+            self.assertTrue(wrong["ok"], wrong["why"])
+            self.assertFalse(right["ok"], "sur develop, rev1 est l'auteur du delta")
+            self.assertIn("rev1", right["authors"])
+
+    def test_the_private_queue_ref_is_honoured(self):
+        # #1515 B2 : la ref privée de la file est fraîche ; la branche locale
+        # peut être en avance (ou en retard), c'est la ref privée qui fait foi.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            git("checkout", "-qb", "develop")
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "b\n")
+            git("commit", "-qam", "b", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            git("checkout", "-q", "develop")
+            base = git("rev-parse", "HEAD")
+            git("checkout", "-q", "main")
+            git("branch", "-f", "develop", frozen)
+            git("update-ref", "refs/ameesh/queue/develop", base)
+            self.assertEqual(
+                merge_queue._delta_authors(tmp, {}, frozen, target="develop"),
+                ["rev1"])
+
+    def test_an_unreadable_target_is_an_error_not_an_empty_delta(self):
+        # #1515 B1/B2 : une cible introuvable n'est pas « aucun auteur ».
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            frozen = git("rev-parse", "HEAD")
+            with self.assertRaises(merge_queue._ProvenanceError):
+                merge_queue._delta_authors(tmp, {}, frozen, target="nope")
 
 
 class ReadyTest(unittest.TestCase):
@@ -383,11 +615,29 @@ class ReadyTest(unittest.TestCase):
 
     ROW = {"id": 42, "title": "t", "branch": "lot/42-x", "assignee": "author"}
 
-    def _verdicts(self, marks, klass, *, repo=None, project=None, target="main"):
+    def _verdicts(self, marks, klass, *, repo="/fake/repo", project=None, target="main"):
+        # Le dépôt factice et les sources simulées suffisent : la provenance
+        # réelle (journal, delta, cible) est éprouvée dans ReviewGateTest et
+        # DeltaAuthorsTest ; ici on teste le routage des portes du feu.
         with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
-                mock.patch.object(merge_queue, "actor_family", side_effect=_family):
-            return fire.ready_verdicts(None, None, self.ROW, marks, repo=repo,
+                mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
+                mock.patch.object(merge_queue, "pinned", return_value=A), \
+                mock.patch.object(merge_queue.work, "events", return_value=[]), \
+                mock.patch.object(merge_queue, "_delta_authors", return_value=[]):
+            return fire.ready_verdicts(None, object(), self.ROW, marks, repo=repo,
                                        project=project, target=target)
+
+    def test_the_verdict_gate_receives_the_effective_target(self):
+        # #1515 B2 : la cible résolue par le feu (project develop, par
+        # exemple) doit atteindre la porte, pas retomber sur origin/main.
+        with mock.patch.object(fire.lot_class, "of_lot", return_value={"class": "light"}), \
+                mock.patch.object(merge_queue, "review_gate",
+                                  return_value={"ok": True, "why": "", "required": 0}) as gate:
+            ok, why, _ = fire.ready_verdicts(None, object(), self.ROW, [],
+                                             repo="/fake/repo", project=None,
+                                             target="develop")
+        self.assertTrue(ok, why)
+        self.assertEqual(gate.call_args.kwargs.get("target"), "develop")
 
     def test_light_passes_without_a_pr(self):
         ok, why, klass = self._verdicts(_marks(_mark("frozen", A)), {"class": "light"})
