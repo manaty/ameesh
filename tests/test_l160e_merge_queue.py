@@ -498,8 +498,8 @@ class TargetResolutionTest(_Base):
 
 class ClassOfSourcesTest(unittest.TestCase):
     """Revue #544 r1 : `_class_of` lit toutes les sources de la tête gelée et
-    garde la plus haute — une lecture calculée ne se rétrograde jamais, et un
-    doute ne se lit pas comme une classe sensible."""
+    garde la plus haute — une lecture calculée ne se rétrograde jamais, et à
+    classe égale un doute l'emporte sur une lecture calculée (#1515 B2/N4)."""
 
     def read(self, answers):
         calls = []
@@ -528,15 +528,16 @@ class ClassOfSourcesTest(unittest.TestCase):
         self.assertEqual(out["why"], "clone")
         self.assertEqual(calls, [merge_queue.QUEUE_REF + "main", "main"])
 
-    def test_un_doute_ne_se_lit_pas_comme_une_classe_sensible(self):
-        # deux lectures sensibles : la calculée explique mieux que le doute
+    def test_un_doute_survit_a_une_classe_calculee_egale(self):
+        # deux lectures sensibles : le doute l'emporte, un diff illisible peut
+        # cacher SQL et ne se rétrograde pas (#1515 B2/N4)
         out, _ = self.class_of({
             merge_queue.QUEUE_REF + "main": {"class": "sensitive", "doubt": True,
                                              "why": "diff illisible"},
             "main": {"class": "sensitive", "doubt": False, "why": "policy"}})
         self.assertEqual(out["class"], "sensitive")
-        self.assertEqual(out["doubt"], False)
-        self.assertEqual(out["why"], "policy")
+        self.assertEqual(out["doubt"], True)
+        self.assertEqual(out["why"], "diff illisible")
 
     def test_un_doute_ne_retrograde_jamais_vers_light(self):
         out, _ = self.class_of({

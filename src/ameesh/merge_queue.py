@@ -843,10 +843,10 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
     `doubt`), et la file garde l'exigence de verdict.
 
     Les lectures sont **toutes** comparées : la plus haute l'emporte, une
-    lecture calculée ne se rétrograde jamais devant une autre, et un doute ne
-    se lit pas comme une classe sensible (le clone radar peut voir des
-    changements sensibles que le checkout de l'auteur ne voit plus — revue
-    #544 r1)."""
+    lecture calculée ne se rétrograde jamais devant une autre, et à classe
+    égale un doute l'emporte sur une lecture calculée (le clone radar peut
+    voir des changements sensibles que le checkout de l'auteur ne voit plus ;
+    un diff illisible peut cacher SQL, #1515 B2/N4 — revue #544 r1)."""
     from . import lot_class
     paths = []
     if target:
@@ -869,15 +869,17 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
 
 
 def _class_worse(candidate: dict, best: dict) -> bool:
-    """La plus haute des deux lectures l'emporte ; à classe égale, une lecture
-    calculée explique mieux qu'un doute."""
+    """La plus haute des deux lectures l'emporte ; à classe égale, un **doute
+    l'emporte** sur une lecture calculée (#1515 B2/N4) : un diff illisible qui
+    pourrait cacher SQL, la sécurité ou la prod ne se rétrograde jamais parce
+    qu'une autre source, elle, explique une classe rassurante."""
     from . import lot_class
     def rank(result):
         return lot_class.RANK.get(str(result.get("class") or ""),
                                   lot_class.RANK[lot_class.SENSITIVE])
     if rank(candidate) != rank(best):
         return rank(candidate) > rank(best)
-    return bool(best.get("doubt")) and not candidate.get("doubt")
+    return bool(candidate.get("doubt")) and not best.get("doubt")
 
 
 def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):

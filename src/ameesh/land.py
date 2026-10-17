@@ -535,14 +535,29 @@ class _Landing:
     def review_after_merge(self, *, merged_sha: str = "", pr=None) -> dict:
         """L539 : ouvre le lot de relecture d'un lot **léger** (canon §2), une
         seule fois, après que la fusion est un fait enregistré. La classe est
-        relue sur le diff gelé (`merge_queue._class_of`, canon §8) ; un doute
-        ou une classe supérieure n'ouvre rien. Ne lève jamais."""
+        relue sur le diff **atterri** (`merge_queue._class_of`, canon §8) ;
+        un doute ou une classe supérieure n'ouvre rien. Ne lève jamais."""
         from . import merge_queue, review_lot
         try:
             item = work.get(self.db, self.lot)
+            target = self.row.get("target")
+            tip = self.row.get("frozen_sha") or ""
+            merged = str(merged_sha or "").strip()
+            if merged:
+                # #1515 B1 : après la fusion, la cible contient déjà la tête
+                # gelée ; relire le gel depuis la cible rendrait un diff vide
+                # (`light`) quel que soit le lot. La base juste est le premier
+                # parent du commit de fusion : le delta réellement atterri.
+                for place in (self.clone, self.project.repo):
+                    if not place:
+                        continue
+                    first = plan_git._commit(place, merged + "^1")
+                    if first:
+                        target, tip = first, merged
+                        break
             klass = merge_queue._class_of(
                 self.db, self.lot, item, self.project.repo, self.clone,
-                self.row.get("target"), self.row.get("frozen_sha") or "", cfg=self.cfg)
+                target, tip, cfg=self.cfg)
             return review_lot.open_after_merge(
                 self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
                 pr=pr, target=self.row.get("target") or "")

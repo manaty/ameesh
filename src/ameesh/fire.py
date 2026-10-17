@@ -482,8 +482,18 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     freeze = freeze_of(marks)
     frozen = _norm((freeze or {}).get("sha"))
     head = merge_queue.pinned(repo, frozen) if repo else None
+    # #1515 B1 : la classe se lit sur la cible **effective**, la même que
+    # celle des auteurs du delta (`_target_commit` : ref privée de la file,
+    # puis ref distante). Une cible laissée à la branche locale pouvait être
+    # en avance du gel non publié : diff vide, classe light, zéro avis.
+    base = target or None
+    if repo:
+        try:
+            base = merge_queue._target_commit(repo, row, target)[0]
+        except merge_queue._ProvenanceError:
+            base = target or None
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=target or None, head=head)
+                             base=base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
@@ -600,12 +610,22 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
             {"project": row.get("app") or "", "pr": status.get("number"), "merged": True})
         from . import review_lot
         try:
+            merged_sha = status.get("merge_commit") or ""
+            base = target or None
+            tip = (merge_queue.pinned(repo, _norm((freeze or {}).get("sha")))
+                   if repo else None)
+            # #1515 B1 : après la fusion, la cible contient la tête gelée ;
+            # le diff gelé y serait vide (`light`). On classe le delta atterri :
+            # premier parent du commit de fusion..commit de fusion.
+            if repo and merged_sha:
+                first = plan_git._commit(repo, merged_sha + "^1")
+                if first:
+                    base, tip = first, merged_sha
             out["review_lot"] = review_lot.open_after_merge(
-                db, lot=lot, item=row, merged_sha=status.get("merge_commit") or "",
+                db, lot=lot, item=row, merged_sha=merged_sha,
                 pr=status.get("number"), target=target,
-                klass=lot_class.of_lot(db, lot, item=row, repo=repo, base=target or None,
-                                       head=merge_queue.pinned(repo, _norm((freeze or {}).get(
-                                           "sha"))) if repo else None))
+                klass=lot_class.of_lot(db, lot, item=row, repo=repo, base=base,
+                                       head=tip))
         except Exception as exc:  # noqa: BLE001 - la fusion est un fait
             out["review_lot"] = {"id": None, "created": False,
                                  "why": "%s: %s" % (type(exc).__name__, str(exc)[:200])}

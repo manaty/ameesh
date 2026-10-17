@@ -202,6 +202,25 @@ class ReviewAfterMergeTest(LocalLandTest):
         self.assertEqual(out["result"], "ejected", out)
         opened.assert_not_called()
 
+    def test_the_class_is_read_on_the_landed_delta(self):
+        # #1515 B1 : la cible contient la tête après fusion ; la classe se lit
+        # sur le premier parent du commit de fusion, jamais sur la cible seule.
+        self.queued(4)
+        seen = {}
+
+        def fake_class(db, lot, row, repo, where, target, tip, **kw):
+            seen.update(target=target, tip=tip)
+            return {"class": "light", "why": "policy"}
+
+        with mock.patch.object(merge_queue, "_class_of", side_effect=fake_class), \
+                mock.patch.object(review_lot, "open_after_merge",
+                                  return_value={"id": 900, "created": True}):
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        merged = _git(self.origin, "rev-parse", "main")
+        self.assertEqual(seen["tip"], merged)
+        self.assertEqual(seen["target"], _git(self.origin, "rev-parse", "main^1"))
+
     def test_a_doubt_or_a_higher_class_opens_nothing(self):
         """La classe relue n'est pas `light` : rien n'est ouvert."""
         self.queued(4)

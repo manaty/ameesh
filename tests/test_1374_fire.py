@@ -629,6 +629,25 @@ class DeltaAuthorsTest(unittest.TestCase):
             with self.assertRaises(merge_queue._ProvenanceError):
                 merge_queue._delta_authors(tmp, {}, frozen, target="nope")
 
+    def test_class_of_reads_the_remote_target_when_the_local_one_carries_the_freeze(self):
+        # #1515 B1 : même racine que le feu — une branche locale en avance du
+        # gel non publié ne doit pas rendre le diff vide et la classe light.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            base = git("rev-parse", "HEAD")
+            git("checkout", "-qb", "develop")
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "b\n")
+            git("commit", "-qam", "b", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            git("update-ref", "refs/remotes/origin/develop", base)
+            git("branch", "-f", "develop", frozen)
+            out = merge_queue._class_of(None, 1, {"app": "ameesh", "id": 1},
+                                        tmp, tmp, "develop", frozen)
+            self.assertEqual(out["class"], "sensitive", out)
+            self.assertTrue(out["doubt"], out)
+
 
 class ReadyTest(unittest.TestCase):
     """Les portes du feu : verdicts d'abord (sans PR), puis PR/CI."""
@@ -705,6 +724,45 @@ class ReadyTest(unittest.TestCase):
         self.assertIn("targets", why)
         ok, why = fire.ready_pr(_status(), target="main", project=None, frozen=A)
         self.assertTrue(ok, why)
+
+
+class ReadyClassTargetTest(unittest.TestCase):
+    """#1515 B1 : la classe de la porte du feu se lit sur la cible
+    **effective** (ref distante, puis ref privée de la file), jamais sur une
+    branche locale qui porte déjà le gel non publié — sinon le diff est vide,
+    la classe `light` et la porte passe sans aucun avis."""
+
+    def test_a_local_target_carrying_the_freeze_does_not_hide_the_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = DeltaAuthorsTest._git(tmp)
+            git("init", "-q", "-b", "main")
+            os.makedirs(os.path.join(tmp, "src/ameesh"))
+            DeltaAuthorsTest._write(tmp, "src/ameesh/merge_queue.py", "base\n")
+            git("add", ".")
+            git("commit", "-qm", "base", name="author")
+            base = git("rev-parse", "HEAD")
+            git("checkout", "-qb", "develop")
+            git("checkout", "-qb", "lot")
+            DeltaAuthorsTest._write(tmp, "src/ameesh/merge_queue.py", "frozen\n")
+            git("commit", "-qam", "lot", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            # origin/develop reste au pied ; develop local porte le gel non publié
+            git("update-ref", "refs/remotes/origin/develop", base)
+            git("branch", "-f", "develop", frozen)
+            row = {"id": 42, "title": "t", "branch": "lot/42-x", "assignee": "author",
+                   "app": "ameesh"}
+            marks = _marks(_mark("frozen", frozen))
+            with mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
+                    mock.patch.object(merge_queue.work, "events", return_value=[]):
+                ok, why, klass = fire.ready_verdicts(
+                    None, None, row, marks, repo=tmp, project=None, target="develop")
+            self.assertFalse(ok, why)
+            self.assertEqual(klass["class"], "sensitive")
+            self.assertIn("2 independent review", why, why)
+            self.assertEqual(fire.lot_class.effective_base(tmp, "develop"),
+                             "refs/remotes/origin/develop")
+            self.assertEqual(fire.lot_class.effective_base(tmp, "refs/heads/develop"),
+                             "refs/heads/develop", "une ref locale explicite est gardée")
 
 
 class TargetKeyTest(unittest.TestCase):

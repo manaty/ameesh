@@ -154,6 +154,30 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             "doubt": False}
 
 
+def effective_base(repo: str, base: str | None) -> str:
+    """La ref qui porte réellement la cible du diff (#1515 B1).
+
+    Une cible **sans préfixe** (`develop`) désigne la branche du dépôt, mais
+    le checkout de l'auteur peut la porter en avance du gel, non publiée : un
+    `develop` local à la tête gelée rendrait le diff vide et le lot « light »
+    alors que sa cible distante ne contient pas encore la correction. Pour une
+    cible non qualifiée, la ref distante `refs/remotes/origin/<cible>` fait
+    donc foi quand elle existe ; une ref explicitement qualifiée
+    (`refs/heads/…`, `refs/remotes/…`, `origin/…`) est gardée telle quelle.
+    Sans ref distante lisible, la cible est rendue inchangée (un diff
+    illisible reste un doute, jamais un « rien à relire »)."""
+    text = str(base or "").strip()
+    if not text or text == "HEAD" or text.startswith(("refs/", "origin/")):
+        return text
+    remote = "refs/remotes/origin/" + text
+    try:
+        if canon_mod.git_commit(repo, remote):
+            return remote
+    except canon_mod.GitError:
+        return text
+    return text
+
+
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
            repo: Optional[str] = None, base: Optional[str] = None,
            head: Optional[str] = None, milestones: Optional[list] = None,
@@ -207,6 +231,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     landing = default_base(cfg, row, repo)
     if not base:
         base = landing
+    base = effective_base(repo, base)
     out["target"] = base or ""
     reason = release_reason(row, landing, base)
     if reason:
