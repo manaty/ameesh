@@ -71,6 +71,28 @@ class PausedAvailabilityTest(PgTestCase):
                 [self.listing_row()], now, idle_s=0)],
             ["dev-paused"])
 
+    def test_plan_underused_does_not_offer_paused_agents_as_capacity(self):
+        # #2200 (auditeur 17/10 08:27) : `plan_underused` nommait les agents
+        # « idle » d'un harnais sous-consommé — dont quatre en pause opérateur.
+        # Les chiffres de sous-consommation restent dus ; l'agent pausé n'est
+        # pas une capacité disponible et ne doit pas être proposé.
+        now = time.time()
+        storage.of(self.db).operations.record_gauges([{
+            "harness": "deepseek", "key": "deepseek-10080min", "used": 0.20,
+            "resets_at": now + 4 * 86400, "window_s": 7 * 86400,
+            "account": "primaire"}])
+        alertes = sous_utilisation.plan_underused(
+            self.db, [self.listing_row()], now)
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual(alertes[0]["idle_agents"], [])
+        self.assertNotIn("idle deepseek agents", alertes[0]["detail"])
+        # contre-épreuve : pause levée, l'agent redevient la capacité nommée.
+        self.pause(False)
+        alertes = sous_utilisation.plan_underused(
+            self.db, [self.listing_row()], now)
+        self.assertEqual(alertes[0]["idle_agents"], ["dev-paused"])
+        self.assertIn("idle deepseek agents: dev-paused", alertes[0]["detail"])
+
     def test_projects_view_names_the_pause_instead_of_idle(self):
         row = self.board_row()
         self.assertTrue(row["operator_paused"])
