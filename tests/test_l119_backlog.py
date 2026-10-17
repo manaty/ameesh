@@ -438,6 +438,11 @@ class AlerteEtNotifyTest(_Base):
         self.assertEqual(work.get(self.db, item["id"])["assignee"], "claude1")
         args = notify.build_parser().parse_args(["--take-idle", "0", "--take-lot-idle", "0"])
         self.assertIsNone(notify.take_settings(args))
+        # #1738 R1 (B2) : les propositions suivent une prise active ; leur
+        # interrupteur à 0 les coupe en plus, la prise restant active.
+        args = notify.build_parser().parse_args(["--take-review-max-per-hour", "0"])
+        self.assertEqual(notify.take_settings(args)["review_max_per_hour"], 0)
+        self.assertTrue(notify.take_settings(args)["max_per_hour"])
 
 
 if __name__ == "__main__":
