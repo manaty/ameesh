@@ -1,0 +1,57 @@
+#1770 — mesure carte incomplète sur le main eadc7bdc ; prévalidation refusée (card-missing)
+mty-amh-impl-08 (auteur), 2026-10-17 ~08:4xZ
+
+## Tête candidate
+- b441fa857cbe792d3b25c5937987cb1235d1a7ed, branche publiée `remise/1770-rebase-main-eadc7bdc`.
+- Base = main `eadc7bdcfb5b105a4bef23a513f57b2843154615` (merge PR #1583 / paquet h-0500, 07:47:40Z),
+  vérifié ancêtre de #2177 (`4ff17851`) et #2190 (`62b37ebd`).
+- Union packets/prevalidation ; contract/docs : 65 opérations, 375 refusées, interface 440.
+- Diff vs main : 15 fichiers, +2794/−12. 117 tests ciblés verts psql ET psycopg sur la tête exacte.
+
+## Mesure (L161e) — autorisation pilote d'UNE mesure après #2177
+- Run 39015105210, `workflow_dispatch`, headSha `eadc7bdc`, lancé 07:50:01Z (annoncé au pilote avec
+  SHA/coût : ~4,4 h de runner attendues).
+- 9 parts de mesure sur 10 **vertes**. **`mesure psycopg 3/6` annulée à 40 m 46 s** par son
+  `timeout-minutes: 40`, alors qu'elle progressait encore (dernier test à 08:30:57, annulation 08:31:07) :
+  74 modules démarrés sur 87, 13 jamais démarrés, 2 316,3 s de tests cumulés pour une estimation de
+  1 588,7 s. Le module `test_503_agent_host` a pris 1 183,7 s (la carte source le donne à 486,2 s, ×2,4).
+- Job `carte` : `RESULTAT_MESURE: cancelled` → `::error::mesure cancelled : carte non publiée
+  (part en échec ou annulée)`. **Aucun artefact `carte`, aucun cache `carte-eadc7bdc`.**
+- Contrôle de couverture des 10 parts (9 740 fichiers `.coverage*`) : **1 fichier vide**,
+  `mesure-psycopg-6/cov/.coverage.ameesh-ci-1.pid148376.X2fizArx`, encadré par les contextes
+  `tests.test_l16_acp.AcpTest.test_protocole_invalide_finit_en_erreur` (PID 148315 / 148439).
+  Le correctif #2177 (save du faux agent sur SIGTERM) est dans le main mais ne couvre pas ce chemin :
+  même une mesure complète aurait rendu une carte partielle (#1257/#1690/#1707).
+- Détail et tableau des parts : `mesure-summary.md`.
+
+## Plan (L161f) et prévalidation
+    PYTHONPATH=src python3 scripts/test-plan.py plan \
+      --out plan-1770-no-map-eadc7bdc.json --event pull_request \
+      --base eadc7bdcfb5b105a4bef23a513f57b2843154615 \
+      --base-ref main --head-ref remise/1770-rebase-main-eadc7bdc
+- head b441fa85, **map absent**, `mode full`, `sure=false`, why « no map ».
+
+    ameesh work prevalidate 1770 --sha b441fa857cbe792d3b25c5937987cb1235d1a7ed \
+      --plan plan-1770-no-map-eadc7bdc.json --host ameesh-agents-1 \
+      --base eadc7bdcfb5b105a4bef23a513f57b2843154615 \
+      --canon-repo /home/ameesh/canon \
+      --canon-commit e86003737725ccc9aa5cca60288e980958ba91ca --json
+- Résultat : **rc=1, causes `["card-missing"]`** — « carte absente ; map not usable (no map) ;
+  sélection non sûre: no map ; phase 2 non sûre: no map » (`refus.json` joint).
+- **Aucun envoi VM, aucun run de prévalidation, aucun repli local, aucun faux vert** : `selection()`
+  refuse avant `run_offload`. Rien n'a été persisté en base.
+
+## Suite (décision pilote)
+- Aucun retry en boucle, aucun second dispatch : la mesure autorisée est consommée et rouge.
+- Deux causes indépendantes à traiter avant une nouvelle mesure :
+  1. **Partition/plafond** : la part psycopg 3/6 était sous-estimée (poids de la carte d900521b,
+     eux-mêmes mesurés sous une autre charge) et il lui manquait ~13 modules à 40 min. Options :
+     corriger les poids/le découpage (geste CI sensible), ou relever le plafond des parts de mesure
+     (borne haute #755 : 60 min), ou les deux.
+  2. **Couverture perdue** : #2177 est nécessaire mais insuffisant ; le fichier vide de
+     `test_l16_acp` vient d'un processus autre que le faux agent couvert (pont/enfant tué avant
+     l'installation du gestionnaire). Options : instrumenter les PID enfants pour qualifier, faire
+     sauver la couverture au pont, ou rendre le save robuste au SIGKILL.
+- La carte d900521b est partielle (3 fichiers ignorés) : elle ne peut pas servir de carte qualifiante ;
+  elle n'a servi qu'aux poids du plan de mesure, comme le workflow le fait par construction.
+- Aucune fusion, aucun verdict, aucune activation du canon. Le lot reste en build.
