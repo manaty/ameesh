@@ -13,7 +13,7 @@ from tests.support import PgTestCase
 
 class UnitTest(unittest.TestCase):
     now = plan.day_start_ts("2026-10-12") + 12 * 3600
-    rows = [{"id": 1, "state": "build", "package_id": "child"}]
+    rows = [{"id": 1, "state": "qa", "package_id": "child"}]
     packages = {"child": {"id": "child", "parent": "epic", "present": True},
                 "epic": {"id": "epic", "present": True},
                 "prerequisite": {"id": "prerequisite", "present": True}}
@@ -193,6 +193,36 @@ class UnitTest(unittest.TestCase):
                 "head": "b" * 40, "until": "2026-10-18"}
         self.assertEqual(work_dependencies.wait_label(wait),
                          "landing on vehicle #42 (qa, head %s) until 2026-10-18" % ("b" * 12))
+
+    def test_landing_only_parks_a_lot_still_in_review(self):
+        """#2171 N3 : sorti de qa (build, blocked, humain), le signal revient."""
+        expected = {1: {"what": "landing", "vehicle": 2, "step": "qa",
+                        "head": "b" * 40, "until": "2026-10-13"}}
+        self.assertEqual(self.resolve(rows=[{"id": 1, "state": "qa"}],
+                                      landings=[self.landing()]), expected)
+        for state in ("intake", "build", "blocked", "waiting_human"):
+            self.assertEqual(self.resolve(rows=[{"id": 1, "state": state}],
+                                          landings=[self.landing()]), {})
+
+    def test_latest_freeze_breaks_ties_on_id_whatever_the_reading_order(self):
+        """#2171 N2 : dernier gel = (at, id) maximal, comme le pin de set_landing."""
+        rows = [
+            {"id": 9, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "b" * 40},
+            {"id": 3, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "a" * 40},
+            {"id": 4, "work_item_id": 2, "kind": "frozen", "at_ts": 4.0, "sha": "c" * 40},
+            {"id": 5, "work_item_id": 2, "kind": "verdict", "at_ts": 9.0, "sha": "d" * 40},
+        ]
+        self.assertEqual(W.latest_freeze(rows)["sha"], "b" * 40)
+        self.assertIsNone(W.latest_freeze([r for r in rows if r["kind"] != "frozen"]))
+
+        class _St:
+            class progress:
+                @staticmethod
+                def lot_milestones(ids):
+                    return rows
+
+        landing = {"work_item_id": 1, "vehicle_id": 2, "pinned_sha": "b" * 40}
+        self.assertEqual(W._with_heads(_St(), [landing])[0]["head"], "b" * 40)
 
 
 class PgTest(PgTestCase):
@@ -380,3 +410,38 @@ class PgTest(PgTestCase):
                          [r["id"] for r in stagnation.stagnant_lots(self.db, now=end_until - 1)])
         self.assertIn(waiting["id"],
                       [r["id"] for r in stagnation.stagnant_lots(self.db, now=end_until)])
+
+    def test_landing_lot_losing_its_verdict_or_freeze_gets_the_signal_back(self):
+        """#2171 N3 (revue cx1) : la lecture groupée relit l'admission du lot.
+
+        Un nouveau gel du lot admis, sans verdict, le laisse en `qa` mais défait
+        son admission : `planned_waits.read` (donc stagnation et progress) rend
+        le signal, comme `progress.verdict_current`."""
+        waiting = work.add(self.db, title="carried while qa", app="acme")
+        work.move(self.db, waiting["id"], "build", actor="test")
+        work.move(self.db, waiting["id"], "qa", actor="test")
+        head = "c" * 40
+        work.milestone(self.db, waiting["id"], "frozen", sha=head, actor="test")
+        work.milestone(self.db, waiting["id"], "verdict", verdict="ok", sha=head,
+                       actor="reviewer")
+        self.old(waiting)
+        vehicle = work.add(self.db, title="package vehicle", app="acme")
+        work.milestone(self.db, vehicle["id"], "frozen", sha="e" * 40, actor="test")
+        until = (datetime.date.fromtimestamp(self.now)
+                 + datetime.timedelta(days=2)).isoformat()
+        work_dependencies.land(self.db, waiting["id"], vehicle["id"],
+                               until_on=until, actor="pilot")
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        # nouveau gel du LOT admis, sans verdict : il reste qa, le signal revient
+        work.milestone(self.db, waiting["id"], "frozen", sha="d" * 40, actor="test")
+        self.old(waiting)
+        item = work.get(self.db, waiting["id"])
+        self.assertEqual(item["state"], "qa")
+        self.assertIsNone(W.read(self.db, [item], now=self.now).get(waiting["id"]))
+        self.assertIsNone(plan.annotate(self.db, [item], now=self.now)[0]["planned_wait"])
+        self.assertIn(waiting["id"],
+                      [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # le verdict ok de l'ancienne tête ne vaut pas pour le nouveau gel
+        self.assertFalse(progress._jalons_de_lot(
+            item, [], [], storage.of(self.db).progress.lot_milestones([waiting["id"]])
+        ).get("verdict_current"))
