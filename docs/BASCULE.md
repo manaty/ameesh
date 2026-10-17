@@ -1332,6 +1332,19 @@ partial directory and leaves the active version untouched. `src-current` and
 `etat`), copied to the VM (server and agents) so that install and rollback use
 the same version whatever commit is deployed.
 
+Launcher bookkeeping follows `bin/` itself (#2230). An activation that writes
+the new launchers and then fails before the switch (full disk, read-only
+`bin/`) leaves the marker naming the new version; the next successful
+activation still removes every launcher of ours that the live version no longer
+provides, so an orphan does not survive an interrupted switch. A script that
+exists only in the new version may still be absent for the moment between the
+launcher writes and the symlink rename (accepted window: it exits 127 with a
+clear message). `retour` renames the symlink **first** and rewrites the
+launchers best-effort, so a full disk or a read-only `bin/` cannot block a
+manual rollback. A script adopted from the previous version becomes a launcher
+when returning, and disappears at the next activation of a version that does
+not provide it — by design.
+
 ## Update to 1.10.0 (path B, mediated executor)
 
 1.10.0 brings path B, the mediated executor (L107 to L115,
