@@ -29,7 +29,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
@@ -215,6 +215,38 @@ class BasculeTest(unittest.TestCase):
         self.assertFalse(lanceur.exists(), "lanceur d'une version quittée laissé")
         self.assertEqual((0, "v1"), lire(self.venv))
 
+    def test_activation_echouee_apres_lanceurs_ne_laisse_pas_d_orphelin(self):
+        """#2230 N1 : le ménage se recalcule depuis bin/, pas depuis le marqueur."""
+        vrai_venv(self.base, "v1", "v1", "v1")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "v2")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        outil = self.base / "venv-v2" / "bin" / "outil-v2"
+        outil.write_text("#!%s/bin/python\nimport pkg1969\nprint(pkg1969.VALUE)\n"
+                         % (self.base / "venv-v2"))
+        outil.chmod(0o755)
+        vrai_venv(self.base, "v3", "v3", "v3")
+        (self.base / "venv-v3" / bascule.MARKER).write_text(json.dumps({"version": "v3"}))
+
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        lanceur = self.venv / "bin" / "outil-v2"
+        self.assertTrue(lanceur.is_file())
+
+        # L'activation de v3 écrit ses lanceurs et son marqueur, puis échoue
+        # avant la bascule (écriture de la précédente impossible) : le
+        # marqueur nomme déjà v3, donc les noms de v2 en sortent.
+        with mock.patch.object(bascule, "_write_report", side_effect=OSError("disque plein")):
+            with self.assertRaises(OSError):
+                activer(self.venv, "v3")
+        self.assertEqual((0, "v2"), lire(self.venv))
+        self.assertTrue(lanceur.is_file(), "l'échec ne doit rien retirer")
+
+        # La reprise aboutit et retire le lanceur que la version vivante ne
+        # porte plus : un orphelin ne survit pas à une activation interrompue.
+        self.assertEqual(0, activer(self.venv, "v3"))
+        self.assertEqual((0, "v3"), lire(self.venv))
+        self.assertFalse(lanceur.exists(), "lanceur orphelin laissé hors du suivi")
+
     # -- B2 : le retour réutilise le venv réel, sans pip --------------------
 
     def test_retour_reutilise_le_venv_reel_sans_pip(self):
@@ -269,6 +301,20 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual((0, "v2"), lire(self.venv))
         self.assertEqual(0, retour(self.venv))
         self.assertEqual((0, "v1"), lire(self.venv))
+
+    def test_retour_bascule_meme_si_les_lanceurs_ne_peuvent_pas_etre_ecrits(self):
+        """#2230 N3 : le retour utile est le rename ; les lanceurs sont best-effort."""
+        vrai_venv(self.base, "v1", "v1", "v1")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "v2")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        with mock.patch.object(bascule, "_installer_lanceurs",
+                               side_effect=OSError("disque plein")):
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(0, retour(self.venv))
+        self.assertEqual((0, "v1"), lire(self.venv))
+        self.assertIn("lanceurs non réécrits", err.getvalue())
 
     def test_bascule_concurrente_voit_ancien_ou_nouveau_entier(self):
         faux_venv(self.base, "v1")
