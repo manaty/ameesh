@@ -1726,9 +1726,16 @@ class WorkItems(Domain):
         """Journal du lot, du plus récent au plus ancien."""
 
     @abc.abstractmethod
-    def events_noted(self, prefix: str, since_ts: float) -> list[dict]:
-        """L317c : les lignes de journal, tous lots, dont la note commence par
-        `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
+    def events_noted(self, prefix: str, since_ts: float, *,
+                     ids: Sequence[int] | None = None) -> list[dict]:
+        """L317c : les lignes de journal dont la note commence par `prefix`,
+        écrites depuis `since_ts` (les plus anciennes d'abord).
+
+        `ids` borne la lecture à ces éléments (#2162, `backlog._DirNotes`) :
+        sans lui, tous les lots ; avec lui, l'historique des lots clos n'est
+        pas lu. Le filtre porte sur les ids, jamais sur une fenêtre
+        temporelle : une note ancienne d'un élément candidat reste lue, donc
+        dédupliquée exactement."""
 
     @abc.abstractmethod
     def milestones(self, item_id: int, limit: int) -> list[dict]:

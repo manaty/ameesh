@@ -884,17 +884,30 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
-    def events_noted(self, prefix, since_ts) -> list[dict]:
+    def events_noted(self, prefix, since_ts, *, ids=None) -> list[dict]:
         pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        params = [pattern, float(since_ts)]
+        # #2162 : borne la lecture aux éléments candidats (index
+        # work_item_events_item_idx) — sans `ids`, le journal entier reste lu.
+        # Aucune fenêtre temporelle : une note ancienne d'un candidat compte.
+        borne = ""
+        if ids is not None:
+            ids = [int(item_id) for item_id in ids]
+            if not ids:
+                return []
+            borne = (" AND e.work_item_id IN"
+                     " (SELECT jsonb_array_elements_text(%s::jsonb)::bigint)")
+            params.append(json.dumps(ids))
         return self.db.query(
             """
             SELECT e.id, e.work_item_id, e.state, e.note, e.actor, w.assignee,
                    extract(epoch from e.created_at)::float8 as created_ts
               FROM work_item_events e JOIN work_items w ON w.id = e.work_item_id
              WHERE e.note LIKE %s AND e.created_at >= to_timestamp(%s)
+            """ + borne + """
              ORDER BY e.id
             """,
-            (pattern, float(since_ts)),
+            tuple(params),
         )
 
     def milestones(self, item_id, limit) -> list[dict]:
