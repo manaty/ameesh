@@ -4,15 +4,23 @@
   ameesh progress --serve [--port 8765] [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
 
 A standard-library HTTP server, **bound to 127.0.0.1 only** (no host
-option), **read-only**: GET and HEAD, nothing else (405), and a Postgres
-session with `default_transaction_read_only` — a write would fail in the
-database itself.
+option), **read-only** except the conversation input of an agent's card
+(L83): GET and HEAD everywhere, plus `POST /api/conversation.json` (the
+`chat` action of L87, idempotency included), and a Postgres session with
+`default_transaction_read_only` for every read — a write would fail in the
+database itself; the input opens its own writable connection.
 
   /                      the page, **without data** (no token needed): it
                          reads /api/progress.json, again at each Refresh
   /api/progress.json     the `ameesh-progress/1` snapshot, with
                          `Authorization: Bearer <token>` only (`?project=P`:
                          a known project, 400 otherwise)
+  /api/conversation.json one agent's shared conversation (L78): GET
+                         (`?agent=NAME&after=N&limit=N`) and POST
+                         (`{agent, text, lot?}` with `Idempotency-Key`),
+                         `Authorization: Bearer <token>` required. The POST
+                         is the only write; a cross-origin request is
+                         preflighted (OPTIONS) and refused (405).
 
 The host is shared (several agents, several Unix accounts): 127.0.0.1 does
 not keep them out. A random **token**, drawn at each start, is required by
@@ -51,6 +59,15 @@ DEFAULT_PORT = 8765
 #: durée de vie d'un instantané servi (secondes)
 CACHE_S = 5.0
 API = "/api/progress.json"
+#: la conversation d'un agent (L83) : lecture, et la seule écriture du serveur
+CHAT = "/api/conversation.json"
+#: corps borné d'une saisie (L83)
+MAX_CHAT_BODY = 16 * 1024
+#: page de conversation maximale
+MAX_CHAT = 500
+_AGENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:+-]{0,127}$")
+_SEQ_RE = re.compile(r"^(0|[1-9][0-9]{0,15})$")
+_IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/-]{0,200})")
 _HEADERS = (("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
@@ -123,14 +140,73 @@ def db_builder(cfg, *, since: str, stale_after: float, gantt: bool,
     return build
 
 
+def _number(query: dict, name: str, default: int, minimum: int,
+            maximum: int | None) -> int:
+    values = query.get(name)
+    if not values or values[0] == "":
+        return default
+    raw = values[0]
+    if not _SEQ_RE.match(raw):
+        raise ServeError(400, "%s: a number is required" % name)
+    value = int(raw)
+    if value < minimum or (maximum is not None and value > maximum):
+        raise ServeError(400, "%s out of range" % name)
+    return value
+
+
+def db_chat(cfg):
+    """La conversation d'un agent (L83), servie avec la page : lecture, et la
+    saisie de la fiche 0024 par le **même** chemin d'écriture que
+    `POST /api/v1/agents/{agent}/chat` (`serve.act` : action `chat`,
+    idempotence comprise). Rend `(read, write_chat)`."""
+    from . import conversation, serve, serve_actions
+    ro = dataclasses.replace(cfg, read_only=True)
+    ctx = serve.Context(cfg=ro, human=serve.owner(cfg, None))
+    action = next(item for item in serve_actions.ACTIONS if item.name == "chat")
+    write = serve.db_writer(cfg)
+
+    def read(query: dict) -> dict:
+        values = query.get("agent") or [""]
+        agent = values[0]
+        if not _AGENT_RE.match(agent):
+            raise ServeError(400, "agent: a name is required")
+        after = _number(query, "after", 0, 0, None)
+        limit = _number(query, "limit", 50, 1, MAX_CHAT)
+        db = db_mod.connect(ro)
+        try:
+            db_mod.require_schema(db, defer=True)
+            return conversation.history(db, agent, after=after, limit=limit)
+        finally:
+            db.close()
+
+    def write_chat(key: str, body: dict) -> tuple:
+        agent = body.get("agent")
+        if not isinstance(agent, str) or not _AGENT_RE.match(agent):
+            raise ServeError(400, "agent: a name is required")
+        payload = {name: value for name, value in body.items() if name != "agent"}
+        unknown = sorted(set(payload) - {"text", "lot"})
+        if unknown:
+            raise ServeError(400, "unknown field(s): %s" % ", ".join(unknown))
+        digest = serve.fingerprint(CHAT, body)
+
+        def run(db):
+            return serve.act(ctx, db, action, {"agent": agent}, payload, key, digest)
+        return write(run)
+
+    return read, write_chat
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
-    """Lecture seule : GET et HEAD ; tout le reste rend 405."""
+    """Lecture seule, sauf la saisie de conversation (L83) : GET et HEAD
+    partout, et `POST /api/conversation.json` pour la fiche agent."""
 
     server_version = "ameesh-progress"
     sys_version = ""
     #: posés par `make_server`
     snapshots: Snapshots
     token: str
+    read_chat = None
+    write_chat = None
     default_project: str | None = None
 
     # -- garde --------------------------------------------------------------
@@ -163,18 +239,99 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(status, (message + "\n").encode("utf-8"), "text/plain; charset=utf-8", extra)
 
     def _refuse(self) -> None:
-        self._error(405, "read-only: GET and HEAD only", (("Allow", "GET, HEAD"),))
+        path = urllib.parse.urlsplit(self.path).path
+        allow = "GET, HEAD, POST" if path == CHAT and self.write_chat is not None else "GET, HEAD"
+        if allow.endswith("POST"):
+            message = "conversation: GET, HEAD and POST only"
+        elif self.write_chat is not None:
+            message = "read-only: GET and HEAD only (POST: %s alone)" % CHAT
+        else:
+            message = "read-only: GET and HEAD only"
+        self._error(405, message, (("Allow", allow),))
 
-    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = \
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = \
         lambda self: self._refuse()
+
+    def _host_refused(self) -> None:
+        self._error(403, "host refused: open http://127.0.0.1:%d/"
+                    % self.server.server_address[1])
+
+    def _unauthorized(self) -> None:
+        self._error(401, "token missing or refused: open the URL printed at start "
+                         "by ameesh progress --serve", (("WWW-Authenticate", "Bearer"),))
+
+    def _json_body(self) -> dict:
+        from . import serve
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            raise ServeError(415, "Content-Type: application/json is required")
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            raise ServeError(400, "invalid Content-Length")
+        if length <= 0:
+            raise ServeError(400, "a JSON body is required")
+        if length > MAX_CHAT_BODY:
+            raise ServeError(413, "body too large (max %d bytes)" % MAX_CHAT_BODY)
+        try:
+            # the parser of L87 (`serve._body`): no duplicate key, no NaN
+            body = json.loads(self.rfile.read(length).decode("utf-8"),
+                              parse_constant=serve._no_constant,
+                              object_pairs_hook=serve._no_duplicates)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise ServeError(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            raise ServeError(400, "a JSON object is required")
+        return body
+
+    def do_POST(self) -> None:
+        if not self._host_ok():
+            self._host_refused()
+            return
+        url = urllib.parse.urlsplit(self.path)
+        if url.path != CHAT or self.read_chat is None or self.write_chat is None:
+            # une seule écriture : la saisie de la conversation (L83) ; tout le
+            # reste du serveur demeure en lecture seule (L304)
+            self._refuse()
+            return
+        if not self._token_ok(self._bearer()):
+            self._unauthorized()
+            return
+        key = (self.headers.get("Idempotency-Key") or "").strip()
+        if not _IDEMPOTENCY_RE.match(key):
+            self._error(400, "one Idempotency-Key header (8 to 128 characters) is required")
+            return
+        try:
+            body = self._json_body()
+        except ServeError as exc:
+            self._error(exc.status, str(exc))
+            return
+        try:
+            status, data, replayed = self.write_chat(key, body)
+        except ServeError as exc:
+            # validation de la saisie : refus avant tout dépôt
+            self._error(exc.status, str(exc))
+            return
+        except (progress.ProgressError, db_mod.DbError, db_mod.Unavailable,
+                db_mod.SchemaMissing) as exc:
+            self._error(503, "conversation unavailable: %s" % exc)
+            return
+        except Exception as exc:  # noqa: BLE001 — an answer, never a trace
+            # `serve.act` keeps the key reserved: the message may be delivered
+            self.log_message("conversation input: internal error (%s)", type(exc).__name__)
+            self._error(500, "internal error: the message may have been delivered; "
+                             "check the conversation before sending it again")
+            return
+        extra = (("Idempotent-Replayed", "true"),) if replayed else ()
+        self._send(status, json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                   "application/json; charset=utf-8", extra)
 
     def do_HEAD(self) -> None:
         self.do_GET()
 
     def do_GET(self) -> None:
         if not self._host_ok():
-            self._error(403, "host refused: open http://127.0.0.1:%d/"
-                        % self.server.server_address[1])
+            self._host_refused()
             return
         url = urllib.parse.urlsplit(self.path)
         if url.path == "/":
@@ -182,12 +339,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
             html = progress.render_html(None, served=True)
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if url.path == CHAT:
+            if not self._token_ok(self._bearer()):
+                self._unauthorized()
+                return
+            if self.read_chat is None:
+                self._error(404, "conversation not served")
+                return
+            query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
+            try:
+                page = self.read_chat(query)
+            except ServeError as exc:
+                self._error(exc.status, str(exc))
+                return
+            except (progress.ProgressError, db_mod.DbError, db_mod.Unavailable,
+                    db_mod.SchemaMissing) as exc:
+                self._error(503, "conversation unavailable: %s" % exc)
+                return
+            except Exception as exc:  # noqa: BLE001 — an answer, never a trace
+                self.log_message("conversation: internal error (%s)", type(exc).__name__)
+                self._error(500, "internal error")
+                return
+            data = json.dumps(page, ensure_ascii=False, sort_keys=True)
+            self._send(200, data.encode("utf-8"), "application/json; charset=utf-8")
+            return
         if url.path != API:
-            self._error(404, "not found: / or %s" % API)
+            self._error(404, "not found: /, %s or %s" % (API, CHAT))
             return
         if not self._token_ok(self._bearer()):
-            self._error(401, "token missing or refused: open the URL printed at start "
-                             "by ameesh progress --serve", (("WWW-Authenticate", "Bearer"),))
+            self._unauthorized()
             return
         query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
         try:
@@ -234,12 +414,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def make_server(snapshots: Snapshots, *, port: int = DEFAULT_PORT, token: str | None = None,
-                project: str | None = None) -> http.server.ThreadingHTTPServer:
+                project: str | None = None,
+                chat: tuple | None = None) -> http.server.ThreadingHTTPServer:
     """Le serveur, lié à 127.0.0.1 (port 0 : un port libre). Son jeton est
-    `server.token` ; un nouveau à chaque appel si `token` n'est pas donné."""
+    `server.token` ; un nouveau à chaque appel si `token` n'est pas donné.
+    `chat=(read, write)` ouvre la conversation (L83) ; sans lui, tout POST
+    reste refusé (405) et la conversation n'est pas servie."""
     token = token or secrets.token_urlsafe(24)
-    handler = type("ProgressHandler", (Handler,), {
-        "snapshots": snapshots, "token": token, "default_project": project})
+    attributes = {"snapshots": snapshots, "token": token, "default_project": project}
+    if chat:
+        attributes["read_chat"] = staticmethod(chat[0])
+        attributes["write_chat"] = staticmethod(chat[1])
+    handler = type("ProgressHandler", (Handler,), attributes)
     try:
         server = http.server.ThreadingHTTPServer((BIND, int(port)), handler)
     except OSError as exc:
@@ -263,8 +449,9 @@ def serve(cfg, *, port: int, since: str, stale_after: float, gantt: bool,
                                      versions=versions))
     # une première lecture : base injoignable ou schéma absent, dit tout de suite
     snapshots.get(project)
-    server = make_server(snapshots, port=port, project=project)
-    print("progress page (read-only): %s" % url_of(server),
+    chat = db_chat(cfg)
+    server = make_server(snapshots, port=port, project=project, chat=chat)
+    print("progress page (read-only except the conversation input): %s" % url_of(server),
           file=out, flush=True)
     print("Ctrl-C to stop; a restart draws a new token.", file=out, flush=True)
     try:
@@ -276,4 +463,5 @@ def serve(cfg, *, port: int, since: str, stale_after: float, gantt: bool,
     return 0
 
 
-__all__ = ["BIND", "DEFAULT_PORT", "Snapshots", "make_server", "serve", "url_of"]
+__all__ = ["BIND", "CHAT", "DEFAULT_PORT", "Snapshots", "db_chat", "make_server", "serve",
+           "url_of"]

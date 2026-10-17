@@ -187,13 +187,18 @@ def day_start_ts(day: str | None) -> float | None:
 # --------------------------------------------------------------------------
 
 def annotate(db, rows: list[dict], *, now: float | None = None,
-             threshold: float = stagnation.DEFAULT_THRESHOLD_S) -> list[dict]:
+             threshold: float = stagnation.DEFAULT_THRESHOLD_S,
+             cfg=None, review_class: dict | None = None) -> list[dict]:
     """Ajoute à chaque lot : `epic`, `waiting_for` (`{what, who, label}`),
     `stale`, `last_activity_ts` — calculés par le module `stagnation`, comme
     l'alerte `stale_lot` et `ameesh progress` — et `delegation` (L40,
-    `work.delegation_view`)."""
+    `work.delegation_view`).
+
+    `cfg` et `review_class` (#1822) : le contexte de classe de revue transmis à
+    `stagnation.describe` (un lot léger attend la fusion, pas un verdict)."""
     packages = {p["id"]: p for p in storage.of(db).packages.all(include_absent=True)}
-    described = stagnation.describe(db, rows, now=now, threshold=threshold)
+    described = stagnation.describe(db, rows, now=now, threshold=threshold,
+                                    cfg=cfg, review_class=review_class)
     for row in rows:
         info = described[int(row["id"])]
         row["epic"] = epic_of(row.get("package_id"), packages)

@@ -11,6 +11,7 @@ from typing import Any
 from .. import interface
 from .action_source import ActionSource
 from .api_requests import ApiRequests
+from .alert_acknowledgements import AlertAcknowledgements
 from .accounts import Accounts
 from .actions import Actions
 from .budgets import Budgets
@@ -36,6 +37,7 @@ from .placement import Placements
 from .prevalidation import PrevalidationReports
 from .progress import Progress
 from .projects import Projects
+from .provenance import Provenance
 from .roadmap import Roadmap
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
@@ -62,6 +64,7 @@ class PostgresStorage(interface.Storage):
         self.credentials = Credentials(db)
         self.budgets = Budgets(db)
         self.api_requests = ApiRequests(db)
+        self.alert_acknowledgements = AlertAcknowledgements(db)
         self.watches = Watches(db)
         self.events = Events(db)
         self.catalog = Catalog(db)
@@ -72,6 +75,7 @@ class PostgresStorage(interface.Storage):
         self.nonces = Nonces(db)
         self.work = WorkItems(db)
         self.work_dependencies = WorkDependencies(db)
+        self.provenance = Provenance(db)
         self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)
         self.actions = Actions(db)

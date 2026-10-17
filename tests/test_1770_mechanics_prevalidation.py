@@ -67,6 +67,8 @@ IDENTICAL = {
     "schema": "ameesh-mechanics/1",
     "timezone": "Europe/Paris",
     "cutoffs": ["11:00", "23:00"],
+    # #1756, arrivé entre-temps : le document /1 porte aussi `packets`
+    "packets": {"cutoffs": []},
     "build": {"max_in_build": 2},
     "ci": {"packet": "full", "incident_label": "ci-full",
            "environment_red": "does_not_block",

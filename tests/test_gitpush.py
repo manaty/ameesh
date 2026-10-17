@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Témoin de `ameesh.gitpush` (#1173) : la politique des deux essais.
+"""Witness of `ameesh.gitpush` (#1173): the two-attempt policy.
 
-Sans git, sans réseau, sans base : un faux `run` rend les codes et les sorties
-choisis. Premier essai accepté -> un seul appel ; refus puis acceptation ->
-deux appels tracés ; refus aux deux essais -> le dernier proc est rendu à
-l'appelant, qui décide de l'arrêt.
+No git, no network, no database: a fake `run` returns the chosen codes and
+outputs. First attempt accepted -> a single call; refusal then acceptance ->
+two traced calls; refusal on both attempts -> the last proc is returned to the
+caller, which decides to stop. Credentials in the traced detail are masked, and
+an exception raised by `run` propagates without a new attempt.
 """
 from __future__ import annotations
 
+import subprocess
 import unittest
 from unittest import mock
 
@@ -22,7 +24,7 @@ class _Proc:
 
 
 class _Runner:
-    """Un `run` scripté : rend les procs dans l'ordre, retient les argv."""
+    """A scripted `run`: returns the procs in order, records the argv."""
 
     def __init__(self, *procs: _Proc):
         self.procs = list(procs)
@@ -31,6 +33,18 @@ class _Runner:
     def __call__(self, argv):
         self.argv.append(list(argv))
         return self.procs[min(len(self.argv) - 1, len(self.procs) - 1)]
+
+
+class _Exploding:
+    """A `run` that raises instead of returning a proc."""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls = 0
+
+    def __call__(self, argv):
+        self.calls += 1
+        raise self.exc
 
 
 class PushWithRetryTest(unittest.TestCase):
@@ -52,9 +66,9 @@ class PushWithRetryTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(len(run.argv), 2)
         self.assertEqual(len(traces), 2)
-        self.assertIn("essai 1/2", traces[0])
+        self.assertIn("attempt 1/2", traces[0])
         self.assertIn("remote rejected", traces[0])
-        self.assertIn("acceptée au deuxième essai", traces[1])
+        self.assertIn("accepted on the second attempt", traces[1])
 
     def test_echec_definitif_deux_essais_puis_arret(self):
         run = _Runner(_Proc(1, stderr="! [remote rejected] HEAD -> lot/x (failed)"))
@@ -64,8 +78,8 @@ class PushWithRetryTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(len(run.argv), 2)
         self.assertEqual(len(traces), 2)
-        self.assertIn("essai 1/2", traces[0])
-        self.assertIn("essai 2/2", traces[1])
+        self.assertIn("attempt 1/2", traces[0])
+        self.assertIn("attempt 2/2", traces[1])
 
     def test_le_delai_par_defaut_est_de_dix_secondes(self):
         self.assertEqual(gitpush.RETRY_DELAY_S, 10)
@@ -78,8 +92,23 @@ class PushWithRetryTest(unittest.TestCase):
         run = _Runner(_Proc(1, stderr="x" * 1000), _Proc(0))
         traces: list[str] = []
         gitpush.push_with_retry(run, ["git", "push"], delay=0, trace=traces.append)
-        detail = traces[0].split(" : ", 1)[1].split(" ; ", 1)[0]
+        detail = traces[0].split("): ", 1)[1].split("; retrying", 1)[0]
         self.assertEqual(len(detail), gitpush.DETAIL_MAX)
+
+    def test_identifiants_masques_dans_le_detail(self):
+        run = _Runner(_Proc(1, stderr="fatal: unable to access "
+                            "'https://user:secret@github.com/manaty/x.git/'"),
+                      _Proc(0))
+        traces: list[str] = []
+        gitpush.push_with_retry(run, ["git", "push"], delay=0, trace=traces.append)
+        self.assertNotIn("secret", traces[0])
+        self.assertIn("https://***@github.com", traces[0])
+
+    def test_exception_de_run_remonte_sans_nouvel_essai(self):
+        run = _Exploding(subprocess.TimeoutExpired(["git", "push"], 10))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            gitpush.push_with_retry(run, ["git", "push"], delay=0)
+        self.assertEqual(run.calls, 1)
 
     def test_trace_absente_est_sans_effet(self):
         run = _Runner(_Proc(1), _Proc(1))

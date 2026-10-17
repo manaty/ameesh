@@ -24,6 +24,7 @@ class FakeOps:
         self.notes: list = []
         self.added: list = []
         self.events_rows: dict = {}
+        self.milestones_rows: dict = {}
         self.next_id = 900
 
     def open_by_ref(self, ref):
@@ -37,6 +38,9 @@ class FakeOps:
 
     def events(self, item_id, limit):
         return self.events_rows.get(int(item_id), [])
+
+    def milestones(self, item_id, limit=100):
+        return self.milestones_rows.get(int(item_id), [])
 
     def note(self, item_id, state, text, actor):
         self.notes.append((int(item_id), text, actor))
@@ -60,6 +64,10 @@ class RuleTest(unittest.TestCase):
                      "assignee": "a1", "state": "merged", "branch_target": "main",
                      "type": "evolution"}
         self.ops = FakeOps({LOT: self.item})
+        # #1053 : la famille vient du gel (acteur + tours tracés), pas du registre
+        self.ops.milestones_rows[LOT] = [
+            {"id": 1, "kind": "frozen", "sha": "a" * 40, "actor": "a1",
+             "at_ts": 1_700_000_000.0}]
         store = mock.Mock(work=self.ops)
         for patch in (
             mock.patch.object(storage, "of", return_value=store),
@@ -69,6 +77,7 @@ class RuleTest(unittest.TestCase):
             mock.patch.object(work, "note",
                               side_effect=lambda db, n, text, actor="": self.ops.note(
                                   n, "", text, actor)),
+            mock.patch.object(review_lot, "_turns_harness", return_value="codex"),
             mock.patch.object(registry, "get",
                               side_effect=lambda db, name: {"harness": "deepseek"}
                               if name == "a1" else None),
@@ -102,9 +111,23 @@ class RuleTest(unittest.TestCase):
         self.assertIn("#539", item["title"])
         body = item["body"]
         self.assertIn("23:59 Europe/Paris", body)
-        self.assertIn("codex", body)           # famille opposée à deepseek
+        # #1053 : la famille suit les tours du gel (codex), pas le registre
+        # courant (deepseek) — le relecteur désigné reste donc Claude.
+        self.assertIn("- Auteur : a1 (harnais codex)", body)
+        self.assertIn("— claude (règle du pilote du 13/10)", body)
+        self.assertNotIn("codex ou claude", body)
         self.assertIn("a" * 12, body)
         self.assertIn("ameesh work milestone 539 verdict", body)
+
+    def test_sans_tour_trace_la_famille_reste_inconnue(self):
+        """#1053 : aucun tour au gel — le registre courant (deepseek) ne sert
+        pas de preuve ; la famille reste ouverte, et le corps le dit."""
+        self.ops.milestones_rows.pop(LOT)
+        out = self.open()
+        self.assertTrue(out["created"], out)
+        body = self.ops.added[0]["body"]
+        self.assertIn("harnais non tracé au gel", body)
+        self.assertIn("codex ou claude", body)
 
     def test_la_seconde_ouverture_est_un_no_op(self):
         first = self.open()
@@ -160,6 +183,11 @@ class ReviewLotDbTest(PgTestCase):
         registry.upsert(self.db, "a1", harness="deepseek", host=self.cfg.host)
         self.lot = work.add(self.db, title="un chemin léger", app="ameesh",
                             assignee="a1")["id"]
+        # #1053 : le gel et le tour qui l'a produit portent la famille du lot
+        self.db.execute("INSERT INTO turn_costs (agent, harness, recorded_at)"
+                        " VALUES (%s, %s, now() - interval '1 minute')",
+                        ("a1", "deepseek"))
+        work.milestone(self.db, self.lot, "frozen", sha="a" * 40, actor="a1")
 
     def test_le_lot_de_relecture_est_ouvert_une_fois(self):
         out = review_lot.open_after_merge(
@@ -171,7 +199,8 @@ class ReviewLotDbTest(PgTestCase):
                          ("intake", None, "evolution", "ameesh"))
         self.assertEqual(item["issue_ref"], review_lot.ref_of(self.lot))
         self.assertIn("23:59 Europe/Paris", item["body"])
-        self.assertIn("codex", item["body"])
+        self.assertIn("- Auteur : a1 (harnais deepseek)", item["body"])
+        self.assertIn("codex", item["body"])   # famille opposée à deepseek
         events = storage.of(self.db).work.events(self.lot, 20)
         self.assertTrue(any(review_lot.ref_of(self.lot) in (e["note"] or "")
                             for e in events), events)

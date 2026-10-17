@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1124 : les explorations restent hors des plans et des lots.
+"""#1124: explorations stay out of plans and lots.
 
-Lecteur sans base, exécuté en CI sur les PR de documentation aussi bien que
-sur les changements de code. Les fixtures vérifient les refus ; le test du
-dépôt applique la garde aux documents versionnés et nouveaux non ignorés.
-Le canon externe et les lots Postgres ne sont pas accessibles à cette garde.
+Database-free reader, run in CI on documentation PRs as well as on code
+changes. The fixtures check the refusals; the repository test applies the
+guard to versioned and new non-ignored documents. The external canon and the
+Postgres lots are not reachable from this guard.
+
+The guard is heuristic. A document counts as a plan/roadmap/lot when a token
+of its path belongs to `PLANNING_NAMES`, or when its `type` field belongs to
+`PLANNING_TYPES`; a reference to `explorations/` is then searched in the
+decoded text (HTML entities, three bounded `unquote` passes, backslashes
+normalized). Known false positives: a planning document that merely mentions
+`explorations/` in prose is refused. Known false negatives: a synonym absent
+from both lists (`feuille-de-route`, `chantier`…) is not seen as planning, and
+a reference obfuscated beyond the three decoding passes is not detected. Both
+lists are deliberately finite: extend them rather than rely on a full
+Markdown parser.
 """
 from __future__ import annotations
 
@@ -68,19 +79,19 @@ def exploration_errors(path: pathlib.PurePosixPath, text: str) -> list[str]:
     errors = []
     expected_type = "index" if path.name == "index.md" else "exploration"
     if field(text, "type") != expected_type or field(text, "status") != "exploration":
-        errors.append("en-tête type/status d’exploration absent ou incorrect")
+        errors.append("missing or incorrect exploration type/status header")
     folded = normalized(text)
-    # Dates interdites aussi dans les tableaux ou la prose, pas seulement YAML.
+    # Forbidden dates apply to tables and prose too, not only to YAML.
     if DATE.search(folded):
-        errors.append("date dans une exploration")
-    # ATX et Setext : une liste de lots ne peut pas être cachée en sous-section.
+        errors.append("date in an exploration")
+    # ATX and Setext: a list of lots cannot hide in a sub-section.
     lines = folded.splitlines()
     headings = [re.sub(r"[*_`]", "", line.lstrip("# ").strip())
                 for i, line in enumerate(lines)
                 if line.lstrip().startswith("#") or
                 (i + 1 < len(lines) and re.fullmatch(r"\s*(?:=+|-+)\s*", lines[i + 1]))]
     if any(FORBIDDEN_SECTION.search(line) for line in headings) or FORBIDDEN_KEY.search(folded):
-        errors.append("section ou champ de planning dans une exploration")
+        errors.append("planning section or field in an exploration")
     return errors
 
 
@@ -94,31 +105,31 @@ def document_errors(path: pathlib.PurePosixPath, text: str) -> list[str]:
         return exploration_errors(path, text)
     if not is_planning(path, text):
         return []
-    # Liens Markdown, champs YAML/JSON, URLs, chemins Windows ou encodés.
-    # Décodage répété borné pour les références doublement encodées.
+    # Markdown links, YAML/JSON fields, URLs, Windows or encoded paths.
+    # Bounded repeated decoding for doubly encoded references.
     decoded = html.unescape(text)
     for _ in range(3):
         decoded = unquote(decoded)
     decoded = decoded.replace("\\", "/").casefold()
     if re.search(r"(?:^|[/\s\"'(<:])explorations(?:/|[\"')>#?]|$)", decoded, re.MULTILINE):
-        return ["plan/roadmap/lot référence explorations/ : référencer une étude décidée"]
+        return ["plan/roadmap/lot references explorations/: reference a decided study"]
     return []
 
 
 class RepositoryGuardTest(unittest.TestCase):
-    def test_documents_du_depot(self):
+    def test_repository_documents(self):
         files = subprocess.check_output(
             ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=REPO,
         ).decode().split("\0")
         errors = []
-        self.assertTrue((REPO / EXPLORATIONS / "index.md").is_file(), "index du sas absent")
+        self.assertTrue((REPO / EXPLORATIONS / "index.md").is_file(), "exploration index missing")
         for name in sorted(set(files) - {""}):
             path = pathlib.PurePosixPath(name)
             if path.suffix not in DOCUMENTS or path.parts[0] in {"tests", "src", ".github"}:
-                continue  # fixtures et code ne sont pas des fiches de planning
+                continue  # fixtures and code are not planning cards
             local = REPO / name
             if not local.is_file():
-                continue  # suppression locale avant commit
+                continue  # local deletion before commit
             errors.extend(f"{name}: {message}" for message in
                           document_errors(path, local.read_text(encoding="utf-8")))
         self.assertEqual(errors, [], "\n".join(errors))
@@ -126,10 +137,10 @@ class RepositoryGuardTest(unittest.TestCase):
 
 class GuardWitnessTest(unittest.TestCase):
     def exploration(self, body):
-        return document_errors(EXPLORATIONS / "idee.md",
+        return document_errors(EXPLORATIONS / "idea.md",
                                "---\ntype: Exploration\nstatus: exploration\n---\n" + body)
 
-    def test_refuse_planning_dans_exploration(self):
+    def test_rejects_planning_in_exploration(self):
         for body in ("## Lots proposés\n- première tranche", "Proposed lots\n-------------\n",
                      "### **Lots proposés**\n", "## Date cible\nÀ préciser",
                      "target_date: demain", "| cible | 2027-01-02 |",
@@ -138,38 +149,38 @@ class GuardWitnessTest(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertTrue(self.exploration(body))
 
-    def test_accepte_questions_et_contexte(self):
+    def test_accepts_questions_and_context(self):
         self.assertEqual(self.exploration(
-            "## Problème\nPourquoi ?\n## Intuitions\nUne piste.\n"
-            "## Questions ouvertes\n[Étude](../etudes/piste.md)\n"), [])
+            "## Problem\nWhy?\n## Intuitions\nA lead.\n"
+            "## Open questions\n[Study](../etudes/lead.md)\n"), [])
 
-    def test_refuse_entete_incorrect(self):
-        self.assertTrue(document_errors(EXPLORATIONS / "idee.md", "# Une idée\n"))
-        self.assertTrue(document_errors(EXPLORATIONS / "idee.md",
+    def test_rejects_wrong_header(self):
+        self.assertTrue(document_errors(EXPLORATIONS / "idea.md", "# An idea\n"))
+        self.assertTrue(document_errors(EXPLORATIONS / "idea.md",
                                        "---\ntype: Study\nstatus: exploration\n---\n"))
 
-    def test_refuse_references_depuis_planning(self):
+    def test_rejects_references_from_planning(self):
         cases = [
-            ("site/docs/roadmap.md", "[idée](../../docs/design/explorations/idee.md)"),
-            ("plan/ameesh/epic.yaml", "source: docs/design/explorations/idee.md"),
-            ("docs/autre.md", '---\ntype: WorkPackage\n---\n[Idée](explorations/idee.md)'),
-            ("cards/travail.yml", 'type: Lot\nsource: https://example.org/explorations/idee.md'),
-            ("cards/compact.json", '{"type":"WorkPackage","source":"explorations/idee.md"}'),
-            ("cards/travail.json", '{\n "type": "WorkItem",\n "source": "explorations/idee.md"\n}'),
-            ("docs/l148-plan.md", 'source: docs%2Fdesign%2Fexplorations%2Fidee.md'),
-            ("roadmap.md", 'source: docs%252Fdesign%252Fexplorations%252Fidee.md'),
-            ("lots/idee.md", r'source: docs\design\explorations\idee.md'),
+            ("site/docs/roadmap.md", "[idea](../../docs/design/explorations/idea.md)"),
+            ("plan/ameesh/epic.yaml", "source: docs/design/explorations/idea.md"),
+            ("docs/other.md", '---\ntype: WorkPackage\n---\n[Idea](explorations/idea.md)'),
+            ("cards/work.yml", 'type: Lot\nsource: https://example.org/explorations/idea.md'),
+            ("cards/compact.json", '{"type":"WorkPackage","source":"explorations/idea.md"}'),
+            ("cards/work.json", '{\n "type": "WorkItem",\n "source": "explorations/idea.md"\n}'),
+            ("docs/l148-plan.md", 'source: docs%2Fdesign%2Fexplorations%2Fidea.md'),
+            ("roadmap.md", 'source: docs%252Fdesign%252Fexplorations%252Fidea.md'),
+            ("lots/idea.md", r'source: docs\design\explorations\idea.md'),
             ("roadmap.md", "[source](explorations)"),
         ]
         for name, text in cases:
             with self.subTest(name=name, text=text):
                 self.assertTrue(document_errors(pathlib.PurePosixPath(name), text))
 
-    def test_lien_de_navigation_et_etude_decidee(self):
+    def test_navigation_link_and_decided_study(self):
         self.assertEqual(document_errors(pathlib.PurePosixPath("docs/design/index.md"),
                                          "[Explorations](explorations/index.md)"), [])
-        self.assertEqual(document_errors(pathlib.PurePosixPath("plan/travail.md"),
-                                         "[Étude](../docs/design/etudes/idee.md)"), [])
+        self.assertEqual(document_errors(pathlib.PurePosixPath("plan/work.md"),
+                                         "[Study](../docs/design/etudes/idea.md)"), [])
 
 
 if __name__ == "__main__":

@@ -213,6 +213,9 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
         "projects": agent_projects(row),
         "primary": True,
         "state": state,
+        # #1070 : the budget pause, distinct from the `state` "paused" of a
+        # `blocked` for another cause
+        "paused_on_budget": progress.paused_on_budget(row),
         "reason": reason,
         "since_ts": round(float(since), 3) if since else None,
         "mode": row.get("mode") or "execute",

@@ -32,18 +32,22 @@ reader therefore follows a **position** (tx, id): it reads only the events
 whose transaction `tx` is below the snapshot's xmin (over for good: committed
 or rolled back, no event can come before them any more), by (tx, id), after
 its position. Each event has its own position (`format_position`,
-"tx-id-cluster"), the SSE `id`: resuming after it gives exactly the events
+"tx-id-journal"), the SSE `id`: resuming after it gives exactly the events
 that follow, none twice, none lost. An open transaction (any one, on the
 base) holds the delivery back until it ends; it never loses an event.
-`tx` only orders within ONE Postgres cluster and timeline: the position
-carries the cluster's `system_identifier` and its timeline
-(`ameesh_events_cluster()`, "<hex>t<timeline>"), and a position of another
-cluster or timeline (logical restore, point-in-time recovery, promotion) is
-a reset, never a silent skip.
+`tx` only orders within ONE Postgres cluster and timeline, and within ONE
+journal: the position carries the cluster's `system_identifier`, its timeline
+and a random identifier of the log itself (`ameesh_events_cluster()`,
+"<hex>t<timeline>j<journal>", migration 0396/0448), so a position of another
+cluster, timeline or mesh — logical restore, point-in-time recovery,
+promotion, another schema of the same base — is a reset, never a silent skip.
 
-The retention deletes by `created_at` and raises, in the same statement, a
-**watermark**: the greatest position it deleted (`ameesh_events_pruned`). A
-position below it is a reset; it waits for a locked row rather than skip it.
+The retention deletes by `created_at`, compared on the DATABASE's clock
+(`now()`), the same clock as the table's own guard, and raises, in the same
+statement, a **watermark**: the greatest position it deleted
+(`ameesh_events_pruned`). A position below it is a reset, at connection and
+for the whole life of the stream; it waits for a locked row rather than skip
+it.
 
 **Retention** (0033 §9): one year by default, `AMEESH_EVENTS_RETENTION_DAYS`
 on the host that prunes (at least 30: the table refuses to delete younger
@@ -75,21 +79,28 @@ PRUNE_BATCH = 10000
 PRUNE_MAX_BATCHES = 10
 PRUNE_MAX_S = 5.0
 _TYPE_RE = re.compile(r"^[a-z]+\.[a-z_]+$")
-_POSITION_RE = re.compile(r"^([0-9]{1,20})-([0-9]{1,19})-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$")
-#: the cluster's identity when its functions are refused: no resume trusted
+#: "<tx>-<id>-<identity>": the identity is "<sysid>t<timeline>j<journal>"
+#: (0396/0448); the journal part is optional, so a position of the code before
+#: 0448 is parsed and then compared — it names another journal, hence a reset,
+#: never a 400 that would leave a browser retrying forever.
+_POSITION_RE = re.compile(
+    r"^([0-9]{1,20})-([0-9]{1,19})-"
+    r"([0-9a-f]{1,16}t[0-9a-f]{8}(?:j[0-9a-f]{16})?|none)$")
+#: the journal's identity when its functions are refused: no resume trusted
 UNKNOWN_CLUSTER = "none"
 _XID8_MAX = 2 ** 64 - 1
 _BIGINT_MAX = 2 ** 63 - 1
 
 
 def format_position(position: tuple, cluster: str) -> str:
-    """A reader's position (tx, id) in `cluster` (`bounds()["cluster"]`) as
-    an SSE id: "tx-id-cluster"."""
+    """A reader's position (tx, id) in `cluster` (`bounds()["cluster"]`, the
+    journal's identity) as an SSE id: "tx-id-cluster"."""
     return "%d-%d-%s" % (int(position[0]), int(position[1]), cluster)
 
 
 def parse_position(text: str) -> tuple | None:
-    """The ((tx, id), cluster) of a `Last-Event-ID`, None if it is not one."""
+    """The ((tx, id), cluster) of a `Last-Event-ID`, None if it is not one.
+    `cluster` is the journal's whole identity, journal identifier included."""
     match = _POSITION_RE.match(text.strip())
     if not match:
         return None
@@ -122,17 +133,19 @@ def retention_days(env=None) -> int:
     return days
 
 
-def prune(db, *, days: int | None = None, now: float | None = None,
+def prune(db, *, days: int | None = None,
           batch: int = PRUNE_BATCH, max_batches: int | None = None,
           max_s: float | None = None, clock=time.monotonic) -> int:
     """Deletes the events older than `days` (default `retention_days()`), by
     batches, `max_batches` batches and `max_s` seconds at most (None: until
-    done); the number deleted. A deletion that would outlast `max_s` (a lock, a
-    slow statement) fails with DbError: the batches before it stay done."""
+    done); the number deleted. The cutoff follows the DATABASE's clock
+    (`now()`), like the table's own guard: two hosts whose clocks differ prune
+    the same events, and a host ahead of the base never has its whole deletion
+    refused. A deletion that would outlast `max_s` (a lock, a slow statement)
+    fails with DbError: the batches before it stay done."""
     days = retention_days() if days is None else int(days)
     if days < MIN_RETENTION_DAYS:
         raise ValueError("retention: at least %d days" % MIN_RETENTION_DAYS)
-    before = (time.time() if now is None else now) - days * 86400.0
     store = storage.of(db).events
     total, batches, start = 0, 0, clock()
     while True:
@@ -143,18 +156,18 @@ def prune(db, *, days: int | None = None, now: float | None = None,
             timeout = max_s - (clock() - start)
             if timeout <= 0:
                 return total
-        n = store.prune(before, batch, timeout)
+        n = store.prune(days, batch, timeout)
         total += n
         batches += 1
         if n < batch or (max_batches is not None and batches >= max_batches):
             return total
 
 
-def expired(db, *, days: int | None = None, now: float | None = None) -> int:
-    """The number of events past the retention (what `prune` would delete)."""
+def expired(db, *, days: int | None = None) -> int:
+    """The number of events past the retention (what `prune` would delete),
+    on the database's clock."""
     days = retention_days() if days is None else int(days)
-    return storage.of(db).events.count_before(
-        (time.time() if now is None else now) - days * 86400.0)
+    return storage.of(db).events.count_before(days)
 
 
 def _main_list(cfg, db, args) -> int:
@@ -212,9 +225,8 @@ def main(argv: list[str] | None = None) -> int:
             print("ameesh events: %s" % exc, file=sys.stderr)
             return 2
         if args.dry_run:
-            before = time.time() - days * 86400.0
             print("ameesh events: %d event(s) older than %d days (dry run)"
-                  % (storage.of(db).events.count_before(before), days))
+                  % (storage.of(db).events.count_before(days), days))
             return 0
         print("ameesh events: %d event(s) older than %d days deleted"
               % (prune(db, days=days), days))
