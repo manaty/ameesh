@@ -66,6 +66,9 @@ def _require_frozen_with_verdict(db, item_id):
     item = work.get(db, item_id)
     if item is None:
         return
+    if item.get("state") != "qa":
+        raise work.WorkError("the landing lot must be in review (qa) before it "
+                             "can be parked")
     st = storage.of(db)
     jalons = progress._jalons_de_lot(
         item, st.progress.lot_transitions([item_id]),
@@ -83,7 +86,9 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
     """Déclare (ou renouvelle) l'atterrissage planifié du lot sur un véhicule.
 
     Le lot et le véhicule doivent être ouverts et distincts ; l'échéance est
-    une journée ISO, fin de journée incluse. L'admission est ÉPINGLÉE au gel
+    une journée ISO, fin de journée incluse, bornée à [aujourd'hui, +90 j]
+    (#2171 N4). Le lot parké doit être en revue (qa), gelé, avec un verdict ok
+    acquis sur son dernier gel (#2171 N3). L'admission est ÉPINGLÉE au gel
     du véhicule : il doit porter une tête gelée et ne pas être `blocked`. Un
     simple geste, aucun texte libre ; l'étape et la tête épinglée sont relues
     à chaque passe, un nouveau gel exige un renouvellement explicite."""
@@ -109,6 +114,7 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
         item_id, vehicle_id, until_on=day.isoformat(), actor=actor)
     errors = {"self_landing": "a lot cannot land on itself",
               "unknown_lot": "landing endpoints must be existing lots",
+              "not_in_review": "the landing lot must be in review (qa)",
               "finished_lot": "the landing lot must still be open",
               "finished_vehicle": "the vehicle must still be open",
               "no_freeze": "the vehicle has no frozen head: freeze it before "

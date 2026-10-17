@@ -151,8 +151,11 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         # comptée en entier) doit être future. Nouveau gel, gel absent, véhicule
         # bloqué, retrait ou échéance dépassée : le signal stale revient, et le
         # pilote renouvelle explicitement la déclaration sur la nouvelle tête.
+        # #2171 N3 : le lot parké doit être EN REVUE (qa) — un atterrissage ne
+        # remplace que l'attente de fusion ; sorti de qa (build, blocked,
+        # waiting_human), le signal revient.
         landing = landing_by_item.get(ident)
-        if not landing:
+        if not landing or row.get("state") != "qa":
             continue
         vehicle = int(landing["vehicle_id"])
         open_vehicle = landing.get("open")

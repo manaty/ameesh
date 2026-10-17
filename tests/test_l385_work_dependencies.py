@@ -473,9 +473,11 @@ class LandingTest(PgTestCase):
         self.db.execute("TRUNCATE work_items CASCADE")
         self.waiting = work.add(self.db, title="waiting", app="acme")["id"]
         self.vehicle = work.add(self.db, title="vehicle", app="acme")["id"]
+        # #2171 N3 : le lot parké est en revue (qa), gelé, verdict ok acquis.
+        work.move(self.db, self.waiting, "build", actor="test")
+        work.move(self.db, self.waiting, "qa", actor="test")
         self.sha = "a" * 40
         work.milestone(self.db, self.vehicle, "frozen", sha=self.sha, actor="test")
-        # #2171 N3 : le lot parké est gelé, avec un verdict ok acquis sur ce gel.
         self.lot_sha = "d" * 40
         work.milestone(self.db, self.waiting, "frozen", sha=self.lot_sha, actor="test")
         work.milestone(self.db, self.waiting, "verdict", verdict="ok", sha=self.lot_sha,
@@ -550,11 +552,15 @@ class LandingTest(PgTestCase):
                           if e["note"].startswith("Landing")], [])
 
 
-    def test_refuses_a_lot_that_is_not_frozen_with_an_acquired_verdict(self):
+    def test_refuses_a_lot_that_is_not_in_review_frozen_or_with_acquired_verdict(self):
         until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
-        lot = work.add(self.db, title="unfrozen lot", app="acme")["id"]
-        self.assertIn("must be frozen", self.cli(str(lot), "--vehicle", str(self.vehicle),
-                                                 "--until", until, ok=False).stderr)
+        lot = work.add(self.db, title="not in review", app="acme")["id"]
+        self.assertIn("must be in review (qa)", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                         "--until", until, ok=False).stderr)
+        work.move(self.db, lot, "build", actor="test")
+        self.assertIn("must be in review (qa)", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                         "--until", until, ok=False).stderr)
+        work.move(self.db, lot, "qa", actor="test")
         sha = "e" * 40
         work.milestone(self.db, lot, "frozen", sha=sha, actor="test")
         self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),

@@ -34,12 +34,13 @@ class WorkDependencies(abc.ABC):
         """Declare (or renew) a planned landing, pinned to the vehicle's freeze.
 
         Both lots must exist and be open, and the vehicle must differ from the
-        lot. The vehicle must carry a frozen head (the declaration is pinned to
+        lot. The landing lot must be in review (`qa`). The vehicle must carry a
+        frozen head (the declaration is pinned to
         exactly that SHA) and must not be `blocked`. The pin is read in the
         same transaction as the write. Repeating the gesture replaces the
         previous declaration and journals once. Returns `landed`, or `error`
-        (`unknown_lot`, `finished_lot`, `finished_vehicle`, `no_freeze`,
-        `blocked_vehicle`).
+        (`unknown_lot`, `finished_lot`, `not_in_review`, `finished_vehicle`,
+        `no_freeze`, `blocked_vehicle`).
         """
 
     @abc.abstractmethod

@@ -13,7 +13,7 @@ from tests.support import PgTestCase
 
 class UnitTest(unittest.TestCase):
     now = plan.day_start_ts("2026-10-12") + 12 * 3600
-    rows = [{"id": 1, "state": "build", "package_id": "child"}]
+    rows = [{"id": 1, "state": "qa", "package_id": "child"}]
     packages = {"child": {"id": "child", "parent": "epic", "present": True},
                 "epic": {"id": "epic", "present": True},
                 "prerequisite": {"id": "prerequisite", "present": True}}
@@ -193,6 +193,16 @@ class UnitTest(unittest.TestCase):
                 "head": "b" * 40, "until": "2026-10-18"}
         self.assertEqual(work_dependencies.wait_label(wait),
                          "landing on vehicle #42 (qa, head %s) until 2026-10-18" % ("b" * 12))
+
+    def test_landing_only_parks_a_lot_still_in_review(self):
+        """#2171 N3 : sorti de qa (build, blocked, humain), le signal revient."""
+        expected = {1: {"what": "landing", "vehicle": 2, "step": "qa",
+                        "head": "b" * 40, "until": "2026-10-13"}}
+        self.assertEqual(self.resolve(rows=[{"id": 1, "state": "qa"}],
+                                      landings=[self.landing()]), expected)
+        for state in ("intake", "build", "blocked", "waiting_human"):
+            self.assertEqual(self.resolve(rows=[{"id": 1, "state": state}],
+                                          landings=[self.landing()]), {})
 
     def test_latest_freeze_breaks_ties_on_id_whatever_the_reading_order(self):
         """#2171 N2 : dernier gel = (at, id) maximal, comme le pin de set_landing."""

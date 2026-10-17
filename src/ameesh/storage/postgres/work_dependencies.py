@@ -105,6 +105,10 @@ class WorkDependencies(Contract):
                 return {"error": "unknown_lot"}
             if states[item_id] in _DONE:
                 return {"error": "finished_lot"}
+            # #2171 N3 : seul un lot en revue peut être parqué ; un lot en
+            # build, bloqué ou en attente d'un humain garde son signal.
+            if states[item_id] != "qa":
+                return {"error": "not_in_review"}
             if states[vehicle_id] in _DONE:
                 return {"error": "finished_vehicle"}
             if states[vehicle_id] == "blocked":
