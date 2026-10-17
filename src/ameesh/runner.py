@@ -2326,16 +2326,20 @@ class AgentWorker(threading.Thread):
             from . import reprise, work as work_mod
             item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
             branche = (item or {}).get("branch")
+            aside = ("the one of lot #%s is put aside and will be resumed when "
+                     "feedback arrives on it" % courant
+                     if out.get("parked") else
+                     "no session of lot #%s was put aside: it is finished or no "
+                     "longer assigned" % courant)
             return reprise.lot_brief(
                 self.cfg, self.db, self.agent, lot,
                 reason="new session dedicated to lot #%s" % lot,
                 consigne="This session is dedicated to lot #%s%s. Your other lots keep "
-                         "their own sessions (the one of lot #%s is put aside and will "
-                         "be resumed when feedback arrives on it): work only on lot #%s "
-                         "here, in its own worktree and branch. This turn's instruction "
-                         "follows this brief." % (
+                         "their own sessions (%s): work only on lot #%s here, in its "
+                         "own worktree and branch. This turn's instruction follows "
+                         "this brief." % (
                              lot, " (branch %s)" % branche if branche else "",
-                             courant, lot))
+                             aside, lot))
         except Exception as exc:  # un brief manquant n'empêche pas la bascule
             log_async("[%s] lot brief unavailable (%s)" % (self.name, exc))
             return None
