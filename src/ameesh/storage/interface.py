@@ -1570,18 +1570,18 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str,
-                           event: str | None = None) -> dict | None:
-        """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
+                           event: str | None = None, remove: bool = False) -> dict | None:
+        """#2076 : ajoute un relecteur désigné (ou le retire explicitement),
         et journalise ; None (rien d'écrit) si le lot n'est plus en `qa` ou si
-        son assigné est devenu le relecteur (la règle est relue dans
+        son assigné est devenu le relecteur à ajouter (la règle est relue dans
         l'écriture, pas seulement avant : #705 r2, B1).
 
-        #1979 : `reviewer` vide efface la désignation et `event` remplace la
+        #1979 : `reviewer` vide efface toutes les désignations et `event` remplace la
         ligne de journal par défaut (« reviewer X designated ») — il porte
         alors le retrait, ou la marque « verdict non requis » de
         `work.waive_review` (`work.REVIEWER_NONE`).
 
-        La colonne vient de la migration 0421 : avant elle, la lecture s'en
+        Les colonnes viennent des migrations 0421 et 0456 : avant elles, la lecture s'en
         passe (`item_columns`) et l'écriture est refusée avec la marche à
         suivre. Un exécuteur médié ne désigne jamais de relecteur (opération
         refusée au contrat L107/L109) : la désignation est un geste

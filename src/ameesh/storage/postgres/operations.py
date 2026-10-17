@@ -354,6 +354,7 @@ class Operations(interface.Operations):
         sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   to_jsonb(w)->'reviewers' AS reviewers,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
                             nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,

@@ -203,6 +203,8 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         # §2 : la relecture d'un lot léger suit la fusion ; aucun verdict
         # n'est dû avant, même si un relecteur est désigné (#1822).
         return _merge_wait(actions, responsible, assignee)
+    if jalons.get("pending_reviewers"):
+        return _waiting("verdict", jalons["pending_reviewers"])
     return _waiting("verdict", jalons.get("reviewer"))
 
 
