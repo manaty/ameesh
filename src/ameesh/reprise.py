@@ -1526,7 +1526,9 @@ def cmd_resume(cfg: Config, args) -> int:
                   file=sys.stderr)
             return 1
         return agent_pause.cmd_cli(cfg, args, paused=False)
-    if getattr(args, "expect_reason", None):
+    # #2184/N7 : un motif vide explicite n'est pas « absent » ; la présence
+    # du drapeau suffit à exiger --operator (même règle qu'agent_pause.py).
+    if getattr(args, "expect_reason", None) is not None:
         print("ameesh resume: --expect-reason requires --operator", file=sys.stderr)
         return 1
     try:
@@ -1564,6 +1566,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pause.add_argument("agent")
     p_pause.add_argument("--reason", required=True)
     p_pause.add_argument("--human", default=None, help="local human (same as ameesh serve)")
+    p_pause.add_argument("--not-after", type=float, default=None, metavar="EPOCH",
+                         help="deadline (epoch) after which the database refuses "
+                              "the pause; set by the drain before a remote call")
     p_pause.add_argument("--json", action="store_true")
     from . import agent_pause
     p_pause.set_defaults(func=lambda cfg, args: agent_pause.cmd_cli(cfg, args, paused=True))
