@@ -93,10 +93,9 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 
 #: la classe « sensible » demande un avis d'une autre famille ; **SQL, sécurité
 #: et prod** en demandent deux, indépendants (canon §2, décision 18855a). Ces
-#: trois domaines se lisent sur le diff classé (`klass["files"]` : le chemin et
-#: la portée qui l'a classé), avec des motifs larges : un chemin critique non
-#: reconnu coûterait un avis manquant, un chemin reconnu à tort ne coûte qu'un
-#: avis de trop.
+#: trois domaines se lisent sur les chemins du diff classé (`klass["files"]`).
+#: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
+#: Les motifs de domaine restent larges pour ne pas omettre un chemin critique.
 CRITICAL_SCOPE = (
     # SQL, migrations, stockage
     re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
@@ -104,7 +103,8 @@ CRITICAL_SCOPE = (
     # sécurité : droits, identité, clés, secrets, décisions
     re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
                r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
-               r"(^|/)(keys?|secrets?)(/|$)"),
+               r"(^|/)(keys?|secrets?)(/|$)|"
+               r"^src/ameesh/(approve_check|approve_client|config)\.py$"),
     # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
     re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
                r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
@@ -123,13 +123,15 @@ def critical_scope(klass) -> bool:
     Un doute de classe (politique ou diff illisible, `files` vide) ne se
     suppose jamais rassurant : `required_verdicts` le compte alors comme un
     domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
-    for entry in (klass or {}).get("files") or ():
+    files = (klass or {}).get("files") or ()
+    if not files:
+        return True
+    for entry in files:
         if str(entry.get("class") or "") == "light":
             continue
-        candidates = [entry.get("path")] + [str(p) for p in (entry.get("rule") or ())]
-        for candidate in candidates:
-            if any(rx.search(str(candidate or "")) for rx in CRITICAL_SCOPE):
-                return True
+        path = str(entry.get("path") or "")
+        if not path or any(rx.search(path) for rx in CRITICAL_SCOPE):
+            return True
     return False
 
 
