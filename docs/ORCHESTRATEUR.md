@@ -412,7 +412,8 @@ si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
-<id>`. Un lot passé `promoted` par erreur : `ameesh work move <id> merged
+<id> | --done` (`--done` : lot livré sans fusion, sans branche). Un lot passé
+`promoted` par erreur : `ameesh work move <id> merged
 --correct "raison"` (humains, orchestrateurs et agents de conception
 seulement ; tracé au journal).
 

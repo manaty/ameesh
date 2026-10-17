@@ -66,11 +66,20 @@ ameesh work show <id> [--json]                     card, epic, PR, waiting
 ameesh work close <id> --abandoned                 lot that will not be done
 ameesh work close <id> --superseded-by <id2>       lot replaced or absorbed by another
 ameesh work close <id> --delivered --sha <head>    lot delivered outside the target (#988)
+ameesh work close <id> --done                      delivered without a merge (no branch)
 ```
 
 `close` moves the lot to the terminal state `closed` and records a `closed` milestone:
 nothing stays open by oversight. A closed lot is **never reopened** by a
-merge observed later (the observation is reported).
+merge observed later (the observation is reported). `--done` (#1280) closes a
+lot delivered without a merge — a review, an analysis — and is refused when
+the lot carries a branch or a PR; on a review already closed `superseded by`
+its own reviewed parent, it rectifies the reason without reopening. For a
+review, the title only attaches the parent — `REVUE #N`, or the manual mission
+`R1`/`R2 <harnais> #<parent>` (#1249) — and `--done` also requires the
+review's `verdict` milestone on that parent (a `blocked` verdict counts: it is
+a delivered review, not a product GO), so a delivered review is proven, never
+deduced from its title.
 
 `--delivered --sha <reviewed head>` closes a lot whose deliverable (report, note,
 rehearsal) lives on a reviewed branch, without a merge into the target: the

@@ -1922,9 +1922,18 @@ class WorkItems(Domain):
     def close(self, item_id: int, *, current: str, reason: str, superseded_by: int | None,
               sha: str = "", actor: str, note: str) -> dict | None:
         """Fermeture explicite (L29, #988) : `current` → `closed` (`abandoned` |
-        `superseded` | `delivered`) si le lot y est encore, journal et jalon
-        `closed` dans la même transaction ; `delivered` écrit en plus le jalon
-        `delivered` (le `sha` de la tête relue, l'auteur) ; None sinon."""
+        `superseded` | `delivered` | `done`) si le lot y est encore, journal et
+        jalon `closed` dans la même transaction ; `delivered` écrit en plus le
+        jalon `delivered` (le `sha` de la tête relue, l'auteur) ; None sinon."""
+
+    @abc.abstractmethod
+    def rectify_close(self, item_id: int, *, current_reason: str, reason: str,
+                      actor: str, note: str) -> dict | None:
+        """Rectifie la raison d'une fermeture déjà écrite (#1280) : le lot reste
+        `closed` — `closed_at` et le jalon `closed` sont conservés, la fermeture
+        a bien eu lieu — seule la raison change (`superseded_by` est effacé) et
+        l'événement est journalisé. None si le lot n'est plus `closed` avec
+        `current_reason` (course perdue)."""
 
     @abc.abstractmethod
     def refresh_package_parents(self) -> int:

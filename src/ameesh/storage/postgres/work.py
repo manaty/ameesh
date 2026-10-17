@@ -2060,6 +2060,26 @@ class WorkItems(interface.WorkItems):
                     (int(item_id), sha or "", actor or "", note or ""))
             return rows[0]
 
+    def rectify_close(self, item_id, *, current_reason, reason, actor, note) -> dict | None:
+        """#1280 : rectifie la raison d'une fermeture déjà écrite. La ligne
+        reste `closed` ; `closed_at` et le jalon `closed` sont conservés (la
+        fermeture a bien eu lieu), `superseded_by` est effacé, et l'événement
+        trace la rectification. Conditionnel à la raison lue par l'appelant :
+        une rectification concurrente ne s'écrase pas."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE work_items
+                   SET close_reason = %s, superseded_by = NULL, updated_at = now()
+                 WHERE id = %s AND state = 'closed' AND close_reason = %s
+                RETURNING __COLUMNS__
+                """.replace("__COLUMNS__", item_columns(self.db)),
+                (reason, int(item_id), current_reason))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), "closed", note, actor)
+            return rows[0]
+
     def refresh_package_parents(self) -> int:
         rows = self.db.query(
             """
