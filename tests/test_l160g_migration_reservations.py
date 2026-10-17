@@ -2,6 +2,9 @@
 """Repository identity, read-only radar and atomic legacy reservation import."""
 from __future__ import annotations
 
+import dataclasses
+import json
+import os
 import threading
 import time
 import unittest
@@ -11,6 +14,7 @@ from ameesh import db as db_mod, migration_reservations as reservations, radar, 
 from ameesh.storage.postgres.work import WorkItems
 
 from .support import PgTestCase
+from .test_l160b_radar import MIG, _git, make_repo
 
 TEXT = '''| Number | Lot | Who | State |
 |---|---|---|---|
@@ -92,13 +96,15 @@ class ReservationImportTest(PgTestCase):
 
     def test_collision_and_existing_lot_reservation_not_overwritten(self):
         other = self.lot("Other", 3)
-        storage.of(self.db).work.reserve_migration(other, self.slug, 324, 0,
-                                                  actor="orch", note="reserved %(number)s")
+        storage.of(self.db).work.reserve_migration(
+            other, self.slug, 324, 0, actor="orch", note="reserved %(number)s",
+            issue_ref=work.get(self.db, other)["issue_ref"])
         with self.assertRaisesRegex(work.WorkError, "already held"):
             self.run_import(apply=True)
         self.assertIsNone(work.get(self.db, self.a)["migration"])
-        storage.of(self.db).work.reserve_migration(self.a, self.slug, 327, 0,
-                                                  actor="orch", note="reserved %(number)s")
+        storage.of(self.db).work.reserve_migration(
+            self.a, self.slug, 327, 0, actor="orch", note="reserved %(number)s",
+            issue_ref=work.get(self.db, self.a)["issue_ref"])
         with self.assertRaisesRegex(work.WorkError, "different reservation"):
             self.run_import(apply=True)
         self.assertEqual(work.get(self.db, self.a)["migration"], 327)
@@ -148,7 +154,8 @@ class ReservationImportTest(PgTestCase):
                     self.assertLess(time.monotonic(), deadline, "import never waited for repository lock")
                     time.sleep(0.01)
                 storage.of(tx).work.reserve_migration(
-                    self.a, self.slug, 323, 0, actor="orch", note="reserved %(number)s")
+                    self.a, self.slug, 323, 0, actor="orch", note="reserved %(number)s",
+                    issue_ref=storage.of(tx).work.get(self.a)["issue_ref"])
         finally:
             thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
@@ -171,8 +178,10 @@ class ReservationImportTest(PgTestCase):
                 # attendre : le pilote psql ouvre une session par transaction.
                 with conn.transaction() as tx:
                     backend.append(tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"])
-                    results.append(original(storage.of(tx).work, other, self.slug, None, 0,
-                                            actor="other", note="waiting %(number)s")["migration"])
+                    results.append(original(
+                        storage.of(tx).work, other, self.slug, None, 0,
+                        actor="other", note="waiting %(number)s",
+                        issue_ref=storage.of(tx).work.get(other)["issue_ref"])["migration"])
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
@@ -227,3 +236,49 @@ class ReservationImportTest(PgTestCase):
         conflict = next(iter(radar.conflicts_of(report).values()))
         self.assertIn("ameesh work migration", radar.message_text(conflict, self.a, {}))
         self.assertIn("unreserved migration", "\n".join(radar.render(report)))
+
+
+class RunPassReservationTest(PgTestCase):
+    """#1335 : le passage de l'exécuteur voit les migrations ajoutées par un lot
+    tant que `added` est disponible, et les signale « unreserved » ; `added`
+    lui-même ne part jamais dans le journal du radar."""
+
+    def test_run_pass_reports_unreserved_migration_without_publishing_added(self):
+        repo = make_repo(self.tmp)
+        lot = work.add(self.db, title="a", branch="lot/1-a")["id"]
+        cfg = dataclasses.replace(
+            self.cfg,
+            radar={"projects": {"p": {"repo": repo, "github": "acme/product",
+                                      "migrations": MIG}}})
+        # #1335 R1 cx2 : la sonde ne lit que les cibles certifiées (#1333) ;
+        # la pointe publiée est simulée lisible et à jour, comme sur un dépôt
+        # réel — sans elle, le delta du lot n'est pas certifié et la sonde se
+        # tait à juste titre (témoin dédié dans test_1333_radar_cible).
+        with mock.patch.object(radar, "published_tip",
+                               return_value=_git(repo, "rev-parse", "main")):
+            lines = radar.run_pass(cfg, self.db, ci=None)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["error"], None)
+        self.assertEqual(lines[0]["summary"]["unreserved_migrations"], 1)
+        with open(os.path.join(radar.journal_dir(cfg), "p.json"), encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        self.assertEqual([(r["number"], r["work_item"]) for r in
+                          snapshot["unreserved_migrations"]], [("0002", lot)])
+        self.assertTrue(snapshot["branches"])
+        self.assertTrue(all("added" not in branch for branch in snapshot["branches"]))
+
+    def test_missing_repository_stays_an_explicit_error_without_probe(self):
+        repo = make_repo(self.tmp)
+        work.add(self.db, title="a", branch="lot/1-a")
+        cfg = dataclasses.replace(
+            self.cfg, radar={"projects": {"p": {"repo": repo, "migrations": MIG}}})
+        lines = radar.run_pass(cfg, self.db, ci=None)
+        self.assertIsNone(lines[0]["error"])
+        with open(os.path.join(radar.journal_dir(cfg), "p.json"), encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        self.assertIn("GitHub repository identity", snapshot["reservation_error"])
+        self.assertNotIn("unreserved_migrations", snapshot)
+
+
+if __name__ == "__main__":
+    unittest.main()

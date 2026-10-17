@@ -74,7 +74,10 @@ prerequisites, including satisfied ones.
 Dependencies are read in groups without the view's project or rendering
 limit; a blocker outside the displayed window still suppresses `stale_lot`
 and its reminders. Links combine with existing open commitment dependencies.
-A future planned start takes precedence in the displayed `planned_wait`.
+A future planned start takes precedence in the displayed `planned_wait`, then
+a lot dependency; a dated external hold (`gate:<name>` in an open commitment,
+[PLANNED-WAITS.md](PLANNED-WAITS.md)) comes last and ends by itself at the end
+of its due day.
 
 A dependency controls inactivity alerts and the ready intake: a lot whose
 prerequisite is not delivered is excluded from the automatic take (L165) and

@@ -382,12 +382,14 @@ class ScopedReservationsTest(PgTestCase):
     def test_release_and_named_allocation_lock_repository_before_lot(self):
         self._legacy_writer_concurrent_with_named(
             lambda api: api.reserve_migration(self.a['id'], None, None, 1, release=True,
-                                              note='release %(number)s', actor='dev'))
+                                              note='release %(number)s', actor='dev',
+                                              issue_ref=None))
 
     def test_repository_move_and_named_allocation_lock_old_repository_before_lot(self):
         self._legacy_writer_concurrent_with_named(
             lambda api: api.reserve_migration(self.a['id'], 'manaty/other', 400, 1,
-                                              note='move %(number)s', actor='dev'))
+                                              note='move %(number)s', actor='dev',
+                                              issue_ref=api.get(self.a['id'])['issue_ref']))
         self.assertEqual(work.get(self.db, self.a['id'])['migration_repo'], 'manaty/other')
 
     def test_repository_changed_after_observation_aborts_writer_without_new_lock(self):
@@ -418,8 +420,9 @@ class ScopedReservationsTest(PgTestCase):
         thread.start()
         try:
             self.assertTrue(observed.wait(timeout=5))
-            storage.of(self.db).work.reserve_migration(self.a['id'], 'manaty/other', 400, 1,
-                                                       note='move %(number)s', actor='dev')
+            storage.of(self.db).work.reserve_migration(
+                self.a['id'], 'manaty/other', 400, 1, note='move %(number)s', actor='dev',
+                issue_ref=work.get(self.db, self.a['id'])['issue_ref'])
         finally:
             moved.set()
             thread.join(timeout=10)
