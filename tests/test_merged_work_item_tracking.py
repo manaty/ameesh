@@ -813,6 +813,12 @@ class MergeSweepTest(_Base):
             # positive ; la négation du parent ne l'atteint pas.
             "Merge sans #12 (mais #13 livré)": {13: "#id"},
             "Merge sans (#12) (mais #13 livré)": {13: "#id"},
+            "Merge sans #12 (mais #13 livré sans #14)": {13: "#id"},
+            "Merge #12 retiré (mais #13 livré)": {13: "#id"},
+            # Un retrait après le groupe porte encore sur ce groupe.
+            "Merge (mais #13) retiré": {},
+            "Merge #12 (mais #13 aussi) reverted": {},
+            "Merge (mais #13) retiré (mais #14 livré)": {14: "#id"},
             "Merge #12 without #13": {12: "#id"},
             "Merge #12 hors #13": {12: "#id"},
             "paquet : tout sauf #12": {},

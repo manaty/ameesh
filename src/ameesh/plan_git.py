@@ -1173,8 +1173,12 @@ def negated_hash_positions(title: str) -> set[int]:
             if not prefixes and not postfixes:
                 continue
             for match in HASH_REF_RE.finditer(title, begin + left, begin + right):
+                # « (mais #13) retiré » reste nié : un retrait qui suit le
+                # groupe l'emporte sur son ouverture positive.
                 if any(gb >= begin and ge <= end and (gb, ge) != (begin, end)
-                       and gb <= match.start() < ge for gb, ge in positives):
+                       and gb <= match.start() < ge
+                       and not any(begin + left + p.start() >= ge for p in postfixes)
+                       for gb, ge in positives):
                     continue
                 position = match.start() - begin - left
                 # « #14 livré sans #12 » livre #14 : une préposition ne nie
