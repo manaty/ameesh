@@ -501,6 +501,31 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('--expect-reason', self.operateur())
         self.assertFalse((self.state / 'pause-dev9').exists())
 
+    def test_pause_creation_delayed_past_stop_unknown_is_not_orphaned(self):
+        """Stop d'une unité absente ne ferme pas une création encore retardée.
+
+        Le client a expiré avant que StartTransientUnit ait été traité. Le
+        stop reçoit 5 (unité inconnue), puis la pose peut encore aboutir après
+        la dernière lecture du cleanup, comme dans le témoin B1 initial.
+        """
+        ctl = self.bin / 'systemctl'
+        ctl.write_text(ctl.read_text().replace(
+            "if 'stop' in args:\n",
+            "if 'stop' in args and scenario == 'pause-expiree-tardive':\n"
+            "    sys.exit(5)  # aucune unité enregistrée à cet instant\n"
+            "if 'stop' in args:\n", 1))
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['ATTENTE_MAX'] = '2'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        p = self.run_vm(scenario='pause-expiree-tardive')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('stop ameesh-drain-', self.units())
+        self.assertIn('resume dev9 --operator', self.operateur())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertFalse((self.state / 'pause-dev9').exists(),
+                         'une création tardive après stop=5 laisse une pause orpheline')
+
     def test_operator_gesture_refused_in_an_agent_session_stops_safely(self):
         """Périmètre annoncé : le drain est un geste d'opérateur. Un refus
         bad_actor (vm.sh lancé dans une session liée à un agent) n'interrompt
