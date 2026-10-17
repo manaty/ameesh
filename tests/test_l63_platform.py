@@ -134,10 +134,97 @@ class PlatformTest(unittest.TestCase):
                     # ligne de commande
                     exclus = platform.holders(chemin, "sid-l63-xyz", exclude=[nomme.pid])
                     self.assertNotIn(nomme.pid, [h["pid"] for h in exclus])
-                    # personne ne tient un autre fichier
+                    # personne ne tient un autre fichier — sauf sur un hôte où
+                    # l'OS cache les fichiers ouverts d'un processus tiers du
+                    # même utilisateur (gpg-agent non dumpable, L63b) : le refus
+                    # est alors la réponse documentée, pas une liste vide non
+                    # vérifiée.
                     autre = os.path.join(tmp, "autre.jsonl")
                     open(autre, "w").close()
-                    self.assertEqual(platform.holders(autre, "sid-absent"), [])
+                    try:
+                        vides = platform.holders(autre, "sid-absent")
+                    except platform.NotAvailable as exc:
+                        self.assertIn("unreadable", str(exc))
+                    else:
+                        self.assertEqual(vides, [])
+
+    def test_une_session_citee_n_est_pas_un_detenteur(self):
+        """#1283 : un argv qui CITE l'id (brief JSON, message) n'est pas une
+        reprise en cours ; seuls les sélecteurs de session le nomment."""
+        with tempfile.TemporaryDirectory() as tmp:
+            chemin = os.path.join(tmp, "session.jsonl")
+            open(chemin, "w").close()
+            sid = "sid-l63-cite-xyz"
+            pret = {nom: os.path.join(tmp, "pret-" + nom)
+                    for nom in ("citant", "repris", "lie", "options")}
+            code = "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)"
+            citant = self._child(code, pret["citant"], "--json",
+                                 '{"brief": "reprends la session %s"}' % sid)
+            repris = self._child(code, pret["repris"], "--resume", sid)
+            lie = self._child(code, pret["lie"], "--resume=%s" % sid)
+            # #1283 R1 cx2 : les options intercalees avant l'id ne perdent pas
+            # la reprise (`codex exec resume --json <id>`).
+            options = self._child(code, pret["options"], "exec", "resume",
+                                  "--json", sid)
+            self._wait(lambda: all(os.path.exists(p) for p in pret.values()))
+            for nom, ctx in self.variants:
+                with self.subTest(nom), ctx():
+                    found = {h["pid"]: h for h in
+                             platform.holders(chemin, sid, session=True)}
+                    self.assertNotIn(citant.pid, found)
+                    self.assertIn(repris.pid, found)
+                    self.assertIn(lie.pid, found)
+                    self.assertIn(options.pid, found)
+
+    def test_reconnaissance_du_positional_de_reprise(self):
+        """#1283 R1 cx2 : options intercalees positives, citations negatives.
+
+        `--all` elargit la recherche (il ne designe pas la derniere session) ;
+        les flags sans valeur ne mangent pas l'id ; `-p`/`--profile` de Codex
+        porte une valeur (contrairement au `-p` de Claude)."""
+        from ameesh.platform import process as platform_process
+        sid, autre = "sid-r1-xyz", "sid-autre-xyz"
+        cas = [
+            (["codex", "exec", "resume", "--json", sid], True),
+            (["codex", "resume", "--no-alt-screen", sid], True),
+            (["codex", "resume", "--no-daemon", sid], True),
+            (["codex", "exec", "resume", "--worktree", sid], True),
+            (["codex", "exec", "resume", "--ephemeral", sid], True),
+            (["codex", "exec", "resume", "--ignore-user-config", sid], True),
+            (["codex", "exec", "resume", "--ignore-rules", sid], True),
+            (["codex", "exec", "resume", "--strict-config", sid], True),
+            # --approve-for-me (interactif seulement) ne prend pas de valeur :
+            # l'id qui suit reste le positional (liste cx2, 14/10 09:42).
+            (["codex", "resume", "--approve-for-me", sid], True),
+            (["codex", "resume", "--dangerously-bypass-hook-trust", sid], True),
+            # --all : Show all sessions, l'id qui suit est le positional
+            (["codex", "resume", "--all", sid], True),
+            (["codex", "resume", "-m", "gpt-5.1-codex", sid], True),
+            (["codex", "resume", "-c", 'model_reasoning_effort="high"', sid], True),
+            (["codex", "resume", "--model=gpt-5.1-codex", sid], True),
+            (["codex", "resume", "--", sid], True),
+            (["claude", "--resume", sid], True),
+            (["claude", "-r", sid], True),
+            (["claude", "--resume", sid, "-p", "prompt qui cite " + sid], True),
+            (["claude", "-p", "prompt qui cite " + sid, "--resume", sid], True),
+            (["dsh", "--session-id", sid], True),
+            (["dsh", "--session-id=%s" % sid], True),
+            (["dsh", "tui", "--resume", sid], True),
+            # un mot `resume` du texte ne masque pas le selecteur reel
+            (["claude", "-p", "resume", "--resume", sid], True),
+            (["codex", "resume", "--json", "prompt qui cite " + sid], False),
+            (["codex", "resume", "--last", "prompt qui cite " + sid], False),
+            (["codex", "resume", "--last", sid], False),
+            (["codex", "resume", autre, "prompt qui cite " + sid], False),
+            (["codex", "resume", "--model", sid, autre], False),
+            (["codex", "resume", "--model=" + sid, autre], False),
+            (["codex", "resume", "-p", sid, autre], False),
+            (["codex", "resume", "--profile", sid, autre], False),
+            (["dsh", "--json", '{"brief": "session %s"}' % sid], False),
+        ]
+        for argv, attendu in cas:
+            with self.subTest(argv=argv):
+                self.assertIs(platform_process._session_argument(argv, sid), attendu)
 
     def test_detenteurs_d_un_dossier(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +437,33 @@ class PlatformTest(unittest.TestCase):
             with self.subTest(nom):
                 self.assertEqual(process._doubt_psutil(PS(proc), 4242, os.getuid(),
                                                        allow), attendu)
+
+    def test_detenteur_verifie_malgre_un_tiers_illisible(self):
+        """#1749 : un détenteur vérifié tient l'entrée ; le refus d'un
+        processus tiers du même utilisateur (gpg-agent non dumpable) ne jette
+        plus cette réponse positive — le ménage gardait sinon tout /tmp
+        (« holders unreadable »). Le doute ne vaut que sans détenteur."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        moi = "%d %d %d %d" % ((os.getuid(),) * 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            # macOS : `tempfile` rend /var/folders/… quand le chemin réel est
+            # /private/var/… ; `holders` compare le lien lu de /proc à son
+            # realpath, donc la cible doit être canonique dès le symlink, sinon
+            # le détenteur n'est pas retrouvé et le doute l'emporte (CI macOS).
+            cible = os.path.realpath(os.path.join(tmp, "tenu"))
+            open(cible, "w").close()
+            racine = self._faux_proc("gpg-agent", moi)
+            # ce processus-ci tient `cible` : le /proc simulé porte son lien
+            os.symlink(cible, os.path.join(racine, str(os.getpid()), "fd", "3"))
+            with mock.patch.object(platform, "psutil", None), \
+                    mock.patch.object(platform.process, "PROC", racine), \
+                    mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                    mock.patch.object(platform.process, "service_managers",
+                                      return_value=frozenset()), \
+                    mock.patch.object(platform, "SYSTEM", "linux"):
+                found = platform.holders(cible)
+        self.assertEqual([h["pid"] for h in found], [os.getpid()])
 
     def test_un_processus_qui_se_termine_n_est_pas_un_doute(self):
         """CI #377 r2 : un `git` en fin de vie refuse son `fd` avant d'être

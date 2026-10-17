@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import subprocess
 
+from . import test_l160e2_land as _land
 from .test_1656_auto_merge import AutoGh
-from .test_l160e2_land import PrLandTest
 
 
 class UnreadableGh(AutoGh):
@@ -26,7 +26,7 @@ class UnreadableGh(AutoGh):
         return super().__call__(args, timeout=timeout)
 
 
-class EjectUnreadableTest(PrLandTest):
+class EjectUnreadableTest(_land.PrLandTest):
     def assert_ejected(self, out, gh):
         self.assertEqual(out["result"], "ejected", out)
         row = self.fake.queue_rows[4]

@@ -432,6 +432,85 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
     return row
 
 
+#: #2102 : le début de la ligne de journal d'un détachement, suivi du nom
+#: court de la branche et d'une espace ; le relevé des fusions n'associe plus
+#: implicitement (L118b) une branche ainsi détachée
+DETACH_NOTE = "branch detached: "
+
+
+def _detach_prefix(branch: str) -> str:
+    from . import plan_git
+
+    return "%s%s " % (DETACH_NOTE, plan_git.short_branch(branch))
+
+
+def is_detached(st, item_id: int, branch: str) -> bool:
+    """#2102 : la branche `branch` a été détachée du lot par `detach_branch`
+    (une ligne de journal la nomme). `st` : le stockage (`storage.of`)."""
+    prefix = _detach_prefix(branch)
+    return any((e.get("note") or "").startswith(prefix)
+               for e in st.work.assignment_events(int(item_id), [prefix]))
+
+
+def attach_implicit_branch(db: Db, item_id: int, branch: str, *, source: str,
+                           actor: str = "") -> dict | None:
+    """L118b, #2102 : la branche implicite `lot/<id>-…` devient celle du lot,
+    journalisée, seulement si le lot n'a toujours pas de branche et qu'elle
+    n'en a pas été détachée — vérifié atomiquement par le stockage, pour
+    qu'un détachement ou une branche explicite posés pendant le relevé ne
+    soient pas écrasés. Rend le lot, ou None si rien n'est posé."""
+    note = "branch %s — %s (before: none)" % (branch, source)
+    return storage.of(db).work.attach_implicit_branch(
+        item_id, branch, detached_prefix=_detach_prefix(branch), note=note, actor=actor)
+
+
+def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: str,
+                  actor: str = "") -> dict:
+    """#2102 : retire la branche d'un lot ouvert (PR fermée ou supplantée),
+    sans toucher à son état, son titulaire ni son relecteur ; journalisé avec
+    la raison et le dernier commit vu. Git n'est pas touché : la branche et
+    ses commits restent là où ils sont. Le relevé des fusions ne réassocie
+    plus implicitement ce nom ; une réassociation se fait explicitement
+    (`set_branch`, `ameesh work branch <id> <branche>`).
+
+    `branch` : la branche à détacher, par défaut celle du lot ; un lot sans
+    branche peut nommer celle à ne plus associer (détachement fait hors CLI).
+    Un nom déjà détaché d'un lot sans branche ne réécrit rien. Rend le lot."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise WorkError("a detachment needs a reason (--reason)")
+    named, _ = _branch_args(branch, None)
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    from . import plan_git
+
+    current = item.get("branch") or None
+    name = named or current
+    if not name:
+        raise WorkError("lot %s has no branch: name the branch to detach" % item_id)
+    if current and plan_git.short_branch(name) != plan_git.short_branch(current):
+        raise WorkError("lot %s carries the branch %s, not %s" % (item_id, current, name))
+    st = storage.of(db)
+    if not current and is_detached(st, item_id, name):
+        return item
+    head = (item.get("branch_head") or "").strip()
+    note = "%s(%s%s) — %s; the merge sweep no longer associates it implicitly " \
+           "(to associate it again: ameesh work branch %d %s)" % (
+               _detach_prefix(name),
+               "last seen %s" % head[:12] if head else "no commit seen",
+               ", target %s" % item["branch_target"] if item.get("branch_target") else "",
+               reason, int(item_id), plan_git.short_branch(name))
+    row = st.work.detach_branch(item_id, current, note=note, actor=actor)
+    if row is None:
+        now = get(db, item_id) or item
+        if now["state"] in MERGED_STATES or now["state"] == "closed":
+            raise WorkError("lot %s already %s: branch not detached" % (item_id, now["state"]))
+        raise WorkError("lot %s: its branch changed meanwhile (now %s): nothing detached, "
+                        "read the lot again" % (item_id, now.get("branch") or "none"))
+    return row
+
+
 # --------------------------------------------------------------------------
 # numéro de migration réservé (L122)
 # --------------------------------------------------------------------------
@@ -678,6 +757,65 @@ def open_lots(db: Db, assignee: str) -> list[dict]:
     return storage.of(db).work.open_for(assignee)
 
 
+#: #753 (B1, R2 Claude) : seuls les arrêts DÉLIBÉRÉS rendent les lots. Un arrêt
+#: automatique et réversible (`erreur` de `stop_after_failures`, `retire_du_canon`
+#: que `canon.revive` annule, `bail_expire`, `externe`) laisse l'agent reprendre
+#: ses lots à la reprise : sinon une panne fournisseur dessaisirait en rafale
+#: tous ses agents. Le pilote peut y ajouter `retire_du_canon` s'il le juge
+#: délibéré.
+RELEASABLE_STOP_REASONS = ("manuel",)
+
+
+def release_lots(db: Db, agent: str, *, reason: str, actor: str = "",
+                 measure_actor: str = "", measure_reason: str = "",
+                 dry_run: bool = False,
+                 stopped_with: tuple[str, ...] = ()) -> list[dict]:
+    """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+    d'équipe — assigné effacé (assignee = NULL), journal au lot avec la raison,
+    délégation en cours annulée —, et ses lots promus (un déploiement porte
+    toujours sa mesure post-déploiement à refaire) vont à `measure_actor`
+    (l'auditeur), avec `measure_reason`. Rend les lots rendus ; idempotent (un
+    lot repris ou fermé entre-temps n'est pas touché). `dry_run` : ce qui
+    serait fait, rien n'est écrit. `stopped_with` : si non vide, la transaction
+    revérifie que l'agent est encore `stopped` pour l'une de ces raisons avant
+    de rendre un lot — sans quoi une reprise (`ameesh resume`) entre le relevé
+    du registre et le geste dessaisirait un agent qui travaille de nouveau."""
+    name = (agent or "").strip()
+    if not name:
+        return []
+    return storage.of(db).work.release_agent(
+        name, reason=reason, actor=actor, measure_actor=measure_actor,
+        measure_reason=measure_reason, dry_run=dry_run,
+        stopped_with=stopped_with)
+
+
+def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
+    """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
+    l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent
+    du canon porte le rôle). Un auditeur arrêté ou mort n'est pas un acteur :
+    on ne réassigne pas un lot à un agent arrêté, ce serait le mal que ce lot
+    corrige. Chaîne vide s'il n'y a aucun auditeur vivant, ou plusieurs sans
+    choix évident : les lots promus restent alors en place. Jamais
+    d'exception. `canons` : canons déjà chargés (le balayage de l'exécuteur
+    espace cette lecture, #1425 N5) ; `None` les lit ici."""
+    from . import alert_briefs, registry
+
+    try:
+        if listing is None:
+            listing = registry.overview(db)
+    except Exception:  # noqa: BLE001 - jamais fatal à l'arrêt d'un agent
+        return ""
+    living = {row.get("name") for row in listing
+              if row.get("name")
+              and (row.get("status") or "") not in ("stopped", "dead")}
+    if alert_briefs.AUDITOR_NAME in living:   # le nom suffit : pas de canon
+        return alert_briefs.AUDITOR_NAME
+    names = [name for name in alert_briefs.auditors(
+                 listing, configured_canons(cfg) if canons is None else canons)
+             if name in living]
+    return names[0] if len(names) == 1 else ""
+
+
 # --------------------------------------------------------------------------
 # attribution gardée (L37, règle 2 de la décision 0030)
 # --------------------------------------------------------------------------
@@ -736,6 +874,15 @@ _ASSIGNEE_HINT = ("register the agent (agent-runner register <name> <harness> �
                   "an external session with a human owner, add --externe")
 
 
+#: #1979 : marque « verdict non requis » que le pilote pose dans la colonne du
+#: relecteur quand aucun re-verdict n'est dû (résolution de composition
+#: mécanique, canon §11 bis/#87, ou verdict conservé d'une tête relue) : sans
+#: elle, le registre affiche un faux « waiting: verdict » et les rappels
+#: partent à un relecteur qui n'a rien à relire. Le jeton commence par un
+#: caractère que `config.NAME_RE` refuse : il ne peut pas désigner un agent.
+REVIEWER_NONE = _pg.REVIEWER_NONE
+
+
 def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     """#705 : le relecteur désigné d'une revue est un nom joignable.
 
@@ -776,14 +923,9 @@ def check_reviewer_choice(db: Db, item: dict, reviewer: str, *, cfg=None) -> str
     return name
 
 
-def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
-                       actor: str | None = None) -> dict:
-    """#705 : désigne (ou change) le relecteur d'un lot **déjà en `qa`**.
-
-    Geste de pilote : mêmes autorités que la correction (`corrector`) — un
-    humain, un orchestrateur ou un agent de conception. Le relecteur doit être
-    joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
-    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
+def _review_item(cfg, db: Db, item_id: int, actor: str | None):
+    """#705/#1979 : l'autorité du geste de relecture, et le lot, qui doit être
+    en `qa` (comme pour `designate_reviewer`)."""
     who = corrector(cfg, db, actor, what="designation")
     item = get(db, item_id)
     if item is None:
@@ -794,17 +936,71 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
             "review (ameesh work move %s qa --reviewer <agent>), or with "
             "ameesh work reviewer %s <agent> once it is in qa"
             % (item_id, item["state"], item_id, item_id))
-    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
-    row = storage.of(db).work.designate_reviewer(item_id, name, actor=who)
+    return who, item
+
+
+def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str) -> dict:
+    """Écrit la colonne du relecteur (nom, vide, ou `REVIEWER_NONE`) et sa
+    ligne de journal, ou dit pourquoi l'écriture n'a pas eu lieu."""
+    row = storage.of(db).work.designate_reviewer(item_id, value, actor=who, event=event)
     if row is None:
         # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
-        # et elle, le lot a pu quitter qa ou recevoir `name` comme assigné.
+        # et elle, le lot a pu quitter qa ou recevoir `value` comme assigné.
         latest = get(db, item_id)
         if latest is not None and latest["state"] == "qa":
             raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
-                            "reviews another agent's work" % (name, item_id))
+                            "reviews another agent's work" % (value, item_id))
         raise WorkError("lot %s left qa in the meantime: retry" % item_id)
     return row
+
+
+def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
+                       actor: str | None = None) -> dict:
+    """#705 : désigne (ou change) le relecteur d'un lot **déjà en `qa`**.
+
+    Geste de pilote : mêmes autorités que la correction (`corrector`) — un
+    humain, un orchestrateur ou un agent de conception. Le relecteur doit être
+    joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
+    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
+    who, item = _review_item(cfg, db, item_id, actor)
+    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
+    return _write_reviewer(db, item_id, name, who, "reviewer %s designated" % name)
+
+
+def clear_reviewer(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
+    """#1979 : retire la désignation du relecteur d'un lot en `qa`.
+
+    Geste de pilote (mêmes autorités que `designate_reviewer`). Le lot
+    retombe dans l'attente réelle d'un relecteur — « verdict d'un relecteur
+    (non désigné) » — et l'alerte redemande d'en désigner un : c'est le geste
+    inverse de `waive_review`, pour une désignation posée à tort."""
+    who, _item = _review_item(cfg, db, item_id, actor)
+    return _write_reviewer(db, item_id, "", who, "reviewer designation removed")
+
+
+def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
+    """#1979 : marque « verdict non requis » sur un lot en `qa`.
+
+    Geste de pilote : il constate qu'aucun re-verdict n'est dû — résolution de
+    composition mécanique (canon §11 bis/#87), verdict conservé d'une tête
+    relue. Le registre cesse alors d'attendre un verdict (l'attente devient la
+    fusion) et les rappels ne partent plus à un relecteur. Désigner un
+    relecteur, retirer la marque (`clear_reviewer`), sortir de qa ou geler
+    une autre tête rend la revue à nouveau due."""
+    who, item = _review_item(cfg, db, item_id, actor)
+    # Un verdict bloquant COURANT demande une correction, pas une dispense :
+    # la marque dormirait et dispenserait la revue suivante à tort. Les
+    # transitions se lisent dans l'ordre chronologique (`lot_transitions`),
+    # pas le journal complet, qui rend le plus récent d'abord.
+    from . import progress  # import tardif : progress importe ce module
+    transitions = storage.of(db).progress.lot_transitions([int(item_id)])
+    jalons = progress._jalons_de_lot(item, transitions, [], milestones(db, item_id))
+    if jalons.get("verdict_kind") == "blocked" and jalons.get("verdict_current"):
+        raise WorkError(
+            "verdict not required refused: lot %s carries a current blocked "
+            "verdict — a fix is due, not a waiver (#1979)" % item_id)
+    return _write_reviewer(db, item_id, REVIEWER_NONE, who,
+                           "verdict not required: no re-verdict due (#1979)")
 
 
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:
@@ -867,6 +1063,12 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
         if mode == "externe":
             hint = (" — its owner can force it with --externe" if responsible
                     else " — set its human owner first, then --externe")
+        elif row.get("operator_paused"):
+            # #2200 : ce n'est pas une inscription à réparer — la pause
+            # humaine se lève nommément, ou le lot va à un autre agent.
+            hint = (" — lift the operator pause (ameesh resume %s --operator "
+                    "--reason <reason>), or assign another agent (the team queue "
+                    "takes an unassigned lot)" % name)
         else:
             hint = (" — fix its registration or admission (agent-runner register "
                     "…, canon sync), or assign to a human (human:<id>)")
@@ -898,7 +1100,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
-           force: str | None = None) -> dict:
+           force: str | None = None, claim: bool = False,
+           if_holder: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -907,15 +1110,45 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
     la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
     du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
-    pas son propre travail."""
+    pas son propre travail.
+
+    #1026 : `claim` n'attribue le lot que s'il est **sans assigné**. Un lot
+    déjà pris est refusé en nommant son porteur, et l'écriture est
+    conditionnelle à `assignee` encore vide : deux prises concurrentes, une
+    seule gagne, l'autre refuse sans changer la main.
+
+    #1787 : une re-prise par le porteur lui-même (`claim` sur son propre lot)
+    est un no-op réussi (`noop`) : l'attribution ne change pas et n'est pas
+    journalisée ; seule une `branch` fournie est enregistrée (`set_branch`).
+
+    #2016 : `if_holder` nomme le titulaire lu par l'appelant (l'instantané
+    d'une alerte) ; si le lot a changé de main depuis, la réassignation est
+    refusée en nommant le porteur courant. Deux agents partis du même brief ne
+    se volent plus le lot : le second relit le lot au lieu d'écraser le
+    premier."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
         raise WorkError("lot %s already %s: nothing to reassign" % (item_id, item["state"]))
     previous = item.get("assignee")
+    if if_holder is not None:
+        expected = str(if_holder).strip() or None
+        if (previous or None) != expected:
+            raise WorkError(
+                "lot %s changed holder since the reading: now %s (expected %s); "
+                "re-read the lot and retry" % (item_id, previous or "nobody",
+                                               expected or "nobody"))
     _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
+    if claim and previous:
+        if previous == check["assignee"]:
+            if branch:
+                row = set_branch(db, item_id, branch, branch_target, actor=actor)
+                return {"item": row, "check": check, "previous": previous, "noop": True}
+            return {"item": item, "check": check, "previous": previous, "noop": True}
+        raise WorkError("lot %s already assigned to %s: claim refused, nothing changed"
+                        % (item_id, previous))
     if previous == check["assignee"]:
         if branch:
             row = set_branch(db, item_id, branch, branch_target, actor=actor)
@@ -930,11 +1163,16 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         if item.get("delegated_by") and item.get("due_ts") else "")
     queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                           % (check["assignee"], previous or "nobody"))
-    row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
+    row = storage.of(db).work.assign(item_id, check["assignee"],
+                                     current=None if claim else previous, note=note,
                                      actor=actor, queued_note=queued,
                                      forced_note=queued and _forced_note(check, note, force,
                                                                          actor))
     if row is None:
+        if claim:
+            holder = (get(db, item_id) or {}).get("assignee")
+            raise WorkError("lot %s taken in the meantime%s: claim refused, nothing changed"
+                            % (item_id, " by %s" % holder if holder else ""))
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
     behind = row.get("queued_behind")
     if branch:
@@ -1298,6 +1536,14 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
         if item is None:
             raise WorkError("lot %s not found" % item_id)
         state = item["state"]
+        pinned = _pinned_ref(item)
+        if pinned:
+            # #1922 : sous workflow, l'état `merged` est écrit par le registre
+            # (garde serveur `merged_and_staging_deployed`), jamais par le
+            # constat de fusion seul.
+            return {"id": int(item_id), "result": "refused", "item": item,
+                    "detail": "lot pinned to workflow %s: transitions go through "
+                              "process_registry" % pinned}
         if state in MERGED_STATES:
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": "already %s" % state}
@@ -1343,8 +1589,54 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     raise WorkError("lot %s moved in the meantime: retry" % item_id)
 
 
+def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
+                           cfg=None) -> str:
+    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture."""
+    from . import plan_git
+    from .canon import GitError
+
+    label = "lot #%s (%s: %s)" % (item["id"], item.get("app") or "?", item["title"])
+    try:
+        checkout = _checkout(lot_repository(item, cfg), repo, cfg)
+        commit = plan_git._commit(checkout, sha)
+        if not commit:
+            raise WorkError("commit %s not found in the lot's repository" % sha)
+        target = item.get("branch_target") or plan_git.default_target(checkout)
+        head = plan_git._commit(checkout, target) if target else None
+        if not head:
+            raise WorkError("merge target %r not found (fetch or configure ameesh.target)"
+                            % target)
+        if plan_git._git(checkout, "merge-base", "--is-ancestor", commit, head).returncode != 0:
+            raise WorkError("commit %s has not entered target %s" % (commit[:12], target))
+        message = plan_git._out(checkout, "show", "-s", "--format=%B", commit)
+        if message is None:
+            raise WorkError("commit message unreadable")
+        title = message.splitlines()[0] if message else ""
+        lot = int(item["id"])
+        if any(int(m.group(1)) == lot for m in plan_git.PARTIAL_TRAILER_RE.finditer(message)):
+            raise WorkError("commit declares only a partial delivery of this lot")
+        how = plan_git.cited_lots(message, hash_refs=plan_git.lot_ref_hash(checkout)).get(lot)
+        if how == "lot-branch" and item.get("branch"):
+            cited = plan_git.LOT_BRANCH_MERGE_RE.match(title)
+            if cited.group("branch") != item["branch"]:
+                how = None
+        if not how and item.get("branch"):
+            # A recorded agent/feature branch may also be named in a real
+            # merge title; a mere mention in a review body proves nothing.
+            parents = plan_git._out(checkout, "show", "-s", "--format=%P", commit)
+            if (parents and len(parents.split()) >= 2
+                    and plan_git._mentions(title, item["branch"])):
+                how = "recorded branch"
+        if not how:
+            raise WorkError("commit does not designate this lot: use ameesh-work: %s "
+                            "in the commit message (a PR number alone is not a lot)" % lot)
+        return commit
+    except (WorkError, GitError, plan_git.MergeProbeError) as exc:
+        raise WorkError("%s: merge declaration refused: %s" % (label, exc)) from exc
+
+
 def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
-           migration_landed: int | None = None, cfg=None) -> dict:
+           repo: str | None = None, migration_landed: int | None = None, cfg=None) -> dict:
     """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
     (fusion locale sur la branche cible) se déclare en une fois.
 
@@ -1353,7 +1645,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     l'acteur ; le journal dit « fusion déclarée par <acteur> (commit …) ».
     Idempotent (`already`, rien n'est réécrit) ; un lot fermé (abandonné,
     remplacé) n'est jamais rouvert : WorkError. Rend le constat de
-    `close_merged`.
+    `close_merged`. Le commit doit être lisible dans le dépôt du lot, désigner
+    ce lot et être entré dans sa cible ; aucune lecture réseau ni force.
 
     `migration_landed` (#1567) : le numéro de migration réellement atterri,
     quand la renumérotation du paquet a changé celui de la réservation (452 au
@@ -1367,12 +1660,16 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    # Preserve idempotency and the closed-lot diagnostic without requiring
+    # that an old clone or object still be available.
+    if item["state"] not in (*MERGED_STATES, "closed"):
+        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
-        repo = _landed_repo(item, cfg)
-        _check_landed_free(db, item_id, number, repo, cfg)
-        landed = (number, repo)
+        landed_repo = _landed_repo(item, cfg)
+        _check_landed_free(db, item_id, number, landed_repo, cfg)
+        landed = (number, landed_repo)
     if landed is not None and item["state"] in MERGED_STATES:
         return _record_landed(db, item, landed, actor=actor, cfg=cfg)
     extra = (note or "").strip()
@@ -1396,7 +1693,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         holder = storage.of(db).work.migration_landed_holder(*landed)
         raise WorkError(_landed_taken(landed[0], landed[1], holder, cfg)) from exc
     if landed is not None and done["result"] == "already":
-        # A merge sweep may have closed the lot after our initial read.
+        # un balayage a pu fusionner le lot après notre lecture : le numéro
+        # déclaré est enregistré (ou corrige celui déjà tenu) après coup
         return _record_landed(db, done["item"], landed, actor=actor, cfg=cfg)
     if done["result"] == "refused":
         item = done["item"]
@@ -1505,6 +1803,10 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pinned = _pinned_ref(item)
+    if pinned:
+        # #1922 : la fermeture d'un lot sous workflow passe par le registre.
+        raise _pinned_close_error(item_id, pinned)
     if superseded_by is not None:
         if int(superseded_by) == int(item_id):
             raise WorkError("a lot cannot supersede itself")
@@ -1535,6 +1837,11 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     for record in threads:
         record(db.cfg, db)
     if row is None:
+        # #1922/N14 : le refus peut venir d'une adoption concurrente, que le
+        # filtre SQL a interceptée (N8) ; nommer la retenue, pas l'état.
+        pinned = _adopted_ref(db, item_id)
+        if pinned:
+            raise _pinned_close_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
 
@@ -1548,6 +1855,43 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
     if state and state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
+
+
+def _pinned_ref(item: dict) -> str:
+    """La révision Process qui pinne le lot (colonne 0452), '' sinon.
+
+    Lue dans l'élément rendu par `work.get`, donc portée par l'interface de
+    stockage — et par le contrat médié pour une session de VM. Aucun SELECT
+    brut ici : il est refusé sur une connexion d'exécuteur médié (B5, #1922).
+    Une base d'avant 0452 rend '' (aucun lot n'y est pinné), comme
+    `workflow_ref` absent d'un élément.
+    """
+    return str(item.get("workflow_ref") or "")
+
+
+def _pinned_transition_error(item_id: int, pinned: str) -> WorkError:
+    """Le refus explicite d'un `move` historique sur un lot pinné (#1922)."""
+    return WorkError(
+        "lot %s is pinned to workflow %s: transitions go through "
+        "process_registry" % (item_id, pinned))
+
+
+def _pinned_close_error(item_id: int, pinned: str) -> WorkError:
+    """Le refus explicite d'une fermeture historique sur un lot pinné (#1922)."""
+    return WorkError(
+        "lot %s is pinned to workflow %s: closing goes through "
+        "process_registry" % (item_id, pinned))
+
+
+def _adopted_ref(db: Db, item_id: int) -> str:
+    """La révision Process qui a adopté le lot entre la lecture et l'écriture.
+
+    #1922/N14 : la garde applicative lit `workflow_ref` hors du verrou du lot ;
+    le filtre SQL refuse ensuite l'écriture (N8). Relire ici rend le refus
+    explicite du lot pinné, au lieu d'un « moved in the meantime » générique
+    qui ferait réessayer une écriture réservée au registre.
+    """
+    return _pinned_ref(get(db, item_id) or {})
 
 
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
@@ -1588,6 +1932,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pinned = _pinned_ref(item)
+    if pinned:
+        # #1922 : un lot pinné sur une révision Process ne bouge que par le
+        # registre (process_registry), qui vérifie la garde côté serveur et
+        # écrit le reçu dans la même transaction.
+        raise _pinned_transition_error(item_id, pinned)
     current = item["state"]
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
@@ -1609,6 +1959,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         row = storage.of(db).work.move(item_id, state, current=current, loops=0, note=text,
                                        actor=actor)
         if row is None:
+            # #1922/N14 : adoption concurrente (workflow_ref) ou état changé.
+            pinned = _adopted_ref(db, item_id)
+            if pinned:
+                raise _pinned_transition_error(item_id, pinned)
             raise WorkError("lot %s moved in the meantime: retry" % item_id)
         return row
     if state not in TRANSITIONS[current]:
@@ -1637,6 +1991,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile
             raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
+        # #1922/N14 : adoption concurrente (workflow_ref) ou état changé.
+        pinned = _adopted_ref(db, item_id)
+        if pinned:
+            raise _pinned_transition_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     if reviewer:
         # #705 : la désignation est un geste distinct (journalisé), fait dans la
@@ -1669,11 +2027,13 @@ def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
-#: les jalons d'un lot : `requested` et `merged` sont automatiques (0013),
-#: `closed` et `delivered` le sont aussi (fermeture, #988), `frozen` et
-#: `verdict` se déclarent par la CLI.
-MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed", "delivered")
-MANUAL_KINDS = ("frozen", "verdict")
+#: les jalons d'un lot : `requested`, `merged`, `closed` et `delivered` sont
+#: automatiques (0013, 0026, fermeture #988) ; `frozen`, `verdict`, `fire` et
+#: `unfire` se déclarent par la CLI — le feu (`fire`/`unfire`, #1374) par
+#: `ameesh work fire` seulement, qui vérifie qu'il porte sur le gel courant
+#: (`ameesh.fire`).
+MILESTONE_KINDS = ("requested", "frozen", "verdict", "fire", "unfire", "merged", "closed", "delivered")
+MANUAL_KINDS = ("frozen", "verdict", "fire", "unfire")
 VERDICTS = ("ok", "blocked")
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
@@ -1715,11 +2075,12 @@ def milestone(
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
-    `frozen` (la branche est gelée pour la revue) et `verdict` (`ok` ou
-    `blocked`, avec le `sha` relu) sont les deux seuls : `requested`, `merged`,
-    `closed` et `delivered` sont écrits automatiquement (transitions et
-    fermeture, 0013 et #988), les déclarer à la main serait un mensonge sur la
-    frise.
+    `frozen` (la branche est gelée pour la revue), `verdict` (`ok` ou
+    `blocked`, avec le `sha` relu), et `fire`/`unfire` (le feu du pilote et son
+    retrait, #1374) sont les seuls déclarés : `requested`, `merged`, `closed`
+    et `delivered` sont écrits automatiquement (transitions, fermeture et
+    livraison hors cible : 0013, 0026, #988), les déclarer à la main serait un
+    mensonge sur la frise.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -1730,6 +2091,9 @@ def milestone(
     imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
     le raccord de la désignation des relecteurs se branche à l'activation du
     lot #1617, pas ici.
+
+    Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
+    porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))

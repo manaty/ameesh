@@ -52,8 +52,11 @@ class VMSupervisor(unittest.TestCase):
 
     def supervise(self, launch, stop=None, **kwargs):
         kwargs.setdefault('log', lambda _: None)
+        kwargs.setdefault('now', lambda: 100)
+        # la fenêtre de reprise suit l'horloge du test, sauf témoin dédié
+        kwargs.setdefault('monotonic', kwargs['now'])
         return V.supervise(self.recipe, stop or threading.Event(), launch=launch,
-                           now=lambda: 100, **kwargs)
+                           **kwargs)
 
     def test_exit_codes_preserve_volume_except_revocation_and_clear_code(self):
         marker = self.root / 'volume/executor.json'
@@ -130,11 +133,23 @@ class VMSupervisor(unittest.TestCase):
         self.assertEqual(calls[0][1]['timeout'], 110)
 
     def test_stale_gate_stops_existing_container_and_preserves_volume(self):
+        """#1916 : la porte devient périmée pendant l'exécution ; le conteneur
+        est arrêté (observé), puis la fenêtre de reprise s'épuise sans porte
+        fraîche et la supervision s'arrête comme avant."""
+        clock = [100.0]
         def launch(_):
             self.state.unlink()
             return Process(0, running=True)
+        class Stop:
+            def is_set(self):
+                return False
+            def wait(self, _):
+                clock[0] += V.STALE_RESUME_MAX_S
+                return False
         calls = []
-        self.assertEqual(self.supervise(launch, run=lambda argv, **_: calls.append(argv) or Process(0)), 0)
+        self.assertEqual(self.supervise(
+            launch, Stop(), run=lambda argv, **_: calls.append(argv) or Process(0),
+            now=lambda: clock[0]), 0)
         self.assertIn('--time=100', calls[0])
 
     def test_dead_guard_during_long_window_is_stopped(self):
@@ -144,13 +159,139 @@ class VMSupervisor(unittest.TestCase):
         self.assertEqual(V.gate_state(str(self.state), 100), 'stale')
         raw['expires_ts'] = 190
         self.state.write_text(json.dumps(raw))
+        clock = [100.0]
         def launch(_):
             raw['expires_ts'] = 99
             self.state.write_text(json.dumps(raw))
             return Process(0, running=True)
+        class Stop:
+            def is_set(self):
+                return False
+            def wait(self, _):
+                clock[0] += V.STALE_RESUME_MAX_S
+                return False
         calls = []
-        self.assertEqual(self.supervise(launch, run=lambda argv, **_: calls.append(argv) or Process(0)), 0)
+        self.assertEqual(self.supervise(
+            launch, Stop(), run=lambda argv, **_: calls.append(argv) or Process(0),
+            now=lambda: clock[0]), 0)
         self.assertIn('--time=100', calls[0])
+
+    def test_stale_gate_resumes_when_the_guard_renews_in_the_window(self):
+        """#1916 : le cas visé — le conteneur est arrêté sur porte périmée et
+        aucun lancement n'a lieu tant qu'elle reste périmée ; une porte fraîche
+        revenue dans la fenêtre relance l'exécuteur sans opérateur."""
+        available = self.state.read_text()
+        launches = []
+        clock = [100.0]
+        case = self
+        def launch(_):
+            launches.append(len(launches) + 1)
+            if len(launches) == 1:
+                self.state.unlink()          # la garde disparaît
+                return Process(0, running=True)
+            case.assertTrue(self.state.exists(), 'relance sur porte fraîche')
+            return Process(0)                # relance, puis fin propre
+        class Stop:
+            waits = 0
+            def is_set(inner):
+                return False
+            def wait(inner, _):
+                inner.waits += 1
+                if inner.waits == 1:
+                    # toujours périmée : rien n'a été relancé
+                    case.assertEqual(launches, [1])
+                    clock[0] += 30
+                elif inner.waits == 2:
+                    self.state.write_text(available)     # la garde renouvelle
+                    clock[0] += 1
+                return False
+        calls = []
+        self.assertEqual(self.supervise(
+            launch, Stop(), run=lambda argv, **_: calls.append(argv) or Process(0),
+            now=lambda: clock[0]), 0)
+        self.assertEqual(launches, [1, 2])
+        self.assertEqual(calls, [['podman', 'stop', '--ignore', '--time=100', V.NAME]])
+
+    def test_stale_resume_requires_a_fresh_gate_before_the_deadline(self):
+        fresh = json.loads(self.state.read_text())
+        for elapsed, expected in ((V.STALE_RESUME_MAX_S - 1, 2),
+                                  (V.STALE_RESUME_MAX_S, 1),
+                                  (V.STALE_RESUME_MAX_S + 1, 1)):
+            with self.subTest(elapsed=elapsed):
+                self.state.write_text(json.dumps(fresh))
+                clock, launches = [100.0], []
+                def launch(_):
+                    launches.append(clock[0])
+                    if len(launches) == 1:
+                        self.state.unlink()
+                        return Process(0, running=True)
+                    return Process(0)
+                class Stop:
+                    def is_set(inner):
+                        return False
+                    def wait(inner, _):
+                        clock[0] += elapsed
+                        renewed = dict(fresh, expires_ts=clock[0] + 90,
+                                       until_ts=clock[0] + 200)
+                        self.state.write_text(json.dumps(renewed))
+                        return False
+                self.assertEqual(self.supervise(
+                    launch, Stop(), run=lambda *_, **__: Process(0),
+                    now=lambda: clock[0]), 0)
+                self.assertEqual(len(launches), expected)
+
+    def test_stale_window_follows_the_monotonic_clock_not_the_wall(self):
+        """#1971 : un saut de l'heure murale (NTP) pendant la fenêtre ne la
+        ferme pas ; seule l'horloge monotone la mesure. #1972 : l'entrée dans
+        la fenêtre et le retour de la porte sont journalisés."""
+        fresh = json.loads(self.state.read_text())
+        wall, mono, launches, logs = [100.0], [0.0], [], []
+        def launch(_):
+            launches.append(wall[0])
+            if len(launches) == 1:
+                self.state.unlink()
+                return Process(0, running=True)
+            return Process(0)
+        class Stop:
+            waits = 0
+            def is_set(inner):
+                return False
+            def wait(inner, _):
+                inner.waits += 1
+                mono[0] += 1
+                if inner.waits == 1:
+                    wall[0] += 3600                 # saut NTP en avant
+                elif inner.waits == 2:
+                    self.state.write_text(json.dumps(dict(
+                        fresh, expires_ts=wall[0] + 90, until_ts=wall[0] + 200)))
+                return False
+        self.assertEqual(self.supervise(
+            launch, Stop(), run=lambda *_, **__: Process(0), log=logs.append,
+            now=lambda: wall[0], monotonic=lambda: mono[0]), 0)
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(sum('guard gate stale, executor stopped' in l for l in logs), 1, logs)
+        self.assertIn('within %ds' % V.STALE_RESUME_MAX_S,
+                      next(l for l in logs if 'guard gate stale' in l))
+        self.assertIn('VM supervisor: guard gate fresh again (available)', logs)
+
+    def test_stale_window_expiry_is_logged(self):
+        """#1972 : la fin de la fenêtre sans porte fraîche est dite avant la
+        sortie."""
+        clock, logs = [100.0], []
+        def launch(_):
+            self.state.unlink()
+            return Process(0, running=True)
+        class Stop:
+            def is_set(inner):
+                return False
+            def wait(inner, _):
+                clock[0] += V.STALE_RESUME_MAX_S
+                return False
+        self.assertEqual(self.supervise(
+            launch, Stop(), run=lambda *_, **__: Process(0), log=logs.append,
+            now=lambda: clock[0]), 0)
+        self.assertEqual(logs[-1], 'VM supervisor: guard gate still stale after %ds, exiting'
+                         % V.STALE_RESUME_MAX_S)
 
     def test_fresh_guard_with_no_window_launches(self):
         self.state.write_text(json.dumps({'schema': 'ameesh-host-state/1', 'state': 'available',
@@ -314,8 +455,11 @@ class VMSupervisor(unittest.TestCase):
         self.assertEqual(stop.waits, 3)
         self.assertEqual(calls, [['podman', 'stop', '--ignore', '--time=100', V.NAME]])
 
-    def test_guard_expiry_while_waiting_for_next_window_exits(self):
-        """A stopped container must not leave its supervisor waiting on a dead guard."""
+    def test_guard_expiry_while_waiting_for_next_window_keeps_waiting(self):
+        """#1916 : une garde morte pendant l'attente d'une prochaine fenêtre
+        n'arrête plus la supervision au premier tour ; l'unité attend la
+        fenêtre de reprise, puis sort (ici sur le signal, la fenêtre n'étant
+        jamais renouvelée)."""
         launches = []
         def launch(_):
             launches.append(1)
@@ -333,7 +477,7 @@ class VMSupervisor(unittest.TestCase):
                 return inner.is_set()
         stop = Stop()
         self.assertEqual(self.supervise(launch, stop, run=lambda *_, **__: Process(0)), 0)
-        self.assertEqual(stop.waits, 1, 'stale gate must end the supervisor before another wait')
+        self.assertEqual(stop.waits, 3, 'stale gate is given the bounded resume window')
         self.assertEqual(len(launches), 1)
 
     def test_stale_gate_at_boot_waits_for_the_guard_instead_of_exiting(self):

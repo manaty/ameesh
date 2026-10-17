@@ -22,8 +22,34 @@ _COLUMNS = """
     planned_source, planned_by
 """
 
+#: Un seul verrou par schéma, pour TOUS les canons (L42/0031 : les identifiants
+#: de `work_packages` sont globaux, le premier canon qui en déclare un le
+#: garde). La clé ne dépend ni du canon ni du clone, comme celle du registre
+#: des authentificateurs : deux canons ne doivent pas lire « absent » ensemble
+#: puis s'écraser, et la bascule du canon par défaut écrit la même colonne.
+SYNC_LOCK_SQL = ("SELECT pg_advisory_xact_lock(hashtextextended("
+                 "current_schema() || ':canon-sync-packages', 0))")
+
 
 class WorkPackages(interface.WorkPackages):
+
+    def lock_sync(self) -> None:
+        """Verrou transactionnel des fiches, pris AVANT leur lecture.
+
+        L'attente d'un verrou consultatif compte dans `statement_timeout` : au
+        démarrage d'un hôte, le premier sync d'un canon peut être long (un
+        déploiement change beaucoup de fiches) et les suivants échoueraient en
+        57014, laissant la porte d'hôte fermée jusqu'au réessai. On lève donc
+        le délai le temps de la prise, puis on rétablit celui de la session
+        pour le reste de la transaction. `set_config(..., true)` (et non un
+        `SET LOCAL ... %s`) : une instruction utilitaire n'accepte pas de
+        paramètre lié, les deux pilotes envoient le leur tel quel.
+        """
+        previous = self.db.query(
+            "SELECT current_setting('statement_timeout') AS timeout")[0]["timeout"]
+        self.db.execute("SELECT set_config('statement_timeout', '0', true)")
+        self.db.execute(SYNC_LOCK_SQL)
+        self.db.execute("SELECT set_config('statement_timeout', %s, true)", (previous,))
 
     def all(self, *, include_absent: bool = False) -> list[dict]:
         sql = "SELECT %s FROM work_packages" % _COLUMNS

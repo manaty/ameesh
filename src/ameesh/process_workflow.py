@@ -23,15 +23,22 @@ classent exactement les cœurs déclarés par les étapes, sans recouvrement ;
 les autres restent ouverts. `blocked` et `waiting_human` sont des retenues
 (holds) qui gardent l'étape courante : ce ne sont pas des cœurs d'étape.
 
+Une même garde peut mener à **plusieurs cibles distinctes** depuis une même
+étape (la carte de référence #1379 le fait : `draft -> backlog` et
+`draft -> sprint` sous `planning`). L'arête est choisie par la commande
+(`to_stage`), et le registre natif vérifie le couple exact
+(`to_stage`, `guard`) depuis `from_stage` ; seul un doublon **exact**
+`(from, to, guard)` est refusé.
+
 Refus (codes stables, portés par `WorkflowRefusal.code`) :
 
 * lecture     `json-invalid`, `key-duplicate` ;
 * forme       `value-type`, `value-empty`, `key-unknown`, `key-missing`,
               `schema-unsupported`, `ref-invalid`, `version-invalid` ;
-* étapes      `stage-duplicate`, `core-unknown`, `initial-undeclared`,
-              `stage-unreachable` ;
+* étapes      `stage-duplicate`, `stage-padded`, `stage-case-duplicate`,
+              `core-unknown`, `initial-undeclared`, `stage-unreachable` ;
 * types       `type-duplicate`, `type-unsupported` ;
-* arêtes      `edge-duplicate`, `edge-ambiguous`, `edge-undeclared`,
+* arêtes      `edge-duplicate`, `edge-undeclared`,
               `guard-unknown`, `terminal-reopening` ;
 * projection  `classification-overlap`, `classification-incomplete`,
               `classification-mismatch`, `projection-conflict`.
@@ -258,6 +265,7 @@ def _stages(value: Any) -> tuple[Stage, ...]:
     items = _list(value, path)
     out: list[Stage] = []
     seen: set[str] = set()
+    folded: dict[str, str] = {}
     for index, raw in enumerate(items):
         item = "%s[%d]" % (path, index)
         obj = _mapping(raw, item)
@@ -267,10 +275,19 @@ def _stages(value: Any) -> tuple[Stage, ...]:
         if core not in CORE_STATES:
             raise WorkflowRefusal("core-unknown", item + ".core",
                                   "cœur hors de %s" % ", ".join(CORE_STATES))
+        if status != status.strip():
+            raise WorkflowRefusal("stage-padded", item + ".status",
+                                  "espaces en bord dans le statut")
+        key = status.casefold()
+        other = folded.get(key)
+        if other is not None and other != status:
+            raise WorkflowRefusal("stage-case-duplicate", item + ".status",
+                                  "statut identique à la casse près à %s" % other)
         if status in seen:
             raise WorkflowRefusal("stage-duplicate", item + ".status",
                                   "statut déclaré deux fois")
         seen.add(status)
+        folded[key] = status
         out.append(Stage(status=status, core=core))
     return tuple(out)
 
@@ -281,7 +298,6 @@ def _transitions(value: Any, stages: tuple[Stage, ...]) -> tuple[Transition, ...
     declared = {stage.status for stage in stages}
     out: list[Transition] = []
     exact: set[tuple[str, str, str]] = set()
-    by_source_guard: dict[tuple[str, str], str] = {}
     for index, raw in enumerate(items):
         item = "%s[%d]" % (path, index)
         obj = _mapping(raw, item)
@@ -302,12 +318,6 @@ def _transitions(value: Any, stages: tuple[Stage, ...]) -> tuple[Transition, ...
         if triple in exact:
             raise WorkflowRefusal("edge-duplicate", item, "arête déjà déclarée")
         exact.add(triple)
-        previous = by_source_guard.get((source, guard))
-        if previous is not None and previous != target:
-            raise WorkflowRefusal("edge-ambiguous", item,
-                                  "la garde %r mène déjà de %r vers %r"
-                                  % (guard, source, previous))
-        by_source_guard[(source, guard)] = target
         out.append(Transition(source=source, target=target, guard=guard))
     return tuple(out)
 

@@ -389,7 +389,8 @@ class BuildersTest(unittest.TestCase):
             self.assertIn(name + "(", source)
         cli = (ROOT / "src" / "ameesh" / "mesh_cli.py").read_text(encoding="utf-8")
         for name in ("agent_detail(db, args.agent)", "work_rows(db,",
-                     "work_detail(cfg, db, args.id)", "_host_json(part)"):
+                     # #1905 : `work show` passe aussi repo= et target= (arguments nommés à défaut)
+                     "work_detail(cfg, db, args.id", "_host_json(part)"):
             self.assertIn(name, cli)
         self.assertTrue(callable(mesh_cli.agent_rows))
 
