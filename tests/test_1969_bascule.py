@@ -185,6 +185,36 @@ class BasculeTest(unittest.TestCase):
             if valeur == "v2":
                 self.assertEqual(0, retour(self.venv))
 
+    def test_script_console_ajoute_par_une_version_ulterieure_est_expose(self):
+        """#2155 : un point d'entrée pip de la v2 apparaît dans le venv stable."""
+        vrai_venv(self.base, "v1", "v1", "old_only")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "new_only")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        # pip n'écrit ce script que dans venv-v2/bin : le venv stable ne l'a
+        # jamais vu à l'adoption.
+        outil = self.base / "venv-v2" / "bin" / "futur-outil"
+        outil.write_text("#!%s/bin/python\nimport pkg1969\nprint(pkg1969.VALUE)\n"
+                         % (self.base / "venv-v2"))
+        outil.chmod(0o755)
+
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+
+        lanceur = self.venv / "bin" / "futur-outil"
+        self.assertTrue(lanceur.is_file(),
+                        "le script console de la version active n'est pas exposé")
+        resultat = subprocess.run([str(lanceur)], capture_output=True, text=True)
+        self.assertEqual(0, resultat.returncode, resultat.stderr)
+        self.assertEqual("v2", resultat.stdout.strip())
+        # Le python et l'ameesh stables restent des lanceurs de la version vive.
+        self.assertEqual((0, "v2"), lire(self.venv))
+
+        self.assertEqual(0, retour(self.venv))
+        # Le lanceur créé pour la v2 disparaît quand la version de retour ne
+        # porte pas ce script ; les scripts adoptés de la v1 restent.
+        self.assertFalse(lanceur.exists(), "lanceur d'une version quittée laissé")
+        self.assertEqual((0, "v1"), lire(self.venv))
+
     # -- B2 : le retour réutilise le venv réel, sans pip --------------------
 
     def test_retour_reutilise_le_venv_reel_sans_pip(self):
