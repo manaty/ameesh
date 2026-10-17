@@ -132,15 +132,19 @@ def check_run(ident: int = 900, *, name: str = "tests", statut: str = "completed
 def marque(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
            token: str = "0" * 16, pr: int = PR, label: str | None = None,
            ident: int = 1, ts: float | None = None, texte: str = "",
-           seen: int | None = 0) -> dict:
+           avis: int | None = None, seen: int | None = 0) -> dict:
     """Un événement `ci-label` du journal du lot, comme `work.events` le rend.
 
-    `seen` est le plus grand identifiant d'exécution connu avant la pose
-    (P2-3) ; `None` écrit une marque d'avant #1343, sans corrélation.
+    `avis` (N2 #2240) garde le nombre d'avis déclaré, y compris 0 ; `None`
+    écrit une marque d'avant #2240, sans ce champ. `seen` est le plus grand
+    identifiant d'exécution connu avant la pose (P2-3) ; `None` écrit une
+    marque d'avant #1343, sans corrélation.
     """
     label = label or "ci-%s-%s" % (mode, sha)
     note = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
             % (state, pr, label, sha, base, mode, token))
+    if avis is not None:
+        note += " avis=%d" % avis
     if seen is not None:
         note += " seen=%d" % seen
     if texte:
@@ -150,11 +154,11 @@ def marque(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
 
 def porte(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
           token: str = "0" * 16, ident: int = 1, ts: float | None = None,
-          seen: int | None = 0) -> dict:
+          avis: int | None = None, seen: int | None = 0) -> dict:
     """Une marque déjà parsée, comme `ci.request_events` la rend."""
     return {"id": ident, "state": state, "pr": PR,
             "label": "ci-%s-%s" % (mode, sha), "sha": sha, "base": base,
-            "mode": mode, "token": token, "seen": seen,
+            "mode": mode, "token": token, "avis": avis, "seen": seen,
             "ts": time.time() if ts is None else ts}
 
 
@@ -189,12 +193,13 @@ class Github:
     """Les lectures GitHub de `gel_plan`/`cancel_plan`/`cmd_ci_run`, sans réseau."""
 
     def __init__(self, *, head: str = GEL, runs=(), workflow: str | None = WORKFLOW,
-                 pulls=None, checks=None):
+                 pulls=None, checks=None, manifest: str | None = None):
         self.head = head
         self.runs = list(runs)
         self.workflow = workflow
         self.pulls = [pull()] if pulls is None else pulls
         self.checks = {"check_runs": [check_run()]} if checks is None else checks
+        self.manifest = manifest
         self.paths: list[str] = []
 
     def rows(self) -> list[dict]:
@@ -232,6 +237,13 @@ class Github:
             if self.workflow is None:
                 return {}
             return {"content": base64.b64encode(self.workflow.encode()).decode()}
+        if "/contents/reviews?" in path:
+            # N1 #2240 : le manifeste de composition du porteur, lu à la tête.
+            # Sans manifeste, GitHub rend un 404 que `_json` lève en
+            # `GithubError` ; le faux rend une liste vide, même verdict.
+            if self.manifest is None:
+                return {}
+            return [{"name": self.manifest, "type": "file"}]
         if "/check-runs?" in path:
             return self.checks
         raise AssertionError("chemin GitHub inattendu : %s" % path)
@@ -446,6 +458,42 @@ class GelPlanTest(GelTestCase):
         self.assertIn("0 independent verdict(s)", str(caught.exception))
         self.assertIn("--exception incident|unblock", str(caught.exception))
         self.assertEqual(api.ecrit(), [], "aucune demande sans les avis")
+
+    def test_un_avis_zero_full_refuse_hors_porteur(self):
+        # N1 #2240 (b) : `--avis 0 --full` n'est permis qu'à une tête
+        # `integration/**` ; une branche de lot garde les avis requis (#2214).
+        self.gele()
+        api = Github()
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, avis=0, full=True,
+                     reason="porteur, unités relues au manifeste")
+        self.assertIn("integration/**", str(caught.exception))
+        self.assertIn("#%d" % PR, str(caught.exception))
+        self.assertEqual([p for p in api.paths if "contents/reviews" in p], [],
+                         "un refus nommé ne lit pas de manifeste")
+
+    def test_un_avis_zero_full_refuse_sans_manifeste(self):
+        # N1 #2240 (b) : le zéro avis du porteur tient à son manifeste de
+        # composition, publié à la tête gelée ; sans lui, refus nommé.
+        self.gele()
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")])
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, avis=0, full=True,
+                     reason="porteur, unités relues au manifeste")
+        self.assertIn("manifest", str(caught.exception))
+        self.assertIn(GEL[:12], str(caught.exception))
+
+    def test_un_avis_zero_full_passe_sur_porteur_et_son_manifeste(self):
+        # N1 #2240 (b) : le porteur `integration/**` qui publie son manifeste
+        # à la tête demande la suite complète sans avis sur la tête composée.
+        self.gele()
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                     manifest="integration-paquet-h-20261017-0600.md")
+        decision = self.gel(api, avis=0, full=True,
+                            reason="porteur, unités relues au manifeste")
+        self.assertEqual((decision["action"], decision["mode"], decision["avis"]),
+                         ("request", "full", 0))
+        self.assertIn("contents/reviews?ref=%s" % GEL, " ".join(api.paths))
 
     def test_un_full_ne_consomme_pas_un_avis_manquant(self):
         # #2214, constat #2209 : `--avis 2 --full` avec un seul `ok` doit
@@ -738,7 +786,10 @@ class GelPlanTest(GelTestCase):
 
     def test_un_lot_leger_demande_sans_avis(self):
         self.jalons.append(jalon("frozen", sha=GEL))
-        self.assertEqual(self.gel(Github(), avis=0)["action"], "request")
+        api = Github()
+        self.assertEqual(self.gel(api, avis=0)["action"], "request")
+        self.assertEqual([p for p in api.paths if "contents/reviews" in p], [],
+                         "la garde du porteur ne concerne que --full")
 
 
 class ReservationTest(unittest.TestCase):
@@ -899,6 +950,51 @@ class RequestTest(GelTestCase):
         self.assertIn(LABEL, applied[0])
         self.assertIn("base %s" % BASE, applied[0])
         self.assertEqual(len(self.marques("reserve")), 1, notes)
+
+    def test_l_avis_declare_est_trace_dans_les_marques(self):
+        # N2 #2240 : le nombre d'avis déclaré par l'appelant reste lisible
+        # dans les marques `reserve` et `applied`, `--avis 0` compris.
+        self.gele()
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 0)
+        for state in ("reserve", "applied"):
+            self.assertEqual(len(self.marques(state)), 1, notes)
+            self.assertIn(" avis=1", self.marques(state)[0])
+        parsed = ci.request_events(self.db, self.item["id"])
+        self.assertEqual([(e["state"], e["avis"]) for e in parsed],
+                         [("reserve", 1), ("applied", 1)])
+
+    def test_un_avis_zero_full_ne_passe_pas_sans_trace(self):
+        # N2 #2240 / N1 : un porteur `integration/**` en `--avis 0 --full`
+        # n'est plus muet — la marque dit avis=0 et `request_events` le relit.
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                     manifest="integration-paquet-h-20261017-0600.md")
+        args = argparse.Namespace(**{**vars(self.args), "avis": 0, "full": True,
+                                     "reason": "porteur, unités relues au manifeste"})
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, args=args)
+        self.assertEqual(code, 0, notes)
+        self.assertIn("ci-full-%s" % GEL, gh.poses())
+        for state in ("reserve", "applied"):
+            self.assertEqual(len(self.marques(state)), 1, notes)
+            self.assertIn(" avis=0", self.marques(state)[0])
+        parsed = ci.request_events(self.db, self.item["id"])
+        self.assertEqual([(e["state"], e["avis"]) for e in parsed],
+                         [("reserve", 0), ("applied", 0)])
+
+    def test_un_avis_zero_full_hors_porteur_ne_pose_rien(self):
+        # N1 #2240 (b) : la garde ne touche que la demande de CI ; hors
+        # porteur, rien n'est annulé, posé ni noté.
+        self.gele()
+        gh = Gh()
+        args = argparse.Namespace(**{**vars(self.args), "avis": 0, "full": True,
+                                     "reason": "porteur, unités relues au manifeste"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(err):
+            code, notes = self.run_cmd(Github(), gh, args=args)
+        self.assertEqual(code, 1, notes)
+        self.assertEqual((gh.calls, notes, gh.poses()), ([], [], []))
 
     def test_dry_run_ne_pose_rien(self):
         self.gele()
@@ -1294,6 +1390,21 @@ class ParsingTest(unittest.TestCase):
         args = parser.parse_args(["ci", "cancel", "1343", "--all", "--dry-run"])
         self.assertEqual(args.func.__name__, "cmd_ci")
         self.assertTrue(args.all and args.dry_run)
+
+    def test_la_marque_porte_l_avis_declare(self):
+        # N2 #2240 : la marque dit avis=N ; une marque d'avant #2240 (sans
+        # champ) reste lisible, avis absent.
+        note = ci._request_note("applied", PR, "ci-full-%s" % GEL, GEL, BASE,
+                                "full", "a" * 16, avis=0, seen=7)
+        found = ci.REQUEST_RE.match(note)
+        self.assertIsNotNone(found)
+        self.assertEqual((found.group("avis"), found.group("seen")), ("0", "7"))
+        legacy = ("ci-label applied pr=%d label=ci-lot-%s sha=%s base=%s "
+                  "mode=lot token=%s seen=3" % (PR, GEL, GEL, BASE, "b" * 16))
+        found = ci.REQUEST_RE.match(legacy)
+        self.assertIsNotNone(found)
+        self.assertIsNone(found.group("avis"))
+        self.assertEqual(found.group("seen"), "3")
 
 
 if __name__ == "__main__":

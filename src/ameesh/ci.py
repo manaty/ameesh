@@ -1985,11 +1985,13 @@ PR_RUN_RE = re.compile(
 #: `seen=<id>` (P2-3) : le plus grand identifiant d'exécution connu avant sa
 #: pose, seule corrélation fiable avec le run qu'elle a produit (les horloges
 #: de la base et de GitHub ne se comparent pas : la seconde contre la fraction).
+#: `avis=<N>` (N2 #2240) garde le nombre d'avis déclaré par l'appelant, y
+#: compris 0 : `--avis 0 --full` reste lisible dans la trace du lot.
 REQUEST_RE = re.compile(
     r"^ci-label (?P<state>reserve|applied|released) pr=(?P<pr>\d+) "
     r"label=(?P<label>ci-(?:lot|full)-[0-9a-f]{40}) sha=(?P<sha>[0-9a-f]{40}) "
     r"base=(?P<base>[0-9a-f]{40}) mode=(?P<mode>lot|full) token=(?P<token>[0-9a-f]{16})"
-    r"(?: seen=(?P<seen>\d+))?\b")
+    r"(?: avis=(?P<avis>\d+))?(?: seen=(?P<seen>\d+))?\b")
 #: l'acteur du `GITHUB_TOKEN` d'Actions : ses étiquettes ne déclenchent rien
 ACTIONS_BOT = "github-actions[bot]"
 
@@ -2204,6 +2206,28 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
     return "types: [labeled]" in text and "ci-(lot|full)-" in text
 
 
+def _carrier_manifest(api, repo: str, sha: str) -> str:
+    """Le manifeste de composition d'un porteur à `sha`, ou "" (N1 #2240).
+
+    Un porteur `integration/**` publie `reviews/integration-paquet-<…>.md` :
+    c'est la revue unitaire du paquet qui tient lieu d'avis sur la tête
+    composée, pour la seule demande de CI (`--avis 0 --full`). Toute réponse
+    illisible ou absente vaut « pas de manifeste » : le refus est nommé, jamais
+    un zéro avis supposé.
+    """
+    from . import plan_github
+    try:
+        data = api("repos/%s/contents/reviews?ref=%s" % (repo, _q(sha)))
+    except plan_github.GithubError:
+        return ""
+    if not isinstance(data, list):
+        return ""
+    names = sorted(str((item or {}).get("name") or "") for item in data
+                   if isinstance(item, dict))
+    return next((name for name in names
+                 if name.startswith("integration-paquet-") and name.endswith(".md")), "")
+
+
 def _short_run(row: dict) -> dict:
     run = {"id": row.get("id"), "status": row.get("status"),
            "conclusion": row.get("conclusion"), "event": row.get("event"),
@@ -2241,9 +2265,13 @@ def _latest_check(api, repo: str, sha: str) -> dict | None:
 
 def _request_note(state: str, number: int, label: str, sha: str, base: str,
                   mode: str, token: str, text: str = "",
-                  seen: int | None = None) -> str:
+                  avis: int | None = None, seen: int | None = None) -> str:
     marker = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
               % (state, number, label, sha, base, mode, token))
+    if avis is not None:
+        #: N2 #2240 : le nombre d'avis déclaré par l'appelant reste lisible
+        #: dans la marque, `--avis 0 --full` compris (aucun passage muet).
+        marker += " avis=%d" % avis
     if seen is not None:
         marker += " seen=%d" % seen
     return "%s: %s" % (marker, text.strip()) if text.strip() else marker
@@ -2261,6 +2289,7 @@ def request_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
                     "pr": int(m.group("pr")), "label": m.group("label"),
                     "sha": m.group("sha"), "base": m.group("base"),
                     "mode": m.group("mode"), "token": m.group("token"),
+                    "avis": int(m.group("avis")) if m.group("avis") is not None else None,
                     "seen": int(m.group("seen")) if m.group("seen") is not None else None,
                     "ts": float(ev.get("created_ts") or 0.0)})
     return sorted(out, key=lambda e: e["id"])
@@ -2405,6 +2434,24 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
         raise GelError("pull request #%d head is %s, the freeze is %s: the PR moved — "
                        "refreeze and re-review, nothing requested"
                        % (pr["number"], pr["head"][:12], frozen_sha[:12]))
+    if full and avis == 0 and not exception:
+        # (b) §12 #2240 (pilote mesh-design, 17/10 13:22) : le zéro avis d'une
+        # suite complète est réservé à un porteur `integration/**` qui publie
+        # son manifeste ; hors de ce cas la relecture reste la règle (#2214).
+        # Cette garde ne touche que la demande de CI : checks requis,
+        # review_gate et porte de fusion du porteur restent inchangés.
+        head_ref = (pr["head_ref"] or "").strip()
+        if not head_ref.startswith("integration/"):
+            raise GelError("pull request #%d: --avis 0 --full is reserved to an "
+                           "integration/** carrier head (source %r); review the head "
+                           "and pass its required verdicts"
+                           % (pr["number"], head_ref or "—"))
+        manifest = _carrier_manifest(api, name, frozen_sha)
+        if not manifest:
+            raise GelError("pull request #%d: --avis 0 --full needs the carrier's "
+                           "manifest (reviews/integration-paquet-*.md) at %s; without "
+                           "it, review the head and pass its required verdicts"
+                           % (pr["number"], frozen_sha[:12]))
     if not _sha_ok(pr["base"]):
         raise GelError("pull request #%d: unusable base commit (%r): the composition "
                        "cannot be checked" % (pr["number"], pr["base"]))
@@ -2707,9 +2754,11 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
 
     def critical(tx) -> dict:
         def note(state: str, text: str = "", seen: int | None = None) -> None:
+            #: N2 #2240 : chaque marque porte le nombre d'avis déclaré, y
+            #: compris 0 (`--avis 0 --full` ne passe plus sans trace).
             work.note(tx, int(item_id),
                       _request_note(state, number, label, sha, base, mode, token, text,
-                                    seen=seen))
+                                    avis=int(decision.get("avis") or 0), seen=seen))
 
         note("reserve", "freeze CI requested")
         known = _pr_runs(api, decision["repo"], number, sha, decision["branch"])
