@@ -1010,15 +1010,14 @@ class Intentions:
         # le parent (racine du journal) naît privé lui aussi : `mkdir -p`
         # laisserait le masque décider de son mode.
         for directory in (self.root.parent, self.root):
-            if not directory.exists():
+            try:
                 directory.mkdir(mode=0o700, exist_ok=True)
-        try:
-            info = self.root.lstat()
-        except OSError:
-            raise Refused('intent_root') from None
-        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != self.uid or stat.S_IMODE(info.st_mode) & 0o077):
-            raise Refused('intent_root')
+                info = directory.lstat()
+            except OSError:
+                raise Refused('intent_root') from None
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != self.uid or stat.S_IMODE(info.st_mode) & 0o077):
+                raise Refused('intent_root')
         return self.root
 
     @staticmethod
