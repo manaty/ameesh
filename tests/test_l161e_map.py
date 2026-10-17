@@ -746,12 +746,26 @@ def _lien_de_valeur(valeur, liens):
 
 def _etoiles(module: str) -> list:
     """Noms liés par `from <module> import *` : les classes publiques du module
-    cible (une classe privée n'est pas liée par l'étoile)."""
+    cible, ou celles d'un `__all__` littéral explicite."""
     chemin = _fichier_module(module)
     if chemin is None:
         return []
-    return [node.name for node in _arbre(chemin).body
-            if isinstance(node, ast.ClassDef) and not node.name.startswith("_")]
+    arbre = _arbre(chemin)
+    noms = None
+    for node in arbre.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(cible, ast.Name) and cible.id == "__all__"
+                for cible in node.targets):
+            try:
+                noms = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                noms = None
+    exports = set(noms) if isinstance(noms, (list, tuple)) \
+        and all(isinstance(nom, str) for nom in noms) else None
+    return [node.name for node in arbre.body
+            if isinstance(node, ast.ClassDef)
+            and (node.name in exports if exports is not None
+                 else not node.name.startswith("_"))]
 
 
 def _liens(chemin) -> dict:
@@ -774,12 +788,14 @@ def _liens(chemin) -> dict:
                 else:
                     liens[alias.asname or alias.name] = (base, alias.name)
         elif isinstance(node, ast.Assign):
+            lien = _lien_de_valeur(node.value, liens)
             for cible in node.targets:
                 if not isinstance(cible, ast.Name):
                     continue
-                lien = _lien_de_valeur(node.value, liens)
                 if lien is not None:
                     liens[cible.id] = lien
+                else:
+                    liens.pop(cible.id, None)
     return liens
 
 
@@ -872,6 +888,26 @@ class LiensTest(unittest.TestCase):
             "AttributionClone = objet.AttributionContractTest\n"
             "Vide = 3\n")
         self.assertEqual({}, liens)
+
+    def test_reaffectation_efface_le_lien(self):
+        liens = self._liens_du_texte(
+            "from . import test_l161e_map as _carte\n"
+            "Clone = _carte.AttributionContractTest\nClone = None\n")
+        self.assertNotIn("Clone", liens)
+
+    def test_affectation_chainee_resout_la_valeur_une_fois(self):
+        liens = self._liens_du_texte(
+            "from . import test_l161e_map as _carte\n"
+            "_carte = Clone = _carte.AttributionContractTest\n")
+        self.assertEqual(liens["_carte"], liens["Clone"])
+
+    def test_etoile_respecte_all_explicite(self):
+        for noms, attendu in (("[]", []), ("['_Prive']", ["_Prive"])):
+            arbre = ast.parse(
+                f"__all__ = {noms}\nclass Publique: pass\nclass _Prive: pass\n")
+            with self.subTest(noms=noms), mock.patch(
+                    __name__ + "._arbre", return_value=arbre):
+                self.assertEqual(_etoiles("tests.test_l161e_map"), attendu)
 
 
 class AttributionContractTest(unittest.TestCase):
