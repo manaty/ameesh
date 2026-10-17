@@ -309,6 +309,22 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     return storage.of(db).leases.clear_session(name, owner, epoch)
 
 
+def adopt_session_origin(db: Db, name: str, session_id: str, lot: str, owner: str,
+                         epoch: int, *, harness: str | None = None,
+                         cwd: str | None = None) -> bool:
+    """#1900 B1 : note l'origine d'une session sans origine, **fencé**.
+
+    Sous verrou de ligne et bail vivant (owner, epoch, échéance recontrôlée
+    après l'attente), et seulement si la ligne porte encore `session_id` et
+    `lot` : une session remplacée entre-temps (rotation, remplaçant, autre lot)
+    n'est jamais réécrite. N'écrit que l'origine, le dossier et le harnais.
+    Renvoie False si le bail n'est plus le nôtre, s'il a expiré pendant
+    l'attente du verrou, ou si la session/le lot ont changé.
+    """
+    return storage.of(db).leases.adopt_session_origin(
+        name, owner, epoch, session_id, lot, harness=harness, cwd=cwd)
+
+
 def record_session_history(db: Db, name: str, session_id: str,
                            account: str | None = None) -> None:
     """Record an accepted session after runner or hook session filtering."""

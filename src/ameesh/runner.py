@@ -2244,6 +2244,46 @@ class AgentWorker(threading.Thread):
                   "session": out.get("parked") or "", "reprise": repris or ""})
         return True
 
+    def _adopt_originless_session(self, session: str, cwd: str) -> bool:
+        """#1900 N1 : adopter une session d'avant 0384 (origine inconnue).
+
+        Un agent multi-projet dont la session courante n'a ni origine ni
+        dossier connus (`session_origin`/`session_cwd` nuls) est basculé de
+        force vers SON lot par `_run_turn` ; quand le lot est le projet
+        primaire — donc le dossier de l'agent, seul dossier où une session
+        d'avant 0384 a pu être ouverte — la bascule ne fait que perdre la
+        session (`courant == to_lot`, rien à mettre de côté). On note son
+        origine au registre : le tour la reprend et les bascules suivantes la
+        mettent de côté normalement.
+
+        Rend False quand l'écriture échoue : l'appelant garde la bascule
+        forcée, comportement d'avant le correctif."""
+        harnais = (self.agent.get("session_harness")
+                   or self.agent.get("harness") or self.turn_harness())
+        # #1900 B1 : écriture fencée (verrou de ligne, bail vivant, échéance
+        # recontrôlée après l'attente, session ET lot inchangés). Une session
+        # remplacée entre l'instantané et l'adoption — rotation, remplaçant,
+        # autre lot — n'est jamais réécrite ; l'appelant garde alors la bascule
+        # forcée, comportement d'avant le correctif.
+        lot = str(self.agent.get("session_work_item") or "")
+        try:
+            adopte = registry.adopt_session_origin(
+                self.db, self.name, session, lot,
+                self.runner.runner_id, self.epoch,
+                harness=harnais, cwd=cwd)
+        except db_mod.DbError as exc:
+            log_async("[%s] originless session %s not adopted (%s)"
+                      % (self.name, session, exc))
+            return False
+        if not adopte:
+            log_async("[%s] originless session %s not adopted: "
+                      "lease or session changed" % (self.name, session))
+            return False
+        self.agent = registry.get(self.db, self.name) or self.agent
+        log_async("[%s] originless session %s adopted for lot %s (origin %s)"
+                  % (self.name, session, self.agent.get("session_work_item"), cwd))
+        return True
+
     def _lot_brief(self, lot: str, courant: str, out: dict) -> str | None:
         """#794 : le brief MINIMAL d'une session neuve dédiée au lot `lot` :
         canon, fiche du lot, diff de sa branche, fil du lot réduit aux
@@ -4996,8 +5036,18 @@ class AgentWorker(threading.Thread):
                 and (self.agent.get("session_origin") != session or not origin
                      or os.path.realpath(origin) != os.path.realpath(cwd))):
             lot = self._workdir_lot
-            if not lot or not self._switch_lot(str(self.agent.get("session_work_item") or ""),
-                                               str(lot)):
+            # #1900 N1 : origine inconnue (session d'avant 0384), sur SON lot
+            # et dans le dossier de l'agent — le seul où elle a pu être
+            # ouverte : adopter plutôt que perdre par une bascule vers le même
+            # lot. Au dossier secondaire, la bascule reste (on ne peut pas
+            # reprendre la session ailleurs).
+            adopted = (not origin and lot
+                       and str(lot) == str(self.agent.get("session_work_item") or "")
+                       and self.agent.get("cwd")
+                       and os.path.realpath(cwd) == os.path.realpath(self.agent["cwd"])
+                       and self._adopt_originless_session(session, cwd))
+            if not adopted and (not lot or not self._switch_lot(
+                    str(self.agent.get("session_work_item") or ""), str(lot))):
                 return False
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
