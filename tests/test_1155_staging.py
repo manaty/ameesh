@@ -838,6 +838,15 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertIsNone(cible)
         self.assertIn('cible nommee a occupee', pourquoi)
 
+    def test_cible_nommee_sans_bail_vivant_ne_sonde_pas(self):
+        for fin in (None, 999.0):
+            row = {'name': 'a', 'host': 'autre', 'status': 'idle',
+                   'lease_owner': 'r', 'lease_expires_ts': fin}
+            for cible, pourquoi in (self.mod.choose([row], 'a', 1000.0),
+                                    self.mod.choisir_croise([row], 'h', 'a', 1000.0)):
+                self.assertIsNone(cible)
+                self.assertIn('sans bail vivant', pourquoi)
+
     def test_choose_cible_nommee_en_pause_ne_sonde_pas(self):
         """#2190 : une cible nommee en pause operateur n'est pas sondee."""
         rows = [{'name': 'a', 'status': 'idle', 'operator_paused': True,
@@ -957,6 +966,8 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.registry, 'overview', return_value=autres), \
              mock.patch.object(self.mod.registry, 'get',
                                return_value={'last_turn_ts': maintenant + 1,
+                                             'lease_owner': 'r',
+                                             'lease_expires_ts': maintenant + 60,
                                              'status': 'idle'}), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
              mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
@@ -1032,6 +1043,26 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertEqual(rapport['verdict'], 'sans-sonde')
         self.assertIn('cible agent occupee (running)', rapport['pourquoi'])
         envoi.assert_not_called()
+
+    def test_main_cible_disparue_ou_bail_expire_ne_sonde_pas(self):
+        row = dict(name='agent', host='h', status='idle', lease_owner='r',
+                   lease_expires_ts=1060.0)
+        for etat in (None, dict(row, lease_expires_ts=999.0)):
+            sortie = io.StringIO()
+            with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+                 mock.patch.object(self.mod.config, 'load', return_value={}), \
+                 mock.patch.multiple(self.mod.registry,
+                                     overview=mock.Mock(return_value=[row]),
+                                     get=mock.Mock(return_value=etat)), \
+                 mock.patch.object(self.mod, 'stuck', return_value=[]), \
+                 mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+                 mock.patch.object(self.mod.mail, 'send', return_value=7) as envoi, \
+                 mock.patch.object(self.mod.time, 'time', return_value=1000.0), \
+                 redirect_stdout(sortie):
+                code = self.mod.main(['--hote', 'h', '--attente', '0', '--json'])
+            self.assertEqual(code, 0, sortie.getvalue())
+            self.assertEqual(json.loads(sortie.getvalue())['verdict'], 'sans-sonde')
+            envoi.assert_not_called()
 
     def test_main_revalide_une_cible_mise_en_pause_avant_envoi(self):
         """#2190 : une cible libre dans la photo mais mise en pause avant

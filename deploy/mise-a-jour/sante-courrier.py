@@ -165,6 +165,8 @@ def choose(rows: list[dict], sonde: str, now: float):
             raise SystemExit("sonde : %s n'est pas une persona de l'hote" % sonde)
         if not libre(row):
             return None, cible_occupee(row, nommee=True)
+        if not driven(row, now):
+            return None, "cible nommee %s sans bail vivant" % row["name"]
         return row, None
     if sonde == "jamais":
         return None, "sonde desactivee"
@@ -193,6 +195,8 @@ def choisir_croise(rows: list[dict], hote: str, cible: str, now: float):
                 "sonde : %s n'est pas une persona d'un autre hote" % cible)
         if not libre(row):
             return None, cible_occupee(row, nommee=True)
+        if not driven(row, now):
+            return None, "cible nommee %s sans bail vivant" % row["name"]
         return row, None
     menes = [r for r in autres if driven(r, now)]
     if not menes:
@@ -322,8 +326,10 @@ def main(argv: list[str] | None = None) -> int:
             # en tour ou etre mise en pause entre-temps. Une derniere lecture
             # evite d'envoyer la sonde dans la file d'un agent non libre
             # (#2190).
-            etat = registry.get(conn, cible["name"]) or cible
-            if not libre(etat):
+            etat = registry.get(conn, cible["name"])
+            if etat is None or not driven(etat, time.time()):
+                cible, pourquoi = None, "cible %s sans bail vivant" % cible["name"]
+            elif not libre(etat):
                 cible, pourquoi = None, cible_occupee(etat)
         resultat = (probe(conn, cible, args.sha, args.attente, args.hote)
                     if cible is not None else None)
