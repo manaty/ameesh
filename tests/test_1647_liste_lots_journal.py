@@ -120,6 +120,22 @@ class ListeLotsJournalTest(PgTestCase):
                          [{"work_item_id": 7, "last_ts": 12.0}])
 
     def test_work_list_et_progress_ne_lisent_pas_le_journal(self):
+        # #1660 : une note tardive écrite sans toucher les horodatages de la
+        # ligne (comme le marquage d'un parent) isole la source de l'activité.
+        # Ligne, journal et jalon `requested` reculent de 2 h : sinon l'un
+        # d'eux, resté près de maintenant, masquerait le retrait d'`events_ts`
+        # (marge de quelques secondes seulement).
+        self.db.execute("UPDATE work_items SET updated_at = now() - interval '2 hours',"
+                        " created_at = now() - interval '2 hours' WHERE id = %s",
+                        (self.lot,))
+        self.db.execute("UPDATE work_item_events SET created_at = now() - interval '2 hours'"
+                        " WHERE work_item_id = %s", (self.lot,))
+        self.db.execute("UPDATE work_item_milestones SET at = now() - interval '2 hours'"
+                        " WHERE work_item_id = %s", (self.lot,))
+        self.db.execute("INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                        " VALUES (%s, 'intake', 'note tardive', 'témoin')", (self.lot,))
+        dernier = float(self.st.progress.lot_event_last([self.lot])[0]["last_ts"])
+
         def interdit(*_args, **_kwargs):
             raise AssertionError("le journal complet est relu par une vue groupée (#1647)")
 
@@ -128,6 +144,8 @@ class ListeLotsJournalTest(PgTestCase):
             snap = progress.snapshot(self.db, self.cfg, since="24h", book=self._book())
         ligne = next(r for r in rows if int(r["id"]) == self.lot)
         self.assertIsNotNone(ligne["last_activity_ts"])
+        # l'activité est celle du journal (la note tardive), pas d'`updated_at`
+        self.assertEqual(ligne["last_activity_ts"], round(dernier, 3))
         self.assertEqual(ligne["waiting_for"],
                          {"what": "start", "who": None,
                           "label": "assignment (lot unassigned)"})

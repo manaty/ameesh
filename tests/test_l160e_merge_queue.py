@@ -21,7 +21,7 @@ from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
                     resolutions, storage, work)
 
 from .support import PgTestCase
-from .test_l160b_radar import LOTS, MIG, _git, make_repo
+from .test_l160b_radar import LOTS, MIG, _git, git_env, make_repo
 from .test_l160d_resolutions import FakeWork, _commit_on, _identity, _manual_resolution
 
 
@@ -100,6 +100,12 @@ class FakeQueue(FakeWork):
 
 
 class _Base(unittest.TestCase):
+    #: familles simulées : ces bancs sans base portent des noms courts (`a1`,
+    #: `rev1`) ; `actor_family` lit le registre, absent ici — l'indépendance
+    #: des avis reste donc vérifiée, mais sur ce dictionnaire.
+    FAMILIES = {"a1": "deepseek", "a2": "deepseek", "a3": "deepseek", "a4": "deepseek",
+                "rev1": "codex", "rev2": "claude", "rev3": "codex"}
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l160e-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -114,7 +120,10 @@ class _Base(unittest.TestCase):
                       mock.patch.object(work, "get",
                                         side_effect=lambda db, n: self.fake.lots.get(n)),
                       mock.patch.object(work, "milestones",
-                                        side_effect=lambda db, n, *a: self.marks.get(n, []))):
+                                        side_effect=lambda db, n, *a: self.marks.get(n, [])),
+                      mock.patch.object(merge_queue, "actor_family",
+                                        side_effect=lambda db, n: self.FAMILIES.get(
+                                            str(n or "").strip(), ""))):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -123,8 +132,12 @@ class _Base(unittest.TestCase):
 
     def ready(self, lot, *, verdict="ok", sha=None):
         sha = sha or self.tip(lot)
-        self.marks[lot] = [{"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha,
-                            "at_ts": 2.0},
+        # un doute de classe (pas de canon lisible dans ces bancs) garde
+        # l'exigence des domaines critiques : deux avis, familles distinctes.
+        self.marks[lot] = [{"id": 3, "kind": "verdict", "verdict": "ok", "sha": sha,
+                            "at_ts": 3.0, "actor": "rev2"},
+                           {"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha,
+                            "at_ts": 2.0, "actor": "rev1"},
                            {"id": 1, "kind": "frozen", "sha": sha, "at_ts": 1.0}]
 
     def green(self, lot, *, number=7, green=True, draft=False):
@@ -133,9 +146,9 @@ class _Base(unittest.TestCase):
         return lambda branch: {"number": number, "green": green, "head": tip,
                                "draft": draft}
 
-    def enter(self, lot, ci="green"):
+    def enter(self, lot, ci="green", **kw):
         return merge_queue.enter(None, lot, repo=self.repo, actor="orch",
-                                 ci=self.green(lot) if ci == "green" else ci)
+                                 ci=self.green(lot) if ci == "green" else ci, **kw)
 
 
 class EntryTest(_Base):
@@ -143,16 +156,19 @@ class EntryTest(_Base):
         with self.assertRaisesRegex(merge_queue.QueueError, "not frozen"):
             self.enter(1)
         self.ready(1, verdict="blocked")
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        # #1374 : un blocage non levé refuse la file avec sa cause
+        with self.assertRaisesRegex(merge_queue.QueueError, "blocked verdict"):
             self.enter(1)
         old = self.tip(1)
         self.ready(1)
         _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "a after the freeze")
         with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
             self.enter(1)
-        self.ready(1)  # frozen again, but the verdict is on the old commit
-        self.marks[1][0]["sha"] = old
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        self.ready(1)  # frozen again, but the verdicts are on the old commit
+        for mark in self.marks[1]:
+            if mark["kind"] == "verdict":
+                mark["sha"] = old
+        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
             self.enter(1)
         self.ready(1)
         with self.assertRaisesRegex(merge_queue.QueueError, "CI of PR #7 is not green"):
@@ -240,7 +256,7 @@ class EntryTest(_Base):
         self.assertFalse(os.path.exists(os.path.join(agents, ".git", "FETCH_HEAD")))
         self.assertNotEqual(subprocess.run(["git", "-C", agents, "cat-file", "-e",
                                             self.tip(1) + "^{commit}"],
-                                           capture_output=True).returncode, 0)
+                                           capture_output=True, env=git_env()).returncode, 0)
         # without the clone, origin cannot be fetched: refused, never the cached tip
         self.fake.queue_rows.clear()
         with self.assertRaisesRegex(merge_queue.QueueError, "without the radar's clone"):
@@ -265,8 +281,10 @@ class EntryTest(_Base):
                 with self.assertRaisesRegex(merge_queue.QueueError, "not a commit id"):
                     self.enter(1)
         self.ready(1)
-        self.marks[1][0]["sha"] = "lot/1-a"  # a verdict on the branch, not on a commit
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        for mark in self.marks[1]:  # a verdict on the branch, not on a commit
+            if mark["kind"] == "verdict":
+                mark["sha"] = "lot/1-a"
+        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
             self.enter(1)
         # a branch named like a commit id is not that commit
         _git(self.repo, "branch", "deadbeef", tip)
@@ -356,7 +374,8 @@ class LightClassTest(_Base):
                 self.enter(1, ci=self.ci(1))
         self.ready(1)  # a verdict ok on the freeze
         with mock.patch.object(lot_class, "of_lot", return_value=release):
-            self.assertEqual(self.enter(1, ci=self.ci(1))["state"], "queued")
+            self.assertEqual(self.enter(1, ci=self.ci(1),
+                                        full_ci=green_full())["state"], "queued")
 
     def test_a_doubt_keeps_the_verdict_and_names_the_class(self):
         self.freeze(1)
@@ -376,6 +395,66 @@ class LightClassTest(_Base):
         rows = [{"work_item_id": 1, "target": "main", "state": "queued", "rank": 1,
                  "title": "t", "assignee": "a1", "frozen_sha": "a" * 12, "reason": ""}]
         self.assertIn("class light", merge_queue.show_lines(rows, {1: "light"})[1])
+
+
+def green_full(**kw):
+    """Un lecteur de suite complète verte, paramétrable par cas."""
+    runs = {"runs": 1, "green": True, "pending": [], "failed": []}
+    runs.update(kw)
+    return lambda sha: runs
+
+
+class ReleaseFullSuiteTest(_Base):
+    """L756 (#566) : un lot de classe release ne se contente pas du check de sa
+    PR — une PR de version seule ne lance rien, et une PR peut n'avoir suivi
+    que le plan impacté. Il lui faut une exécution de la **suite complète**
+    (poussée ou lancement manuel) verte sur la tête gelée exacte."""
+
+    def release(self):
+        return mock.patch.object(lot_class, "of_lot",
+                                 return_value={"class": "release",
+                                               "why": "lot type release"})
+
+    def ci(self, lot):
+        tip = self.tip(lot)
+        return lambda branch: {"number": 7, "green": True, "head": tip, "draft": False}
+
+    def test_a_release_lot_needs_a_full_suite_run(self):
+        self.ready(1)
+        with self.release():
+            with self.assertRaisesRegex(merge_queue.QueueError, "no full-suite run"):
+                self.enter(1, ci=self.ci(1), full_ci=green_full(runs=0, green=False))
+            with self.assertRaisesRegex(merge_queue.QueueError, "still running"):
+                self.enter(1, ci=self.ci(1),
+                           full_ci=green_full(green=False, pending=["tests"]))
+            with self.assertRaisesRegex(merge_queue.QueueError, "is red"):
+                self.enter(1, ci=self.ci(1),
+                           full_ci=green_full(green=False, failed=["tests"]))
+            with self.assertRaisesRegex(merge_queue.QueueError, "not green"):
+                self.enter(1, ci=self.ci(1), full_ci=green_full(green=False))
+            row = self.enter(1, ci=self.ci(1), full_ci=green_full())
+        self.assertEqual(row["state"], "queued")
+
+    def test_a_release_lot_without_a_reader_is_refused(self):
+        self.ready(1)
+        with self.release():
+            with self.assertRaisesRegex(merge_queue.QueueError, "no full-suite reader"):
+                self.enter(1, ci=self.ci(1))
+
+    def test_an_unreadable_full_suite_refuses_the_lot(self):
+        self.ready(1)
+
+        def boom(sha):
+            raise plan_github.GithubError("gh down")
+
+        with self.release():
+            with self.assertRaisesRegex(merge_queue.QueueError, "cannot read the full-suite"):
+                self.enter(1, ci=self.ci(1), full_ci=boom)
+
+    def test_another_class_needs_no_full_suite(self):
+        self.ready(1)  # no canon: lot_class answers sensitive, never release
+        row = self.enter(1, ci=self.ci(1), full_ci=lambda sha: None)
+        self.assertEqual(row["state"], "queued")
 
 
 class TargetResolutionTest(_Base):
@@ -699,7 +778,8 @@ class PassTest(_Base):
         report = self.run_pass(repo=agents)
         for repo in (self.repo, agents, radar.clone_dir(self.cfg, "p")):
             self.assertNotEqual(subprocess.run(["git", "cat-file", "-e", frozen + "^{commit}"],
-                                               cwd=repo, capture_output=True).returncode, 0)
+                                               cwd=repo, capture_output=True,
+                                               env=git_env()).returncode, 0)
         self.assertNotIn(1, [b["work_item"] for b in report["branches"]])
         self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
         self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
@@ -893,6 +973,71 @@ class QueueDbTest(PgTestCase):
         out = self.mesh("work", "queue", "add", str(lot), "--repo", repo)
         self.assertEqual(out.returncode, 1)
         self.assertIn("is not frozen", out.stderr)
+
+
+class QueueWithoutRadarTest(PgTestCase):
+    """#1761: `work queue add` from an agent's or pilot's post, where no radar
+    project (hence no radar clone) is declared: a throwaway clone reads the
+    branch fresh from origin, and the agents' repository is never written."""
+
+    def test_a_post_without_the_radar_project_queues_the_fresh_tip(self):
+        origin = make_repo(self.tmp)
+        _identity(origin)
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", origin, agents)
+        _identity(agents)
+        stale = _git(agents, "rev-parse", "refs/remotes/origin/lot/1-a")
+        _commit_on(origin, "lot/1-a", "other.py", "z\n", "pushed from another host")
+        fresh = _git(origin, "rev-parse", "lot/1-a")
+        self.assertNotEqual(stale, fresh)
+        lot = work.add(self.db, title="a", branch="lot/1-a")["id"]
+        # #1374 : la porte des avis lit la famille de modele de l'auteur ; le
+        # banc simule l'auteur (`a1`) et deux relecteurs de familles distinctes
+        # (`rev1`, `rev2`), comme les bancs sans base plus haut.
+        self.db.execute("UPDATE work_items SET assignee = 'a1' WHERE id = %d" % lot)
+        work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")
+        status = {"number": 7, "green": True, "head": fresh, "draft": False}
+        made: list = []
+        real = tempfile.mkdtemp
+
+        def record(*args, **kwargs):
+            path = real(*args, **kwargs)
+            made.append(path)
+            return path
+
+        args = mock.Mock(queue_command="add", id=lot, repo=agents, actor="pilot", json=False)
+        with mock.patch.object(merge_queue, "radar_project", return_value=None), \
+                mock.patch.object(radar, "github_ci",
+                                  return_value=lambda branch: dict(status)), \
+                mock.patch.object(merge_queue, "actor_family",
+                                  side_effect=lambda db, n: {
+                                      "a1": "deepseek", "rev1": "codex",
+                                      "rev2": "claude"}.get(str(n or "").strip(), "")), \
+                mock.patch.object(merge_queue.tempfile, "mkdtemp", side_effect=record):
+            self.assertEqual(merge_queue.run(self.cfg, self.db, args), 0)
+        # the fresh tip entered the queue, never the stale remote ref
+        rows = storage.of(self.db).work.queue()
+        self.assertEqual([(r["frozen_sha"], r["target"]) for r in rows],
+                         [(fresh, "origin/main")])
+        # the throwaway clone is gone, and the agents' repository is untouched
+        self.assertEqual(len(made), 1)
+        self.assertFalse(os.path.exists(made[0]))
+        self.assertEqual(_git(agents, "rev-parse", "refs/remotes/origin/lot/1-a"), stale)
+        self.assertNotEqual(subprocess.run(
+            ["git", "-C", agents, "cat-file", "-e", fresh + "^{commit}"],
+            capture_output=True, env=git_env()).returncode, 0)
+
+    def test_the_declared_project_keeps_the_radar_clone(self):
+        clone, scratch = merge_queue.working_clone(
+            self.cfg, self.tmp, radar.Project(name="p", repo=self.tmp))
+        self.assertIsNone(scratch)
+        self.assertEqual(clone.path, radar.clone_dir(self.cfg, "p"))
+        clone, scratch = merge_queue.working_clone(self.cfg, self.tmp, None)
+        self.addCleanup(shutil.rmtree, scratch, True)
+        self.assertTrue(os.path.isdir(scratch))
+        self.assertEqual(os.path.dirname(clone.path), scratch)
 
 
 if __name__ == "__main__":

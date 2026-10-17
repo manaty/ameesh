@@ -32,18 +32,45 @@ deploy/mise-a-jour/vm.sh agents controler
 ```
 
 Le redémarrage attend la fin des tours, pendant au plus `ATTENTE_MAX`
-secondes (7200 par défaut). Il relit le placement avant chaque redémarrage :
-un agent déplacé, arrêté ou passé en observation est ignoré. Le compte
+secondes (7200 par défaut). Après `DRAIN_ATTENTE` secondes (300 par défaut,
+0 pour désactiver) d'attente d'un même tour, il pose lui-même une pause
+opérateur courte et nommée (drain, #2152) : le tour en cours se termine —
+aucun tour n'est interrompu —, plus aucun ne commence, l'unité est
+redémarrée dès que l'agent est hors tour, puis la pause est levée et la
+reprise du bail prouvée. Le mesh journalise la pose et la levée
+(`operator_pause_events`) ; une pause déjà posée par un autre acteur n'est
+ni doublée ni levée, et aucune pause posée par le script ne survit à sa
+sortie. La levée est **conditionnelle** : le motif exact de la pause posée
+(unique, avec son jeton) est son identité, et `ameesh resume --operator
+--expect-reason` ne lève que cette pause-là — la comparaison et la levée se
+font dans la même instruction SQL (migration 0458), donc une pause étrangère
+posée entre la lecture et la reprise n'est jamais levée. Si la réponse de la
+pause se perd (SSH coupé, JSON illisible), le script réconcilie par l'état
+réel : motif identique, le drain continue ; sinon il ne redémarre ni ne lève
+rien et s'arrête en le disant. Pose et levée sont des gestes d'opérateur : le
+CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh` doit
+être lancé hors session d'agent ; sinon la pause est refusée et le
+redémarrage de cet agent s'arrête sans interrompre aucun tour. Un CLI de
+cible antérieur à #2152 (sans `--expect-reason`) n'est jamais utilisé pour
+drainer : le script attend comme avant plutôt que de laisser une pause
+orpheline. Il relit le placement avant chaque redémarrage :
+un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
+pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
+est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
+reprise de l’owner avec la version d’avant le déploiement. Le compte
 `ameesh` doit avoir un gestionnaire systemd utilisateur ; le script pose
 `HOME`, `XDG_RUNTIME_DIR` et `DBUS_SESSION_BUS_ADDRESS` pour joindre son bus.
 Le CLI distant est celui de l’unité :
 `/home/ameesh/.local/share/ameesh/venv/bin/ameesh`.
 La CLI et la lecture de l’horloge passent par `systemd-run --user --pipe
---wait --quiet`, avec `EnvironmentFile=%h/.config/ameesh/env` obligatoire.
-Systemd lit ce fichier avec le même parseur que le runner : les valeurs
-contenant `$USER`, des guillemets ou `#` restent intactes. Un fichier absent
-ou illisible produit une erreur avant toute exécution, sans configuration
-de repli.
+--wait --quiet`, avec `EnvironmentFile` sur un chemin absolu : `systemd-run
+-p` n’étend pas le spécificateur `%h` dans une unité transitoire (#1133), le
+shell expanse donc `$HOME` (`/home/ameesh/.config/ameesh/env`). Les fichiers
+d’unité `deploy/systemd/*.service` gardent `%h`, résolu dans une unité
+installée. Systemd lit ce fichier avec le même parseur que le runner : les
+valeurs contenant `$USER`, des guillemets ou `#` restent intactes. Un
+fichier absent ou illisible produit une erreur avant toute exécution, sans
+configuration de repli.
 
 Une unité active ne suffit pas à prouver la reprise d’un bail. Le contrôle
 partagé avec le poste et le serveur (`deploy/mise-a-jour/bail.sh`, #502/#503)
@@ -133,6 +160,68 @@ la lecture), et retiré après le `fetch`. Le paquet exclut le HEAD du clone de 
 VM, dont la présence est prouvée avant l’envoi ; sans base lisible, ou si
 l’exclusion vide le paquet, il est autonome — une cible déjà fusionnée dans
 `origin/main` passe donc, comme le retour vers un ancêtre absent de la VM.
+
+La séquence de staging écrit chaque événement en JSONL (`date`, `hôte`, `étape`, `verdict`,
+`sha`, `precedent`, `detail`) dans
+`~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`. Le `detail` de
+l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
+verdict, et pour une remise réelle le message de sonde, son destinataire,
+l’hôte de ce destinataire et son délai) : c’est la preuve structurée que le
+signal ci-dessous exige. Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, ou
+`auto` sans persona menée — ne prouve aucune remise.
+
+## Signal « staging actif » (#1323)
+
+Le signal est porté par
+[`deploy/mise-a-jour/staging.sh`](../deploy/mise-a-jour/staging.sh) : une
+séquence **complète et saine** — les quatre hôtes, `installer`,
+`redemarrer`, `controler` et sonde de courrier réellement remise — écrit une
+attestation durable sous
+`~/.local/state/ameesh/mise-a-jour/actif-<commit>.json` et réveille les
+rapporteurs déclarés avec `--lots "917 988"` et
+`--rapporteurs "mty-amh-docs-01"` (ou `LOTS_VERIF` / `RAPPORTEURS_VERIF` dans
+`BASCULE_ENV`).
+
+Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
+séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
+concernés. Un échec, un retour automatique, une séquence partielle
+(`--hotes`), un journal d’une autre exécution ou une santé sans sonde de
+remise réelle (`--sans-sonde`, `SONDE_<HOTE>=jamais`, `auto` sans persona
+menée) n’émettent **aucun signal de réussite** : chaque événement de la
+fenêtre doit porter le commit visé, et le message de sonde est relu en base
+(expéditeur système, destinataire, hôte, commit, remise effective). Aucune
+clôture de lot n’est automatique : le rapporteur reprend lui-même sa
+vérification après déploiement.
+
+Un hôte **sans exécutant** (mode serveur, comme `manaty-mesh-1`) ne peut pas
+prouver sa chaîne par une remise locale : sa preuve est le `controler` vert
+plus une **sonde croisée**, remise à une persona menée d’un autre hôte
+canonique **après son redémarrage** — la remise traverse alors sa base, le
+message étant déposé dans la base du serveur et relevé par l’exécuteur de
+l’autre hôte. `sante-courrier.py --serveur` produit cette sonde et nomme
+l’hôte destinataire (`hote_destinataire`) ; `actif.py` relit la remise en base
+et exige qu’elle soit postérieure au `redemarrer` de l’hôte mesuré. Un serveur
+qui porte des exécutants garde la règle locale : une santé `sans-sonde`
+(aucune persona menée) n’atteste rien, et une sonde croisée n’est acceptée que
+pour un hôte à zéro persona.
+
+L’émission est bornée et **idempotente** : un seul courrier par rapporteur et
+par commit, même si la séquence est relancée. La clé d’émission est écrite
+dans l’attestation (champ `emissions`) **avant** l’envoi ; une relance relit
+le courrier déjà déposé portant cette clé et le réconcilie au lieu de le
+renvoyer. Cette recherche est **exhaustive** : la fenêtre relue double tant
+qu’elle est pleine, une absence n’est donc retenue que prouvée. Si l’absence
+ne peut pas être prouvée (base injoignable, ou fenêtre toujours pleine au
+plafond), la marque d’émission est **préservée** et rien n’est renvoyé
+automatiquement : `actif.py` sort en code 5 et `staging.sh` le signale, le
+relais opérateur vérifie le dépôt avant toute relance. Si l’envoi échoue et
+que l’absence est prouvée, la clé reste en attente et la relance renvoie une
+seule fois. L’attestation est réécrite en place, par un temporaire unique
+créé en `0600`.
+
+Si le courrier ne part pas (base indisponible), l’attestation reste écrite et
+`staging.sh` le signale : le relais opérateur transmet alors le journal et
+l’attestation à la main.
 
 Les migrations de la base commune doivent être appliquées avant l’installation
 du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette

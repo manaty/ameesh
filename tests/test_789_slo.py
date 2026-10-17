@@ -159,6 +159,27 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(after["started_ts"], before["started_ts"])
         self.assertEqual(after["elapsed_s"], before["elapsed_s"])
 
+    def test_intake_passee_sans_evenement_build_n_est_pas_un_retard(self):
+        # #1982 : un lot en build ou en qa sans événement `build` a franchi
+        # intake ; la durée est non mesurable — on ne fabrique ni date de build
+        # ni retard (cas réel #377).
+        events = [_ev("intake", T0), _ev("qa", T0 + 900)]
+        for state, at in (("build", T0 + 900), ("qa", T0 + 900)):
+            with self.subTest(state=state):
+                item = _item(state=state, assignee="executant", updated_ts=at)
+                rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7200)
+                self.assertEqual([r for r in rows if r["step"] == "intake_started"], [])
+
+    def test_intake_hors_intake_sans_evenement_build_n_est_pas_un_retard(self):
+        # #1982/#1658 : un lot volontairement bloqué ou en attente d'un humain
+        # n'est pas « prêt, pas démarré » — pas de retard intake inventé.
+        events = [_ev("intake", T0)]
+        for state in ("blocked", "waiting_human"):
+            with self.subTest(state=state):
+                item = _item(state=state, assignee="executant", updated_ts=T0)
+                rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7200)
+                self.assertEqual([r for r in rows if r["step"] == "intake_started"], [])
+
     def test_build_sans_evenement(self):
         events = [_ev("intake", T0), _ev("build", T0 + 600)]
         item = _item(state="build", assignee="executant", updated_ts=T0 + 600)

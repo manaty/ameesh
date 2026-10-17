@@ -18,7 +18,8 @@ sous-utilisation se trompaient et la frise restait vide.
   lot qu'il citait). Un rôle déclaré n'y change rien (#859) : la remise est
   un geste explicite, `ameesh work assign`. Un lot SANS agent assigné reste
   distribuable par l'historique de distribution (L94 ; le bureau distribue
-  ainsi, canon §4).
+  ainsi, canon §4) — ou par le geste explicite `--assign` (#964), ouvert à
+  tout expéditeur.
   #858 : un refus de la garde qui ne tient qu'au DESTINATAIRE (profil
   divergé en attendant le prochain canon sync, responsable manquant, agent
   externe…) ne fait pas perdre le message — il est déposé, rattaché au lot,
@@ -33,6 +34,10 @@ Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
 lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
 Correctif du 2026-10-13 (#1066) : la remise implicite du lot tenu par
 l'expéditeur lui-même est refusée comme celle du lot d'un autre agent.
+Added #964: `--assign` is the explicit gesture that lets a sender the history
+does not detect as an orchestrator hand over a FREE lot (or one held by a
+human); it never takes a lot held by an agent, not even its own (handing over
+goes through `ameesh work assign`).
 """
 from __future__ import annotations
 
@@ -51,12 +56,13 @@ class AssignmentError(RuntimeError):
 
 def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
-    agent qui a confié des lots dans les 30 derniers jours, ou fiche Agent du
-    canon dont `roles` nomme un orchestrateur (`sous_utilisation.orchestrators`,
-    lu en dernier : le canon coûte une lecture du dépôt). `roles` : les rôles
-    du canon qui comptent (défaut : orchestrateur ; `work.CORRECTOR_ROLES`
-    ajoute les agents de conception). `history=False` (#740) : les lots confiés
-    ne comptent pas, seule une déclaration compte."""
+    fiche Agent de son canon propriétaire dont `roles` nomme un orchestrateur
+    (`sous_utilisation.orchestrators`), ou — tant que son organisation ne
+    déclare aucun rôle (L242c) — agent qui a confié des lots dans les 30
+    derniers jours. `roles` : les rôles du canon qui comptent (défaut :
+    orchestrateur ; `work.CORRECTOR_ROLES` ajoute les agents de conception).
+    `history=False` (#740) : les lots confiés ne comptent pas, seule une
+    déclaration compte."""
     from . import sous_utilisation as su
 
     declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
@@ -64,22 +70,15 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
     if name in declared:
         return True
     try:
-        if history and name in {su._bare(n) for n in storage.of(db).operations.assigners(
-                since_s=su.ASSIGNERS_SINCE_S)}:
-            return True
+        from . import canon, registry
+        canons = canon.load_configured(cfg) if cfg is not None else []
+        row = registry.get(db, name) if db is not None else None
     except Exception:
-        pass
+        canons, row = [], None
+    row = dict(row or {}, name=name)
     try:
-        canons = None
-        if roles is not None:
-            # Correction roles are authority from this agent's own canon,
-            # never from a namesake card in another configured canon.
-            from . import canon, registry
-            row = registry.get(db, name)
-            canons = [c for c in (canon.load_configured(cfg) if cfg is not None else [])
-                      if row is not None and c.owns(row.get("canon"))]
-        return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
-                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES,
+        return name in su.orchestrators(cfg, db, [row], declared=(), canons=canons,
+                                        roles=roles or su.ORCHESTRATOR_ROLES,
                                         history=history)
     except Exception:
         return False
@@ -132,18 +131,43 @@ def _assignment_deferred(item: dict, recipient: str, why: str) -> str:
                recipient, int(item["id"]), recipient))
 
 
+def _branch_owner(db, branch: str, exclude: int | None = None):
+    """#1646 : le lot qui porte DÉJÀ cette branche, sinon None.
+
+    Une branche citée par un courrier peut être celle du parent d'un lot
+    empilé : la poser sur ce lot le ferait clore à la fusion du parent, sans
+    son propre contenu. Un lot terminal compte aussi : sa branche a déjà
+    atterri, la reposer fermerait le nouveau lot aussitôt."""
+    sql = "SELECT id, state, title FROM work_items WHERE branch = %s"
+    params: tuple = (branch,)
+    if exclude is not None:
+        sql += " AND id != %s"
+        params += (int(exclude),)
+    rows = db.query(sql + " ORDER BY id LIMIT 1", params)
+    return rows[0] if rows else None
+
+
+def _cited_branch_warning(owner: dict, branch: str, lot_id: int, recipient: str) -> str:
+    return ("branch %s already belongs to lot #%d (%s): not set on lot #%d — a branch "
+            "closes its own lot; to ride it anyway, set it explicitly: ameesh work "
+            "assign %d %s --branch %s"
+            % (branch, int(owner["id"]), owner.get("state") or "?",
+               int(lot_id), int(lot_id), recipient, branch))
+
+
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
-                 force: str | None = None,
+                 assign: bool = False, force: str | None = None,
                  parent_lot: int | None = None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
     `work_item_id` est l'étiquette du fil (le numéro du lot s'il est connu,
     sinon `lot` tel quel). `branch` (déduite du message par l'appelant) est
-    posée sur le lot qui n'en a pas. Lève AssignmentError quand le LOT ne peut
-    pas être rattaché (rien n'est alors déposé).
+    posée sur le lot qui n'en a pas, sauf si elle est déjà celle d'un autre
+    lot (#1646 : un avertissement dit alors quoi faire). Lève AssignmentError
+    quand le LOT ne peut pas être rattaché (rien n'est alors déposé).
 
     #858 : un refus de la garde d'attribution qui ne tient qu'au DESTINATAIRE
     (profil divergé en attendant le prochain canon sync, responsable manquant,
@@ -151,6 +175,13 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     lot, l'attribution est différée et l'avertissement dit pourquoi. Un
     message perdu emportait le réveil ; un réveil différé se rattrape à la
     prochaine réclamation.
+
+    `assign` (#964): the message's explicit `--assign` gesture. Without it, a
+    `--lot` only assigns when it comes from a sender the orchestrator
+    detection recognises (including the distribution history, L94); otherwise
+    it stays a plain thread label. With it, any sender can hand over a FREE
+    lot (or one held by a human), never a lot held by an agent — not even its
+    own (#1066): handing over goes through `ameesh work assign`.
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
@@ -175,11 +206,20 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         has_open = bool(work_mod.open_lots(db, recipient))
         if lot is None and has_open:
             return out
-        if not is_orchestrator(cfg, db, sender):
-            # un `--lot` d'un autre agent n'assigne rien ; mais une étiquette
-            # qui désigne un lot ouvert est rendue par son numéro, pour tout
-            # expéditeur : le fil, l'activité du lot et le lot en cours
-            # (`ameesh projects`) la lisent. Sinon, étiquette libre (inchangé).
+        # #964: `--assign` is the explicit gesture that does without the
+        # orchestrator detection. Without it, the distribution history (L94)
+        # keeps the right to hand over a FREE lot — that is how the bureau
+        # distributes (canon §4, #859); a lot held by an agent is never handed
+        # over by the label, even to a declared orchestrator (#1066, below).
+        # #1701 N2: with `--assign` the gesture decides alone, so the
+        # detection (a canon read) is not consulted. `out["orchestrator"]`
+        # has no consumer; it reports the detection only when it ran.
+        orchestrator = is_orchestrator(cfg, db, sender) if not assign else False
+        if not assign and not orchestrator:
+            # une étiquette qui désigne un lot ouvert est rendue par son
+            # numéro, pour tout expéditeur : le fil, l'activité du lot et le
+            # lot en cours (`ameesh projects`) la lisent. Sinon, étiquette
+            # libre (inchangé).
             if lot is not None:
                 try:
                     item = resolve_lot(db, lot)
@@ -188,7 +228,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                 if item is not None:
                     out.update(lot=item, work_item_id=str(item["id"]))
             return out
-        out["orchestrator"] = True
+        out["orchestrator"] = orchestrator
     else:
         has_open = True
         out["orchestrator"] = is_orchestrator(cfg, db, sender)
@@ -208,6 +248,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             # #506: read before the lot exists (it makes its project known)
             introduced = (work_projects.introduction(cfg, db, project, sender)
                           if new_project and app is not None else "")
+            # #1646 : une branche déjà portée par un autre lot n'est pas
+            # reposée (elle clorait ce lot à la fusion du sien).
+            owner = _branch_owner(db, branch) if branch else None
             # #858 : un destinataire momentanément non réveillable ne fait pas
             # perdre le message : le lot est créé SANS assigné, l'attribution
             # est différée et l'expéditeur est averti (même règle que --lot).
@@ -215,7 +258,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             item = work_mod.add(db, title=title,
                                 assignee=None if refusal else recipient, actor=sender,
                                 source="mail", app=project, cfg=cfg,
-                                branch=None if refusal else branch,
+                                branch=None if (refusal or owner) else branch,
                                 estimate=minutes, note=introduced, force=force,
                                 parent_lot=parent_lot)
             if not refusal and item.get("queue_warning"):
@@ -223,6 +266,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             out.update(created=True, assigned=not refusal, branch=item.get("branch"))
             if refusal:
                 out["warnings"].append(_assignment_deferred(item, recipient, refusal))
+            if owner is not None:
+                out["warnings"].append(_cited_branch_warning(
+                    owner, branch, int(item["id"]), recipient))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
             # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne
@@ -233,6 +279,13 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         elif lot is not None:
             item = resolve_lot(db, lot)
             if item is None:
+                if assign:
+                    # #1701 N1: the explicit gesture names the lot to assign;
+                    # a reference matching no open lot is refused before any
+                    # deposit instead of degrading to a plain thread label.
+                    raise AssignmentError(
+                        "--assign: --lot %s matches no open lot (nothing is deposited; "
+                        "to create the lot: --new-lot \"title\", or ameesh work add)" % lot)
                 out["warnings"].append(
                     "--lot %s matches no open lot: kept as a plain thread label "
                     "(to create the lot: --new-lot \"title\", or ameesh work add)" % lot)
@@ -287,9 +340,14 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                                 out["warnings"].append(done["check"]["warning"])
                 if branch and not item.get("branch") \
                         and (item.get("assignee") or "") == recipient:
-                    item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
-                                               source="cited by the mail")
-                    out["branch"] = item.get("branch")
+                    owner = _branch_owner(db, branch, exclude=int(item["id"]))
+                    if owner is not None:
+                        out["warnings"].append(_cited_branch_warning(
+                            owner, branch, int(item["id"]), recipient))
+                    else:
+                        item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
+                                                   source="cited by the mail")
+                        out["branch"] = item.get("branch")
     except work_mod.WorkError as exc:
         raise AssignmentError(str(exc)) from exc
     if item is not None:
