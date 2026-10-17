@@ -179,7 +179,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0403 : attente de bail depuis (un instant)
         'lease_wait_since',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
-        'workstream'
+        'workstream',
+        -- #508 (0411) : la vue est recréée avec `r.*` et expose les mêmes
+        -- colonnes que `agent_registry` ; preuve de vie du runner, sans
+        -- contenu ni secret, accordée à l'identique de la table
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
