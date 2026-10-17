@@ -101,9 +101,11 @@ CRITICAL_SCOPE = (
     # SQL, migrations, stockage
     re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
                r"(^|/)db\.py$|\.sql$"),
-    # sécurité : droits, identité, clés, secrets, décisions
+    # sécurité : droits, identité, clés, secrets, décisions ; garde cgroup
+    # DeepSeek (#2282 : le préchargement Node et son module Python)
     re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
                r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
+               r"(^|/)deepseek_cgroup\.(?:cjs|py)$|"
                r"(^|/)(keys?|secrets?)(/|$)"),
     # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
     re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
