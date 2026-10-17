@@ -440,6 +440,11 @@ class AgentWorker(threading.Thread):
     #: held » ou « attach requested ») — le worker n'espace et ne rend visible
     #: qu'un verrou tenu par un tiers.
     deferred_reason = ""
+    #: #2160 : motif de la série de reports en cours. Un changement de motif
+    #: (attach ↔ verrou tenu) clôt la série : la grâce d'un verrou tenu ne
+    #: compte que les reports de verrou, pas les passations d'attach qui l'ont
+    #: précédé.
+    deferred_series_reason = ""
 
     #: L76 : le processus résident de l'agent entre ses tours, ou None.
     #: Défaut de classe : les constructions partielles (`__new__` sans
@@ -4257,6 +4262,14 @@ class AgentWorker(threading.Thread):
         résident doit reprendre la main dès la passation finie. Rend le pas de
         reprise."""
         maintenant = self.monotonic()
+        motif = self.deferred_reason
+        if self.deferred_series_reason != motif:
+            # #2160 : le motif a changé (attach ↔ verrou tenu) — la série
+            # précédente est close, sa marque éventuelle levée, et la grâce
+            # d'un verrou tenu repart de zéro : un report d'attach (passation
+            # normale) qui la précède ne la consomme pas.
+            self._deferral_over()
+            self.deferred_series_reason = motif
         if self.deferred_since is None:
             self.deferred_since = maintenant
         self.deferred_streak += 1
@@ -4300,6 +4313,7 @@ class AgentWorker(threading.Thread):
         self.deferred_alerted = False
         self.deferred_wait_s = self.DEFERRED_RETRY
         self.deferred_reason = ""
+        self.deferred_series_reason = ""
         if not etait:
             return
         try:
