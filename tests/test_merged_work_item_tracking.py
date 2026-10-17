@@ -390,6 +390,59 @@ class MergeSweepTest(_Base):
         self.sync()
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
 
+    def test_diese_nie_dans_un_titre_ne_ferme_pas_le_lot(self):
+        # #2259, cas Nexlink #598 (commit 84c68e9d4) : un montage de paquet
+        # cite « sans #598 » dans son titre ; la branche du lot reste en
+        # avance, sa tête n'est pas dans la cible, le lot reste ouvert.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        branch = "lot/%d-ouvert" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("travail-du-lot")
+        _git(self.repo, "checkout", "-q", "develop")
+        work.set_branch(self.db, n, branch, "develop", actor="orch")
+        self.merge("feature/paquet-52-v2",
+                   "paquet 52 v2 : montage #2221 sur develop — recomposition sans "
+                   "#%d ni correctif .github (décision pilote (c), courrier #97932) "
+                   "[skip ci]" % n)
+        report = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(report[n]["result"], "open")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
+
+    def test_diese_parenthese_nie_ne_ferme_pas_le_lot(self):
+        # R Codex #2259 : la parenthèse ne sépare pas « sans » du lot exclu.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("feature/paquet-sans-parenthese", "Merge sans (#%d)" % n)
+        self.sync()
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
+
+    def test_lot_livre_avant_sans_reste_cite(self):
+        # Précision impl-08 : « #N livré sans (#M) » livre N, jamais M.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        livre, exclu = self.lot(), self.lot()
+        self.merge("feature/paquet-positif-avant-sans", "paquet : #%d livré sans (#%d)"
+                   % (livre["id"], exclu["id"]))
+        self.sync()
+        self.assertEqual(work.get(self.db, livre["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, exclu["id"])["state"], "intake")
+
+    def test_diese_retire_apres_le_numero_ne_ferme_pas_le_lot(self):
+        # #2259 : « Merge #N retiré » cite un retrait, pas une livraison.
+        # Restreindre la négation aux numéros d'après le mot fermait encore
+        # le lot (régression du 17/10) ; le participe nie aussi ce qui précède.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("feature/retrait", "Merge #%d retiré" % n)
+        self.sync()
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
+
     # --- L118b : la fusion d'une branche lot/<id>-… ferme le lot -----------
 
     def test_fusion_github_d_une_branche_lot_ferme_le_lot(self):
@@ -730,6 +783,36 @@ class MergeSweepTest(_Base):
             "Merge pull request #45 from org/branche": {45: "#id"},
             "Merge #7.": {7: "#id"},
             "Merge PR#9, depot#9, ##9, #9a, &#93;": {},
+            # #2259 : une mention niée ne désigne pas le lot. Le titre du
+            # commit 84c68e9d4 (Nexlink, paquet 52 v2) fermait #598 alors que
+            # sa PR restait ouverte et sa tête hors de develop. Le courrier
+            # cité dans la parenthèse du retrait ne prouve pas une livraison.
+            "paquet 52 v2 : montage #2221 (cd8b0483a) sur develop e5b4f300a — "
+            "recomposition sans #598 ni correctif .github (décision pilote (c), "
+            "courrier #97932) [skip ci]": {2221: "#id"},
+            "Merge sans #12": {},
+            "Merge retiré #12": {},
+            "Merge hors #12": {},
+            "Merge without #12": {},
+            "Revert #12": {},
+            "Merge sans #12 / #13 livré": {13: "#id"},
+            "Merge sans #12, puis #12 livré": {12: "#id"},
+            "Merge sans (#12)": {},
+            "Merge without (#12, (#13)), #14 livré": {14: "#id"},
+            "Merge #14 (sans #12)": {14: "#id"},
+            "paquet : #2221 sans #598": {2221: "#id"},
+            "#598 livré sans #601": {598: "#id"},
+            "Merge #14 sans (#12 ni (#13))": {14: "#id"},
+            "Merge sans #12 ni #13": {},
+            "Merge exclues #12": {},
+            "Merge #12 retiré": {},
+            "Merge (#12) retiré": {},
+            "Merge #12 reverted": {},
+            "Merge #12 sans #13": {12: "#id"},
+            "Merge #12 without #13": {12: "#id"},
+            "Merge #12 hors #13": {12: "#id"},
+            "paquet : tout sauf #12": {},
+            "Merge #12 except #13": {12: "#id"},
             "Merge x\n\nameesh-work: #12\n  ameesh-work: 13": {12: "ameesh-work",
                                                                13: "ameesh-work"},
             "Merge x\n\nvoir ameesh-work: 14 plus tard": {},

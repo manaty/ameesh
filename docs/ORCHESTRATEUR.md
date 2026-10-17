@@ -70,7 +70,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   désigne les orchestrateurs prévenus et sert au personnel et aux alertes. Un
   lot sans équipe connue attend l'orchestrateur.
 * Ordre : priorité, puis dates prévues (début, fin, livraison), puis
-  ancienneté. Un orchestrateur ne se sert pas lui-même.
+  ancienneté. Un orchestrateur ne se sert pas lui-même. Lors d'un appel
+  central (`agents` absent), ses candidats passent en dernier et, s'il prend
+  un lot faute d'autre preneur, la note d'attribution porte la trace du repli
+  (#1739) ; en prise locale (#804, `agents` fourni, même vide), aucun repli :
+  son orchestrateur reste exclu (L804).
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
@@ -462,6 +466,14 @@ est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le re
 bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
 `docs/PAQUET-INCLUSION.md`.
 
+Chaque commit de composition (une unité du paquet) porte un trailer
+`ameesh-work: <id>` par lot qu'il porte : il devient déclarable nativement
+(`ameesh work merged --sha <commit>`, `sync-branches`) même quand
+la remise du lot diffère du gel enregistré (#2157). `scripts/paquet-compose.py`
+compose l'unité et écrit ce message, y compris sur conflit (`.git/MERGE_MSG`
+prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé n'est
+réécrit pour ce seul métadonné.
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot
@@ -676,9 +688,10 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    packages, review before CI and no CI per lot between cuts, sober proofs
    (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
    reviewed commit.
-4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
-   un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
-   d'exécuteur du poste le lance dans une unité systemd distincte :
+4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
+   exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
+   Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance
+   donc dans une unité systemd distincte :
    `systemd-run --user --unit=ameesh-redemarrer-$(date +%s) bash
    deploy/mise-a-jour/poste.sh redemarrer <REF>`. Un `setsid` ou un `nohup`
    ne suffit pas : le script reste dans le groupe de contrôle de l'unité de

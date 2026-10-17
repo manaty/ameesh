@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import build_artifacts as ba
+from ameesh import housekeeping_discovery as hd
 from ameesh import menage, platform
 from ameesh.platform import process
 
@@ -623,7 +624,8 @@ class OrphanGuardsTest(unittest.TestCase):
                     if recent:
                         os.utime(source, (now - 60, now - 60))
                     row = dict(id=1, path=path, agent="a1", lot=None, branch=branch,
-                               detail=menage.UNATTRIBUTED, status="active", created_ts=now - 3 * 86400)
+                               repo=root, detail=menage.UNATTRIBUTED, status="active",
+                               created_ts=now - 3 * 86400)
                     if label.startswith("other-merged-kept"):
                         row.update(status="kept", checked_ts=now - 2 * DAY,
                                    detail="lot #7 merged (assigned to another agent): "
@@ -647,6 +649,9 @@ class OrphanGuardsTest(unittest.TestCase):
                             mock.patch.object(menage, "worktree_state", return_value=git), \
                             mock.patch.object(menage, "worktree_in_use", return_value=False), \
                             mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
+                            mock.patch.object(hd, "_marker", return_value="linked"), \
+                            mock.patch.object(menage, "common_dir",
+                                              return_value=os.path.realpath(root)), \
                             mock.patch.object(platform, "user_paths", return_value=platform.UserPaths()):
                         entries, plan = menage._worktree_pass(None, "pc", dry_run=True,
                                                              protected=set(), now=now)
@@ -684,7 +689,10 @@ class _Store:
 class MergedKeptTest(_Repo):
     def row(self, path, *, checked_ago, detail=None, lot="7"):
         st = menage.worktree_state(path)
-        return {"id": 1, "path": path, "agent": "dev2", "lot": lot, "repo": self.main,
+        # #2180: `repo` porte le common dir du dépôt (comme les lignes écrites
+        # par `register_worktree`), pas le chemin du worktree principal.
+        return {"id": 1, "path": path, "agent": "dev2", "lot": lot,
+                "repo": menage.common_dir(self.main),
                 "status": "kept", "created_ts": time.time() - 3 * DAY,
                 "checked_ts": time.time() - checked_ago,
                 "detail": detail if detail is not None else

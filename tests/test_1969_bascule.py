@@ -185,6 +185,36 @@ class BasculeTest(unittest.TestCase):
             if valeur == "v2":
                 self.assertEqual(0, retour(self.venv))
 
+    def test_script_console_ajoute_par_une_version_ulterieure_est_expose(self):
+        """#2155 : un point d'entrée pip de la v2 apparaît dans le venv stable."""
+        vrai_venv(self.base, "v1", "v1", "old_only")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "new_only")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        # pip n'écrit ce script que dans venv-v2/bin : le venv stable ne l'a
+        # jamais vu à l'adoption.
+        outil = self.base / "venv-v2" / "bin" / "futur-outil"
+        outil.write_text("#!%s/bin/python\nimport pkg1969\nprint(pkg1969.VALUE)\n"
+                         % (self.base / "venv-v2"))
+        outil.chmod(0o755)
+
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+
+        lanceur = self.venv / "bin" / "futur-outil"
+        self.assertTrue(lanceur.is_file(),
+                        "le script console de la version active n'est pas exposé")
+        resultat = subprocess.run([str(lanceur)], capture_output=True, text=True)
+        self.assertEqual(0, resultat.returncode, resultat.stderr)
+        self.assertEqual("v2", resultat.stdout.strip())
+        # Le python et l'ameesh stables restent des lanceurs de la version vive.
+        self.assertEqual((0, "v2"), lire(self.venv))
+
+        self.assertEqual(0, retour(self.venv))
+        # Le lanceur créé pour la v2 disparaît quand la version de retour ne
+        # porte pas ce script ; les scripts adoptés de la v1 restent.
+        self.assertFalse(lanceur.exists(), "lanceur d'une version quittée laissé")
+        self.assertEqual((0, "v1"), lire(self.venv))
+
     # -- B2 : le retour réutilise le venv réel, sans pip --------------------
 
     def test_retour_reutilise_le_venv_reel_sans_pip(self):
@@ -321,6 +351,35 @@ class BasculeTest(unittest.TestCase):
                      "#!%s" % (cible / "bin" / "pythonx")):
             with self.assertRaises(RuntimeError):
                 controler(faux)
+
+    def test_controles_acceptent_le_wrapper_bin_sh_de_pip_chemin_long(self):
+        """#2156 : au-delà de 127 octets, pip préfixe le script d'un /bin/sh."""
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        ameesh = cible / "bin" / "ameesh"
+
+        def controler(executable, fermeture="' '''"):
+            # Forme écrite par pip 24 (distlib) quand le shebang dépasse 127
+            # octets, reproduite avec un interpréteur de 148 caractères.
+            preambule = ("#!/bin/sh\n"
+                         "'''exec' %s \"$0\" \"$@\"\n"
+                         "%s\n" % (executable, fermeture))
+            ameesh.write_text(preambule + "import sys\n")
+            with mock.patch.object(bascule, "_run"):
+                bascule._controles(str(cible))
+
+        for nom in ("python", "python3", "python3.14"):
+            controler(cible / "bin" / nom)
+        # chemin contenant une espace : distlib met l'exécutable entre guillemets
+        controler('"%s"' % (cible / "bin" / "python3"))
+        for faux in (self.venv / "bin" / "python3",
+                     "/usr/bin/python3",
+                     cible / "bin" / "pythonx"):
+            with self.assertRaises(RuntimeError):
+                controler(faux)
+        # la troisième ligne ferme la chaîne qui rend le script valide en Python
+        with self.assertRaises(RuntimeError):
+            controler(cible / "bin" / "python3", fermeture="'''")
 
     def test_activer_refuse_un_venv_non_prepare(self):
         faux_venv(self.base, "v1")

@@ -232,7 +232,17 @@ def name_lock_key(name: str) -> str:
 
 class Agents(interface.Agents):
 
-    def operator_pause(self, name, *, paused, reason, actor, principal) -> dict | None:
+    def operator_pause(self, name, *, paused, reason, actor, principal,
+                       expect_reason=None) -> dict | None:
+        # #2152 : reprise conditionnelle (une seule instruction SQL, verrou de
+        # ligne) ; `expect_reason` n'a de sens que pour LEVER une pause.
+        if expect_reason is not None:
+            if paused:
+                raise ValueError("expect_reason only lifts an operator pause")
+            rows = self.db.query(
+                "SELECT * FROM ameesh_operator_resume_if(%s, %s, %s, %s, %s)",
+                (name, reason, actor, principal, expect_reason))
+            return rows[0] if rows else None
         rows = self.db.query(
             "SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",
             (name, paused, reason, actor, principal))
@@ -508,6 +518,8 @@ class Agents(interface.Agents):
             """
             SELECT r.name, r.mode, r.status, r.stop_reason, r.responsible, r.host,
                    r.canon_ref, r.placement_ok, r.placement_diagnostic,
+                   -- #2200 : la pause opérateur fait partie de la disponibilité
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
                    (NOT r.ephemeral OR r.ephemeral_expires_at > now()) AS alive,
                    __GOVERNED__ AS canon_governed,
                    __CLAIM_OK__ AS canon_claim_ok,

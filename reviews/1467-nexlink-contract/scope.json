@@ -1,0 +1,68 @@
+{
+  "schema": "ameesh-train-ci-source-scope-draft/1",
+  "status": "unqualified",
+  "groups": {
+    "script_launchers_and_helpers": [
+      "scripts/**",
+      "infra/lib/**",
+      "infra/compute-build/win-nsis/**",
+      "website/scripts/**",
+      "desktop/scripts/**",
+      "desktop/host/scripts/**",
+      "mobile/scripts/**",
+      "mobile/plugins/**",
+      "shared/*/scripts/**",
+      "shared/routing/vectors/**"
+    ],
+    "node_package_execution": [
+      "backend/package*.json",
+      "website/package*.json",
+      "desktop/package*.json",
+      "mobile/package*.json",
+      "shared/*/package*.json",
+      "backend/tsconfig*.json",
+      "website/tsconfig*.json",
+      "desktop/tsconfig*.json",
+      "mobile/tsconfig*.json",
+      "shared/*/tsconfig*.json",
+      "backend/jest.config.cjs",
+      "backend/test/jest-boot.cjs",
+      "backend/test/jest-e2e.cjs",
+      "backend/.dependency-cruiser.js",
+      "backend/eslint*.mjs",
+      "website/vitest.config.mts",
+      "website/__tests__/setup.ts",
+      "website/playwright.remote-mock.config.ts",
+      "desktop/jest.config.js",
+      "mobile/jest.config.js",
+      "mobile/metro.config.js",
+      "mobile/app.config.ts",
+      "mobile/__mocks__/**",
+      "shared/*/jest.config.*"
+    ],
+    "rust_workspace_execution": [
+      "desktop/host/Cargo.toml",
+      "desktop/host/Cargo.lock",
+      "desktop/host/deny.toml",
+      "desktop/host/rust-toolchain.toml",
+      "desktop/host/.cargo/**",
+      "desktop/host/crates/*/Cargo.toml",
+      "desktop/host/vendor/**"
+    ]
+  },
+  "qualified_boundaries": {
+    "source": "mesh-design, ameesh/1467 thread, 2026-10-15T15:20:34+02:00, reporting project qualification from mty-nxl-impl-01",
+    "deployment_dispatch_gate": "scripts/deploy-workflow-shell.test.mjs belongs to the deployment dispatch gate deploy-api.yml, outside the twenty candidate code workflows; no deployment dispatch or extra code-suite CI follows from its exclusion",
+    "mobile_performance": "mobile live performance tests belong to local performance qualification, outside the standard code workflow baseline",
+    "website_staging_e2e": "general website staging e2e tests belong to staging qualification, outside the Vitest and remote-assistance Playwright mock baseline"
+  },
+  "scope_questions": [
+    "the project pilot must still qualify the complete twenty-workflow code contract",
+    "hosted desktop matrices and the compute device bridge depend on external variables and authorization"
+  ],
+  "external_inputs": [
+    "GitHub actions and reusable remote workflows at the refs declared in each workflow",
+    "CI_HOSTED_DESKTOP, NEXLINK_CI_RUNNER_SHARE, bridge inputs and runner capabilities",
+    "unlocked npm install in shared/compute and shared/page-host, dynamic Python cryptography dependency and downloaded toolchains"
+  ]
+}

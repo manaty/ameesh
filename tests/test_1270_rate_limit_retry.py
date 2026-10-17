@@ -17,20 +17,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import adapters, exploitation, rate_limit, registry
+from ameesh import adapters, db as db_mod, exploitation, rate_limit, registry
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
 from .test_l30_accounts import _Base
-
-
-def attendre(cond, delai=10.0, pas=0.02) -> bool:
-    fin = time.monotonic() + delai
-    while time.monotonic() < fin:
-        if cond():
-            return True
-        time.sleep(pas)
-    return cond()
 
 
 class ClassifyTest(unittest.TestCase):
@@ -606,47 +597,115 @@ class BailTest(_Base):
 
     Dormir jusqu'à la deadline (borne de `wait_timeout`) faisait refuser le
     renouvellement au réveil (`deadline_passed`) : le worker rendait le bail au
-    lieu de reprendre. Témoins de service, sans courrier, reprise > bail."""
+    lieu de reprendre. Témoins de service, sans courrier, reprise > bail.
+
+    #2139 : la boucle est la vraie (`AgentWorker.run`), mais l'horloge est
+    virtuelle et le renouvellement un oracle en mémoire. Le témoin en temps
+    réel qui vivait ici dépendait de la latence du banc : sous charge, un
+    aller-retour psql de 1,2 s (mesuré) consommait la marge du bail et
+    `_renew_call` concluait « renewal unanswered past the lease » — le worker
+    s'arrêtait sans qu'aucun défaut du produit ne soit en cause. L'assertion de
+    renouvellement est conservée telle quelle : marge strictement positive à
+    chaque appel, au moins trois renouvellements, aucun tour avant l'échéance."""
 
     TTL = 2.0
     REPRISE = 4.0
 
-    def _worker_court(self, name: str):
+    def _worker_court(self, name: str, ttl: float | None = None):
+        ttl = self.TTL if ttl is None else ttl
         cfg = dataclasses.replace(self.cfg, budget_usd_per_hour=10.0,
                                   budget_check_interval=0.0, poll=0.05)
         runner = Runner(cfg, self.db, once=False)
-        runner.lease_ttl = self.TTL
+        runner.lease_ttl = ttl
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
         self.register(name, "claude", cwd=cwd)
-        lease = registry.claim(self.db, name, runner.runner_id, self.TTL)
+        lease = registry.claim(self.db, name, runner.runner_id, ttl)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         self.addCleanup(worker.watchdog_stop.set)
-        self.addCleanup(lambda: (worker.stopping.set(), worker.wake.set(),
-                                 worker.join(timeout=5)))
         return worker
 
-    def _espionne(self, worker):
-        """Compte les renouvellements et la marge restante à chaque appel."""
-        renews, tours = [], []
-        vrai_renew = worker.renew
+    def _horloge(self, worker, *, bail_restant: float | None = None,
+                 oracle: bool = True, limite: int = 1000):
+        """Horloge virtuelle et oracle de bail, branchés sur le worker.
 
-        def espion():
-            renews.append(worker.lease_deadline - time.time())
-            return vrai_renew()
+        `renew` enregistre la marge (`lease_deadline - maintenant`) et refuse,
+        comme le vrai, dès qu'elle n'est pas strictement positive ; chaque
+        renouvellement accepté repousse l'échéance d'un bail. `wake.wait`
+        avance l'horloge du délai demandé : aucune attente réelle, aucune
+        latence de base — le témoin ne dépend plus de l'ordonnancement.
 
-        worker.renew = espion
-        return renews, tours
+        `oracle=False` garde le **vrai** `renew()` (et son `_renew_call`,
+        bouchonné par le témoin de panne) : l'horloge et le réveil restent
+        virtuels.
 
-    def _lance(self, worker):
-        """Démarre la boucle de service en isolant les entrées/sorties du tour."""
-        return mock.patch.multiple(
-            worker,
-            pick=mock.Mock(return_value={"kind": "consigne"}),
+        #2172 N2 : `limite` borne le nombre de réveils virtuels. Au-delà, le
+        banc échoue (`AssertionError`) au lieu de boucler à vide : un réveil
+        de 0 s n'avance pas l'horloge, donc une régression de `renew_wait`
+        ferait tourner `run()` sans fin. rl6/rl7/rl8 n'ont pas d'autre
+        garde-fou ; rl9/rl10 gardent le leur sur les appels de base."""
+        horloge = {"t": 1000.0, "reveils": 0}
+        renews: list[float] = []
+
+        def attendre(timeout):
+            horloge["reveils"] += 1
+            if horloge["reveils"] > limite:
+                raise AssertionError(
+                    "garde-fou BailTest (#2172) : %d réveils virtuels sans "
+                    "progrès, la boucle ne se termine pas" % limite)
+            horloge["t"] += max(0.0, float(timeout))
+            return False
+
+        def renew():
+            marge = worker.lease_deadline - horloge["t"]
+            renews.append(marge)
+            if marge <= 0:
+                worker.lease_lost.set()
+                return False
+            worker.lease_deadline = horloge["t"] + worker.runner.lease_ttl
+            return True
+
+        if oracle:
+            worker.renew = renew
+        worker.lease_deadline = horloge["t"] + (
+            worker.runner.lease_ttl if bail_restant is None else bail_restant)
+        worker.wake = SimpleNamespace(
+            wait=attendre,
+            clear=lambda: None,
+            set=lambda: None)
+        return horloge, renews
+
+    def _lance(self, worker, *, pick=None, avant_reprise=None, renew_call=None):
+        """La boucle de service réelle, ses entrées/sorties isolées.
+
+        Le veilleur est neutralisé : il lit l'horloge réelle, pas l'horloge
+        virtuelle du témoin (#2139). `avant_reprise` est joué par
+        `maybe_rotate`, entre le renouvellement de boucle et la lecture de
+        l'échéance de reprise. `renew_call` remplace l'appel de base (panne
+        simulée) ; `renew()` reste le vrai."""
+        patches = dict(
+            ensure_watchdog=mock.Mock(),
+            placed_elsewhere=mock.Mock(return_value=""),
+            pick=pick or mock.Mock(return_value={"kind": "consigne"}),
             rotate_for_lot=mock.Mock(side_effect=lambda s: s),
-            maybe_rotate=mock.Mock(),
+            maybe_rotate=(mock.Mock(side_effect=avant_reprise)
+                          if avant_reprise else mock.Mock()),
             apply_restart_if_requested=mock.Mock())
+        if renew_call is not None:
+            patches["_renew_call"] = mock.Mock(side_effect=renew_call)
+        return mock.patch.multiple(worker, **patches)
+
+    def _joue(self, worker, horloge, *, pick=None, avant_reprise=None,
+              renew_call=None) -> None:
+        """Exécute la boucle réelle (`run`) sur l'horloge virtuelle, sans attente."""
+        with self._lance(worker, pick=pick, avant_reprise=avant_reprise,
+                         renew_call=renew_call), \
+                mock.patch("ameesh.runner.time.time",
+                           side_effect=lambda: horloge["t"]), \
+                mock.patch("ameesh.runner.time.monotonic",
+                           side_effect=lambda: horloge["t"]):
+            worker.run()
 
     def _verifie_bail(self, worker, renews, tours, echeance):
         self.assertFalse(worker.lease_lost.is_set(),
@@ -662,57 +721,195 @@ class BailTest(_Base):
     def test_reprise_plus_longue_que_le_bail(self):
         # aucun échec : l'épisode est déjà durable au démarrage du service.
         worker = self._worker_court("rl6")
-        renews, tours = self._espionne(worker)
-        echeance = time.time() + self.REPRISE
+        horloge, renews = self._horloge(worker)
+        tours: list[float] = []
+        echeance = horloge["t"] + self.REPRISE
         worker.rate_limit = rate_limit.RATE_LIMITED
         worker.rate_limit_streak = 1
-        worker.rate_limit_since = time.time()
+        worker.rate_limit_since = horloge["t"]
         worker.rate_limit_retry_at = echeance
-        worker.run_turn = lambda spec: (tours.append(time.time()),
+        worker.run_turn = lambda spec: (tours.append(horloge["t"]),
                                         worker.stopping.set(), True)[-1]
-        with self._lance(worker):
-            worker.start()
-            self.assertTrue(attendre(lambda: tours, delai=10.0),
-                            "le worker doit reprendre après l'échéance, bail tenu")
+        self._joue(worker, horloge)
+        self.assertEqual(len(tours), 1,
+                         "le worker doit reprendre après l'échéance, bail tenu "
+                         "(renouvellements : %r)" % (renews,))
         self._verifie_bail(worker, renews, tours, echeance)
 
     def test_attente_apres_echec_renouvelle_le_bail(self):
         # un vrai échec de tour (429) : l'attente post-échec est plus longue
         # que le bail et doit se découper, pas dormir jusqu'à la deadline.
         worker = self._worker_court("rl7")
-        renews, tours = self._espionne(worker)
-        echeance = time.time() + self.REPRISE
+        horloge, renews = self._horloge(worker)
+        tours: list[float] = []
+        echeance = horloge["t"] + self.REPRISE
 
         def tour(_spec):
-            tours.append(time.time())
+            tours.append(horloge["t"])
             if len(tours) == 1:
                 worker.rate_limit = rate_limit.RATE_LIMITED
                 worker.rate_limit_streak = 1
-                worker.rate_limit_since = time.time()
+                worker.rate_limit_since = horloge["t"]
                 worker.rate_limit_retry_at = echeance
                 return False
             worker.stopping.set()
             return True
 
         worker.run_turn = tour
-        with self._lance(worker):
-            worker.start()
-            self.assertTrue(attendre(lambda: len(tours) >= 2, delai=10.0),
-                            "un échec de débit ne doit pas faire rendre le bail")
-        self.assertEqual(len(tours), 2, "aucun tour ne doit partir avant l'échéance")
+        self._joue(worker, horloge)
+        self.assertEqual(len(tours), 2,
+                         "un échec puis la reprise, aucun tour avant l'échéance "
+                         "(renouvellements : %r)" % (renews,))
         self._verifie_bail(worker, renews, tours, echeance)
+
+    def test_bail_proche_de_l_echeance_renouvele_sans_attendre(self):
+        """#2139 : à moins d'une tranche de l'échéance, l'attente ne planifie
+        pas un réveil À l'échéance — elle renouvelle immédiatement.
+
+        Cas réel : un tour long ou un aller-retour de base lent laisse le bail
+        presque échu quand la boucle le relit. Borner la tranche au temps
+        restant faisait tomber le réveil sur l'échéance même, et le
+        renouvellement était refusé (marge nulle) : le worker rendait un bail
+        encore valide."""
+        worker = self._worker_court("rl8")
+        horloge, renews = self._horloge(worker)
+        tours: list[float] = []
+        echeance = horloge["t"] + self.REPRISE
+        reduit: list[bool] = []
+
+        def bail_presque_echu():
+            # le bail est presque échu quand la boucle le relit, après le
+            # renouvellement de boucle et avant l'attente de reprise.
+            if not reduit:
+                reduit.append(True)
+                worker.lease_deadline = horloge["t"] + 0.1
+
+        worker.rate_limit = rate_limit.RATE_LIMITED
+        worker.rate_limit_streak = 1
+        worker.rate_limit_since = horloge["t"]
+        worker.rate_limit_retry_at = echeance
+        worker.run_turn = lambda spec: (tours.append(horloge["t"]),
+                                        worker.stopping.set(), True)[-1]
+        self._joue(worker, horloge, avant_reprise=bail_presque_echu)
+        self.assertEqual(len(tours), 1,
+                         "le worker doit reprendre après l'échéance, bail tenu "
+                         "(renouvellements : %r)" % (renews,))
+        self._verifie_bail(worker, renews, tours, echeance)
+
+    def test_panne_de_base_espace_les_essais_et_reprend(self):
+        """#2139 : sur une panne de base, `renew()` rend True **sans prolonger**
+        le bail. Les essais doivent être espacés (délai court L72) au lieu de
+        boucler à vide, et la cadence nominale reprend au retour de la base.
+
+        Le vrai `renew()` est exercé (`_renew_call` seul est bouchonné) : la
+        boucle `run()` réelle, sur l'horloge virtuelle. TTL 300 s, bail à 50 s
+        de l'échéance — le cas de la sonde mesh-design (#2139)."""
+        worker = self._worker_court("rl9", ttl=300.0)
+        horloge, _ = self._horloge(worker, bail_restant=50.0, oracle=False)
+        tours: list[float] = []
+        appels: list[float] = []
+        echeance = horloge["t"] + 400.0
+        limite = 12
+        pannes = 3
+        worker.rate_limit = rate_limit.RATE_LIMITED
+        worker.rate_limit_streak = 1
+        worker.rate_limit_since = horloge["t"]
+        worker.rate_limit_retry_at = echeance
+        worker.run_turn = lambda spec: (tours.append(horloge["t"]),
+                                        worker.stopping.set(), True)[-1]
+
+        def renew_call():
+            appels.append(horloge["t"])
+            if len(appels) > limite:  # garde-fou : l'ancien code bouclait à vide
+                worker.stopping.set()
+                return True, horloge["t"] + worker.runner.lease_ttl, None
+            if len(appels) <= pannes:
+                return True, None, db_mod.Unavailable("base injoignable (témoin)")
+            return True, horloge["t"] + worker.runner.lease_ttl, None
+
+        self._joue(worker, horloge, renew_call=renew_call)
+        self.assertLessEqual(len(appels), limite,
+                             "les essais de renouvellement bouclent à vide : %r"
+                             % (appels,))
+        # panne : essais espacés du délai court, jamais nuls
+        self.assertEqual([round(b - a, 3) for a, b in zip(appels[:3], appels[1:4])],
+                         [2.0, 2.0, 2.0],
+                         "les essais en panne ne sont pas espacés : %r" % (appels,))
+        # retour de la base : la cadence nominale (ttl/3) reprend
+        self.assertEqual(round(appels[4] - appels[3], 3), 100.0,
+                         "la cadence nominale ne reprend pas : %r" % (appels,))
+        self.assertFalse(worker.lease_lost.is_set(),
+                         "le bail a été perdu pendant la panne")
+        self.assertEqual(worker.renew_failures, 0)
+        self.assertEqual(len(tours), 1)
+        self.assertGreaterEqual(tours[-1], echeance - 0.05,
+                                "le tour ne part pas à l'échéance de reprise")
+
+    def test_panne_de_base_permanente_s_arrete_a_l_echeance(self):
+        """#2139 : panne permanente — les essais restent espacés et s'arrêtent à
+        l'échéance du bail, sans relèvement ni plancher après la deadline."""
+        worker = self._worker_court("rl10", ttl=300.0)
+        horloge, _ = self._horloge(worker, bail_restant=8.0, oracle=False)
+        tours: list[float] = []
+        appels: list[float] = []
+        limite = 12
+        deadline = worker.lease_deadline
+        echeance = deadline + 400.0
+        worker.rate_limit = rate_limit.RATE_LIMITED
+        worker.rate_limit_streak = 1
+        worker.rate_limit_since = horloge["t"]
+        worker.rate_limit_retry_at = echeance
+        worker.run_turn = lambda spec: (tours.append(horloge["t"]),
+                                        worker.stopping.set(), True)[-1]
+
+        def renew_call():
+            appels.append(horloge["t"])
+            if len(appels) > limite:  # garde-fou : l'ancien code bouclait à vide
+                worker.stopping.set()
+                return True, horloge["t"] + worker.runner.lease_ttl, None
+            return True, None, db_mod.Unavailable("base injoignable (témoin)")
+
+        self._joue(worker, horloge, renew_call=renew_call)
+        self.assertLessEqual(len(appels), 6,
+                             "les essais ne s'arrêtent pas à l'échéance : %r"
+                             % (appels,))
+        self.assertLessEqual(max(appels), deadline,
+                             "un essai a lieu après l'échéance du bail : %r"
+                             % (appels,))
+        self.assertTrue(worker.lease_lost.is_set(),
+                        "l'échéance du bail n'a pas arrêté le worker")
+        self.assertEqual(tours, [], "aucun tour ne doit partir sur un bail perdu")
+
+    def test_garde_fou_coupe_une_boucle_sans_progres(self):
+        """#2172 N2 : un réveil virtuel nul ne fait plus tourner le banc à vide.
+
+        Le garde-fou de `_horloge` est la seule borne de rl6/rl7/rl8 ; ici on
+        force la régression (tranche nulle) et on exige l'échec rapide au lieu
+        d'un `run()` sans fin."""
+        worker = self._worker_court("rl11")
+        horloge, _ = self._horloge(worker, limite=5)
+        worker.rate_limit = rate_limit.RATE_LIMITED
+        worker.rate_limit_streak = 1
+        worker.rate_limit_since = horloge["t"]
+        worker.rate_limit_retry_at = horloge["t"] + self.REPRISE
+        worker.renew_wait = lambda cap: 0.0
+        with self.assertRaisesRegex(AssertionError, "garde-fou BailTest"):
+            self._joue(worker, horloge)
 
 
 class CadenceTest(unittest.TestCase):
     """Sonde déterministe (horloge simulée) de `renew_wait` et de la cadence.
 
-    Les témoins de service ci-dessus dépendent de l'ordonnancement réel ; ici
-    aucune attente réelle : la tranche vaut `ttl/3`, sans plancher dépassant
-    l'échéance, et `_attendre_reprise` renouvelle à ce pas (R1 cx3 B1)."""
+    Les témoins de la boucle ci-dessus sont déterministes eux aussi (#2139) ;
+    ici, encore plus bas : la tranche vaut `ttl/3`, réserve une tranche pleine
+    avant l'échéance, et `_attendre_reprise` renouvelle à ce pas (R1 cx3 B1)."""
 
     def _bail(self, ttl: float, deadline: float):
-        return SimpleNamespace(lease_deadline=deadline,
+        bail = SimpleNamespace(lease_deadline=deadline,
                                runner=SimpleNamespace(lease_ttl=ttl))
+        # la branche d'échec borne l'attente par `wait_timeout`
+        bail.wait_timeout = lambda cap: AgentWorker.wait_timeout(bail, cap)
+        return bail
 
     def test_tranche_au_tiers_du_bail(self):
         self.assertAlmostEqual(
@@ -722,14 +919,31 @@ class CadenceTest(unittest.TestCase):
             AgentWorker.renew_wait(self._bail(300.0, time.time() + 10_000.0),
                                    600.0), 100.0)
 
-    def test_echeance_proche_sans_plancher(self):
+    def test_echeance_proche_renouvellement_immediat(self):
         with mock.patch("ameesh.runner.time.time", return_value=100.0):
-            # 5 ms avant l'échéance : la tranche vaut ces 5 ms, pas un plancher
+            # à 150 s de l'échéance (moins de deux tranches), la tranche est
+            # bornée pour laisser une tranche pleine de marge au renouvellement
             self.assertAlmostEqual(
-                AgentWorker.renew_wait(self._bail(300.0, 100.005), 600.0), 0.005)
+                AgentWorker.renew_wait(self._bail(300.0, 250.0), 600.0), 50.0)
+            # à 5 ms de l'échéance, il n'y a plus de marge : tranche nulle,
+            # l'appelant renouvelle immédiatement (#2139) au lieu de dormir
+            # jusqu'à la deadline, où `renew()` serait refusé
+            self.assertEqual(
+                AgentWorker.renew_wait(self._bail(300.0, 100.005), 600.0), 0.0)
             # échéance atteinte : 0 exactement, `renew()` coupe
             self.assertEqual(
                 AgentWorker.renew_wait(self._bail(300.0, 99.0), 600.0), 0.0)
+
+    def test_panne_proche_de_l_echeance_vise_la_mi_marge(self):
+        with mock.patch("ameesh.runner.time.time", return_value=100.0):
+            # #2172 N1 : sous 2 s de marge, viser la moitié du temps restant,
+            # pour que l'essai suivant ait un budget d'appel avant l'échéance
+            bail = self._bail(300.0, 101.0)
+            bail.renew_failures = 1
+            self.assertAlmostEqual(AgentWorker.renew_wait(bail, 600.0), 0.5)
+            # au-dessus du délai court L72, il reste 2 s
+            bail.lease_deadline = 110.0
+            self.assertAlmostEqual(AgentWorker.renew_wait(bail, 600.0), 2.0)
 
     def test_attente_de_reprise_renouvelle_toutes_les_ttl_sur_3(self):
         faux, horloge, renews = self._faux()
@@ -775,6 +989,44 @@ class CadenceTest(unittest.TestCase):
             AgentWorker._attendre_apres_echec(faux, 30.0)
         self.assertEqual(horloge["t"], 30.0)
         self.assertEqual(renews, [])
+
+    def test_panne_de_base_ne_boucle_pas_sur_un_bail_presque_echu(self):
+        for boucle in ("_attendre_reprise", "_attendre_apres_echec"):
+            for restant in (1.0, 10.0):
+                with self.subTest(boucle=boucle, restant=restant):
+                    faux, horloge, _ = self._faux()
+                    faux.name = "cadence"
+                    faux.lease_deadline = restant
+                    faux.renew_failures = 0
+                    faux.lease_lost = threading.Event()
+                    faux.stop_group_now = mock.Mock()
+                    faux.deadline_passed = lambda: AgentWorker.deadline_passed(faux)
+                    faux.wait_timeout = lambda cap: AgentWorker.wait_timeout(faux, cap)
+                    faux.renew = lambda: AgentWorker.renew(faux)
+                    appels = []
+
+                    def indisponible():
+                        appels.append(horloge["t"])
+                        horloge["t"] += 0.001
+                        return True, None, db_mod.Unavailable("connection refused")
+
+                    faux._renew_call = indisponible
+                    with mock.patch("ameesh.runner.time.time",
+                                    side_effect=lambda: horloge["t"]), \
+                            mock.patch("ameesh.runner.time.monotonic",
+                                       side_effect=lambda: horloge["t"]), \
+                            mock.patch("ameesh.runner.log_async"):
+                        getattr(AgentWorker, boucle)(faux, restant + 1.0)
+                    self.assertEqual(appels[0], 0.0, "premier essai immédiat")
+                    self.assertLessEqual(len(appels), 16,
+                                         "une panne ne doit pas boucler sans attente")
+                    self.assertTrue(
+                        any(0.0 < t < restant for t in appels[1:]),
+                        "aucun essai de renouvellement avant l'échéance : le "
+                        "dernier essai utile est perdu (%r)" % (appels,))
+                    self.assertTrue(faux.lease_lost.is_set())
+                    self.assertEqual(horloge["t"], restant,
+                                     "aucune attente au-delà du bail")
 
 
 class AlerteTest(PgTestCase):

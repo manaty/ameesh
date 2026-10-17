@@ -365,6 +365,54 @@ class JournalReadTest(unittest.TestCase):
         rendu = [ligne for ligne in cost._lines_reverse(self.path, bloc=16) if ligne]
         self.assertEqual(rendu, list(reversed(attendu)))
 
+    def test_a_giant_line_is_reassembled_in_linear_work(self):
+        # #2125 : une ligne géante (un événement de plusieurs Mo) était
+        # recollée par `bloc + reste` à chaque tour, donc la ligne déjà lue
+        # était recopiée en entier : O(n² / bloc) d'octets. Le témoin compte
+        # les octets que les concaténations recopient, pas une durée (canon
+        # §3) : une jointure unique par ligne n'en recopie aucun, l'ancien
+        # code en recopiait ~135 Mo pour une ligne de 1 Mo.
+        ligne = b"x" * (1 << 20)
+        self.write(ligne, b"fin")
+        recopies = []
+
+        class Compte(bytes):
+            def __add__(self, autre):
+                recopies.append(len(self) + len(autre))
+                return bytes.__add__(self, autre)
+
+        vrai_open = open
+
+        class Flux:
+            """Le fichier réel, dont les lectures rendent des octets comptés."""
+
+            def __init__(self, flux):
+                self.flux = flux
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.flux.close()
+                return False
+
+            def seek(self, *args):
+                return self.flux.seek(*args)
+
+            def tell(self):
+                return self.flux.tell()
+
+            def read(self, taille=-1):
+                return Compte(self.flux.read(taille))
+
+        def compte_open(chemin, mode="rb", *args, **kwargs):
+            return Flux(vrai_open(chemin, mode, *args, **kwargs))
+
+        with mock.patch.object(cost, "open", compte_open, create=True):
+            rendu = [l for l in cost._lines_reverse(self.path, bloc=4096) if l]
+        self.assertEqual(rendu, [b"fin", ligne])
+        self.assertLessEqual(sum(recopies), len(ligne))
+
     def test_session_of_reads_from_the_end(self):
         book = self.write(*[{"type": "x", "n": i} for i in range(300)],
                           {"type": "result", "session_id": "s-fin"})
