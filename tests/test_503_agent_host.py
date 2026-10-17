@@ -202,6 +202,17 @@ assert args[0] == '--user', args
 unit = args[-1]
 with (state / 'units.log').open('a') as f: f.write(' '.join(args) + '\n')
 scenario = (state / 'scenario').read_text()
+if 'stop' in args:
+    # #2184/B1 : l'arrêt ordonné de l'unité de pause. Dans le pire cas la
+    # pause a commité juste avant l'arrêt : on la matérialise pour que la
+    # reprise conditionnelle la lève. L'autre cas (unité encore en file) est
+    # l'annulation, couvert par la variante sans fichier tardif.
+    for tardive in state.glob('pause-tardive-*'):
+        name = tardive.name.removeprefix('pause-tardive-')
+        (state / ('pause-' + name)).touch()
+        (state / ('motif-' + name)).write_text(tardive.read_text())
+        tardive.unlink()
+    sys.exit(0)
 if 'restart' in args:
     if scenario == 'restart-error': sys.exit(1)
     (state / ('restart-' + unit.split('@')[1].removesuffix('.service'))).touch()
@@ -229,15 +240,18 @@ import json, os, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
+# #2184/B1 : une pose de pause porte un nom d'unité stable (--unit=...).
+# Le reste des arguments garde la forme historique vérifiée ci-dessous.
+sans_unite = [a for a in args if not a.startswith('--unit=')]
 # #1133 : the value given to -p must already be absolute — systemd-run does
 # not expand %h in a transient unit's properties (it answers "not absolute").
-assert args[:7] == ['--user', '--pipe', '--wait', '--quiet', '-p',
-                    'EnvironmentFile=' + str(state / 'runner.env'), '--'], args
+assert sans_unite[:7] == ['--user', '--pipe', '--wait', '--quiet', '-p',
+                          'EnvironmentFile=' + str(state / 'runner.env'), '--'], sans_unite
 with (state / 'systemd-run.log').open('a') as f: f.write(' '.join(args) + '\n')
 # The manager supplies these values; this stub deliberately does not source
 # or reimplement EnvironmentFile. A separate test exercises the real parser.
 env = dict(os.environ, **json.loads((state / 'expected-env.json').read_text()))
-os.execvpe(args[7], args[7:], env)
+os.execvpe(sans_unite[7], sans_unite[7:], env)
 '''
 
 DB_PYTHON = r'''#!/usr/bin/env python3
@@ -469,7 +483,8 @@ class AgentHostTest(unittest.TestCase):
 
     def test_timed_out_pause_committed_late_is_still_lifted(self):
         """#2184 R orchestrateur B1 : un appel pause expiré (rc 124) peut
-        aboutir après la relecture ; l'intention reste suivie et EXIT lève."""
+        aboutir après la relecture ; l'unité est arrêtée de façon ordonnée
+        avant la reprise, qui lève la pause si elle a commité."""
         self.env['DRAIN_ATTENTE'] = '1'
         self.env['ATTENTE_MAX'] = '2'
         (self.state / 'horloge').write_text('0')
@@ -478,6 +493,10 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertFalse((self.state / 'pause-tardive-dev9').exists())
         self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        # La pose porte un nom d'unité stable, et l'arrêt ordonné est émis
+        # avant la reprise : c'est lui qui ferme la fenêtre de commit tardif.
+        self.assertIn('--unit=ameesh-drain-', (self.state / 'systemd-run.log').read_text())
+        self.assertIn('stop ameesh-drain-', self.units())
         self.assertIn('resume dev9 --operator', self.operateur())
         self.assertIn('--expect-reason', self.operateur())
         self.assertFalse((self.state / 'pause-dev9').exists())
