@@ -2,8 +2,10 @@
 """Migrations versionnées : application, idempotence, immuabilité."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -12,7 +14,53 @@ from ameesh import authority, db as db_mod, mail, migrations, registry, signing
 from .support import PgTestCase
 
 
+def marque_temoin(genre: str, schema: str) -> str:
+    """Marque `application_name` d'un témoin, unique à l'invocation (#835 R2).
+
+    Le schéma porte déjà l'unicité de l'exécution (uuid4 par test). Deux
+    exécutions de la suite peuvent partager le même cluster (AMEESH_TEST_DSN
+    commun sur un hôte d'agents) : une marque constante rendrait les témoins
+    complices — chacun verrait l'attente de l'autre et passerait vert sans rien
+    prouver (relevé par cx2 et l'auditeur).
+    """
+    return "l835-%s-%s" % (genre, schema)
+
+
+def attente_vue(observateur, marque: str, evenement: str, timeout: float = 5.0) -> bool:
+    """Le backend `marque` est-il *vu* par le serveur en attente d'un verrou ?
+
+    `evenement` est le `wait_event` de `pg_stat_activity` : `relation` pour un
+    verrou de table, `advisory` pour le verrou consultatif des migrations. Le
+    `application_name` porte la marque de CETTE invocation (`marque_temoin` :
+    préfixe + schéma, lui-même unique) : jamais un `migrate` d'un autre test ni
+    d'une autre exécution de la suite sur le même cluster (R2 cx2/auditeur).
+    Cette preuve remplace le sleep : un témoin qui n'a pas encore atteint son
+    SQL ne peut plus passer vert à tort (L835 R1).
+    """
+    requete = (
+        "SELECT count(*)::int AS n FROM pg_stat_activity "
+        "WHERE application_name = %s AND wait_event_type = 'Lock' AND wait_event = %s"
+    )
+    fin = time.monotonic() + timeout
+    while time.monotonic() < fin:
+        if observateur.query(requete, (marque, evenement))[0]["n"]:
+            return True
+        time.sleep(0.02)
+    return False
+
+
 class MigrationsTest(PgTestCase):
+    def connect_marque(self, schema: str, marque: str):
+        """Une connexion dont le backend est identifiable dans pg_stat_activity."""
+        dsn = self.cfg.dsn
+        if "://" in dsn:                                  # URI libpq
+            dsn = "%s%sapplication_name=%s" % (dsn, "&" if "?" in dsn else "?", marque)
+        elif "=" in dsn:                                  # paires clé/valeur
+            dsn = "%s application_name=%s" % (dsn, marque)
+        else:                                             # nom de base nu
+            dsn = "dbname=%s application_name=%s" % (dsn, marque)
+        return db_mod.connect(dataclasses.replace(self.cfg, schema=schema, dsn=dsn))
+
     def test_schema_migre_versionne(self):
         rows = self.db.query(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
@@ -272,6 +320,293 @@ class MigrationsTest(PgTestCase):
                 finally:
                     lent.close()
         finally:
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
+    def test_migration_attend_verrou_borne_et_reste_en_attente(self):
+        """L835 : l'attente d'un verrou de table est bornée ; la transaction
+        est annulée, la migration reste en attente, puis s'applique.
+
+        R1 : le témoin atteste l'attente VUE par le serveur (pg_stat_activity)
+        et juge l'erreur/le rollback — pas une durée totale."""
+        import threading
+        from unittest import mock
+        schema = "t_verrou_%s" % uuid.uuid4().hex[:8]
+        db = self.connect(schema)
+        holder = self.connect(schema)
+        libere = threading.Event()
+        resultat: dict = {}
+        fil = fil2 = None
+        try:
+            db.execute('CREATE SCHEMA "%s"' % schema)
+            with tempfile.TemporaryDirectory() as dossier:
+                with open(os.path.join(dossier, "0001_table.sql"), "w", encoding="utf-8") as fh:
+                    fh.write("create table verrou (id int primary key);\n")
+                self.assertEqual(
+                    [m.version for m in migrations.migrate(db, directory=dossier)], [1])
+                with open(os.path.join(dossier, "0002_colonne.sql"), "w", encoding="utf-8") as fh:
+                    fh.write("alter table verrou add column note text;\n")
+                pris = threading.Event()
+
+                def tenir():
+                    try:
+                        with holder.transaction() as tx:
+                            tx.execute("LOCK TABLE verrou IN ACCESS EXCLUSIVE MODE")
+                            pris.set()
+                            libere.wait(30)
+                    except Exception as exc:  # le témoin doit dire pourquoi il n'a pas pris
+                        resultat["tenir"] = exc
+
+                fil = threading.Thread(target=tenir, daemon=True)
+                fil.start()
+                self.assertTrue(pris.wait(5),
+                                "le verrou ACCESS EXCLUSIVE n'a pas été pris : %s"
+                                % resultat.get("tenir"))
+
+                def migrer():
+                    con = self.connect_marque(schema, marque_temoin("table", schema))
+                    try:
+                        resultat["done"] = [
+                            m.version for m in migrations.migrate(con, directory=dossier)]
+                    except Exception as exc:  # témoin du verdict, remonté tel quel
+                        resultat["erreur"] = exc
+                    finally:
+                        con.close()
+
+                with mock.patch.object(migrations, "LOCK_TIMEOUT", "3s"):
+                    fil2 = threading.Thread(target=migrer, daemon=True)
+                    fil2.start()
+                    # la migration est VUE en attente du verrou de table : le
+                    # sleep seul pouvait passer avant qu'elle n'atteigne son SQL
+                    self.assertTrue(
+                        attente_vue(db, marque_temoin("table", schema), "relation"),
+                        "le backend de la migration n'a pas été vu en attente du verrou de table")
+                    fil2.join(15)
+                self.assertFalse(fil2.is_alive(),
+                                 "la migration attend toujours le verrou : la borne n'a pas joué")
+                self.assertIn("erreur", resultat,
+                              "la migration n'a pas échoué alors que la borne est dépassée")
+                self.assertIn("lock timeout", str(resultat["erreur"]).lower())
+                # transaction annulée : rien d'enregistré, le lot reste en attente
+                self.assertNotIn(2, migrations.applied(db))
+                self.assertEqual([m.version for m in migrations.pending(db, dossier)], [2])
+                # verrou libéré : le lot s'applique
+                libere.set()
+                fil.join(10)
+                self.assertFalse(fil.is_alive())
+                self.assertEqual(
+                    [m.version for m in migrations.migrate(db, directory=dossier)], [2])
+                self.assertIn(2, migrations.applied(db))
+        finally:
+            libere.set()
+            # les témoins rendent leurs verrous avant que le schéma ne tombe :
+            # un migrate resté en attente et le DROP SCHEMA se bloqueraient
+            # l'un l'autre (deadlock), et masqueraient l'échec réel du test
+            for temoin in (fil, fil2):
+                if temoin is not None:
+                    temoin.join(15)
+            holder.close()
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
+    def test_migration_qui_doit_attendre_pose_son_propre_delai(self):
+        """L835 : le réglage de la migration l'emporte sur la borne du
+        mécanisme — une migration qui assume d'attendre se pose son délai.
+
+        R1 : le backend est VU en attente du verrou de table ; c'est seulement
+        ensuite qu'on vérifie qu'il tient plus que la borne du mécanisme."""
+        import threading
+        import time as temps
+        from unittest import mock
+        schema = "t_propre_%s" % uuid.uuid4().hex[:8]
+        db = self.connect(schema)
+        holder = self.connect(schema)
+        libere = threading.Event()
+        resultat: dict = {}
+        fil = fil2 = None
+        try:
+            db.execute('CREATE SCHEMA "%s"' % schema)
+            with tempfile.TemporaryDirectory() as dossier:
+                with open(os.path.join(dossier, "0001_table.sql"), "w", encoding="utf-8") as fh:
+                    fh.write("create table propre (id int primary key);\n")
+                self.assertEqual(
+                    [m.version for m in migrations.migrate(db, directory=dossier)], [1])
+                with open(os.path.join(dossier, "0002_colonne.sql"), "w", encoding="utf-8") as fh:
+                    fh.write("set local lock_timeout = '10s';\n"
+                             "alter table propre add column note text;\n")
+                pris = threading.Event()
+
+                def tenir():
+                    try:
+                        with holder.transaction() as tx:
+                            tx.execute("LOCK TABLE propre IN ACCESS EXCLUSIVE MODE")
+                            pris.set()
+                            libere.wait(30)
+                    except Exception as exc:  # le témoin doit dire pourquoi il n'a pas pris
+                        resultat["tenir"] = exc
+
+                fil = threading.Thread(target=tenir, daemon=True)
+                fil.start()
+                self.assertTrue(pris.wait(5),
+                                "le verrou ACCESS EXCLUSIVE n'a pas été pris : %s"
+                                % resultat.get("tenir"))
+
+                def migrer():
+                    con = self.connect_marque(schema, marque_temoin("propre", schema))
+                    try:
+                        resultat["done"] = [
+                            m.version for m in migrations.migrate(con, directory=dossier)]
+                    except Exception as exc:  # témoin du verdict, remonté tel quel
+                        resultat["erreur"] = exc
+                    finally:
+                        con.close()
+
+                # la borne du mécanisme est plus courte que l'attente : c'est le
+                # réglage de la migration qui décide (sinon elle échouerait ici)
+                with mock.patch.object(migrations, "LOCK_TIMEOUT", "300ms"):
+                    fil2 = threading.Thread(target=migrer, daemon=True)
+                    fil2.start()
+                    self.assertTrue(
+                        attente_vue(db, marque_temoin("propre", schema), "relation"),
+                        "le backend de la migration n'a pas été vu en attente du verrou de table")
+                    # vu en attente : 300 ms plus tard, la migration tient
+                    # toujours — son `set local lock_timeout = '10s'` a primé
+                    temps.sleep(0.8)
+                    self.assertNotIn("erreur", resultat,
+                                     "le réglage de la migration n'a pas primé sur LOCK_TIMEOUT")
+                    libere.set()
+                    fil.join(10)
+                    fil2.join(10)
+                self.assertEqual(resultat.get("done"), [2])
+                self.assertIn(2, migrations.applied(db))
+        finally:
+            libere.set()
+            # les témoins rendent leurs verrous avant que le schéma ne tombe :
+            # un migrate resté en attente et le DROP SCHEMA se bloqueraient
+            # l'un l'autre (deadlock), et masqueraient l'échec réel du test
+            for temoin in (fil, fil2):
+                if temoin is not None:
+                    temoin.join(15)
+            holder.close()
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
+    def test_verrou_consultatif_non_borne(self):
+        """L835 : le verrou consultatif des migrations n'est pas borné par
+        LOCK_TIMEOUT — un `migrate` concurrent attend son tour, puis applique.
+
+        R1 : le backend est VU en attente `advisory` ; c'est seulement ensuite
+        qu'on vérifie qu'il tient plus que la borne du mécanisme."""
+        import threading
+        import time as temps
+        from unittest import mock
+        schema = "t_consult_%s" % uuid.uuid4().hex[:8]
+        db = self.connect(schema)
+        holder = self.connect(schema)
+        libere = threading.Event()
+        resultat: dict = {}
+        fil = fil2 = None
+        try:
+            db.execute('CREATE SCHEMA "%s"' % schema)
+            with tempfile.TemporaryDirectory() as dossier:
+                with open(os.path.join(dossier, "0001_table.sql"), "w", encoding="utf-8") as fh:
+                    fh.write("create table consult (id int primary key);\n")
+                pris = threading.Event()
+
+                def tenir():
+                    try:
+                        with holder.transaction() as tx:
+                            tx.execute(
+                                "select pg_advisory_xact_lock(hashtext('%s'))" % migrations._LOCK)
+                            pris.set()
+                            libere.wait(30)
+                    except Exception as exc:  # le témoin doit dire pourquoi il n'a pas pris
+                        resultat["tenir"] = exc
+
+                fil = threading.Thread(target=tenir, daemon=True)
+                fil.start()
+                self.assertTrue(pris.wait(5), "le verrou consultatif n'a pas été pris : %s"
+                                % resultat.get("tenir"))
+
+                def migrer():
+                    con = self.connect_marque(schema, marque_temoin("consult", schema))
+                    try:
+                        resultat["done"] = [
+                            m.version for m in migrations.migrate(con, directory=dossier)]
+                    except Exception as exc:  # témoin du verdict, remonté tel quel
+                        resultat["erreur"] = exc
+                    finally:
+                        con.close()
+
+                # la borne de 300 ms ne doit pas s'appliquer au verrou consultatif
+                with mock.patch.object(migrations, "LOCK_TIMEOUT", "300ms"):
+                    fil2 = threading.Thread(target=migrer, daemon=True)
+                    fil2.start()
+                    self.assertTrue(
+                        attente_vue(db, marque_temoin("consult", schema), "advisory"),
+                        "le backend de la migration n'a pas été vu en attente consultative")
+                    # vu en attente consultative : 300 ms plus tard, il attend
+                    # toujours — la borne du mécanisme ne s'y applique pas
+                    temps.sleep(0.8)
+                    self.assertNotIn("erreur", resultat,
+                                     "le verrou consultatif a été borné par LOCK_TIMEOUT")
+                    libere.set()
+                    fil.join(10)
+                    fil2.join(10)
+                self.assertEqual(resultat.get("done"), [1])
+                self.assertIn(1, migrations.applied(db))
+        finally:
+            libere.set()
+            # les témoins rendent leurs verrous avant que le schéma ne tombe :
+            # un migrate resté en attente et le DROP SCHEMA se bloqueraient
+            # l'un l'autre (deadlock), et masqueraient l'échec réel du test
+            for temoin in (fil, fil2):
+                if temoin is not None:
+                    temoin.join(15)
+            holder.close()
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
+    def test_marque_de_temoin_ne_voit_pas_une_autre_invocation(self):
+        """#835 R2 : une marque d'une AUTRE invocation ne compte pas.
+
+        Deux exécutions de la suite peuvent partager le cluster (AMEESH_TEST_DSN
+        commun sur un hôte d'agents). Le témoin doit exiger SA marque : un
+        backend en attente portant une autre marque ne doit jamais le faire
+        passer vert (faux vert relevé par cx2 et l'auditeur).
+        """
+        import threading
+        schema = "t_marque_%s" % uuid.uuid4().hex[:8]
+        db = self.connect(schema)
+        holder = self.connect(schema)
+        fil = None
+        try:
+            db.execute('CREATE SCHEMA "%s"' % schema)
+            db.execute("create table marquee (id int primary key)")
+            marque = marque_temoin("table", schema)
+            autre = marque_temoin("table", "t_autre_%s" % uuid.uuid4().hex[:8])
+
+            def lire():
+                con = self.connect_marque(schema, marque)
+                try:
+                    con.query("SELECT * FROM marquee")
+                finally:
+                    con.close()
+
+            with holder.transaction() as tx:
+                tx.execute("LOCK TABLE marquee IN ACCESS EXCLUSIVE MODE")
+                fil = threading.Thread(target=lire, daemon=True)
+                fil.start()
+                self.assertTrue(attente_vue(db, marque, "relation"),
+                                "le backend portant SA marque n'a pas été vu en attente")
+                self.assertFalse(attente_vue(db, autre, "relation", timeout=0.3),
+                                 "une marque d'une AUTRE invocation a été comptée")
+            fil.join(10)
+            self.assertFalse(fil.is_alive(), "le lecteur bloqué n'a pas rendu la main")
+        finally:
+            if fil is not None:
+                fil.join(15)
+            holder.close()
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
 

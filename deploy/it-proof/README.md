@@ -18,6 +18,12 @@ it or executes an artifact.
    configuration and canonical checkout. The existing trust checks and atomic
    registry/module-policy transaction still apply; an executor attempting a
    policy write is refused, even if an old ACL grants it that write.
+   After creating the logins and memberships, reapply
+   `deploy/sql/role-module-writers.sql`: it rejects TEMP on the writer groups,
+   their transitive members and those members' parent roles, including PUBLIC
+   and SET ROLE paths. Reapply it after membership or database ACL changes;
+   a failed audit does not revoke the offending grants. See the
+   [TEMP barrier for module guards](../../docs/EXPLOITATION.md#isolated-it-proof-and-policy-writers-l317a-r2).
 3. Install the reviewed ameesh wheel and its dependencies into the root-owned
    virtualenv `/opt/ameesh-it-proof`. Install the fixed wrapper
    `deploy/it-proof/ameesh-it-proof` as
