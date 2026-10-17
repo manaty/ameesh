@@ -1018,9 +1018,12 @@ The `installer` step follows the same practice.
 
 1. `poste.sh verifier`: target databases (without password), runners, SSH
    access to the server. Nothing is modified.
-2. `poste.sh sauvegarder`: `pg_dump -Fc` of the mesh database (the
-   server's) from the workstation, server backup (`ameesh-sauvegarde`), and
-   `pg_dump` of the old database, into `~/backups/ameesh/`.
+2. `poste.sh sauvegarder`: the server backup (`ameesh-sauvegarde`) dumps the
+   mesh database on the VM into its guarded local copy, then `poste.sh`
+   retrieves that dump compressed over SSH into `~/backups/ameesh/`, checking
+   its size and SHA-256 before publishing it. `pg_dump` of the old database
+   follows. The retrieval is bounded and reports a timeout with the bytes
+   already written: a slow WireGuard link no longer fails silently.
 3. `poste.sh installer [REF]`: snapshot of commit REF, installed with its
    dependencies (psycopg). The previous version is recorded for rollback.
    Running runners keep the old code in memory: continue without
