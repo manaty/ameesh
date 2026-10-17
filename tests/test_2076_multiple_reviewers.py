@@ -214,6 +214,10 @@ class MultipleReviewersTest(PgTestCase):
     def notes(self):
         return [e["note"] for e in work.events(self.db, self.lot["id"])]
 
+    def test_assigning_a_missing_lot_is_a_noop(self):
+        self.assertIsNone(storage.of(self.db).work.assign(
+            -1, "first", current=None, note="missing lot", actor="chief"))
+
     def test_removing_an_undesignated_name_writes_no_journal_line(self):
         self.designate("first")
         before = self.notes()

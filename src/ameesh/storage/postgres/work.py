@@ -627,7 +627,9 @@ class WorkItems(interface.WorkItems):
             seen = self.db.query(
                 "SELECT reviewer%s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
                 % (", reviewers" if with_reviewers else ""), (int(item_id),))
-            previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
+            if not seen:
+                return None
+            previous_reviewer = seen[0]["reviewer"] or ""
             previous_reviewers = (list(seen[0].get("reviewers") or [])
                                   if with_reviewers else
                                   ([previous_reviewer] if previous_reviewer else []))
