@@ -107,6 +107,22 @@ test("host: a <ameesh-config> is created when the page has none", () => {
   holder.remove();
 });
 
+test("host: with a created <ameesh-config>, the events of the components beside it reach the host", () => {
+  for (const el of document.querySelectorAll("ameesh-config")) el.remove();
+  const holder = document.createElement("div");
+  const view = document.createElement("div");
+  holder.appendChild(view);
+  document.body.appendChild(holder);
+  const { host, calls } = fakeHost();
+  const off = ui.connectHost(host, { root: holder });
+  fire(view, "ameesh:approval-requested", "https://m.example/a/1");
+  assert.deepEqual(calls.approvals, ["https://m.example/a/1"]);
+  off();
+  fire(view, "ameesh:approval-requested", "https://m.example/a/2");
+  assert.deepEqual(calls.approvals, ["https://m.example/a/1"]);
+  holder.remove();
+});
+
 test("host: an explicit API base selects the token of that mesh", async () => {
   const { holder, config } = mountConfig();
   config.apiBase = "https://b.example";

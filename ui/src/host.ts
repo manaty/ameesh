@@ -104,19 +104,24 @@ function meshForBase(list: AmeeshMesh[], base: string): AmeeshMesh | null {
  *
  * One binding, one <ameesh-config>: the events are listened to on that
  * element, so a page that shows two meshes never hands one mesh's event to
- * the other's host. The config's `apiBase` (or `options.apiBase`) selects
+ * the other's host (a config the binding creates wraps no component, so its
+ * events are listened to on `root`). The config's `apiBase` (or `options.apiBase`) selects
  * the mesh in `meshes()`, and therefore the token: no mesh's token is sent
  * to another origin.
  */
 export function connectHost(host: AmeeshHost, options: ConnectHostOptions = {}): () => void {
   const root: ParentNode = options.root ?? document;
   let config = options.config ?? firstConfig(root);
+  const created = !config;
   if (!config) {
     config = document.createElement("ameesh-config") as AmeeshConfig;
     const parent = (root as Document).body ?? (root as Element);
     parent.appendChild(config);
   }
   const target = config;
+  // a created config wraps none of the components: their events reach it
+  // only through `root`
+  const listener: EventTarget = created ? root : target;
   let mesh = options.mesh;
   let disposed = false;
   const tokenProvider = () => host.getToken(mesh);
@@ -147,8 +152,8 @@ export function connectHost(host: AmeeshHost, options: ConnectHostOptions = {}):
     }).catch(() => undefined);
   }
 
-  const on = (type: string, fn: (event: Event) => void) => target.addEventListener(type, fn);
-  const off = (type: string, fn: (event: Event) => void) => target.removeEventListener(type, fn);
+  const on = (type: string, fn: (event: Event) => void) => listener.addEventListener(type, fn);
+  const off = (type: string, fn: (event: Event) => void) => listener.removeEventListener(type, fn);
 
   const opened = (kind: string) => (event: Event) => {
     const row = (event as CustomEvent).detail as HostRow | undefined;
