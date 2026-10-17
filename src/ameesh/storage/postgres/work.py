@@ -199,6 +199,18 @@ _DELEGATION_COLUMNS = """
 """
 
 
+#: #1693 (N4) : un jalon `merged` n'est effectif que si aucune correction
+#: `merged → build` ne l'a annulé — une correction au moins aussi récente que
+#: le jalon. Les jalons annulés RESTENT dans la table (aucune reprise
+#: destructive) ; la lecture calcule le jalon effectif depuis le journal.
+def _effective_merged(alias: str) -> str:
+    return ("NOT EXISTS (SELECT 1 FROM work_item_events c"
+            " WHERE c.work_item_id = %s.work_item_id"
+            "   AND c.state = 'build'"
+            "   AND starts_with(c.note, 'correction: merged → build')"
+            "   AND c.created_at >= %s.at)" % (alias, alias))
+
+
 #: Les délais d'un lot, dérivés de ses jalons (L10, R19). Forme **stable** :
 #: L24 (`ameesh progress`) et Nexlink la consomment telle quelle ; une étape qui
 #: n'a pas eu lieu est NULL, jamais zéro. Le premier gel et le premier verdict
@@ -232,8 +244,9 @@ _DELAYS_SELECT = """
              WHERE m.work_item_id = w.id AND m.kind = 'verdict'
              ORDER BY m.at, m.id LIMIT 1) rev ON true
       LEFT JOIN LATERAL (
-            SELECT min(m.at) AS at FROM work_item_milestones m
-             WHERE m.work_item_id = w.id AND m.kind = 'merged') fus ON true
+            SELECT max(m.at) AS at FROM work_item_milestones m
+             WHERE m.work_item_id = w.id AND m.kind = 'merged'
+               AND __MERGED_EFFECTIVE__) fus ON true
       LEFT JOIN LATERAL (
             SELECT min(m.at) AS at FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'delivered') liv ON true
@@ -244,7 +257,7 @@ _DELAYS_SELECT = """
             SELECT count(*) AS n FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'verdict'
                AND m.verdict = 'blocked') blk ON true
-"""
+""".replace("__MERGED_EFFECTIVE__", _effective_merged("m"))
 
 
 class WorkItems(interface.WorkItems):
@@ -490,7 +503,8 @@ class WorkItems(interface.WorkItems):
             sql += (
                 "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
                 "                WHERE m.work_item_id = w.id AND m.kind = 'merged'"
-                "                  AND m.at >= %s)"
+                "                  AND m.at >= %s"
+                "                  AND " + _effective_merged("m") + ")"
             )
             params.append(since)
         if terminal_prefix:
@@ -556,6 +570,10 @@ class WorkItems(interface.WorkItems):
         demande de décision ouverte le tient — vérifiée dans la même
         instruction, la demande verrouillée (voir l'interface). Un passage
         vers un état terminal libère la réservation de migration (#956).
+        #1693 (N4) : une correction `merged → build` ne retire PAS le jalon
+        `merged` de la table — l'historique reste, et la lecture (progress,
+        délais, jalons effectifs) écarte le jalon qu'elle annule. La vraie
+        fusion en écrit un second, que le trigger de 0013 pose après elle.
         Un lot pinné sur une révision Process (`workflow_ref`) n'est jamais
         déplacé ici : la garde est aussi dans le SQL, pour la course entre la
         lecture de l'appelant et l'adoption concurrente (#1922/N8)."""
@@ -1983,6 +2001,12 @@ class WorkItems(interface.WorkItems):
         écrit dans la transaction de la fusion (`migration_landed`,
         `migration_landed_repo`).
 
+        #1693 (N1/N4) : le `pr_ref` d'une fusion réelle remplace celui de la
+        fusion annulée (une chaîne vide ne l'efface pas), et le jalon visé est
+        le plus récent encore sans commit — après une correction, le jalon de
+        la fusion annulée reste dans la table, le trigger de 0013 a posé celui
+        de la vraie fusion.
+
         Rien n'est écrit avant ce recontrôle : la fermeture est appelée dans
         la transaction qui porte aussi le réveil des dépendants (L385 suite),
         et un `UPDATE` suivi d'un `None` n'était annulé que par SA transaction
@@ -2009,7 +2033,7 @@ class WorkItems(interface.WorkItems):
                 """
                 UPDATE work_items
                    SET state = 'merged', updated_at = now(), closed_at = NULL,
-                       pr_ref = coalesce(%s, pr_ref),
+                       pr_ref = coalesce(nullif(%s, ''), pr_ref),
                        migration_landed = coalesce(%s, migration_landed),
                        migration_landed_repo = coalesce(%s, migration_landed_repo)
                  WHERE id = %s AND state = %s AND __UNPINNED__
@@ -2023,7 +2047,9 @@ class WorkItems(interface.WorkItems):
             self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
             tx.query(
                 "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
-                " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
+                " WHERE id = (SELECT id FROM work_item_milestones"
+                "              WHERE work_item_id = %s AND kind = 'merged' AND sha = ''"
+                "              ORDER BY at DESC, id DESC LIMIT 1) RETURNING id",
                 (sha or "", actor or "", note or "", int(item_id)))
             return rows[0]
 
@@ -2265,8 +2291,9 @@ class WorkItems(interface.WorkItems):
             "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
             "       r.chantier AS assignee_chantier, r.host AS assignee_host,"
             # L157 : dates prévues et fusion, pour l'en-tête de l'issue
-            "       (SELECT extract(epoch from min(m.at))::float8 FROM work_item_milestones m"
-            "         WHERE m.work_item_id = w.id AND m.kind = 'merged') AS merged_ts"
+            "       (SELECT extract(epoch from max(m.at))::float8 FROM work_item_milestones m"
+            "         WHERE m.work_item_id = w.id AND m.kind = 'merged'"
+            "           AND " + _effective_merged("m") + ") AS merged_ts"
             "  FROM (SELECT %s,"
             "               coalesce(to_jsonb(work_items)->>'workflow_ref', '')"
             "                 AS workflow_ref,"
@@ -2378,9 +2405,11 @@ class WorkItems(interface.WorkItems):
             "                               OR w.estimate_minutes IS NOT NULL)) AS late,"
             "       coalesce(n.n, 0)::int AS revisions"
             "  FROM work_items w"
-            "  JOIN LATERAL (SELECT min(m.at) AS at FROM work_item_milestones m"
+            "  JOIN LATERAL (SELECT max(m.at) AS at FROM work_item_milestones m"
             "                 WHERE m.work_item_id = w.id"
-            "                   AND m.kind IN ('merged', 'delivered')) fus"
+            "                   AND m.kind IN ('merged', 'delivered')"
+            "                   AND (m.kind <> 'merged' OR "
+            + _effective_merged("m") + ")) fus"
             "    ON fus.at IS NOT NULL"
             "  LEFT JOIN LATERAL (SELECT e.minutes, e.estimated_by, e.source"
             "                       FROM work_item_estimates e"
@@ -2431,7 +2460,8 @@ class WorkItems(interface.WorkItems):
             "  FROM work_items w"
             "  JOIN LATERAL (SELECT x.at, x.sha FROM work_item_milestones x"
             "                 WHERE x.work_item_id = w.id AND x.kind = 'merged'"
-            "                 ORDER BY x.at, x.id LIMIT 1) fus ON true"
+            "                   AND " + _effective_merged("x") +
+            "                 ORDER BY x.at DESC, x.id DESC LIMIT 1) fus ON true"
             "  LEFT JOIN work_item_measures m ON m.work_item_id = w.id"
             " WHERE w.started_at IS NOT NULL AND w.state <> 'closed'")
         params: list = []

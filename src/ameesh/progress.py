@@ -192,6 +192,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     """
     requested = item.get("created_ts")
     merged = None
+    merge_corrected = None
     blocks = 0
     prev = None
     ev_freezes: list = []
@@ -210,13 +211,23 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         if prev == "qa" and state in ("build", "merged"):
             ev_verdicts.append((at, "ok" if state == "merged" else "blocked",
                                 ev.get("actor") or None))
-        if state == "merged" and merged is None:
+        if state == "merged" and prev != "promoted":
+            # #1693 (N4) : la DERNIÈRE entrée en merged date la livraison — un
+            # lot rouvert par correction `merged → build` puis refusionné porte
+            # deux transitions, la première annulée. Une correction depuis
+            # promoted conserve, elle, la fusion réelle.
             merged = at
+        elif prev == "merged" and state == "build":
+            # La correction annule aussi les replis depuis le journal et
+            # l'action de fusion confirmée, pas seulement le jalon SQL.
+            merge_corrected, merged = at, None
         if state in _WAITING and prev not in _WAITING:
             blocks += 1
         prev = state
 
-    rows = [r for r in (declared or []) if r.get("at_ts") is not None]
+    rows = [r for r in (declared or []) if r.get("at_ts") is not None
+            and not (r.get("kind") == "merged" and merge_corrected is not None
+                     and r["at_ts"] <= merge_corrected)]
     if any(r.get("kind") in ("frozen", "verdict") for r in rows):
         source = "milestones"
         freezes = [{"at_ts": r["at_ts"], "sha": (r.get("sha") or "").strip()}
@@ -235,9 +246,12 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # déclarations, sinon le journal, la table ne comblant que ses trous.
     auto = {}
     for r in rows:
-        if (r.get("kind") in ("requested", "merged", "delivered")
-                and r.get("kind") not in auto):
-            auto[r["kind"]] = r["at_ts"]          # lignes en ordre chronologique
+        if r.get("kind") in ("requested", "merged", "delivered"):
+            # #1693 (N4) : plusieurs jalons `merged` peuvent coexister (un par
+            # fusion, la correction ne les retire plus) ; le dernier encore
+            # effectif date la livraison.
+            if r["kind"] == "merged" or r["kind"] not in auto:
+                auto[r["kind"]] = r["at_ts"]      # lignes en ordre chronologique
     if source == "milestones":
         requested = auto.get("requested", requested)
         merged = auto.get("merged", merged)
@@ -259,7 +273,9 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
             verdicts.append({"at_ts": act["approved_ts"], "kind": "ok",
                              "actor": act.get("auth_approver") or act.get("last_actor") or None,
                              "sha": (act.get("sha") or "").strip()})
-        if act.get("state") == "confirmed" and merged is None:
+        if (act.get("state") == "confirmed" and merged is None
+                and (merge_corrected is None
+                     or (act.get("finished_ts") or 0) > merge_corrected)):
             merged = act.get("finished_ts")
 
     freezes.sort(key=lambda f: f["at_ts"])
