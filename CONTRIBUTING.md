@@ -106,14 +106,14 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
 
-Les idées qui ne sont pas décidées vont dans le [sas d’explorations](docs/design/explorations/index.md) :
-un fichier par idée, `type: Exploration`, `status: exploration`, avec problème,
-intuitions et questions ouvertes. Ni lots proposés, ni dates, ni estimations,
-ni critère « fait » ; aucun lot, WorkPackage, backlog ou ligne de roadmap ne
-se déduit d’une exploration. Seule une décision explicite de l’owner,
-consignée dans `docs/design/decisions/`, permet la promotion en étude puis en
-lots. Les fiches de plan et de lot pointent vers l’étude décidée. La garde
-`tests.test_l1124_explorations` vérifie cette séparation dans le dépôt.
+Undecided ideas go to the [exploration inbox](docs/design/explorations/index.md):
+one file per idea, `type: Exploration`, `status: exploration`, with a problem,
+intuitions and open questions. No proposed lots, no dates, no estimates, no
+"done" criterion; no lot, WorkPackage, backlog entry or roadmap line is
+derived from an exploration. Only an explicit owner decision, recorded in
+`docs/design/decisions/`, allows promotion to a study and then to lots. Plan
+and lot cards point to the decided study. The `tests.test_l1124_explorations`
+guard verifies this separation in the repository.
 
 ## Numérotation des versions
 

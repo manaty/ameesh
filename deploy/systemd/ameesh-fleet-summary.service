@@ -1,0 +1,18 @@
+# #2022 — daily fleet summary: `ameesh hosts --fleet` (one line per host,
+# stale readings, disks, zombies, the hosts to look at first) mailed to the
+# bureau's thread, which the owner reads. Exits non-zero when the summary
+# cannot be sent: the unit shows failed (`systemctl --user status`).
+# Started once a day by ameesh-fleet-summary.timer, on ONE host of the mesh
+# (the server).
+[Unit]
+Description=ameesh daily fleet summary to the bureau (#2022)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/ameesh/env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh hosts --fleet --send bureau
+Nice=10
+NoNewPrivileges=yes

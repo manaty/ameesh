@@ -26,6 +26,23 @@ const routes = {
   "/api/v1/threads/ameesh": [200, { entries: [] }],
   "/api/v1/threads/ameesh/7": [200, { entries: [{ author: "agent:ada", recipient: "human:ada", ts: stamp,
     text: "<img src=x onerror=alert(1)>\n**literal message**", id: "1" }] }],
+  // L90: the human's queue, in the shape of `GET /api/v1/decisions`
+  "/api/v1/decisions": [200, {
+    for: "human:ada",
+    approvals: [{ action_id: "act_0123456789abcdef", project: "ameesh", work_item: 7,
+      proposed_by: "agent:ada", connector: "stripe", operation: "refund", target: "ch_1",
+      class: "money", amount: 4200, currency: "EUR", digest: "sha256:abc", state: "proposed" }],
+    requests: [{ id: 12, project: "ameesh", lot: 7, lot_title: "Read screens",
+      requester: "agent:ada", owner: "human:ada", question: "Which <b>option</b>?",
+      options: [{ key: "a", label: "ship" }, { key: "b", label: "wait" }], recommend: "a",
+      urgent: false, overdue: false, created_ts: stamp, due_ts: stamp + 3600, state: "pending" }],
+    waiting_human: [{ id: 9, title: "Awaiting answer", state: "waiting_human",
+      assignee: "ada", project: "ameesh" }],
+    unknown: [], interrupted: [],
+    prose: [{ id: 31, sender: "agent:ada", recipient: "human:ada", lot: 7,
+      created_ts: stamp - 60, age_s: 60, cues: ["il faudrait trancher"],
+      excerpt: "il faudrait trancher : <img src=x>", convert: "ameesh decide ask --from-mail 31" }],
+  }],
 };
 
 export { routes };

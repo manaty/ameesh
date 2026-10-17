@@ -120,6 +120,7 @@ elif 'show' in args:
 elif 'is-active' in args:
     if scenario == 'inactive' or stopped(): sys.exit(3)
     if scenario == 'inactive-dev9' and '@dev9.' in args[-1]: sys.exit(3)
+    if (state / ('inactive-' + unit.split('@')[1].removesuffix('.service'))).exists(): sys.exit(3)
     print('active')
 '''
 
@@ -229,8 +230,27 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.starts(), ['--user start ameesh-runner-agent@dev8.service',
                                          '--user start ameesh-runner-agent@dev9.service'])
-        self.assertNotIn('restart', self.units())
+        # #1152 : les personas actives prouvent leur arrêt puis redémarrent,
+        # jamais par `restart`. #1633 : la persona arrêtée du registre est du
+        # lot — son unité active est seulement rechargée sur le nouveau code
+        # (aucun bail exigé) ; l'observateur et l'agent d'un autre hôte restent
+        # ignorés.
+        restarts = [l for l in self.units().splitlines() if 'restart' in l]
+        self.assertEqual(restarts, ['--user restart ameesh-runner-agent@stopped.service'])
         self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertIn('stopped : arrêté dans le registre', p.stdout)
+        self.assertNotIn('stopped : redémarré (était', p.stdout)
+        self.assertNotIn('no lease before the restart', p.stdout)
+
+    def test_restart_leaves_an_inactive_stopped_unit_alone(self):
+        # #1633 : unité déjà arrêtée — aucune relance : elle chargera le
+        # nouveau code à son démarrage.
+        (self.state / 'inactive-stopped').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('restart ameesh-runner-agent@stopped.service', self.units())
+        self.assertIn('stopped : arrêté dans le registre', p.stdout)
+        self.assertIn('déjà arrêtée', p.stdout)
 
     def test_restart_stops_proves_then_starts(self):
         """#1152 : l'arrêt (SIGTERM, drainage) précède la preuve du point sûr
@@ -248,7 +268,11 @@ class AgentHostTest(unittest.TestCase):
             self.assertLess(stop, actif, unite)
             self.assertLess(actif, start, unite)
             self.assertLess(pid, start, unite)
-        self.assertNotIn('restart', self.units())
+        # `restart` ne prouve rien pour une persona active (#1152) ; seule la
+        # persona arrêtée du registre recharge son unité par `restart` (#1633).
+        for unite in ('ameesh-runner-agent@dev8.service',
+                      'ameesh-runner-agent@dev9.service'):
+            self.assertNotIn('--user restart ' + unite, self.units())
 
     def test_restart_gates_agent_in_turn_without_idle_wait(self):
         # #1152/R1 : un agent vu `running` n'est plus différé — il est arrêté
@@ -258,7 +282,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertTrue((self.state / 'busy-seen').exists())
         self.assertIn('--user stop ameesh-runner-agent@dev9.service', self.units())
         self.assertIn('--user start ameesh-runner-agent@dev9.service', self.units())
-        self.assertNotIn('restart', self.units())
+        self.assertNotIn('--user restart ameesh-runner-agent@dev9.service', self.units())
 
     def test_restart_rejects_unchanged_lease(self):
         for scenario in ['stale-lease']:

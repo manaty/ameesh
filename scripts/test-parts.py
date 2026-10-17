@@ -25,8 +25,9 @@ repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
 pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
 plan de repli le demande par `pilot_list` ; une PR de release garde la suite
 complète, scripts/test-plan.py). La liste
-est additive (L160a) : noms en ordre alphabétique et sans doublon, sinon
-refusée.
+est additive (L160a) : on écrit un nom par ligne, en ordre alphabétique et
+sans doublon ; la lecture range et dédoublonne ce qu'une fusion `union`
+(.gitattributes) produit, et refuse toujours un nom inconnu.
 
 `run` exécute la part dans ce processus (`unittest`, verbeux) et mesure la
 durée de chaque module ; `durations` fusionne ces mesures dans la table.
@@ -123,11 +124,11 @@ def read_list(chemin: str | os.PathLike, connus: list[str]) -> list[str]:
     inconnus = sorted(set(noms) - set(connus))
     if inconnus:
         raise SystemExit(f"{chemin} : module(s) inconnu(s) : {', '.join(inconnus)}")
-    # L160a: kept sorted and unique so that two additions never touch the same line
-    if noms != sorted(set(noms)):
-        raise SystemExit(f"{chemin} : liste non rangée (ordre alphabétique, sans doublon) ; "
-                         f"attendu : {', '.join(sorted(set(noms)))}")
-    return noms
+    # L160a : on écrit une entrée par ligne, à sa place alphabétique. #1517 :
+    # la fusion `union` (.gitattributes) de deux ajouts au même endroit garde
+    # les deux lignes dans l'ordre des côtés, ou deux fois la même : la
+    # lecture range et dédoublonne au lieu de refuser.
+    return sorted(set(noms))
 
 
 def test_count(module: str, tests: pathlib.Path = TESTS) -> int:

@@ -184,6 +184,8 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
       Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
       renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
       ne compte pas ; sans SHA des deux côtés, comparaison des instants ;
+    * `verdict_required` : False quand le pilote a marqué « verdict non
+      requis » (`work.REVIEWER_NONE`, #1979) — la revue n'attend plus rien ;
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
@@ -273,6 +275,11 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
     reviewer = (last["actor"] if last else None) if verdict_current else designated
+    # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
+    # mécanique, canon §11 bis/#87) en marquant la colonne du relecteur
+    # (`work.waive_review`) : l'attente passe alors à la fusion, sans faux
+    # « waiting: verdict » ni rappel à un relecteur.
+    verdict_required = designated != work_mod.REVIEWER_NONE
     return {
         "requested": requested,
         "frozen": freezes[0]["at_ts"] if freezes else None,
@@ -281,6 +288,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "verdict_kind": last["kind"] if last else None,
         "reviewer": reviewer,
         "verdict_current": verdict_current,
+        "verdict_required": verdict_required,
         "merged": merged,
         "delivered": delivered,
         "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
@@ -316,7 +324,9 @@ def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
 
 def lot_state(work_state: str, jalons: dict) -> str:
     """État affiché d'un lot (décision 0024) : en revue, il n'est approuvé
-    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA)."""
+    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA) — ou,
+    #1979, par la marque « verdict non requis » du pilote (résolution de
+    composition mécanique, canon §11 bis/#87)."""
     if work_state in ("merged", "promoted"):
         return "merged"
     if work_state == "closed":
@@ -328,6 +338,13 @@ def lot_state(work_state: str, jalons: dict) -> str:
         if current is None:                 # jalons partiels : repli par les instants
             last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
             current = (jalons.get("verdict") or 0) >= last_frozen
+        # #1979 : dispensé de re-verdict, le lot n'est pas « en revue » : il
+        # est prêt à fusionner, comme après un verdict `ok` courant. Un verdict
+        # bloquant COURANT garde la main (une correction est due), comme dans
+        # `stagnation.waiting`.
+        if not (jalons.get("verdict_kind") == "blocked" and current) \
+                and jalons.get("verdict_required", True) is False:
+            return "approved"
         if jalons.get("verdict_kind") == "ok" and current:
             return "approved"
         return "review"
@@ -383,7 +400,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "state": lot_state(item.get("state") or "", jalons),
         "work_state": item.get("state") or "",
         "assignee": item.get("assignee") or None,
-        "reviewer": jalons["reviewer"],
+        # #1979 : une revue dispensée n'a pas de relecteur — l'état `approved`
+        # le dit ; le jeton de la colonne ne sort pas dans la vue.
+        "reviewer": (None if jalons["reviewer"] == work_mod.REVIEWER_NONE
+                     else jalons["reviewer"]),
         "milestones": {k: _round(jalons[k])
                        for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
@@ -454,11 +474,27 @@ def agent_state(row: dict) -> str:
         return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
+    if row.get("operator_paused") and status not in ("stopped", "dead"):
+        return "paused"
     if status == "blocked":
         return "paused"                 # pause budget ou comptable (L13)
     if status in ("stopped", "dead"):
         return "stopped"
     return "idle"                       # idle, queued
+
+
+def paused_on_budget(row: dict) -> bool:
+    """#1070 : l'agent est en pause BUDGET — la pause annoncée par son
+    exécuteur (`status` `blocked`, texte « budget : … »).
+
+    Distincte d'un `blocked` d'une autre cause (hôte non prêt,
+    authentification), que `agent_state` range lui aussi dans « paused » :
+    un bilan qui compte les agents en pause budget lit ce prédicat, pas le
+    préfixe d'un texte tronqué à l'affichage. La règle est celle de
+    `handoff.paused` (L233b), la seule définition de la pause budget : on la
+    reprend ici au lieu d'en entretenir une seconde."""
+    from . import handoff
+    return handoff.paused(row)
 
 
 def _excerpt(text: str | None, limit: int = TASK_CHARS) -> str | None:
@@ -506,6 +542,9 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "state": state,
         "status": row.get("status") or None,
         "status_text": _excerpt(row.get("status_text"), 160),
+        # #1070 : la pause budget se distingue d'un `blocked` d'une autre cause
+        # sans déchiffrer le texte
+        "paused_on_budget": paused_on_budget(row),
         "since_ts": _round(since),
         "turn": turn,
         "turns": int(row.get("turns") or 0),
@@ -515,6 +554,13 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
+        "operator_pause": ({
+            "reason": row.get("operator_pause_reason"),
+            "by": row.get("operator_pause_by"),
+            "for": row.get("operator_pause_for"),
+            "since_ts": _round(row.get("operator_pause_ts")),
+            "after_turn": state == "working",
+        } if row.get("operator_paused") else None),
     }
 
 
@@ -788,7 +834,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     # agrégation, jamais de la lecture des notes.
     for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
-    last_events = {int(r["work_item_id"]): r.get("last_ts")
+    last_events = {int(r["work_item_id"]): float(r["last_ts"])
                    for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
@@ -813,6 +859,26 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
+    # #1822 : un lot léger sans verdict courant attend la fusion, pas un
+    # verdict ; la classe n'est lue — une fois par passage — que pour ces lots.
+    from . import lot_class
+    classes: dict = {}
+    for lot, item in zip(lots, items):
+        if (lot.get("waiting_for") or {}).get("what") != "verdict":
+            continue
+        cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes,
+                                         milestones=declared.get(int(item["id"]), []))
+        if cls != lot_class.LIGHT:
+            continue
+        rid = int(item["id"])
+        acts = by_item.get(rid, [])
+        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid))
+        lot["waiting_for"] = stagnation.with_availability(
+            stagnation.waiting(item, jalons, acts,
+                               responsible=(packages.get(item.get("package_id"))
+                                            or {}).get("responsible"),
+                               review_class=cls),
+            states, externals)
     package_items = st.package_items()
     plan = plan_mod.summarize(package_rows, package_items)
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)
@@ -1050,6 +1116,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
         elif agent["state"] in ("paused", "stopped") and agent["status_text"]:
             line("reason: %s" % agent["status_text"], "    ")
+        hold = agent.get("operator_pause")
+        if hold:
+            line("operator pause%s: %s (by %s for %s)" % (
+                " after this turn" if hold["after_turn"] else "",
+                hold["reason"], hold["by"], hold["for"]), "    ")
 
     out.append("")
     if snap["milestones"]:

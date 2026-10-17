@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,11 @@ import unittest
 from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import dsn as dsn_mod
+
+try:  # the private backup channel (L232b) splits credentials through psycopg
+    import psycopg
+except ImportError:  # the psql-only parts: the private channel cannot run
+    psycopg = None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "deploy", "mise-a-jour", "poste.sh")
@@ -110,6 +116,16 @@ def blanks_in_uri(dsn):
     """libpq 16 to 18 drop the blanks around a URI token and refuse one
     inside it, as ameesh.dsn does; an older libpq may keep them."""
     return dsn.startswith(("postgresql://", "postgres://")) and " " in dsn
+
+
+def without_empty_password(parameters):
+    """libpq's parameters minus the empty password the private channel drops.
+
+    An explicit empty password still overrides PGPASSWORD or a service: the
+    private channel keeps that override in its own private pgpass file
+    (L232b), so the DSN handed to the tool no longer carries the key.
+    """
+    return {k: v for k, v in parameters.items() if not (k == "password" and v == "")}
 
 
 def expected(case):
@@ -223,16 +239,20 @@ class CommandLineTest(unittest.TestCase):
                 self.assertNotIn(b"Pw", proc.stderr)
 
 
-# one record per call, ended by \036: tool, PGPASSWORD, then argv, separated by
-# \037, so that newlines survive (a POSIX sh, cheap to start on a loaded host);
-# `-At` queries answer 1 (the role exists); pg_dump writes its -f file; ssh
-# drains its standard input
+# one record per call, ended by \036: tool, PGPASSWORD, PGPASSFILE, then argv,
+# separated by \037, so that newlines survive (a POSIX sh, cheap to start on a
+# loaded host); `-At` queries answer 1 (the role exists); pg_dump writes a
+# non-empty -f/--file target; pg_restore lists nothing; ssh drains its input
 FAKE_TOOL = r'''#!/bin/sh
 name=${0##*/}
-{ printf '%s\037' "$name" "${PGPASSWORD-<unset>}" "$@"; printf '\036'; } >> "$FAKE_STATE/calls.log"
+{ printf '%s\037' "$name" "${PGPASSWORD-<unset>}" "${PGPASSFILE-<unset>}" "$@"; printf '\036'; } >> "$FAKE_STATE/calls.log"
 case $name in
   ssh) cat > /dev/null ;;
-  pg_dump) prev=; for a; do [ "$prev" = -f ] && : > "$a"; prev=$a; done ;;
+  pg_restore) : ;;
+  pg_dump) prev=; for a; do
+      if [ "$prev" = -f ] || [ "$prev" = --file ]; then printf 'dump' > "$a"; fi
+      prev=$a
+    done ;;
 esac
 case "$*" in *-At*) echo 1 ;; esac
 exit 0
@@ -244,6 +264,7 @@ class PosteDsnTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-518-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         home = os.path.join(self.tmp, "home")
+        self.home = home
         bin_dir = os.path.join(self.tmp, "bin")
         self.conf = os.path.join(home, ".config", "ameesh")
         self.state = os.path.join(self.tmp, "state")
@@ -251,11 +272,20 @@ class PosteDsnTest(unittest.TestCase):
             os.makedirs(path)
         with open(os.path.join(self.conf, "bascule.env"), "w", encoding="utf-8") as fh:
             fh.write("VM=vm.invalid\n")
-        for tool in ("pg_dump", "psql", "ssh", "systemctl"):
+        for tool in ("pg_dump", "pg_restore", "psql", "ssh", "systemctl"):
             path = os.path.join(bin_dir, tool)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(FAKE_TOOL)
             os.chmod(path, 0o755)
+        # `sauvegarder` runs the private backup channel through the venv's
+        # python, as a real poste does (~/.local/share/ameesh/venv): a shim to
+        # this interpreter, so the channel really runs its pg_dump/pg_restore.
+        venv_bin = os.path.join(home, ".local", "share", "ameesh", "venv", "bin")
+        os.makedirs(venv_bin)
+        python = os.path.join(venv_bin, "python")
+        with open(python, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexec %s \"$@\"\n" % shlex.quote(sys.executable))
+        os.chmod(python, 0o755)
         self.env = dict(os.environ, HOME=home, FAKE_STATE=self.state,
                         PATH=bin_dir + os.pathsep + os.environ["PATH"])
         for name in ("PGPASSWORD", "PGSERVICE", "BASCULE_ENV", "UNITES_RESTE"):
@@ -273,6 +303,9 @@ class PosteDsnTest(unittest.TestCase):
         calls = os.path.join(self.state, "calls.log")
         if os.path.exists(calls):
             os.remove(calls)
+        # the private channel refuses an existing destination: a fresh run
+        # starts without this date's backups.
+        shutil.rmtree(os.path.join(self.home, "backups"), ignore_errors=True)
 
     def run_step(self, step, *, trace=False):
         proc = subprocess.run(["bash"] + (["-x"] if trace else []) + [SCRIPT, step],
@@ -284,9 +317,10 @@ class PosteDsnTest(unittest.TestCase):
         if os.path.exists(path):
             with open(path, encoding="utf-8", newline="") as fh:
                 for record in fh.read().split("\036")[:-1]:
-                    name, password, *argv = record.split("\037")[:-1]
+                    name, password, passfile, *argv = record.split("\037")[:-1]
                     calls.append({"tool": name, "argv": argv,
-                                  "pgpassword": None if password == "<unset>" else password})
+                                  "pgpassword": None if password == "<unset>" else password,
+                                  "pgpassfile": None if passfile == "<unset>" else passfile})
         return proc, calls
 
     def assert_secret_absent(self, text):
@@ -294,31 +328,62 @@ class PosteDsnTest(unittest.TestCase):
         # partial leak (the end of a quoted value) is caught too
         self.assertNotIn("Pw", text)
 
+    def public_dsn(self, calls):
+        """The private channel's pg_dump call and the DSN it was handed."""
+        dumps = [c for c in calls if c["tool"] == "pg_dump"]
+        self.assertEqual(len(dumps), 1, calls)
+        argv = dumps[0]["argv"]
+        return dumps[0], argv[argv.index("--dbname") + 1]
+
+    @unittest.skipUnless(psycopg, "the private backup channel needs psycopg")
     def test_backups_follow_the_shared_table(self):
+        from psycopg import pq
+        from psycopg.conninfo import conninfo_to_dict
         for case in CASES:
             if case[0] == "ameesh":
+                continue
+            if blanks_in_uri(case[0]) and pq.version() < 160000:
                 continue
             with self.subTest(dsn=case[0]):
                 password, rest = expected(case)
                 self.configure(case[0])
+                if any(c in password for c in "\r\n\x00"):
+                    # a private pgpass file cannot carry such a password: the
+                    # backup stops instead of falling back to PGPASSWORD (#518)
+                    self.assert_stops(self.env)
+                    continue
+                carries = "password" in conninfo_to_dict(case[0])
                 proc, calls = self.run_step("sauvegarder")
-                dumps = [c for c in calls if c["tool"] == "pg_dump"]
-                self.assertEqual(len(dumps), 1, calls)
-                argv = dumps[0]["argv"]
-                self.assertEqual(argv[argv.index("-d") + 1], rest)
-                self.assertEqual(dumps[0]["pgpassword"], password or None)
+                dump, public = self.public_dsn(calls)
+                # the channel hands pg_dump the same connection without its
+                # password; the credential rides a private pgpass file instead
+                self.assertEqual(without_empty_password(conninfo_to_dict(public)),
+                                 without_empty_password(conninfo_to_dict(rest)))
+                self.assertIsNone(dump["pgpassword"])
+                self.assertEqual(dump["pgpassfile"] is not None, carries)
                 self.assert_secret_absent(json.dumps([c["argv"] for c in calls]))
                 self.assert_secret_absent(proc.stdout + proc.stderr)
 
+    @unittest.skipUnless(psycopg, "the private backup channel needs psycopg")
     def test_trailing_newlines_reach_the_tools(self):
+        from psycopg import pq
+        from psycopg.conninfo import conninfo_to_dict
         for case in (c for c in CASES if c[0].endswith("\n") or c[1].endswith("\n")):
+            if blanks_in_uri(case[0]) and pq.version() < 160000:
+                continue
+            password, rest = expected(case)
             with self.subTest(dsn=case[0]):
-                password, rest = expected(case)
                 self.configure(case[0])
+                if any(c in password for c in "\r\n\x00"):
+                    # a private pgpass file cannot carry it: the backup stops
+                    # instead of falling back to PGPASSWORD (#518, fail closed)
+                    self.assert_stops(self.env)
+                    continue
                 proc, calls = self.run_step("sauvegarder")
-                dump = [c for c in calls if c["tool"] == "pg_dump"][0]
-                self.assertEqual(dump["argv"][dump["argv"].index("-d") + 1], rest)
-                self.assertEqual(dump["pgpassword"], password)
+                dump, public = self.public_dsn(calls)
+                self.assertEqual(without_empty_password(conninfo_to_dict(public)),
+                                 without_empty_password(conninfo_to_dict(rest)))
+                self.assertIsNone(dump["pgpassword"])
 
     def test_roles_of_the_old_base(self):
         mesh, old = case("postgresql://ameesh:"), case("dbname=db password=")
@@ -337,6 +402,8 @@ class PosteDsnTest(unittest.TestCase):
         mesh, old = case("postgresql://u@h.invalid/db?password=Pw-first"), case(r"password='Pw\'")
         self.configure(mesh[0], old[0])
         for step in ("verifier", "sauvegarder", "role"):
+            if step == "sauvegarder" and not psycopg:
+                continue   # the private backup channel cannot run without psycopg
             with self.subTest(step=step):
                 proc, calls = self.run_step(step, trace=True)
                 self.assertIn("+ ", proc.stderr)   # traced indeed
@@ -362,7 +429,7 @@ class PosteDsnTest(unittest.TestCase):
     def fake_venv(self, home):
         """A venv python that records its calls: migrer's ameesh_de runs it."""
         bin_dir = os.path.join(home, ".local", "share", "ameesh", "venv", "bin")
-        os.makedirs(bin_dir)
+        os.makedirs(bin_dir, exist_ok=True)   # setUp already shims this python
         path = os.path.join(bin_dir, "python")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(FAKE_TOOL)

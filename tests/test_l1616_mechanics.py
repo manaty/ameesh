@@ -263,8 +263,11 @@ class TestRules(MechanicsTest):
                 rules.reviews_for(["README.md", path])
         self.assertEqual(rules.reviews_for(["src/ameesh/mechanics.py"]),
                          mechanics.ReviewNeed("sensitive", 2))
-        # ni liste vide ni chaîne nue : zéro avis serait un repli
-        for paths in ([], (), "src/ameesh/mechanics.py"):
+        # ni liste vide, ni chaîne nue, ni entrée non itérable : zéro avis
+        # serait un repli. « Makefile » et « src » discriminent le refus de la
+        # chaîne nue : sans « . » ni « / », leurs caractères se classaient
+        # légers un à un et rendaient light/0 avis avant le garde.
+        for paths in ([], (), "Makefile", "src", "src/ameesh/mechanics.py", None):
             with self.subTest(paths=paths), self.assertRaises(mechanics.MechanicsError):
                 rules.reviews_for(paths)
 

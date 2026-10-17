@@ -9,20 +9,23 @@
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
 #   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
 #   migrer [--additif-seulement] [REF]
-#                migrations de REF, lancées depuis son instantané AVANT de
-#                l'installer : base du mesh (UNE fois), puis ancienne base ;
-#                refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#                migrations de REF (défaut HEAD, comme installer), lancées
+#                depuis son instantané AVANT de l'installer : base du mesh
+#                (UNE fois), puis ancienne
+#                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
-#                installé dans le venv (dépendance psycopg comprise) ; refusé
-#                tant qu'une base n'a pas les migrations de REF
+#                venv versionné préparé à l'écart (dépendance psycopg comprise)
+#                puis bascule atomique du venv (#1969) ; refusé tant qu'une
+#                base n'a pas les migrations de REF
 #   role         rôle superviseur réappliqué, sur chaque base où il existe
 #   redemarrer   exécuteurs du poste un par un (arrêt prouvé avant chaque
 #                démarrage), puis notify, puis les exécuteurs de l'ancienne base
 #   controler    doctor, budget, accounts list, projects, alerts
-#   retour       réinstalle la version précédente et redémarre (sans toucher
-#                aux bases : 0041 à 0047 sont additives)
+#   retour       bascule en arrière vers le venv précédent conservé (sans pip),
+#                puis redémarre (sans toucher aux bases : 0041 à 0047 sont
+#                additives)
 #   publier      étiquette annotée v<version> sur REF (un commit de main, la
 #                version de son pyproject.toml), poussée, puis release GitHub
 #                (notes : docs/versions/<version>.md de main, sinon la PR qui a
@@ -37,9 +40,10 @@
 #   écrire, pas même un fetch (le distant est lu par ls-remote, main est
 #   $DISTANT/main local). Ces deux étapes ne lisent pas $BASCULE_ENV.
 #
-# REF (migrer, installer) : commit, branche ou étiquette du dépôt qui contient
-# ce script ; défaut : HEAD de ce dépôt. MIGRER_APRES=1 (installer) : ancien
-# ordre, pour une migration non additive (docs/BASCULE.md, L151).
+# REF : commit, branche ou étiquette du dépôt qui contient ce script.
+# Défaut HEAD pour migrer et installer (#1245) ; le contrôleur de release L232b,
+# lui, migre toujours l'instantané de son commit épinglé. MIGRER_APRES=1
+# ne désactive jamais la garde additive de migrer (docs/BASCULE.md, L232b).
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57, jamais dans le dépôt) : VM (adresse WireGuard du serveur),
@@ -147,15 +151,24 @@ verifier() {
 sauvegarder() {
   local jour dsn; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
+  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
+  # d'ouvrir le canal privé de sauvegarde, comme pour « migrer ».
   dsn_part dsn "$CONFIG" dsn || return
-  avec_mdp "$CONFIG" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG" \
+    --output "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
-  ssh_vm 'systemctl start ameesh-sauvegarde.service && systemctl is-active ameesh-sauvegarde.service || true'
+  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
+  # Un échec de backup/upload doit arrêter cette étape avant les migrations.
+  ssh_vm 'set -e
+    systemctl start ameesh-sauvegarde.service
+    test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
+    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
   if ancienne; then
     etape "ancienne base"
     dsn_part dsn "$CONFIG_RESTE" dsn || return
-    avec_mdp "$CONFIG_RESTE" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+    "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
+      --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
   fi
 }
@@ -181,7 +194,7 @@ ameesh_de() {
 installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
-  local ref=${1:-HEAD} cible court
+  local ref=${1:-HEAD} cible court precedent_court=
   cible=$(instantane "$ref")
   court=${cible##*/src-}
   etape "instantané $ref ($court) dans $cible"
@@ -200,38 +213,40 @@ installer() {
   fi
   [ -L "$PARTAGE/src-current" ] && readlink "$PARTAGE/src-current" > "$TRAVAIL/precedent"
   echo "version précédente : $(cat "$TRAVAIL/precedent" 2>/dev/null || echo '?')"
-  etape "installation dans $VENV (code puis dépendances, dont psycopg)"
-  "$VENV/bin/pip" install -q --force-reinstall --no-deps "$cible"
-  "$VENV/bin/pip" install -q "$cible"
+  if [ -s "$TRAVAIL/precedent" ]; then
+    precedent_court=$(basename "$(cat "$TRAVAIL/precedent")"); precedent_court=${precedent_court#src-}
+  fi
+  # #1969 : jamais de pip dans le venv vivant. Le venv de $court est préparé à
+  # l'écart (pip + contrôles d'imports, de point d'entrée et de shebang), puis
+  # la bascule n'est qu'un rename : un appel concurrent des agents voit
+  # l'ancien ou le nouveau code entier, jamais un état incomplet. La première
+  # conversion adopte le venv réel comme version précédente, sans pip.
+  etape "préparation isolée du venv de $court (code puis dépendances, dont psycopg)"
+  python3 "$ICI/bascule.py" preparer --venv "$VENV" --src "$cible" --version "$court"
+  etape "bascule atomique du venv et du code courant"
+  python3 "$ICI/bascule.py" activer --venv "$VENV" --version "$court" \
+    ${precedent_court:+--precedent "$precedent_court"}
   ln -sfn "src-$court" "$PARTAGE/src-current"
   "$VENV/bin/python" -c 'import psycopg, ameesh.budget, ameesh.projects; print("psycopg", psycopg.__version__, ": modules L70 et L62 présents")'
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
-# Migrations du commit REF, lancées depuis son instantané. Avant installation,
-# seules les migrations additives passent (--additive-only) : le code en
-# place, exécuteurs et commandes des agents, tourne sur la base migrée. Une
-# fois REF installé (ancien ordre, MIGRER_APRES=1), tout passe.
+# Migrations du commit REF (défaut HEAD, comme installer) : garde additive même
+# si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
+# migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref=${1:-HEAD} cible d garde=(--additive-only) force=0
+  local ref cible d garde=(--additive-only) sha
   if [ "${1:-}" = "--additif-seulement" ]; then
-    force=1
-    ref=${2:-HEAD}
+    shift
   fi
-  cible=$(instantane "$ref")
-  # --additif-seulement : la garde tient meme quand l'instantane est deja
-  # src-current (reprise de staging, avis R1 B2) : des VM peuvent tourner un
-  # code precedent sur la base migree.
-  if [ "$force" != 1 ] && installe "$cible"; then
-    garde=()
-    etape "$(basename "$cible") déjà installé : toutes ses migrations passent"
-  else
-    etape "migrations de $(basename "$cible"), avant son installation (additives seulement)"
-  fi
+  ref=${1:-HEAD}
+  sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
+  cible=$(instantane "$sha")
+  etape "migrations du commit $sha, additives seulement"
   etape "base du mesh (une seule fois pour tout le mesh)"
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
-  ameesh_de "$cible" migrate --dry-run
+  ameesh_de "$cible" migrate --dry-run --additive-only
   migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
@@ -245,7 +260,7 @@ migrer_base() {
   ameesh_de "$cible" migrate "$@" || code=$?
   if [ "$code" = 3 ]; then
     echo "migration non additive : le code en place casserait sur la base migrée." >&2
-    echo "Procédure à part (docs/BASCULE.md, L151) : MIGRER_APRES=1 $0 installer, puis $0 migrer, puis redemarrer, d'affilée." >&2
+    echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
   fi
   [ "$code" = 0 ] || exit "$code"
   ameesh_de "$cible" doctor --probe
@@ -358,7 +373,9 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # part. On n'attend plus un créneau « idle » : un statut `running` à chaque
 # lecture faisait expirer la mise à jour sans même arrêter l'unité (starvation
 # de l'incident impl07, #1152/R1). Le statut sert encore à la garde `stopped`
-# (#1131) : une persona arrêtée par le propriétaire n'est pas relancée.
+# (#1131) : une persona arrêtée par le propriétaire n'est pas relancée ; son
+# unité encore active est seulement rechargée sur le nouveau code (#1633),
+# sans bail ni tour.
 redemarrer_liste() {
   local base=$1; shift
   local u p st avant ligne heure tenu attendu
@@ -369,8 +386,20 @@ redemarrer_liste() {
     # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
     # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
     # actives malgré le registre `stopped`).
+    # #1633 : la laisser tourner sur l'ancien code faisait repartir une
+    # reprise ultérieure sur cette version. Si son unité est encore active,
+    # on la redémarre pour charger le nouveau code — sans exiger de bail :
+    # la persona reste arrêtée, aucun tour. Une unité déjà arrêtée n'est pas
+    # relancée (elle chargera le nouveau code à son démarrage).
     if [ "$st" = stopped ]; then
-      echo "$p : arrêté dans le registre — unité $u ignorée, pas de redémarrage (systemctl --user disable --now $u pour la retirer)"
+      if systemctl --user is-active --quiet "$u"; then
+        systemctl --user restart "$u" \
+          && systemctl --user is-active --quiet "$u" \
+          || { echo "$u : unité d'une persona arrêtée, ne redémarre pas — journalctl --user -u $u -n 50" >&2; exit 1; }
+        echo "$p : arrêté dans le registre — unité $u redémarrée pour charger le nouveau code, aucun tour"
+      else
+        echo "$p : arrêté dans le registre — unité $u déjà arrêtée, rien à recharger"
+      fi
       continue
     fi
     # #502: only a runner that held its lease must take it again (bail.sh)
@@ -448,8 +477,10 @@ retour() {
   precedent=$(cat "$TRAVAIL/precedent" 2>/dev/null || true)
   [ -n "$precedent" ] && [ -d "$PARTAGE/$precedent" ] \
     || { echo "version précédente inconnue ($TRAVAIL/precedent)" >&2; exit 1; }
-  etape "réinstallation de $precedent"
-  "$VENV/bin/pip" install -q --force-reinstall --no-deps "$PARTAGE/$precedent"
+  etape "retour par la bascule, sans pip : $precedent"
+  # #1969 : le venv précédent est conservé entier sur disque ; le retour est la
+  # même bascule en arrière, pas une réinstallation dans le venv vivant.
+  python3 "$ICI/bascule.py" retour --venv "$VENV"
   ln -sfn "$precedent" "$PARTAGE/src-current"
   echo "bases inchangées : 0041 à 0047 n'ajoutent que des colonnes et des tables, que l'ancien code ignore"
   redemarrer

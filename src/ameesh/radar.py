@@ -12,7 +12,9 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
    depuis la base commune avec la cible ;
 2. chaque paire de lots de même cible qui touchent un même fichier : une
    fusion d'essai `git merge-tree --write-tree` (état `conflict` ou
-   `overlap`) ; chaque lot contre sa cible (`conflict` ou `clean`) ;
+   `overlap`), puis attribution par fusions témoins si les bases diffèrent
+   (`target-conflict`, `superseded` ou `unclassified` pour les conflits
+   hérités ou incertains, #2104) ; chaque lot contre sa cible (`conflict` ou `clean`) ;
 3. la sonde des migrations (si le projet déclare `migrations`) : un même
    numéro `NNNN_` ajouté par deux lots, ou par un lot alors que la cible l'a
    déjà sous un autre nom. Seules les migrations du **delta propre** du lot
@@ -22,7 +24,7 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
 Les fusions d'essai n'écrivent rien dans le dépôt des agents : leurs objets
 vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
 alternates), aucun worktree, aucun `fetch`. Une paire n'est recalculée que si
-l'une de ses deux pointes a bougé (cache en mémoire de l'exécuteur).
+l'une de ses deux pointes ou la cible a bougé (cache en mémoire de l'exécuteur).
 
 Une cible qui nomme une branche — `develop`, `origin/develop`,
 `refs/remotes/origin/develop`, `refs/heads/develop`, `release/1.x`, ou
@@ -70,7 +72,10 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
-                "lease_ref", "generated", "ci_required", "protected", "full_suite")
+                "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts")
+#: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
+#: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
+CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
 #: #194 r6: where the lease of a target lives on the remote (local mode)
 LEASE_REF_DEFAULT = "refs/ameesh/land/"
 #: #194 r8: the only namespaces a lease ref may live in — never a branch that
@@ -96,6 +101,12 @@ _ORIGIN_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.
 CI_OK = frozenset(("SUCCESS", "NEUTRAL", "SKIPPED"))
 #: #1333: lecture seule de la pointe publiée d'une cible (`git ls-remote`)
 LS_REMOTE_TIMEOUT = 30.0
+#: L1651 (#1650) : conclusions d'un run ou d'un check qui prouvent une part
+#: due — `skipped` dit que la part n'a pas tourné, c'est le trou mesuré
+CI_DUE_OK = frozenset(("success", "neutral"))
+#: L1651 : états possibles d'un contexte sur la tête gelée, du plus faible au
+#: plus fort ; plusieurs sources qui portent le même libellé gardent le plus fort
+CI_CONTEXT_RANK = {"success": 0, "pending": 1, "failed": 2}
 
 
 class SettingsError(ValueError):
@@ -118,6 +129,23 @@ class Gate:
     touches one of `paths` (globs, as the paths filters of a workflow)."""
     run: str
     paths: tuple = ()
+
+
+@dataclass(frozen=True)
+class CiParts:
+    """L1651 (#1650) : les parts qu'un change set rend dues, recalculées par
+    le sélecteur versionné du dépôt (`ci_parts.selector`, lu au commit de
+    `rev`, la cible par défaut) et non déduites des statuts présents.
+
+    `argv` est lancé dans l'arbre extrait du commit épinglé, sans shell ;
+    `{selector}`, `{root}`, `{files}` (les noms changés, séparés par NUL) et
+    `{out}` (le plan JSON) y sont substitués. `schema` (facultatif) fixe le
+    schéma attendu du plan, `due` le champ qui porte la liste des parts."""
+    selector: str
+    argv: tuple
+    rev: str = ""
+    schema: str = ""
+    due: str = "due"
 
 
 @dataclass(frozen=True)
@@ -162,6 +190,10 @@ class Project:
     #: impactés` job is `continue-on-error: true` and "never required",
     #: EXPLOITATION §L161). Only meaningful with a declared `jobs` list.
     full_suite_tolerated: tuple = ()
+    #: L1651 (#1650): les parts dues d'un change set gelé, recalculées par le
+    #: sélecteur versionné du dépôt (`CiParts`) ; None : aucune preuve de
+    #: complétude n'est demandée
+    ci_parts: CiParts | None = None
 
 
 @dataclass
@@ -194,6 +226,67 @@ def _suite_jobs(declared, where: str, path, kind: str, empty_ok: bool = False) -
                                 % (where, path, kind, name))
         out.append(name)
     return tuple(out)
+
+
+def parse_ci_parts(raw, where: str) -> CiParts:
+    """L1651 (#1650) : la déclaration `ci_parts` d'un projet. Le contrat est
+    refusé à la moindre ambiguïté (clé inconnue, sélecteur hors du dépôt,
+    `argv` sans `{files}` ni `{out}`, espace réservé inconnu) : une porte qui
+    ne sait pas recalculer les parts dues refuse, elle ne devine pas."""
+    from . import ci_parts
+    if not isinstance(raw, dict):
+        raise SettingsError("%s.ci_parts: object {\"selector\": …, \"argv\": […]} expected"
+                            % where)
+    extra = sorted(set(map(str, raw)) - set(CI_PARTS_KEYS))
+    if extra:
+        raise SettingsError("%s.ci_parts: unknown key(s) %s (allowed: %s)"
+                            % (where, ", ".join(extra), ", ".join(CI_PARTS_KEYS)))
+    selector = raw.get("selector")
+    if not isinstance(selector, str) or not selector.strip():
+        raise SettingsError("%s.ci_parts.selector: repository-relative path expected" % where)
+    selector = selector.strip()
+    if selector.startswith("/") or any(part in ("", ".", "..") for part in selector.split("/")):
+        raise SettingsError("%s.ci_parts.selector: %r is not a path inside the repository"
+                            % (where, selector))
+    argv = raw.get("argv")
+    if isinstance(argv, str):
+        argv = (argv,)
+    if not isinstance(argv, (list, tuple)) or not argv \
+            or not all(isinstance(part, str) and part.strip() for part in argv):
+        raise SettingsError("%s.ci_parts.argv: a non-empty list of command arguments expected "
+                            "(no shell)" % where)
+    argv = tuple(part.strip() for part in argv)
+    placeholders = []
+    for part in argv:
+        placeholders.extend(ci_parts.PLACEHOLDER_RE.findall(part))
+        if ci_parts.PLACEHOLDER_RE.sub("", part).count("{") or \
+                ci_parts.PLACEHOLDER_RE.sub("", part).count("}"):
+            raise SettingsError("%s.ci_parts.argv: stray brace in %r (placeholders: %s)"
+                                % (where, part,
+                                   ", ".join("{%s}" % p for p in ci_parts.PLACEHOLDERS)))
+    unknown = sorted(set(placeholders) - set(ci_parts.PLACEHOLDERS))
+    if unknown:
+        raise SettingsError("%s.ci_parts.argv: unknown placeholder(s) %s (allowed: %s)"
+                            % (where, ", ".join("{%s}" % p for p in unknown),
+                               ", ".join("{%s}" % p for p in ci_parts.PLACEHOLDERS)))
+    for required in ("files", "out"):
+        if required not in placeholders:
+            raise SettingsError("%s.ci_parts.argv: {%s} is required (the change set fed to the "
+                                "selector, and the plan it writes)" % (where, required))
+    rev = (raw.get("rev") or "").strip()
+    if rev:
+        try:
+            plan_git.check_ref(rev, "ci_parts.rev")
+        except ValueError as exc:
+            raise SettingsError("%s.ci_parts.rev: %s" % (where, exc)) from exc
+    texts = {}
+    for key, default in (("schema", ""), ("due", "due")):
+        text = raw.get(key, default)
+        if not isinstance(text, str) or not text.strip():
+            raise SettingsError("%s.ci_parts.%s: non-empty text expected" % (where, key))
+        texts[key] = text.strip()
+    return CiParts(selector=selector, argv=argv, rev=rev, schema=texts["schema"],
+                   due=texts["due"])
 
 
 def parse_settings(raw) -> Settings:
@@ -289,6 +382,15 @@ def parse_settings(raw) -> Settings:
         ci_required = value.get("ci_required", False)
         if not isinstance(ci_required, bool):
             raise SettingsError("%s.ci_required: true or false expected" % where)
+        ci_parts = None
+        if value.get("ci_parts") is not None:
+            ci_parts = parse_ci_parts(value["ci_parts"], where)
+            if not ci_required:
+                # L1651 : la preuve de complétude n'a de sens que dans la
+                # lecture de la CI du commit gelé ; une déclaration inerte
+                # serait un faux sentiment de porte
+                raise SettingsError("%s.ci_parts: ci_required must be true for the due parts of "
+                                    "the frozen commit to be proven" % where)
         protected = value.get("protected") or ()
         if isinstance(protected, str):
             protected = (protected,)
@@ -368,7 +470,8 @@ def parse_settings(raw) -> Settings:
                                  protected=tuple(p.strip() for p in protected),
                                  full_suite=tuple(full_suite),
                                  full_suite_required=tuple(required_jobs),
-                                 full_suite_tolerated=tuple(tolerated_jobs))
+                                 full_suite_tolerated=tuple(tolerated_jobs),
+                                 ci_parts=ci_parts)
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
@@ -443,10 +546,19 @@ def _lines(proc) -> list[str]:
     return [p for p in proc.stdout.decode("utf-8", "replace").split("\0") if p]
 
 
-def trial_merge(repo: str, objects: str, scratch: str, a: str, b: str) -> list[str] | None:
+def trial_merge(repo: str, objects: str, scratch: str, a: str, b: str, *,
+                attributes_tree: str | None = None) -> list[str] | None:
     """Fusion d'essai de deux commits : la liste des fichiers en conflit (vide :
-    fusion propre), None si git n'a pas su la calculer."""
-    proc = _scratch_git(repo, objects, scratch, "merge-tree", "--write-tree", "-z",
+    fusion propre), None si git n'a pas su la calculer.
+
+    #1517 : les attributs de fusion (`.gitattributes`, `merge=union` des
+    listes centrales) sont lus dans l'arbre de la cible, et non dans ce que
+    la copie locale a d'extrait. Pour une paire de lots, `attributes_tree`
+    nomme cette cible même si aucun des lots n'en porte les attributs (#1610).
+    Par défaut, `a` est la cible de la fusion."""
+    proc = _scratch_git(repo, objects, scratch, "-c",
+                        "attr.tree=%s" % (attributes_tree or a),
+                        "merge-tree", "--write-tree", "-z",
                         "--name-only", "--no-messages", a, b)
     if proc.returncode not in (0, 1):
         return None
@@ -585,12 +697,13 @@ def published_tip(repo: str, remote: str, branch: str) -> str | None:
 # --------------------------------------------------------------------------
 
 class Cache:
-    """Résultats déjà calculés, par commits : une paire n'est refaite que si
-    l'une de ses pointes a bougé."""
+    """Résultats déjà calculés, par commits : une paire est refaite si l'une
+    de ses pointes ou la cible qui fournit ses attributs a bougé."""
 
     def __init__(self) -> None:
         self.merges: dict = {}
         self.diffs: dict = {}
+        self.attributions: dict = {}
         # L160d: change sizes for the resolver, replays of prepared resolutions
         self.sizes: dict = {}
         self.replays: dict = {}
@@ -599,7 +712,8 @@ class Cache:
         self.locks: dict = {}
 
     def trim(self) -> None:
-        for table in (self.merges, self.diffs, self.sizes, self.replays, self.stacks):
+        for table in (self.merges, self.diffs, self.attributions,
+                      self.sizes, self.replays, self.stacks):
             while len(table) > MAX_CACHE:
                 table.pop(next(iter(table)))
 
@@ -703,20 +817,40 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     checked = 0
     scratch = tempfile.mkdtemp(prefix="ameesh-radar-")
     try:
-        def merge(a: str, b: str):
-            key = (a, b) if a < b else (b, a)
+        def merge(a: str, b: str, attributes_tree: str):
+            key = (attributes_tree, *sorted((a, b)))
             if key not in cache.merges:
-                cache.merges[key] = trial_merge(repo, objects, scratch, a, b)
+                cache.merges[key] = trial_merge(
+                    repo, objects, scratch, a, b, attributes_tree=attributes_tree)
             return cache.merges[key]
 
+        def attribution(one: dict, other: dict, raw_files: list[str]):
+            from . import radar_attribution
+            if one["target_head"] != other["target_head"]:
+                return {"native": [], "inherited": [], "uncertain": raw_files}
+            if one["base"] == other["base"]:
+                # Both sides diverge from the same target base: no differing
+                # target history can be responsible for their raw conflict.
+                return {"native": raw_files, "inherited": [], "uncertain": []}
+            head = one["target_head"]
+            key = (head, one["tip"], one["base"], other["tip"], other["base"])
+            if key not in cache.attributions:
+                def probe(a, b):
+                    return radar_attribution.read_merge(_scratch_git(
+                        repo, objects, scratch, "-c", "attr.tree=%s" % head,
+                        "merge-tree", "--write-tree", "-z", "--messages", a, b))
+                cache.attributions[key] = radar_attribution.classify(one, other, probe)
+            return cache.attributions[key]
+
         for one in branches:
-            conflicts = merge(one["target_head"], one["tip"])
+            conflicts = merge(one["target_head"], one["tip"], one["target_head"])
             against.append({"work_item": one["work_item"], "branch": one["branch"],
                             "target": one["target"], "tip": one["tip"],
                             "target_head": one["target_head"],
                             "state": "error" if conflicts is None
                             else "conflict" if conflicts else "clean",
                             "files": conflicts or []})
+        target_states = {item["work_item"]: item["state"] for item in against}
         for i, one in enumerate(branches):
             for other in branches[i + 1:]:
                 if one["target"] != other["target"]:
@@ -725,13 +859,32 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
                 shared = sorted(set(one["files"]) & set(other["files"]))
                 if not shared:
                     continue
-                conflicts = merge(one["tip"], other["tip"])
-                pairs.append({"lots": [one["work_item"], other["work_item"]],
-                              "branches": [one["branch"], other["branch"]],
-                              "tips": [one["tip"], other["tip"]], "target": one["target"],
-                              "state": "error" if conflicts is None
-                              else "conflict" if conflicts else "overlap",
-                              "shared": shared, "files": conflicts or []})
+                conflicts = merge(one["tip"], other["tip"], one["target_head"])
+                pair = {"lots": [one["work_item"], other["work_item"]],
+                        "branches": [one["branch"], other["branch"]],
+                        "tips": [one["tip"], other["tip"]], "target": one["target"],
+                        "state": "error" if conflicts is None
+                        else "conflict" if conflicts else "overlap",
+                        "shared": shared, "files": conflicts or []}
+                if conflicts:
+                    evidence = attribution(one, other, conflicts)
+                    uncertain = ((set(conflicts) - set(evidence["native"])
+                                  - set(evidence["inherited"]))
+                                 | set(evidence["uncertain"] or ()))
+                    pair.update(raw_files=conflicts, target_head=one["target_head"],
+                                bases=[one["base"], other["base"]],
+                                inherited_files=evidence["inherited"],
+                                uncertain_files=sorted(uncertain))
+                    pair["files"] = evidence["native"]
+                    pair["attribution_pending"] = bool(pair["inherited_files"]
+                                                       or pair["uncertain_files"])
+                    if not pair["files"]:
+                        pair["state"] = ("unclassified" if pair["uncertain_files"]
+                                         else "target-conflict")
+                        if (pair["state"] == "target-conflict"
+                                and all(target_states[n] == "clean" for n in pair["lots"])):
+                            pair["state"] = "superseded"
+                pairs.append(pair)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     cache.trim()
@@ -818,6 +971,9 @@ def summary(report: dict) -> dict:
             "conflict": sum(1 for p in pairs if p["state"] == "conflict"),
             "prepared": sum(1 for p in pairs if p["state"] == "prepared"),
             "stale": sum(1 for p in pairs if p["state"] == "stale"),
+            "inherited": sum(1 for p in pairs if p["state"] == "target-conflict"),
+            "superseded": sum(1 for p in pairs if p["state"] == "superseded"),
+            "unclassified": sum(1 for p in pairs if p["state"] == "unclassified"),
             "target_conflict": sum(1 for a in report.get("against_target") or ()
                                    if a["state"] == "conflict"),
             "migration_duplicates": len(report.get("migrations") or ()),
@@ -904,7 +1060,8 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
     resolutions (`ameesh.resolutions.annotate`). Never raises: an error is
     noted in the report and the pairs stay `conflict`."""
     from . import resolutions, storage
-    conflicted = sorted({n for p in report.get("pairs") or () if p["state"] == "conflict"
+    conflicted = sorted({n for p in report.get("pairs") or ()
+                         if p["state"] in ("conflict", "target-conflict", "unclassified", "superseded")
                          for n in p["lots"]})
     if not conflicted:
         return
@@ -1015,9 +1172,22 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
     (Actions, external app checks and commit statuses), the latest activity
     of each workflow database ID: `{runs,
-    green, pending: [workflows], failed: [workflows]}`; green needs at least
-    one check, all concluded and passing. Raises `plan_github.GithubError`
-    when it cannot be read (never taken for « no CI »)."""
+    green, pending: [workflows], failed: [workflows], contexts: {label:
+    success|pending|failed}, statuses: {context: success|pending|failed}}`;
+    green needs at least one check, all concluded and passing. Raises
+    `plan_github.GithubError` when it cannot be read (never taken for
+    « no CI »).
+
+    L1651 (#1650): `contexts` carries the same reading label by label, so the
+    gate can prove that a part the change set makes due **exists** on the
+    frozen commit; a `skipped` run or check is `success` for the rollup (it
+    blocks nothing) but `failed` here — a due part that did not run is not a
+    green one.
+
+    N1 de #1666 : `contexts` mêle les libellés des trois espaces (runs,
+    checks, statuts). Les parts dues d'un projet (`ci_parts`) sont des
+    **statuts de commit** : `statuses` les rend seuls, pour qu'un run ou un
+    check portant le nom d'une part ne puisse pas en tenir lieu."""
     from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
@@ -1058,6 +1228,21 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     pending = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") != "completed")
     failed = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") == "completed"
                     and (r.get("conclusion") or "").lower() not in CI_PASSING)
+    # L1651 (#1650): what the frozen commit carries, label by label. A due
+    # part is proven by a context that exists here and is terminal-success; a
+    # part absent from this map was never dispatched, which is exactly the
+    # hole a non-empty rollup of green statuses used to hide.
+    contexts: dict = {}
+
+    def note(name: str, state: str) -> None:
+        """Le plus fort des états d'un même libellé l'emporte : un contexte
+        vert quelque part ne rachète pas le même libellé rouge ailleurs."""
+        if CI_CONTEXT_RANK[state] > CI_CONTEXT_RANK.get(contexts.get(name), -1):
+            contexts[name] = state
+
+    for identity, run in latest.items():
+        note(label(identity, run), "pending" if (run.get("status") or "") != "completed"
+             else ("success" if (run.get("conclusion") or "").lower() in CI_DUE_OK else "failed"))
     # Actions alone cannot certify a commit: GitHub Apps and classic commit
     # statuses can also block it. Read the same exact SHA, never the PR head.
     checks = plan_github._json(gh, ["api", "repos/%s/commits/%s/check-runs?filter=all&per_page=100"
@@ -1098,8 +1283,13 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
         label = "%s/%s" % (check["app"]["id"], check["name"])
         if check.get("status") != "completed":
             pending.append(label)
+            note(label, "pending")
         elif (check.get("conclusion") or "").lower() not in CI_PASSING:
             failed.append(label)
+            note(label, "failed")
+        else:
+            note(label, "success" if (check.get("conclusion") or "").lower() in CI_DUE_OK
+                 else "failed")
     statuses = plan_github._json(gh, ["api", "repos/%s/commits/%s/status?per_page=100"
                                      % (slug, sha)])
     if (not isinstance(statuses, dict) or statuses.get("sha") != sha
@@ -1108,16 +1298,35 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
             or statuses["total_count"] != len(statuses["statuses"])
             or statuses["total_count"] >= 100):
         raise plan_github.GithubError("commit statuses: malformed, truncated or wrong SHA response")
+    #: N1 de #1666 : les parts dues d'un projet (`ci_parts`) sont des statuts
+    #: de commit ; ce dictionnaire ne retient que cet espace-là, là où
+    #: `contexts` mêle aussi les libellés de runs et de checks.
+    status_contexts: dict = {}
+
+    def note_status(name: str, state: str) -> None:
+        """Même règle que `note` : le plus fort des états d'un même contexte
+        l'emporte — un contexte vert ne rachète pas le même contexte rouge."""
+        if CI_CONTEXT_RANK[state] > CI_CONTEXT_RANK.get(status_contexts.get(name), -1):
+            status_contexts[name] = state
+
     for status in statuses["statuses"]:
         if not isinstance(status, dict) or not status.get("context"):
             raise plan_github.GithubError("commit statuses: invalid context")
         if status.get("state") == "pending":
             pending.append(status["context"])
+            note(status["context"], "pending")
+            note_status(status["context"], "pending")
         elif status.get("state") != "success":
             failed.append(status["context"])
+            note(status["context"], "failed")
+            note_status(status["context"], "failed")
+        else:
+            note(status["context"], "success")
+            note_status(status["context"], "success")
     count = len(latest) + len(external) + len(statuses["statuses"])
     return {"runs": count, "green": bool(count) and not pending and not failed,
-            "pending": sorted(pending), "failed": sorted(failed)}
+            "pending": sorted(pending), "failed": sorted(failed),
+            "contexts": contexts, "statuses": status_contexts}
 
 
 #: L756 (#566): les déclencheurs d'une exécution de la suite **complète** —
@@ -1355,10 +1564,12 @@ def conflicts_of(report: dict) -> dict:
     leur cible, numéros de migration en double (mêmes clés que `_states`)."""
     out = {}
     for pair in report.get("pairs") or ():
-        if pair["state"] == "conflict":
+        if pair["state"] in ("conflict", "unclassified"):
             out["pair:%d-%d" % tuple(pair["lots"])] = {
-                "kind": "pair", "lots": list(pair["lots"]), "files": pair["files"],
-                "target": pair["target"], "resolver": pair.get("resolver")}
+                "kind": "pair", "lots": list(pair["lots"]),
+                "files": pair["files"] or pair.get("uncertain_files") or [],
+                "target": pair["target"], "resolver": pair.get("resolver"),
+                "attribution_pending": pair.get("attribution_pending", False)}
         elif pair["state"] == "stale":
             # L160d: only the lot that prepared the resolution is told
             resolution = pair["resolution"]
@@ -1410,7 +1621,11 @@ def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
     if conflict["kind"] == "pair":
         other = [n for n in conflict["lots"] if n != lot][0]
         resolver = conflict.get("resolver") or {}
-        if resolver.get("lot") == lot:
+        if conflict.get("attribution_pending"):
+            todo = ("The raw merge also contains inherited or unclassified conflicts. "
+                    "No resolver is assigned. Consult each branch's target diagnostics; "
+                    "pair attribution will be retried when the branches or target change.")
+        elif resolver.get("lot") == lot:
             todo = ("You prepare the resolution (%s), as you go: "
                     "`ameesh work resolve %d --with %d`; your branch does not change."
                     % (RESOLVER_REASONS.get(resolver.get("reason"), resolver.get("reason")),
@@ -1575,9 +1790,13 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
            "%d overlapping, %d in conflict (%d prepared, %d stale), "
            "%d lot(s) in conflict with their target, %d duplicate migration number(s)"
            % (report.get("project"), when, report.get("duration_s") or 0, s["branches"],
-              s["pairs_checked"], s["overlap"] + s["conflict"] + s["prepared"] + s["stale"],
+              s["pairs_checked"], len(report.get("pairs") or ()),
               s["conflict"] + s["prepared"] + s["stale"], s["prepared"], s["stale"],
               s["target_conflict"], s["migration_duplicates"])]
+    if s["inherited"] or s["unclassified"] or s["superseded"]:
+        out.append("  pair attribution: %d inherited target conflict(s), %d unclassified pair(s), "
+                   "%d superseded raw conflict(s)"
+                   % (s["inherited"], s["unclassified"], s["superseded"]))
     if report.get("error"):
         out.append("  error: %s" % report["error"])
     if report.get("resolution_error"):
@@ -1592,7 +1811,8 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue
-        files = pair["shared"] if pair["state"] == "overlap" else pair["files"]
+        files = (pair["shared"] if pair["state"] == "overlap" else
+                 pair["files"] or pair.get("uncertain_files") or pair.get("inherited_files") or [])
         resolver = pair.get("resolver") or {}
         resolution = pair.get("resolution") or {}
         out.append("  %-8s %s %s  %s%s%s" % (
@@ -1607,6 +1827,10 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                 ", replay %s" % resolution["replay"]
                 if resolution.get("replay") not in ("prepared", "stale") else "")
             if resolution else ""))
+        if pair.get("attribution_pending"):
+            out.append("    attribution pending; inherited: %s; unclassified: %s"
+                       % (_files(pair.get("inherited_files")),
+                          _files(pair.get("uncertain_files"))))
     for one in report.get("against_target") or ():
         if one["state"] == "clean" and not everything:
             continue

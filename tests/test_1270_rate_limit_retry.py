@@ -17,10 +17,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import exploitation, rate_limit, registry
+from ameesh import adapters, exploitation, rate_limit, registry
 from ameesh.runner import AgentWorker, Runner
 
-from .support import PgTestCase
+from .support import FAKEBIN, PgTestCase
 from .test_l30_accounts import _Base
 
 
@@ -162,9 +162,7 @@ class ClassifyTest(unittest.TestCase):
         # mismatch » et « Service is too busy. We advise users to temporarily
         # switch to alternative LLM API service providers. ».
         for texte in ("dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event type mismatch",
-                      "MALFORMED_RESPONSE",
                       "DeepSeek Messages SSE event type mismatch",
-                      "SSE error: stream closed unexpectedly",
                       "Service is too busy. We advise users to temporarily switch to "
                       "alternative LLM API service providers.",
                       "HTTP 502 Bad Gateway",
@@ -194,11 +192,97 @@ class ClassifyTest(unittest.TestCase):
                 self.assertIsNone(rate_limit.classify(result=texte))
                 self.assertIsNone(rate_limit.classify(stderr_tail=texte))
 
+    def test_pannes_passageres_5xx_et_deepseek(self):
+        # bureau 15/10 : la reprise couvre aussi les 5xx explicites et les
+        # erreurs passagères DeepSeek (`dsh: <CODE>: …` sur stderr), pas
+        # seulement le 429 Codex — sur les canaux du fournisseur seulement.
+        for texte in ("dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event type mismatch",
+                      "dsh: SERVER: DeepSeek Messages request failed (503)",
+                      "dsh: RATE_LIMIT: DeepSeek Messages request failed (429)",
+                      "dsh: STREAM_CLOSED: DeepSeek Messages stream ended before message_stop",
+                      "exceeded retry limit, last status: 503 Service Unavailable",
+                      "unexpected status 502 Bad Gateway: upstream connect error",
+                      'API Error: 500 {"type":"error","error":{"type":"api_error"}}',
+                      "HTTP/1.1 504 Gateway Timeout",
+                      "500 Internal Server Error",
+                      "stream disconnected before completion: error decoding response body"):
+            with self.subTest(texte=texte):
+                self.assertEqual(rate_limit.classify(error=texte), rate_limit.RATE_LIMITED)
+                self.assertEqual(rate_limit.classify(stderr_tail="bruit\n" + texte),
+                                 rate_limit.RATE_LIMITED)
+                self.assertIsNone(rate_limit.classify(result=texte))
+
+    def test_5xx_et_codes_dsh_sans_signature_ne_classent_pas(self):
+        for texte in ('  File "request.py", line 503, in send',
+                      "(/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js:500:15)",
+                      "listening on port 5003",
+                      "HTTP 501 Not Implemented",
+                      "assert response.status_code == 500",
+                      "MALFORMED_RESPONSE dans mes notes",
+                      "dsh: AUTH: invalid credential",
+                      "dsh: CONTEXT_WINDOW_EXCEEDED: prompt too long",
+                      # transport MCP (SDK) et serveurs tiers : ni débit ni
+                      # panne passagère du fournisseur (R1 dev2 du 15/10)
+                      "SSE error: Non-200 status code (401)",
+                      'MCP server "figma": SSE connection closed',
+                      "remote: Internal Server Error",
+                      "MCP server x: Service Unavailable"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(error=texte))
+                self.assertIsNone(rate_limit.classify(stderr_tail=texte))
+        # le solde DeepSeek épuisé (402) est un quota, pas une panne passagère
+        self.assertEqual(rate_limit.classify(stderr_tail="dsh: QUOTA: Insufficient Balance"),
+                         rate_limit.QUOTA)
+
 
 class DelaiTest(unittest.TestCase):
     def test_cadence_1_2_5_10_min_puis_palier(self):
         self.assertEqual([rate_limit.delay(n) for n in (1, 2, 3, 4, 5, 99)],
                          [60.0, 120.0, 300.0, 600.0, 600.0, 600.0])
+
+    def test_borne_de_reprise_atteignable_et_stable(self):
+        # #1592 : la borne de la reprise cadencée est atteinte dès le 4e
+        # palier et ne croît plus — un code classé passager ne se reprend pas
+        # sans fin à délai croissant.
+        delais = [rate_limit.delay(n) for n in range(1, 12)]
+        self.assertEqual(delais, sorted(delais), "le délai ne recule jamais")
+        self.assertEqual(delais[3], rate_limit.DELAYS[-1], "borne au 4e palier")
+        self.assertEqual(rate_limit.delay(10 ** 6), rate_limit.DELAYS[-1])
+        self.assertEqual(rate_limit.delay(0), rate_limit.DELAYS[0])
+
+
+class CodesDshTest(unittest.TestCase):
+    """#1592 : la source dsh des codes passagers est consignée.
+
+    Le descripteur `dsh-llm` (dsh 0.2.0-rc.2) retente lui-même TIMEOUT
+    (watchdog d'inactivité du flux) et TRANSPORT (réseau) par cinq essais ;
+    ameesh classe passagère la ligne `dsh: <CODE>:` qu'il émet après ces
+    essais (#1270) — TIMEOUT et TRANSPORT compris — et la reprend à délais
+    cadencés. Un code nu, sans la signature `dsh: <CODE>:`, n'est pas classé ;
+    `test_pannes_passageres_deepseek` couvre les autres formes réelles.
+    """
+
+    def test_codes_dsh_emis_apres_ses_reprises_sont_passagers(self):
+        for texte in ("dsh: TIMEOUT: DeepSeek Messages stream idle timeout",
+                      "dsh: TRANSPORT: Messages transport failed"):
+            with self.subTest(texte=texte):
+                self.assertEqual(rate_limit.classify(error=texte),
+                                 rate_limit.RATE_LIMITED)
+                self.assertEqual(rate_limit.classify(stderr_tail=texte),
+                                 rate_limit.RATE_LIMITED)
+
+    def test_codes_nus_sans_signature_dsh_ne_sont_pas_classes(self):
+        for texte in ("TIMEOUT", "TRANSPORT"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(error=texte))
+                self.assertIsNone(rate_limit.classify(stderr_tail=texte))
+
+    def test_signature_dsh_seule_ne_suffit_pas(self):
+        # seuls les codes passagers listés sont repris : la signature
+        # `dsh: <CODE>:` d'un autre code ne vaut pas panne passagère
+        self.assertEqual(rate_limit.classify(error="dsh: QUOTA: solde épuisé"),
+                         rate_limit.QUOTA)
+        self.assertIsNone(rate_limit.classify(error="dsh: AUTH: invalid key"))
 
 
 class EtatTest(unittest.TestCase):
@@ -304,8 +388,10 @@ class RepriseTest(_Base):
 
     def test_quota_dans_un_result_marque_is_error(self):
         # #1397 (NO-GO dev1) : Claude ne dit un quota que dans le `result`
-        # marqué `is_error` — ce texte est un canal du CLI, donc classé quota,
-        # et le tour n'est pas un échec rapide (L48 désarmé).
+        # marqué `is_error` — ce texte est un canal du CLI, donc classé quota.
+        # Le sort de L48 pour un quota est la décision de #1270 (R1 dev2 :
+        # quota = cadence lente mais L48 reste armé) ; ce témoin ne fixe que
+        # le classement, commun aux deux têtes.
         _, worker = self._worker("rlq", "claude", {})
         try:
             self.assertIsNotNone(self._tour(
@@ -314,7 +400,7 @@ class RepriseTest(_Base):
             ligne = registry.get(self.db, "rlq")
             etat = rate_limit.state(ligne["status_text"])
             self.assertEqual(etat["kind"], rate_limit.QUOTA)
-            self.assertFalse(worker.fast_failure)
+            self.assertEqual(worker.rate_limit, rate_limit.QUOTA)
         finally:
             worker.watchdog_stop.set()
 
@@ -396,6 +482,122 @@ class RepriseTest(_Base):
             self.assertGreater(worker.retry_remaining(), 0.0)
         finally:
             worker.watchdog_stop.set()
+
+    def test_tour_sans_consigne_repris_a_l_echeance(self):
+        # relecture bureau : un tour de courrier ou d'événements en échec ne
+        # laisse aucune consigne en attente (courrier soldé au lancement) ; à
+        # l'échéance, `pick` rend un tour de reprise au lieu de rien.
+        _, worker = self._worker("rl10", "claude", {})
+        try:
+            self.assertIsNotNone(self._tour(worker, **self.DEBIT))
+            registry.set_pending_prompt(self.db, "rl10", None)  # rien de remis
+            worker.rate_limit_retry_at = time.time() - 1
+            with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
+                                              "AMEESH_TEST_LOG": self.turns_log}):
+                spec = worker.pick()
+            self.assertIsNotNone(spec)
+            self.assertEqual((spec["kind"], spec["prompt"]),
+                             ("idle", adapters.RETRY_PROMPT))
+        finally:
+            worker.watchdog_stop.set()
+
+    QUOTA = {"AMEESH_TEST_STDERR": "Error: insufficient_quota: you exceeded your "
+                                   "current quota\n",
+             "AMEESH_TEST_EXIT": "1"}
+
+    def test_quota_reste_compte_par_l48(self):
+        # relecture bureau : un quota épuisé suit la cadence mais reste un échec
+        # rapide — L48 l'arrête au bout de cinq refus, pas de reprise sans fin.
+        _, worker = self._worker("rl11", "claude", {})
+        try:
+            self.assertIsNotNone(self._tour(worker, **self.QUOTA))
+            self.assertEqual(worker.rate_limit, rate_limit.QUOTA)
+            self.assertTrue(worker.fast_failure)
+            self.assertAlmostEqual(worker.failure_wait(), 60.0, delta=2.0)
+            worker.rate_limit_retry_at = time.time() - 1
+            self.assertFalse(worker.retry_due())
+        finally:
+            worker.watchdog_stop.set()
+
+
+class TourDeRepriseTest(unittest.TestCase):
+    """Relecture bureau (#1270) : sans base. Un tour sans consigne à remettre
+    en attente (courrier, événements, reprise) repart à l'échéance par un tour
+    de reprise ; sinon l'agent restait `blocked` jusqu'au courrier suivant.
+    Worker factice : les gardes de `_pick` (base, budget, hôte, compte) sont
+    neutralisées, rien n'est en attente."""
+
+    def _worker(self, genre: str, echeance: float):
+        w = AgentWorker.__new__(AgentWorker)
+        threading.Thread.__init__(w, name="rlx", daemon=True)  # jamais démarré
+        w.db, w.epoch = object(), 1
+        w.runner = SimpleNamespace(runner_id="r", idle_nudge=1200.0,
+                                   gate_holds=lambda: False, host_pressure=lambda: {})
+        w.rate_limit, w.rate_limit_streak = genre, 1
+        w.rate_limit_since, w.rate_limit_retry_at = time.time() - 60, echeance
+        w.nudged, w.last_activity = True, time.monotonic()
+        w._session_en_attente, w.suite, w._reprise_attach = None, None, False
+        return w
+
+    def _pick(self, w):
+        oui, non = mock.Mock(return_value=True), mock.Mock(return_value=False)
+        with mock.patch.multiple(w, _marque_base=non, maybe_relocate=non, budget_ok=oui,
+                                 _held_by_pressure=non, _host_pressure_release=mock.Mock(),
+                                 host_ready=oui, workdir_ready=oui, auth_ready=oui,
+                                 _lot_wake_spec=mock.Mock(return_value=None)), \
+                mock.patch("ameesh.runner.registry.get", return_value={"status": "blocked"}), \
+                mock.patch("ameesh.runner.registry.take_pending_prompt", return_value=None), \
+                mock.patch("ameesh.runner.mail.unread_urgent", return_value=[]), \
+                mock.patch("ameesh.runner.mail.unread", return_value=[]), \
+                mock.patch("ameesh.runner.account_turn.continuity", return_value=True):
+            return w._pick()
+
+    def _peek(self, w):
+        """#1593: the wake decision alone (`peek`), without `pick`/`_pick`.
+
+        Registry and mail neutralised, nothing pending, idle nudge not due
+        (`nudged`): only the retry deadline can wake the worker here."""
+        with mock.patch("ameesh.runner.registry.get", return_value={"status": "blocked"}), \
+                mock.patch("ameesh.runner.mail.unread_active", return_value=[]):
+            return w.peek()
+
+    def test_peek_wakes_at_the_retry_deadline(self):
+        # #1593: direct witness of the wake by `peek()` on `retry_due`. A
+        # regression that drops the deadline from `peek()` leaves the `pick()`
+        # and `_pick()` cases above green: only this one sees it.
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() - 1)
+        self.assertTrue(w.retry_due())
+        self.assertFalse(w.idle_due())  # nothing else can wake it here
+        self.assertTrue(self._peek(w))
+
+    def test_peek_does_not_wake_before_the_deadline(self):
+        # Counter-witness: a deadline still ahead does not wake it…
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() + 60)
+        self.assertFalse(w.retry_due())
+        self.assertFalse(self._peek(w))
+
+    def test_peek_does_not_wake_on_an_exhausted_quota(self):
+        # …and an exhausted quota, even past its deadline, does not either
+        # (L48): `peek` follows `retry_due`, not the cadence alone.
+        w = self._worker(rate_limit.QUOTA, time.time() - 1)
+        self.assertFalse(w.retry_due())
+        self.assertFalse(self._peek(w))
+
+    def test_echeance_passee_lance_un_tour_de_reprise(self):
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() - 1)
+        self.assertTrue(w.retry_due())
+        spec = self._pick(w)
+        self.assertEqual((spec["kind"], spec["prompt"]), ("idle", adapters.RETRY_PROMPT))
+
+    def test_avant_l_echeance_rien(self):
+        w = self._worker(rate_limit.RATE_LIMITED, time.time() + 60)
+        self.assertFalse(w.retry_due())
+        self.assertIsNone(self._pick(w))
+
+    def test_un_quota_n_est_pas_repris_sans_fin(self):
+        w = self._worker(rate_limit.QUOTA, time.time() - 1)
+        self.assertFalse(w.retry_due())
+        self.assertIsNone(self._pick(w))
 
 
 class BailTest(_Base):
