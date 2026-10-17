@@ -1,0 +1,4 @@
+# Registre des têtes retirées des paquets §12 — une ligne par retrait.
+# lot	head	date	retire_par	motif
+2076	879cef08fc9b	2026-10-17	owner (human:smichea)	décision de l'owner relayée par le bureau le 17/10, deux familles indisponibles pour #2076 (comptes Codex plafonnés jusqu'au 22/10) ; aucune dérogation à la règle des deux familles
+2084	4813dba027ff	2026-10-17	owner (human:smichea)	idem ; suite de relecture de #2076 (« #2076 : N du relecteur DeepSeek… »), dépend de #2076
