@@ -1895,7 +1895,11 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     commit ; seule celle qui l'avance (`claim_commit`, dans la transaction
     des envois) pousse, les autres ne poussent rien. Le repère est indépendant
     de `record_state`, qu'un sync ancien peut écrire après un sync récent ;
-    un commit antérieur au repère ne pousse jamais des règles périmées."""
+    un commit antérieur au repère ne pousse jamais des règles périmées.
+
+    #1464 : un repère qui n'appartient à aucune des deux histoires (canon
+    réécrit, repère d'un autre canon) ne peut plus produire de diff ; il est
+    signalé (`error`) au lieu de laisser les envois s'arrêter en silence."""
     done = ProcessSync()
     if not canon.sources or not canon.processes or not agents:
         return done
@@ -1908,7 +1912,22 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
         return done
     try:
         if not canon_mod.git_contains(source.repo, old, source.commit):
-            return done  # ancien sync ou historique divergé : repère conservé
+            if canon_mod.git_contains(source.repo, source.commit, old):
+                # sync ancien : un sync plus récent a déjà poussé au-delà de ce
+                # commit — rien à pousser, rien à signaler, repère conservé
+                return done
+            # #1464 (N1 #793) : repère figé — l'historique du canon a été réécrit
+            # (ou le repère vient d'un autre dépôt) : le diff `old..source.commit`
+            # est impossible, et sans ré-ancrage du repère `process_commit` les
+            # envois de règles ne repartiront JAMAIS. On le dit (`error`) au lieu
+            # de perdre les envois en silence ; les règles, elles, restent dans le
+            # brief de la prochaine session.
+            done.error = (
+                "process_commit %s is not in the history of %s: the canon history "
+                "was rewritten (or this marker comes from another canon) — the "
+                "changed Process rules are no longer pushed on this host until "
+                "the push marker is re-anchored" % (old[:12], source.commit[:12]))
+            return done
         # #538 : la comparaison porte sur la RÉFÉRENCE APPROUVÉE (`source.commit`),
         # pas sur HEAD ni l'arbre de travail : si la référence avance sans que le
         # checkout suive, le changement est quand même poussé (sinon le point de

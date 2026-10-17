@@ -179,7 +179,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0403 : attente de bail depuis (un instant)
         'lease_wait_since',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
-        'workstream'
+        'workstream',
+        -- #508 (0411) : la vue est recréée avec `r.*` et expose les mêmes
+        -- colonnes que `agent_registry` ; preuve de vie du runner, sans
+        -- contenu ni secret, accordée à l'identique de la table
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
@@ -192,6 +196,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_by', 'canon_ref', 'capabilities', 'last_event_at',
         'placement_ok', 'placement_diagnostic', 'placement_ref',
         'placement_profile',
+        -- #508 (0411) : preuve de vie du runner, sans contenu ni secret
+        'runner_seen_at', 'runner_seen_host', 'runner_seen_owner',
         -- L232a (0371) : clôture de passage entre hôtes
         'handoff_fenced',
         -- #1521 (0446) : début du motif de statut, sans contenu

@@ -461,10 +461,49 @@ class PickupTest(consumers.PriseMultiProjetsTest):
                 mock.patch.object(work, 'events', interdit):
             self.assertEqual(self.take(), [])
             self.assertEqual(self.take(), [])
-        self.assertEqual(lues, [backlog.MISSING_DIR_NOTE_PREFIX] * 2)
+        self.assertEqual(lues, [backlog.DIRECTORY_NOTE_PREFIX] * 2)
         raisons = [e['note'] for e in work.events(self.db, item['id'])
                    if (e.get('note') or '').startswith('L243-4:')]
         self.assertEqual(len(raisons), 1)
+
+    def test_two_agents_note_the_refusal_once(self):
+        """#1538 : le refus de dossier se note une fois par ÉLÉMENT, pas une
+        fois par (agent, élément) — deux agents et deux passages ne laissent
+        qu'une seule note L243-4 sur le lot."""
+        self.multi('m1')
+        self.multi('m2')
+        item = self.lot('secondary', app='nexlink')
+        self.assertEqual(self.take(), [])
+        self.assertEqual(self.take(), [])
+        self.assertIsNone(work.get(self.db, item['id'])['assignee'])
+        reasons = [e['note'] for e in work.events(self.db, item['id'])
+                   if (e.get('note') or '').startswith('L243-4:')]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn('Host work root', reasons[0])
+
+    def test_notes_are_read_once_per_pass_not_per_element(self):
+        """#1538 + #1900 N2 : deux agents butent sur le même lot dans la même
+        passe ; le journal n'est lu ni par couple (agent, élément) ni par
+        élément, mais une seule fois par le relevé borné des notes."""
+        self.multi('m1')
+        self.multi('m2')
+        self.lot('secondary', app='nexlink')
+        from ameesh.storage.postgres import work as work_store
+        lues = []
+        vrai = work_store.WorkItems.events_noted
+
+        def notes(store, prefix, since_ts):
+            lues.append(prefix)
+            return vrai(store, prefix, since_ts)
+
+        with mock.patch.object(work_store.WorkItems, 'events_noted', notes), \
+                mock.patch('ameesh.lot_workdir.problem',
+                           wraps=lot_workdir.problem) as problem, \
+                mock.patch.object(work, 'events', wraps=work.events) as events:
+            self.assertEqual(self.take(), [])
+        self.assertEqual(problem.call_count, 2)   # m1 puis m2 ont été évalués
+        self.assertEqual(len(lues), 1)            # une seule lecture bornée
+        self.assertEqual(events.call_count, 0)    # aucun journal par élément
 
     def test_dry_run_missing_policy_does_not_write_reason(self):
         self.multi()

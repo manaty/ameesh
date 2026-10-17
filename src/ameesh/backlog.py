@@ -527,34 +527,39 @@ def _primary_project(agent: dict) -> str:
     return names[0] if names else ""
 
 
-#: #1900 N2 : préfixe des notes « projet déclaré sans dossier » (`_directory_ready`).
-MISSING_DIR_NOTE_PREFIX = "L243-4: "
+#: #1538 : marque d'un refus de dossier dans le journal d'un élément. La
+#: relecture se fait sur ce préfixe, jamais sur le texte complet : la note
+#: nomme l'agent qui l'a rencontré, mais elle est unique PAR ÉLÉMENT.
+#: #1900 N2 : c'est ce même préfixe que lit le relevé borné de la passe.
+DIRECTORY_NOTE_PREFIX = "L243-4:"
 
 
 class _DirNotes:
-    """Les notes de dossier déjà écrites, lues une fois par passe (#1900 N2).
+    """Les éléments dont le refus de dossier a déjà été noté, lus une fois par
+    passe (#1900 N2).
 
     La lecture est paresseuse — aucun item ne manque de dossier, aucune
-    requête — et bornée au préfixe des notes L243-4 ; `has` répond ensuite en
-    mémoire, `add` retient la note que `_directory_ready` vient d'écrire. Sans
-    elle, chaque passe d'`auto_take` relisait les 100 derniers événements de
-    chaque lot dont le dossier manque, pour chaque agent candidat."""
+    requête — et bornée au préfixe DIRECTORY_NOTE_PREFIX ; `has` répond
+    ensuite en mémoire, `add` retient l'élément que `_directory_ready` vient
+    d'écrire. Sans elle, chaque passe d'`auto_take` relisait les 100 derniers
+    événements de chaque lot dont le dossier manque, pour chaque agent
+    candidat."""
 
     def __init__(self, store):
         self._store = store
-        self._notes: set[tuple[int, str]] | None = None
+        self._items: set[int] | None = None
 
-    def _load(self) -> set[tuple[int, str]]:
-        if self._notes is None:
-            self._notes = {(int(row["work_item_id"]), row.get("note") or "")
-                           for row in self._store.events_noted(MISSING_DIR_NOTE_PREFIX, 0.0)}
-        return self._notes
+    def _load(self) -> set[int]:
+        if self._items is None:
+            self._items = {int(row["work_item_id"])
+                           for row in self._store.events_noted(DIRECTORY_NOTE_PREFIX, 0.0)}
+        return self._items
 
-    def has(self, item_id, note: str) -> bool:
-        return (int(item_id), note) in self._load()
+    def has(self, item_id) -> bool:
+        return int(item_id) in self._load()
 
-    def add(self, item_id, note: str) -> None:
-        self._load().add((int(item_id), note))
+    def add(self, item_id) -> None:
+        self._load().add(int(item_id))
 
 
 def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, notes=None):
@@ -562,19 +567,23 @@ def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, notes=No
     reason = lot_workdir.problem(cfg, agent, project, canons=canons)
     if reason is None:
         return True
-    # #811 N1 : hors périmètre (raison vide) — aucune note ; un projet déclaré
-    # qui attend son dossier est noté une fois par lot.
+    # #811 N1 : hors périmètre (raison vide) — aucune note ; #1538 : une raison
+    # réelle (dossier déclaré absent ou ambigu) est notée une fois PAR ÉLÉMENT,
+    # quel que soit l'agent qui bute dessus — pas une note par (agent, élément).
+    # `notes` (le relevé borné de la passe) retient les éléments déjà notés :
+    # le journal n'est pas relu pour chaque couple (agent, élément) du lot.
     if not dry_run and reason:
-        note = MISSING_DIR_NOTE_PREFIX + "%s cannot pick up project %s: %s" % (
-            agent["name"], project, reason)
+        note = "%s %s cannot pick up project %s: %s" % (
+            DIRECTORY_NOTE_PREFIX, agent["name"], project, reason)
         if notes is not None:
-            # #1900 N2 : la note déjà écrite se lit dans le relevé borné de la
-            # passe (une requête), plus dans les 100 derniers événements du lot
-            # relus à chaque passe tant que le dossier manque.
-            if not notes.has(item["id"], note):
+            # #1900 N2 : le relevé borné de la passe porte les éléments déjà
+            # notés (une requête), plus les 100 derniers événements du lot
+            # relus par élément tant que le dossier manque.
+            if not notes.has(item["id"]):
                 work.note(db, item["id"], note, actor=SENDER)
-                notes.add(item["id"], note)
-        elif not any(e.get("note") == note for e in work.events(db, item["id"])):
+                notes.add(item["id"])
+        elif not any((e.get("note") or "").startswith(DIRECTORY_NOTE_PREFIX)
+                     for e in work.events(db, item["id"])):
             work.note(db, item["id"], note, actor=SENDER)
     return False
 
