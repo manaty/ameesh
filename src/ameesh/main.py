@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """ameesh — the mesh command, and its subcommands.
 
-
   ameesh accounts list | use <harness> <account> | auto [harness]
         multiple accounts per provider: active, gauges, override (L30);
   ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
