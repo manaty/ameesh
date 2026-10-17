@@ -324,6 +324,27 @@ def _remote_branch(name: str) -> str:
     return name
 
 
+def _class_base(repo: str, target: str, *, queue: bool = False) -> str | None:
+    """La référence de cible qui explique la classe d'un lot, ou None.
+
+    #2207 : un `main` local en retard sur `origin/main` faisait entrer dans le
+    diff des commits déjà fusionnés (dont des chemins sensibles) et classait
+    `sensitive` un lot léger. La cible distante dit ce que la file va
+    fusionner : la référence de la file d'abord (clone du radar), puis
+    `origin/<cible>`, puis la cible locale."""
+    wanted = _remote_branch(target)
+    candidates = []
+    if queue:
+        candidates.append(QUEUE_REF + target)
+    for candidate in ("origin/" + wanted, target):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if plan_git._commit(repo, candidate):
+            return candidate
+    return None
+
+
 _SCP = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
 _URL = re.compile(r"^([a-z][a-z0-9+.-]*)://(?:[^@/]+@)?([^/:]+)(?::(\d+))?/(.+)$", re.I)
 #: the port a scheme names when it names none: `ssh://host:22/x` is `host:x`
@@ -560,9 +581,10 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
     """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
 
     Le clone de la file range les branches sous `QUEUE_REF` ; à défaut la
-    référence de la cible y est tentée, puis le dépôt du projet. `cfg` absent
-    ou dépôt illisible : `lot_class.of_lot` rend un doute (`sensitive`, drapeau
-    `doubt`), et la file garde l'exigence de verdict.
+    cible distante (`origin/<cible>`, #2207) ou locale y est tentée, puis le
+    dépôt du projet. `cfg` absent ou dépôt illisible : `lot_class.of_lot` rend
+    un doute (`sensitive`, drapeau `doubt`), et la file garde l'exigence de
+    verdict.
 
     Les lectures sont **toutes** comparées : la plus haute l'emporte, une
     lecture calculée ne se rétrograde jamais devant une autre, et un doute ne
@@ -573,12 +595,11 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
     paths = []
     if target:
         base_repo = where or repo
-        for candidate in (QUEUE_REF + target, target):
-            if plan_git._commit(base_repo, candidate):
-                paths.append((base_repo, candidate))
-                break
+        base = _class_base(base_repo, target, queue=True)
+        if base:
+            paths.append((base_repo, base))
         if where and where != repo:
-            paths.append((repo, target))
+            paths.append((repo, _class_base(repo, target) or target))
     if not paths:
         paths.append((repo, target))
     best = None

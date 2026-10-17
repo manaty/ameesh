@@ -493,7 +493,8 @@ class TargetResolutionTest(_Base):
 class ClassOfSourcesTest(unittest.TestCase):
     """Revue #544 r1 : `_class_of` lit toutes les sources de la tête gelée et
     garde la plus haute — une lecture calculée ne se rétrograde jamais, et un
-    doute ne se lit pas comme une classe sensible."""
+    doute ne se lit pas comme une classe sensible. #2207 : la cible distante
+    prime sur un `main` local en retard."""
 
     def read(self, answers):
         calls = []
@@ -517,17 +518,17 @@ class ClassOfSourcesTest(unittest.TestCase):
         out, calls = self.class_of({
             merge_queue.QUEUE_REF + "main": {"class": "sensitive", "doubt": False,
                                              "why": "clone"},
-            "main": {"class": "light", "doubt": False, "why": "checkout auteur"}})
+            "origin/main": {"class": "light", "doubt": False, "why": "checkout auteur"}})
         self.assertEqual(out["class"], "sensitive")
         self.assertEqual(out["why"], "clone")
-        self.assertEqual(calls, [merge_queue.QUEUE_REF + "main", "main"])
+        self.assertEqual(calls, [merge_queue.QUEUE_REF + "main", "origin/main"])
 
     def test_un_doute_ne_se_lit_pas_comme_une_classe_sensible(self):
         # deux lectures sensibles : la calculée explique mieux que le doute
         out, _ = self.class_of({
             merge_queue.QUEUE_REF + "main": {"class": "sensitive", "doubt": True,
                                              "why": "diff illisible"},
-            "main": {"class": "sensitive", "doubt": False, "why": "policy"}})
+            "origin/main": {"class": "sensitive", "doubt": False, "why": "policy"}})
         self.assertEqual(out["class"], "sensitive")
         self.assertEqual(out["doubt"], False)
         self.assertEqual(out["why"], "policy")
@@ -536,10 +537,29 @@ class ClassOfSourcesTest(unittest.TestCase):
         out, _ = self.class_of({
             merge_queue.QUEUE_REF + "main": {"class": "light", "doubt": False,
                                              "why": "checkout"},
-            "main": {"class": "sensitive", "doubt": True, "why": "diff illisible"}})
+            "origin/main": {"class": "sensitive", "doubt": True, "why": "diff illisible"}})
         self.assertEqual(out["class"], "sensitive")
         self.assertEqual(out["doubt"], True)
         self.assertEqual(out["why"], "diff illisible")
+
+    def test_la_cible_distante_prime_sur_un_main_local_en_retard(self):
+        # #2207 : le `main` local du worktree était en retard sur origin/main ;
+        # le diff emportait des commits déjà fusionnés, dont des chemins
+        # sensibles, et classait `sensitive` un lot léger.
+        calls, fake = self.read({
+            "origin/main": {"class": "light", "doubt": False, "why": "origin"},
+            "main": {"class": "sensitive", "doubt": False, "why": "main local"}})
+
+        def present(repo, ref):
+            return "c" * 40 if ref in ("origin/main", "main") else None
+
+        with mock.patch.object(plan_git, "_commit", side_effect=present), \
+                mock.patch.object(lot_class, "of_lot", side_effect=fake):
+            out = merge_queue._class_of(None, 1, {"app": "ameesh"}, "depot", "clone",
+                                        "main", "f" * 40)
+        self.assertEqual(out["class"], "light")
+        self.assertEqual(out["why"], "origin")
+        self.assertEqual(calls, ["origin/main", "origin/main"])
 
 
 class OrderTest(unittest.TestCase):
