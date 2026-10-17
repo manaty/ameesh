@@ -23,6 +23,12 @@ def probe(db, project, branches) -> list[dict]:
     Existing files in the common base are historical, so are not reported.
     No writes and no fetch; holders are checked in the project's repository.
     An unreadable registry produces a radar error, never a clean report.
+
+    #2146 : une migration déjà atterrie (L1567) n'est pas une réservation
+    manquante. Une branche qui porte les migrations d'une autre ligne (une
+    coupe `release/*` sur `develop`, dont la cible est `main`) les hérite :
+    sans cette règle, le probe réclamait au lot de la coupe de réserver des
+    numéros déjà livrés par des lots terminaux.
     """
     if not project.migrations:
         return []
@@ -30,7 +36,7 @@ def probe(db, project, branches) -> list[dict]:
     slug = migrations.repo_key(radar.github_slug(project))
     if not slug:
         raise GitError("project %s: migration reservation probe needs a GitHub repository" % project.name)
-    found, holders = [], {}
+    found, holders, landed = [], {}, {}
     try:
         registry = storage.of(db).work
         for branch in branches:
@@ -46,6 +52,11 @@ def probe(db, project, branches) -> list[dict]:
                 holder = holders[number]
                 if holder and int(holder["id"]) == int(branch["work_item"]):
                     continue
+                if holder is None:
+                    if number not in landed:
+                        landed[number] = registry.migration_landed_holder(number, slug)
+                    if landed[number] is not None:
+                        continue
                 found.append({"work_item": branch["work_item"], "target": branch["target"],
                               "path": path, "number": match.group(1), "repo": slug,
                               "holder": holder["id"] if holder else None})
