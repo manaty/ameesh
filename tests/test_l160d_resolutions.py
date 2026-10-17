@@ -225,6 +225,19 @@ class ReplayTest(_Base):
     def test_asymmetric_pair_primed_by_python_port(self):
         self.check_asymmetric(None)
 
+    def test_asymmetric_pair_retrains_legacy_cache(self):
+        sha = self.asymmetric_pair()
+        rp = self.replayer(None)
+        rp.ensure()
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        # A radar that already saw this pair has a first-parent-only cache.
+        resolutions._learn(rp.path, sha, a, [b])
+        legacy = os.path.join(rp.path, ".git", "ameesh-rr", sha)
+        shutil.copytree(rp._rr_cache(), legacy)
+        self.assertEqual(rp.prime([sha]), [])
+        got = rp.replay(b, a, sha)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+
     def test_resolution_from_another_host_is_fetched(self):
         bare = self.origin()
         sha = _manual_resolution(self.repo)

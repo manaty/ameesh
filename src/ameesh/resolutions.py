@@ -67,6 +67,8 @@ REF_PREFIX = "refs/ameesh/resolutions/"
 #: fallback for hosts that refuse refs outside `refs/heads`
 BRANCH_PREFIX = "ameesh/resolve/"
 TRAILER = "ameesh-resolution"
+# v2 learns both merge directions; first-parent-only caches must be retrained.
+TRAINING_CACHE = "ameesh-rr-v2"
 #: worktrees of open resolutions, under the repository's common directory
 WORKTREE_DIR = "ameesh-resolve"
 #: where git ships `rerere-train.sh`, relative to `git --exec-path` or absolute
@@ -234,8 +236,8 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
 
     #2136 : a merge is not symmetric — a `.gitattributes` a merge brings in
     only drives that merge once it is checked out (so `merge=union` applies
-    on one side only), and rerere keys a conflict by its preimage, where ours
-    and theirs are ordered. The script and the loop only learn the
+    on one side only), so the conflicted paths can differ in each direction.
+    The script and the loop only learn the
     first-parent direction; the other is learnt here from the same commit, so
     a resolution prepared in one direction replays in the landing direction
     of the queue."""
@@ -688,7 +690,7 @@ class Replayer:
     """The radar's private clone of a project. Objects come from the agents'
     repository (`--shared`); merges are replayed in the clone's worktree.
     Each resolution commit gets its own `rr-cache`, trained once and kept
-    under `.git/ameesh-rr/<commit>`: a replay sees the pair's resolution
+    under `.git/ameesh-rr-v2/<commit>`: a replay sees the pair's resolution
     only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto") -> None:
@@ -716,7 +718,7 @@ class Replayer:
         return os.path.join(self.path, ".git", "rr-cache")
 
     def _store(self, sha: str = "") -> str:
-        return os.path.join(self.path, ".git", "ameesh-rr", sha)
+        return os.path.join(self.path, ".git", TRAINING_CACHE, sha)
 
     def trained(self) -> list[str]:
         try:
