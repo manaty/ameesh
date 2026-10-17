@@ -1076,13 +1076,21 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
         attrs = replayer.attributes_key(tree) if tree else None
         key = (p["tips"][0], p["tips"][1], row["commit_sha"], attrs,
                tuple(sorted(generated)))
-        if key not in replays:
+        # #2254: an `error` is not a result of these inputs — a checkout
+        # disturbed by another pass, an unreadable object, a saturated disk —
+        # it is retried at the next pass. Keeping it would freeze a transient
+        # failure on this executor for as long as the tips stay put, and make
+        # it alternate with the `prepared` another executor reports: the very
+        # input-keyed cache that saves a replay must not keep a non-answer.
+        result = replays.get(key)
+        if result is None or result.get("state") == "error":
             try:
-                replays[key] = replayer.replay(*p["tips"], row["commit_sha"],
-                                               attributes_tree=tree, generated=generated)
+                result = replayer.replay(*p["tips"], row["commit_sha"],
+                                         attributes_tree=tree, generated=generated)
             except (GitError, OSError) as exc:
-                replays[key] = {"state": "error", "error": str(exc)[:300]}
-        result = replays[key]
+                result = {"state": "error", "error": str(exc)[:300]}
+            if result.get("state") != "error":
+                replays[key] = result
         resolution["replay"] = result["state"]
         resolution["remaining"] = result.get("remaining") or []
         if (p["state"] == "conflict" and result["state"] in ("prepared", "stale")
