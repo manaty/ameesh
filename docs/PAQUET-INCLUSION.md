@@ -67,9 +67,9 @@ ameesh-work: 2131
 ```
 
 Sans elle, le commit ne désigne pas son lot : `ameesh work merged --sha
-<commit>` le refuse, et `sync-merges`/`sync-branches` ne voient que le gel
-enregistré quand la composition a porté une remise (#1628). Le trailer ne change
-ni l'arbre ni la CI.
+<commit>` le refuse, et `sync-branches` ne voit que le gel enregistré quand la
+composition a porté une remise (#1628). Le trailer ne change ni l'arbre ni la
+CI.
 
 Pour l'écrire sans y penser, `scripts/paquet-compose.py` fait la fusion et le
 message, avec un `--lot` par lot porté :

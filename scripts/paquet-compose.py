@@ -9,10 +9,10 @@ Fusionne `--source` dans la branche courante (`git merge --no-ff --no-commit`),
 écrit le message de composition et y ajoute une ligne `ameesh-work: <lot>` par
 lot porté (répéter `--lot` pour une unité qui en porte plusieurs). Le commit
 devient déclarable nativement : `ameesh work merged --sha <commit de
-composition>` l'accepte, et `work sync-merges`/`sync-branches` le voient
-(`cited_lots`, `merge_citing`) même quand la remise du lot diffère de son gel
-enregistré (#1628). Aucune autre modification de l'arbre : la fusion est celle
-du composeur, le trailer ne change ni contenu ni CI.
+composition>` l'accepte, et `work sync-branches` le voit (`cited_lots`,
+`merge_citing`) même quand la remise du lot diffère de son gel enregistré
+(#1628). Aucune autre modification de l'arbre : la fusion est celle du
+composeur, le trailer ne change ni contenu ni CI.
 
 Sur fusion propre, le commit est créé et son SHA affiché. Sur conflit, rien
 n'est commité : le message complet (sujet, corps, trailer) est déjà écrit dans

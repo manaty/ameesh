@@ -464,7 +464,7 @@ bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
 
 Chaque commit de composition (une unité du paquet) porte un trailer
 `ameesh-work: <id>` par lot qu'il porte : il devient déclarable nativement
-(`ameesh work merged --sha <commit>`, `sync-merges`/`sync-branches`) même quand
+(`ameesh work merged --sha <commit>`, `sync-branches`) même quand
 la remise du lot diffère du gel enregistré (#2157). `scripts/paquet-compose.py`
 compose l'unité et écrit ce message, y compris sur conflit (`.git/MERGE_MSG`
 prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé n'est
