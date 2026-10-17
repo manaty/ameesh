@@ -2747,6 +2747,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if st["locked"]:
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
+        if foreign and not st["pushed"]:
+            plan.append(dict(base, action="garde", detail="%s; commits not pushed" % why))
+            continue
         if worktree_in_use(path, allow=allow):
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))

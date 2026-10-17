@@ -604,6 +604,7 @@ class OrphanGuardsTest(unittest.TestCase):
                  {7: "closed", 6: "merged"}, False),
                 ("other-merged-kept", "lot/7-x", "other", "merged", False),
                 ("other-merged-kept-recent", "lot/7-x", "other", "merged", True),
+                ("other-unpushed-equivalent", "lot/7-x", "other", "closed", False),
                 ("unknown", "lot/7-x", None, None, False),
                 ("unreadable", "lot/7-x", None, RuntimeError("offline"), False),
                 ("named-directory", "", "other", "build", False),
@@ -638,6 +639,10 @@ class OrphanGuardsTest(unittest.TestCase):
                         housekeeping=SimpleNamespace(worktrees=mock.Mock(return_value=[row])))
                     git = dict(exists=True, clean=True, pushed=True, integrated=False,
                                locked=False, submodules="", gitdir="", reason="not integrated")
+                    if label == "other-unpushed-equivalent":
+                        # git cherry / a squash can prove equivalent content
+                        # on main while the original HEAD is still unpushed.
+                        git.update(pushed=False, integrated=True, reason="")
                     with mock.patch.object(menage.storage, "of", return_value=store), \
                             mock.patch.object(menage, "worktree_state", return_value=git), \
                             mock.patch.object(menage, "worktree_in_use", return_value=False), \
