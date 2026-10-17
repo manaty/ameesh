@@ -342,6 +342,74 @@ class RoutingTest(sessions._Base):
         self.assertNotIn('--resume', argv)
         self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self.secondary)
 
+    def test_adoption_refuse_bail_perdu_et_session_remplacee(self):
+        """#1900 B1 : un remplaçant a réclamé l'agent (epoch suivant) et noté sa
+        session ; le worker dépassé, dont l'instantané porte encore la sienne,
+        ne la réécrit pas en adoptant."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        self.assertTrue(registry.release(self.db, 'worker', self.worker.runner.runner_id,
+                                        self.worker.epoch))
+        remplacant = registry.claim(self.db, 'worker', 'runner-remplacant', 3600)
+        self.assertIsNotNone(remplacant)
+        registry.set_session(self.db, 'worker', 'session-remplacante', None,
+                            harness='claude', cwd=self.primary)
+        self.assertFalse(self.worker._adopt_originless_session('session-A', self.primary))
+        row = registry.get(self.db, 'worker')
+        self.assertEqual(row['session_id'], 'session-remplacante')
+        # l'origine du remplaçant, pas celle du worker dépassé
+        self.assertEqual(row['session_origin'], 'session-remplacante')
+
+    def test_adoption_refuse_session_remplacee_sous_notre_bail(self):
+        """#1900 B1 : même sous notre bail vivant, une session remplacée entre
+        l'instantané du worker et l'adoption n'est jamais réécrite."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        registry.set_session(self.db, 'worker', 'session-remplacante', None,
+                            harness='claude', cwd=self.primary)
+        self.assertFalse(self.worker._adopt_originless_session('session-A', self.primary))
+        row = registry.get(self.db, 'worker')
+        self.assertEqual(row['session_id'], 'session-remplacante')
+        # l'origine du remplaçant, pas celle du worker dépassé
+        self.assertEqual(row['session_origin'], 'session-remplacante')
+
+    def test_adoption_attendant_le_verrou_au_dela_de_l_echeance_refuse(self):
+        """#1900 B1 : l'échéance du bail est recontrôlée APRÈS l'attente du
+        verrou — une adoption bloquée au-delà de l'échéance refuse et ne touche
+        rien."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute(
+            "UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL,"
+            " lease_expires_at = clock_timestamp() + interval '0.4 second'"
+            " WHERE name = 'worker'")
+        verrou = self.connect()
+        self.addCleanup(verrou.close)
+        pret = threading.Event()
+
+        def tenir():
+            with verrou.transaction() as tx:
+                tx.query("SELECT 1 FROM agent_registry WHERE name = 'worker' FOR UPDATE")
+                pret.set()
+                time.sleep(1.0)      # détient le verrou au-delà de l'échéance
+
+        fil = threading.Thread(target=tenir, daemon=True)
+        fil.start()
+        self.assertTrue(pret.wait(10))
+        resultat = []
+        adoptant = threading.Thread(
+            target=lambda: resultat.append(
+                self.worker._adopt_originless_session('session-A', self.primary)),
+            daemon=True)
+        adoptant.start()
+        fil.join(10)
+        adoptant.join(10)
+        self.assertEqual(resultat, [False])
+        row = registry.get(self.db, 'worker')
+        self.assertIsNone(row['session_origin'])
+        self.assertEqual(row['session_id'], 'session-A')
+
 
 class PickupTest(consumers.PriseMultiProjetsTest):
     """Existing primary-only tests still cover hosts without secondary roots."""

@@ -2241,13 +2241,24 @@ class AgentWorker(threading.Thread):
         forcée, comportement d'avant le correctif."""
         harnais = (self.agent.get("session_harness")
                    or self.agent.get("harness") or self.turn_harness())
+        # #1900 B1 : écriture fencée (verrou de ligne, bail vivant, échéance
+        # recontrôlée après l'attente, session ET lot inchangés). Une session
+        # remplacée entre l'instantané et l'adoption — rotation, remplaçant,
+        # autre lot — n'est jamais réécrite ; l'appelant garde alors la bascule
+        # forcée, comportement d'avant le correctif.
+        lot = str(self.agent.get("session_work_item") or "")
         try:
-            registry.set_session(self.db, self.name, session,
-                                 self.agent.get("session_account"),
-                                 harness=harnais, cwd=cwd)
+            adopte = registry.adopt_session_origin(
+                self.db, self.name, session, lot,
+                self.runner.runner_id, self.epoch,
+                harness=harnais, cwd=cwd)
         except db_mod.DbError as exc:
             log_async("[%s] originless session %s not adopted (%s)"
                       % (self.name, session, exc))
+            return False
+        if not adopte:
+            log_async("[%s] originless session %s not adopted: "
+                      "lease or session changed" % (self.name, session))
             return False
         self.agent = registry.get(self.db, self.name) or self.agent
         log_async("[%s] originless session %s adopted for lot %s (origin %s)"

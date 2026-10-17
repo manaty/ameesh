@@ -54,7 +54,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    clear_model count
    leases          claim attach_claim state renew release turn_in_progress
                    reap clear_session take_pending_prompt begin_turn
-                   restore_prompt end_turn
+                   restore_prompt end_turn adopt_session_origin
    pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
    turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
@@ -339,6 +339,16 @@ class Leases(Domain):
         """Oublie la session, fencé par un bail valide ; l'oubli est durable
         (`session_reset_at` posé dans la même écriture), pour qu'un fichier
         local non retiré ne ressuscite pas la session (#794)."""
+
+    @abc.abstractmethod
+    def adopt_session_origin(self, name: str, owner: str, epoch: int, session: str,
+                             lot: str, *, harness: str | None, cwd: str | None) -> bool:
+        """#1900 B1 : note l'origine d'une session sans origine, sous un bail
+        VIVANT (owner, epoch, échéance recontrôlée après l'attente du verrou)
+        et seulement si la ligne porte encore `session` et `lot` : une session
+        remplacée entre-temps (rotation, remplaçant, autre lot) n'est jamais
+        réécrite. N'écrit que l'origine, le dossier et le harnais — la session
+        et son compte restent ceux de la ligne. Faux sinon."""
 
     @abc.abstractmethod
     def hold_note(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
