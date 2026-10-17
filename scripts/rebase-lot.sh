@@ -16,6 +16,12 @@
 # abandon volontaire (--empty=drop, drop dans -i, --skip) et n'est pas une
 # perte (#1516).
 #
+# La trace est cherchée dans le premier paragraphe du corps *joint par des
+# espaces* (ce que `%s` rend si la ligne « #… » est retirée : un paragraphe
+# multiligne devient un seul sujet), et seulement parmi les commits produits
+# par ce rebasage (<destination>..HEAD), pas dans tous les ancêtres : un sujet
+# d'amont ne vaut pas trace d'un sujet perdu (#2043, réserves P2 de #1516).
+#
 # #1669 : le contrôle porte aussi sur l'historique rejoué lui-même —
 # 1. chaque commit rejoué d'une branche `lot/<id>…` garde un sujet
 #    « #<id> … » : un bisect reste rattachable au lot ;
@@ -32,7 +38,7 @@ set -euo pipefail
 etat=$(git rev-parse --git-path ameesh-rebase-lot.sujets)
 #: marque la première ligne de l'état : un sujet « #… » peut porter n'importe
 #: quel texte, elle évite de le confondre avec un sujet.
-ETAT_MARQUE='rebase-lot/etat-v2'
+ETAT_MARQUE='rebase-lot/etat-v3'
 #: #1669 : la borne basse de la plage rejouée, résolue AVANT le rebasage
 #: (`root` pour --root), et l'id du lot déduit de la branche `lot/<id>…`.
 base_etat=$(git rev-parse --git-path ameesh-rebase-lot.base)
@@ -133,15 +139,19 @@ noter_sujets() {
   printf '%s\n' "$lot" >"$lot_etat"
   # Les commits de fusion ne sont pas rejoués par un rebase ordinaire.
   ((merges)) || options_log+=(--no-merges)
-  # Chaque sujet « #… » est noté avec la première ligne du corps de son
-  # commit : le défaut transforme le corps en sujet, cette marque le retrouve.
+  # Chaque sujet « #… » est noté avec la trace du défaut : le premier
+  # paragraphe du corps, joint par des espaces, comme `%s` le rendrait si le
+  # nettoyage retirait la ligne « #… » (un corps multiligne devient un seul
+  # sujet) — la première ligne seule ratait ce cas (#2043).
   local liste h s corps
   liste=$(git log --format='%H%x1f%s' "${options_log[@]}" "${revisions[@]}" --) || return
   {
     printf '%s\n' "$ETAT_MARQUE"
     while IFS=$'\x1f' read -r h s; do
       case "$s" in \#*) ;; *) continue ;; esac
-      corps=$(git show -s --format='%b' "$h" | sed -n '/[^[:space:]]/{p;q;}')
+      corps=$(git show -s --format='%b' "$h" \
+        | sed -e 's/[[:space:]]*$//' \
+        | awk 'BEGIN{RS=""; ORS=""} NR==1{gsub(/\n/, " "); print}')
       printf '%s\x1f%s\n' "$s" "$corps"
     done <<<"$liste"
   } >"$etat"
@@ -168,71 +178,83 @@ if ((abandon)); then
   exit 0
 fi
 
-# Rebasage terminé. Chaque sujet « #… » noté au départ doit exister (#1277) —
-# un sujet disparu est un abandon volontaire (--empty=drop, drop dans -i,
-# --skip) SAUF si le corps de son commit réapparaît en sujet (#1516) : le
-# nettoyage a alors retiré la ligne « #… » ; puis l'historique rejoué est
+# Rebasage terminé. Les sujets « #… » notés au départ sont contrôlés (#1277) :
+# un sujet disparu dont la trace du défaut réapparaît en sujet parmi les
+# commits produits par ce rebasage est une perte (sortie 4) ; sans trace,
+# c'est un abandon volontaire (#1516, #2043). Puis l'historique rejoué est
 # contrôlé (#1669) : préfixe du lot sur chaque commit, aucun marqueur de
 # conflit committé.
 if [ -f "$etat" ] && ! en_cours; then
-  finaux=$(git log --format='%s' HEAD)
-  #: un sujet vidé (nettoyage + --allow-empty-message) est une perte aussi ;
-  #: on ne regarde que les commits produits par ce rebasage (ORIG_HEAD est la
-  #: tête d'avant, posée par git rebase).
-  origine=$(git rev-parse --verify -q ORIG_HEAD 2>/dev/null || :)
-  [ -n "$origine" ] || origine=HEAD
-  sujets_vides=$(git log --format='%s' "$origine"..HEAD 2>/dev/null | grep -c '^$' || :)
   base=$(cat "$base_etat" 2>/dev/null || :)
   lot=$(cat "$lot_etat" 2>/dev/null || :)
-  perdus= abandonnes=
-  while IFS= read -r ligne; do
-    [ "$ligne" != "$ETAT_MARQUE" ] || continue
-    sujet=${ligne%%$'\x1f'*}
-    corps=${ligne#*$'\x1f'}
-    printf '%s\n' "$finaux" | grep -Fqx -- "$sujet" && continue
-    if { [ -n "$corps" ] && printf '%s\n' "$finaux" | grep -Fqx -- "$corps"; } \
-      || [ "$sujets_vides" != 0 ]; then
-      perdus+="$sujet"$'\n'
-    else
-      abandonnes+="$sujet"$'\n'
+  finaux=$(git log --format='%s' HEAD)
+  marque=
+  { IFS= read -r marque; } <"$etat" || :
+  if [ "$marque" != "$ETAT_MARQUE" ]; then
+    # État d'une autre version du lanceur : illisible ici, contrôle ignoré
+    # plutôt qu'un diagnostic inventé.
+    printf 'rebase-lot : état %s illisible, contrôle ignoré\n' "$marque" >&2
+    rm -f "$etat" "$base_etat" "$lot_etat"
+  else
+    # Les commits produits par ce rebasage : <destination>..HEAD. Sans
+    # destination connue (--root ou base non résolue), tout HEAD est né du
+    # rebasage.
+    nouveaux=$finaux
+    if [ -n "$base" ] && [ "$base" != root ] \
+      && git rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1; then
+      nouveaux=$(git log --format='%s' "$base"..HEAD 2>/dev/null || :)
     fi
-  done <"$etat"
-  rm -f "$etat" "$base_etat" "$lot_etat"
-  echec=0
-  if [ -n "$abandonnes" ]; then
-    printf 'rebase-lot : sujets « #… » absents — abandon volontaire (drop, skip ou commit vidé), pas une perte :\n%s' "$abandonnes" >&2
-  fi
-  if [ -n "$perdus" ]; then
-    printf 'rebase-lot : sujets « #… » absents après le rebasage :\n%s' "$perdus" >&2
-    printf "rebase-lot : contrôle « git log --format='%%s' » — un sujet a pu passer en corps.\n" >&2
-    echec=1
-  fi
-  if [ -n "$base" ]; then
-    if [ "$base" = root ]; then plage=(HEAD); else plage=("$base..HEAD"); fi
-    if [ -n "$lot" ]; then
-      hors=()
-      while IFS= read -r ligne; do
-        [ -n "$ligne" ] || continue
-        [[ ${ligne#* } =~ ^#${lot}([ :]|$) ]] || hors+=("$ligne")
-      done < <(git log --no-merges --format='%h %s' "${plage[@]}" -- || :)
-      if ((${#hors[@]})); then
-        printf 'rebase-lot : commits rejoués sans le préfixe « #%s » :\n' "$lot" >&2
-        printf '  %s\n' "${hors[@]}" >&2
+    #: un sujet vidé (nettoyage + --allow-empty-message) reste une perte aussi.
+    sujets_vides=0
+    [ -z "$nouveaux" ] || sujets_vides=$(printf '%s\n' "$nouveaux" | grep -c '^$' || :)
+    perdus= abandonnes=
+    while IFS=$'\x1f' read -r sujet corps; do
+      [ -n "$sujet" ] || continue
+      printf '%s\n' "$finaux" | grep -Fqx -- "$sujet" && continue
+      if { [ -n "$corps" ] && printf '%s\n' "$nouveaux" | grep -Fqx -- "$corps"; } \
+        || [ "$sujets_vides" != 0 ]; then
+        perdus+="$sujet"$'\n'
+      else
+        abandonnes+="$sujet"$'\n'
+      fi
+    done < <(tail -n +2 "$etat")
+    rm -f "$etat" "$base_etat" "$lot_etat"
+    echec=0
+    if [ -n "$abandonnes" ]; then
+      printf 'rebase-lot : sujets « #… » absents — abandon volontaire (drop, skip ou commit vidé), pas une perte :\n%s' "$abandonnes" >&2
+    fi
+    if [ -n "$perdus" ]; then
+      printf 'rebase-lot : sujets « #… » absents après le rebasage :\n%s' "$perdus" >&2
+      printf "rebase-lot : contrôle « git log --format='%%s' » — un sujet a pu passer en corps.\n" >&2
+      echec=1
+    fi
+    if [ -n "$base" ]; then
+      if [ "$base" = root ]; then plage=(HEAD); else plage=("$base..HEAD"); fi
+      if [ -n "$lot" ]; then
+        hors=()
+        while IFS= read -r ligne; do
+          [ -n "$ligne" ] || continue
+          [[ ${ligne#* } =~ ^#${lot}([ :]|$) ]] || hors+=("$ligne")
+        done < <(git log --no-merges --format='%h %s' "${plage[@]}" -- || :)
+        if ((${#hors[@]})); then
+          printf 'rebase-lot : commits rejoués sans le préfixe « #%s » :\n' "$lot" >&2
+          printf '  %s\n' "${hors[@]}" >&2
+          echec=1
+        fi
+      fi
+      marqueurs=()
+      while IFS= read -r sha; do
+        [ -n "$sha" ] || continue
+        diff=$(git show --format= --no-color --no-ext-diff "$sha" -- || :)
+        grep -qE '^\+<{7}( |$)|\+>{7}( |$)|\+\|{7}( |$)' <<<"$diff" || continue
+        marqueurs+=("$sha")
+      done < <(git rev-list --no-merges "${plage[@]}" -- || :)
+      if ((${#marqueurs[@]})); then
+        printf 'rebase-lot : marqueurs de conflit committés dans :\n' >&2
+        printf '  %s\n' "${marqueurs[@]}" >&2
         echec=1
       fi
     fi
-    marqueurs=()
-    while IFS= read -r sha; do
-      [ -n "$sha" ] || continue
-      diff=$(git show --format= --no-color --no-ext-diff "$sha" -- || :)
-      grep -qE '^\+<{7}( |$)|\+>{7}( |$)|\+\|{7}( |$)' <<<"$diff" || continue
-      marqueurs+=("$sha")
-    done < <(git rev-list --no-merges "${plage[@]}" -- || :)
-    if ((${#marqueurs[@]})); then
-      printf 'rebase-lot : marqueurs de conflit committés dans :\n' >&2
-      printf '  %s\n' "${marqueurs[@]}" >&2
-      echec=1
-    fi
+    if ((echec)); then exit 4; fi
   fi
-  if ((echec)); then exit 4; fi
 fi
