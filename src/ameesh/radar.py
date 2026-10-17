@@ -72,7 +72,8 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
-                "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts")
+                "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
+                "required_checks")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -194,6 +195,10 @@ class Project:
     #: sélecteur versionné du dépôt (`CiParts`) ; None : aucune preuve de
     #: complétude n'est demandée
     ci_parts: CiParts | None = None
+    #: #2271 : les contextes de check requis, par nom exact. La protection de
+    #: la branche cible est lue à la forge ; cette déclaration la complète et
+    #: la remplace quand elle ne peut pas être lue (jamais pour l'affaiblir).
+    required_checks: tuple = ()
 
 
 @dataclass
@@ -382,6 +387,19 @@ def parse_settings(raw) -> Settings:
         ci_required = value.get("ci_required", False)
         if not isinstance(ci_required, bool):
             raise SettingsError("%s.ci_required: true or false expected" % where)
+        required_checks = value.get("required_checks", ())
+        if required_checks is None:
+            required_checks = ()
+        if isinstance(required_checks, str):
+            required_checks = (required_checks,)
+        if not isinstance(required_checks, (list, tuple)) or not all(
+                isinstance(name, str) and name.strip() for name in required_checks):
+            raise SettingsError("%s.required_checks: a list of check names expected" % where)
+        # Un nom de check est un contexte exact : ne pas rogner ses espaces
+        # significatifs, `tests ` n'est pas `tests` pour la forge.
+        required_checks = tuple(required_checks)
+        if len(set(required_checks)) != len(required_checks):
+            raise SettingsError("%s.required_checks: duplicate check name" % where)
         ci_parts = None
         if value.get("ci_parts") is not None:
             ci_parts = parse_ci_parts(value["ci_parts"], where)
@@ -471,7 +489,8 @@ def parse_settings(raw) -> Settings:
                                  full_suite=tuple(full_suite),
                                  full_suite_required=tuple(required_jobs),
                                  full_suite_tolerated=tuple(tolerated_jobs),
-                                 ci_parts=ci_parts)
+                                 ci_parts=ci_parts,
+                                 required_checks=required_checks)
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
