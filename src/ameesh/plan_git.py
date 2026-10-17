@@ -855,6 +855,16 @@ GITHUB_MERGE_PR_RE = re.compile(r"^Merge pull request #([1-9][0-9]{0,17}) from \
 #: `#<id>` dans le titre d'un commit de fusion (« Merge #93 … », « … (#91) ») ;
 #: ni `PR#9`, ni `depot#9`, ni `##9`, ni `#9a`
 HASH_REF_RE = re.compile(r"(?<![\w/#&])#([1-9][0-9]{0,17})(?!\w)")
+#: #2259 : séparateurs de proposition d'un titre de fusion ; une négation ne
+#: vaut que dans sa proposition (« sans #598 / #599 livré » garde #599)
+CLAUSE_SPLIT_RE = re.compile(r"[;/|—–]|\s+-\s+|\(|\)|,")
+#: #2259 : mots qui nient les `#<id>` de leur proposition — « recomposition
+#: sans #598 » (commit 84c68e9d4, Nexlink) désignait #598 et fermait son lot
+#: alors que sa PR était ouverte et sa tête hors de la cible. Même prudence
+#: pour « retiré », « hors », « without », « revert », « exclu ».
+NEGATED_REF_RE = re.compile(
+    r"\b(?:sans|ni|hors|retir[ée]e?s?|exclu[es]?|exclu[ea]nt|without|reverts?|reverted)\b",
+    re.IGNORECASE)
 #: clé de configuration git du dépôt : comment ses commits de fusion citent un
 #: lot en plus de `ameesh-work:` — `hash` : `#<id>` dans le titre
 LOT_REF_GIT_KEY = "ameesh.lotRef"
@@ -1093,12 +1103,45 @@ def merge_commits(repo: str, target: str, since_ts: float | None = None,
     return rows
 
 
+def _title_clauses(title: str) -> list[tuple[int, int]]:
+    """Les bornes des propositions d'un titre (séparateurs exclus)."""
+    bounds = []
+    begin = 0
+    for separator in CLAUSE_SPLIT_RE.finditer(title or ""):
+        bounds.append((begin, separator.start()))
+        begin = separator.end()
+    bounds.append((begin, len(title or "")))
+    return bounds
+
+
+def negated_hash_positions(title: str) -> set[int]:
+    """Les départs des `#<id>` que leur proposition nie dans un titre (#2259).
+
+    « paquet 52 v2 : … recomposition sans #598 ni correctif .github » ne
+    désigne pas le lot 598 : sa PR peut rester ouverte. Le découpage par
+    proposition garde une citation positive voisine (« sans #598, #599
+    livré » désigne 599). Un titre sans négation ne change rien. Les
+    positions (et non les numéros) laissent compter une citation positive du
+    même lot dans une autre proposition.
+    """
+    negated: set[int] = set()
+    spans = _title_clauses(title)
+    for match in HASH_REF_RE.finditer(title or ""):
+        for begin, end in spans:
+            if begin <= match.start() < end:
+                if NEGATED_REF_RE.search((title or "")[begin:end]):
+                    negated.add(match.start())
+                break
+    return negated
+
+
 def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
     """`{lot: forme}` des lots que désigne le message d'un commit de fusion :
     une ligne `ameesh-work: <id>` (forme `ameesh-work`), le titre de la fusion
     d'une branche `lot/<id>-…` (forme `lot-branch`, L118b), et, avec
     `hash_refs`, `#<id>` dans le titre (forme `#id`) — pas dans le corps, qui
-    peut recopier les titres des commits fusionnés. Un lot déclaré partiel
+    peut recopier les titres des commits fusionnés. Un `#<id>` nié par sa
+    proposition ne désigne pas le lot (#2259). Un lot déclaré partiel
     (`ameesh-work-partial: <id>`) n'est pas désigné."""
     found: dict[int, str] = {}
     lines = (message or "").strip().splitlines()
@@ -1109,8 +1152,10 @@ def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
     if branch:
         found.setdefault(int(branch.group("lot")), "lot-branch")
     if hash_refs:
+        negated = negated_hash_positions(title)
         for match in HASH_REF_RE.finditer(title):
-            found.setdefault(int(match.group(1)), "#id")
+            if match.start() not in negated:
+                found.setdefault(int(match.group(1)), "#id")
     for match in PARTIAL_TRAILER_RE.finditer(message or ""):
         found.pop(int(match.group(1)), None)
     return found
