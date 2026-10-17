@@ -8,10 +8,12 @@ groupe de processus dédié, et ne garde l'URL d'autorisation et le code à usag
 unique que le temps de les remettre au service `ameesh-approve` par le rappel
 `publish` (jamais sur disque, jamais dans un journal, jamais dans un `repr`).
 
-L'humain décide (`done` | `cancel`) dans la vue privée ; le superviseur tue
-alors le groupe (SIGTERM, puis SIGKILL après `grace`) et, sur `done`,
-interroge la santé du compte (`health`) : un reçu « terminé » ne prouve pas le
-grant fournisseur.
+L'humain décide (`done` | `cancel`) dans la vue privée ; sur `cancel`, le
+superviseur tue le groupe (SIGTERM, puis SIGKILL après `grace`). Sur `done`, il
+attend d'abord, borné par `settle`, la FIN FOURNISSEUR — la sortie propre du
+CLI (code 0) — et ne sonde la santé du compte (`health`) qu'après elle : un
+CLI tué ou sorti non nul ne peut pas devenir `healthy`, et un reçu « terminé »
+ne prouve pas le grant fournisseur.
 
 Règles du socle (mesh-design #81614) :
 
@@ -44,6 +46,9 @@ from urllib.parse import urlsplit
 TTL_S = 900.0
 #: délai entre SIGTERM et SIGKILL du groupe de processus
 TERMINATE_GRACE_S = 5.0
+#: borne d'attente de la fin fournisseur (sortie propre du CLI) sur `done` :
+#: la santé n'est sondée qu'après une sortie 0, jamais après un SIGTERM
+PROVIDER_END_S = 30.0
 #: sortie privée gardée en mémoire, jamais écrite sur disque
 CAPTURE_MAX = 64 * 1024
 #: pas d'attente des boucles de surveillance
@@ -88,6 +93,17 @@ class LoginError(Exception):
 def new_request_id() -> str:
     """Identifiant local, même forme que ceux du service (`lgn_...`)."""
     return "lgn_" + "".join(secrets.choice(_CROCKFORD) for _ in range(26))
+
+
+def _refusal_category(exc: BaseException) -> str:
+    """Catégorie locale d'un refus du service (`already_pending`, …).
+
+    Seul un code court et sûr passe ; jamais le message ni une valeur reçue.
+    """
+    code = getattr(exc, "code", "")
+    if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,32}", code):
+        return code
+    return "failed"
 
 
 @dataclass(frozen=True)
@@ -363,16 +379,19 @@ class Supervisor:
     """
 
     def __init__(self, *, registry: Registry | None = None, clock=time.time,
-                 spawn=subprocess.Popen, publish=None, health=None,
+                 spawn=subprocess.Popen, publish=None, health=None, invalidate=None,
                  sleep=time.sleep, grace: float = TERMINATE_GRACE_S,
+                 settle: float = PROVIDER_END_S,
                  capture_max: int = CAPTURE_MAX):
         self.registry = registry if registry is not None else Registry(clock=clock)
         self.clock = clock
         self.spawn = spawn
         self.publish = publish
         self.health = health
+        self.invalidate = invalidate
         self.sleep = sleep
         self.grace = grace
+        self.settle = settle
         self.capture_max = capture_max
         self._procs: dict[str, object] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -432,7 +451,13 @@ class Supervisor:
         return request
 
     def finish(self, request_id: str, decision: str) -> Request:
-        """`done` | `cancel` : tue le groupe, puis interroge la santé si `done`."""
+        """`done` | `cancel`.
+
+        `cancel` : tue le groupe. `done` : attend la fin fournisseur (sortie
+        propre, bornée par `settle`) AVANT de sonder la santé ; un CLI tué,
+        interrompu ou sorti non nul reste `provider_refused` — une santé
+        observée sur un ancien cache ne vaut pas preuve de cette tentative.
+        """
         if decision not in DECISIONS:
             raise LoginError("format", "decision: done or cancel expected")
         request = self.registry.get(request_id)
@@ -445,32 +470,40 @@ class Supervisor:
         # la décision est en cours : la fin du processus (SIGTERM) ne doit plus
         # clore la demande en « provider_refused »
         request.closing = True
-        self._terminate(request)
         if decision == "cancel":
+            self._invalidate(request)
+            self._terminate(request)
             return self.registry.finish(request, CANCELLED, "cancelled")
+        if not self._settle_done(request):
+            self._invalidate(request)
+            return self.registry.finish(request, DONE, "provider_refused")
         healthy = False
         try:
             healthy = self.health(request) in (True, "healthy")
         except Exception:  # une sonde en panne ne prouve jamais la santé
             healthy = False
+        if not healthy:
+            self._invalidate(request)
         return self.registry.finish(request, DONE, "healthy" if healthy else "provider_refused")
 
     def reap(self, now: float | None = None) -> list[Request]:
-        """Clôt et tue les demandes expirées."""
+        """Clôt, invalide au service et tue les demandes expirées."""
         due = self.registry.reap(now)
         for request in due:
+            self._invalidate(request)
             self._terminate(request)
         return due
 
     def expire(self, request_id: str) -> Request:
         """Clôt une demande sur l'échéance du service (sans attendre l'horloge
-        locale) : tue le groupe, catégorie `expired`."""
+        locale) : invalide le défi distant, tue le groupe, catégorie `expired`."""
         request = self.registry.get(request_id)
         if request is None:
             raise LoginError("unknown", "unknown login request")
         if request.state in TERMINAL:
             return request
         request.closing = True
+        self._invalidate(request)
         self._terminate(request)
         return self.registry.finish(request, EXPIRED, "expired")
 
@@ -487,6 +520,7 @@ class Supervisor:
         for request_id in held:
             request = self.registry.get(request_id)
             request.closing = True
+            self._invalidate(request)
             self._terminate(request)
             self.registry.finish(request, CANCELLED, "cancelled")
 
@@ -548,6 +582,28 @@ class Supervisor:
         if code and request.state == VIEWING and not request.closing:
             self.registry.finish(request, FAILED, "provider_refused")
 
+    def _settle_done(self, request: Request) -> bool:
+        """Attend la FIN FOURNISSEUR (sortie propre du CLI), bornée.
+
+        Rend True seulement si le processus s'est terminé de lui-même avec le
+        code 0 ; sinon (sortie non nulle, processus tué/interrompu ou toujours
+        vivant à l'échéance) tue le groupe et rend False : une santé observée
+        ensuite ne prouverait pas cette tentative.
+        """
+        with self._lock:
+            proc = self._procs.get(request.id)
+        if proc is None:
+            return False
+        deadline = time.monotonic() + max(0.0, self.settle)
+        while proc.poll() is None and time.monotonic() < deadline:
+            self.sleep(POLL_S)
+        if proc.poll() == 0:  # sortie naturelle réussie, même à l'échéance
+            with self._lock:
+                self._procs.pop(request.id, None)
+            return True
+        self._terminate(request)
+        return False
+
     def _publish(self, request: Request, adapter: Adapter, flow: Flow,
                  approver: str, requested_by: str, scope: str) -> None:
         payload = {"host": request.host, "provider": adapter.harness,
@@ -558,8 +614,9 @@ class Supervisor:
             payload["provider_exp"] = int(request.expires)
         try:
             answer = self.publish(payload) or {}
-        except Exception:
-            self._fail(request, adapter, "failed", "challenge service refused the request")
+        except Exception as exc:
+            self._fail(request, adapter, _refusal_category(exc),
+                       "challenge service refused the request")
             return
         del payload, flow
         login_id = str(answer.get("login_id") or "")
@@ -582,7 +639,22 @@ class Supervisor:
             return
         self.registry.finish(request, FAILED, category)
         _ = (adapter, message)  # jamais journalisé : la valeur reste privée
+        self._invalidate(request)
         self._terminate(request)
+
+    def _invalidate(self, request: Request) -> None:
+        """Clôt le défi distant (meilleur effort).
+
+        Une annulation, une expiration ou une erreur locale ne doit laisser ni
+        lien vivant ni charge privée au service ; si l'appel échoue, la
+        décision locale tient et le défi distant expirera seul.
+        """
+        if not self.invalidate or not request.login_id:
+            return
+        try:
+            self.invalidate(request)
+        except Exception:
+            pass
 
     def _terminate(self, request: Request) -> None:
         with self._lock:

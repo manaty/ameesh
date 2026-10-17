@@ -15,6 +15,10 @@ Routes :
                               JSON du service) ; le jeton de service de
                               l'équipe n'y est JAMAIS accepté (avis B1 dev4)
     GET  /login-receipts/<id> jeton de connexion — le reçu du défi (200|202|410)
+    POST /login-close/<id>    jeton de connexion — clôture TECHNIQUE demandée
+                              par le superviseur : efface l'URL et le code,
+                              libère la réservation, refuse lien/assertion
+                              tardifs ; n'écrit jamais de reçu humain
     GET  /a/<jeton>           page d'approbation
     POST /a/<jeton>           assertion WebAuthn → reçu (approve | deny)
     GET  /login/<jeton>       page du défi : sans URL ni code (lien muet)
@@ -96,6 +100,7 @@ _ROUTES = (
     ("api", "POST", re.compile(r"^/requests$")),
     ("api", "GET", re.compile(r"^/receipts/(req_[0-9a-z]{26})$")),
     ("login-api", "POST", re.compile(r"^/login-requests$")),
+    ("login-api", "POST", re.compile(r"^/login-close/(lgn_[0-9a-z]{26})$")),
     ("login-api", "GET", re.compile(r"^/login-receipts/(lgn_[0-9a-z]{26})$")),
     ("health", "GET", re.compile(r"^/health$")),
     ("approve", "GET POST", re.compile(r"^/a/%s$" % _TOKEN_PATH)),
@@ -384,6 +389,8 @@ class ApproveHandler(BaseHTTPRequestHandler):
             raise ApproveError(401, "unauthorized", "service token missing or invalid")
         if kind == "login-api":
             if self.command == "POST":
+                if reference is not None:  # /login-close/<id> : clôture technique
+                    return self._json(200, service.close_login(reference))
                 return self._json(201, service.create_login_request(load_json_body(raw)))
             status, payload = service.login_receipt(reference)
         else:

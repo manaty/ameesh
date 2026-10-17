@@ -166,6 +166,30 @@ class LoginEndToEndTest(ApproveBase):
         self.assertEqual(row.get("source"), "sentinel")
         self.assertIn("refresh token present", row.get("reason") or "")
 
+    def test_annulation_locale_invalide_le_defi_au_service(self):
+        """#366/B3 : `cancel` côté ameesh clôt le défi distant (jeton de l'API
+        des défis), efface URL/code et refuse lien et assertion tardifs."""
+        supervisor = self.supervisor()
+        supervisor.invalidate = lambda request: approve_client.close_login_request(
+            self.cfg, request.login_id)
+        request = supervisor.begin(host=self.HOST, harness="codex", account="default",
+                                   home=self.home, version="0.159.3", approver=ALICE,
+                                   requested_by=AGENT, environ=self.environ)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        path = urlsplit(request.link).path
+        self.assertIsNotNone(self.service.store.login_private(request.login_id))
+
+        done = supervisor.finish(request.id, "cancel")
+        self.assertEqual((done.state, done.category), (login.CANCELLED, "cancelled"))
+
+        # le défi distant est clos, sans reçu humain forgé
+        self.assertIsNone(self.service.store.login_private(request.login_id))
+        self.assertFalse(self.service.store.has_login_receipt(request.login_id))
+        self.assertEqual(self.page(path)[0], 410)
+        status, payload = approve_client.fetch_login_receipt(self.cfg, request.login_id)
+        self.assertEqual((status, payload.get("status")), ("expired", "closed"))
+        self.assertTrue(wait_for(lambda: self.spawned and self.spawned[0].poll() is not None))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -332,3 +332,17 @@ def fetch_login_receipt(cfg: Config, login_id: str) -> tuple[str, bytes | dict]:
     if status == 410:
         return "expired", _json(payload)
     raise _refusal(status, payload)
+
+
+def close_login_request(cfg: Config, login_id: str) -> dict:
+    """`POST /login-close/<id>` (L232d) : clôture TECHNIQUE du défi demandée
+    par le superviseur (jeton dédié de l'API des défis). Le service efface
+    l'URL et le code, libère la réservation et refuse lien/assertion tardifs ;
+    il n'écrit jamais de reçu humain."""
+    if not LOGIN_ID_RE.fullmatch(login_id or ""):
+        raise ApproveClientError("format", "login id \"lgn_...\" expected")
+    status, payload = _call(cfg, "POST", "/login-close/" + login_id, {},
+                            credential="login")
+    if status != 200:
+        raise _refusal(status, payload)
+    return _json(payload)

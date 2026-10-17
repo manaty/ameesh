@@ -529,8 +529,20 @@ class ApproveService:
             "exp": request["exp"],
             "created": now,
         }
+        # B3 (#366) : une seule opération vivante par tuple, réservée AVANT
+        # l'écriture publique — deux invocations concurrentes (processus
+        # distincts, chacun son Registry) ne peuvent pas déposer deux défis
+        # vivants pour le même (hôte, fournisseur, compte).
+        if not self.store.reserve_login(record, now=now):
+            raise ApproveError(409, "already_pending",
+                               "%s/%s on %s already has a live login challenge"
+                               % (provider, account or "(default)", host))
         private = {"url": url, "code": code, "provider_exp": provider_exp}
-        self.store.save_login(record, token, private)
+        try:
+            self.store.save_login(record, token, private)
+        except Exception:
+            self.store.release_login(record)
+            raise
         self.store.prune(now)
         log.info("login challenge %s: %s/%s on %s, approver %s, requested by %s, %d s",
                  login_id, provider, account or "(default)", host, approver, requested_by,
@@ -552,6 +564,8 @@ class ApproveService:
             raise ApproveError(404, "unknown_link", "unknown link")
         if self.store.has_login_receipt(record["login_id"]):
             raise ApproveError(410, "used", "this challenge is already settled")
+        if self.store.login_closed(record["login_id"]):
+            raise ApproveError(410, "closed", "this challenge is closed")
         if self.clock() >= record["link_exp"] or self.clock() >= record["request"]["exp"]:
             raise ApproveError(410, "expired", "this challenge has expired")
         return record
@@ -641,6 +655,18 @@ class ApproveService:
                  verdict.approver)
         return {"login_id": record["login_id"], "decision": decision}
 
+    def close_login(self, login_id) -> dict:
+        """Clôture TECHNIQUE d'un défi, demandée par le superviseur (jeton de
+        l'API des défis) : marque clos, efface la charge privée, libère la
+        réservation. N'écrit AUCUN reçu humain ; le lien et toute assertion
+        tardive sont ensuite refusés par `_live_login`."""
+        record = self.store.get_login(login_id) if isinstance(login_id, str) else None
+        if record is None:
+            raise ApproveError(404, "unknown_request", "unknown challenge")
+        written = self.store.close_login(record["login_id"])
+        log.info("login %s: technical closure by the login API", record["login_id"])
+        return {"login_id": record["login_id"], "closed": True, "was_open": bool(written)}
+
     def login_receipt(self, login_id: str) -> tuple[int, bytes | dict]:
         """`GET /login-receipts/<id>` : le reçu (200), en attente (202), échu (410)."""
         raw = self.store.login_receipt_bytes(login_id)
@@ -649,6 +675,8 @@ class ApproveService:
         record = self.store.get_login(login_id)
         if record is None:
             raise ApproveError(404, "unknown_request", "unknown challenge")
+        if self.store.login_closed(login_id):
+            return 410, {"status": "closed", "login_id": login_id}
         if self.clock() >= record["link_exp"] or self.clock() >= record["request"]["exp"]:
             return 410, {"status": "expired", "login_id": login_id}
         return 202, {"status": "pending", "login_id": login_id,

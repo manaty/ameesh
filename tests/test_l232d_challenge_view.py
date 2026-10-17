@@ -12,12 +12,15 @@ passkey logicielle (tests/webauthn_soft.py), horloge avançable.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import json
 import os
 import re
+import shutil
 import stat
 import tempfile
+import time
 import unittest
 from urllib.parse import urlsplit
 
@@ -25,6 +28,7 @@ from ameesh import receipts
 from ameesh.approve.config import ApproveConfig
 from ameesh.approve.config import ApproveConfig, ApproveConfigError
 from ameesh.approve.service import ApproveService
+from ameesh.approve.store import Store
 
 from .test_approve import AGENT, ALICE, ApproveBase
 from .webauthn_soft import SoftWebAuthn
@@ -99,9 +103,10 @@ class LoginCreationContractTest(unittest.TestCase):
                         dict(record["request"], decision="done")), "login")
 
 
-class LoginChallengeTest(ApproveBase):
-    #: l'API des défis est ouverte sur ce banc, avec son jeton DÉDIÉ : le
-    #: jeton de service de l'équipe n'y est jamais accepté (avis B1 dev4).
+class LoginApiMixin:
+    """Banc de l'API des défis : ouverte, avec son jeton DÉDIÉ (le jeton de
+    service de l'équipe n'y est jamais accepté, avis B1 dev4)."""
+
     LOGIN_API = True
 
     def login_api(self, method: str, path: str, body=None, **kwargs):
@@ -110,6 +115,17 @@ class LoginChallengeTest(ApproveBase):
         kwargs.setdefault("auth", self.login_token)
         return self.http(method, path, body, **kwargs)
 
+    def open_view(self, path):
+        status, headers, text = self.page(path)
+        self.assertEqual(status, 200, text)
+        self.assertSecurityHeaders(headers)
+        page = self.page_data(text, "ameesh-login")
+        status, payload = self.submit(path, self.sign(self.alice, page, decision="view"))
+        self.assertEqual(status, 200, payload)
+        return page, payload
+
+
+class LoginChallengeTest(LoginApiMixin, ApproveBase):
     def create_login(self, **overrides):
         body = {"host": "ameesh-agents-1", "provider": "gh", "account": "smichea",
                 "approver": ALICE, "requested_by": AGENT, "url": URL, "code": CODE}
@@ -123,15 +139,6 @@ class LoginChallengeTest(ApproveBase):
         self.assertNotIn(CODE, payload.decode())
         self.assertNotIn(URL, payload.decode())
         return data, link.path
-
-    def open_view(self, path):
-        status, headers, text = self.page(path)
-        self.assertEqual(status, 200, text)
-        self.assertSecurityHeaders(headers)
-        page = self.page_data(text, "ameesh-login")
-        status, payload = self.submit(path, self.sign(self.alice, page, decision="view"))
-        self.assertEqual(status, 200, payload)
-        return page, payload
 
     def fetch_login_receipt(self, login_id):
         status, _headers, payload = self.login_api("GET", "/login-receipts/" + login_id)
@@ -358,7 +365,7 @@ class LoginChallengeTest(ApproveBase):
 
     def test_ttl_borne(self):
         # 15 min au plus
-        _data, _path = self.create_login()
+        _data, _path = self.create_login(account="ttl-default")
         record = self.service.store.get_login(
             next(name[:-5] for name in os.listdir(os.path.join(
                 self.acfg.state_dir, "login-requests"))))
@@ -473,3 +480,111 @@ def receipts_render_summary_digest(request: dict) -> str:
     """L'empreinte du résumé, recalculée depuis la demande signée."""
     from ameesh.approve import render
     return render.summary_digest(render.render_login_summary(request))
+
+
+class LoginUniquenessTest(LoginApiMixin, ApproveBase):
+    """#366/B3 : un seul défi vivant par (hôte, fournisseur, compte), réservé
+    par le service ; la clôture technique libère la place, efface la charge
+    privée et ne forge jamais de reçu humain."""
+
+    def create_login(self, **overrides):
+        body = {"host": "ameesh-agents-1", "provider": "gh", "account": "smichea",
+                "approver": ALICE, "requested_by": AGENT, "url": URL, "code": CODE}
+        body.update(overrides)
+        status, _headers, payload = self.login_api("POST", "/login-requests", body)
+        return status, payload
+
+    def close_login(self, login_id):
+        status, _headers, payload = self.login_api("POST", "/login-close/" + login_id, {})
+        return status, payload
+
+    def test_un_seul_defi_vivant_par_tuple(self):
+        status, payload = self.create_login()
+        self.assertEqual(status, 201, payload)
+        first = json.loads(payload)
+        status, payload = self.create_login()
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(json.loads(payload)["error"], "already_pending")
+        # un autre compte est un autre tuple
+        self.assertEqual(self.create_login(account="other")[0], 201)
+        # la clôture technique libère la place
+        status, closed = self.close_login(first["login_id"])
+        self.assertEqual((status, json.loads(closed)["closed"]), (200, True))
+        self.assertEqual(self.create_login()[0], 201)
+
+    def test_le_recu_humain_libere_la_place(self):
+        _status, payload = self.create_login()
+        data = json.loads(payload)
+        path = urlsplit(data["link"]).path
+        _page, opened = self.open_view(path)
+        status, signed = self.submit(path, self.sign(
+            self.alice, {"challenge-done": opened["challenge_done"]}, decision="done"))
+        self.assertEqual(status, 200, signed)
+        self.assertEqual(self.create_login()[0], 201)
+
+    def test_l_echeance_libere_la_place(self):
+        now = int(self.clock())
+        self.assertEqual(self.create_login(provider_exp=now + 60)[0], 201)
+        self.assertEqual(self.create_login()[0], 409)
+        self.clock.offset = 61
+        self.assertEqual(self.create_login()[0], 201)
+
+    def test_cloture_technique_efface_et_ne_ressuscite_rien(self):
+        _status, payload = self.create_login()
+        data = json.loads(payload)
+        login_id, path = data["login_id"], urlsplit(data["link"]).path
+        self.assertIsNotNone(self.service.store.login_private(login_id))
+        status, closed = self.close_login(login_id)
+        self.assertEqual((status, json.loads(closed)["closed"]), (200, True))
+        # charge privée effacée, aucun reçu forgé
+        self.assertIsNone(self.service.store.login_private(login_id))
+        self.assertFalse(self.service.store.has_login_receipt(login_id))
+        status, _headers, payload = self.login_api("GET", "/login-receipts/" + login_id)
+        self.assertEqual((status, json.loads(payload)["status"]), (410, "closed"))
+        # le lien muet ne s'ouvre plus
+        self.assertEqual(self.page(path)[0], 410)
+        # une assertion tardive ne ressuscite rien
+        record = self.service.store.get_login(login_id)
+        challenge = receipts.b64u_encode(receipts.challenge(
+            dict(record["request"], decision="view")))
+        status, _payload = self.submit(path, self.sign(
+            self.alice, {"challenge-view": challenge}, decision="view"))
+        self.assertEqual(status, 410)
+
+    def test_la_cloture_technique_n_efface_pas_un_recu_humain(self):
+        _status, payload = self.create_login()
+        data = json.loads(payload)
+        path = urlsplit(data["link"]).path
+        _page, opened = self.open_view(path)
+        self.submit(path, self.sign(
+            self.alice, {"challenge-done": opened["challenge_done"]}, decision="done"))
+        self.assertEqual(self.close_login(data["login_id"])[0], 200)
+        status, _headers, _payload = self.login_api("GET", "/login-receipts/" + data["login_id"])
+        self.assertEqual(status, 200)  # le reçu humain reste la preuve
+
+
+class LoginReservationRaceTest(unittest.TestCase):
+    """#366/B3 : réservation atomique entre processus — deux `Store` sur le
+    même état, aucun verrou en mémoire partagé."""
+
+    def test_deux_stores_ne_prennent_pas_la_meme_place(self):
+        root = tempfile.mkdtemp(prefix="l232d-live-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        stores = [Store(root), Store(root)]
+        now = time.time()
+
+        def record(i):
+            return {"login_id": "lgn_" + ("%026x" % i), "exp": now + 900,
+                    "link_exp": now + 900,
+                    "request": {"host": "h", "provider": "gh", "account": "a",
+                                "exp": now + 900}}
+
+        def claim(i):
+            return stores[i % 2].reserve_login(record(i), now=now)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(claim, range(8)))
+        self.assertEqual(sum(1 for taken in results if taken), 1)
+        winner = results.index(True)
+        self.assertTrue(stores[winner % 2].release_login(record(winner)))
+        self.assertTrue(stores[(winner + 1) % 2].reserve_login(record(winner + 1), now=now))

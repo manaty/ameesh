@@ -248,7 +248,9 @@ def _run(cfg: Config, args) -> int:
         supervisor = login_mod.Supervisor(
             publish=login_mod.publisher(approve_client, cfg, approver=approver,
                                         requested_by=who, scope=scope),
-            health=lambda request: health_report(db, cfg, profile, request, environ=environ))
+            health=lambda request: health_report(db, cfg, profile, request, environ=environ),
+            invalidate=lambda request: approve_client.close_login_request(
+                cfg, request.login_id))
         request = supervisor.begin(
             host=cfg.host, harness=harness, account=profile.name,
             home=profile.home(environ), version=probe["version"], approver=approver,

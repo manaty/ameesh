@@ -455,6 +455,53 @@ class SupervisorTest(FakeCliTest):
         self.assertEqual(request.state, login.VIEWING)
         sup.finish(request.id, "cancel")
 
+    # -- B3 : la clôture locale invalide le défi distant ---------------------
+    def test_annuler_invalide_le_defi_distant(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        seen: list = []
+        sup = self.supervisor()
+        sup.invalidate = lambda request: seen.append(request.login_id)
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        sup.finish(request.id, "cancel")
+        self.assertEqual(seen, [request.login_id])
+
+    def test_expirer_invalide_le_defi_distant(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        seen: list = []
+        sup = self.supervisor()
+        sup.invalidate = lambda request: seen.append(request.login_id)
+        request = self.begin(sup, ttl=10)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        self.clock.now += 11
+        sup.reap()
+        self.assertEqual(seen, [request.login_id])
+
+    def test_provider_refused_invalide_le_defi_distant(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        seen: list = []
+        sup = self.supervisor(health=lambda request: "healthy", grace=0.2)
+        sup.settle = 0.2
+        sup.invalidate = lambda request: seen.append(request.login_id)
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        done = sup.finish(request.id, "done")
+        self.assertEqual((done.state, done.category), (login.DONE, "provider_refused"))
+        self.assertEqual(seen, [request.login_id])
+
+    def test_une_invalidation_en_panne_ne_change_pas_la_decision_locale(self):
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
+        sup = self.supervisor()
+
+        def boom(request):
+            raise RuntimeError("challenge service unreachable")
+
+        sup.invalidate = boom
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+        done = sup.finish(request.id, "cancel")
+        self.assertEqual((done.state, done.category), (login.CANCELLED, "cancelled"))
+
 
 class ReceiptTest(unittest.TestCase):
     @staticmethod
