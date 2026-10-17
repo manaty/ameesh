@@ -16,9 +16,33 @@ export type Body<P extends ReadPath> = Get<P> extends {
   responses: { 200: { content: { "application/json": infer B } } };
 } ? B : never;
 
+// L90: the human actions (L87) answer POST; same OpenAPI document, with the
+// body and the headers the operation declares (the `Idempotency-Key`).
+type Post<P extends keyof paths> = paths[P] extends { post: infer O } ? O : never;
+/** Paths answered by POST. */
+export type WritePath = { [P in keyof paths]: Post<P> extends never ? never : P }[keyof paths];
+type WriteParameters<P extends WritePath> = Post<P> extends { parameters: infer A } ? A : never;
+type WritePathParams<P extends WritePath> = WriteParameters<P> extends { path: infer T } ? T : never;
+type WriteHeaders<P extends WritePath> = WriteParameters<P> extends { header: infer T } ? T : never;
+/** The JSON body a POST expects. */
+export type WriteBody<P extends WritePath> = Post<P> extends {
+  requestBody: { content: { "application/json": infer B } };
+} ? B : never;
+/** The 200 body of a POST. */
+export type WriteResult<P extends WritePath> = Post<P> extends {
+  responses: { 200: { content: { "application/json": infer R } } };
+} ? R : never;
+
 export type RequestOptions<P extends ReadPath> =
   ([PathParams<P>] extends [never] ? { path?: never } : { path: PathParams<P> })
   & { query?: QueryParams<P>; signal?: AbortSignal };
+
+/** A POST: its path parameters, its required headers and its JSON body. */
+export type PostOptions<P extends WritePath> =
+  ([WritePathParams<P>] extends [never] ? { path?: never } : { path: WritePathParams<P> })
+  & ([WriteHeaders<P>] extends [never] ? { headers?: Record<string, string> }
+     : { headers: WriteHeaders<P> })
+  & { body: WriteBody<P>; signal?: AbortSignal };
 
 /** The token of the current human, asked for each request; null: none. */
 export type TokenProvider = () => string | null | Promise<string | null>;
@@ -46,6 +70,8 @@ export interface Client {
   readonly baseUrl: string;
   get<P extends ReadPath>(path: P, ...options: RequestOptions<P> extends { path: unknown }
     ? [RequestOptions<P>] : [RequestOptions<P>?]): Promise<Body<P>>;
+  /** A human action (L87): one request, the same body on a retry. */
+  post<P extends WritePath>(path: P, options: PostOptions<P>): Promise<WriteResult<P>>;
   /** A URL of the mesh and the headers to call it with (used by the stream). */
   request(path: string, init?: RequestInit): Promise<Response>;
 }
@@ -79,11 +105,7 @@ export function createClient(options: ClientOptions): Client {
     return response;
   }
 
-  async function get(path: string, opts: {
-    path?: Record<string, string | number>; query?: Record<string, unknown>; signal?: AbortSignal;
-  } = {}): Promise<unknown> {
-    const url = expand(path, opts.path ?? {}) + queryString(opts.query ?? {});
-    const response = await request(url, { method: "GET", signal: opts.signal });
+  async function answer(response: Response): Promise<unknown> {
     const body = await response.json().catch(() => null) as
       { error?: unknown; message?: unknown } | null;
     if (!response.ok) {
@@ -94,7 +116,30 @@ export function createClient(options: ClientOptions): Client {
     return body;
   }
 
-  return { baseUrl, get: get as Client["get"], request };
+  async function get(path: string, opts: {
+    path?: Record<string, string | number>; query?: Record<string, unknown>; signal?: AbortSignal;
+  } = {}): Promise<unknown> {
+    const url = expand(path, opts.path ?? {}) + queryString(opts.query ?? {});
+    return answer(await request(url, { method: "GET", signal: opts.signal }));
+  }
+
+  async function post(path: string, opts: {
+    path?: Record<string, string | number>; headers?: Record<string, string>;
+    body?: unknown; signal?: AbortSignal;
+  } = {}): Promise<unknown> {
+    const url = expand(path, opts.path ?? {});
+    return answer(await request(url, {
+      method: "POST", signal: opts.signal,
+      headers: { "Content-Type": "application/json", ...(opts.headers ?? {}) },
+      body: JSON.stringify(opts.body ?? {}),
+    }));
+  }
+
+  // the two casts mirror `get`: the implementation takes strings, the interface
+  // carries the OpenAPI types of each path (post's generic result is not
+  // provable from the implementation, hence the `unknown` step).
+  return { baseUrl, get: get as Client["get"],
+           post: post as unknown as Client["post"], request };
 }
 
 /** `/lots/{id}` with `{id: 7}` → `/lots/7`, each value encoded. */
