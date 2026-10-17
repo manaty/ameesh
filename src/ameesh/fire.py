@@ -810,11 +810,11 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     complétés par la déclaration `radar.projects.<p>.required_checks` (des
     noms, sans application imposée).
 
-    Quand la forge ne peut pas être lue (jeton sans droits, forge muette),
-    la déclaration du projet la remplace ; sans déclaration, la lecture
-    refuse. La déclaration ne peut jamais retirer un check que la forge
-    exige : elle s'ajoute. Les noms sont exacts de bout en bout : la
-    déclaration `tests ` ne vaut pas le contexte `tests`."""
+    Quand une lecture de la forge échoue (jeton sans droits, forge muette), la
+    déclaration du projet la remplace **sans retirer l'autre lecture** ; sans
+    déclaration, la lecture refuse. La déclaration ne peut jamais retirer un
+    check que la forge exige : elle s'ajoute. Les noms sont exacts de bout en
+    bout : la déclaration `tests ` ne vaut pas le contexte `tests`."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
                      if str(name).strip())
@@ -822,14 +822,17 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
         if declared:
             return declared
         raise land.LandError("no target branch known: its required checks cannot be read")
-    try:
-        forged = _protection_required(slug, target, gh=gh) \
-            + _ruleset_required(slug, target, gh=gh)
-    except land.LandError:
-        if declared:
-            return declared
-        raise
-    return tuple(dict.fromkeys(forged + declared))
+    forged = []
+    for read in (lambda: _protection_required(slug, target, gh=gh),
+                 lambda: _ruleset_required(slug, target, gh=gh)):
+        try:
+            forged.extend(read())
+        except land.LandError:
+            # Une source illisible n'efface pas l'autre : la déclaration
+            # remplace la seule lecture manquante (#2285).
+            if not declared:
+                raise
+    return tuple(dict.fromkeys(tuple(forged) + declared))
 
 
 def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,

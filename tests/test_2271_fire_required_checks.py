@@ -280,10 +280,20 @@ class RulesetTest(unittest.TestCase):
         with self.assertRaises(land.LandError):
             self._required(gh)
 
-    def test_a_declaration_covers_an_unreadable_ruleset(self):
+    def test_a_declaration_covers_an_unreadable_ruleset_without_erasing_the_protection(self):
+        # #2285 : une source illisible n'efface pas l'autre ; la déclaration
+        # ne retire jamais un check que la forge exige encore.
         gh = FakeGh(rules_error="gh: Resource not accessible by integration (HTTP 403)")
         project = _project(required_checks=("coverage",))
-        self.assertEqual(self._required(gh, project=project), (("coverage", None),))
+        self.assertEqual(self._required(gh, project=project),
+                         (("tests", 15368), ("coverage", None)))
+
+    def test_a_declaration_covers_an_unreadable_protection_without_erasing_the_rulesets(self):
+        gh = FakeGh(error="gh: Resource not accessible by integration (HTTP 403)",
+                    rules=RULESET)
+        project = _project(required_checks=("coverage",))
+        self.assertEqual(self._required(gh, project=project),
+                         (("tests", 15368), ("coverage", None)))
 
     def test_a_malformed_ruleset_page_is_refused(self):
         with self.assertRaises(land.LandError):
