@@ -4222,17 +4222,20 @@ class AgentWorker(threading.Thread):
 
         Best-effort : ne lève jamais, et ne fait rien si la croissance du tour
         reste sous `TURN_TRIM_RSS_GROWTH` (un tour ordinaire ne paie pas le
-        geste) ou si la plateforme ne sait pas mesurer/rendre."""
+        geste) ou si la plateforme ne sait pas mesurer/rendre.
+
+        #2107/#2108 : le journal dit le motif exact (`platform.process.TRIM_*`)
+        — « rien à rendre » n'est pas une plateforme sans `malloc_trim`."""
         try:
             from .platform import process
             apres = process.rss_bytes()
             if rss_before is None or apres is None or apres - rss_before < TURN_TRIM_RSS_GROWTH:
                 return
             croissance = apres - rss_before
-            rendu = process.release_free_memory()
+            motif = process.trim_free_memory()
             log_async("[%s] turn memory: RSS +%.1f MiB, arenas %s"
                       % (self.name, croissance / (1024.0 * 1024.0),
-                         "returned to the kernel" if rendu else "not releasable here"))
+                         process.TRIM_LABELS.get(motif, motif)))
         except Exception as exc:  # une mesure ratée ne défait pas le tour
             log_async("[%s] turn memory not released (%s)" % (self.name, exc))
 
