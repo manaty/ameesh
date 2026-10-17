@@ -27,9 +27,9 @@ class ProbeHealthTest(unittest.TestCase):
         environ = {"GH_CONFIG_DIR": "/another", "GH_TOKEN": "canary",
                    "GITHUB_TOKEN": "canary", "GH_HOST": "evil.example"}
         profile = accounts_mod.Profile(harness="gh", name="", path=self.home, declared=True)
-        seen = {}
+        seen = {"argv": []}
         def run(_argv, **kwargs):
-            seen["argv"] = list(_argv)
+            seen["argv"].append(list(_argv))
             seen.update(kwargs.get("env") or {})
             return 1, "not logged in"
         with mock.patch("ameesh.sentinel.shutil.which", return_value="gh"):
@@ -38,8 +38,10 @@ class ProbeHealthTest(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", seen)
         self.assertNotIn("GH_HOST", seen)
         # N5 : la sonde vise github.com comme l'adaptateur de connexion
-        self.assertEqual(seen.get("argv"),
-                         ["gh", "auth", "status", "--hostname", "github.com"])
+        # (B3 relit aussi le jeton après la sonde : on vérifie la présence de
+        # la commande de statut, pas la dernière invocation)
+        self.assertIn(["gh", "auth", "status", "--hostname", "github.com"],
+                      seen.get("argv"))
         self.assertEqual(seen.get("GH_CONFIG_DIR"), self.home)
         self.assertEqual(verdict.state, "failing")
 
