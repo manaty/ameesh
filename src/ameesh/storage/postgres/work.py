@@ -766,6 +766,10 @@ class WorkItems(interface.WorkItems):
         previous_reviewers: list[str] = []
         reviewer_set = ""
         params: list = [assignee]
+        if has_reviewers(self.db):
+            # #2204/N1 : le journal Python ci-dessous nomme le retrait avec
+            # l'acteur ; le trigger d'audit ne doit pas doubler la ligne.
+            self.db.execute("SET LOCAL ameesh.reviewer_audit = 'python'")
         if has_reviewer(self.db):
             # #813 : NO KEY UPDATE suffit à sérialiser deux réassignations, et
             # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
@@ -844,6 +848,8 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             with_reviewer = has_reviewer(self.db)
             with_reviewers = has_reviewers(self.db)
+            if with_reviewers:
+                tx.execute("SET LOCAL ameesh.reviewer_audit = 'python'")
             seen = tx.query(
                 "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
@@ -994,6 +1000,8 @@ class WorkItems(interface.WorkItems):
                 # la désignation tombe dans la même écriture.
                 reviewer_set = ""
                 params: list = [row["delegated_by"]]
+                if with_reviewers:
+                    tx.execute("SET LOCAL ameesh.reviewer_audit = 'python'")
                 if with_reviewer:
                     reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
                                     " ELSE reviewer END")

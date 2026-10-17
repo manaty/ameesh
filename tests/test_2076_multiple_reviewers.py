@@ -12,9 +12,10 @@ from ameesh import alert_briefs, progress, stagnation, storage, work
 
 
 class ReviewWaitingTest(unittest.TestCase):
-    def marks(self, *verdicts, frozen="a" * 40):
-        item = {"state": "qa", "assignee": "author", "reviewer": "second",
-                "reviewers": ["first", "second"]}
+    def marks(self, *verdicts, frozen="a" * 40, reviewers=None):
+        reviewers = list(reviewers or ("first", "second"))
+        item = {"state": "qa", "assignee": "author",
+                "reviewer": reviewers[-1] if reviewers else "", "reviewers": reviewers}
         rows = [{"kind": "frozen", "at_ts": 1, "sha": frozen}]
         rows += [{"kind": "verdict", "at_ts": i + 2, "actor": actor,
                   "verdict": verdict, "sha": sha}
@@ -72,6 +73,24 @@ class ReviewWaitingTest(unittest.TestCase):
                 self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
                 self.assertEqual(progress.lot_state("qa", marks), "approved")
 
+    def test_blocked_verdict_of_a_withdrawn_reviewer_does_not_hold_the_lot(self):
+        a = "a" * 40
+        item, marks = self.marks(("first", "blocked", a), ("second", "ok", a),
+                                 reviewers=["second"])
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+        self.assertEqual(progress.lot_state("qa", marks), "approved")
+        self.assertEqual(marks["pending_reviewers"], [])
+
+    def test_human_prefixed_actor_matches_a_bare_designation(self):
+        a = "a" * 40
+        item, marks = self.marks(("first", "ok", a), ("human:second", "ok", a))
+        self.assertEqual(marks["pending_reviewers"], [])
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+        item, marks = self.marks(("first", "ok", a), ("second", "ok", a),
+                                 reviewers=["first", "human:second"])
+        self.assertEqual(marks["pending_reviewers"], [])
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+
     def test_waiver_is_not_a_reviewer_and_light_lots_can_merge(self):
         from ameesh import lot_class
         item, marks = self.marks()
@@ -123,11 +142,23 @@ class MultipleReviewersTest(PgTestCase):
         self.assertEqual(row["reviewers"], ["first"])
         self.assertEqual(row["reviewer"], "first")
 
+    def test_direct_sql_assignment_journals_the_cleared_reviewer(self):
+        self.designate("first")
+        self.designate("second")
+        self.db.execute("UPDATE work_items SET assignee = 'first' WHERE id = %s",
+                        (self.lot["id"],))
+        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
+        notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
+        self.assertIn("reviewer first cleared (they now hold the lot)", notes)
+
     def test_legacy_writer_accumulates_and_cannot_reintroduce_author(self):
         for name in ("first", "second", "first"):
             self.db.execute("UPDATE work_items SET reviewer = %s WHERE id = %s",
                             (name, self.lot["id"]))
-        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["first", "second"])
+        # #2204/N2 : re-désigner un nom déjà présent le remet en dernier.
+        row = work.get(self.db, self.lot["id"])
+        self.assertEqual(row["reviewers"], ["second", "first"])
+        self.assertEqual(row["reviewer"], "first")
         self.db.execute("UPDATE work_items SET assignee = 'first' WHERE id = %s",
                         (self.lot["id"],))
         self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
@@ -204,8 +235,12 @@ class MultipleReviewersTest(PgTestCase):
     def test_pre_migration_reads_backfill_and_live_connection(self):
         from ameesh import db as db_mod
         migration = Path(REPO, "src/ameesh/migrations/0456_work_item_reviewers.sql").read_text()
+        audit = Path(REPO, "src/ameesh/migrations/0462_reviewer_audit.sql").read_text()
         self.db.execute("DROP TRIGGER work_item_reviewers_sync ON work_items")
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewers")
+        # LIFO : 0456 d'abord, puis 0462 qui rétablit le trigger d'audit.
+        self.addCleanup(self.db.execute, audit)
         self.addCleanup(self.db.execute, migration)
         self.db.__dict__.pop("_has_reviewers", None)
         self.db.execute("UPDATE work_items SET reviewer = 'first' WHERE id = %s",

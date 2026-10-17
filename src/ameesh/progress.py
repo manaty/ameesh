@@ -278,11 +278,14 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     from .work_reviewers import designated as designated_reviewers
     reviewers = designated_reviewers(item)
     current = {v["actor"]: v for v in verdicts if _verdict_applies(v, last_frozen)}
-    pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
+    pending = ([name for name in reviewers
+                if not any(_same_actor(name, actor) and verdict["kind"] == "ok"
+                           for actor, verdict in current.items())]
                if item.get("reviewers") is not None else [])
     # Every designated reviewer owes their own verdict on the frozen head.
     # A later GO from another reviewer cannot erase a blocking verdict.
-    blocked = [v for v in current.values() if v["kind"] == "blocked"]
+    blocked = [v for v in current.values() if v["kind"] == "blocked"
+               and any(_same_actor(name, v["actor"]) for name in reviewers)]
     if item.get("reviewers") is not None and reviewers and blocked:
         last = max(blocked, key=lambda v: v["at_ts"])
         verdict_current = True
@@ -322,6 +325,20 @@ def _same_commit(a: str | None, b: str | None) -> bool:
     Un identifiant vide n'est jamais « le même commit »."""
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
     return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _same_actor(left: str | None, right: str | None) -> bool:
+    """#2204/N4 : `seb` et `human:seb` nomment le même humain. Un relecteur
+    déclaré sous la forme nue doit donc reconnaître l'approbation humaine
+    (`auth_approver`) enregistrée sous `human:seb`, et inversement."""
+    left, right = (left or "").strip(), (right or "").strip()
+    if left == right:
+        return True
+    if left.startswith("human:"):
+        return left[len("human:"):] == right
+    if right.startswith("human:"):
+        return right[len("human:"):] == left
+    return False
 
 
 def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
