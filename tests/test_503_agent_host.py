@@ -68,6 +68,10 @@ elif sys.argv[1] == 'show':
     row = dict(row, lease_owner='runner-' + name + '@host-agents', lease_epoch=7, lease_expires_ts=time.time()+300)
     pause = state / ('pause-' + name)
     motif = state / ('motif-' + name)
+    if scenario == 'pause-coupee-etat-perdu' and pause.exists() \
+            and not (state / 'lecture-perdue').exists():
+        (state / 'lecture-perdue').touch()
+        sys.exit(1)
     # R1 B1 : après notre pose et avant notre reprise, le monde extérieur lève
     # notre drain puis pose une NOUVELLE pause (humaine, étrangère).
     if scenario == 'drain-remplace' and motif.exists() and '#2152' in motif.read_text() \
@@ -86,7 +90,8 @@ elif sys.argv[1] == 'show':
     if name == 'dev9' and scenario in ('chaines', 'chaines-pause-error',
                                        'chaines-resume-error', 'pause-concurrente',
                                        'drain-remplace', 'pause-reponse-perdue',
-                                       'pause-coupee', 'pause-perdue-sans-pose',
+                                       'pause-coupee', 'pause-coupee-etat-perdu',
+                                       'pause-perdue-sans-pose',
                                        'drain-refuse-identite') \
             and not pause.exists():
         row['status'] = 'running'
@@ -132,7 +137,7 @@ elif sys.argv[1] in ('pause', 'resume'):
             # R1 B2 : la pose a abouti, mais la réponse est illisible.
             print('{bad-json')
             sys.exit(0)
-        elif scenario == 'pause-coupee':
+        elif scenario in ('pause-coupee', 'pause-coupee-etat-perdu'):
             # R1 B2 : la pose a abouti, puis le lien SSH tombe (rc ≠ 0).
             sys.exit(1)
         else:
@@ -389,6 +394,17 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn("n'est pas celle de ce drain", p.stderr)
         self.assertFalse((self.state / 'pause-dev9').exists())
         self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+
+    def test_lost_pause_and_reconciliation_still_attempt_conditional_cleanup(self):
+        """A committed pause stays tracked when its reconciliation read fails."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='pause-coupee-etat-perdu')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertTrue((self.state / 'lecture-perdue').exists())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        self.assertIn('resume dev9 --operator', self.operateur())
+        self.assertIn('--expect-reason', self.operateur())
 
     def test_operator_gesture_refused_in_an_agent_session_stops_safely(self):
         """Périmètre annoncé : le drain est un geste d'opérateur. Un refus

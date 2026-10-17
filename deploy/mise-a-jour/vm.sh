@@ -370,16 +370,19 @@ pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état r
 poser_drain() {  # $1 persona, $2 secondes déjà attendues
   local motif sortie change etat pose raison
   motif=$(drain_motif "$(drain_jeton)")
+  # Track the intent before the call: both its reply and the reconciliation
+  # read can fail after commit. EXIT still attempts the conditional cleanup.
+  DRAINS+=("$1"$'\t'"$motif")
   echo "$1 : en tour depuis ${2}s — pose d'une pause opérateur (drain #2152)"
   if sortie=$(pause_operateur "$1" "$motif"); then
     if change=$(json_champ changed <<<"$sortie") && [ -n "$change" ]; then
       if [ "$change" = 1 ]; then
-        DRAINS+=("$1"$'\t'"$motif")
         echo "$1 : drain posé — le tour en cours se termine, aucun tour interrompu ; redémarrage dès qu'il est hors tour"
         return 0
       fi
       # Posée entre notre lecture et la nôtre : elle n'est pas de ce script,
       # il ne la lèvera pas (on ne lève que la pause qu'on a posée).
+      drain_retire "$1"
       echo "$1 : pause opérateur déjà posée par un autre acteur — laissée en place"
       return 0
     fi
@@ -394,10 +397,10 @@ poser_drain() {  # $1 persona, $2 secondes déjà attendues
   fi
   IFS='|' read -r pose raison <<<"$etat"
   if [ "$pose" = 1 ] && [ "$raison" = "$motif" ]; then
-    DRAINS+=("$1"$'\t'"$motif")
     echo "$1 : drain posé (confirmé par l'état réel) — le tour en cours se termine, aucun tour interrompu"
     return 0
   fi
+  drain_retire "$1"
   echo "$1 : la pause en place n'est pas celle de ce drain — aucun redémarrage, aucune levée" >&2
   return 1
 }
