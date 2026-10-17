@@ -24,6 +24,7 @@ chose sur la sortie standard (le protocole l'interdit).
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import signal
@@ -58,7 +59,8 @@ def _save_coverage() -> None:
     et rien n'est fait.
     """
     try:
-        import coverage
+        coverage = importlib.import_module(
+            os.environ.get("FAKE_ACP_COVERAGE_MODULE", "coverage"))
         collector = coverage.Coverage.current()
         if collector is not None:
             collector.save()

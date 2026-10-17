@@ -8,8 +8,10 @@ partielle et la prévalidation refuse (incident #1770, gardes #1707/#1257
 intactes). Le faux agent est un processus de test : il écrit sa mesure avant
 de sortir, sans toucher au pont ni aux agents réels.
 
-Le module `coverage` est ici un doublon de test : ces témoins sont hermétiques
-et ne dépendent pas de coverage installé. Le cas `FAKE_ACP_IGNORE_SIGTERM=1`
+Le module de mesure est ici un doublon de test (`fake_coverage_2177`, nom
+distinct de `coverage` pour ne pas masquer la mesure réelle) : ces témoins
+sont hermétiques et ne dépendent pas de coverage installé. Le cas
+`FAKE_ACP_IGNORE_SIGTERM=1`
 reste celui du test d'annulation : la mesure est sauvée, puis l'agent continue
 d'ignorer SIGTERM, donc le pont exerce bien sa grâce.
 """
@@ -38,7 +40,8 @@ class CoverageSaveOnSigtermTest(unittest.TestCase):
         self.marker = os.path.join(self.tmp, "saved")
         self.covpy = os.path.join(self.tmp, "covpy")
         os.makedirs(self.covpy)
-        with open(os.path.join(self.covpy, "coverage.py"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(self.covpy, "fake_coverage_2177.py"), "w",
+                  encoding="utf-8") as fh:
             fh.write(textwrap.dedent("""\
                 import os
 
@@ -59,6 +62,7 @@ class CoverageSaveOnSigtermTest(unittest.TestCase):
         env = child_env(
             FAKE_ACP_MODE="mute",
             FAKE_ACP_READY="1",
+            FAKE_ACP_COVERAGE_MODULE="fake_coverage_2177",
             FAKE_COVERAGE_SAVE=self.marker,
             PYTHONPATH=self.covpy + os.pathsep + SRC
                       + os.pathsep + os.environ.get("PYTHONPATH", ""))
