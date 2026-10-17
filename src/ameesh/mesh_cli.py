@@ -1713,8 +1713,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
             if item.get("reviewer") == work.REVIEWER_NONE:
                 print("reviewer : — (verdict not required, #1979)")
-            elif item.get("reviewer"):
-                print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
+            else:
+                from .work_reviewers import designated
+                if designated(item):
+                    print("reviewer : %s (designated for the review, #2076)" %
+                          ", ".join(designated(item)))
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -1840,13 +1843,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 if args.correct is not None else ""))
             return 0
         if args.work_command == "reviewer":
-            # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
+            # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
             # sans aller-retour build/qa ; c'est la commande que l'alerte
             # `stale_lot` recommande à l'orchestrateur du projet.
             # #1979 : `--remove` retire la désignation, `--no-verdict` marque
             # « verdict non requis » (résolution de composition mécanique,
             # canon §11 bis/#87) : l'attente passe à la fusion, sans rappel.
-            if args.agent and (args.remove or args.no_verdict):
+            if args.no_verdict and (args.agent or args.remove):
                 print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
                       "mutually exclusive", file=sys.stderr)
                 return 2
@@ -1854,7 +1857,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
                       file=sys.stderr)
                 return 2
-            if args.remove:
+            if args.remove and args.agent:
+                item = work.designate_reviewer(cfg, db, args.id, args.agent,
+                                               actor=args.actor, remove=True)
+                print("lot #%d: reviewer %s removed (state %s, by %s)" % (
+                    item["id"], args.agent, item["state"],
+                    args.actor or "the bound identity"))
+            elif args.remove:
                 item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
                 print("lot #%d: reviewer designation removed (state %s, by %s)" % (
                     item["id"], item["state"], args.actor or "the bound identity"))
@@ -2779,14 +2788,14 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
-        help="#705: designate (or change) the reviewer of a lot already in qa, "
+        help="#2076: add a designated reviewer of a lot already in qa, "
              "without a build/qa round trip")
     pw_reviewer.add_argument("id", type=int)
     pw_reviewer.add_argument("agent", nargs="?", metavar="AGENT",
                              help="a registry agent, or human:<id>; never the lot's assignee")
     pw_reviewer.add_argument("--remove", action="store_true",
-                             help="#1979: remove the designation (the review goes back to "
-                                  "« verdict from a reviewer (none designated) »)")
+                             help="#2076: remove AGENT's designation; without AGENT, "
+                                  "remove all designations (#1979)")
     pw_reviewer.add_argument("--no-verdict", dest="no_verdict", action="store_true",
                              help="#1979: mark « verdict not required » (mechanical composition "
                                   "resolution, canon §11 bis/#87): the lot waits for its merge "
