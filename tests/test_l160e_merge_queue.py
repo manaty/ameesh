@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -21,7 +22,7 @@ from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
                     resolutions, storage, work)
 
 from .support import PgTestCase
-from .test_l160b_radar import LOTS, MIG, _git, git_env, make_repo
+from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
 from .test_l160d_resolutions import FakeWork, _commit_on, _identity, _manual_resolution
 
 
@@ -491,10 +492,11 @@ class TargetResolutionTest(_Base):
 
 
 class ClassOfSourcesTest(unittest.TestCase):
-    """Revue #544 r1 : `_class_of` lit toutes les sources de la tête gelée et
-    garde la plus haute — une lecture calculée ne se rétrograde jamais, et un
-    doute ne se lit pas comme une classe sensible. #2207 : la cible distante
-    prime sur un `main` local en retard."""
+    """Revue #544 r1 : entre lectures de la même borne, `_class_of` garde la
+    plus haute — une lecture calculée ne se rétrograde jamais, et un doute ne
+    se lit pas comme une classe sensible. #2207 : les bornes des lectures
+    comparées et le choix de la cible fraîche sont couverts par le témoin Git
+    réel `ClassOfFreshTargetGitTest` (main et develop)."""
 
     def read(self, answers):
         calls = []
@@ -542,24 +544,130 @@ class ClassOfSourcesTest(unittest.TestCase):
         self.assertEqual(out["doubt"], True)
         self.assertEqual(out["why"], "diff illisible")
 
-    def test_la_cible_distante_prime_sur_un_main_local_en_retard(self):
-        # #2207 : le `main` local du worktree était en retard sur origin/main ;
-        # le diff emportait des commits déjà fusionnés, dont des chemins
-        # sensibles, et classait `sensitive` un lot léger.
-        calls, fake = self.read({
-            "origin/main": {"class": "light", "doubt": False, "why": "origin"},
-            "main": {"class": "sensitive", "doubt": False, "why": "main local"}})
 
-        def present(repo, ref):
-            return "c" * 40 if ref in ("origin/main", "main") else None
+class ClassOfFreshTargetGitTest(unittest.TestCase):
+    """#2207, R1 : la classe de la file se lit entre la cible **fraîche** et la
+    tête gelée, jamais depuis le `main`/`develop` local du checkout des agents
+    ni depuis la copie que le clone `--shared` a prise de ce checkout.
 
-        with mock.patch.object(plan_git, "_commit", side_effect=present), \
-                mock.patch.object(lot_class, "of_lot", side_effect=fake):
-            out = merge_queue._class_of(None, 1, {"app": "ameesh"}, "depot", "clone",
-                                        "main", "f" * 40)
-        self.assertEqual(out["class"], "light")
-        self.assertEqual(out["why"], "origin")
-        self.assertEqual(calls, ["origin/main", "origin/main"])
+    Témoin Git réel : upstream à A, agents clonés à A ; upstream avance à B
+    avec une migration déjà fusionnée (chemin sensible), puis `lot/light` part
+    de B et ne change que `README.md`. La classe attendue est `light` : le
+    fichier sensible de B n'appartient pas au lot."""
+
+    def canon(self):
+        # Politique du projet : tout `.sql` est sensible, le reste léger.
+        return types.SimpleNamespace(
+            root="canon", sources=[],
+            federation={"review_policies": {"risk_classes": {
+                "projects": {"ameesh": {
+                    "default": "light",
+                    "rules": [{"paths": ["**/*.sql"], "class": "sensitive"}]}}}}})
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-2207-class-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.row, self.marks = {}, []
+        for obj, name, kwargs in (
+                (work, "configured_canons", {"return_value": [self.canon()]}),
+                (work, "get", {"side_effect": lambda db, n: self.row}),
+                (work, "milestones", {"side_effect": lambda db, n, *a: self.marks})):
+            patcher = mock.patch.object(obj, name, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def witness(self, target):
+        """(upstream, agents, A, B, C) pour une cible `main` ou `develop`."""
+        slug = target.replace("/", "-")
+        upstream = os.path.join(self.tmp, "upstream-" + slug)
+        os.makedirs(upstream)
+        _git(upstream, "init", "-q", "-b", target)
+        _write(upstream, "README.md", "A\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "A")
+        a = _git(upstream, "rev-parse", "HEAD")
+        agents = os.path.join(self.tmp, "agents-" + slug)
+        _git(self.tmp, "clone", "-q", "--branch", target, upstream, agents)
+        # B : un chemin sensible déjà fusionné dans la cible, hors du lot.
+        _write(upstream, "src/ameesh/migrations/9999_already_merged.sql", "-- merged\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "B, already merged")
+        b = _git(upstream, "rev-parse", "HEAD")
+        # C : le lot, qui ne touche que README.md depuis B.
+        _git(upstream, "checkout", "-q", "-b", "lot/light", b)
+        _write(upstream, "README.md", "C\n")
+        _git(upstream, "commit", "-qam", "C, light")
+        c = _git(upstream, "rev-parse", "HEAD")
+        _git(upstream, "checkout", "-q", target)
+        return upstream, agents, a, b, c
+
+    def lot(self, target):
+        self.row = {"id": 1, "app": "ameesh", "branch": "lot/light", "state": "qa",
+                    "assignee": "a1", "branch_target": target, "type": "evolution"}
+
+    def clone(self, agents, target):
+        return resolutions.Replayer(
+            agents, os.path.join(self.tmp, "clone-" + target.replace("/", "-")))
+
+    def test_admission_fetches_the_target_and_reads_the_fresh_class(self):
+        """P2-1 : le fetch d'admission doit ramener la cible (`QUEUE_REF`) ; les
+        agents n'ont jamais récupéré B ni C, seul le clone les a."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                self.lot(target)
+                self.marks = [{"id": 1, "kind": "frozen", "sha": c, "at_ts": 1.0}]
+                clone = self.clone(agents, target)
+                ready = merge_queue.readiness(
+                    None, 1, agents, clone=clone, cfg=None,
+                    ci=lambda branch: {"number": 7, "green": True, "head": c,
+                                       "draft": False})
+                self.assertEqual(ready["class"], "light")
+                self.assertEqual(ready["frozen_sha"], c)
+                # la cible fraîche est dans le clone, pas la copie locale A
+                self.assertEqual(_git(clone.path, "rev-parse",
+                                      merge_queue.QUEUE_REF + target), b)
+                self.assertEqual(_git(agents, "rev-parse", target), a)
+                # le checkout des agents n'a été ni fetché ni écrit
+                self.assertNotEqual(_git(agents, "rev-parse",
+                                         "refs/remotes/origin/" + target), b)
+                self.assertEqual(_git(agents, "rev-parse", "HEAD"), a)
+
+    def test_the_clone_cached_target_is_not_a_base(self):
+        """P2-1 : la copie `origin/<cible>` du clone `--shared` vaut le local A
+        des agents ; elle ne doit pas expliquer la classe."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                # l'agent a récupéré son origin (B), son local reste en A
+                _git(agents, "fetch", "-q", "origin")
+                clone = self.clone(agents, target)
+                merge_queue.fetch_fresh(agents, ["lot/light"], clone)
+                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
+                self.lot(target)
+                out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                            target, c, cfg=None)
+                self.assertEqual(out["class"], "light")
+                self.assertFalse(out["doubt"])
+
+    def test_a_stale_agent_target_does_not_overclassify_the_fresh_read(self):
+        """P2-2 : même avec `QUEUE_REF` frais, un `origin/<cible>` d'agent
+        remis en arrière (A) ne doit pas surclasser la lecture fraîche."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                _git(agents, "fetch", "-q", "origin")   # origin/<cible> = B
+                clone = self.clone(agents, target)
+                merge_queue.fetch_fresh(agents, ["lot/light", target], clone)
+                # la ref de l'agent redevient périmée, comme dans le témoin R1
+                _git(agents, "update-ref", "refs/remotes/origin/" + target, a)
+                self.assertEqual(_git(agents, "rev-parse",
+                                      "refs/remotes/origin/" + target), a)
+                self.lot(target)
+                out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                            target, c, cfg=None)
+                self.assertEqual(out["class"], "light")
+                self.assertFalse(out["doubt"])
 
 
 class OrderTest(unittest.TestCase):

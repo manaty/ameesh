@@ -330,19 +330,34 @@ def _class_base(repo: str, target: str, *, queue: bool = False) -> str | None:
     #2207 : un `main` local en retard sur `origin/main` faisait entrer dans le
     diff des commits déjà fusionnés (dont des chemins sensibles) et classait
     `sensitive` un lot léger. La cible distante dit ce que la file va
-    fusionner : la référence de la file d'abord (clone du radar), puis
-    `origin/<cible>`, puis la cible locale."""
+    fusionner : `origin/<cible>` avant la cible locale dans un checkout.
+
+    Dans le clone de la file (`queue=True`), **seule** la cible récupérée
+    fraîchement sous `QUEUE_REF` fait foi : `origin/<cible>` y est la copie que
+    le clone `--shared` a prise du checkout des agents, donc la cible locale
+    périmée de sa source, jamais l'origin du projet (P2-1 de la revue R1)."""
     wanted = _remote_branch(target)
-    candidates = []
-    if queue:
-        candidates.append(QUEUE_REF + target)
-    for candidate in ("origin/" + wanted, target):
-        if candidate not in candidates:
-            candidates.append(candidate)
+    candidates = ([QUEUE_REF + wanted] if queue
+                  else ["origin/" + wanted, wanted])
     for candidate in candidates:
         if plan_git._commit(repo, candidate):
             return candidate
     return None
+
+
+def _class_ref(repo: str, target: str, sha: str, *, queue: bool = False) -> str:
+    """La référence de `repo` qui nomme la cible fraîche `sha`, sinon le commit.
+
+    Le diff de classe se lit toujours entre **les mêmes** deux commits : une
+    source dont la référence de cible ne pointe pas sur `sha` est périmée et
+    ne doit pas fournir une autre borne (P2-2 de la revue R1)."""
+    wanted = _remote_branch(target)
+    candidates = ([QUEUE_REF + wanted] if queue
+                  else ["origin/" + wanted, wanted])
+    for candidate in candidates:
+        if plan_git._commit(repo, candidate) == sha:
+            return candidate
+    return sha
 
 
 _SCP = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
@@ -461,6 +476,10 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     then the project's, then the repository's default) carries through the
     classification and the admission (revue #544 r2).
 
+    #2207 : la branche **et la cible** sont récupérées fraîches dans le clone
+    du radar ; la classe, comme toutes les lectures comparées, se lit contre
+    ce même commit de cible, jamais contre la cible locale d'un checkout.
+
     L756 (#566): a lot of class **release** must additionally certify its
     frozen head with a **full-suite** run — a push or a manual dispatch,
     never the impacted-only plan of a pull request (`full_ci`,
@@ -512,10 +531,25 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     if not freeze or not freeze.get("sha"):
         raise QueueError("lot #%d is not frozen: ameesh work milestone %d frozen --sha <commit>"
                          % (lot, lot))
-    tip, where = branch_tip(repo, row["branch"], clone)
+    # #2207 : la cible est récupérée avec la branche, dans le même fetch. Le
+    # clone `--shared` a pris `origin/<cible>` du checkout des agents, qui peut
+    # être en retard : sans cette récupération, la classe et la fusion se
+    # lisaient sur une cible périmée (P2-1 de la R1).
+    names = [row["branch"]] + ([target] if target else [])
+    try:
+        tips, where = fetch_fresh(repo, names, clone)
+    except QueueError as exc:
+        raise QueueError("cannot fetch branch %s%s from origin: %s"
+                         % (row["branch"], " and target %s" % target if target else "",
+                            str(exc))) from exc
+    tip = tips.get(row["branch"])
     if not tip:
+        if where != repo:
+            raise QueueError("cannot fetch branch %s from origin (no such branch there): push "
+                             "it again" % row["branch"])
         raise QueueError("branch %s of lot #%d is neither local nor on origin"
                          % (row["branch"], lot))
+    fresh_target = tips.get(target) if target else None
     frozen = pinned(where, freeze["sha"])
     if frozen is None and not _HEX.fullmatch(freeze["sha"].strip().lower()):
         raise QueueError("the freeze of lot #%d names %r, not a commit id: freeze it again "
@@ -526,7 +560,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
-    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
+    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg,
+                      base=fresh_target)
     # #1374 : la même porte que le feu — avis comptés par classe, indépendants
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
     # `blocked` d'un autre relecteur (P1-1).
@@ -577,34 +612,57 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
 
 
 def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
-              tip: str, *, cfg=None) -> dict:
+              tip: str, *, cfg=None, base: str | None = None) -> dict:
     """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
 
-    Le clone de la file range les branches sous `QUEUE_REF` ; à défaut la
-    cible distante (`origin/<cible>`, #2207) ou locale y est tentée, puis le
-    dépôt du projet. `cfg` absent ou dépôt illisible : `lot_class.of_lot` rend
-    un doute (`sensitive`, drapeau `doubt`), et la file garde l'exigence de
-    verdict.
+    La classe se lit entre la cible **fraîche** et la tête gelée. La cible
+    fraîche vient de l'admission (`base`, le commit récupéré par `readiness`),
+    sinon de la cible que le radar a récupérée sous `QUEUE_REF` dans son clone ;
+    à défaut seulement, de `origin/<cible>` du dépôt des agents, puis de sa
+    cible locale. La copie `origin/<cible>` du clone `--shared` n'est jamais
+    une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
 
-    Les lectures sont **toutes** comparées : la plus haute l'emporte, une
-    lecture calculée ne se rétrograde jamais devant une autre, et un doute ne
-    se lit pas comme une classe sensible (le clone radar peut voir des
-    changements sensibles que le checkout de l'auteur ne voit plus — revue
-    #544 r1)."""
+    Toutes les lectures comparées portent sur **la même** cible fraîche : une
+    source qui ne la porte pas (référence périmée, objet absent) est écartée
+    plutôt que comparée avec une autre borne — un `main` en retard ajouterait
+    des commits déjà fusionnés, dont des chemins sensibles, et surclasserait
+    la lecture fraîche (#2207, P2-2). Entre lectures de même borne, la plus
+    haute l'emporte, une lecture calculée ne se rétrograde jamais devant une
+    autre, et un doute ne se lit pas comme une classe sensible (revue #544 r1).
+
+    `cfg` absent ou dépôt illisible : `lot_class.of_lot` rend un doute
+    (`sensitive`, drapeau `doubt`), et la file garde l'exigence de verdict."""
     from . import lot_class
     paths = []
     if target:
-        base_repo = where or repo
-        base = _class_base(base_repo, target, queue=True)
-        if base:
-            paths.append((base_repo, base))
-        if where and where != repo:
-            paths.append((repo, _class_base(repo, target) or target))
-    if not paths:
+        source = where or repo
+        cloned = bool(where and where != repo)
+        fresh = base
+        if fresh is None and cloned:
+            ref = _class_base(where, target, queue=True)
+            fresh = plan_git._commit(where, ref) if ref else None
+        if fresh is None:
+            ref = _class_base(repo, target)
+            fresh = plan_git._commit(repo, ref) if ref else None
+        repos = [source] + ([repo] if cloned else [])
+        for path in repos:
+            # Une source ne parle du lot que si elle porte les deux bornes :
+            # sa cible peut être en retard et ses objets absents (le fetch de
+            # `readiness` n'écrit que dans le clone).
+            if fresh and plan_git._commit(path, fresh) and plan_git._commit(path, tip):
+                paths.append((path, _class_ref(path, target, fresh,
+                                               queue=cloned and path == source)))
+        if not paths:
+            # aucune cible fraîche lisible : repli explicite sur les refs de
+            # cible disponibles ; `of_lot` rendra un doute, jamais un `light`.
+            paths.append((source, _class_base(source, target, queue=cloned) or target))
+            if cloned:
+                paths.append((repo, _class_base(repo, target) or target))
+    else:
         paths.append((repo, target))
     best = None
-    for path, base in paths:
-        current = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base,
+    for path, base_ref in paths:
+        current = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base_ref,
                                    head=tip)
         if best is None or _class_worse(current, best):
             best = current
