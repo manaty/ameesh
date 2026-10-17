@@ -128,14 +128,24 @@ def unmerged(cwd: str) -> list[str]:
     return _paths(_run(cwd, "diff", "--name-only", "--diff-filter=U", "-z"))
 
 
-def _both_sides(cwd: str) -> list[str]:
-    """Unmerged paths with both sides in the index (stages 2 and 3)."""
-    stages: dict = {}
-    for entry in _run(cwd, "ls-files", "-u", "-z").stdout.decode("utf-8", "replace").split("\0"):
-        if "\t" in entry:
-            info, path = entry.split("\t", 1)
-            stages.setdefault(path, set()).add(info.split()[-1])
-    return sorted(p for p, s in stages.items() if {"2", "3"} <= s)
+def _merge_rr(cwd: str) -> bool:
+    """`test -s "$GIT_DIR/MERGE_RR"`: a conflicted merge left something to learn."""
+    path = _text(_run(cwd, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_RR"))
+    return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _restore_rr(cache: str, stash: str) -> None:
+    """Puts the hidden `rr-cache` back under its name: the entries the trial
+    merge recorded win over the stashed ones (same conflict, fresher record),
+    the others are kept, and the stash goes away."""
+    os.makedirs(cache, exist_ok=True)
+    for name in os.listdir(stash):
+        src, dst = os.path.join(stash, name), os.path.join(cache, name)
+        if os.path.exists(dst):
+            shutil.rmtree(src, ignore_errors=True)
+        else:
+            os.rename(src, dst)
+    shutil.rmtree(stash, ignore_errors=True)
 
 
 def rerere_remaining(cwd: str) -> list[str]:
@@ -192,13 +202,18 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
     """Primes the `rr-cache` of the repository of worktree `cwd` from the
     merge commits `commits` (`--overwrite`: a replaced resolution wins),
     with `rerere-train.sh`, or the same loop in Python when the script is
-    not installed (`script=None` forces the port). Leaves `cwd` clean, on
-    the commit it was on. Returns the commits it learnt from."""
+    not installed (`script=None` forces the port). The port follows the
+    script's loop and never re-renders the conflict with `checkout -m`
+    (#2165); unlike the script it hides the cache during the trial merge,
+    so `--overwrite` really replaces a resolution the merge would have
+    replayed from the cache. Leaves `cwd` clean, on the commit it was on.
+    Returns the commits it learnt from."""
     commits = [c for c in commits if c]
     if not commits:
         return []
-    os.makedirs(_check(_run(cwd, "rev-parse", "--path-format=absolute", "--git-path",
-                            "rr-cache"), "rev-parse"), exist_ok=True)
+    cache = _check(_run(cwd, "rev-parse", "--path-format=absolute", "--git-path",
+                        "rr-cache"), "rev-parse")
+    os.makedirs(cache, exist_ok=True)
     if script == "auto":
         script = rerere_train_script()
     if script:
@@ -219,26 +234,37 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
             if len(parents) < 2:
                 continue
             _check(_run(cwd, "checkout", "-q", "-f", "--detach", parents[0]), "checkout")
-            if _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
-                    "merge", "-q", "--no-ff", "--no-commit", *parents[1:]).returncode != 0:
-                conflicted = unmerged(cwd)
-                # `forget` exits 0 even when it did nothing (rerere off): check it
-                _run(cwd, "-c", "rerere.enabled=true", "rerere", "forget", ".")
-                still = sorted(set(conflicted) - set(rerere_remaining(cwd)))
-                if still:
-                    raise GitError("git rerere forget left %s resolved (%s)"
-                                   % (", ".join(still), commit[:12]))
-                both = _both_sides(cwd)
-                if both:
-                    # forget leaves the old resolution in the files: back to the conflict,
-                    # else the next `rerere` records the old resolution again (only paths
-                    # with both sides: a modify/delete conflict has nothing to restore)
-                    _check(_run(cwd, "checkout", "-m", "--", *both), "checkout -m")
-                if conflicted:
-                    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
-                    _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
-                    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
-                    learnt.append(commit)
+            # the merge must render the conflicts itself: with the cache in place
+            # it would replay the recorded resolution into the files, and `rerere`
+            # would record that stale content as the new preimage (#2165). The
+            # cache is put back before `forget`, which drops the pair's entries
+            # (--overwrite) while the other pairs' entries survive.
+            stash = "%s.train-%d" % (cache, os.getpid())
+            hidden = os.path.isdir(cache) and not os.path.isdir(stash)
+            if hidden:
+                os.rename(cache, stash)
+            try:
+                merge = _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+                             "merge", "-q", "--no-ff", "--no-commit", *parents[1:])
+            finally:
+                if hidden and os.path.isdir(stash):
+                    _restore_rr(cache, stash)
+            if merge.returncode == 0:
+                continue
+            # `forget` exits 0 even when it did nothing (rerere off): the MERGE_RR
+            # gate below tells whether a conflict is left to learn from, exactly
+            # as `test -s "$GIT_DIR/MERGE_RR"` does in rerere-train.sh (#2165)
+            _run(cwd, "-c", "rerere.enabled=true", "rerere", "forget", ".")
+            if not _merge_rr(cwd):
+                _run(cwd, "reset", "-q", "--hard")
+                continue
+            learnt.append(commit)
+            # the preimage is the conflict the merge just rendered: never
+            # re-render it with `checkout -m`, whose markers ("ours"/"theirs")
+            # differ from the merge's ("HEAD"/branch) and miss at replay (#2165)
+            _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
+            _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
+            _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
             _run(cwd, "reset", "-q", "--hard")
     finally:
         _run(cwd, "reset", "-q", "--hard")
