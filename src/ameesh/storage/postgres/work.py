@@ -467,7 +467,7 @@ class WorkItems(interface.WorkItems):
         )
         params.append(int(limit))
         return self.db.query(
-            sql.replace("__COLUMNS__", item_columns(self.db)).replace(
+            sql.replace("__COLUMNS__", item_columns(self.db, "w")).replace(
                 "__STATES__", ", ".join(["%s"] * len(wanted))),
             tuple(params))
 
@@ -1919,7 +1919,7 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "SELECT %s FROM work_items w"
                 " WHERE w.assignee = %%s AND w.state = 'promoted'"
-                " ORDER BY w.id%s" % (item_columns(self.db), limit), (agent,))
+                " ORDER BY w.id%s" % (item_columns(self.db, "w"), limit), (agent,))
             for row in rows:
                 if dry_run:
                     out.append(dict(row, dry_run=True, assigned_to=measure_actor))
