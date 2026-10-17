@@ -241,8 +241,8 @@ class ReviewGateTest(unittest.TestCase):
         """#2264 : le témoin de #2249 forçait `klass` — il serait resté vert si
         le canon ne classait plus ces chemins. Ici la classe est lue par
         `lot_class.class_of_paths` sur un canon synthétique, puis la porte en
-        déduit les avis ; le contrôle négatif (même canon sans règle) retombe
-        à `light` et zéro avis, donc le témoin dépend bien du canon."""
+        déduit les avis. Sans règle, la classe retombe à `light` ; la ceinture
+        de #2265 exige toujours deux avis pour ces chemins critiques connus."""
         canon = self.canon(self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
         for path in self.GATE_CANON_PATHS:
             klass = lot_class.class_of_paths([canon], "ameesh", [path])
@@ -260,13 +260,29 @@ class ReviewGateTest(unittest.TestCase):
         self.assertTrue(two["ok"], two["why"])
         one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=together)
         self.assertFalse(one["ok"], "la classe lue exige bien deux avis")
-        # Contrôle négatif : sans règle, ces mêmes chemins ne sont plus
-        # sensibles et la porte n'exige plus d'avis.
+        # Sans règle, la classe baisse mais les chemins critiques connus
+        # restent protégés par #2265.
         bare = self.canon()
         light = lot_class.class_of_paths(
             [bare], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
         self.assertEqual(light["class"], "light", light)
-        self.assertEqual(merge_queue.required_verdicts(light), 0, light)
+        self.assertEqual(merge_queue.required_verdicts(light), 2, light)
+
+    def test_class_and_off_api_merge_need_two_families(self):
+        # #2249 : la classe du lot, son classement et la fusion hors API sont
+        # la porte de fusion, comme merge_queue et land.
+        for path in ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                     "src/ameesh/review.py"):
+            with self.subTest(path=path):
+                klass = {"class": "sensitive", "files": [
+                    {"path": path, "class": "sensitive", "rule": [path]}]}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+        near = {"class": "sensitive", "files": [
+            {"path": "src/ameesh/preview.py", "class": "sensitive",
+             "rule": ["src/ameesh/preview.py"]}]}
+        self.assertEqual(merge_queue.required_verdicts(near), 1, "motif ancré au nom")
 
     def test_author_family_never_counts(self):
         klass = {"class": "sensitive", "files": [self.SQL]}
