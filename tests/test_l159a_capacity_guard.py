@@ -182,6 +182,33 @@ class OfferTest(unittest.TestCase):
                         self.assertTrue(any(expected in p for p in problems),
                                         (expected, problems))
 
+    def test_busy_tasks_is_read_and_needs_busy_units(self):
+        # #1256 : le motif de tâche est ce qui distingue un job d'un écouteur
+        # persistant ; il ne se lit que sur des unités (`busy_units`)
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        offer, problems, unknown = capacity_guard.parse_lend(dict(base, reclaim={
+            "busy_units": ["actions.runner.*"], "busy_tasks": ["Runner.Worker"],
+            "busy_max": 2}))
+        self.assertEqual(problems, [])
+        self.assertEqual(unknown, [])
+        self.assertEqual(offer["reclaim"]["busy_tasks"], ["Runner.Worker"])
+        self.assertEqual(offer["reclaim"]["busy_max"], 2)
+        # une chaîne seule vaut une liste d'un motif (comme `busy_units`)
+        offer, problems, _ = capacity_guard.parse_lend(dict(base, reclaim={
+            "busy_units": ["actions.runner.*"], "busy_tasks": "Runner.Worker"}))
+        self.assertEqual(problems, [])
+        self.assertEqual(offer["reclaim"]["busy_tasks"], ["Runner.Worker"])
+        # sans unités, ou avec une entrée vide : refusé, l'offre tombe
+        for reclaim in ({"busy_tasks": ["Runner.Worker"]},
+                        {"busy_units": ["actions.runner.*"], "busy_tasks": []},
+                        {"busy_units": ["actions.runner.*"], "busy_tasks": [""]},
+                        {"busy_units": ["actions.runner.*"], "busy_tasks": [3]},
+                        {"busy_units": ["actions.runner.*"], "busy_tasks": ["a\nb"]}):
+            with self.subTest(reclaim=reclaim):
+                offer, problems, _ = capacity_guard.parse_lend(dict(base, reclaim=reclaim))
+                self.assertIsNone(offer, reclaim)
+                self.assertTrue(any("busy_tasks" in p for p in problems), problems)
+
     def test_windows(self):
         self.assertEqual(capacity_guard.parse_window("mon-fri 18:00-14:00 UTC"),
                          {"days": ["mon", "tue", "wed", "thu", "fri"], "start": 1080,
@@ -535,7 +562,7 @@ class OfferTest(unittest.TestCase):
         base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
         for key in ("io_pressure_max", "disk_free_min", "disk_paths",
                     "memory_available_min", "cpu_pressure_max", "memory_pressure_max",
-                    "busy_units", "busy_max"):
+                    "busy_units", "busy_tasks", "busy_max"):
             with self.subTest(key=key):
                 offer, problems, unknown = capacity_guard.parse_lend(
                     dict(base, reclaim={key: None}))

@@ -39,13 +39,18 @@ class TextTest(unittest.TestCase):
         # every deployment, the owner keeps production
         for words in ("Merge first", "PREPARED in full", "rollback", "owner's decisions"):
             self.assertIn(words, text)
-        # the working rules of the canon (home#71, §§3/6/12): integration by
-        # packages, review before CI, sober proofs — carried by the injected
-        # text because the Process card is truncated in the brief
+        # the working rules of the canon (home#71, §§3/6/11 bis/12): integration
+        # by packages, review before CI and no CI per lot between cuts, sober
+        # proofs — carried by the injected text because the Process card is
+        # truncated in the brief
         for words in ("packages", "30 min at most", "Review before CI",
                       "frozen head", "cancelled", "Sober proofs",
                       "a proof is a link", "sha256", "merge-tree", "3 lines"):
             self.assertIn(words, text)
+        # #1676 : le paquet est celui de la coupure, avec tous les lots prêts —
+        # plus la promesse « about ten lots » que le §11 bis a remplacée
+        self.assertIn("next cut's single package", text)
+        self.assertNotIn("about ten lots", text)
         self.assertIsNone(fil.unreadable_reason(text))
 
     def test_units(self):
@@ -472,7 +477,8 @@ class WakeTest(PgTestCase):
                         service.index('ExecStart='))
         self.assertIn("Restart=on-failure", service)   # a failed firing retries
         timer = found["ameesh-wake-4-w121-deadline.timer"]
-        self.assertIn("OnActiveSec=1800\n", timer)
+        self.assertIn("OnCalendar=", timer)
+        self.assertNotIn("OnActiveSec=", timer)
         self.assertIn("AccuracySec=1s\n", timer)
         self.assertNotIn("OnUnitActiveSec", timer)     # one shot, not a period
 

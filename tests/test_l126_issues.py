@@ -68,6 +68,25 @@ class SettingsTest(unittest.TestCase):
         # forme courte : aucune liste déclarée, le veilleur découvre
         self.assertIsNone(plan_github.parse_settings(SETTINGS).workflows_for(PUBLIC))
 
+    def test_base_declaree(self):
+        """#1483 : la base d'un dépôt, quand ce n'est pas main (Nexlink :
+        develop), se déclare par projet."""
+        settings = plan_github.parse_settings({"projects": {"app": {
+            "repo": PRIVATE, "base": "develop"}}})
+        self.assertEqual(settings.bases_for(PRIVATE), ("develop",))
+        self.assertEqual(settings.bases_for(PRIVATE.upper()), ("develop",))
+        self.assertEqual(settings.all_bases(), ("develop",))
+        self.assertIsNone(settings.bases_for(PUBLIC))
+        self.assertIsNone(settings.bases_for(""))
+        # une liste, sans doublon, dans l'ordre de déclaration
+        settings = plan_github.parse_settings({"projects": {
+            "app": {"repo": PRIVATE, "base": ["main", "develop", "develop"]},
+            "web": {"repo": PUBLIC, "base": "release/1"}}})
+        self.assertEqual(settings.bases_for(PRIVATE), ("main", "develop"))
+        self.assertEqual(settings.all_bases(), ("main", "develop", "release/1"))
+        # forme courte : aucune base déclarée, le défaut du veilleur s'applique
+        self.assertIsNone(plan_github.parse_settings(SETTINGS).bases_for(PUBLIC))
+
     def test_refus(self):
         for raw, needle in (
             ([], "JSON object"),
@@ -87,6 +106,10 @@ class SettingsTest(unittest.TestCase):
             ({"projects": {"web": {"repo": PUBLIC, "workflows": [""]}}}, "workflow file name"),
             ({"projects": {"web": {"repo": PUBLIC, "workflows": ["tests.exe"]}}},
              "not a workflow file name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": []}}}, "branch name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": 7}}}, "branch name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": "de velop"}}}, "branch name"),
+            ({"projects": {"web": {"repo": PUBLIC, "base": [""]}}}, "branch name"),
         ):
             with self.subTest(raw=raw):
                 with self.assertRaises(plan_github.SettingsError) as ctx:

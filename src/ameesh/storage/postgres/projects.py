@@ -66,7 +66,7 @@ WITH unread AS (
     HAVING count(DISTINCT w.id) = 1
 ), agents AS (
     SELECT r.name, r.workstream, r.workstream AS chantier,
-           r.team, r.harness, r.host, r.provider, r.credential_mode,
+           r.team, r.projects, r.harness, r.host, r.provider, r.credential_mode,
            r.status, r.status_text, r.mode, r.stop_reason, r.responsible,
            (r.lease_owner IS NOT NULL
             AND r.lease_expires_at > clock_timestamp()) AS lease_live,

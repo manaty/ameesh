@@ -18,9 +18,8 @@ ameesh-approve and returns the **link**: the human signs on that origin with
 their passkey, and the receipt comes back through `ameesh action
 fetch-receipt`, never through this API.
 
-Not here yet: pausing and resuming an agent, and acknowledging an alert. No
-library function does them today (lot #375 note): their routes come with
-their primitive.
+Operator pause/resume (L87b, #1462) retains prompts and lets the active turn
+finish. Alert acknowledgement (L87c, #1463) preserves alert visibility.
 """
 from __future__ import annotations
 
@@ -165,6 +164,26 @@ def _message(ctx, db, params, body) -> dict:
     return {"agent": params["agent"], "message_id": message_id, "lot": lot}
 
 
+def _chat(ctx, db, params, body) -> dict:
+    """A message to an agent's shared conversation (L83): the server writes the
+    `human_message` entry and delivers the mail that wakes the agent. The
+    author is the human the API authenticated, never a body field; the
+    relation check of 0033 §7/§9 arrives with the OIDC tokens (L86)."""
+    from . import chat, registry, undeliverable
+    text = _text(body, "text")
+    lot = _lot_label(db, body.get("lot"))
+    sender = mail_name(ctx)
+    if registry.get(db, params["agent"]) is None:
+        raise ActionError(404, "not_found", "unknown agent")
+    try:
+        undeliverable.check_send(ctx.cfg, db, sender=sender, dest=params["agent"],
+                                 explicit=True)
+    except undeliverable.Refused as exc:
+        raise ActionError(409, "refused", str(exc)) from exc
+    return chat.post_human_message(ctx.cfg, db, human=ctx.human, sender=sender,
+                                   agent=params["agent"], text=text, lot=lot)
+
+
 def _publish(ctx, db, params, body) -> dict:
     """An entry in a project's thread, or in a lot's (the lot must belong to
     the project)."""
@@ -208,11 +227,34 @@ def _stop(ctx, db, params, body) -> dict:
     from . import exploitation
     reason = _text(body, "reason", limit=exploitation.STOP_REASON_MAX)
     try:
-        return exploitation.stop(ctx.cfg, db, params["agent"], reason, actor=actor(ctx))
+        return exploitation.stop(ctx.cfg, db, params["agent"], reason, actor=actor(ctx),
+                                 sender=ctx.human)
     except exploitation.StopRefused as exc:
         raise ActionError(404 if exc.code == "unknown_agent" else 400,
                           "not_found" if exc.code == "unknown_agent" else "bad_body",
                           str(exc)) from exc
+
+
+def _operator_pause(ctx, db, params, body, *, paused: bool) -> dict:
+    from . import agent_pause
+    reason = _text(body, "reason", limit=agent_pause.REASON_MAX)
+    try:
+        return agent_pause.change(db, params["agent"], paused=paused, reason=reason,
+                                  actor=ctx.human, principal=principal(ctx))
+    except agent_pause.PauseRefused as exc:
+        if exc.code == "unknown_agent":
+            raise ActionError(404, "not_found", str(exc)) from exc
+        if exc.code == "external_agent":
+            raise ActionError(409, "refused", str(exc)) from exc
+        raise ActionError(400, "bad_body", str(exc)) from exc
+
+
+def _pause(ctx, db, params, body) -> dict:
+    return _operator_pause(ctx, db, params, body, paused=True)
+
+
+def _resume(ctx, db, params, body) -> dict:
+    return _operator_pause(ctx, db, params, body, paused=False)
 
 
 def _assign(ctx, db, params, body) -> dict:
@@ -263,7 +305,8 @@ def _lower_cap(ctx, db, params, body) -> dict:
     agent = _name(body, "agent", required=False)
     try:
         changed, old = budget.change(ctx.cfg, db, agent=agent, window=window, usd=float(usd),
-                                     actor=actor(ctx), lower_only=True)
+                                     actor=actor(ctx), lower_only=True,
+                                     sender=ctx.human)
     except budget.BudgetError as exc:
         raise ActionError(409, "not_a_lowering", str(exc)) from exc
     return {"scope": agent or "mesh", "window": body["window"], "usd": float(usd),
@@ -295,12 +338,29 @@ def _approval_request(ctx, db, params, body) -> dict:
                                              "action_id", "approver", "digest")}
 
 
+def _ack_alert(ctx, db, params, body) -> dict:
+    from . import alert_ack
+    try:
+        return alert_ack.acknowledge(ctx.cfg, db, params["key"], actor=ctx.human,
+                                     principal=principal(ctx))
+    except alert_ack.AckRefused as exc:
+        status = {"not_found": 404, "forbidden": 403, "native_only": 403}.get(exc.code, 400)
+        raise ActionError(status, exc.code, str(exc)) from exc
+
+
 _TEXT = ({"type": "string", "minLength": 1, "maxLength": MAX_TEXT}, True)
 ACTIONS = (
+    Action("/alerts/{key}/ack", "ack_alert",
+           "Acknowledge an alert as its human recipient; the alert remains visible",
+           _ack_alert, {}),
     Action("/agents/{agent}/messages", "message",
            "Message to an agent: its mailbox and its thread (`agent-mail send`)", _message,
            {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False),
             "urgent": ({"type": "boolean"}, False)}),
+    Action("/agents/{agent}/chat", "chat",
+           "A message to an agent's shared conversation (L83: the server writes the entry "
+           "and wakes the agent by mail)", _chat,
+           {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False)}),
     Action("/threads/{project}", "publish", "Publish in a project's thread", _publish,
            {"text": _TEXT}),
     Action("/threads/{project}/{lot}", "publish", "Publish in a lot's thread", _publish,
@@ -311,6 +371,12 @@ ACTIONS = (
     Action("/agents/{agent}/stop", "stop",
            "Stop an agent by hand, with a reason (0030 §4: `manuel`)", _stop,
            {"reason": ({"type": "string", "minLength": 1, "maxLength": 500}, True)}),
+    Action("/agents/{agent}/pause", "pause",
+           "Operator pause: finish this turn, start no new one", _pause,
+           {"reason": ({"type": "string", "minLength": 1, "maxLength": 2000}, True)}),
+    Action("/agents/{agent}/resume", "resume",
+           "Lift only the operator pause; do not restart a stopped agent", _resume,
+           {"reason": ({"type": "string", "minLength": 1, "maxLength": 2000}, True)}),
     Action("/lots/{id}/assign", "assign",
            "Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent)",
            _assign, {"assignee": ({"type": "string"}, True)}),
