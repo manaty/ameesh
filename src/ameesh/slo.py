@@ -35,6 +35,13 @@ SOURCE = "canon §9 (processus/lots.md, home#40, 2026-10-13)"
 #: la source d'une étape : les événements du lot, ou un signal externe
 LOT_EVENTS = "lot_events"
 EXTERNAL = "external"
+#: #2217 : une prise en charge (assignation, réassignation, prise `--claim`)
+#: ouvre une grâce de ce délai. Un dépassement déjà couru avant la prise n'est
+#: pas imputé au nouveau porteur : son escalade est suspendue le temps qu'il
+#: prenne la main, sinon une réassignation pour porteur indisponible déclenche
+#: aussitôt une nouvelle demande de réassignation, en boucle. Le retard reste
+#: mesuré (`elapsed_s`), seule l'escalade est suspendue.
+HANDOVER_GRACE_S = 30 * 60.0
 
 
 class Step(NamedTuple):
@@ -157,6 +164,25 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     return None
 
 
+def handover_ts(item: dict, events: Iterable[dict]) -> float | None:
+    """L'instant de la dernière prise en charge du lot (#2217).
+
+    `work assign` (et `--claim`) écrivent « assigned to X (before: Y|nobody) »
+    dans le journal du lot : la dernière de ces lignes est la prise la plus
+    récente, réassignation comprise. `None` quand le journal n'en porte aucune
+    (lot jamais assigné par cette voie, ou créé déjà assigné par
+    `work add --assignee`) : il n'y a alors pas de prise à dater, donc pas de
+    grâce à ouvrir."""
+    last = None
+    for ev in events:
+        note = ev.get("note") or ""
+        if note.startswith("assigned to ") and "(before: " in note:
+            at = ev.get("created_ts")
+            if at is not None and (last is None or float(at) > last):
+                last = float(at)
+    return last
+
+
 def last_event_ts(item: dict, events: Iterable[dict]) -> float | None:
     """Dernière activité écrite (ligne du lot ou événement)."""
     stamps = [item.get("updated_ts"), item.get("created_ts")]
@@ -200,6 +226,14 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     étape terminée est rendue avec `done_ts` et `level` 0 ; une étape en cours
     court jusqu'à `now`. Une étape non mesurable n'est pas inventée : elle est
     absente (la table la déclare, `STEPS`).
+
+    #2217 : quand le lot vient d'être pris en charge (dernière ligne
+    `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
+    dépassements déjà courus ne sont pas imputés au nouveau porteur : leur
+    escalade est suspendue (`level` 0, `targets` vides, `overdue_s` 0) et la
+    ligne porte `handover_grace_s` (secondes restantes). La mesure reste
+    visible (`elapsed_s`, `target_s`) ; après la grâce, l'escalade reprend au
+    niveau que le retard justifie.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -249,6 +283,22 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             elapsed_s=int(max(0.0, float(merged) - float(verdict)))))
         elif state not in ("merged", "promoted", "closed"):
             out.append(_row(step, verdict, now=now, critical=critical))
+
+    handover = handover_ts(item, events)
+    if handover is not None and state not in ("merged", "promoted", "closed"):
+        remaining = HANDOVER_GRACE_S - (now - handover)
+        if 0 < remaining <= HANDOVER_GRACE_S:
+            for row in out:
+                if int(row.get("level") or 0) < 1:
+                    continue
+                # #2217 : le retard a couru avant la prise en charge ; le
+                # nouveau porteur n'a pas à recevoir une demande de
+                # réassignation aussitôt. La mesure (elapsed_s, target_s)
+                # reste lisible, l'escalade reprend après la grâce.
+                row["handover_grace_s"] = int(remaining)
+                row["level"] = 0
+                row["targets"] = ()
+                row["overdue_s"] = 0
 
     return out
 

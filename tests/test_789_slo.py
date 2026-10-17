@@ -236,5 +236,64 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(got, ["b", "d", "a"])
 
 
+class GracePriseTest(unittest.TestCase):
+    """#2217 : une prise en charge récente suspend l'escalade, sans effacer la mesure.
+
+    Cas réels du 17/10 : #2180 réassigné cx3→dev7 à 10:50, alerte de niveau 3
+    à 10:53 demandant de réassigner « --if-holder ameesh-dev7 » alors que dev7
+    venait de prendre le lot ; même chose sur #660, pris par rel-01 à 10:39,
+    alerte à 10:42. Le retard de l'étape court depuis le jalon, pas depuis la
+    prise du porteur actuel : le nouveau porteur n'a pas à recevoir aussitôt
+    une demande de réassignation.
+    """
+
+    def _lot_qa(self, *, verdict_age_s, handover_age_s):
+        handover = T0 + 10 * 86400
+        verdict = handover - verdict_age_s
+        events = [_ev("intake", T0), _ev("build", T0 + 600),
+                  _ev("qa", T0 + 1200),
+                  _ev("qa", handover, "assigned to nouveau (before: ancien)")]
+        item = _item(state="qa", assignee="nouveau", updated_ts=handover)
+        jalons = _jalons(item, events)
+        jalons["verdict"], jalons["verdict_kind"] = verdict, "ok"
+        jalons["verdict_current"] = True
+        return slo.lot_steps(item, jalons, events, now=handover + handover_age_s)
+
+    def test_prise_recente_suspend_l_escalade(self):
+        rows = self._lot_qa(verdict_age_s=3 * 86400, handover_age_s=10 * 60)
+        row = [r for r in rows if r["step"] == "verdict_merge"][0]
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["targets"], ())
+        self.assertEqual(row["overdue_s"], 0)
+        self.assertEqual(row["handover_grace_s"],
+                         int(slo.HANDOVER_GRACE_S) - 600)
+        # le retard reste mesuré, il n'est pas effacé
+        self.assertEqual(row["elapsed_s"], 3 * 86400 + 600)
+        self.assertGreater(row["elapsed_s"], row["target_s"])
+        # aucune escalade ne part pendant la grâce
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_prise_ancienne_laisse_l_escalade(self):
+        rows = self._lot_qa(verdict_age_s=3 * 86400, handover_age_s=1860)
+        row = [r for r in rows if r["step"] == "verdict_merge"][0]
+        self.assertEqual(row["level"], 3)
+        self.assertEqual(row["targets"], ("bureau", "auditeur"))
+        self.assertNotIn("handover_grace_s", row)
+        self.assertEqual([r["step"] for r in slo.breaches(rows)],
+                         ["verdict_merge"])
+
+    def test_derniere_prise_en_compte(self):
+        events = [_ev("intake", T0, "assigned to a (before: nobody)"),
+                  _ev("qa", T0 + 100, "assigned to b (before: a)"),
+                  _ev("qa", T0 + 200, "assigned to c (before: b)")]
+        self.assertEqual(slo.handover_ts(_item(), events), T0 + 200)
+
+    def test_attribution_initiale_sans_grace(self):
+        # un lot créé déjà assigné (`work add --assignee`) n'a pas changé de
+        # main : aucune prise à dater, donc pas de grâce.
+        self.assertIsNone(slo.handover_ts(_item(assignee="executant"), []))
+        self.assertIsNone(slo.handover_ts(_item(), []))
+
+
 if __name__ == "__main__":
     unittest.main()
