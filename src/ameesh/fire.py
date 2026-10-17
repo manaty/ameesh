@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import socket
+from urllib.parse import quote
 
 from . import land, lot_class, merge_queue, plan_git, storage, work
 
@@ -336,6 +337,9 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
         "merged": str(row.get("state") or "").upper() == "MERGED",
         "merge_commit": _norm(commit.get("oid") if isinstance(commit, dict) else ""),
         "armed": row.get("autoMergeRequest") is not None, "url": row.get("url") or "",
+        # #2271 : `ready_pr` lit les checks requis dans ce rollup, pas dans
+        # `ci` seul (qui compte `SKIPPED` comme vert).
+        "rollup": rollup,
     }
 
 
@@ -494,9 +498,123 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     return True, "", klass
 
 
-def ready_pr(status: dict, *, target: str, project, frozen: str) -> tuple:
+def _rollup_name(entry) -> str:
+    """Le nom d'une entrée de `statusCheckRollup` : `name` d'un check run,
+    `context` d'un statut de commit."""
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("name") or entry.get("context") or "")
+
+
+def _rollup_state(entry) -> str:
+    """L'état d'une entrée de `statusCheckRollup`, en majuscules : un statut
+    de commit porte `state`, un check run `status` et `conclusion`."""
+    if not isinstance(entry, dict):
+        return ""
+    if entry.get("__typename") == "StatusContext" or \
+            ("state" in entry and "conclusion" not in entry):
+        return str(entry.get("state") or "").upper()
+    if str(entry.get("status") or "").upper() != "COMPLETED":
+        return "PENDING"
+    return str(entry.get("conclusion") or "").upper()
+
+
+def _required_gap(required, rollup) -> list:
+    """Les checks requis que `rollup` ne prouve pas : absents, non conclus, ou
+    terminés autrement que `SUCCESS` (un `SKIPPED` ne prouve rien). Un même
+    nom porté par plusieurs entrées n'est vert que si toutes le sont : le
+    doute ne verdit pas la porte."""
+    names = (required,) if isinstance(required, str) else tuple(required or ())
+    gaps = []
+    for name in names:
+        states = [_rollup_state(entry) for entry in rollup or ()
+                  if _rollup_name(entry) == name]
+        if not states:
+            gaps.append("%s (absent)" % name)
+            continue
+        bad = sorted({state or "?" for state in states if state != "SUCCESS"})
+        if bad:
+            gaps.append("%s (%s)" % (name, ", ".join(bad)))
+    return gaps
+
+
+def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
+    """Les contextes requis par la protection classique de `target`, lus à la
+    forge. Un 404 « Branch not protected » est une réponse (aucun check
+    requis) ; toute autre lecture — droits, branche absente, réponse
+    malformée — lève `land.LandError` : l'absence de garde ne se suppose
+    jamais."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the required checks of %s "
+                             "cannot be read" % (target or "the target"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the required checks of %s cannot be read"
+                             % target)
+    path = "repos/%s/branches/%s/protection" % (slug, quote(target, safe=""))
+    proc = gh(["api", path])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        if "Branch not protected" in detail:
+            return ()
+        raise land.LandError("gh api %s: %s"
+                             % (path, detail or "exit %d" % proc.returncode))
+    data = land._json(proc, "gh api %s" % path, dict)
+    required = data.get("required_status_checks")
+    if required is None:
+        return ()
+    if not isinstance(required, dict):
+        raise land.LandError("gh api %s: required_status_checks is not an object" % path)
+    contexts = required.get("contexts") or ()
+    checks = required.get("checks") or ()
+    if not isinstance(contexts, (list, tuple)) or not isinstance(checks, (list, tuple)):
+        raise land.LandError("gh api %s: malformed required_status_checks" % path)
+    names = []
+    for context in contexts:
+        if not isinstance(context, str) or not context.strip():
+            raise land.LandError("gh api %s: invalid required context" % path)
+        names.append(context.strip())
+    for check in checks:
+        if not isinstance(check, dict) or not isinstance(check.get("context"), str) \
+                or not check["context"].strip():
+            raise land.LandError("gh api %s: invalid required check" % path)
+        names.append(check["context"].strip())
+    return tuple(dict.fromkeys(names))
+
+
+def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
+    """Les checks requis de la branche cible : la protection lue à la forge,
+    complétée par la déclaration `radar.projects.<p>.required_checks`.
+
+    Quand la protection ne peut pas être lue (jeton sans droits, forge
+    muette), la déclaration du projet la remplace ; sans déclaration, la
+    lecture refuse. La déclaration ne peut jamais retirer un check que la
+    forge exige : elle s'ajoute."""
+    declared = tuple(str(name).strip() for name in
+                     (getattr(project, "required_checks", ()) or ())
+                     if str(name).strip())
+    if not target:
+        if declared:
+            return declared
+        raise land.LandError("no target branch known: its required checks cannot be read")
+    try:
+        forged = _protection_required(slug, target, gh=gh)
+    except land.LandError:
+        if declared:
+            return declared
+        raise
+    return tuple(dict.fromkeys(forged + declared))
+
+
+def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
+             slug: str | None = None, gh=None) -> tuple:
     """Les portes qui dépendent de la PR : brouillon, cible, CI verte sur la
-    tête gelée, CI du commit gelé quand le projet l'exige (L160g)."""
+    tête gelée, **checks requis de la branche cible** présents et `SUCCESS`
+    sur cette tête (protection de la forge ou déclaration du projet), CI du
+    commit gelé quand le projet l'exige (L160g).
+
+    `required` remplace la lecture (tests, appelant qui l'a déjà faite) ;
+    `slug`/`gh` la permettent. Sans l'un ou l'autre, la porte refuse : un
+    check requis inconnu ne se suppose pas vert."""
     if status.get("draft"):
         return False, "PR #%s is a draft" % status.get("number")
     if target and status.get("base") and status["base"] != target:
@@ -505,6 +623,17 @@ def ready_pr(status: dict, *, target: str, project, frozen: str) -> tuple:
     if status.get("ci") != "green":
         return False, "the CI of PR #%s is %s on the freeze %s" % (
             status.get("number"), status.get("ci"), frozen[:12])
+    if required is None:
+        try:
+            required = required_checks(slug, target, project, gh=gh)
+        except land.LandError as exc:
+            return False, ("the required checks of %s on the freeze %s cannot be proven: %s"
+                           % (target or "the target", frozen[:12], exc))
+    gaps = _required_gap(required, status.get("rollup") or ())
+    if gaps:
+        return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
+                       % (status.get("number"), target or "the target", frozen[:12],
+                          ", ".join(gaps)))
     if project is not None and getattr(project, "ci_required", False):
         try:
             merge_queue._required_ci(project, frozen)
@@ -514,7 +643,7 @@ def ready_pr(status: dict, *, target: str, project, frozen: str) -> tuple:
 
 
 def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
-          project, target: str) -> tuple:
+          project, target: str, gh=None) -> tuple:
     """Les deux portes réunies : verdicts puis PR/CI. Rend `(ok, raison,
     classe)` ; `status` peut être None (aucune PR lue : seule la porte des
     verdicts est évaluée)."""
@@ -523,7 +652,8 @@ def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
     if not ok or status is None:
         return ok, why, klass
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
-    ok, why = ready_pr(status, target=target, project=project, frozen=frozen)
+    ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
+                       slug=_slug(cfg, row, repo), gh=gh or land._gh)
     return ok, why, klass
 
 
@@ -966,7 +1096,8 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     le gel et les verdicts sont relus juste avant le geste (P1-3)."""
     lot = int(row["id"])
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
-    ok, why = ready_pr(status, target=target, project=project, frozen=frozen)
+    ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
+                       slug=slug, gh=gh)
     if not ok:
         return _not_ready(db, row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
                           handle=handle)
