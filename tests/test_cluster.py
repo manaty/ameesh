@@ -63,6 +63,11 @@ SIGNATURES = {
     # L87b (0441) : journal des transitions de la pause opérateur.
     "operator_pause_events": {"id", "agent", "paused", "reason", "actor",
                               "principal", "created_at"},
+    # L87c (0444): native-operator acknowledgement audit. Preserve the
+    # migration's closed rights; this classification adds no GRANT.
+    "alert_acknowledgements": {"id", "alert_key", "severity", "observation_host",
+                               "actor", "principal", "acknowledged_at", "confirmed_at",
+                               "invalidated_at", "invalidation_reason"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }

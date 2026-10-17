@@ -141,7 +141,7 @@ class ReferencePgTest(PgTestCase):
 
     def _deliver(self, lot_id, *, started_min_ago):
         work.move(self.db, lot_id, "build")
-        work.merged(self.db, lot_id, sha="abcdef1")
+        work.close_merged(self.db, lot_id, sha="abcdef1")
         # un seul instant pour les trois dates : avec le pilote psql, chaque
         # requête a sa transaction, donc son propre now()
         at = float(self.db.query("SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"])

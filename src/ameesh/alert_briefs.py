@@ -124,8 +124,11 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
                 "merge packet/queue — no author action, do not nudge its assignee or "
                 "reassign it; the composer/pilot carries the merge")
     if who:
+        # #2016 : la commande porte le titulaire lu ici (`--if-holder`) : un
+        # second agent parti du même brief est refusé si le lot a changé de
+        # main entre-temps, au lieu de voler le lot au premier.
         return ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
-                "ameesh work assign %d <agent>" % (who, who, lot, lot))
+                "ameesh work assign %d <agent> --if-holder %s" % (who, who, lot, lot, who))
     # #1026 : un lot sans assigné se prend (`--claim`) : deux orchestrateurs
     # qui l'assignent en même temps ne peuvent plus se voler le lot.
     return "assign it: ameesh work assign %d <agent> --claim" % lot
@@ -247,13 +250,17 @@ def _slo_breach(alert: dict) -> str:
                sous_utilisation._duration(alert.get("value") or 0),
                sous_utilisation._duration(alert.get("threshold") or 0),
                ", assigned to %s" % who if who else ", unassigned"))
+    # #2016 : quand la commande est proposée, elle porte le titulaire lu
+    # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
+    # le lot a changé de main entre-temps, au lieu d'écraser le premier geste.
+    holder = " --if-holder %s" % who if who else ""
     if level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
-                "%d <agent>, then agent-mail send <agent> \"…\" --lot %d); do not wait "
-                "for the pilot if it is itself late" % (lot, lot))
+                "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
+                "for the pilot if it is itself late" % (lot, holder, lot))
     elif level >= 2:
-        move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>, then "
-                "agent-mail send <agent> \"…\" --lot %d)" % (lot, lot))
+        move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>%s, then "
+                "agent-mail send <agent> \"…\" --lot %d)" % (lot, holder, lot))
     else:
         move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
                 "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
@@ -291,8 +298,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné — ou du projet du lot quand aucun relecteur n'est
-    désigné (#705) —, ou **un seul** quand le lot n'a pas d'assigné
+    l'équipe de l'assigné (sinon celle du lot, #917) — ou du projet du lot
+    quand aucun relecteur n'est désigné (#705) —, ou **un seul** quand le lot
+    n'a pas d'assigné
     (#1026 : sans équipe, le brief partait à tous et deux orchestrateurs
     traitaient le même lot) ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
@@ -357,6 +365,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
             text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
             teams = _projects(by_name, alert.get("agent"))
+            if not teams:
+                # #917 : sans assigné connu, l'équipe du lot — sinon un lot
+                # ameesh réveillerait les orchestrateurs nexlink, et
+                # inversement (une alerte reçue pousse à assigner, ce qui
+                # entretient la liste des orchestrateurs par historique).
+                teams = {(alert.get("lot_team") or "").strip()} - {""}
             if reviewer and str(reviewer) in by_name:
                 extra[str(reviewer)] = _verdict_due(alert)
         elif kind == "estimate_bias":

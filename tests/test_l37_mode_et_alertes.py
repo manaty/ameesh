@@ -275,6 +275,39 @@ class AttributionGardeeTest(_Base):
                  if "assigned to" in e["note"]]
         self.assertEqual(len(notes), 1, notes)
 
+    def test_work_assign_claim_refuse_si_l_agent_a_deja_un_lot(self):
+        """#1787 N2 : un claim qui retombe dans la file d'équipe (#540) n'a pas
+        pris : refus lisible et code 1, le lot reste sans porteur."""
+        self.register("second", "codex", cwd=self.tmp)
+        premier = work.add(self.db, title="déjà en attente", assignee="second")
+        lot = work.add(self.db, title="à prendre")
+        proc = self.mesh("work", "assign", str(lot["id"]), "second", "--claim",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("claim refused", proc.stderr)
+        self.assertIn("#540", proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(work.get(self.db, premier["id"])["assignee"], "second")
+
+    def test_work_assign_claim_du_porteur_est_un_noop(self):
+        """#1787 N3 : le porteur qui re-claim son lot n'est pas refusé : no-op
+        réussi, sans nouvelle ligne d'affectation."""
+        self.register("second", "codex", cwd=self.tmp)
+        lot = work.add(self.db, title="à prendre")
+        proc = self.mesh("work", "assign", str(lot["id"]), "second", "--claim",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        avant = [e["note"] for e in work.events(self.db, lot["id"])
+                 if "assigned to" in e["note"]]
+        proc = self.mesh("work", "assign", str(lot["id"]), "second", "--claim",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("no-op", proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "second")
+        apres = [e["note"] for e in work.events(self.db, lot["id"])
+                 if "assigned to" in e["note"]]
+        self.assertEqual(apres, avant)
+
 
 class AlertesVivaciteTest(_Base):
     def _courrier_ancien(self, dest):

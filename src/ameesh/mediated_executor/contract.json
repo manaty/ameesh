@@ -4018,6 +4018,7 @@
    "action_source": "autorité (0012)",
    "actions": "hors du sous-ensemble de l'exécuteur médié",
    "agents": "hors du sous-ensemble de l'exécuteur médié",
+   "alert_acknowledgements": "human alert acknowledgement (L87c): native operator only",
    "api_requests": "API idempotency (L87): ameesh serve only",
    "approvals": "autorité : jamais d'approbation depuis l'appareil (0012)",
    "authenticators": "autorité (0012)",
@@ -4097,6 +4098,12 @@
     "note_unleased",
     "operator_pause"
    ],
+   "alert_acknowledgements": [
+    "acknowledge",
+    "clock",
+    "invalidate",
+    "live"
+   ],
    "api_requests": [
     "complete",
     "release",
@@ -4129,6 +4136,7 @@
     "put"
    ],
    "canon": [
+    "claim_commit",
     "clear_pending_stop",
     "clear_responsible",
     "close_others",
@@ -4169,7 +4177,6 @@
     "failures",
     "finish_guard_scan",
     "for_lot",
-    "guard_runs",
     "head_replaced",
     "latest_concluded",
     "mark_started",
@@ -4179,8 +4186,8 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
-    "queued",
     "queued_oldest",
+    "reopen_run",
     "run",
     "running",
     "running_on",
@@ -4238,6 +4245,7 @@
     "lend_basis",
     "record_harness_version",
     "release",
+    "runners",
     "since",
     "usage"
    ],
@@ -4288,6 +4296,7 @@
     "adopt",
     "assigners",
     "gauge_history",
+    "gauge_latest",
     "latest_gauges",
     "listing",
     "open_lots_activity",
@@ -4302,6 +4311,7 @@
    "packages": [
     "all",
     "get",
+    "lock_sync",
     "retire",
     "upsert"
    ],
@@ -4348,12 +4358,15 @@
    ],
    "turn_costs": [
     "correct",
+    "first_after",
+    "last_before",
     "ledger",
     "paid_lines",
     "spent_between",
     "unpriced"
    ],
    "turn_resources": [
+    "attach_cgroup",
     "begin_grace",
     "churn",
     "get",
@@ -4381,6 +4394,7 @@
     "add_milestone",
     "assign",
     "assignment_events",
+    "attach_implicit_branch",
     "auto_takes_since",
     "backlog",
     "backlog_add",

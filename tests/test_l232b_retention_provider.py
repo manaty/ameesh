@@ -205,6 +205,22 @@ class ProviderWiringTest(unittest.TestCase):
             with self.assertRaisesRegex(retention.RetentionError, "^untrusted provider retention module$"):
                 retention.provider_adapter(self.enrollment)
 
+    def test_root_owned_installed_provider_module_is_accepted(self):
+        # The installer copies the fixed module as root (0755) under
+        # /usr/local/sbin while the helper runs as the enrolled user: the
+        # installed case is root-owned and must load.
+        self.artifact()
+        real = retention.os.lstat
+        def root_owned(path):
+            info = real(path)
+            if Path(path).name == retention.PROVIDER_MODULE + ".py":
+                fields = list(info); fields[4] = 0
+                return os.stat_result(fields)
+            return info
+        with mock.patch.object(retention.os, "lstat", side_effect=root_owned):
+            loaded = retention.provider_module()
+        self.assertTrue(callable(getattr(loaded, "VersionRetention", None)))
+
     def test_host_outside_credential_allowlist_refused_without_request(self):
         self.artifact()
         self.enrolled(host="other-host")

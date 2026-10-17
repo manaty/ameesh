@@ -109,13 +109,26 @@ tree), `{files}` (the frozen head's changed names against the merge base with
 that commit, NUL-separated as `git diff --name-only -z` writes them) and
 `{out}` (the plan) substituted. The plan must carry a non-empty `schema`
 (checked against `schema` when declared) and the `due` field: a list of
-non-empty part contexts, without duplicates. Each due context must exist in
-the reading of the **frozen SHA** and be terminal-success; a part that is
-absent, pending, skipped, cancelled or red refuses admission and ejects a
-queued lot before landing. A status of another commit or an older attempt of
-the same workflow never covers the current one. No fallback: an unreadable
-configuration, a selector absent from the pinned tree, an unknown change set,
-a failing command, a missing, malformed or other-schema plan all refuse.
+non-empty part contexts, without duplicates. Each due context must exist among
+the **commit statuses** of the **frozen SHA** and be terminal-success; a part
+that is absent, pending, skipped, cancelled or red refuses admission and ejects
+a queued lot before landing. A run or a check carrying the name of a part does
+not prove it — only the commit status space does (N1 de #1666). A status of
+another commit or an older attempt of the same workflow never covers the
+current one. No fallback: an unreadable configuration, a selector absent from
+the pinned tree, an unknown change set, a failing command, a missing,
+malformed or other-schema plan all refuse. The proof is cached per (base
+commit, frozen head, contract) under `<state>/radar/ci-parts` (N2 de #1666):
+the tree of the target is extracted once per pair instead of at every control,
+and a re-read entry is revalidated, never trusted as is. The selector runs in
+its own session and its whole process group is killed when it exceeds its
+delay (N4 de #1666). The selector is target code: it only runs inside a
+`bwrap` sandbox (N3 de #1666) — separate namespaces, network cut, emptied
+environment, empty root exposing only the runtime, the extracted tree and the
+inputs (read-only) plus two proof-local writable directories (work and plan
+output). No host root or home directory is mounted, and **there is no
+fallback**: without `bwrap`, or if the sandbox cannot start (namespaces
+refused by the kernel), the proof is refused, never computed on the host.
 
 The contract is the target's, not the branch's: a lot cannot suppress a part
 by editing its own workflows, and an old head that carries no plan job is

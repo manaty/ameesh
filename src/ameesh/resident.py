@@ -38,11 +38,13 @@ served, whatever the protocol does underneath (a second `result` for Claude, a
 second `turn/start` for Codex when the steer lost the race against the end of
 the turn, a second `session/prompt` for ACP).
 
-Every event read from the harness goes to `on_event(raw, parsed)`: `raw` is
-the harness's own message, `parsed` the contract of `adapters.StreamReader`
-(`session`, `display`, `final`, `usage`, `call_usage`, `cost`, `safe_point`,
-`error`, `model`), so that the runner can log and display it as it does for a
-turn process.
+Every event of a turn read from the harness goes to `on_event(raw, parsed)`:
+`raw` is the harness's own message, `parsed` the contract of
+`adapters.StreamReader` (`session`, `display`, `final`, `usage`, `call_usage`,
+`cost`, `safe_point`, `error`, `model`), so that the runner can log and
+display it as it does for a turn process. A harness can also push messages of
+its own outside any turn (Claude Code's command list, UI state, background
+tasks…): they are not a turn's events and never enter its stream (#1337).
 
 The harness runs in its own process group (`pgid`), which the runner records
 and kills as a whole. No lock is held while waiting for the harness: the
@@ -91,6 +93,47 @@ FAILED = "failed"
 #: Codex items that are not an action (no safe point after them)
 _CODEX_NOT_ACTIONS = ("userMessage", "hookPrompt", "agentMessage", "reasoning", "plan",
                       "contextCompaction", "enteredReviewMode", "exitedReviewMode")
+
+#: #1337 (L76) : messages du protocole `stream-json` de Claude Code qui ne sont
+#: jamais la sortie d'un tour — ses poussées « fire-and-forget » (liste des
+#: commandes, état d'interface, tâches de fond, hooks, miroir de transcription…).
+#: C'est sa propre classification (`isTurnMessage` du SDK, 2.1.296). Une sonde
+#: de vivacité en déclenche hors tour : observé sur 2.1.296,
+#: `system/commands_changed` arrive ~1,4 s après la réponse à `initialize`,
+#: donc après le drain qui précède l'envoi — sans ce filtre il tombait dans le
+#: flux du tour suivant.
+NOT_TURN_TYPES = frozenset((
+    "stream_event", "keep_alive", "prompt_suggestion", "conversation_reset",
+    "transcript_mirror", "command_lifecycle", "active_goal",
+    "autocompact_state", "control_cancel_request",
+))
+NOT_TURN_SYSTEM = frozenset((
+    "session_state_changed", "permission_denied", "task_notification",
+    "task_started", "task_updated", "task_progress", "background_tasks_changed",
+    "feedback_draft_queued", "control_request_progress", "notification",
+    "post_turn_summary", "task_summary", "session_metadata", "hook_started",
+    "hook_progress", "hook_response", "commands_changed",
+    "elicitation_complete", "files_persisted", "mirror_error",
+    "code_change_published", "tool_host_result", "peer_message_hold",
+    "ui_invalidate", "ui_log", "ui_toast", "ui_status", "ui_panes",
+    "ui_scroll", "ui_focus", "permission_check_status", "vcs_state_changed",
+    "dev_intent", "session_title_changed", "turn_preempted",
+    "per_turn_effort_changed", "instruction_size_warning",
+    "file_attachments_missing",
+))
+
+
+def is_turn_event(event: Mapping) -> bool:
+    """#1337 (L76) : l'événement appartient-il à un tour ? La classification du
+    CLI lui-même : une poussée hors tour (liste des commandes, état
+    d'interface, tâche de fond, hook…) n'est jamais la sortie d'un tour. Un
+    type ou sous-type inconnu (ou non textuel) reste un événement de tour :
+    seul ce que le CLI déclare hors tour est écarté."""
+    kind = event.get("type")
+    if kind == "system":
+        subtype = event.get("subtype")
+        return not isinstance(subtype, str) or subtype not in NOT_TURN_SYSTEM
+    return not isinstance(kind, str) or kind not in NOT_TURN_TYPES
 
 
 class ResidentError(RuntimeError):
@@ -986,6 +1029,11 @@ class ClaudeStreamJson(ResidentDriver):
                     "error": "not supported by the ameesh resident client"}})
             except ResidentError:
                 pass
+            return
+        if not is_turn_event(event):
+            # #1337 : une poussée du CLI hors tour (la sonde de vivacité en
+            # déclenche une) n'entre pas dans la file : elle ne peut pas être
+            # lue comme un événement du tour suivant.
             return
         parsed = self.adapter.parse(line)
         if parsed.get("session"):

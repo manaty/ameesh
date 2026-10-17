@@ -359,12 +359,25 @@ class DoctorHooksTest(unittest.TestCase):
         home = self._home(binary=True, rel=".local/bin/agent-mail")
         for word in ("'$HOME/.local/bin/agent-mail'",
                      r"\$HOME/.local/bin/agent-mail",
-                     r'"\$HOME/.local/bin/agent-mail"'):
+                     r'"\$HOME/.local/bin/agent-mail"',
+                     "'~/.local/bin/agent-mail'",
+                     '"~/.local/bin/agent-mail"'):
             with self.subTest(word=word):
                 self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
                 out = self._lines(home, environ={"HOME": home})
                 self.assertFalse(out["ok"], out["lines"])
                 self.assertIn("127", "\n".join(out["lines"]))
+
+    def test_variable_dont_le_nom_commence_par_un_chiffre(self):
+        """#1981/N2 : `$1abc` vaut `$1` puis `abc` (le shell), pas la variable
+        `1abc` ; `$1` seul reste développé et un nom normal aussi ; `${1abc}`
+        reste littéral (substitution invalide)."""
+        self.assertEqual(hostcheck._hook_path("$1abc", {"1abc": "/mauvais"}),
+                         "$1abc")
+        self.assertEqual(hostcheck._hook_path("${1abc}", {"1abc": "/mauvais"}),
+                         "${1abc}")
+        self.assertEqual(hostcheck._hook_path("$1", {"1": "/bon"}), "/bon")
+        self.assertEqual(hostcheck._hook_path("$a1", {"a1": "/bon"}), "/bon")
 
     def test_home_entre_guillemets_doubles_reste_developpe(self):
         home = self._home(binary=True, rel=".local/bin/agent-mail")

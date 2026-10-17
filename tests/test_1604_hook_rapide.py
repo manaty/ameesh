@@ -309,3 +309,62 @@ class HookRapideTest(PgTestCase):
                                         AMEESH_STATUSLINE_TTL="0"))
         self.assertEqual(frais.returncode, 0, frais.stderr)
         self.assertNotIn("✉", frais.stdout)
+
+    # -- suites de la relecture (#1628) ------------------------------------
+
+    def test_statusline_ne_partage_pas_la_ligne_entre_deux_agents(self):
+        """#1628 N1 : sans session_id, deux sessions d'un même dossier ne
+        partagent plus la ligne en cache."""
+        dossier = os.path.join(self.tmp, "sl-1628")
+        os.makedirs(dossier, exist_ok=True)
+        payload = json.dumps({"workspace": {"current_dir": dossier}})
+        alpha = self.entry("statusline", env=self.env(AGENT_MAIL_NAME="alpha"),
+                           stdin=payload)
+        self.assertEqual(alpha.returncode, 0, alpha.stderr)
+        self.assertIn("alpha", alpha.stdout)
+        # le second appel est dans la fenêtre du cache : sans le nom dans la
+        # clé, il rendrait la ligne d'alpha (l'ancien défaut)
+        beta = self.entry("statusline", env=self.env(AGENT_MAIL_NAME="beta"),
+                          stdin=payload)
+        self.assertEqual(beta.returncode, 0, beta.stderr)
+        self.assertIn("beta", beta.stdout)
+        self.assertNotIn("alpha", beta.stdout)
+
+    def test_cle_de_statusline_departage_agents_et_sessions(self):
+        """#1628 N1 : nom d'agent et transcript_path entrent dans la clé."""
+        base = {"workspace": {"current_dir": self.tmp}}
+        cles = {
+            fastmail.statusline_key(dict(base, session_id="s1"), "alpha"),
+            fastmail.statusline_key(dict(base), "beta"),
+            fastmail.statusline_key(dict(base, transcript_path="/t/1"), "alpha"),
+            fastmail.statusline_key(dict(base, transcript_path="/t/2"), "alpha"),
+        }
+        self.assertEqual(len(cles), 4)
+        # même session, même nom : même clé (le cache fonctionne toujours)
+        self.assertEqual(fastmail.statusline_key(dict(base, session_id="s1"), "alpha"),
+                         fastmail.statusline_key(dict(base, session_id="s1"), "alpha"))
+
+    def test_marqueur_pose_meme_appele_depuis_un_except(self):
+        """#1628 N2 : le marqueur ne dépend plus de l'exception extérieure."""
+        env = self.env(AGENT_MAIL_NAME="alpha")
+        charge = json.dumps({"hook_event_name": "PostToolUse", "cwd": self.tmp,
+                             "session_id": "sess-exc"})
+        code = (
+            "import io, sys\n"
+            "sys.argv = ['agent-mail', 'hook', 'claude']\n"
+            "sys.stdin = io.StringIO(%r)\n"
+            "from ameesh import cli\n"
+            "try:\n"
+            "    raise RuntimeError('exterieure')\n"
+            "except RuntimeError:\n"
+            "    rc = cli.main()\n"
+            "print('rc', rc)\n"
+        ) % charge
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                              text=True, timeout=60, env=env, cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("rc 0", proc.stdout)
+        marque = fastmail.read_marker(self.cfg, "alpha")
+        self.assertIsNotNone(marque, "un appel depuis un except ne doit pas "
+                                     "empêcher le marqueur")
+        self.assertFalse(marque["pending"])
