@@ -14,7 +14,7 @@ import dataclasses
 import os
 from unittest import mock
 
-from ameesh import plan_git, radar, registry, storage, work
+from ameesh import plan_git, plan_github, radar, registry, storage, work
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, make_repo
@@ -129,6 +129,28 @@ class DetachSweepTest(_Base):
         _git(self.repo, "merge", "-q", "--no-ff", "-m",
              "Merge branch '%s'\n\nameesh-work: %d" % (name, n), name)
         self.assertEqual(self.sync()["merged"], 1)
+
+    def test_pr_d_une_branche_detachee_ne_designe_plus_le_lot(self):
+        # N2 (QA DeepSeek) : `lot/<id>-…` détachée ne désigne plus le lot par
+        # sa PR ; une citation explicite reste une désignation.
+        n = self.blocked_lot()["id"]
+        name = "lot/%d-supplantee" % n
+        self.branch(name)
+        pr = {"headRefName": name, "isCrossRepository": False, "body": ""}
+        st = storage.of(self.db)
+        targets, _ = plan_github._targets_of_pr(self.db, st, pr, "manaty/ameesh", [])
+        self.assertEqual(targets, [(n, None)])              # associée : elle désigne
+        work.detach_branch(self.db, n, name, reason="PR supplantée")
+        targets, _ = plan_github._targets_of_pr(self.db, st, pr, "manaty/ameesh", [])
+        self.assertEqual(targets, [])                       # détachée : plus rien
+        pr["body"] = "ameesh-work: %d" % n                  # la ligne explicite reste
+        targets, _ = plan_github._targets_of_pr(self.db, st, pr, "manaty/ameesh", [])
+        self.assertEqual(targets, [(n, None)])
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("manaty/ameesh#42", n))
+        pr["body"] = "Closes #42"                           # `Closes` aussi
+        targets, _ = plan_github._targets_of_pr(self.db, st, pr, "manaty/ameesh", [])
+        self.assertEqual(targets, [(n, None)])
 
     def during_probe(self, gesture):
         """Le relevé, avec `gesture` joué dans `branch_probe` : après la
