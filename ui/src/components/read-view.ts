@@ -52,6 +52,8 @@ export abstract class ReadView extends LitElement {
   protected required: "project" | "agent" | null = null;
   protected abstract load(client: Client, signal: AbortSignal): Promise<unknown>;
   protected abstract content(data: Row): unknown;
+  /** The client in use: the host's, else the nearest <ameesh-config>'s. */
+  protected get api(): Client | null { return this.client ?? this.#config?.client ?? null; }
   #config: AmeeshConfig | null = null;
   #signature: unknown[] = [];
   #abort: AbortController | null = null;
@@ -77,7 +79,7 @@ export abstract class ReadView extends LitElement {
   override willUpdate(): void { this.#sync(); }
   #sync(): void {
     if (!this.isConnected) return;
-    const client = this.client ?? this.#config?.client ?? null;
+    const client = this.api;
     const signature = [client, this.project, this.agent, this.lot];
     if (signature.every((value, i) => value === this.#signature[i])) return;
     this.#signature = signature;
@@ -108,7 +110,7 @@ export abstract class ReadView extends LitElement {
     }, 1000);
   }
   async refresh(): Promise<void> {
-    const client = this.client ?? this.#config?.client ?? null;
+    const client = this.api;
     if (!client || !this.isConnected || (this.required && !this[this.required])) return;
     if (this.#abort) { this.#again = true; return; }
     const abort = this.#abort = new AbortController();

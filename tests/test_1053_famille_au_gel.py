@@ -18,6 +18,9 @@ produit. Témoins :
 * #1777 : un gel reposé par un tiers garde l'acteur du premier gel, même si
   le tiers a des tours tracés ; sans tour tracé, on retombe sur l'assigné,
   producteur du lot ;
+* #1859 : le tiers qui n'a jamais tenu le lot est écarté par les détenteurs lus
+  au journal (`assigned to` / `delegated to` / `before:`) et le corps du lot de
+  relecture le nomme ; un ancien détenteur qui repose le gel en reste l'auteur ;
 * sans tour tracé, la famille reste inconnue : le registre courant n'est jamais
   une preuve historique.
 """
@@ -116,12 +119,14 @@ class FamilleAuGelTest(PgTestCase):
         self.assertIn("— claude (règle du pilote du 13/10)", body)
 
     def test_un_gel_par_un_tiers_sans_tour_retombe_sur_l_assigne(self):
-        """#1777 N2 : le pilote repose le gel ; il n'a aucun tour tracé, donc
-        sa famille n'est pas déduite — l'assigné porte la production."""
+        """#1777 N2 / #1859 : le pilote repose le gel ; il n'a aucun tour tracé,
+        donc sa famille n'est pas déduite — l'assigné porte la production, et
+        le corps nomme le tiers écarté."""
         self.turn("a1", "deepseek", offset=-5, session="s-deepseek")
         self.freeze(actor="mesh-design")
         body = self.body()
-        self.assertIn("- Auteur : a1 (harnais deepseek)", body)
+        self.assertIn("- Auteur : a1 (harnais deepseek; gel reposé par"
+                      " mesh-design, qui n'a pas tenu le lot)", body)
         self.assertIn("— codex (règle du pilote du 13/10)", body)
 
     def test_un_gel_par_un_tiers_ne_lit_pas_le_tour_suivant_de_l_assigne(self):
@@ -131,19 +136,45 @@ class FamilleAuGelTest(PgTestCase):
         self.freeze(actor="mesh-design")
         self.turn("a1", "codex", offset=2, session="s-codex")
         body = self.body()
-        self.assertIn("- Auteur : a1 (harnais deepseek)", body)
+        self.assertIn("- Auteur : a1 (harnais deepseek; gel reposé par"
+                      " mesh-design, qui n'a pas tenu le lot)", body)
 
     def test_un_gel_repose_par_un_tiers_garde_l_acteur_du_premier_gel(self):
-        """#1777 N2 : le pilote repose le gel sur une nouvelle tête ; même avec
-        des tours tracés à lui, l'auteur reste l'acteur du premier gel."""
+        """#1777 N2 / #1859 : le pilote repose le gel sur une nouvelle tête ;
+        même avec des tours tracés à lui, l'auteur reste l'acteur du premier
+        gel, et le corps nomme le tiers écarté."""
         self.turn("a1", "deepseek", offset=-5, session="s-deepseek")
         self.freeze()                                   # livraison par l'auteur
         self.turn("mesh-design", "claude", offset=-2, session="s-pilote")
         self.freeze(actor="mesh-design", sha="c" * 40)  # gel reposé, autre tête
         body = self.body()
-        self.assertIn("- Auteur : a1 (harnais deepseek)", body)
+        self.assertIn("- Auteur : a1 (harnais deepseek; gel reposé par"
+                      " mesh-design, qui n'a pas tenu le lot)", body)
         self.assertIn("— codex (règle du pilote du 13/10)", body)
-        self.assertNotIn("mesh-design", body)
+
+    def test_un_tiers_qui_repose_le_gel_ne_change_pas_la_famille(self):
+        """#1859 : le pilote (claude) repose le gel d'un lot qu'il n'a jamais
+        tenu ; l'auteur reste a1, avec son harnais à son propre gel."""
+        self.turn("a1", "deepseek", offset=-10)
+        self.freeze()
+        self.turn("pilote", "claude", offset=-5)
+        self.freeze(actor="pilote")
+        body = self.body()
+        self.assertIn("- Auteur : a1 (harnais deepseek; gel reposé par pilote,"
+                      " qui n'a pas tenu le lot)", body)
+        self.assertIn("— codex (règle du pilote du 13/10)", body)
+
+    def test_un_ancien_assigne_qui_repose_le_gel_en_reste_l_auteur(self):
+        """#1859 : a2 a tenu le lot puis l'a rendu ; son gel compte, il n'est
+        pas pris pour un tiers (journal : assigned to / before:)."""
+        registry.upsert(self.db, "a2", harness="codex", host=self.cfg.host)
+        work.assign(self.db, self.lot, "a2", actor="mesh-design")
+        work.assign(self.db, self.lot, "a1", actor="mesh-design")
+        self.turn("a2", "codex", offset=-5)
+        self.freeze(actor="a2")
+        body = self.body()
+        self.assertIn("- Auteur : a2 (harnais codex)", body)
+        self.assertNotIn("gel reposé", body)
 
     def test_l_auteur_est_l_acteur_du_gel_meme_reassigne_depuis(self):
         """La relecture réassigne le lot après le gel : la famille reste celle

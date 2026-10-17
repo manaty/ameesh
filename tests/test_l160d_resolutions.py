@@ -20,7 +20,7 @@ from unittest import mock
 from ameesh import plan_git, radar, resolutions, storage, work
 
 from .support import PgTestCase
-from .test_l160b_radar import LOTS, MIG, _git, _write, make_repo
+from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
 
 #: the line both lots 1 and 2 changed, resolved
 RESOLVED = "UN-One\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n"
@@ -549,7 +549,8 @@ class ReviewTest(_Base):
         return sha
 
     def test_i_modify_delete_conflict_still_learnt(self):
-        # codex, 2nd review (P2): checkout -m failed on the modify/delete path
+        # codex, 2nd review (P2): a modify/delete conflict is still learnt
+        # (`checkout -m` used to fail on that path, and is no longer needed)
         sha = self.modify_delete_resolution()
         rp = resolutions.Replayer(self.repo, os.path.join(self.tmp, "scratch"), script=None)
         rp.ensure()
@@ -562,6 +563,66 @@ class ReviewTest(_Base):
         self.assertNotIn("shared.py", got["remaining"])
         self.assertIn("other.py", got["files"])
 
+    def test_k_preimage_is_the_merge_render_not_a_checkout_m_rerender(self):
+        # #2165 (impl04, 17/10): `checkout -m` re-renders the conflict, and on
+        # this pair its render normalizes to another preimage (two hunks against
+        # one): the rr-cache entry then never matches at replay. Case reduced to
+        # three blobs from the pair #2032/#1349 (openapi-v1.json, schema.d.ts).
+        base = ('        },\n        "summary": "Message to an agent: its mailbox and '
+                'its thread (`agent-mail send`)"\n      }\n          }\n        },')
+        ours = "          }\n        },\n      }\n"
+        theirs = ('            "description": "database unavailable"\n        },\n'
+                  '        "summary": "Message to an agent: its mailbox and its thread '
+                  '(`agent-mail send`)"\n      }\n          },')
+        tmp = tempfile.mkdtemp(prefix="ameesh-l160d-2165-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _write(repo, "f.json", base)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "base")
+        _git(repo, "checkout", "-qb", "theirs")
+        _write(repo, "f.json", theirs)
+        _git(repo, "commit", "-qam", "theirs")
+        _git(repo, "checkout", "-q", "main")
+        _write(repo, "f.json", ours)
+        _git(repo, "commit", "-qam", "ours")
+        wt = os.path.join(tmp, "wt")
+        _git(repo, "worktree", "add", "-q", "--detach", wt, "main")
+        merge = resolutions._run(wt, "merge", "-q", "--no-ff", "--no-commit", "theirs",
+                                 env_extra=git_env())
+        self.assertEqual(merge.returncode, 1, merge.stderr.decode("utf-8", "replace"))
+        _write(wt, "f.json", ours)
+        _git(wt, "add", "f.json")
+        _git(wt, "commit", "-qm", "R")
+        r = _git(wt, "rev-parse", "HEAD")
+        _git(repo, "worktree", "remove", "--force", wt)
+        a, b = _git(repo, "rev-parse", "main"), _git(repo, "rev-parse", "theirs")
+        rp = resolutions.Replayer(repo, os.path.join(tmp, "clone"), script=None)
+        rp.ensure()
+        # The old port may already have cached this SHA without the matching
+        # preimage. An upgrade must relearn it instead of keeping it stale.
+        os.makedirs(os.path.join(rp.path, ".git", "ameesh-rr", r))
+        # #2136 already used v2, but still trained checkout -m preimages.
+        # Seed that historical cache too: #2165 must not reuse it on upgrade.
+        _git(rp.path, "checkout", "-q", "-f", "--detach", a)
+        merge = resolutions._run(
+            rp.path, "-c", "rerere.enabled=true", "merge", "-q",
+            "--no-ff", "--no-commit", b, env_extra=git_env())
+        self.assertEqual(merge.returncode, 1)
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere", "forget", ".")
+        _git(rp.path, "checkout", "-m", "--", "f.json")
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere")
+        _git(rp.path, "checkout", r, "--", ".")
+        _git(rp.path, "-c", "rerere.enabled=true", "rerere")
+        shutil.copytree(os.path.join(rp.path, ".git", "rr-cache"),
+                        os.path.join(rp.path, ".git", "ameesh-rr-v2", r))
+        _git(rp.path, "reset", "-q", "--hard")
+        self.assertEqual(rp.prime([r]), [])
+        got = rp.replay(a, b, r)
+        self.assertEqual((got["state"], got["remaining"]), ("prepared", []))
+
     def test_i_failed_training_is_isolated_to_its_pair(self):
         # codex, 2nd review (P2): one failed training cut the replay of every pair
         r1 = _manual_resolution(self.repo)
@@ -571,7 +632,7 @@ class ReviewTest(_Base):
 
         def flaky(cwd, commits, *, script="auto"):
             if commits == ["f" * 40]:
-                raise resolutions.GitError("git checkout -m: boom")
+                raise resolutions.GitError("git rerere: boom")
             return real(cwd, commits, script=script)
         with mock.patch.object(resolutions, "train", side_effect=flaky), \
                 mock.patch.object(rp, "has", return_value=True):
