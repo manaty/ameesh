@@ -477,6 +477,36 @@
      "server_ts": 1791640000.12
     }
    }
+  },
+  {
+   "name": "agents.resolve_name/ok",
+   "op": "agents.resolve_name",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.resolve_name",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": "inge-front",
+     "server_ts": 1791640000.12
+    }
+   }
   }
  ]
 }

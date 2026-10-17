@@ -94,7 +94,9 @@ class HostScopeRules(ScopeRules):
                      if self.credential_modes is None
                      or (r.get("credential_mode") or "") in self.credential_modes}
             if principal.agents_allowlist is not None:
-                names &= set(principal.agents_allowlist)
+                from ..agent_names import resolve
+                names &= {resolve(n, db=self.db, operation="mediated.allowlist")
+                          for n in principal.agents_allowlist}
             self._admitted = frozenset(names)
         return self._admitted
 
