@@ -192,6 +192,11 @@ if 'stop' in args:
     if scenario == 'stop-error' or (scenario == 'drain-puis-stop-error' and name == 'dev9'):
         sys.exit(1)
     if scenario != 'stop-unproven': (state / ('stopped-' + name)).touch()
+    if scenario == 'stop-failed': (state / ('failed-' + name)).touch()
+elif 'reset-failed' in args:
+    if scenario == 'reset-error': sys.exit(1)
+    if scenario != 'reset-no-effect':
+        (state / ('failed-' + name)).unlink(missing_ok=True)
 elif 'start' in args:
     if scenario == 'restart-error': sys.exit(1)
     (state / ('restart-' + name)).touch()
@@ -202,7 +207,7 @@ elif 'restart' in args:
     (state / ('restart-' + name)).touch()
 elif 'show' in args:
     if 'ActiveState' in args:
-        if scenario == 'stop-failed' and stopped(): print('failed')
+        if (state / ('failed-' + name)).exists(): print('failed')
         else: print('inactive' if stopped() else 'active')
     elif 'MainPID' in args:
         print('0' if stopped() else '123')
@@ -370,9 +375,11 @@ class AgentHostTest(unittest.TestCase):
         for name in ('dev8', 'dev9'):
             unite = 'ameesh-runner-agent@' + name + '.service'
             stop = log.index('--user stop ' + unite)
-            actif = log.index('--user show -p ActiveState --value ' + unite)
+            before = log.index('--user show -p ActiveState --value ' + unite)
+            actif = log.index('--user show -p ActiveState --value ' + unite, stop + 1)
             pid = log.index('--user show -p MainPID --value ' + unite)
             start = log.index('--user start ' + unite)
+            self.assertLess(before, stop, unite)
             self.assertLess(stop, actif, unite)
             self.assertLess(actif, start, unite)
             self.assertLess(pid, start, unite)
@@ -381,6 +388,44 @@ class AgentHostTest(unittest.TestCase):
         for unite in ('ameesh-runner-agent@dev8.service',
                       'ameesh-runner-agent@dev9.service'):
             self.assertNotIn('--user restart ' + unite, self.units())
+
+    def test_preexisting_failed_units_are_reset_before_proven_stop(self):
+        for name in ('dev8', 'dev9'):
+            (self.state / ('failed-' + name)).touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        log = self.units().splitlines()
+        for name in ('dev8', 'dev9'):
+            unit = 'ameesh-runner-agent@' + name + '.service'
+            before = log.index('--user show -p ActiveState --value ' + unit)
+            reset = log.index('--user reset-failed ' + unit)
+            stop = log.index('--user stop ' + unit)
+            proof = log.index('--user show -p ActiveState --value ' + unit, stop + 1)
+            pid = log.index('--user show -p MainPID --value ' + unit, stop + 1)
+            start = log.index('--user start ' + unit)
+            self.assertLess(before, reset)
+            self.assertLess(reset, stop)
+            self.assertLess(stop, proof)
+            self.assertLess(proof, start)
+            self.assertLess(pid, start)
+            self.assertIn(name + ' : redémarré', p.stdout)
+
+    def test_preexisting_failure_does_not_bypass_stop_proof(self):
+        unit = 'ameesh-runner-agent@dev8.service'
+        for scenario in ('stop-failed', 'reset-error', 'reset-no-effect'):
+            with self.subTest(scenario=scenario):
+                (self.state / 'units.log').unlink(missing_ok=True)
+                (self.state / 'failed-dev8').touch()
+                p = self.run_vm(scenario=scenario)
+                self.assertNotEqual(p.returncode, 0, p.stdout)
+                log = self.units().splitlines()
+                reset = log.index('--user reset-failed ' + unit)
+                self.assertEqual(self.starts(), [])
+                self.assertNotIn('--user stop ameesh-runner-agent@dev9.service', log)
+                if scenario == 'reset-error':
+                    self.assertNotIn('--user stop ' + unit, log)
+                else:
+                    self.assertLess(reset, log.index('--user stop ' + unit))
 
     def test_restart_gates_agent_in_turn_without_idle_wait(self):
         # #1152/R1 : un agent vu `running` n'est plus différé — il est arrêté
