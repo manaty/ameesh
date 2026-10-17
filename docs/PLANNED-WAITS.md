@@ -42,6 +42,11 @@ A lot is stale when it is open and inactive beyond the configured threshold
   The declaration is an admission **pinned to the vehicle's freeze**: the
   vehicle must carry a `frozen` head (refused otherwise, and refused while it
   is `blocked`), and the pin is read in the same transaction as the write.
+  The waiting lot must itself be **frozen with an acquired `ok` verdict on its
+  last freeze** (refused otherwise): a lot still in build, or still waiting for
+  its review, cannot be parked. The deadline is a short, finite day: `--until`
+  must be today or later and at most 90 days ahead (`LANDING_MAX_DAYS`),
+  refused otherwise.
   While the vehicle is open, not `blocked`, its last freeze is exactly that
   pinned head **and** the day is not past (its day counts in full, like a
   hold), the lot is not stale. A new freeze, a vehicle left without a freeze,

@@ -11,6 +11,7 @@ from unittest import mock
 
 from ameesh import db as D, mail, plan, planned_waits, progress, stagnation, storage, work
 from ameesh import work_dependencies as dependencies
+from ameesh.storage.postgres.work_dependencies import WorkDependencies as PgLandingStore
 from tests.support import PgTestCase
 
 
@@ -474,6 +475,11 @@ class LandingTest(PgTestCase):
         self.vehicle = work.add(self.db, title="vehicle", app="acme")["id"]
         self.sha = "a" * 40
         work.milestone(self.db, self.vehicle, "frozen", sha=self.sha, actor="test")
+        # #2171 N3 : le lot parké est gelé, avec un verdict ok acquis sur ce gel.
+        self.lot_sha = "d" * 40
+        work.milestone(self.db, self.waiting, "frozen", sha=self.lot_sha, actor="test")
+        work.milestone(self.db, self.waiting, "verdict", verdict="ok", sha=self.lot_sha,
+                       actor="test")
 
     def cli(self, *args, ok=True):
         proc = self.mesh("work", "landing", *args, "--actor", "test")
@@ -544,6 +550,38 @@ class LandingTest(PgTestCase):
                           if e["note"].startswith("Landing")], [])
 
 
+    def test_refuses_a_lot_that_is_not_frozen_with_an_acquired_verdict(self):
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        lot = work.add(self.db, title="unfrozen lot", app="acme")["id"]
+        self.assertIn("must be frozen", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                 "--until", until, ok=False).stderr)
+        sha = "e" * 40
+        work.milestone(self.db, lot, "frozen", sha=sha, actor="test")
+        self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                      "--until", until, ok=False).stderr)
+        work.milestone(self.db, lot, "verdict", verdict="blocked", sha=sha, actor="test")
+        self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                      "--until", until, ok=False).stderr)
+        # un verdict ok d'une AUTRE tête ne vaut pas pour le dernier gel
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha="f" * 40, actor="test")
+        self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                      "--until", until, ok=False).stderr)
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha=sha, actor="test")
+        self.cli(str(lot), "--vehicle", str(self.vehicle), "--until", until)
+        self.assertEqual(len(storage.of(self.db).work_dependencies.landings_for([lot])), 1)
+
+    def test_refuses_a_past_or_too_far_deadline(self):
+        today = datetime.date.today()
+        for day, needle in (
+                (today - datetime.timedelta(days=1), "already past"),
+                (today + datetime.timedelta(days=dependencies.LANDING_MAX_DAYS + 1), "too far")):
+            self.assertIn(needle, self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                           "--until", day.isoformat(), ok=False).stderr)
+        # la borne haute exacte est admise
+        self.cli(str(self.waiting), "--vehicle", str(self.vehicle), "--until",
+                 (today + datetime.timedelta(days=dependencies.LANDING_MAX_DAYS)).isoformat())
+
+
 class ResolverTest(unittest.TestCase):
     def test_invalid_landing_ids_days_and_empty_actor_are_refused_before_storage(self):
         for item in (-1, 0, True, "1"):
@@ -577,3 +615,86 @@ class ResolverTest(unittest.TestCase):
                 dependencies.add(None, item, 2, actor="test")
         with self.assertRaises(work.WorkError):
             dependencies.add(None, 1, 2, actor="")
+
+    def test_landing_deadline_is_bounded_before_storage(self):
+        """#2171 N4 : ni un jour passé, ni une échéance invraisemblable."""
+        today = datetime.date.today()
+        for day in ((today - datetime.timedelta(days=1)).isoformat(),
+                    (today + datetime.timedelta(days=dependencies.LANDING_MAX_DAYS + 1)).isoformat()):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, 1, 2, until_on=day, actor="test")
+
+    def test_landing_head_breaks_freeze_ties_on_id_not_reading_order(self):
+        """#2171 N2 : même (at, id) maximal que set_landing, quel que soit l'ordre."""
+        st = mock.Mock()
+        st.progress.lot_milestones.return_value = [
+            {"id": 9, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "b" * 40},
+            {"id": 3, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "a" * 40},
+            {"id": 4, "work_item_id": 2, "kind": "verdict", "at_ts": 9.0, "sha": "c" * 40},
+        ]
+        with mock.patch.object(dependencies.storage, "of", return_value=st):
+            self.assertEqual(dependencies.landing_head(None, 2), "b" * 40)
+
+
+class _RecordingTx:
+    """Transaction factice : enregistre les ordres et rend des réponses fixes."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def execute(self, sql, params=()):
+        self.calls.append(str(sql))
+
+    def query(self, sql, params=()):
+        self.calls.append(str(sql))
+        return self.responses.pop(0) if self.responses else []
+
+
+class _RecordingDb:
+    """Pilote factice : `transaction()` ouvre la transaction, `execute` non."""
+
+    def __init__(self, tx):
+        self.tx = tx
+        self.calls = []
+
+    def execute(self, sql, params=()):
+        self.calls.append(str(sql))
+
+    def transaction(self):
+        return _TxContext(self.tx)
+
+
+class _TxContext:
+    def __init__(self, tx):
+        self.tx = tx
+
+    def __enter__(self):
+        return self.tx
+
+    def __exit__(self, *exc):
+        return False
+
+
+class LandingTransactionLockTest(unittest.TestCase):
+    """#2171 N1 : le verrou consultatif part dans la TRANSACTION.
+
+    `self.db.execute(_LOCK)` le posait dans une autre session (pilote psql,
+    autocommit) : il était relâché aussitôt, et le « même verrou que le graphe »
+    était faux. Le factice discrimine exactement ce chemin."""
+
+    def test_set_and_clear_take_the_graph_lock_on_the_transaction(self):
+        tx = _RecordingTx(
+            [{"id": 1, "state": "qa"}, {"id": 2, "state": "qa"}],   # les deux lots
+            [{"sha": "a" * 40}],                                    # gel du véhicule
+        )
+        db = _RecordingDb(tx)
+        self.assertEqual(PgLandingStore(db).set_landing(
+            1, 2, until_on="2026-10-18", actor="test"), {"landed": True})
+        clear_tx = _RecordingTx([{"vehicle_id": 2}])
+        clear_db = _RecordingDb(clear_tx)
+        self.assertTrue(PgLandingStore(clear_db).clear_landing(1, actor="test"))
+        for driver, calls in ((db, tx.calls), (clear_db, clear_tx.calls)):
+            self.assertEqual(driver.calls, [], "le verrou est parti hors transaction")
+            self.assertIn("pg_advisory_xact_lock", calls[0],
+                          "le verrou doit précéder toute lecture dans la transaction")

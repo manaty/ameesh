@@ -13,6 +13,10 @@ class WorkDependencies(Contract):
         self.db = db
 
     def lock(self):
+        # Les fermetures de lot appellent ce verrou avec la TRANSACTION
+        # (`work_dependencies.lock(tx)`, work.py) : il tient jusqu'au commit.
+        # #2171 N1 : les gestes d'atterrissage ci-dessous, eux, tenaient `db`
+        # (le pilote) et non `tx` — ils utilisent donc `tx.execute(_LOCK)`.
         self.db.execute(_LOCK)
 
     @staticmethod
@@ -89,7 +93,11 @@ class WorkDependencies(Contract):
         if item_id == vehicle_id:
             return {"error": "self_landing"}
         with self.db.transaction() as tx:
-            self.lock()                       # même verrou que le graphe de dépendances
+            # #2171 N1 : le verrou est celui de la TRANSACTION. `self.db.execute`
+            # le posait dans une autre session (pilote psql, autocommit) : il
+            # était relâché aussitôt, et le « même verrou que le graphe » était
+            # faux.
+            tx.execute(_LOCK)
             rows = tx.query("SELECT id, state FROM work_items WHERE id IN (%s, %s)"
                             " ORDER BY id FOR UPDATE", (item_id, vehicle_id))
             states = {int(row["id"]): row["state"] for row in rows}
@@ -104,6 +112,8 @@ class WorkDependencies(Contract):
             # #1945, revue B : l'admission est ÉPINGLÉE au gel du véhicule. La
             # tête est lue dans la même transaction que l'écriture ; sans gel,
             # rien ne peut être épinglé et la déclaration est refusée.
+            # #2171 N2 : à instants égaux, le dernier gel est le (at, id) le plus
+            # grand — même règle que planned_waits.latest_freeze.
             freezes = tx.query("""
                 SELECT sha FROM work_item_milestones
                  WHERE work_item_id = %s AND kind = 'frozen'
@@ -130,7 +140,7 @@ class WorkDependencies(Contract):
 
     def clear_landing(self, item_id, *, actor):
         with self.db.transaction() as tx:
-            self.lock()
+            tx.execute(_LOCK)                 # #2171 N1 : même verrou, dans la transaction
             removed = tx.query("DELETE FROM work_landings WHERE work_item_id = %s"
                                " RETURNING vehicle_id", (item_id,))
             if not removed:

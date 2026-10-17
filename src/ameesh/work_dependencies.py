@@ -50,6 +50,35 @@ def grouped(db, item_ids):
 # #1945 : atterrissage planifié sur un véhicule de paquet
 # --------------------------------------------------------------------------
 
+#: #2171 N4 : une déclaration reste une échéance courte et finie. Une borne
+#: haute empêche un `--until 2099-12-31` de parquer un lot sans terme crédible.
+LANDING_MAX_DAYS = 90
+
+
+def _require_frozen_with_verdict(db, item_id):
+    """#2171 N3 : on ne parque qu'un lot gelé, au verdict ok ACQUIS.
+
+    Même vérité que l'étiquette de `stagnation` (`progress._jalons_de_lot`) :
+    le verdict retenu doit porter sur le dernier gel. Sans cette garde, le geste
+    masquerait stale pour un lot encore en cours (build) ou en attente de
+    relecture. L'absence de lot est laissée au stockage (`unknown_lot`)."""
+    from . import progress
+    item = work.get(db, item_id)
+    if item is None:
+        return
+    st = storage.of(db)
+    jalons = progress._jalons_de_lot(
+        item, st.progress.lot_transitions([item_id]),
+        st.progress.lot_actions([item_id]),
+        st.progress.lot_milestones([item_id]))
+    if not jalons.get("last_frozen"):
+        raise work.WorkError("the landing lot must be frozen (qa) before it can "
+                             "be parked")
+    if jalons.get("verdict_kind") != "ok" or not jalons.get("verdict_current"):
+        raise work.WorkError("the landing lot needs an acquired ok verdict on its "
+                             "last freeze")
+
+
 def land(db, item_id, vehicle_id, *, until_on, actor):
     """Déclare (ou renouvelle) l'atterrissage planifié du lot sur un véhicule.
 
@@ -63,11 +92,21 @@ def land(db, item_id, vehicle_id, *, until_on, actor):
     if not isinstance(actor, str) or not actor.strip():
         raise work.WorkError("a landing declaration needs an identified actor")
     try:
-        day = datetime.date.fromisoformat(str(until_on)[:10]).isoformat()
+        day = datetime.date.fromisoformat(str(until_on)[:10])
     except (TypeError, ValueError, OverflowError):
         raise work.WorkError("--until expects an ISO day (YYYY-MM-DD)")
+    # #2171 N4 : bornes de la déclaration — ni un jour déjà passé, ni une
+    # échéance invraisemblable (le résolveur ne lit que des journées finies).
+    today = datetime.date.today()
+    if day < today:
+        raise work.WorkError("--until %s is already past: the deadline must be "
+                             "today or later" % day.isoformat())
+    if (day - today).days > LANDING_MAX_DAYS:
+        raise work.WorkError("--until %s is too far: at most %d days ahead"
+                             % (day.isoformat(), LANDING_MAX_DAYS))
+    _require_frozen_with_verdict(db, item_id)
     result = storage.of(db).work_dependencies.set_landing(
-        item_id, vehicle_id, until_on=day, actor=actor)
+        item_id, vehicle_id, until_on=day.isoformat(), actor=actor)
     errors = {"self_landing": "a lot cannot land on itself",
               "unknown_lot": "landing endpoints must be existing lots",
               "finished_lot": "the landing lot must still be open",
@@ -96,12 +135,13 @@ def landings(db, item_ids):
 
 
 def landing_head(db, vehicle_id):
-    """Dernier gel du véhicule (sha), ou None : la tête exacte, lue en base."""
-    rows = storage.of(db).progress.lot_milestones([int(vehicle_id)])
-    freezes = [r for r in rows if r.get("kind") == "frozen"
-               and (r.get("sha") or "").strip()]
-    freezes.sort(key=lambda r: r.get("at_ts") or 0)
-    return freezes[-1]["sha"].strip() if freezes else None
+    """Dernier gel du véhicule (sha), ou None : la tête exacte, lue en base.
+
+    #2171 N2 : même départage que `set_landing` et `_with_heads` — `(at, id)`
+    le plus grand, jamais l'ordre de lecture."""
+    from .planned_waits import latest_freeze
+    row = latest_freeze(storage.of(db).progress.lot_milestones([int(vehicle_id)]))
+    return row["sha"].strip() if row else None
 
 
 def landing_label(landing, head=None):

@@ -194,6 +194,26 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(work_dependencies.wait_label(wait),
                          "landing on vehicle #42 (qa, head %s) until 2026-10-18" % ("b" * 12))
 
+    def test_latest_freeze_breaks_ties_on_id_whatever_the_reading_order(self):
+        """#2171 N2 : dernier gel = (at, id) maximal, comme le pin de set_landing."""
+        rows = [
+            {"id": 9, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "b" * 40},
+            {"id": 3, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "a" * 40},
+            {"id": 4, "work_item_id": 2, "kind": "frozen", "at_ts": 4.0, "sha": "c" * 40},
+            {"id": 5, "work_item_id": 2, "kind": "verdict", "at_ts": 9.0, "sha": "d" * 40},
+        ]
+        self.assertEqual(W.latest_freeze(rows)["sha"], "b" * 40)
+        self.assertIsNone(W.latest_freeze([r for r in rows if r["kind"] != "frozen"]))
+
+        class _St:
+            class progress:
+                @staticmethod
+                def lot_milestones(ids):
+                    return rows
+
+        landing = {"work_item_id": 1, "vehicle_id": 2, "pinned_sha": "b" * 40}
+        self.assertEqual(W._with_heads(_St(), [landing])[0]["head"], "b" * 40)
+
 
 class PgTest(PgTestCase):
     def setUp(self):
