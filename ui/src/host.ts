@@ -5,7 +5,7 @@
 // to a page: it feeds <ameesh-config> (one token provider per mesh) and
 // routes the components' DOM events, so navigation, the opening of an
 // approval and system notifications stay the host's decisions (study §2.2).
-// Nothing else crosses: no window.open, no cookie, no storage.
+// Nothing else crosses: no popup, no cookie, no storage.
 import { AmeeshConfig } from "./components/ameesh-config";
 
 /** A mesh known to the host: a public API base, and what to call it. */
