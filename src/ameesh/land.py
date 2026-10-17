@@ -543,6 +543,7 @@ class _Landing:
             target = self.row.get("target")
             tip = self.row.get("frozen_sha") or ""
             merged = str(merged_sha or "").strip()
+            repo, where = self.project.repo, self.clone
             if merged:
                 # #1515 B1 : après la fusion, la cible contient déjà la tête
                 # gelée ; relire le gel depuis la cible rendrait un diff vide
@@ -554,9 +555,15 @@ class _Landing:
                     first = plan_git._commit(place, merged + "^1")
                     if first:
                         target, tip = first, merged
+                        # #1515 R3/R1 : la classe se lit là où le commit de
+                        # fusion vit, et nulle part ailleurs. Lire aussi le
+                        # checkout du projet, qui n'a pas encore la fusion,
+                        # rendrait un doute qui, à classe égale, l'emporte sur
+                        # le `light` du clone et fermerait la relecture §2.
+                        repo, where = place, place
                         break
             klass = merge_queue._class_of(
-                self.db, self.lot, item, self.project.repo, self.clone,
+                self.db, self.lot, item, repo, where,
                 target, tip, cfg=self.cfg)
             return review_lot.open_after_merge(
                 self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,

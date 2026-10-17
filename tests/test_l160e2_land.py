@@ -17,7 +17,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import land, mail, merge_queue, radar, resolutions, review_lot, storage, work
+from ameesh import (land, lot_class, mail, merge_queue, radar, resolutions, review_lot,
+                    storage, work)
 
 from .support import PgTestCase
 from .test_l160b_radar import MIG, _git
@@ -220,6 +221,35 @@ class ReviewAfterMergeTest(LocalLandTest):
         merged = _git(self.origin, "rev-parse", "main")
         self.assertEqual(seen["tip"], merged)
         self.assertEqual(seen["target"], _git(self.origin, "rev-parse", "main^1"))
+
+    def test_a_landed_light_lot_reads_only_where_the_merge_lives(self):
+        # #1515 R3/R1 : le checkout des agents n'a pas encore la fusion ; le
+        # lire en plus du clone rend un doute qui, à classe égale, l'emporte
+        # sur le `light` et ferme à tort la relecture §2. Témoin sans mock de
+        # `_class_of` : seule la lecture du clone (qui porte la fusion) compte.
+        self.queued(4)
+        clone = radar.clone_dir(self.cfg, "p")
+        seen = []
+
+        def class_at(db, lot, **kw):
+            seen.append(kw.get("repo"))
+            if kw.get("repo") == clone:
+                return {"class": "light", "why": "policy", "doubt": False}
+            return {"class": "sensitive", "why": "cannot read the merge",
+                    "doubt": True}
+
+        def opened(db, **kw):
+            klass = kw["klass"]
+            light = klass["class"] == "light" and not klass.get("doubt")
+            return {"lot": kw["lot"], "id": 900 if light else None, "created": light,
+                    "class": klass["class"], "why": klass.get("why") or ""}
+
+        with mock.patch.object(lot_class, "of_lot", side_effect=class_at), \
+                mock.patch.object(review_lot, "open_after_merge", side_effect=opened):
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(seen, [clone])
+        self.assertTrue(out["review_lot"]["created"], out)
 
     def test_a_doubt_or_a_higher_class_opens_nothing(self):
         """La classe relue n'est pas `light` : rien n'est ouvert."""
