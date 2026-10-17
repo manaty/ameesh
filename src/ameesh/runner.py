@@ -4270,6 +4270,10 @@ class AgentWorker(threading.Thread):
             # normale) qui la précède ne la consomme pas.
             self._deferral_over()
             self.deferred_series_reason = motif
+            # #2206 : `_deferral_over` remet `deferred_reason` à vide ; le
+            # motif de la série qui commence est rétabli pour que la lecture
+            # qui suit (grâce d'un verrou tenu) porte sur ce motif.
+            self.deferred_reason = motif
         if self.deferred_since is None:
             self.deferred_since = maintenant
         self.deferred_streak += 1
