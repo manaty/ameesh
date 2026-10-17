@@ -25,6 +25,13 @@ class _Base(PgTestCase):
             work.assign(self.db, item["id"], assignee, cfg=self.cfg, force="test: lots multiples (#540)")
         return work.get(self.db, item["id"])
 
+    def merged(self, lot, *, actor="test", note="merged (test)"):
+        """#1286 : ces témoins n'ont pas de dépôt git ; l'état `merged` est posé
+        par les transitions, sans la preuve locale exigée par `work.merged`."""
+        for state in ("build", "qa", "merged"):
+            work.move(self.db, lot["id"], state, note=note, actor=actor)
+        return work.get(self.db, lot["id"])
+
 
 class StopReleasesLotsTest(_Base):
     def test_release_open_lots_with_journal_and_idempotence(self):
@@ -52,7 +59,7 @@ class StopReleasesLotsTest(_Base):
         mine = self.lot("mine", assignee="dev1")
         theirs = self.lot("theirs", assignee="dev2")
         merged = self.lot("merged", assignee="dev1")
-        work.merged(self.db, merged["id"], sha="deadbeef" * 5, note="", actor="test")
+        self.merged(merged)
         done = work.release_lots(self.db, "dev1", reason="r", actor="a")
         self.assertEqual([row["id"] for row in done], [mine["id"]])
         self.assertEqual(work.get(self.db, theirs["id"])["assignee"], "dev2")
@@ -88,7 +95,7 @@ class PromotedMeasurementTest(_Base):
     def promoted(self, assignee="dev1", *, remeasure_after=False):
         self.agent(assignee)
         lot = self.lot("deployed", assignee=assignee)
-        work.merged(self.db, lot["id"], sha="a" * 40, actor=assignee)
+        self.merged(lot, actor=assignee)
         self.measure(lot["id"], offset_s=-3600)     # mesure de livraison à la fusion
         work.move(self.db, lot["id"], "promoted", note="déployé", actor="auditeur")
         if remeasure_after:
@@ -148,7 +155,7 @@ class PromotedMeasurementTest(_Base):
     def test_merged_lot_is_not_handed_to_the_measure_actor(self):
         self.agent("dev1")
         lot = self.lot("merged, not deployed", assignee="dev1")
-        work.merged(self.db, lot["id"], sha="c" * 40, actor="dev1")
+        self.merged(lot, actor="dev1")
         self.assertEqual(work.release_lots(self.db, "dev1", reason="r", actor="a",
                                            measure_actor="auditeur", measure_reason="m"), [])
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")

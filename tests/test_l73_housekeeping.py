@@ -405,6 +405,22 @@ class WorktreeEtatTest(_Tmp):
         with mock.patch.object(platform, "holders", side_effect=muet):
             self.assertTrue(menage.worktree_in_use(wt))
 
+    def test_processus_illisible_nomme_par_l_hote_n_est_pas_un_doute(self):
+        """L230/#1807 : un processus illisible que l'hôte nomme dans
+        `unreadable_ok` n'est plus un doute ; sans allow, la réponse reste OUI
+        (fail-closed)."""
+        wt = os.path.join(self.base, "wt-allow")
+        os.makedirs(wt)
+
+        def holders(path, **kw):
+            if "gpg-agent" in (kw.get("allow") or ()):
+                return []
+            raise platform.NotAvailable("détenteurs d'un fichier", "test", "linux")
+
+        with mock.patch.object(platform, "holders", side_effect=holders):
+            self.assertTrue(menage.worktree_in_use(wt))
+            self.assertFalse(menage.worktree_in_use(wt, allow=("gpg-agent",)))
+
 
 # ==========================================================================
 # conteneurs (L73) : étiquetage, liste, suppression des seuls conteneurs d'un tour
@@ -618,6 +634,32 @@ class MenageDbTest(PgTestCase):
                    if a["type"] == "worktree_kept"]
         self.assertEqual([a["path"] for a in alertes], [sale])
         self.assertIn("untracked", alertes[0]["detail"])
+
+    def test_unreadable_ok_de_l_hote_est_passe_au_garde_fou_processus(self):
+        """L230/#1807 : le plan des worktrees passe `policy.unreadable_ok` à
+        `worktree_in_use` — un processus illisible déclaré par l'hôte ne
+        retient plus un worktree de lot fini ; sans allow, il attend
+        (fail-closed)."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        fini = self._lot("fini")
+        propre = self._suivi(main, "propre", fini)
+        work.close(self.db, fini, abandoned=True)
+        plus_tard = time.time() + 2 * 3600   # garde d'âge d'une heure franchie
+
+        def holders(path, **kw):
+            if "gpg-agent" in (kw.get("allow") or ()):
+                return []
+            raise platform.NotAvailable("détenteurs d'un fichier", "test", "linux")
+
+        with mock.patch.object(platform, "holders", side_effect=holders):
+            garde = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                    actor="t", dry_run=True, now=plus_tard)
+            permis = menage.run_pass(self.cfgl, self.db,
+                                     menage.Policy(unreadable_ok=("gpg-agent",)),
+                                     host="pc", actor="t", dry_run=True, now=plus_tard)
+        self.assertEqual({p["path"]: p["action"] for p in garde["plan"]}[propre], "attend")
+        self.assertEqual({p["path"]: p["action"] for p in permis["plan"]}[propre], "retrait")
 
     def test_worktree_d_un_autre_agent_orphelin_garde_puis_retire(self):
         """L73b/#1665, cas réel : un agent crée un worktree de relecture

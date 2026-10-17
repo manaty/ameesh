@@ -72,6 +72,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -80,6 +81,8 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from . import plan as plan_mod
+from . import process_projection as projection_mod
+from . import process_workflow as workflow_mod
 from . import projects as projects_mod
 from . import storage
 from . import work as work_mod
@@ -358,42 +361,70 @@ def reads_scope(base: str | None, token: str | None = None) -> str:
 
 #: instances vivantes du processus : leurs compteurs en mémoire restent
 #: visibles (`counters`) et partent une fois à la fin du passage (N3) —
-#: jamais un verrou et une réécriture par hit de cache.
+#: jamais un verrou de fichier ni une réécriture par hit de cache. #1927 :
+#: chaque instance porte un verrou en mémoire, pris par `count`, le retrait
+#: (`_take_pending`) et `counters`, jamais pendant une E/S.
 _LIVE_READS: "weakref.WeakSet" = weakref.WeakSet()
 
 
-def _merge_counters(data: dict, pending: dict, clock) -> list[str]:
-    """Fusionne `pending` dans `data["counters"]` ; rend les noms fusionnés."""
+def _merge_counters(data: dict, delta: dict, clock) -> None:
+    """Fusionne un `delta` de compteurs dans `data["counters"]`."""
     counters = data.setdefault("counters", {})
     if not isinstance(counters, dict):
         counters = data["counters"] = {}
-    merged = []
-    for name, n in pending.items():
+    for name, n in delta.items():
         counters[name] = int(counters.get(name) or 0) + int(n)
-        merged.append(name)
-    if merged:
+    if delta:
         counters["updated"] = float(clock())
-    return merged
 
 
-def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> None:
+def _take_pending(pending: dict, lock) -> dict:
+    """Retire les compteurs en attente sous verrou et les rend (#1927).
+
+    Le retrait est un échange, jamais un vidage après coup : un incrément reçu
+    pendant l'écriture se dépose dans le dictionnaire devenu vide et reste
+    visible (`counters`), au lieu d'être purgé sans avoir été fusionné."""
+    with lock:
+        taken = dict(pending)
+        pending.clear()
+    return taken
+
+
+def _restore_pending(pending: dict, taken: dict, lock) -> None:
+    """Rend au dictionnaire les compteurs d'un `taken` dont l'écriture a
+    échoué, en s'ajoutant aux incréments arrivés entre-temps (#1927)."""
+    if not taken:
+        return
+    with lock:
+        for name, n in taken.items():
+            pending[name] = int(pending.get(name) or 0) + int(n)
+
+
+def _write_counters(state_dir, root, lock_path, quota_path, pending, clock,
+                    pending_lock) -> None:
     """Écrit une fois les compteurs en mémoire dans `quota.json` (N3).
 
     Un état d'hôte disparu (dossier temporaire nettoyé, poste effacé) n'est
     pas ressuscité pour y écrire des compteurs. Jamais bloquant : une panne
-    (droits, disque) laisse `pending` intact pour le prochain essai."""
-    if not pending:
+    (droits, disque) rend au dictionnaire les compteurs retirés, pour le
+    prochain essai ; un incrément arrivé pendant l'écriture n'est jamais
+    emporté par le retrait (#1927)."""
+    taken = _take_pending(pending, pending_lock)
+    if not taken:
         return
     if not os.path.isdir(state_dir):
+        _restore_pending(pending, taken, pending_lock)
         return
     for directory in (root, os.path.join(root, "reads")):
         with contextlib.suppress(OSError):
             os.makedirs(directory, mode=0o700, exist_ok=True)
     if not os.path.isdir(root):
+        _restore_pending(pending, taken, pending_lock)
         return
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
+        _restore_pending(pending, taken, pending_lock)
         return
     merged = False
     try:
@@ -406,7 +437,7 @@ def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> N
                 data = loaded
         except (OSError, ValueError):
             data = {}
-        _merge_counters(data, pending, clock)
+        _merge_counters(data, taken, clock)
         _atomic_write(quota_path, data)
         merged = True
     except (OSError, ValueError):
@@ -414,10 +445,34 @@ def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> N
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-    if merged:
-        for name in list(pending):
-            pending.pop(name, None)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        # Dans `finally` : une panne d'un autre type (TypeError d'un
+        # `quota.json` aux valeurs étrangères) se propage, mais rend aussi
+        # les compteurs retirés.
+        if not merged:
+            _restore_pending(pending, taken, pending_lock)
+
+
+def flush_reads(state_dir) -> int:
+    """Écrit une fois les compteurs en attente des caches vivants de ce
+    processus pour `state_dir` (#1813).
+
+    Le passage du Watcher dure toute la vie du runner : sans cet appel, une
+    suite de hits de cache restait invisible sur disque jusqu'à la requête
+    réelle suivante (`note`) ou à la fin du processus. Rend le nombre de
+    caches concernés ; jamais bloquant (une panne laisse `pending` intact)."""
+    state_dir = str(state_dir or "").strip()
+    if not state_dir:
+        return 0
+    root = os.path.join(state_dir, READS_DIR)
+    flushed = 0
+    for reads in list(_LIVE_READS):
+        if reads.root != root:
+            continue
+        reads.flush()
+        flushed += 1
+    return flushed
 
 
 class SharedReads:
@@ -445,8 +500,11 @@ class SharedReads:
     N1 : une construction ou une lecture ne crée aucun dossier — le cache
     naît à sa première écriture, et un `state_dir` vide est refusé plutôt
     que de fabriquer un chemin relatif. N3 : les compteurs s'agrègent en
-    mémoire et s'écrivent une fois par passage (`flush`, fin de processus),
-    jamais un verrou par hit. N4 : la clé d'une entrée porte la base d'API
+    mémoire et s'écrivent une fois par passage (`flush` : fin de passage du
+    Watcher, #1813, ou fin de processus),
+    jamais un verrou par hit ; le retrait avant écriture est un échange sous
+    verrou, donc un incrément concurrent n'est jamais perdu (#1927).
+    N4 : la clé d'une entrée porte la base d'API
     et une empreinte non réversible du jeton."""
 
     def __init__(self, state_dir, *, clock=time.time, ttl: float = READS_TTL,
@@ -465,11 +523,15 @@ class SharedReads:
         self._lock_path = os.path.join(self.root, ".lock")
         self._stores = 0
         self._pending: dict = {}
+        # #1927 : `count` peut venir d'un autre fil que `flush`/`note` ; ce
+        # verrou ne protège que le dictionnaire en mémoire, jamais une E/S.
+        self._pending_lock = threading.Lock()
         _LIVE_READS.add(self)
         # N3 : les compteurs en attente partent une fois, à la fin du passage
         # (objet libéré ou processus terminé), sans ressusciter un état disparu.
         weakref.finalize(self, _write_counters, self.state_dir, self.root,
-                         self._lock_path, self._quota_path, self._pending, self.clock)
+                         self._lock_path, self._quota_path, self._pending,
+                         self.clock, self._pending_lock)
 
     def _ensure_dirs(self) -> None:
         """La racine du cache (0700), créée avant une écriture, jamais pour lire."""
@@ -487,7 +549,8 @@ class SharedReads:
         finally:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
     # -- entrées du cache ---------------------------------------------------
     def _entry_path(self, path: str) -> str:
@@ -593,25 +656,28 @@ class SharedReads:
         for reads in list(_LIVE_READS):
             if reads.root != self.root:
                 continue
-            for name, n in reads._pending.items():
+            with reads._pending_lock:
+                pending = list(reads._pending.items())
+            for name, n in pending:
                 merged[name] = int(merged.get(name) or 0) + int(n)
         return merged
-
-    def _merge_pending(self, data: dict) -> list[str]:
-        """Fusionne les compteurs en mémoire dans `data` ; rend leurs noms."""
-        return _merge_counters(data, self._pending, self.clock)
 
     def count(self, name: str, n: int = 1) -> None:
         """Un compteur partagé (hits, stale, refused…) ; jamais bloquant.
 
-        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (ou la fin
-        du processus) fait une seule écriture par passage, au lieu d'un verrou
-        et d'une réécriture de `quota.json` à chaque hit de cache."""
+        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (fin de
+        passage du Watcher, #1813, ou fin du processus) fait une seule écriture
+        par passage, au lieu d'un verrou de fichier et d'une réécriture de
+        `quota.json` à chaque hit de cache.
+        #1927 : le verrou en mémoire rend l'incrément sûr entre fils, et le
+        retrait avant écriture (`_take_pending`) ne l'emporte jamais."""
         try:
             key = str(name)
-            self._pending[key] = self._pending.get(key, 0) + int(n)
+            value = int(n)
         except (TypeError, ValueError):
             return
+        with self._pending_lock:
+            self._pending[key] = self._pending.get(key, 0) + value
 
     def flush(self) -> None:
         """Écrit une fois les compteurs agrégés depuis le dernier `flush` (N3).
@@ -619,7 +685,8 @@ class SharedReads:
         Sans compteur en attente, ne touche à rien. Une panne (droits, disque)
         laisse les compteurs en mémoire : le prochain passage réessaiera."""
         _write_counters(self.state_dir, self.root, self._lock_path,
-                        self._quota_path, self._pending, self.clock)
+                        self._quota_path, self._pending, self.clock,
+                        self._pending_lock)
 
     def note(self, headers, *, status: int, now=None) -> float | None:
         """Enregistre le quota lu dans les en-têtes, compte la requête.
@@ -635,10 +702,12 @@ class SharedReads:
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
             or DEFAULT_RESOURCE
         self._ensure_dirs()
+        taken = _take_pending(self._pending, self._pending_lock)
+        written = False
         try:
             with self._locked():
                 data = self._load()
-                merged = self._merge_pending(data)
+                _merge_counters(data, taken, self.clock)
                 quotas = data.setdefault("quota", {})
                 if not isinstance(quotas, dict):
                     quotas = data["quota"] = {}
@@ -664,11 +733,16 @@ class SharedReads:
                 quota["blocked_until"] = blocked if blocked > now else 0.0
                 quota["checked"] = now
                 _atomic_write(self._quota_path, data)
-                for name in merged:
-                    self._pending.pop(name, None)
+                written = True
                 return quota["blocked_until"] or None
         except (OSError, ValueError):
             return None
+        finally:
+            # #1927 : le retrait n'est confirmé qu'une fois l'écriture faite ;
+            # les compteurs retirés reviennent tant qu'elle n'a pas eu lieu,
+            # quelle que soit la panne.
+            if not written:
+                _restore_pending(self._pending, taken, self._pending_lock)
 
     def blocked(self, now=None, resource: str = DEFAULT_RESOURCE) -> float | None:
         """L'instant (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""
@@ -1106,14 +1180,22 @@ def _clean(body: str | None, marker_re=None) -> str:
     return "\n".join(line.rstrip() for line in text.split("\n"))
 
 
-def _own_labels(labels: Iterable) -> list[str]:
+def _managed_label(name: str, managed=None) -> bool:
+    """L'étiquette est à ameesh : `ameesh`, `ameesh:*`, ou un libellé de board
+    admis du projet (#2130/D)."""
+    return bool(name) and (name == BASE_LABEL or name.startswith(BASE_LABEL + ":")
+                           or name in (managed or ()))
+
+
+def _own_labels(labels: Iterable, managed=None) -> list[str]:
     names = [(lab.get("name") if isinstance(lab, dict) else str(lab)) for lab in labels or []]
-    return sorted(n for n in names if n and (n == BASE_LABEL or n.startswith(BASE_LABEL + ":")))
+    return sorted(n for n in names if _managed_label(n, managed))
 
 
-def _fields(title: str, body: str, labels: Iterable, state: str, marker_re=None) -> dict:
+def _fields(title: str, body: str, labels: Iterable, state: str, marker_re=None,
+            managed=None) -> dict:
     return {"title": (title or "").strip(), "body": _clean(body, marker_re),
-            "labels": _own_labels(labels), "state": (state or "").lower()}
+            "labels": _own_labels(labels, managed), "state": (state or "").lower()}
 
 
 _FIELD_NAMES = ("title", "body", "labels", "state")
@@ -1486,10 +1568,12 @@ TITLE_MAX = 256
 BODY_MAX = 30000
 SUMMARY_MAX = 300
 #: clé `github` de la configuration de l'hôte : clés admises, cadence
-SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms")
-#: forme longue d'un projet : `repo`, et les workflows suivis par le veilleur
-#: de CI (#1110, `ci.Watcher`)
-PROJECT_KEYS = ("repo", "workflows")
+SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms", "process")
+#: #2130/D : clés admises d'un mapping Process (data only, compilé au chargement)
+PROCESS_KEYS = ("ref", "version", "document", "labels")
+#: forme longue d'un projet : `repo`, les workflows suivis par le veilleur de
+#: CI (#1110, `ci.Watcher`) et la ou les branches de base du dépôt (#1483)
+PROJECT_KEYS = ("repo", "workflows", "base")
 #: suffixes admis pour un fichier de workflow (`.github/workflows/…`)
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 DEFAULT_INTERVAL = 300.0
@@ -1552,6 +1636,19 @@ class Settings:
     #: {dépôt: (fichiers de workflow, …)} — les workflows que le veilleur de CI
     #: suit dans ce dépôt (#1110) ; sans entrée, il découvre ceux du dépôt
     workflows: dict = field(default_factory=dict)
+    #: {dépôt: (branches de base, …)} — les branches sur lesquelles une
+    #: exécution n'est jamais remplacée et dont le rouge sert de référence
+    #: (#1483 : Nexlink a `develop` pour base) ; sans entrée, `ci.BASE_BRANCHES`
+    bases: dict = field(default_factory=dict)
+    #: #2130/D : {projet: (ProcessMapping, …)} — les révisions Process admises et
+    #: leurs libellés de board ; un lot pinné n'est projeté que par un mapping
+    #: admis de son couple exact (ref, version). Vide : aucune greffe.
+    process: dict = field(default_factory=dict)
+
+    def process_for(self, project: str | None) -> tuple:
+        """Les mappings admis d'un projet (nom sans casse), ou () — opt-in."""
+        name = self.project_name(project)
+        return tuple(self.process.get(name, ())) if name else ()
 
     def project_name(self, project: str | None) -> str | None:
         """Le nom configuré d'un projet (sans casse), ou None."""
@@ -1572,6 +1669,88 @@ class Settings:
         return next((tuple(files) for name, files in self.workflows.items()
                      if name.casefold() == key), None)
 
+    def bases_for(self, repo: str | None) -> tuple | None:
+        """Les branches de base déclarées d'un dépôt, ou None (défaut du
+        veilleur : `ci.BASE_BRANCHES`)."""
+        key = (repo or "").strip().casefold()
+        if not key:
+            return None
+        return next((tuple(branches) for name, branches in self.bases.items()
+                     if name.casefold() == key), None)
+
+    def all_bases(self) -> tuple:
+        """Toutes les branches de base déclarées, sans doublon, dans l'ordre
+        de déclaration : la lecture des alertes (`ci.main_red`) couvre ainsi
+        les bases de tous les dépôts (le défaut `main` reste à la charge de
+        l'appelant)."""
+        out: list[str] = []
+        for branches in self.bases.values():
+            out.extend(branches)
+        return tuple(dict.fromkeys(out))
+
+
+def _board_labels(project: str, spec: dict, artifact) -> dict:
+    """#2130/D : un libellé de board admis par étape, exactement."""
+    where = "`github.process.%s.labels`" % project
+    labels = spec.get("labels")
+    if not isinstance(labels, dict) or not labels:
+        raise SettingsError("%s: object {stage: board label} expected" % where)
+    stages = artifact.statuses()
+    unknown = sorted(str(key) for key in labels if str(key) not in stages)
+    if unknown:
+        raise SettingsError("%s: unknown stage(s) %s (artifact stages: %s)"
+                            % (where, ", ".join(unknown), ", ".join(stages)))
+    out = {}
+    for stage in stages:
+        value = labels.get(stage)
+        if not isinstance(value, str) or not value.strip():
+            raise SettingsError("%s.%s: non-empty board label expected" % (where, stage))
+        out[stage] = value.strip()
+    return out
+
+
+def _process_mapping(project: str, spec) -> projection_mod.ProcessMapping:
+    """#2130/D : compile un mapping admis (données seules, schéma fermé)."""
+    where = "`github.process.%s`" % project
+    if not isinstance(spec, dict):
+        raise SettingsError("%s: object expected" % where)
+    extra = sorted(set(map(str, spec)) - set(PROCESS_KEYS))
+    if extra:
+        raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
+                            % (where, ", ".join(extra), ", ".join(PROCESS_KEYS)))
+    ref = spec.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        raise SettingsError("%s.ref: Process revision reference expected" % where)
+    version = spec.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise SettingsError("%s.version: integer >= 0 expected" % where)
+    document = spec.get("document")
+    if not isinstance(document, dict):
+        raise SettingsError("%s.document: Process document (data only) expected" % where)
+    try:
+        artifact = workflow_mod.compile_workflow(document, ref=ref.strip(), version=version)
+    except workflow_mod.WorkflowRefusal as exc:
+        raise SettingsError("%s.document: %s" % (where, exc)) from exc
+    return projection_mod.ProcessMapping(
+        project=project, ref=artifact.workflow_ref, version=artifact.workflow_version,
+        spec=artifact, labels=_board_labels(project, spec, artifact))
+
+
+def _process_mappings(project: str, value) -> tuple:
+    """Un mapping, ou une liste : un transfert admet deux révisions à la fois."""
+    items = value if isinstance(value, list) else [value]
+    if not items:
+        raise SettingsError("`github.process.%s`: at least one mapping expected" % project)
+    out: list = []
+    for spec in items:
+        mapping = _process_mapping(project, spec)
+        if any(m.ref == mapping.ref and m.version == mapping.version for m in out):
+            raise SettingsError(
+                "`github.process.%s`: revision %s@%d admitted twice "
+                "(projection-ambiguous)" % (project, mapping.ref, mapping.version))
+        out.append(mapping)
+    return tuple(out)
+
 
 def parse_settings(raw) -> Settings:
     """Valide la clé `github` (SettingsError : message actionnable)."""
@@ -1589,6 +1768,7 @@ def parse_settings(raw) -> Settings:
         raise SettingsError("`github.projects`: object {\"project\": \"owner/repo\"} expected")
     projects: dict = {}
     workflows: dict = {}
+    bases: dict = {}
     for name, value in declared.items():
         name = str(name).strip()
         where = "`github.projects.%s`" % name
@@ -1597,32 +1777,51 @@ def parse_settings(raw) -> Settings:
         if any(other.casefold() == name.casefold() for other in projects):
             raise SettingsError("%s: project declared twice (case-insensitive)" % where)
         files = None
+        declared_bases = None
         if isinstance(value, dict):
             extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
             if extra:
                 raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
                                     % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
             files = value.get("workflows")
+            declared_bases = value.get("base")
             value = value.get("repo")
         if not isinstance(value, str) or not _REPO_RE.fullmatch(value.strip()):
             raise SettingsError("%s: repository \"owner/repo\" expected, not %r" % (where, value))
         projects[name] = value.strip()
         if files is not None:
-            where = "%s.workflows" % where
+            where_files = "%s.workflows" % where
             if not isinstance(files, list) or not files:
-                raise SettingsError("%s: non-empty list of workflow file names expected" % where)
+                raise SettingsError("%s: non-empty list of workflow file names expected"
+                                    % where_files)
             names = []
             for item in files:
                 if not isinstance(item, str) or not item.strip():
-                    raise SettingsError("%s: workflow file name expected, not %r" % (where, item))
+                    raise SettingsError("%s: workflow file name expected, not %r"
+                                        % (where_files, item))
                 filename = item.strip().rsplit("/", 1)[-1]
                 if not filename.endswith(WORKFLOW_SUFFIXES):
                     raise SettingsError("%s: %r is not a workflow file name (…%s)"
-                                        % (where, item, "/".join(WORKFLOW_SUFFIXES)))
+                                        % (where_files, item, "/".join(WORKFLOW_SUFFIXES)))
                 if filename not in names:
                     names.append(filename)
             key = projects[name]
             workflows[key] = tuple(dict.fromkeys(workflows.get(key, ()) + tuple(names)))
+        if declared_bases is not None:
+            where = "%s.base" % where
+            items = [declared_bases] if isinstance(declared_bases, str) else declared_bases
+            if not isinstance(items, list) or not items:
+                raise SettingsError("%s: branch name or non-empty list expected "
+                                    "(\"develop\" or [\"main\", \"develop\"])" % where)
+            names = []
+            for item in items:
+                if not isinstance(item, str) or not item.strip() or item.strip() != item \
+                        or any(ch.isspace() for ch in item):
+                    raise SettingsError("%s: branch name expected, not %r" % (where, item))
+                if item not in names:
+                    names.append(item)
+            key = projects[name]
+            bases[key] = tuple(dict.fromkeys(bases.get(key, ()) + tuple(names)))
     host = raw.get("host")
     if host is not None and not isinstance(host, str):
         raise SettingsError("`github.host`: host name expected")
@@ -1640,10 +1839,26 @@ def parse_settings(raw) -> Settings:
     terms = [] if terms is None else terms
     if not isinstance(terms, list) or not all(isinstance(t, str) and t.strip() for t in terms):
         raise SettingsError("`github.exclude_terms`: list of non-empty terms expected")
+    declared_process = raw.get("process")
+    if declared_process is None:
+        declared_process = {}
+    if not isinstance(declared_process, dict):
+        raise SettingsError("`github.process`: object {project: mapping} expected")
+    process: dict = {}
+    for name, value in declared_process.items():
+        key = str(name).strip()
+        canonical = next((p for p in projects if p.casefold() == key.casefold()), None)
+        if canonical is None:
+            raise SettingsError("`github.process.%s`: project not declared in "
+                                "`github.projects`" % name)
+        if canonical in process:
+            raise SettingsError("`github.process`: project %s declared twice (case-insensitive)"
+                                % canonical)
+        process[canonical] = _process_mappings(canonical, value)
     return Settings(projects=projects, host=(host or "").strip() or None,
                     interval=float(interval), ci_ttl=float(ci_ttl),
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
-                    workflows=workflows)
+                    workflows=workflows, bases=bases, process=process)
 
 
 def settings_of(cfg) -> Settings:
@@ -1796,9 +2011,21 @@ def lot_project(item: dict) -> str | None:
     return projects_mod.lot_project(lot, {item.get("assignee") or "": agent})
 
 
-def needs_issue(item: dict) -> bool:
-    """Un lot ouvert sans issue_ref : son issue reste à créer."""
-    return item.get("state") not in LOT_TERMINAL and not (item.get("issue_ref") or "").strip()
+def needs_issue(item: dict, mapping=None) -> bool:
+    """Un lot sans issue_ref : son issue reste à créer.
+
+    #2130/D : pour un lot pinné, « ouvert » est l'état PROJETÉ (le cœur
+    `merged` reste ouvert) ; sans mapping admis, aucune issue neuve — jamais la
+    règle legacy sur l'état de la ligne.
+    """
+    if (item.get("issue_ref") or "").strip():
+        return False
+    if projection_mod.pinned(item):
+        try:
+            return projection_mod.project_issue(item, mapping).state == "open"
+        except projection_mod.ProjectionRefusal:
+            return False
+    return item.get("state") not in LOT_TERMINAL
 
 
 def _priority(item: dict) -> int | None:
@@ -1809,10 +2036,13 @@ def _priority(item: dict) -> int | None:
     return value if value in PRIORITY_LABELS else None
 
 
-def lot_labels(item: dict) -> list[str]:
-    """`ameesh`, `ameesh:<état>`, `ameesh:<type>`, `ameesh:p<priorité>`."""
+def lot_labels(item: dict, *, stage_label: str | None = None) -> list[str]:
+    """`ameesh`, l'état — ou le libellé d'étape admis d'un lot pinné (#2130/D) —
+    `ameesh:<type>`, `ameesh:p<priorité>`."""
     labels = {BASE_LABEL}
-    if item.get("state"):
+    if stage_label:
+        labels.add(stage_label)
+    elif item.get("state"):
         labels.add("%s:%s" % (BASE_LABEL, item["state"]))
     if item.get("type") in LOT_TYPES:
         labels.add("%s:%s" % (BASE_LABEL, item["type"]))
@@ -1867,6 +2097,9 @@ class LotView:
     closing: str | None             # pourquoi l'issue est fermée (commentaire)
     refused: list[str] = field(default_factory=list)    # titre non publiable
     withheld: list[dict] = field(default_factory=list)  # parties retenues
+    #: #2130/D : refus de projection d'un lot pinné (codes stables) ; non vide,
+    #: l'issue n'est touchée par AUCUN champ (l'appelant saute le lot).
+    projection_refused: list[str] = field(default_factory=list)
 
 
 def _assignee_text(item: dict, public: bool, guard: Guard) -> str:
@@ -1996,10 +2229,14 @@ def _compose(item: dict, *, public: bool, guard: Guard,
     return None, withheld
 
 
-def _closing(item: dict, *, repo: str, public: bool, issue_of) -> str | None:
-    """Le commentaire de fermeture : pourquoi le lot est terminé."""
+def _closing(item: dict, *, repo: str, public: bool, issue_of,
+             core: str | None = None) -> str | None:
+    """Le commentaire de fermeture : pourquoi le lot est terminé.
+
+    `core` (#2130/D) : le cœur décidé par la projection d'un lot pinné, quand
+    il diffère de l'état de la ligne (retenue, ou cœur projeté)."""
     n = int(item["id"])
-    state = item.get("state")
+    state = core or item.get("state")
     if state == "merged":
         pr = _ref_parts(item.get("pr_ref"))
         where = ""
@@ -2023,8 +2260,15 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of) -> str | None:
 
 
 def lot_view(item: dict, *, public: bool, guard: Guard, project: str, repo: str,
-             issue_of=lambda _lot: None) -> LotView:
-    """L'issue voulue pour le lot `item` dans `repo` (public ou privé)."""
+             issue_of=lambda _lot: None, mapping=None) -> LotView:
+    """L'issue voulue pour le lot `item` dans `repo` (public ou privé).
+
+    #2130/D : un lot pinné (`workflow_ref`) est projeté par le mapping admis de
+    son couple exact (ref, version) — état, libellé de board et commentaire de
+    fermeture viennent de l'artefact, jamais de l'état legacy. Sans mapping, ou
+    sur un fait manquant/ambigu, `projection_refused` porte le code et aucun
+    champ désiré n'est calculé : l'appelant laisse l'issue intacte.
+    """
     title = _cut(" ".join(str(item.get("title") or "").split()), TITLE_MAX) \
         or "Work item %d" % int(item["id"])
     refused = guard.problems(title, public=public)
@@ -2033,11 +2277,24 @@ def lot_view(item: dict, *, public: bool, guard: Guard, project: str, repo: str,
         refused = refused + [r for part in withheld for r in part["reasons"]
                              if r not in refused]
         body = ""
-    state, reason = lot_issue_state(item)
-    closing = _closing(item, repo=repo, public=public, issue_of=issue_of)
+    core = None
+    if projection_mod.pinned(item):
+        try:
+            projected = projection_mod.project_issue(item, mapping)
+        except projection_mod.ProjectionRefusal as exc:
+            return LotView(item_id=int(item["id"]), title=title, body=body, labels=[],
+                           state="", state_reason=None, closing=None,
+                           refused=refused, withheld=withheld,
+                           projection_refused=[exc.code])
+        state, reason, core = projected.state, projected.state_reason, projected.core
+        labels = lot_labels(item, stage_label=projected.label)
+    else:
+        state, reason = lot_issue_state(item)
+        labels = lot_labels(item)
+    closing = _closing(item, repo=repo, public=public, issue_of=issue_of, core=core)
     if closing and guard.problems(closing, public=public):
         closing = "Work item %d finished: issue closed by ameesh." % int(item["id"])
-    return LotView(item_id=int(item["id"]), title=title, body=body, labels=lot_labels(item),
+    return LotView(item_id=int(item["id"]), title=title, body=body, labels=labels,
                    state=state, state_reason=reason, closing=closing,
                    refused=refused, withheld=withheld)
 
@@ -2054,25 +2311,26 @@ def _restamp(body: str | None, marker: str) -> str:
     return marker + "\n" + body
 
 
-def _foreign_labels(issue: dict) -> list[str]:
+def _foreign_labels(issue: dict, managed=None) -> list[str]:
     """Les étiquettes qui ne sont pas à ameesh : jamais touchées."""
     names = [(lab.get("name") if isinstance(lab, dict) else str(lab))
              for lab in issue.get("labels") or []]
-    return sorted(n for n in names if n and not (n == BASE_LABEL
-                                                 or n.startswith(BASE_LABEL + ":")))
+    return sorted(n for n in names if n and not _managed_label(n, managed))
 
 
-def _three_way(view: LotView, issue: dict) -> tuple[dict, list, list, list]:
+def _three_way(view: LotView, issue: dict, managed=None) -> tuple[dict, list, list, list]:
     """(champs voulus, à écrire, changés dans GitHub, gardés tels quels).
 
     Les empreintes du marqueur disent ce qu'ameesh a écrit la dernière fois.
     Un champ que le lot a changé depuis est écrit ; un champ qu'un humain a
     changé dans GitHub, et que le lot n'a pas changé, est gardé. Une issue
     sans empreintes (désignée par l'issue_ref, sans marqueur) est adoptée :
-    seules les étiquettes `ameesh` y sont posées."""
-    want = _fields(view.title, view.body, view.labels, view.state, _WORK_MARKER_RE)
+    seules les étiquettes `ameesh` y sont posées. `managed` (#2130/D) : les
+    libellés de board admis du projet sont à nous, comme `ameesh:*`."""
+    want = _fields(view.title, view.body, view.labels, view.state, _WORK_MARKER_RE,
+                   managed=managed)
     have = _fields(issue.get("title"), issue.get("body"), issue.get("labels"),
-                   issue.get("state"), _WORK_MARKER_RE)
+                   issue.get("state"), _WORK_MARKER_RE, managed=managed)
     recorded = (issue.get("_recorded") or "").split(".") if issue.get("_recorded") else []
     if len(recorded) == len(_FIELD_NAMES):
         ours = [k for k, d in zip(_FIELD_NAMES, recorded) if _digest(want[k]) != d]
@@ -2097,7 +2355,8 @@ def _label_description(name: str) -> str:
 
 
 def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
-                 settings: Settings | None = None, feed: list | None = None,
+                 settings: Settings | None = None, mappings: Iterable = (),
+                 feed: list | None = None,
                  cache: dict | None = None, forge_hosts: Iterable = (),
                  local_host: str | None = None, max_creates: int = MAX_CREATES,
                  now: float | None = None) -> dict:
@@ -2123,7 +2382,8 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
     report: dict = {"project": project, "repo": repo, "visibility": visibility,
                     "public": public, "dry_run": bool(dry_run), "issues": [],
                     "labels_created": [], "refused": [], "withheld": [], "human_edits": [],
-                    "issue_refs": [], "duplicates": [], "orphans": [], "errors": []}
+                    "issue_refs": [], "duplicates": [], "orphans": [], "errors": [],
+                    "projection_refused": []}
     issues = gh_repo.issues()
     by_number = {int(i["number"]): i for i in issues if i.get("number") is not None}
     markers: dict = {}
@@ -2182,12 +2442,39 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
 
     plans: list[dict] = []
     creates = 0
+    # #2130/D : l'ensemble géré est celui du PROJET — l'union des libellés de
+    # toutes les révisions admises. Un transfert admet deux révisions : le
+    # libellé de l'ancienne est à nous et doit céder la place au nouveau, pas
+    # rester comme une étiquette étrangère. `mapping` reste celui du lot.
+    managed_set = set()
+    for admitted in mappings or ():
+        managed_set.update(admitted.labels.values())
+    managed = managed_set or None
+    refused_lots: set = set()
     for item, issue in mine:
         lot_id = int(item["id"])
-        if issue is None and item.get("state") in LOT_TERMINAL:
-            continue                    # jamais d'issue neuve pour un lot terminé
+        mapping = projection_mod.mapping_for(mappings, item)
         view = lot_view(item, public=public, guard=guard, project=project, repo=repo,
-                        issue_of=issue_of)
+                        issue_of=issue_of, mapping=mapping)
+        if view.projection_refused:
+            # #2130/D : fait manquant/ambigu — l'issue n'est touchée par aucun
+            # champ, et l'état legacy ne sert JAMAIS de repli. Le lot est aussi
+            # exclu de la pose d'`issue_ref` en fin de passe (aucune écriture
+            # native : un mapping corrigé reprend sans autre geste).
+            refused_lots.add(lot_id)
+            report["projection_refused"].append({
+                "work_item": lot_id, "number": int(issue["number"]) if issue else None,
+                "codes": list(view.projection_refused),
+                "ref": str(item.get("workflow_ref") or ""),
+                "version": item.get("workflow_version") or 0,
+                "stage": item.get("workflow_stage")})
+            report["issues"].append({"work_item": lot_id,
+                                     "number": int(issue["number"]) if issue else None,
+                                     "action": "refused-projection", "changes": [],
+                                     "codes": list(view.projection_refused)})
+            continue
+        if issue is None and view.state == "closed":
+            continue                    # jamais d'issue neuve pour un lot terminé
         for part in view.withheld:
             report["withheld"].append(dict(part, work_item=lot_id))
         entry = {"work_item": lot_id, "number": int(issue["number"]) if issue else None,
@@ -2207,7 +2494,8 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
                 entry["action"] = "deferred"
                 continue
             creates += 1
-            want = _fields(view.title, view.body, view.labels, view.state, _WORK_MARKER_RE)
+            want = _fields(view.title, view.body, view.labels, view.state, _WORK_MARKER_RE,
+                           managed=managed)
             entry["action"] = "create"
             plans.append({"entry": entry, "item": item, "labels": view.labels,
                           "payload": {"title": view.title,
@@ -2216,7 +2504,14 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
             continue
         if view.refused:
             view.title = (issue.get("title") or "").strip()   # titre gardé tel quel
-        want, write, human, kept = _three_way(view, issue)
+        want, write, human, kept = _three_way(view, issue, managed=managed)
+        if mapping is not None and view.state == "closed" and "state" not in write \
+                and (issue.get("state") or "").lower() == "closed" \
+                and (issue.get("state_reason") or "") != (view.state_reason or ""):
+            # #2130/D : l'issue est déjà fermée, mais pour une autre raison
+            # (fermeture legacy au mauvais motif) : la raison se corrige, sans
+            # commentaire — état et raison restent cohérents.
+            write = list(write) + ["state"]
         if human:
             report["human_edits"].append({
                 "work_item": lot_id, "number": int(issue["number"]),
@@ -2227,7 +2522,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
         if "title" in write:
             payload["title"] = view.title
         if "labels" in write:
-            payload["labels"] = _foreign_labels(issue) + view.labels
+            payload["labels"] = _foreign_labels(issue, managed) + view.labels
         if "state" in write:
             payload["state"] = view.state
             if view.state == "closed" and view.state_reason:
@@ -2260,8 +2555,12 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
         for plan in plans:
             _execute(db, st, gh_repo, report, plan)
         # issue retrouvée par son marqueur (ou adoptée) : l'issue_ref du lot la
-        # désigne, sauf si elle désigne déjà une issue existante de ce dépôt
+        # désigne, sauf si elle désigne déjà une issue existante de ce dépôt.
+        # #2130/D : un lot pinné refusé n'écrit rien, pas même son issue_ref
+        # (le refus n'est pas une adoption, et l'état legacy ne décide pas).
         for item, issue in mine:
+            if int(item["id"]) in refused_lots:
+                continue
             ref = _ref_parts(item.get("issue_ref"))
             if issue is None or (ref and ref[0].casefold() == repo.casefold()
                                  and ref[1] in by_number):
@@ -2350,6 +2649,7 @@ def _tally_lots(report: dict) -> dict:
         "created": actions.count("create"), "updated": actions.count("update"),
         "closed": actions.count("close"), "unchanged": actions.count("unchanged"),
         "refused": actions.count("refused"), "deferred": actions.count("deferred"),
+        "projection_refused": actions.count("refused-projection"),
         "errors": len(report["errors"])}
     return report
 
@@ -2407,6 +2707,7 @@ class Projector:
         for name, repo in sorted(settings.projects.items(), key=lambda kv: kv[0].casefold()):
             if now < self.backoff.get(name, 0.0):
                 continue
+            mappings = settings.process_for(name)
             last = self.last.get(name)
             try:
                 if last is not None and now - last < settings.interval:
@@ -2414,7 +2715,7 @@ class Projector:
                         continue
                     if feed is None:
                         feed = storage.of(db).work.issue_feed(FEED_LIMIT)
-                    if not any(needs_issue(i)
+                    if not any(needs_issue(i, projection_mod.mapping_for(mappings, i))
                                and (int(i["id"]), _digest(i.get("title") or "")) not in self.skip
                                and (lot_project(i) or "").casefold() == name.casefold()
                                for i in feed):
@@ -2424,7 +2725,8 @@ class Projector:
                 if self.gh is None:
                     self.gh = Gh()
                 report = project_lots(db, self.gh, name, repo, dry_run=self.dry_run,
-                                      settings=settings, feed=feed, cache=self.cache,
+                                      settings=settings, mappings=mappings, feed=feed,
+                                      cache=self.cache,
                                       forge_hosts=getattr(self.cfg, "forge_hosts", None) or (),
                                       local_host=here, now=now)
             except Exception as exc:  # noqa: BLE001 - GitHub, gh, base : jamais fatal
@@ -2450,6 +2752,7 @@ class Projector:
             ("updated", "to update" if dry else "updated"),
             ("closed", "to close" if dry else "closed"),
             ("deferred", "deferred to the next pass"),
+            ("projection_refused", "refused (Process projection)"),
             ("errors", "in error")) if counts.get(key)]
         if parts:
             line = "GitHub issues %s: %s%s" % (where, ", ".join(parts), " [dry run]" if dry else "")
@@ -2465,6 +2768,13 @@ class Projector:
                                   ", ".join(row["reasons"]),
                                   "title of #%d kept as is" % row["number"] if row["number"]
                                   else "not published"))
+        for row in report["projection_refused"]:
+            self._once(("proj", report["repo"], row["work_item"], tuple(row["codes"])),
+                       "GitHub issues %s: work item %d pinned on %s@%s refused (%s): %s "
+                       "left unchanged; fix the admitted Process mapping"
+                       % (where, row["work_item"], row["ref"] or "(none)", row["version"],
+                          ", ".join(row["codes"]),
+                          "#%d" % row["number"] if row["number"] else "no issue created"))
         for row in report["withheld"]:
             self._once(("withheld", row["work_item"], row["field"], tuple(row["reasons"])),
                        "GitHub issues %s: work item %d, %s not published (%s)"

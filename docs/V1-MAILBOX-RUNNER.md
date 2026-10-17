@@ -311,11 +311,16 @@ test (three messages → three notifications) caught the bug.
   renewed as long as the session lives, the harness is killed if the lease is lost, and
   the lease is returned on exit.
 * **Priority interrupt (0018, R19)**: an undelivered message marked
-  `payload.urgent` from an **authorized sender** (`AMEESH_INTERRUPT_SENDERS`
-  without canon; the "interrupt" capability of a canon card will be added) stops the
+  `payload.urgent` from an **authorized sender** stops the
   running turn (brief SIGTERM then SIGKILL), puts the turn's prompt back as
   pending, and `pick()` serves the priority message **first** on the next turn,
-  on the same session. An urgent message from an unauthorized sender interrupts nothing
+  on the same session. Authorized senders (#795): the owner (`human:*`) always;
+  `ameesh` only for an event **verified in the database** (the end of CI of one
+  of the agent's work items — the run is recorded, the lot is assigned to the
+  agent, and the mail is the one CI posted for that run), so an imitated
+  `--from ameesh` does not interrupt; agents declared in
+  `AMEESH_INTERRUPT_SENDERS` (the "interrupt" capability of a canon card will be
+  added). An urgent message from an unauthorized sender interrupts nothing
   (this is logged): it is delivered like a message — since L125, without
   waiting for the batching window; the thread keeps a record of
   the interruption and its reason.

@@ -85,13 +85,18 @@ def docs_only(names: list[str]) -> tuple[bool, str]:
 
 def doc_readers(path: pathlib.Path = READERS_FILE) -> list[str]:
     """Modules de test qui lisent la documentation (un par ligne, `#` en
-    commentaire), en noms pointés pour `python -m unittest`."""
+    commentaire), en noms pointés pour `python -m unittest`.
+
+    #1609 : `tests/parts/*.txt` est fusionné en `union` (.gitattributes) : deux
+    lots qui ajoutent le même lecteur au même endroit donnent une ligne
+    dupliquée. L'ordre du fichier est gardé, chaque module n'est passé qu'une
+    fois à `python -m unittest`."""
     names = []
     for line in path.read_text(encoding="utf-8").splitlines():
         name = line.split("#", 1)[0].strip()
         if name:
             names.append("tests." + name)
-    return names
+    return list(dict.fromkeys(names))
 
 
 def _git(*args: str) -> str:

@@ -11,7 +11,10 @@ sur quoi, ce qui attend, ce qui est livré.
 ameesh reconnaît un orchestrateur de trois façons : sa fiche Agent du canon
 porte `roles: [orchestrateur]`, il est déclaré dans
 `AMEESH_ALERT_ORCHESTRATORS`, ou il a confié des lots (`work assign`,
-`work delegate`) dans les 30 derniers jours. La fiche est la voie durable.
+`work delegate`) dans les 30 derniers jours. Cette dernière déduction cesse
+dès qu'une fiche de son organisation (son canon) déclare des rôles (L242c) :
+la fiche est alors la seule voie durable. Seule compte la fiche de son
+propre canon, jamais une fiche homonyme d'un autre.
 
 ## Tout travail confié passe par un lot
 
@@ -25,6 +28,7 @@ lot**.
 | Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 2h` |
 | Demande d'un humain (L130) | `ameesh work add --title "RÉF : titre" --source "… « phrase exacte »" --priority N --estimate 2h`, puis le message `--lot <id>` |
 | Lot existant, sans agent | `ameesh mail send <agent> "…" --lot <id\|RÉF>` |
+| Prendre un lot sans agent (brief `stale_lot`/`idle_capacity`) | `ameesh work assign <id> <agent> --claim` : refusé si un autre l'a pris entre-temps, jamais de changement de main silencieux (#1026) |
 | Reprendre un lot à un autre agent | `ameesh work assign <id> <agent>`, puis le message `--lot <id>` |
 | Message sur un lot (relance, question) | `ameesh mail send <agent> "…" --lot <id>` |
 
@@ -296,7 +300,18 @@ Elle est posée sur le lot dès que le relevé la voit en avance sur sa cible.
 La fusion GitHub de cette branche (« Merge pull request #N from
 owner/lot/<id>-… ») ou une fusion locale (« Merge branch 'lot/<id>-…' »)
 ferme le lot, même après la suppression de la branche. Le relevé lit alors le
-corps de la PR (`gh`). Une PR qui ne livre qu'une partie d'un lot parapluie
+corps de la PR (`gh`).
+
+**Détacher une branche obsolète** (#2102). Quand la PR d'un lot est fermée ou
+supplantée et que le lot reste ouvert (vérification restante, autre
+livraison), sa branche sort du lot sans changer son état, son titulaire ni
+son relecteur : `ameesh work branch <id> --detach --reason "PR #N supplantée
+par #M"`. La ligne de journal garde le nom, le dernier commit vu, la cible et
+la raison ; Git n'est pas touché. Le radar ne lit plus cette branche, et le
+relevé ne l'associe plus implicitement, même si `lot/<id>-…` existe encore.
+Un lot sans branche peut nommer celle à ne plus deviner (`ameesh work branch
+<id> lot/<id>-… --detach --reason …`). La réassociation est explicite :
+`ameesh work branch <id> <branche> [--target T]`. Une PR qui ne livre qu'une partie d'un lot parapluie
 (#139) porte dans sa description :
 
 ```
@@ -365,13 +380,23 @@ le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
 commit de fusion et une note qui dit comment la fusion a été constatée.
 
 À la main, quand le relevé ne peut pas la voir (lot sans assigné, autre
-hôte, commit qui ne le désigne pas) :
+hôte), depuis un clone du dépôt du lot :
 
 ```
-ameesh work merged <id> --sha <commit de fusion> [--note "…"]
+ameesh work merged <id> --sha <commit de fusion> [--repo <clone local>] [--note "…"]
 ```
 
 depuis tout état ouvert, en une fois ; l'acteur est votre identité liée.
+La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
+(ou le dépôt configuré pour son projet), puis le commit dans sa cible.
+Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
+de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
+Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
+pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
+n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
+dossier courant. La lecture reste locale : récupérer la cible au préalable
+si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
@@ -496,9 +521,12 @@ courrier les rappelle) :
   « go », « d'accord » restent des réponses, qui réveillent.
 * **`--urgent` seulement quand l'attente bloque** : le destinataire doit agir
   avant de continuer (build cassé sur la branche commune, fusion à arrêter,
-  question sans laquelle il tourne à vide). D'un expéditeur habilité
-  (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même un tour en cours :
-  à réserver aux vraies urgences.
+  question sans laquelle il tourne à vide). De l'owner (`human:*`) ou d'un
+  expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même
+  un tour en cours : à réserver aux vraies urgences. Depuis #795, la première
+  alerte d'échec d'un lot est elle-même un urgent vérifié en base qui
+  interrompt le tour de l'agent du lot ; le verdict (vert ou rouge), lui,
+  réveille sans couper (#514).
 * **Diffusions** : `agent-mail send all "…"` dépose une annonce lue au
   prochain tour de chacun, sans réveiller personne ; `--urgent` réveille toute
   l'équipe, rarement.
@@ -604,7 +632,10 @@ relis :
 ## Livraison et déploiements
 
 Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
-restée 4 h fusionnée sans être déployée :
+restée 4 h fusionnée sans être déployée, actualisées selon le
+[canon « Processus de lot » §14](https://github.com/manaty/home/blob/c838dd3e94bf/processus/lots.md#14-staging-et-prod-dameesh)
+(owner, 2026-10-14 vers 02:45, session bureau Claude
+`17076001-2b29-414c-a288-06791a5d9719`), source unique :
 
 1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
    propriétaire se fusionne avant tout nouveau chantier.
@@ -613,14 +644,23 @@ restée 4 h fusionnée sans être déployée :
    `deploy/mise-a-jour` (vérifier, sauvegarder, migrer, installer, redémarrer
    hors tour, contrôler, retour possible). Le propriétaire et les agents
    touchés sont prévenus après coup.
-3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,
+3. **Le staging d'ameesh se déploie sans go du propriétaire ni procédure de
+   release**, y compris sur pc-smichea, pour une nouvelle fonction, une version
+   mineure ou une migration additive. Suivre `deploy/mise-a-jour/` : migrations
+   additives avant de relancer les exécuteurs, VM d'agents d'abord, pc-smichea
+   en dernier et seulement si les VM sont saines (runners redémarrés publiant
+   leur vivacité, `ameesh doctor` vert et courrier test livré). Un hôte malsain
+   revient à la version précédente (étape `retour`) et le déploiement s'arrête.
+   Les hôtes ameesh-agents-1, ameesh-agents-2, manaty-mesh-1 et pc-smichea sont
+   le staging ; la prod est une installation utilisée hors du mesh qui construit
+   ameesh. **Un déploiement en prod se prépare entièrement** (nouvelle fonction,
    version mineure, migration qui change le comportement) : étiquette posée,
    `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
-   verifier <REF>` passés, plan de retour connu (étape `retour`). Ils sont
-   proposés au propriétaire dès son retour, en premier point, avec les choix
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Il est
+   proposé au propriétaire dès son retour, en premier point, avec les choix
    possibles : version seule ou `main` entier, migrations, risques. Une
-   consigne de veille ne se contente jamais d'interdire « tout déploiement »
-   sans le préparer. Les gestes en production d'un projet, les dépenses et les
+   consigne de veille prépare le staging sans lui appliquer cette attente.
+   Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
