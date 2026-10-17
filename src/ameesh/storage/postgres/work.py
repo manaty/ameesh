@@ -887,9 +887,13 @@ class WorkItems(interface.WorkItems):
         )
 
     def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
-                      on_frozen=None, after_commit=None) -> dict:
+                      proof=None, on_frozen=None, after_commit=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
         s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
+
+        #1465 : quand `proof` porte un sha complet, sa ligne de provenance est
+        écrite dans la MÊME transaction — le fait et sa preuve naissent
+        ensemble, ou pas du tout.
 
         `on_frozen` (facultatif, #1617) : callback appelé **dans la
         transaction** du jalon, juste après l'INSERT d'un jalon `frozen`, avec
@@ -922,6 +926,14 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if proof and proof.get("sha"):
+                tx.execute(
+                    "INSERT INTO provenance_receipts"
+                    "       (subject, sha, actor, session, turn, harness, work_item_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (subject) DO NOTHING",
+                    ("milestone:%d" % int(milestone["id"]), proof["sha"], proof["actor"],
+                     proof["session"], proof["turn"], proof["harness"], int(item_id)))
             if kind == "frozen" and has_reviewer(self.db):
                 WorkItems(tx)._lapse_waiver(int(item_id), milestone, actor)
             if on_frozen is not None:
