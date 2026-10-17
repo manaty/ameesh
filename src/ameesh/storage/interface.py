@@ -1678,6 +1678,37 @@ class WorkItems(Domain):
         the ready intake never offers a lot that cannot be started."""
 
     @abc.abstractmethod
+    def review_proposals(self, limit: int, *, proposal_prefix: str,
+                         window_s: float = 21600.0) -> list[dict]:
+        """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
+        sans verdict COURANT (une relecture est due) ou à verdict courant
+        bloquant (une correction est due) — avec leur auteur, leur branche,
+        leur tête gelée, leur équipe résolue (`lot_team`) et les colonnes du
+        lot dont la prise a besoin.
+
+        Un lot déjà muni d'un relecteur désigné, ou sans tête gelée, est
+        écarté ; un lot dont une proposition (`proposal_prefix` au journal) a
+        moins de `window_s` n'est pas reproposé. Le verdict retenu est celui
+        qui nomme le dernier gel (#1677 B1) : un `ok` périmé par un regel ne
+        dispense pas de la relecture."""
+
+    @abc.abstractmethod
+    def claim_review_proposal(self, item_id: int, *, agent: str, kind: str,
+                              proposal_prefix: str, window_s: float,
+                              actor: str) -> bool:
+        """#1738 (N5/N7) : enregistre la proposition d'un lot en `qa` sous un
+        verrou consultatif par lot — le contrôle (fenêtre `window_s`,
+        `proposal_prefix` au journal, lot encore en `qa`, agent différent de
+        l'assigné), la désignation du relecteur (#705, pour `kind='review'`)
+        et la note tiennent ensemble. Rend False sans rien écrire si un autre
+        passage a déjà proposé le lot, si le lot n'est plus en `qa`, ou si
+        l'agent en est l'assigné — deux passages (hôtes distincts) ne
+        proposent jamais le même lot deux fois. #1738 R1 (B1) : sous le
+        verrou, le lot est revalidé avec le prédicat de `review_proposals`
+        (relecteur vide, verdict courant, gel) et `kind` doit y correspondre ;
+        le relecteur n'est posé que s'il est encore vide (compare-and-set)."""
+
+    @abc.abstractmethod
     def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
         """L233b : la dernière ligne de journal du lot dont la note commence
         par l'un des `prefixes` (une attribution), puis sa ligne la plus
