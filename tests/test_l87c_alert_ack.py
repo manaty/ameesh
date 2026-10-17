@@ -364,13 +364,14 @@ class AcknowledgementTest(PostMixin, PgTestCase):
                                   wraps=alert_ack.reconcile) as reconcile:
             self.notifier().run_pass(self.db)
         self.assertEqual(len(observed), 1)
-        seuils = {k: v for k, v in observed[0].items()
+        thresholds = {k: v for k, v in observed[0].items()
                   if k not in ("now", "local_pool", "unreadable")}
-        # #2105 : la passe observe avec le périmètre qu'elle déclare à
-        # reconcile — sans seuils, les défauts du parser, environnement compris.
+        # #2105 : the pass observes with the perimeter it declares to
+        # reconcile — without thresholds, the parser's defaults, environment
+        # included.
         self.assertEqual(reconcile.call_args.kwargs["perimeter"],
-                         alert_ack.canonical(seuils))
-        self.assertEqual(seuils.get("long_turn_s"), 999.0)
+                         alert_ack.canonical(thresholds))
+        self.assertEqual(thresholds.get("long_turn_s"), 999.0)
 
     def test_ack_between_last_raise_and_resolution_silences_resolution(self):
         n = self.notifier()
