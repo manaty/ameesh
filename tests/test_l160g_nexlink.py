@@ -411,7 +411,7 @@ class RequiredCiLandTest(_Land):
         with mock.patch.object(radar, "commit_ci", return_value=self.RED) as ci:
             out = self.land(4)
         self.assertEqual(out["result"], "ejected", out)
-        ci.assert_called_once_with(self.project, self.tip(4))
+        ci.assert_called_once_with(self.project, self.tip(4), branch=self.fake.lots[4]["branch"])
         self.assertIn("is red", self.fake.queue_rows[4]["reason"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
 
@@ -423,7 +423,7 @@ class RequiredCiLandTest(_Land):
                 "runs": 0, "green": False, "pending": [], "failed": []}) as ci:
             out = self.land(4)
         self.assertEqual(out["result"], "ejected", out)
-        ci.assert_called_once_with(self.project, self.tip(4))
+        ci.assert_called_once_with(self.project, self.tip(4), branch=self.fake.lots[4]["branch"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
 
     def test_ci_is_checked_again_after_merged_tree_gates(self):
@@ -433,7 +433,7 @@ class RequiredCiLandTest(_Land):
         with mock.patch.object(radar, "commit_ci", side_effect=[self.GREEN, self.RED]) as ci:
             out = self.land(4)
         self.assertEqual(out["result"], "ejected", out)
-        self.assertEqual(ci.call_args_list, [mock.call(self.project, self.tip(4))] * 2)
+        self.assertEqual(ci.call_args_list, [mock.call(self.project, self.tip(4), branch=self.fake.lots[4]["branch"])] * 2)
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
 
     def test_already_pushed_commit_remains_a_fact_after_ci_turns_red(self):
@@ -451,7 +451,7 @@ class RequiredCiLandTest(_Land):
         with mock.patch.object(radar, "commit_ci", return_value=self.GREEN) as ci:
             out = self.land(4)
         self.assertEqual(out["result"], "landed", out)
-        self.assertEqual(ci.call_args_list, [mock.call(self.project, self.tip(4))] * 2)
+        self.assertEqual(ci.call_args_list, [mock.call(self.project, self.tip(4), branch=self.fake.lots[4]["branch"])] * 2)
 
     def test_unreadable_frozen_ci_does_not_land(self):
         self.queued(4)
@@ -528,7 +528,7 @@ class PrFrozenCiR3Test(_Land):
         with mock.patch.object(radar, "commit_ci", return_value=self.RED) as ci:
             out = self.land(4, gh=gh)
         self.assertEqual(out["result"], "ejected", out)
-        ci.assert_called_once_with(self.project, self.tip(4))
+        ci.assert_called_once_with(self.project, self.tip(4), branch=self.fake.lots[4]["branch"])
         self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
 
 
