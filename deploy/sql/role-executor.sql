@@ -56,6 +56,12 @@ SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM %I', :'schema', name, :'role')
   FROM unnest(ARRAY['host_release_operations','host_release_fences','host_release_fence_receipts']) name
  WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
+-- #1448: the post-merge catch-up activation bound (migration 0438) is
+-- read-only for the executors; only its owner (the pilot's decision) may
+-- move it, never a turn.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.review_catch_up FROM %I',
+              :'schema', :'role')
+ WHERE to_regclass(format('%I.review_catch_up', :'schema')) IS NOT NULL \gexec
 -- #326 r4: the key journal's order is the server's; no setval on its ids
 SELECT format('REVOKE UPDATE ON SEQUENCE %I.key_events_id_seq FROM %I', :'schema', :'role')
  WHERE to_regclass(format('%I.key_events_id_seq', :'schema')) IS NOT NULL \gexec
@@ -160,7 +166,7 @@ BEGIN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
                 END IF;
             END LOOP;
-        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts') THEN
+        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts','review_catch_up') THEN
             IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
                 violations := violations || format('missing SELECT on %s', item.relname);
             END IF;
