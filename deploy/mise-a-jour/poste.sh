@@ -16,14 +16,16 @@
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
-#                installé dans le venv (dépendance psycopg comprise) ; refusé
-#                tant qu'une base n'a pas les migrations de REF
+#                venv versionné préparé à l'écart (dépendance psycopg comprise)
+#                puis bascule atomique du venv (#1969) ; refusé tant qu'une
+#                base n'a pas les migrations de REF
 #   role         rôle superviseur réappliqué, sur chaque base où il existe
 #   redemarrer   exécuteurs du poste un par un, chacun hors tour, puis notify,
 #                puis les exécuteurs de l'ancienne base
 #   controler    doctor, budget, accounts list, projects, alerts
-#   retour       réinstalle la version précédente et redémarre (sans toucher
-#                aux bases : 0041 à 0047 sont additives)
+#   retour       bascule en arrière vers le venv précédent conservé (sans pip),
+#                puis redémarre (sans toucher aux bases : 0041 à 0047 sont
+#                additives)
 #   publier      étiquette annotée v<version> sur REF (un commit de main, la
 #                version de son pyproject.toml), poussée, puis release GitHub
 #                (notes : docs/versions/<version>.md de main, sinon la PR qui a
@@ -194,7 +196,7 @@ ameesh_de() {
 installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
-  local ref=${1:-HEAD} cible court
+  local ref=${1:-HEAD} cible court precedent_court=
   cible=$(instantane "$ref")
   court=${cible##*/src-}
   etape "instantané $ref ($court) dans $cible"
@@ -213,9 +215,19 @@ installer() {
   fi
   [ -L "$PARTAGE/src-current" ] && readlink "$PARTAGE/src-current" > "$TRAVAIL/precedent"
   echo "version précédente : $(cat "$TRAVAIL/precedent" 2>/dev/null || echo '?')"
-  etape "installation dans $VENV (code puis dépendances, dont psycopg)"
-  "$VENV/bin/pip" install -q --force-reinstall --no-deps "$cible"
-  "$VENV/bin/pip" install -q "$cible"
+  if [ -s "$TRAVAIL/precedent" ]; then
+    precedent_court=$(basename "$(cat "$TRAVAIL/precedent")"); precedent_court=${precedent_court#src-}
+  fi
+  # #1969 : jamais de pip dans le venv vivant. Le venv de $court est préparé à
+  # l'écart (pip + contrôles d'imports, de point d'entrée et de shebang), puis
+  # la bascule n'est qu'un rename : un appel concurrent des agents voit
+  # l'ancien ou le nouveau code entier, jamais un état incomplet. La première
+  # conversion adopte le venv réel comme version précédente, sans pip.
+  etape "préparation isolée du venv de $court (code puis dépendances, dont psycopg)"
+  python3 "$ICI/bascule.py" preparer --venv "$VENV" --src "$cible" --version "$court"
+  etape "bascule atomique du venv et du code courant"
+  python3 "$ICI/bascule.py" activer --venv "$VENV" --version "$court" \
+    ${precedent_court:+--precedent "$precedent_court"}
   ln -sfn "src-$court" "$PARTAGE/src-current"
   "$VENV/bin/python" -c 'import psycopg, ameesh.budget, ameesh.projects; print("psycopg", psycopg.__version__, ": modules L70 et L62 présents")'
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
@@ -452,8 +464,10 @@ retour() {
   precedent=$(cat "$TRAVAIL/precedent" 2>/dev/null || true)
   [ -n "$precedent" ] && [ -d "$PARTAGE/$precedent" ] \
     || { echo "version précédente inconnue ($TRAVAIL/precedent)" >&2; exit 1; }
-  etape "réinstallation de $precedent"
-  "$VENV/bin/pip" install -q --force-reinstall --no-deps "$PARTAGE/$precedent"
+  etape "retour par la bascule, sans pip : $precedent"
+  # #1969 : le venv précédent est conservé entier sur disque ; le retour est la
+  # même bascule en arrière, pas une réinstallation dans le venv vivant.
+  python3 "$ICI/bascule.py" retour --venv "$VENV"
   ln -sfn "$precedent" "$PARTAGE/src-current"
   echo "bases inchangées : 0041 à 0047 n'ajoutent que des colonnes et des tables, que l'ancien code ignore"
   redemarrer
