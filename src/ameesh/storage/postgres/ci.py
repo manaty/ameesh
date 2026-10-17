@@ -184,18 +184,23 @@ class CiResults(interface.CiResults):
         # tête plus ancienne ne redevient pas la base. Pour chaque tête, sa
         # première observation, annulations comprises (un réessai ne la
         # rajeunit pas), mais le résultat de sa dernière exécution conclue.
+        # #2064 : `created_at` de GitHub est à la seconde ; à observation
+        # égale, la tête poussée en dernier (run_id le plus grand) prime sur
+        # l'ordre des conclusions.
         rows = self.db.query(
             """
             WITH runs AS (
                 SELECT run_id, head_sha, run_attempt, status, concluded_at,
                        min(coalesce(created_at, first_seen_at))
-                           OVER (PARTITION BY head_sha) AS seen_at
+                           OVER (PARTITION BY head_sha) AS seen_at,
+                       max(run_id) OVER (PARTITION BY head_sha) AS head_run
                   FROM ci_runs
                  WHERE repo = %s AND branch = %s AND workflow = %s
             ), last AS (
                 SELECT run_id, head_sha, run_attempt FROM runs
                  WHERE status IN ('success', 'failure')
-                 ORDER BY seen_at DESC, concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
+                 ORDER BY seen_at DESC, head_run DESC,
+                          concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f

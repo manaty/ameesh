@@ -1802,6 +1802,34 @@ class WatcherTest(PgTestCase):
         self.assertEqual(st.ci.base_failures(repo, "main", workflow="tests.yml")["run_id"],
                          2002)
 
+    def test_seconde_egale_garde_la_tete_poussee_en_dernier(self):
+        """#2064 : `created_at` est à la seconde ; à observation égale, une
+        tête plus ancienne conclue plus tard ne redevient pas la référence —
+        c'est la tête poussée en dernier (run_id le plus grand) qui l'est."""
+        st = storage.of(self.db)
+        repo = "manaty/seconde-egale"
+        ancienne, recente = "0f" * 20, "10" * 20
+        for run_id, tete in ((2201, ancienne), (2202, recente)):
+            st.ci.open_run(repo, run_id, head_sha=tete, branch="main", event="push",
+                           base="main", work_item_id=None, url=None,
+                           workflow="tests.yml",
+                           created_at="2026-01-01T10:00:00Z")
+        st.ci.add_failure(repo, 2201, run_attempt=1, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(repo, 2201, "failure")
+        st.ci.conclude(repo, 2202, "success")
+        # la tête ancienne est conclue plus tard, dans la même seconde
+        self.db.execute(
+            "UPDATE ci_runs SET concluded_at = CASE run_id"
+            " WHEN 2201 THEN '2026-01-01T11:00:00Z'::timestamptz"
+            " WHEN 2202 THEN '2026-01-01T10:30:00Z'::timestamptz END"
+            " WHERE repo = %s AND run_id IN (2201, 2202)", (repo,))
+        reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+        self.assertEqual((reference["run_id"], reference["head_sha"]), (2202, recente))
+        self.assertEqual(reference["tests"], [])
+
     def test_reference_garde_le_dernier_resultat_de_la_tete_recente(self):
         """Une reprise actualise le résultat, jamais l'âge de sa tête."""
         st = storage.of(self.db)
