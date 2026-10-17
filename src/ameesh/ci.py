@@ -1952,7 +1952,9 @@ def quota_line(state_dir, *, now=None) -> str | None:
 # demande sa CI en parallèle de sa relecture, `--exception incident|unblock
 # --reason …` ; le motif et la marque restent dans la trace du lot. `--full
 # --reason …` demande la suite complète sur une PR ordinaire ; une source ou
-# une cible `release/**` ou `integration/**` l'impose et refuse `ci-lot`.
+# une cible `release/**` ou `integration/**` l'impose et refuse `ci-lot`. Le
+# mode `full` ne dispense jamais des avis requis (#2214) : seul `--exception`
+# les suspend, avec son motif.
 #
 # `ameesh ci cancel <lot>` fait la même annulation seule (`--all` : tout, y
 # compris le run de la composition gelée).
@@ -2381,7 +2383,10 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     verdicts = latest_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
     reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
     blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
-    if not (exception or full):
+    if not exception:
+        # #2214 : `--full` ne dispense pas des avis. La suite complète est un
+        # mode d'exécution, pas une relecture ; seules les exceptions motivées
+        # du canon §3 (incident|unblock) partent en parallèle de la relecture.
         # un `blocked` est le dernier mot d'un relecteur sur cette tête : la
         # corriger demande une nouvelle tête, donc un nouveau gel (P1 R1).
         if blocked:
@@ -2631,26 +2636,29 @@ def _revalidate(db, item_id: int, decision: dict) -> None:
     (dernier verdict `blocked`) ou un nouveau gel être enregistré avant que la
     réservation n'obtienne le verrou de la ligne du lot. Cette relecture refait
     les gardes de `gel_plan` dans la transaction qui tient cette ligne, donc
-    après toute écriture concurrente ; les exceptions explicites
-    (`--exception`, `--full`), gestes marqués et motivés, ne dépendent pas des
-    verdicts et gardent leur cours.
+    après toute écriture concurrente ; seule l'exception explicite
+    (`--exception … --reason …`), geste marqué et motivé, ne dépend pas des
+    verdicts et garde son cours. `--full` reste soumis aux avis (#2214).
     """
     from . import work
     item = work.get(db, int(item_id))
     if item is None:
         raise GelError("lot #%s unknown" % item_id)
-    if decision.get("exception") or decision.get("mode") == "full":
+    if decision.get("exception"):
         return
     sha = decision["sha"]
-    freeze = frozen_of(db, item_id)
-    frozen = ((freeze or {}).get("sha") or "").strip().lower()
-    if frozen != sha:
-        if not frozen:
-            raise GelError("lot #%s is no longer frozen (the freeze milestone moved while "
-                           "the request was prepared): nothing posed" % item_id)
-        raise GelError("the freeze of lot #%s moved to %s while the request was prepared "
-                       "(%s requested): refreeze and re-review, nothing posed"
-                       % (item_id, frozen[:12], sha[:12]))
+    if decision.get("mode") != "full":
+        #: un `--full` nomme sa tête lui-même (gel facultatif, cf. `gel_plan`) ;
+        #: il ne relit donc pas le gel, mais bien les verdicts ci-dessous.
+        freeze = frozen_of(db, item_id)
+        frozen = ((freeze or {}).get("sha") or "").strip().lower()
+        if frozen != sha:
+            if not frozen:
+                raise GelError("lot #%s is no longer frozen (the freeze milestone moved "
+                               "while the request was prepared): nothing posed" % item_id)
+            raise GelError("the freeze of lot #%s moved to %s while the request was "
+                           "prepared (%s requested): refreeze and re-review, nothing posed"
+                           % (item_id, frozen[:12], sha[:12]))
     assignee = (item.get("assignee") or "")
     verdicts = latest_verdicts(db, item_id, sha, assignee)
     blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
