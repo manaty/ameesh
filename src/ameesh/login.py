@@ -57,6 +57,8 @@ PUBLISH_CLOSE_S = 30.0
 CAPTURE_MAX = 64 * 1024
 #: pas d'attente des boucles de surveillance
 POLL_S = 0.05
+#: waitid(WNOWAIT) observe la sortie du chef sans le récolter (N1)
+PEEK_EXIT = all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID"))
 
 STARTING = "starting"
 VIEWING = "viewing"
@@ -577,11 +579,28 @@ class Supervisor:
         jusqu'à `_terminate` : le `killpg` de nettoyage ne peut pas viser un
         PID recyclé par le noyau (N1). Un chef déjà récolté rend son code
         (`returncode`), mais `_terminate` refuse alors tout signal.
+
+        Sans waitid(WNOWAIT) (`PEEK_EXIT` faux), N1 est perdu : le repli
+        `proc.poll()` récolte le chef et tue aussitôt son groupe. Reste une
+        fenêtre de quelques instructions où un groupe déjà vide verrait son
+        pgid recyclé (rebouclage complet des PID).
         """
         with self._lock:
             if proc.returncode is not None:
                 return proc.returncode
-            return exited_child_status(proc.pid)
+            if PEEK_EXIT:
+                return exited_child_status(proc.pid)
+            # Sans waitid(WNOWAIT) (macOS avant Python 3.13), seule la récolte
+            # observe la sortie : le groupe est tué dans la foulée, tant que ses
+            # membres empêchent la réattribution du pgid (POSIX) ; `_terminate`
+            # ne le signale plus ensuite.
+            status = proc.poll()
+            if status is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            return status
     def _read(self, request: Request, adapter: Adapter, proc, approver: str,
               requested_by: str, scope: str) -> None:
         captured: list[bytes] = []
@@ -746,10 +765,11 @@ class Supervisor:
             while status is None and time.monotonic() < deadline:
                 self.sleep(POLL_S)
                 status = self._leader_status(proc)
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            if proc.returncode is None:  # récolté par le repli : déjà tué
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
             try:
                 proc.wait(timeout=1.0)
             except Exception:

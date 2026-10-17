@@ -578,6 +578,51 @@ class SupervisorClosureRaceTest(unittest.TestCase):
         kill.assert_any_call(proc.pid, login.signal.SIGKILL)
         self.assertEqual(proc.returncode, 0)
 
+    def _sans_waitid(self, proc, forward=False):
+        """Repli sans waitid(WNOWAIT) : journal ordonné des récoltes et signaux."""
+        events = []
+        poll = proc.poll
+        real_killpg = os.killpg
+
+        def logged_killpg(pgid, sig):
+            events.append(sig)
+            if forward:
+                real_killpg(pgid, sig)
+
+        def logged_poll():
+            before = proc.returncode
+            status = poll()
+            if before is None and status is not None:
+                events.append("reap")
+            return status
+        proc.poll = logged_poll
+        self.enterContext(mock.patch.object(login, "PEEK_EXIT", False))
+        self.enterContext(mock.patch.object(login.os, "killpg", side_effect=logged_killpg))
+        return events
+
+    def test_done_sans_waitid_tue_le_groupe_des_la_recolte(self):
+        sup = login.Supervisor(health=lambda _request: "healthy", grace=0)
+        request = sup.registry.open(host="h", harness="gh", account="a")
+        proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        sup._procs[request.id] = proc
+        events = self._sans_waitid(proc)
+        done = sup.finish(request.id, "done")
+        self.assertEqual(done.category, "healthy")
+        self.assertEqual(events, ["reap", login.signal.SIGKILL])
+        self.assertEqual(proc.returncode, 0)
+
+    def test_terminate_sans_waitid_ne_signale_plus_apres_la_recolte(self):
+        sup = login.Supervisor(grace=5)
+        request = sup.registry.open(host="h", harness="codex", account="default")
+        proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        sup._procs[request.id] = proc
+        events = self._sans_waitid(proc, forward=True)
+        sup.finish(request.id, "cancel")
+        self.assertEqual(events, [login.signal.SIGTERM, "reap", login.signal.SIGKILL])
+        self.assertIsNotNone(proc.returncode)
+
 
 class ReceiptTest(unittest.TestCase):
     @staticmethod
