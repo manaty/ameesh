@@ -307,7 +307,10 @@ class _Base(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         for table in ("account_active", "account_holds", "account_switches", "turn_costs",
-                      "spend_pending", "quota_gauge_readings", "provider_balances"):
+                      "spend_pending", "quota_gauge_readings", "provider_balances",
+                      # #1883 : les empreintes de dossier publiées par les tests
+                      # précédents ne doivent pas créer de faux conflits
+                      "account_identities"):
             self.db.execute("DELETE FROM %s" % table)
 
     def _claude_comptes(self, partage: bool = True) -> list:

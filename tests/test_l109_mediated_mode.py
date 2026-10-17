@@ -533,8 +533,11 @@ class SessionTest(unittest.TestCase):
     def test_work_note_et_move(self):
         # les états des jeux dorés (`doing`, `review`) ne sont pas ceux de
         # `work.STATES` : lot scripté dans un état réel
+        # B5 (#1922) : le vrai `work.get` porte `workflow_ref` ('' pour un lot
+        # non pinné) ; la garde des commandes historiques le lit dans
+        # l'élément, sans SELECT brut — interdit sur une connexion médiée.
         lot = {"id": 812, "project": "site", "title": "Page d'accueil", "state": "build",
-               "assignee": "inge-front", "loops": 0}
+               "assignee": "inge-front", "loops": 0, "workflow_ref": ""}
         self.responder.script["work.get"] = lot
         self.responder.script["work.move"] = dict(lot, state="qa")
         self.responder.script["work.note"] = None
@@ -546,6 +549,35 @@ class SessionTest(unittest.TestCase):
                                      "--actor", "inge-front")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.server.ops(), ["work.get", "work.note", "work.get", "work.move"])
+        self.assert_session_only()
+
+    def test_work_move_lot_pinne_refuse_sans_sql(self):
+        # B5 (#1922) : un lot pinné sur une révision Process ne bouge que par
+        # le registre ; la session le refuse depuis l'élément de `work.get`,
+        # sans SELECT brut et sans envoyer `work.move`.
+        lot = {"id": 815, "project": "site", "title": "Page d'accueil",
+               "state": "build", "assignee": "inge-front", "loops": 0,
+               "workflow_ref": "canon/process/site@7"}
+        self.responder.script["work.get"] = lot
+        code, _out, err = self.ameesh("work", "move", "815", "qa", "--actor", "inge-front")
+        self.assertEqual(code, 1)
+        self.assertIn("pinned to workflow canon/process/site@7", err)
+        self.assertIn("process_registry", err)
+        self.assertEqual(self.server.ops(), ["work.get"])
+        self.assert_session_only()
+
+    def test_work_close_lot_pinne_refuse_sans_sql(self):
+        # même garde pour la fermeture d'un lot pinné (#1922) : la session la
+        # refuse depuis la lecture, pas depuis un SELECT brut.
+        lot = {"id": 816, "project": "site", "title": "Page d'accueil",
+               "state": "build", "assignee": "inge-front", "loops": 0,
+               "workflow_ref": "canon/process/site@7"}
+        self.responder.script["work.get"] = lot
+        code, _out, err = self.ameesh("work", "close", "816", "--abandoned",
+                                      "--actor", "inge-front")
+        self.assertEqual(code, 1)
+        self.assertIn("pinned to workflow canon/process/site@7", err)
+        self.assertEqual(self.server.ops(), ["work.get"])
         self.assert_session_only()
 
     def test_action_propose(self):
