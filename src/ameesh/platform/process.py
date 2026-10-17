@@ -535,15 +535,31 @@ def children(pid: int | None = None) -> list[dict]:
     raise NotAvailable("enfants d'un processus", "ni liste du noyau ni psutil")
 
 
-def exited_child(pid: int) -> bool:
-    """Observe an exited direct child without consuming its wait status."""
+def exited_child_status(pid: int) -> int | None:
+    """Exit status of an exited direct child, WITHOUT consuming it.
+
+    None while it runs, when it is not our child, or when the OS cannot
+    observe it. A negative status means killed by that signal. The child
+    stays a zombie, so its pid — and the process-group id that an exited
+    session leader keeps — cannot be reused until the caller reaps it
+    (a `killpg` on that pgid is then aimed at our group, not a recycled one).
+    """
     if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")):
-        return False
+        return None
     try:
         info = os.waitid(os.P_PID, int(pid), os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        return info is not None and info.si_pid == int(pid)
     except (ChildProcessError, OSError):
-        return False
+        return None
+    if info is None or info.si_pid != int(pid):
+        return None
+    if getattr(os, "CLD_EXITED", None) is not None and info.si_code == os.CLD_EXITED:
+        return int(info.si_status)
+    return -int(info.si_status)
+
+
+def exited_child(pid: int) -> bool:
+    """Observe an exited direct child without consuming its wait status."""
+    return exited_child_status(pid) is not None
 
 
 def reap(pid: int) -> int | None:

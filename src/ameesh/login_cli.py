@@ -111,8 +111,14 @@ def home_problems(profile, environ=None) -> list:
     return problems
 
 
-def pinned_version(harness: str, *, probe=None) -> dict:
-    """La version installée, refusée si absente ou hors épinglage (L120)."""
+def pinned_version(harness: str, *, probe=None, environ=None, home: str = "") -> dict:
+    """La version installée, refusée si absente ou hors épinglage (L120).
+
+    N6 : la sonde de version tourne avec l'environnement ÉPURÉ de la connexion
+    (`login_env`) : ni GH_TOKEN, ni ANTHROPIC_API_KEY, ni les autres clés
+    héritées ne sont visibles par un binaire qu'on interroge seulement pour
+    son numéro de version.
+    """
     from . import harness_versions
     from . import login as login_mod
     adapter = login_mod.ADAPTERS.get(harness)
@@ -126,6 +132,7 @@ def pinned_version(harness: str, *, probe=None) -> dict:
         try:
             answer = subprocess.run([adapter.argv[0], "--version"], capture_output=True,
                                     text=True, stdin=subprocess.DEVNULL,
+                                    env=login_mod.login_env(adapter, home, environ),
                                     timeout=harness_versions.PROBE_TIMEOUT_S)
             result = {"version": harness_versions.parse_version(answer.stdout or answer.stderr),
                       "error": None if answer.returncode == 0 else "version probe failed"}
@@ -141,6 +148,41 @@ def pinned_version(harness: str, *, probe=None) -> dict:
                      "%s %s is not a pinned version (%s)"
                      % (harness, version, ", ".join(adapter.versions)))
     return result
+
+
+#: distingue « pas de credential avant » (None) de « non mesuré » (témoins)
+_UNMEASURED = object()
+
+
+def credential_fingerprint(harness: str, profile, *, environ=None) -> str | None:
+    """Empreinte NON secrète de la credential en place (N2).
+
+    Lue AVANT de lancer la connexion, puis comparée à celle que porte le
+    verdict sain : une sonde saine sur la MÊME credential ne prouve pas une
+    connexion neuve. Jamais une valeur : seulement le SHA-256 tronqué déjà
+    journalisé par `credential_health`.
+    """
+    from . import login as login_mod
+    from . import sentinel
+    environ = os.environ if environ is None else environ
+    adapter = login_mod.ADAPTERS.get(harness)
+    if adapter is None:
+        return None
+    env = login_mod.login_env(adapter, profile.home(environ), environ)
+    if harness == "gh":
+        # le foyer de la connexion est `GH_CONFIG_DIR` (posé par login_env) ;
+        # les jetons ambiants ont été retirés, le fichier fait foi
+        return sentinel.file_fingerprint(sentinel.gh_store(env))
+    return sentinel.fingerprint(harness, profile, environ)
+
+
+def _proves_new_credential(before: str | None, after: str | None) -> bool:
+    """La credential d'après est-elle NEUVE par rapport à celle d'avant ?
+
+    Sans empreinte après, rien n'est prouvé. Sans credential avant, toute
+    empreinte après est nouvelle ; sinon elle doit différer de l'ancienne.
+    """
+    return after is not None and (before is None or after != before)
 
 
 def probe_health(cfg: Config, profile, harness: str, *, environ=None, run=None,
@@ -161,15 +203,22 @@ def probe_health(cfg: Config, profile, harness: str, *, environ=None, run=None,
         env = login_mod.login_env(login_mod.ADAPTERS["gh"], profile.home(environ), environ)
         def probe_gh(argv, **kwargs):
             return (run or sentinel._run)(argv, env=env, **kwargs)
-        return sentinel.probe_cli("gh", ["gh", "auth", "status"],
+        return sentinel.probe_cli("gh", ["gh", "auth", "status",
+                                         "--hostname", "github.com"],
                                   "gh auth login -h github.com", probe_gh,
                                   sentinel.gh_store(env))
     return None
 
 
 def health_report(db, cfg: Config, profile, request, *, environ=None, run=None,
-                  now: float | None = None) -> str:
+                  now: float | None = None, credential_before=_UNMEASURED) -> str:
     """Sonde APRÈS la connexion et écrit `credential_health` (L226b).
+
+    `credential_before` est l'empreinte lue AVANT de lancer la connexion
+    (N2) : un verdict `healthy` sur la même empreinte ne prouve pas une
+    credential neuve et ne devient jamais `healthy` ; la ligne existante
+    n'est pas réécrite. `_UNMEASURED` (appelant historique/témoin) ne
+    déclenche pas cette preuve.
 
     L'interface ne change pas (`host_preflight` lit la même table) ; seule
     l'alimentation est nouvelle. Rend l'état de la sonde, `""` si inconnu.
@@ -185,6 +234,9 @@ def health_report(db, cfg: Config, profile, request, *, environ=None, run=None,
     verdict = probe_health(cfg, profile, request.harness, environ=environ, run=run, now=now)
     if verdict is None:
         return ""
+    if (verdict.state == "healthy" and credential_before is not _UNMEASURED
+            and not _proves_new_credential(credential_before, verdict.fingerprint)):
+        return "failing"
     if sentinel.kept_failure(current, verdict):
         return "failing"
     written = store.report(cfg.host, request.harness, request.account, verdict.state,
@@ -237,7 +289,10 @@ def _run(cfg: Config, args) -> int:
     problems = home_problems(profile, environ)
     if problems:
         raise login_mod.LoginError("failed", "; ".join(problems))
-    probe = pinned_version(harness)
+    probe = pinned_version(harness, environ=environ, home=profile.home(environ))
+    # N2 : l'empreinte est lue AVANT que le CLI puisse toucher au foyer ; le
+    # verdict sain devra porter une empreinte différente pour valoir « neuf ».
+    credential_before = credential_fingerprint(harness, profile, environ=environ)
     approver = args.approver
     who = getattr(args, "by", None) or actor(environ)
     scope = getattr(args, "scope", "") or ""
@@ -248,9 +303,11 @@ def _run(cfg: Config, args) -> int:
         supervisor = login_mod.Supervisor(
             publish=login_mod.publisher(approve_client, cfg, approver=approver,
                                         requested_by=who, scope=scope),
-            health=lambda request: health_report(db, cfg, profile, request, environ=environ),
+            health=lambda request: health_report(
+                db, cfg, profile, request, environ=environ,
+                credential_before=credential_before),
             invalidate=lambda request: approve_client.close_login_request(
-                cfg, request.login_id))
+                cfg, request.login_id, request.close_token))
         request = supervisor.begin(
             host=cfg.host, harness=harness, account=profile.name,
             home=profile.home(environ), version=probe["version"], approver=approver,

@@ -24,16 +24,22 @@ from ameesh import storage
 
 class ProbeHealthTest(unittest.TestCase):
     def test_gh_sonde_sans_jeton_ambiant_dans_le_foyer_demande(self):
-        environ = {"GH_CONFIG_DIR": "/another", "GH_TOKEN": "canary", "GITHUB_TOKEN": "canary"}
+        environ = {"GH_CONFIG_DIR": "/another", "GH_TOKEN": "canary",
+                   "GITHUB_TOKEN": "canary", "GH_HOST": "evil.example"}
         profile = accounts_mod.Profile(harness="gh", name="", path=self.home, declared=True)
         seen = {}
         def run(_argv, **kwargs):
+            seen["argv"] = list(_argv)
             seen.update(kwargs.get("env") or {})
             return 1, "not logged in"
         with mock.patch("ameesh.sentinel.shutil.which", return_value="gh"):
             verdict = login_cli.probe_health(self.cfg, profile, "gh", environ=environ, run=run)
         self.assertNotIn("GH_TOKEN", seen)
         self.assertNotIn("GITHUB_TOKEN", seen)
+        self.assertNotIn("GH_HOST", seen)
+        # N5 : la sonde vise github.com comme l'adaptateur de connexion
+        self.assertEqual(seen.get("argv"),
+                         ["gh", "auth", "status", "--hostname", "github.com"])
         self.assertEqual(seen.get("GH_CONFIG_DIR"), self.home)
         self.assertEqual(verdict.state, "failing")
 
@@ -184,6 +190,52 @@ class HealthReportTest(unittest.TestCase):
                                         SimpleNamespace(harness="dsh", account="default"),
                                         environ={}, now=1.0)
         self.assertEqual(state, "")
+        self.assertEqual(self.credentials.calls, [])
+
+    def test_empreinte_avant_apres_suit_la_credential(self):
+        self.write_auth("old")
+        profile = accounts_mod.parse(self.cfg.accounts)["codex"][0]
+        first = login_cli.credential_fingerprint("codex", profile, environ={})
+        self.assertIsNotNone(first)
+        self.write_auth("new")
+        second = login_cli.credential_fingerprint("codex", profile, environ={})
+        self.assertNotEqual(first, second)
+
+    def test_meme_credential_avant_apres_ne_prouve_pas_une_connexion_neuve(self):
+        """N2 : un verdict sain sur la MÊME empreinte n'est pas une preuve."""
+        verdict = sentinel.Verdict("codex", "default", "healthy", "present",
+                                   fingerprint="same")
+        with mock.patch.object(login_cli, "probe_health", return_value=verdict):
+            state = login_cli.health_report(self.store, self.cfg, None, self.request,
+                                            credential_before="same")
+        self.assertEqual(state, "failing")
+        self.assertEqual(self.credentials.calls, [])
+
+    def test_credential_differente_prouve_la_connexion(self):
+        verdict = sentinel.Verdict("codex", "default", "healthy", "present",
+                                   fingerprint="new")
+        with mock.patch.object(login_cli, "probe_health", return_value=verdict):
+            state = login_cli.health_report(self.store, self.cfg, None, self.request,
+                                            credential_before="old")
+        self.assertEqual(state, "healthy")
+        self.assertEqual(len(self.credentials.calls), 1)
+
+    def test_aucune_credential_avant_est_une_preuve(self):
+        verdict = sentinel.Verdict("codex", "default", "healthy", "present",
+                                   fingerprint="new")
+        with mock.patch.object(login_cli, "probe_health", return_value=verdict):
+            state = login_cli.health_report(self.store, self.cfg, None, self.request,
+                                            credential_before=None)
+        self.assertEqual(state, "healthy")
+        self.assertEqual(len(self.credentials.calls), 1)
+
+    def test_absence_d_empreinte_apres_ne_prouve_rien(self):
+        verdict = sentinel.Verdict("codex", "default", "healthy", "present",
+                                   fingerprint=None)
+        with mock.patch.object(login_cli, "probe_health", return_value=verdict):
+            state = login_cli.health_report(self.store, self.cfg, None, self.request,
+                                            credential_before=None)
+        self.assertEqual(state, "failing")
         self.assertEqual(self.credentials.calls, [])
 
 

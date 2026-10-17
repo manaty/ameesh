@@ -477,7 +477,12 @@ def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Ver
         elif harness == "gcloud":
             out.append(probe_gcloud(conf, now, run, environ))
         elif harness == "gh":
-            out.append(probe_cli("gh", ["gh", "auth", "status"], "gh auth login -h github.com",
+            # N5 (#2178) : la sonde vise github.com comme l'adaptateur de
+            # connexion ; sans cela, GH_HOST peut faire lire un autre hôte et
+            # rendre un faux « healthy ».
+            out.append(probe_cli("gh", ["gh", "auth", "status",
+                                        "--hostname", "github.com"],
+                                 "gh auth login -h github.com",
                                  run, gh_store(environ),
                                  env_override(environ, GH_TOKEN_VARS)))
         elif harness == "scw":
