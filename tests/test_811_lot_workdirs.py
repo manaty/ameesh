@@ -318,6 +318,30 @@ class RoutingTest(sessions._Base):
         self.assertNotIn('--resume', argv)
         self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self._cwd('beta-new'))
 
+    def test_originless_session_same_lot_primary_root_is_adopted(self):
+        """#1900 N1 : session d'avant 0384 (origine inconnue) sur son propre
+        lot, dans le dossier de l'agent : la bascule forcée vers ce même lot
+        la perdrait ; elle est adoptée (origine notée) et le tour la reprend."""
+        self.tour(self.worker, self.a, 'start A', session='session-A')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        argv = self.tour(self.worker, self.a, 'A after deployment', session='session-A')
+        self.assertEqual(argv[argv.index('--resume') + 1], 'session-A')
+        row = registry.get(self.db, 'worker')
+        self.assertEqual((row['session_origin'], row['session_cwd']),
+                         ('session-A', self.primary))
+
+    def test_originless_session_secondary_root_starts_a_new_session(self):
+        """#1900 N1 (frontière) : au dossier secondaire, la session d'origine
+        inconnue ne peut pas être reprise (elle a été ouverte dans le dossier
+        de l'agent) ; le tour repart neuf, comportement conservé."""
+        self.tour(self.worker, self.b, 'start B', session='session-B')
+        self.db.execute("UPDATE agent_registry SET session_origin = NULL, session_cwd = NULL"
+                        " WHERE name = 'worker'")
+        argv = self.tour(self.worker, self.b, 'B after deployment', session='session-B2')
+        self.assertNotIn('--resume', argv)
+        self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self.secondary)
+
 
 class PickupTest(consumers.PriseMultiProjetsTest):
     """Existing primary-only tests still cover hosts without secondary roots."""
@@ -347,6 +371,32 @@ class PickupTest(consumers.PriseMultiProjetsTest):
                    if (e.get('note') or '').startswith('L243-4:')]
         self.assertEqual(len(reasons), 1)
         self.assertIn('Host work root', reasons[0])
+
+    def test_missing_dir_note_is_deduced_from_one_bounded_read_per_pass(self):
+        """#1900 N2 : la note L243-4 déjà écrite se déduit d'une lecture
+        bornée des notes (une par passe d'auto_take), plus des 100 derniers
+        événements du lot relus à chaque passe."""
+        self.multi()
+        item = self.lot('secondary', app='nexlink')
+        from ameesh.storage.postgres import work as work_store
+        lues = []
+        vrai = work_store.WorkItems.events_noted
+
+        def notes(store, prefix, since_ts):
+            lues.append(prefix)
+            return vrai(store, prefix, since_ts)
+
+        def interdit(*args, **kwargs):
+            raise AssertionError('work.events relu par lot à chaque passe')
+
+        with mock.patch.object(work_store.WorkItems, 'events_noted', notes), \
+                mock.patch.object(work, 'events', interdit):
+            self.assertEqual(self.take(), [])
+            self.assertEqual(self.take(), [])
+        self.assertEqual(lues, [backlog.MISSING_DIR_NOTE_PREFIX] * 2)
+        raisons = [e['note'] for e in work.events(self.db, item['id'])
+                   if (e.get('note') or '').startswith('L243-4:')]
+        self.assertEqual(len(raisons), 1)
 
     def test_dry_run_missing_policy_does_not_write_reason(self):
         self.multi()

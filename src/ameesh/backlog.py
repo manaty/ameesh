@@ -527,7 +527,37 @@ def _primary_project(agent: dict) -> str:
     return names[0] if names else ""
 
 
-def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run):
+#: #1900 N2 : préfixe des notes « projet déclaré sans dossier » (`_directory_ready`).
+MISSING_DIR_NOTE_PREFIX = "L243-4: "
+
+
+class _DirNotes:
+    """Les notes de dossier déjà écrites, lues une fois par passe (#1900 N2).
+
+    La lecture est paresseuse — aucun item ne manque de dossier, aucune
+    requête — et bornée au préfixe des notes L243-4 ; `has` répond ensuite en
+    mémoire, `add` retient la note que `_directory_ready` vient d'écrire. Sans
+    elle, chaque passe d'`auto_take` relisait les 100 derniers événements de
+    chaque lot dont le dossier manque, pour chaque agent candidat."""
+
+    def __init__(self, store):
+        self._store = store
+        self._notes: set[tuple[int, str]] | None = None
+
+    def _load(self) -> set[tuple[int, str]]:
+        if self._notes is None:
+            self._notes = {(int(row["work_item_id"]), row.get("note") or "")
+                           for row in self._store.events_noted(MISSING_DIR_NOTE_PREFIX, 0.0)}
+        return self._notes
+
+    def has(self, item_id, note: str) -> bool:
+        return (int(item_id), note) in self._load()
+
+    def add(self, item_id, note: str) -> None:
+        self._load().add((int(item_id), note))
+
+
+def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, notes=None):
     from . import lot_workdir, work
     reason = lot_workdir.problem(cfg, agent, project, canons=canons)
     if reason is None:
@@ -535,8 +565,16 @@ def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run):
     # #811 N1 : hors périmètre (raison vide) — aucune note ; un projet déclaré
     # qui attend son dossier est noté une fois par lot.
     if not dry_run and reason:
-        note = "L243-4: %s cannot pick up project %s: %s" % (agent["name"], project, reason)
-        if not any(e.get("note") == note for e in work.events(db, item["id"])):
+        note = MISSING_DIR_NOTE_PREFIX + "%s cannot pick up project %s: %s" % (
+            agent["name"], project, reason)
+        if notes is not None:
+            # #1900 N2 : la note déjà écrite se lit dans le relevé borné de la
+            # passe (une requête), plus dans les 100 derniers événements du lot
+            # relus à chaque passe tant que le dossier manque.
+            if not notes.has(item["id"], note):
+                work.note(db, item["id"], note, actor=SENDER)
+                notes.add(item["id"], note)
+        elif not any(e.get("note") == note for e in work.events(db, item["id"])):
             work.note(db, item["id"], note, actor=SENDER)
     return False
 
@@ -599,6 +637,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    # #1900 N2 : une lecture paresseuse et bornée des notes de dossier pour
+    # toute la passe (les deux boucles ci-dessous la partagent).
+    dir_notes = _DirNotes(st.work)
 
     # #804 : la place restante est relue avant **chaque** prise, pas une fois
     # par passe. Les compteurs sont en base et partagés par tous les
@@ -715,7 +756,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                 card=auditors.get(row["name"]), others=listing):
                     continue
                 if not _directory_ready(cfg, db, agent, item, _lot_project(item),
-                                        canons=canons, dry_run=dry_run):
+                                        canons=canons, dry_run=dry_run, notes=dir_notes):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -786,7 +827,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                         card=auditors.get(row["name"]), others=listing):
                 continue
             if not _directory_ready(cfg, db, agent, item, _lot_project(item),
-                                    canons=canons, dry_run=dry_run):
+                                    canons=canons, dry_run=dry_run, notes=dir_notes):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
