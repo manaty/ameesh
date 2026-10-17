@@ -5,6 +5,13 @@ paths, CI required on the frozen commit, and protected targets in the host's
 `radar.projects` configuration. These conditions supplement the queue's
 existing freeze, review, generation and lease checks.
 
+A running runner re-reads the `radar` key of its configuration file on each
+fire and radar pass (#2212): declaring `land` for a project takes effect
+without restarting the runners, and the fire then routes that project through
+the queue instead of merging directly on GitHub. If the file becomes
+unreadable, the pass fails and is retried; it never falls back to conditions
+without a queue.
+
 ```json
 {
   "radar": {

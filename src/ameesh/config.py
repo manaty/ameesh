@@ -439,6 +439,10 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: #2212 : fichier de configuration lu par `load` ("" sans fichier), pour
+    #: relire `radar` à chaque passage du feu (`fresh_radar`) ; calculé, jamais
+    #: lu tel quel
+    config_file: str = ""
     #: Neutral memory transport settings; ssh_key names a host-managed key file.
     persona_memory: dict = field(default_factory=dict)
 
@@ -515,9 +519,11 @@ def load(env: dict | None = None) -> Config:
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
         known.discard("budget_explicit")  # calculé, jamais lu tel quel
+        known.discard("config_file")      # calculé, jamais lu tel quel
         if isinstance(raw.get("humans"), list):
             raw = dict(raw, humans=",".join(str(n) for n in raw["humans"]))
-        cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
+        cfg = replace(cfg, config_file=cfg_path,
+                      **{k: v for k, v in raw.items() if k in known})
         if raw.get("canons") is not None:
             cfg = replace(cfg, **_canons_from_file(raw, cfg_path))
 
@@ -762,6 +768,27 @@ def load(env: dict | None = None) -> Config:
         raise SystemExit("mediated backend: missing server URL (exec_url or "
                          "AMEESH_EXEC_URL)")
     return cfg
+
+
+def fresh_radar(cfg: Config) -> Config:
+    """#2212 : `cfg` avec la clé `radar` relue dans le fichier que `load` a lu.
+    Le mode du feu (file de fusion ou fusion GitHub directe) en dépend : un
+    exécuteur démarré avant qu'un projet déclare `land` ne doit pas fusionner
+    en direct ce qui passe désormais par la file. Fichier devenu illisible :
+    ValueError — le passage échoue et sera retenté — plutôt qu'un retour
+    silencieux à des conditions sans file. Sans fichier lu au démarrage
+    (`config_file` vide), `cfg` tel quel."""
+    if not cfg.config_file:
+        return cfg
+    try:
+        with open(cfg.config_file, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ValueError("unreadable config %s: %s" % (cfg.config_file, exc)) from exc
+    if not isinstance(raw, dict):
+        raise ValueError("unreadable config %s: JSON object expected" % cfg.config_file)
+    radar = raw.get("radar")
+    return replace(cfg, radar={} if radar is None else radar)
 
 
 def _canons_from_file(raw: dict, where: str) -> dict:
