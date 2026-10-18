@@ -51,7 +51,11 @@ Reliability: the delivery state is kept in `<state>/notify/state.json` (a
 lasting alert is not resent after a restart; an alert resolved while
 stopped is sent on restart); rate limited per human (beyond that, a
 summary); a failing channel does not block the others and is retried on
-later passes, a bounded number of times.
+later passes, a bounded number of times. #2395: the state also keeps a
+persistent `notified` ledger — one notification per alert identity (same
+`since`, same severity) and per human, even if the alert resolves and comes
+back, and even after `ameesh notify` restarts; `slo_breach` is never pushed
+to the owner (canon §9, owner decision 18/10).
 
 Channels: `desktop`, `ntfy`, `slack`, `app`. L66 — the `desktop` channel
 follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
@@ -157,6 +161,11 @@ DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_INTERVAL_S = 30.0
 #: fenêtre de la limite de débit, et intervalle minimal entre deux résumés
 RATE_WINDOW_S = 60.0
+#: #2395 : rétention du registre `notified` (une notification par identité
+#: d'alerte, sévérité et humain) — 30 jours, avec une borne dure pour que
+#: l'état reste petit même sur une longue série d'alertes.
+NOTIFIED_RETENTION_S = 30 * 24 * 3600.0
+NOTIFIED_MAX = 5000
 DEFAULT_SLACK_ENV = "AMEESH_SLACK_WEBHOOK"
 
 #: clés qui porteraient un secret EN CLAIR dans la configuration : refusées
@@ -897,12 +906,17 @@ class Router:
         return fiche.responsible if fiche is not None else None
 
     def resolve(self, alert: dict) -> tuple:
-        """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None)."""
-        if "owner" in (alert.get("targets") or ()):
-            # #789 t2 (canon §9) : un dépassement critique (P1) escalade au
-            # propriétaire — `notify.default_human`, comme le dit la
-            # documentation de ce module. La cible prime le `responsible` de
-            # l'agent, qui peut être un pilote : un P1 ne s'arrête pas à lui.
+        """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None).
+
+        #2395 (canon §9, owner 18/10) : un `slo_breach` n'est **jamais** poussé
+        à l'owner (`notify.default_human`), même si son type est configuré ou
+        si une cible `owner` traîne dans l'alerte. Ses destinataires sont les
+        rôles de `targets`, par courrier d'agent ; seul un `responsible`
+        explicitement nommé peut désigner un autre humain."""
+        if forces_owner(alert):
+            # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
+            # escalade au propriétaire — `notify.default_human`. La cible prime
+            # le `responsible` de l'agent, qui peut être un pilote.
             human = normalize_human(self.ncfg.default_human)
             if human:
                 return human, "defaut"
@@ -928,6 +942,11 @@ class Router:
         for source, value in steps:
             human = normalize_human(value())
             if human:
+                if (alert.get("type") == "slo_breach"
+                        and human == normalize_human(self.ncfg.default_human)):
+                    # #2395 : même explicitement configuré, un dépassement de
+                    # délai ne part pas sur le bureau de l'owner.
+                    return None, None
                 return human, source
         return None, None
 
@@ -942,7 +961,7 @@ def state_path(cfg: Config) -> str:
 
 def empty_state() -> dict:
     return {"schema": STATE_SCHEMA, "active": {}, "resolved": {}, "rate": {},
-            "summary": {}, "last_summary": {}, "briefs": {}}
+            "summary": {}, "last_summary": {}, "briefs": {}, "notified": {}}
 
 
 def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
@@ -991,6 +1010,15 @@ def key_of(alert: dict) -> str:
     if alert.get("type") == "orphan_lot" and alert.get("grouped"):
         key.append(alert.get("responsible"))
     return json.dumps(key, ensure_ascii=False)
+
+
+def forces_owner(alert: dict) -> bool:
+    """#789 t2, restreint par #2395 : une cible `owner` force la livraison à
+    l'humain même hors `notify.types`. Un `slo_breach` n'en bénéficie jamais :
+    aucun dépassement de délai n'est notifié à l'owner (canon §9, décision
+    owner 18/10)."""
+    return (alert.get("type") != "slo_breach"
+            and "owner" in (alert.get("targets") or ()))
 
 
 GROUPED_LOTS_SHOWN = 5
@@ -1135,15 +1163,12 @@ class Notifier:
             subjects_by_key.setdefault(key_of(group), []).append({
                 "key": alert_ack.key_of(subject), "severity": alert_ack.severity(subject)})
         # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
-        # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
-        # perd pas — elle atteint l'humain même si son type a été retiré de
-        # `notify.types` ; c'est le comportement par défaut qui tient le
-        # contrat « un P1 escalade au propriétaire ». Les dépassements
-        # ordinaires restent filtrables : `slo_breach` s'ajoute à
-        # `notify.types` pour les recevoir sur les canaux humains.
+        # (`targets` contient "owner") ne se perd pas — elle atteint l'humain
+        # même si son type a été retiré de `notify.types`. #2395 : sauf un
+        # `slo_breach`, jamais poussé à l'owner (décision owner 18/10) ; ses
+        # dépassements restent filtrables et partent aux rôles par courrier.
         wanted = {key_of(a): a for a in notifications
-                  if a.get("type") in self.ncfg.types
-                  or "owner" in (a.get("targets") or ())}
+                  if a.get("type") in self.ncfg.types or forces_owner(a)}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
         # Persisted deliveries from an older routing policy must not retry or
@@ -1174,7 +1199,7 @@ class Notifier:
             if self._acknowledged(entry, acknowledgements):
                 self._mute(entry)
             if entry["alert"].get("type") not in self.ncfg.types \
-                    and "owner" not in (entry["alert"].get("targets") or ()):
+                    and not forces_owner(entry["alert"]):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
@@ -1189,6 +1214,14 @@ class Notifier:
             # A partial orphan group only mentions its unacknowledged members.
             alert = audible.get(key, alert)
             level = alert_ack.severity(alert)
+            if (entry is not None and alert.get("type") == "slo_breach"
+                    and entry.get("status") == "envoi" and entry.get("human")
+                    and entry.get("human") == normalize_human(self.ncfg.default_human)):
+                # #2395 : entrée persistée par l'ancienne politique, qui
+                # retentait une livraison SLO vers l'owner. On la remet en
+                # attente de destinataire : `_raise` applique les règles
+                # neuves (aucun envoi owner), sans retenter ni résoudre.
+                entry.update(status="sans_destinataire", channels={}, human=None)
             changed_ack_level = any(r["principal"] == human
                 and any(r["alert_key"] == a["key"] and r["severity"] != a["severity"]
                         for a in subjects)
@@ -1202,13 +1235,20 @@ class Notifier:
             if muted:
                 if entry is None:
                     entry = active[key] = {"alert": {k: alert.get(k) for k in _KEPT
-                        if alert.get(k) is not None}, "raised_ts": now, "channels": {}}
+                        if alert.get(k) is not None}, "key": key, "severity": level,
+                        "raised_ts": now, "channels": {}}
                 entry.update(human=human, severity=level, ack_subjects=subjects)
                 self._mute(entry)
                 continue
+            if entry is not None:
+                # #2395 : l'identité et la sévérité de l'alerte vivent dans
+                # l'entrée, pour le registre persistant `notified`.
+                entry["key"] = key
+                entry["severity"] = level
             if entry is None:
                 entry = active[key] = {
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                    "key": key, "severity": level,
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
                 if alert.get("type") in exploitation.ESCALATING:
@@ -1237,6 +1277,12 @@ class Notifier:
         self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
+            if (entry["alert"].get("type") == "slo_breach" and entry.get("human")
+                    and entry.get("human") == normalize_human(self.ncfg.default_human)):
+                # #2395 : une résolution SLO persistée par l'ancienne politique
+                # n'est pas renvoyée à l'owner ; elle s'arrête là.
+                del self.state["resolved"][key]
+                continue
             if self._acknowledged(entry, acknowledgements):
                 del self.state["resolved"][key]
                 continue
@@ -1256,6 +1302,7 @@ class Notifier:
                 self.state["rate"][human] = window
             else:
                 del self.state["rate"][human]
+        self._prune_notified(now)
         return records
 
     def run_local_pass(self, now: float | None = None) -> list:
@@ -1296,6 +1343,7 @@ class Notifier:
             else:
                 self._retry(entry, "raised", now)
         self._local_resolutions(wanted, now)
+        self._prune_notified(now)
         return records
 
     def _local_resolutions(self, wanted: dict, now: float) -> None:
@@ -1462,6 +1510,35 @@ class Notifier:
             self._record("budget_handoff", entry,
                          "a_blanc" if self.dry_run else ("rendu" if queued else "prise"), {})
 
+    # -- registre des notifications (#2395) ------------------------------------
+    @staticmethod
+    def _notified_id(entry: dict, human: str) -> str:
+        """Identité du registre : la clé de l'alerte (elle porte le `since` et
+        la raison, donc le niveau), la sévérité et l'humain. Une même alerte
+        qui se résout puis revient ne repart pas ; une escalade de niveau a
+        une autre identité et part bien."""
+        key = entry.get("key") or key_of(entry["alert"])
+        return json.dumps([key, entry.get("severity"), human], ensure_ascii=False)
+
+    def _already_notified(self, entry: dict, human: str) -> bool:
+        return self._notified_id(entry, human) in (self.state.get("notified") or {})
+
+    def _mark_notified(self, entry: dict, now: float) -> None:
+        human = entry.get("human")
+        if not human:
+            return
+        self.state.setdefault("notified", {})[
+            self._notified_id(entry, human)] = round(float(now), 3)
+
+    def _prune_notified(self, now: float) -> None:
+        ledger = self.state.get("notified") or {}
+        kept = {key: ts for key, ts in ledger.items()
+                if now - float(ts) < NOTIFIED_RETENTION_S}
+        if len(kept) > NOTIFIED_MAX:
+            newest = sorted(kept.items(), key=lambda item: float(item[1]))[-NOTIFIED_MAX:]
+            kept = dict(newest)
+        self.state["notified"] = kept
+
     # -- levée ----------------------------------------------------------------
     def _event(self, db, kind: str, key: str, alert: dict) -> None:
         """L85: the alert in the event log (`GET /api/v1/events`); a base
@@ -1499,6 +1576,16 @@ class Notifier:
                                                        _subject(alert)))
                 self._record("raised", entry, "sans_canal", {})
             entry["status"] = "sans_canal"
+            return
+        if self._already_notified(entry, human):
+            # #2395 : une seule notification par alerte (même `since`), même
+            # sévérité et par humain — y compris si l'alerte se résout puis
+            # revient, et après un redémarrage d'`ameesh-notify` (registre
+            # persistant). Rien n'est renvoyé : seul le journal le dit.
+            entry["status"] = "notifiee"
+            entry["channels"] = {}
+            self.log("[%s] %s already notified to %s (same alert, same severity): "
+                     "not sent again" % (alert.get("type"), _subject(alert), human))
             return
         if not self._allow(human, now):
             entry["status"] = "resumee"
@@ -1695,7 +1782,16 @@ class Notifier:
             # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
             self._record("resolved", entry, "sans_envoi", {})
             return
-        if status == "acknowledged":
+        if (alert.get("type") == "slo_breach" and human
+                and human == normalize_human(self.ncfg.default_human)):
+            # #2395 : une résolution de dépassement ne part pas non plus sur le
+            # bureau de l'owner — y compris pour une entrée persistée par
+            # l'ancienne politique, ou si son type a été configuré.
+            self.log("alert resolved [%s] %s: owner notification suppressed (#2395)"
+                     % (alert.get("type"), _subject(alert)))
+            self._record("resolved", entry, "sans_envoi", {})
+            return
+        if status in ("acknowledged", "notifiee"):
             self._record("resolved", entry, "sans_envoi", {})
             return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
@@ -1763,6 +1859,12 @@ class Notifier:
         if results:
             delivery = ("a_blanc" if self.dry_run else
                         "envoyee" if any(v == "ok" for v in results.values()) else "echec")
+            if event == "raised" and any(v == "ok" for v in results.values()):
+                # #2395 : au moins un canal a livré — l'alerte est marquée au
+                # registre AVANT le journal, pour qu'un arrêt juste après ne la
+                # fasse pas repartir à la reprise. Un échec total n'est pas
+                # marqué : les canaux restent retentés comme avant.
+                self._mark_notified(entry, now)
             self._record(event, entry, delivery, results, message)
 
     def _send(self, channel: Channel, message: Message) -> tuple:

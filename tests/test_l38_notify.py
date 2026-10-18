@@ -485,6 +485,35 @@ class FiabiliteTest(_Base):
         self.assertEqual([(r["event"], r["type"]) for r in records],
                          [("raised", "stopped_with_mail")])
 
+    def test_une_seule_notification_par_alerte_et_par_humain(self):
+        # #2395 : le registre `notified` retient l'alerte (même `since`) et son
+        # humain, même résolue puis revenue, et après redémarrage.
+        path = os.path.join(self.tmp, "notify", "state.json")
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert()
+        notifier = self.notifier(ncfg)
+        self.assertEqual(len(self.passe(notifier, [alerte])), 1)
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        records = self.passe(notifier, [])
+        self.assertEqual([r["event"] for r in records], ["resolved"])
+        sent = len(_desktop_log(self.desk))
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([r for r in records if r["event"] == "raised"], [])
+        self.assertEqual(len(_desktop_log(self.desk)), sent)
+        self.assertTrue(any("already notified" in line for line in self.logs))
+        notify.save_state(path, notifier.state)
+        notifier = self.notifier(ncfg, notify.load_state(path))
+        self.assertEqual(self.passe(notifier, [alerte]), [])
+        self.assertEqual(len(_desktop_log(self.desk)), sent)
+        # un humain différent est une autre notification (le registre est par
+        # humain) ; l'entrée active de l'ancien humain est écartée pour isoler
+        # ce que le registre retient.
+        notifier.state["active"] = {}
+        autre = dict(alerte, responsible="human:autre")
+        records = self.passe(notifier, [autre])
+        self.assertEqual([(r["event"], r["human"]) for r in records],
+                         [("raised", "human:autre")])
+
     def test_etat_illisible_mis_de_cote(self):
         path = os.path.join(self.tmp, "notify", "state.json")
         os.makedirs(os.path.dirname(path))
