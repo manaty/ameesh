@@ -92,9 +92,11 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
   modification locale ne peuvent donc pas entrer dans la preuve (défaut trouvé
   par cx1 : `git status` les masquait alors que la photographie les
   embarquait). Le plan est un chemin **relatif** à cet arbre, refusé s'il en
-  sort (`selection-unsafe`), s'il est ignoré par git ou s'il remplacerait un
-  chemin du SHA candidat, même retiré de l'index local ; c'est le texte lu qui
-  est embarqué, pas une relecture du disque au moment du run ;
+  sort (`selection-unsafe`), s'il est ignoré par git, s'il remplacerait un
+  chemin du SHA candidat, même retiré de l'index local, ou si un parent de son
+  chemin y est un fichier (`plan-path-conflict`, conflit D/F : `update-index`
+  refuserait l'arbre construit, #1820) ; c'est le texte lu qui est embarqué,
+  pas une relecture du disque au moment du run ;
 - délai du run : `timeout_seconds` du canon ; exécution par
   `ameesh offload run --fallback none` uniquement. Sur la VM, ce chemin est
   celui du guest L159b (jetons de concurrence `flock`, scope cgroup plafonné par
@@ -120,7 +122,9 @@ ou un flux sans test donnent `run-incomplete` ; une part rouge donne `run-red`.
 Seul `fin.statut = succes` est vert : `echec` est rouge, tout autre statut
 (`interrompu`, `unknown`, vide) est incomplet, et le `detail` nomme le statut
 observé. Un `fin=succes` isolé, sans événement de test, n'est jamais un vert et
-ne remplit jamais `modules` avec le plan.
+ne remplit jamais `modules` avec le plan. Un run arrêté par la porte de l'hôte
+(drain : note `stopped on … host stopped|draining`) donne `gate-preempted`,
+jamais `no-vm` : la VM existe, c'est l'hôte qui a préempté le run (#2298).
 
 `tree` recopie ce qui a été vérifié et ce qui est parti : `head` observé,
 `snapshot` (l'identité exacte du commit envoyé, vérifiable localement par
@@ -138,10 +142,10 @@ garde le rapport entier (modules, parts, tests, hôte, durée).
 L'écriture a lieu **après** le run distant, en une instruction hors de toute
 transaction : aucun verrou de base n'est tenu pendant que la VM exécute la
 sélection. Un refus avant run (`block-missing`, `no-vm`,
-`selection-unsafe`) n'écrit rien ; un run rouge ou incomplet est un résultat et
-s'enregistre (`ok` faux). Le rapport n'est pas un verdict : il ne remplace ni
-#1617 (désignation au gel) ni #1756 (gel dérivé), et son écriture n'active
-aucune règle.
+`selection-unsafe`, `plan-path-conflict`) n'écrit rien ; un run rouge ou
+incomplet est un résultat et s'enregistre (`ok` faux). Le rapport n'est pas un
+verdict : il ne remplace ni #1617 (désignation au gel) ni #1756 (gel dérivé),
+et son écriture n'active aucune règle.
 
 Le rapport est **imprimé avant l'écriture** : tant que 0450 n'est pas déployée
 (cas de la preuve d'avant fusion), l'écriture échoue en `SchemaMissing`,

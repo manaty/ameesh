@@ -167,6 +167,9 @@ class DeclaredCriticalScopeTest(ReviewPolicyFixture, unittest.TestCase):
                 self.assertTrue(self.gate(klass, "codex", "claude")["ok"])
 
     def test_invalid_critical_declaration_fails_closed(self):
+        # Une déclaration `critical` invalide fait douter de la politique : la
+        # classe tombe en sensible, jamais en light. #2394 : un doute de classe
+        # reste à un avis (canon §2), il ne réclame pas deux familles.
         for value, cls in (("true", "sensitive"), (1, "sensitive"),
                            (None, "sensitive"), (True, "light"), (True, "normal")):
             with self.subTest(value=value, cls=cls):
@@ -176,7 +179,8 @@ class DeclaredCriticalScopeTest(ReviewPolicyFixture, unittest.TestCase):
                 self.assertTrue(any(level == "error" for _code, level, _why in problems))
                 klass = self.classify([self.PATH], rules=raw["rules"])
                 self.assertTrue(klass["doubt"])
-                self.assertEqual(merge_queue.required_verdicts(klass), 2)
+                self.assertEqual(klass["class"], "sensitive")
+                self.assertEqual(merge_queue.required_verdicts(klass), 1)
 
     def test_critical_yaml_boolean_is_preserved_by_the_canon_readers(self):
         text = ("default: light\nrules:\n  - paths: ['src/ameesh/new_verifier.py']\n"

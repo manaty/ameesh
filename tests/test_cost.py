@@ -493,6 +493,138 @@ class TurnAccountingTest(Sandbox, PgTestCase):
         delta = (400 * 1.25 + 200 * 0.125 + 50 * 10.0) / 1e6
         self.assertAlmostEqual(second.usd, delta, places=9)
 
+    def test_codex_resident_turn_event_wins_over_the_native_stream(self):
+        # L80a: the app-server reports its usage in `thread/tokenUsage/updated`,
+        # which the raw JSON-RPC stream does not give `turn.completed`. The
+        # `resident.turn` event (from `TurnResult`) is the turn's only measure;
+        # a native completion in the same slice must not be counted again.
+        self.agent("a1", "codex", "gpt-6.1-sol")
+        book = self.book()
+        self.events(
+            "a1",
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "turn.completed", "usage": {"input_tokens": 9_999,
+                                                 "cached_input_tokens": 0,
+                                                 "output_tokens": 999}},
+            {"type": "resident.turn", "protocol": "codex-app-server",
+             "session": "t1", "turn": "tour-1", "status": "completed",
+             "usage": {"input_tokens": 100, "cache_read_input_tokens": 200,
+                       "output_tokens": 9},
+             "usage_total": {"input_tokens": 300, "cached_input_tokens": 200,
+                             "output_tokens": 9}})
+        first = book.record("a1")
+        expected = (100 * 1.25 + 200 * 0.125 + 9 * 10.0) / 1e6
+        self.assertAlmostEqual(first.usd, expected, places=9)
+        self.assertEqual((first.input_tokens, first.cached_input_tokens,
+                          first.output_tokens), (300, 200, 9))
+        # the thread total is the next turn's baseline, not the turn alone
+        self.assertEqual(book.baseline("a1", "codex", "t1")["cum_usage"],
+                         [300, 200, 9])
+
+        self.events(
+            "a1",
+            {"type": "resident.turn", "protocol": "codex-app-server",
+             "session": "t1", "turn": "tour-2", "status": "completed",
+             "usage": {"input_tokens": 100, "cache_read_input_tokens": 200,
+                       "output_tokens": 9},
+             "usage_total": {"input_tokens": 600, "cached_input_tokens": 400,
+                             "output_tokens": 18}})
+        second = book.record("a1", start=3)
+        self.assertAlmostEqual(second.usd, expected, places=9)   # the turn, once
+        self.assertEqual((second.input_tokens, second.cached_input_tokens,
+                          second.output_tokens), (300, 200, 9))
+        row = self.db.query("SELECT cum_input_tokens, cum_cached_input_tokens, "
+                            "cum_output_tokens FROM turn_costs WHERE agent = 'a1' "
+                            "ORDER BY id")[-1]
+        self.assertEqual((row["cum_input_tokens"], row["cum_cached_input_tokens"],
+                          row["cum_output_tokens"]), (600, 400, 18))
+
+    def test_resident_turn_without_total_extends_the_previous_baseline(self):
+        # L80a: a driver that did not publish `tokenUsage.total` still gives
+        # the ledger a baseline: the last known cumulative reading of the same
+        # session plus this turn.
+        self.agent("a1", "codex", "gpt-6.1-sol")
+        book = self.book()
+        event = {"type": "resident.turn", "protocol": "codex-app-server",
+                 "session": "t1", "usage": {"input_tokens": 100,
+                                            "cache_read_input_tokens": 200,
+                                            "output_tokens": 9}}
+        self.events("a1", dict(event, usage_total={"input_tokens": 300,
+                                                   "cached_input_tokens": 200,
+                                                   "output_tokens": 9}))
+        book.record("a1")
+        self.events("a1", event)
+        book.record("a1", start=1)
+        row = self.db.query("SELECT cum_input_tokens, cum_cached_input_tokens, "
+                            "cum_output_tokens FROM turn_costs WHERE agent = 'a1' "
+                            "ORDER BY id")[-1]
+        self.assertEqual((row["cum_input_tokens"], row["cum_cached_input_tokens"],
+                          row["cum_output_tokens"]), (600, 400, 18))
+
+    def test_acp_resident_turn_uses_its_cost_and_ignores_step_usage(self):
+        # L80a: ACP turns carry a USD delta (cumulative `cost` published by
+        # the harness); it makes the turn, and the native step readings of the
+        # same slice are not priced again.
+        self.agent("a1", "deepseek", "deepseek-flash")
+        book = self.book()
+        self.events(
+            "a1",
+            {"type": "status", "phase": "step_end",
+             "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
+                       "outputTokens": 0}},
+            {"type": "resident.turn", "protocol": "acp", "session": "sess-1",
+             "turn": "tour-1", "status": "completed",
+             "usage": {"input_tokens": 1234, "cache_read_input_tokens": 0,
+                       "output_tokens": 0},
+             "cost": 0.02, "cost_total": 0.02})
+        usage = book.record("a1")
+        self.assertAlmostEqual(usage.usd, 0.02, places=9)
+        self.assertEqual(usage.input_tokens, 1234)
+        self.assertIsNone(usage.price_fallback)
+
+    def test_acp_resident_turn_without_cost_is_priced_on_its_tokens(self):
+        self.agent("a1", "deepseek", "deepseek-flash")
+        self.events("a1", {"type": "resident.turn", "protocol": "acp",
+                           "session": "sess-1", "status": "completed",
+                           "usage": {"input_tokens": 1_000_000,
+                                     "cache_read_input_tokens": 0,
+                                     "output_tokens": 0}})
+        self.assertAlmostEqual(self.book().record("a1").usd, 0.30, places=9)
+
+    def test_acp_resident_turn_after_restart_uses_the_durable_cost_base(self):
+        # L80a B1: a restarted process has no in-memory `cost_base`; its first
+        # prompt carries only the cumulative `cost_total`. The turn is the delta
+        # against the last durable USD reading of the same session — not the
+        # whole cumulative history, nor a tariff on the context tokens.
+        self.agent("a1", "deepseek", "deepseek-flash")
+        book = self.book()
+        self.events("a1", {"type": "resident.turn", "protocol": "acp",
+                           "session": "sess-1", "status": "completed",
+                           "usage": {"input_tokens": 1234},
+                           "cost": 0.04, "cost_total": 0.04})
+        first = book.record("a1")
+        self.assertAlmostEqual(first.usd, 0.04, places=9)
+        self.assertAlmostEqual(book.baseline("a1", "deepseek", "sess-1")["cum_usd"],
+                               0.04, places=9)
+        # process restart: no delta in the event, only the cumulative reading
+        self.events("a1", {"type": "resident.turn", "protocol": "acp",
+                           "session": "sess-1", "status": "completed",
+                           "usage": {"input_tokens": 1234},
+                           "cost_total": 0.06})
+        second = book.record("a1", start=1)
+        self.assertAlmostEqual(second.usd, 0.02, places=9)
+        self.assertEqual(second.input_tokens, 1234)
+        self.assertAlmostEqual(book.baseline("a1", "deepseek", "sess-1")["cum_usd"],
+                               0.06, places=9)
+
+    def test_a_resident_event_never_overrides_the_claude_stream(self):
+        # L80a: Claude's stream still carries its own usage; a stray
+        # `resident.turn` (never written for it) must not become its cost.
+        self.agent("a1", "claude")
+        self.events("a1", {"type": "resident.turn", "protocol": "acp",
+                           "usage": {"input_tokens": 1_000_000}})
+        self.assertEqual(self.book().turn_usage("a1").usd, 0.0)
+
     def test_deepseek_usage_par_etape_fois_le_bareme(self):
         self.agent("a1", "deepseek", "deepseek-flash")
         self.events("a1",

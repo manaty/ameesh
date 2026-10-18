@@ -167,6 +167,14 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+#: the event the runner writes once per logical resident turn for the ledger
+#: (L80a): its `usage` (and `cost`/`cost_total` when the harness reports USD)
+#: comes from the turn's `TurnResult`, never from the raw protocol stream.
+#: `cost.CostBook` reads it as the turn's only usage, so a process that serves
+#: several turns cannot count the same tokens twice.
+USAGE_EVENT = "resident.turn"
+
+
 @dataclass
 class TurnResult:
     """End of a logical turn.
@@ -186,6 +194,12 @@ class TurnResult:
     session: str | None = None
     inputs: tuple[str, ...] = ()
     usage: dict = field(default_factory=dict)
+    #: cumulative usage the harness published for the session/thread (Codex
+    #: `tokenUsage.total`), in its own convention (`input_tokens` includes the
+    #: cache read); empty when the harness does not publish one. It gives the
+    #: ledger its cumulative baseline across resident turns (L80a), without
+    #: summing in memory.
+    usage_total: dict = field(default_factory=dict)
     cost: float | None = None
     cost_total: float | None = None
     duration_s: float = 0.0
@@ -626,6 +640,9 @@ class ResidentDriver:
                        "cache_creation_input_tokens": 0, "output_tokens": 0}
         self._context: int | None = None
         self._window: int | None = None
+        #: L80a: cumulative usage published by the harness for this session
+        #: (Codex `tokenUsage.total`), kept for the ledger's baseline
+        self._usage_total: dict = {}
         self._cost: float | None = None
         self._cost_total: float | None = None
         #: L81: native compaction reported in this turn (compact_boundary)
@@ -665,6 +682,7 @@ class ResidentDriver:
                 status=status, final=self._final[-FINAL_MAX_CHARS:],
                 error=error if error is not None else self._error,
                 session=self.session_id, usage=usage,
+                usage_total=dict(self._usage_total),
                 inputs=tuple(i for i in current.inputs if i not in self._unconfirmed),
                 cost=self._cost, cost_total=self._cost_total,
                 duration_s=round(time.monotonic() - current.started, 3),
@@ -1391,10 +1409,18 @@ class CodexAppServer(ResidentDriver):
             # Codex counts the cache inside the input (`adapters.reread_tokens`)
             self._add_usage(max(call["input_tokens"] - call["cached_input_tokens"], 0),
                             call["cached_input_tokens"], 0, call["output_tokens"])
+            total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
             with self._lock:
                 self._context = call["input_tokens"]
                 if _number(usage.get("modelContextWindow")):
                     self._window = _number(usage.get("modelContextWindow"))
+                if total:
+                    # L80a: cumulative usage of the thread, for the ledger's
+                    # baseline; `last` above remains this turn's measure.
+                    self._usage_total = {
+                        "input_tokens": _number(total.get("inputTokens")),
+                        "cached_input_tokens": _number(total.get("cachedInputTokens")),
+                        "output_tokens": _number(total.get("outputTokens"))}
         elif method == "error":
             error = params.get("error") or {}
             if not params.get("willRetry"):
@@ -1598,8 +1624,12 @@ class AcpResident(ResidentDriver):
                 # difference with the reading before it (codex r1, #325), as
                 # for Claude; unknown for a resumed session without a base
                 if self.cost_base is not None:
-                    self._cost = (self._cost or 0.0) + max(
-                        client._last_cost - self.cost_base, 0.0)
+                    delta = client._last_cost - self.cost_base
+                    # L80a: an agent that restarts its cumulative on a resumed
+                    # session publishes a lower total; that total is the turn,
+                    # not zero (the durable base may come from another process).
+                    self._cost = (self._cost or 0.0) + (
+                        delta if delta >= 0 else client._last_cost)
                 self.cost_base = client._last_cost
                 self._cost_total = client._last_cost
         parsed = {"display": ["%s (%s)" % (adapters.END_OF_TURN_MARK, stop)]}
