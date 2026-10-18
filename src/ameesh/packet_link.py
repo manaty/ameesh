@@ -181,8 +181,12 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
         # Une recomposition garde la base de la composition précédente : si la
         # cible a été fusionnée dans le paquet entre-temps, `merge-base` aurait
         # avancé et les unités déjà composées sortiraient de l'intervalle.
-        # Une base enregistrée n'est reprise que si elle est encore ancêtre de
-        # `head` (sinon le paquet a été rebasé : la base commune fait foi).
+        # Une base enregistrée n'est reprise que si la tête enregistrée est
+        # encore ancêtre de `head` : le paquet a seulement grandi. Un paquet
+        # recomposé sur une cible plus récente garde l'ancienne base pour
+        # ancêtre, mais `base..head` traverserait alors la première parente de
+        # la cible, dont les fusions de paquets portent aussi `ameesh-work:` :
+        # la base commune fait foi.
         try:
             previous_members = memberships(db, package_ids=[int(package_id)])
         except DbError as exc:
@@ -191,8 +195,10 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
                 % exc) from exc
         for member in previous_members:
             previous = _text(member.get("base_sha"))
-            if previous and _commit(top, previous) \
-                    and plan_git._git(top, "merge-base", "--is-ancestor", previous,
+            previous_head = _text(member.get("head_sha"))
+            if previous and previous_head and _commit(top, previous) \
+                    and _commit(top, previous_head) \
+                    and plan_git._git(top, "merge-base", "--is-ancestor", previous_head,
                                       head_sha).returncode == 0:
                 base = previous
                 break

@@ -169,6 +169,35 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
                           packet_link.memberships(self.db, package_ids=[porteur["id"]])},
                          {one["id"], two["id"]})
 
+    def test_record_recomposed_on_newer_target_ignores_target_merges(self):
+        """Un paquet refait sur une cible plus récente ne reprend pas l'ancienne
+        base : la première parente de la cible porte aussi des trailers."""
+        first = self.unit_branch("lot/quinze", "src/onze.py", "onze\n", "onze")
+        one = self.lot("composé dans ce paquet")
+        self.freeze(one, first)
+        head = self.compose("integration/paquet-1", [(one["id"], first)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        # un AUTRE paquet entre dans la cible, avec son trailer
+        other_sha = self.unit_branch("lot/autre", "src/autre.py", "autre\n", "autre")
+        other = self.lot("livré par un autre paquet")
+        self.freeze(other, other_sha)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "fusion paquet-0\n\nameesh-work: %d" % other["id"], other_sha)
+        new_base = git(self.repo, "rev-parse", "HEAD")
+        # ce paquet est refait depuis la nouvelle tête de la cible
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", new_base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d\n\nameesh-work: %d" % (one["id"], one["id"]), first)
+        new_head = git(self.repo, "rev-parse", "HEAD")
+        report = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                    head=new_head, actor="pilote", cfg=self.cfg)
+        self.assertEqual(report["base"], new_base)
+        self.assertEqual({u["work_item_id"] for u in report["units"]}, {one["id"]})
+        self.assertEqual(packet_link.for_item(self.db, other["id"]), [])
+
     def test_record_refuses_unknown_unit_and_foreign_repo(self):
         sha = self.unit_branch("lot/neuf", "src/cinq.py", "cinq\n", "cinq")
         item = self.lot("cinq")
