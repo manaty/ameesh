@@ -207,7 +207,8 @@ class PgPort:
     def commit(self, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping] = (), policy_ref: str = "",
-               notify: str = "", messages: Sequence[Mapping] = ()) -> dict:
+               notify: str = "", messages: Sequence[Mapping] = (),
+               force: bool = False) -> dict:
         """Writes the freeze's designation in one transaction and returns its shape.
 
         Under the lock of the lot row: rechecks that `freeze` is still the
@@ -216,14 +217,16 @@ class PgPort:
         designation, without a second mail), deposits the mails then the mark —
         all in the same transaction. A designation is final for its freeze; a
         waiting state is retryable and its notification leaves only once per
-        freeze."""
+        freeze. `force` (#2487) writes a new mark even when the freeze already
+        has one (a forced selection after a refused carry must supersede the
+        reported mark); the caller uses it only for an explicit replay."""
         lot = int(lot)
         if self.after_commit is not None:
             return self._write(self.db, lot, freeze=freeze, required=required,
                                state=state, reviewers=reviewers, missing=missing,
                                why=why, authors=authors, policy_ref=policy_ref,
                                notify=notify, messages=messages,
-                               hook=self.at_freeze)
+                               hook=self.at_freeze, force=force)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads)
         with self.db.transaction() as tx:
@@ -240,7 +243,7 @@ class PgPort:
             out = inner._write(tx, lot, freeze=freeze, required=required, state=state,
                                reviewers=reviewers, missing=missing, why=why,
                                authors=authors, policy_ref=policy_ref, notify=notify,
-                               messages=messages, hook=False)
+                               messages=messages, hook=False, force=force)
         # the external thread only after the commit: a cancelled send leaves nothing
         for record in threads:
             record(self.db.cfg, self.db)
@@ -248,7 +251,8 @@ class PgPort:
 
     def _write(self, db, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str, authors,
-               policy_ref: str, notify: str, messages, hook: bool) -> dict:
+               policy_ref: str, notify: str, messages, hook: bool,
+               force: bool = False) -> dict:
         freeze = dict(freeze or {})
         sha = str(freeze.get("sha") or "").strip().lower()
         try:
@@ -305,12 +309,13 @@ class PgPort:
             if state == DESIGNATED:
                 state, reviewers, missing = WAITING, [], int(required)
             messages = []
-        existing = self._recorded_in(db, lot, freeze_id,
-                                     since_ts=float(last.get("at_ts") or 0.0))
+        existing = None if force else self._recorded_in(
+            db, lot, freeze_id, since_ts=float(last.get("at_ts") or 0.0))
         # A designation is final; a waiting state is not rewritten (a single
         # notification per freeze) but **yields** to the designation when
         # capacity comes back: it is the same freeze, the following mark
-        # prevails.
+        # prevails. A forced replay writes a newer mark even over a final one:
+        # the caller is an explicit recovery after a refused carry (#2487).
         if existing is not None and (existing.get("state") == DESIGNATED
                                      or state == WAITING):
             return existing

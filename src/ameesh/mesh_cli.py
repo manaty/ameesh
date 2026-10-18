@@ -2053,6 +2053,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("designation: %s" % names)
                         if designation.get("policy_ref"):
                             print("policy     : %s" % designation["policy_ref"])
+                    elif designation.get("state") == "carried":
+                        print("designation: kept from carried verdicts (%s)"
+                              % ", ".join(str(r.get("name"))
+                                          for r in designation.get("reviewers") or ()))
                     else:
                         print("designation: %s — %s" % (
                             designation.get("state"), designation.get("why") or ""))
@@ -2071,6 +2075,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("waiting    : %s" % (applied.get("why") or ""))
                 elif state == "manual":
                     print("manual     : %s" % (applied.get("why") or ""))
+                elif state == "carried":
+                    print("kept       : %s" % ", ".join(
+                        str(r.get("name")) for r in applied.get("reviewers") or ()))
                 elif state in ("unavailable", "none", "unfrozen"):
                     print("%-11s: %s" % (state, applied.get("why") or ""))
                 else:
@@ -2078,32 +2085,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "milestone":
             from . import review_designation_activation as activation
-            threads: list = []
             outcome: dict = {}
-            on_frozen = None
-            if args.kind == "frozen" and activation.enabled(cfg):
-                on_frozen = activation.hook(cfg, outcome)
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=args.note or "",
-                on_frozen=on_frozen, after_commit=threads if on_frozen else None)
-            for record in threads:
-                record(db.cfg, db)
+                verdict=args.verdict, note=args.note or "", outcome=outcome)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
-            state = str(outcome.get("state") or "")
-            if state == "designated":
-                print("reviewers: %s" % ", ".join(
-                    "%s (%s)" % (r.get("name"), r.get("family"))
-                    for r in outcome.get("reviewers") or ()))
-            elif state == "waiting":
-                print("review pending: %s" % (outcome.get("why") or ""))
-            elif state == "manual":
-                print("reviewers: manual designation kept (%s)"
-                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
-            elif state == "unavailable":
-                print("review designation unavailable: %s" % (outcome.get("why") or ""))
             if args.kind == "frozen":
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
@@ -2111,6 +2099,32 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 carried = verdict_carry.carry(cfg, db, args.id)
                 if carried["result"] != "idle":
                     print(verdict_carry.describe(carried))
+                # #2487 : la désignation s'est abstenue sur le plan du report.
+                # Si le report refuse finalement, les sièges manquants sont
+                # désignés maintenant, hors du gel, sans attendre un passage.
+                # `busy`/`moved` ne sont pas des refus : un autre hôte porte le
+                # report ou le gel a bougé, la désignation attend.
+                if outcome.get("state") == "carried" \
+                        and carried.get("result") in ("not-carried", "no-repository",
+                                                      "error", "idle"):
+                    outcome = activation.designate(cfg, db, args.id, force=True)
+                    print("review designation after the carry refused: %s"
+                          % (outcome.get("state") or "?"))
+            state = str(outcome.get("state") or "")
+            if state == "designated":
+                print("reviewers: %s" % ", ".join(
+                    "%s (%s)" % (r.get("name"), r.get("family"))
+                    for r in outcome.get("reviewers") or ()))
+            elif state == "carried":
+                print("reviewers: kept from carried verdicts (%s)" % ", ".join(
+                    str(r.get("name")) for r in outcome.get("reviewers") or ()))
+            elif state == "waiting":
+                print("review pending: %s" % (outcome.get("why") or ""))
+            elif state == "manual":
+                print("reviewers: manual designation kept (%s)"
+                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
+            elif state == "unavailable":
+                print("review designation unavailable: %s" % (outcome.get("why") or ""))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2

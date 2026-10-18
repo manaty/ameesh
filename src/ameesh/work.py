@@ -2718,6 +2718,7 @@ def milestone(
     note: str = "",
     on_frozen=None,
     after_commit: list | None = None,
+    outcome: dict | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -2744,6 +2745,13 @@ def milestone(
     hook et sa liste, comme le contrat #1617 l'exige. Un callback explicite
     l'emporte toujours (témoins, reprise hors hook).
 
+    `outcome` (facultatif) reçoit la forme de la désignation du gel par défaut,
+    pour le message de la CLI. Avant d'installer ce hook, un gel dont la tête
+    est couverte par un report de verdicts (#2442) est reconnu par
+    `verdict_carry.would_carry` : la désignation s'abstient alors et garde les
+    relecteurs reportés, sans courrier (#2487). Le plan est lu **avant** la
+    transaction du jalon : la transaction ne fait aucune lecture réseau.
+
     Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
     porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
     """
@@ -2768,7 +2776,11 @@ def milestone(
         from . import review_designation_activation as activation
         cfg = getattr(db, "cfg", None)
         if activation.enabled(cfg) and not _in_transaction(db):
-            on_frozen = activation.hook(cfg)
+            # #2487 : un gel réaligné dont les verdicts vont être reportés
+            # n'appelle pas de nouvelle désignation. Le plan est lu avant la
+            # transaction du jalon (lectures git/réseau hors verrou de ligne).
+            carried = activation.carried_plan(cfg, db, item_id, sha)
+            on_frozen = activation.hook(cfg, outcome, carried=carried)
             if after_commit is None:
                 after_commit = []
                 drain = after_commit
