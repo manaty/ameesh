@@ -13,7 +13,7 @@ from .train import TrainError, digest, identity, ordered
 
 class Runtime:
     def __init__(self, *, ledger, repository, ci, fires, admissions, target,
-                 policy, notify, inventory=None, enrollment=None):
+                 policy, notify, inventory=None, enrollment=None, migrations=None):
         target = merge_queue._remote_branch(target)
         if ledger.key != land.lock_key(repository.project, target) or fires.ledger is not ledger:
             raise TrainError("runtime adapters must share the exact target reservation")
@@ -31,6 +31,7 @@ class Runtime:
         self.fires, self.admissions = fires, admissions
         self.target_branch, self.policy, self.notify = target, policy, notify
         self.inventory, self.enrollment = inventory, enrollment
+        self.migrations = migrations
         self.enrollment_result = None
 
     def enroll(self, epoch):
@@ -153,11 +154,25 @@ class Runtime:
         self.fires.promote(plan, fire, epoch, validate=validate,
                            effect=lambda: self.repository.promote(
                                plan, key=self.ledger.key, epoch=epoch, owner=self.ledger.owner))
+        self._migrations_landed(plan)
 
     def reconcile(self, plan, fire, epoch):
         self._belongs(plan)
         self._held(epoch)
-        return self.fires.reconcile(plan, fire["id"], epoch, target=self.target)
+        receipt = self.fires.reconcile(plan, fire["id"], epoch, target=self.target)
+        self._migrations_landed(plan)
+        return receipt
+
+    def _migrations_landed(self, plan):
+        """Secondary bookkeeping after a confirmed promotion; never revokes it."""
+        if self.migrations is None or not plan.get("migrations"):
+            return
+        try:
+            errors = self.migrations.landed(plan, path=self.repository.clone.path)
+        except Exception as exc:  # noqa: BLE001 - the merge fact stays written
+            errors = [str(exc)]
+        if errors:
+            self.notify("migration landing record incomplete: " + "; ".join(errors), plan)
 
     def quarantine(self, rows, reason, epoch):
         self._held(epoch)

@@ -583,7 +583,8 @@ def lot_repository(item: dict, cfg=None) -> str:
 def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
                       actor: str = "", cfg=None,
-                      skip_branches: tuple[str, ...] = ()) -> dict:
+                      skip_branches: tuple[str, ...] = (),
+                      skip_worktree: bool = False) -> dict:
     """L122, #443 : réserve au lot le numéro de sa migration, avant d'écrire
     le fichier, dans le dépôt du lot (`lot_repository`) : le dossier et la
     numérotation sont les siens, jamais ceux d'ameesh pour un autre dépôt.
@@ -599,7 +600,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
     en plus de celle du lot — la branche d'intégration d'un paquet en
     composition, dont les fichiers renumérotés ne doivent pas compter contre
-    la réservation. Rend le lot, avec `migration_file`. Une correction
+    la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail du
+    clone de lecture — le train y compose justement la migration à réserver.
+    Rend le lot, avec `migration_file`. Une correction
     concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
@@ -637,7 +640,8 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
         raise WorkError("--skip-branch %s: a trunk branch is always scanned" % trunks[0])
     present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
-                                      also_skip=tuple(skip_branches))
+                                      also_skip=tuple(skip_branches),
+                                      worktree=not skip_worktree)
     if number is None:
         floor = max(present or [0]) + 1
         note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
