@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 import time
+import warnings
 
 from . import merge_queue, plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -53,7 +54,31 @@ FRESH_REF = "refs/ameesh/land/target"
 #: il ne peut pas le porter). Au-delà, la ligne est éjectée (fail-closed) et
 #: l'assigné réveillé ; 6 réessais ≈ 30 min au rythme de relevé par défaut
 #: (300 s), réglable par `AMEESH_LAND_TRANSIENT_RETRIES`.
-TRANSIENT_RETRY_LIMIT = max(0, int(os.environ.get("AMEESH_LAND_TRANSIENT_RETRIES", "6")))
+DEFAULT_TRANSIENT_RETRY_LIMIT = 6
+
+
+def _retry_limit(environ=None) -> int:
+    """#2371 : lire la borne sans faire échouer l'import de `land` (#2345).
+
+    Une valeur absente ou vide garde le défaut ; une valeur non entière le
+    garde aussi, avec un avertissement (l'import d'un module ne doit pas
+    dépendre d'une variable d'environnement mal formée). Une valeur négative
+    vaut 0 : la borne s'applique alors dès le premier réessai.
+    """
+    raw = (os.environ if environ is None else environ).get(
+        "AMEESH_LAND_TRANSIENT_RETRIES")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_TRANSIENT_RETRY_LIMIT
+    try:
+        return max(0, int(str(raw).strip()))
+    except ValueError:
+        warnings.warn(
+            "AMEESH_LAND_TRANSIENT_RETRIES=%r is not an integer: using %d"
+            % (raw, DEFAULT_TRANSIENT_RETRY_LIMIT), RuntimeWarning, stacklevel=2)
+        return DEFAULT_TRANSIENT_RETRY_LIMIT
+
+
+TRANSIENT_RETRY_LIMIT = _retry_limit()
 #: préfixe des notes de journal qui comptent ces réessais (`events_noted`).
 RETRY_NOTE = "land transient retry"
 
