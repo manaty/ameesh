@@ -28,7 +28,7 @@ Demandes : **bureau** — mail du 18/10 02:48Z : main libre, aucun paquet ouvert
 | 1 | #2296 | `12b959de45b3c630c554ccb9d393065bf1b712e7` (`lot/2296-admission-pression-memoire`, PR #1689) | `2ba41f91b05f` | deux avis sur la tête : Claude `mesh-design` + Codex `ameesh-cx1` ; classe prod sensible (`host_*`, `resources.py`, `canon.py`) ; composition propre |
 | 2 | #2341 | `466609e44b4a11e2fc0e4a7b552f41dfd9f1da7c` (`auditeur/host-unsampled`) | `5e77d7dce95d` | avis Codex `codex1` sur la tête (auteur Claude : autre famille) ; classe prod sensible (`exploitation.py`, `notify.py`) ; composition propre |
 | 3 | #2342 | `c40fde773f01e2c90bd76176e0306e81acc56014` (`auditeur/engagement-overdue-p80`) | `bd3dbcebd03d` | avis Codex `ameesh-cx1` sur la tête (auteur Claude) ; alerte/roadmap (`roadmap.py`, `roadmap_dev.py`) ; composition propre |
-| 4 | #2340 | `e5b037d9b3468dd980987b12bf7d64377d626326` (`auditeur/consigne-auditeur-dsn-journal`, PR #1736) | `b791534bcd56` + adaptation `01435d13a4` | deux avis sur la tête : Claude `ameesh-dev4` + Codex `ameesh-cx1` ; SQL/droits (`deploy/sql/role-auditeur.sql`), contrat `tests/parts/toujours.txt` ; adaptation psql de la ligne `server_version_num` reprise de #2355 (`97d7b760f`), test seul, aucun avis requis |
+| 4 | #2340 | `e5b037d9b3468dd980987b12bf7d64377d626326` (`auditeur/consigne-auditeur-dsn-journal`, PR #1736) ; tête gelée finale `18c62c071` | `b791534bcd56` + adaptation `01435d13a4` + merge `ddf9f6529` | deux avis sur la tête : Claude `ameesh-dev4` + Codex `ameesh-cx1` ; SQL/droits (`deploy/sql/role-auditeur.sql`), contrat `tests/parts/toujours.txt` ; adaptation psql de la ligne `server_version_num` reprise de #2355 (`97d7b760f`), test seul, aucun avis requis ; la tête refreezée `18c62c071` porte le même delta test (deux avis sur cette tête, arbre identique via `ddf9f6529`) |
 | 5 | #2289 | `84045d1a354371e975cc584e8cce60dbe6924219` (`lot/2289-required-refusal-slug`, PR #1705) | `3561de311c93` | deux avis sur la tête : Codex `codex3` + DeepSeek `mty-nxl-rel-01` ; porte de fusion (`merge_pr.py`) ; composition propre |
 | 6 | #2336 | `e9ee6759e5de96e3f40adfa8bc82169304b79f1f` (`auditeur/plafond-contexte`, PR #1737) | `37298ecc7d16` | avis Codex `codex1` sur la tête (auteur DeepSeek : autre famille) ; §8 exécuteur (`runner.py`, `adapters.py`) ; composition propre |
 | 7 | #2306 | `809823bf3765e043667fd7b59942dea012f6726a` (`lot/2306-check-read-retry`) | `18474b8a8d01` | deux avis sur la tête : Codex `ameesh-cx1` + Claude `auditeur` ; porte de fusion (`fire.py`, `land.py`) ; composition propre |
@@ -55,6 +55,8 @@ Aucun conflit non résolu entre les 14 unités : les merges `--no-ff` passent rc
 
 #2340 : la ligne de test `SHOW server_version_num` via `db.query` est refusée sous psql ; l'adaptation mécanique de #2355 (`97d7b760f`, `SELECT current_setting('server_version_num') AS v`) est reprise seule dans `01435d13a4`, sans le reste de #2355 (relu à part). Adaptation de test, aucun avis requis (§11 bis) ; le reste de #2340 est celui de sa tête gelée.
 
+Complément (03:07Z) : après la composition, l'auteur de #2340 a refreezé `18c62c071` (= `e5b037d9b` + ce même delta test, contenu de prod inchangé) et obtenu les deux avis sur cette tête (dev4, cx1). Le merge `ddf9f6529` ajoute `18c62c071` comme second parent de l'unité 4 ; son arbre est identique à `01435d13a4` (`git diff` vide), donc la tête gelée du lot est un ancêtre du paquet et le contenu relu est celui qui part en CI.
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
@@ -73,10 +75,10 @@ Aucun conflit non résolu entre les 14 unités : les merges `--no-ff` passent rc
 ## Preuves
 
 - `git diff --check 44cb7dc51..HEAD` : rc 0, aucun marqueur de conflit.
-- Seconds parents et trailers `ameesh-work` : 14/14 vérifiés sur la première ligne de l'historique ; adaptation `01435d13a4` sans trailer, documentée ci-dessus.
+- Seconds parents et trailers `ameesh-work` : 14/14 vérifiés sur la première ligne de l'historique ; adaptation `01435d13a4` sans trailer, documentée ci-dessus ; le merge `ddf9f6529` porte #2340 en second parent (`18c62c071`) et le trailer `ameesh-work: #2340`.
 - `git diff 1c3a69d9 <tête> -- src/ameesh/fire.py` : vide ; résolutions #1945 × #2171 et #2328 × #2305 utilisées comme sources des unités 10 et 11.
 - Chaque tête source est la tête distante gelée (`ls-remote` = sources listées) ; aucun rebase de lot, aucune CI de lot.
-- `scripts/paquet-inclusion.py --manifest <ce fichier> --head 01435d13a4 --expected 2296,2285,2306,2340,2289,2341,2342,2336,1945,2171,2328,2338,2280,1658` : rejoué après mise à jour du manifeste ; 11 lots présents, #1945, #2306 et #2340 partiels sur les écarts lus ci-dessus, aucun défaut.
+- `scripts/paquet-inclusion.py --manifest <ce fichier> --head HEAD --expected 2296,2285,2306,2340,2289,2341,2342,2336,1945,2171,2328,2338,2280,1658` : rejoué sur la tête finale après le commit de manifeste ; 11 lots présents, #1945, #2306 et #2340 partiels sur les écarts lus ci-dessus, aucun défaut.
 
 ## CI et fusion
 
