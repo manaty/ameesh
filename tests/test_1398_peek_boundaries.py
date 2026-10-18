@@ -10,7 +10,8 @@ from unittest import mock
 
 from ameesh import agent_peek as peek, decisions, registry, storage
 from tests.support import PgTestCase
-from tests.test_l108_executor_server import OWNER, ServeurExecTest
+from tests import test_l108_executor_server as _exec_server
+from tests.test_l108_executor_server import OWNER
 
 
 class EmptyReaderTest(PgTestCase):
@@ -45,7 +46,7 @@ class EmptyReaderTest(PgTestCase):
         self.assertEqual(stored[0]["n"], 1)
 
 
-class NameFenceTest(ServeurExecTest):
+class NameFenceTest(_exec_server.ServeurExecTest):
     FENCE = ("inge-front", OWNER, 42)
 
     def test_name_must_equal_the_fence_agent_before_any_write(self):

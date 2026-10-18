@@ -82,6 +82,12 @@ leur delta propre. Aucun conflit de composition n'a été rencontré.
   `docs/EXECUTEUR-MEDIEE.md` sont réalignés (aucun contenu de lot perdu) ;
   le test est vert localement, puis le run complet est redemandé sur cette
   tête.
+- Correctif de composition (CI 39177568925) : `test_l161e_map` refuse qu'un
+  module de test lie une classe de test concrète venue d'un autre module
+  (#1632) ; `test_1398_peek_boundaries.py` importait `ServeurExecTest` et le
+  sous-classait. Le module est désormais lié (`_exec_server`) et
+  `NameFenceTest` en dérive ; le test d'attribution est vert localement.
+  Run complet redemandé sur cette tête.
 
 ## Contenus à lire (avertissements d'inclusion)
 
