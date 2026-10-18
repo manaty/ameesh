@@ -271,6 +271,11 @@ class Gauge:
     #: générale. Un seau propre à un modèle ne compte que pour une session de
     #: ce modèle (`accounts.gauges_of`) ; l'affichage les montre tous.
     scope: str = ""
+    #: #1702 (N2) : cette fenêtre vient de l'historique partagé, pas de la
+    #: lecture locale. Elle sert à la garde — c'est la mesure la plus fraîche —
+    #: mais ne doit jamais être réécrite dans l'historique : chaque hôte
+    #: évaluateur réinscrivait sinon le relevé d'un autre avec sa source (échos).
+    from_history: bool = False
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -497,9 +502,11 @@ class TurnUsage:
     def reread_tokens(self) -> int:
         """Jetons d'entrée **relus** par le tour, cache compris (L60).
 
-        C'est la mesure du plafond de contexte : chaque étape d'un tour relit
-        tout le contexte de la session. Codex compte déjà l'entrée en cache
-        dans `input_tokens` ; les autres harnais la comptent à part."""
+        Mesure du coût du tour et de l'alerte `session_too_big` : chaque étape
+        d'un tour relit tout le contexte de la session. Ce n'est pas la taille
+        du contexte — le plafond de contexte mesure le dernier appel (#2336).
+        Codex compte déjà l'entrée en cache dans `input_tokens` ; les autres
+        harnais la comptent à part."""
         if self.harness == "codex":
             return max(int(self.input_tokens), int(self.cached_input_tokens))
         return int(self.input_tokens) + int(self.cached_input_tokens)
@@ -889,6 +896,11 @@ class CostBook:
         jamais une liste nue : un appelant qui lit `.overage` en direct ne
         doit pas tomber sur le chemin vide. Le chemin par compte rend une
         copie (le relevé est mis en cache et partagé entre CostBook).
+
+        #1702 (N4) : la lecture sans compte récupère elle aussi le marqueur de
+        compte hors de la tranche lue, comme le chemin par compte — sans cela
+        une mesure dont le marqueur précédait la tranche restait non datée et
+        perdait contre toute mesure datée d'un autre flux.
         """
         if account is not None:
             return self._claude_gauges_of(account, primary)
@@ -898,10 +910,13 @@ class CostBook:
                 continue
             path = os.path.join(self.agent_dir(agent), "events.jsonl")
             try:
-                mtime = os.stat(path).st_mtime
+                # #1702 (N4) : même récupération du marqueur hors tail que le
+                # chemin par compte ; la mtime ne sert qu'à départager deux
+                # mesures non datées, jamais à en dater une.
+                events, stat, _complete = _claude_account_tail(path)
             except OSError:
                 continue
-            found = _last_claude_reading(self.events(agent, tail=True), agent, mtime)
+            found = _last_claude_reading(events, agent, stat.st_mtime)
             if found is None:
                 continue
             if newest is None or _reading_rank(found) >= _reading_rank(newest):
@@ -982,6 +997,17 @@ class CostBook:
 
         L'historique ne porte pas les drapeaux d'overage : la copie rendue
         garde ceux de la lecture locale, avec le type `Gauges` (#1649).
+
+        #1702 (N2) : une fenêtre reprise d'ici porte `from_history=True` ; la
+        garde la lit comme la mesure la plus fraîche, mais `record_gauges` ne
+        la réécrit jamais — chaque hôte évaluateur réinscrivait sinon le relevé
+        d'un autre sous sa source (échos toutes les dix minutes).
+
+        Sur un exécuteur `backend=mediated`, `operations.gauge_latest` n'est
+        pas admise au contrat médié : l'appel est refusé, l'exception est
+        avalée et la lecture locale est rendue sans réconciliation. C'est
+        documenté dans `docs/COMPTES.md` ; l'admettre toucherait le contrat
+        d'autorisation (deux avis), ce n'est pas le geste de ce lot.
         """
         if self.db is None:
             return gauges
@@ -1001,7 +1027,7 @@ class CostBook:
                 merged.append(Gauge("claude", gauge.key, float(row["used"]),
                                     row.get("resets_at_ts"), float(row["window_s"]),
                                     read_at=produced, produced_at=produced,
-                                    source=row.get("source") or ""))
+                                    source=row.get("source") or "", from_history=True))
                 changed = True
             else:
                 merged.append(gauge)
@@ -1011,7 +1037,7 @@ class CostBook:
                 merged.append(Gauge("claude", key, float(row["used"]),
                                     row.get("resets_at_ts"), float(row["window_s"]),
                                     read_at=produced, produced_at=produced,
-                                    source=row.get("source") or ""))
+                                    source=row.get("source") or "", from_history=True))
                 changed = True
         if not changed:
             return gauges
@@ -1106,12 +1132,18 @@ class CostBook:
         la garde de budget qui lit les jauges avant chaque tour.
 
         `account` (L30, migration 0028) : les jauges sont celles de ce compte.
+
+        #1702 (N2) : une fenêtre reprise de l'historique (`from_history`) n'y
+        est jamais réécrite — elle y est déjà, et la réinscrire sous la source
+        de l'hôte évaluateur fabriquait des échos toutes les dix minutes.
         """
         if self.db is None or not gauges:
             return 0
         try:
             lignes = []
             for g in gauges:
+                if getattr(g, "from_history", False):
+                    continue
                 ligne = {"harness": g.harness, "key": g.key, "used": g.used,
                          "resets_at": g.resets_at, "window_s": g.window_s,
                          "produced_at": getattr(g, "produced_at", None),
@@ -1119,6 +1151,8 @@ class CostBook:
                 if account is not None:
                     ligne["account"] = account
                 lignes.append(ligne)
+            if not lignes:
+                return 0
             return storage.of(self.db).operations.record_gauges(lignes)
         except Exception:  # historique facultatif : jamais fatal
             return 0

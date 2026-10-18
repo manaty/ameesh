@@ -1,0 +1,19 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Reference renderer of an Electron host (L92): the application's own page,
+     bundled with @ameesh/ui. The CSP is the application's; the mesh's origin
+     is in connect-src, and no remote code is ever executed. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://mesh.acme.example">
+<title>Acme — ameesh</title>
+<script type="module" src="renderer.mjs"></script>
+</head>
+<body>
+<ameesh-config>
+  <ameesh-app></ameesh-app>
+</ameesh-config>
+</body>
+</html>

@@ -256,27 +256,14 @@ def _declared_profiles(cfg) -> dict:
         return {}
 
 
-def _declared_pace(items: list, account: str | None) -> tuple[float, float]:
-    """(multiplicateur, plafond de rythme) du compte déclaré (#1227 N3).
-
-    Le relevé de `latest_account_gauges` nomme son compte : on lit le réglage
-    du profil correspondant (`pace_ceiling`, `pace_multiplier`) au lieu des
-    90 % et du ×1 en dur, qui contredisaient `limits` (#1075, #1176). Un
-    compte non déclaré, ou un relevé sans compte sur un harnais à plusieurs
-    comptes, garde les défauts : jamais un plafond inventé. Le relèvement de
-    fin de fenêtre n'est pas reproduit ici — il exige la preuve fraîche
-    d'overage impossible, que lit `accounts.evaluate` — le diagnostic reste
-    donc conservateur (jamais au-dessus du plafond de `limits`).
-    """
-    profile = None
+def _declared_profile(items: list, account: str | None) -> accounts_mod.Profile | None:
+    """Le profil du relevé (#1227, #2233), None si inconnu ou ambigu."""
     if items:
         if account:
-            profile = accounts_mod.by_name(items, account)
+            return accounts_mod.by_name(items, account)
         elif len(items) == 1:
-            profile = items[0]
-    if profile is None:
-        return 1.0, cost_mod.PACE_CEILING
-    return profile.pace_multiplier, profile.pace_ceiling
+            return items[0]
+    return None
 
 
 def plan_underused(db, listing: list, now: float, *,
@@ -286,7 +273,9 @@ def plan_underused(db, listing: list, now: float, *,
                    paid=None, held=(), cfg=None) -> list:
     """`cfg` (#1227 N3) : la configuration des comptes déclarés — le rythme et
     le plafond du compte nommé par le relevé remplacent les 90 % et le ×1 en
-    dur ; un compte absent, inconnu ou ambigu garde les défauts."""
+    dur ; un compte absent, inconnu ou ambigu garde les défauts. #2233 : les
+    plafonds fixes et courts de `accounts.limits` bloquent aussi une fausse
+    promesse de capacité sur une autre fenêtre du même compte."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -294,20 +283,47 @@ def plan_underused(db, listing: list, now: float, *,
     out: list = []
     spend = None
     spend_read = False
+    book = None
     declared = _declared_profiles(cfg)
     for (harness, account), gauges in sorted(latest_account_gauges(db, now).items(),
                                               key=lambda kv: (kv[0][0], kv[0][1] or "")):
-        multiplier, ceiling = _declared_pace(declared.get(harness) or [], account)
+        items = declared.get(harness) or []
+        profile = _declared_profile(items, account)
+        multiplier = profile.pace_multiplier if profile else 1.0
+        ceiling = profile.pace_ceiling if profile else cost_mod.PACE_CEILING
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
         # #1789/N6 : un seau propre à un modèle (#1580 tranche 3) ne rend pas
         # la capacité générale du compte inutilisable — seules les fenêtres
         # générales se taisent entre elles ; un seau de modèle reste alerte.
-        blocking = [(g, seen) for g, seen in live if not getattr(g, "scope", "")]
+        blocking = [(g, seen) for g, seen in gauges
+                    if not g.scope and not g.reset_passed(now)]
+        caps = {}
+        if profile is not None:
+            measured = cost_mod.Gauges(g for g, _ in gauges)
+            # #2233 : l'historique ne porte pas la capacité d'overage. Ne
+            # lire le journal du compte que si son plafond pourrait bloquer.
+            if profile.overage == "auto" and any(
+                    g.used_at(now) >= profile.overage_cap for g, _ in blocking):
+                try:
+                    if book is None:
+                        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+                    current = accounts_mod.gauges_of(book, profile, items, now=now)
+                    measured.overage = getattr(current, "overage", None)
+                except Exception:  # compte illisible : aucune capacité promise
+                    continue
+            # Comme avant #2233, aucun relèvement de fin de fenêtre sans
+            # preuve fraîche ; les plafonds fixes et courts viennent de limits.
+            caps = accounts_mod.limits(profile, measured, now, ceilings={
+                g.key: accounts_mod.Ceiling(ceiling) for g in measured})
+            if any(g.used_at(now) >= caps[g.key][0] for g, _ in blocking):
+                continue
         for gauge, seen in live:
-            if any(other.exceeded(now, 0.0, multiplier, ceiling)
-                   for other, _ in blocking if other is not gauge):
+            if caps and gauge.used_at(now) >= caps[gauge.key][0]:
+                continue
+            if profile is None and any(other.exceeded(now, 0.0, multiplier, ceiling)
+                                       for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
@@ -903,9 +919,16 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
 
 def is_backlog_item(lot: dict) -> bool:
     """Élément de la file d'amélioration encore à prendre (L119) : il attend un
-    preneur automatique, ce n'est ni un lot en souffrance ni un lot stagnant."""
-    return (lot.get("type") == "improvement" and not (lot.get("assignee") or "").strip()
-            and lot.get("state") == "intake")
+    preneur automatique, ce n'est ni un lot en souffrance ni un lot stagnant.
+    §4 : un élément `build` sans assigné n'est un élément de la file que s'il a
+    été RENDU (`returned_to_queue`) — un élément en cours sans preneur n'y est
+    pas."""
+    if (lot.get("assignee") or "").strip():
+        return False
+    if lot.get("state") == "intake":
+        return lot.get("type") == "improvement"
+    return (lot.get("type") == "improvement" and lot.get("state") == "build"
+            and bool(lot.get("returned_to_queue")))
 
 
 def waiting_project_lots(lots: list, *, db=None, now: float | None = None) -> list:
@@ -969,6 +992,23 @@ def split_startable(waiting_lots: list, waits: dict) -> tuple:
     return startable, blocked
 
 
+def lots_for_idle(lots: list, idle: list) -> list:
+    """#2337 B4 : ne garder que les lots qu'un agent au repos peut prendre —
+    le projet du lot (`app`, `workstream` ; `projects.lot_project`) doit
+    figurer dans ceux d'au moins un agent. Un lot sans projet connu reste (on
+    ne devine pas) et un repos sans projet déclaré ne filtre rien (cas hub).
+    Sans ce croisement, cinq agents Nexlink au repos et un lot ameesh
+    démarrable levaient encore l'alerte."""
+    from . import projects as projects_mod
+    wanted = {project for row in idle
+              for project in projects_mod.agent_projects(row)}
+    if not wanted:
+        return list(lots)
+    return [lot for lot in lots
+            if not projects_mod.lot_project(lot)
+            or projects_mod.lot_project(lot) in wanted]
+
+
 def waiting_text(blocked: dict, limit: int = 6) -> str:
     """« #12 waits on #3, #4; #15 is scheduled for 2026-10-16 » (L368)."""
     parts = []
@@ -1023,6 +1063,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
     waiting_lots = waiting_project_lots(lots)
+    # #2337 B4 : un lot démarrable d'un autre projet n'est pas une capacité
+    # pour ces agents (cinq agents Nexlink au repos + un lot ameesh levait
+    # encore l'alerte) ; on croise avec les projets des agents au repos.
+    waiting_lots = lots_for_idle(waiting_lots, idle)
     waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
     startable_lots, blocked_lots = split_startable(waiting_lots, waits)
     backlog = [row for row in listing
@@ -1034,7 +1078,12 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                           and _state(row) == "working" and not _attached(row))
     plan_idle = [row for row in idle if paid is not None and row.get("harness") not in paid]
     aggravating = bool(paid_working and plan_idle)
-    if not (waiting_lots or backlog or aggravating):
+    # #2337 : la levée se lit sur les lots DÉMARRABLES — un lot qu'une
+    # dépendance ou une date retient n'est pas du travail à confier, et
+    # `waiting_lots` en compte 24 sans qu'un agent puisse rien prendre. Les
+    # bloqués restent dans le détail d'une alerte levée par autre chose (un
+    # courrier en souffrance, le forfait au repos).
+    if not (startable_lots or backlog or aggravating):
         return []
     names = sorted(row["name"] for row in idle)
     # #1677 (b) : le repos se lit sur les lots actionnables, plus sur le temps
@@ -1111,8 +1160,9 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     et (L165b) aux agents de conception.
 
     Rend `{orchestrateur: texte}` : à chacun, les agents au repos sans lot de
-    SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (un lot
-    ne dit pas son équipe : tous). Un orchestrateur sans agent à occuper ne
+    SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (filtrés
+    en amont sur les projets des agents au repos, #2337 B4 ; un lot sans
+    projet connu reste). Un orchestrateur sans agent à occuper ne
     reçoit rien ; il n'est jamais cité dans sa propre liste.
 
     #1608 : seuls les lots sans attente planifiée sont proposés (L368) ; les
@@ -1135,8 +1185,8 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             not mine or mine & set(projects_mod.agent_projects(by_name.get(n) or {})))]
         if not names:
             continue
-        parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "
-                 "than %s: %s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
+        parts = ["Idle capacity: %d wakeable agent(s) without an actionable lot: %s."
+                 % (len(names), ", ".join(names))]
         if startable:
             parts.append("Open lots without an agent: %s." % ", ".join(
                 "#%d%s" % (i, " \"%s\"" % titles[i] if titles.get(i) else "")

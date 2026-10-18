@@ -12,14 +12,15 @@ from ameesh import alert_briefs, progress, stagnation, storage, work
 
 
 class ReviewWaitingTest(unittest.TestCase):
-    def marks(self, *verdicts, frozen="a" * 40):
-        item = {"state": "qa", "assignee": "author", "reviewer": "second",
-                "reviewers": ["first", "second"]}
+    def marks(self, *verdicts, frozen="a" * 40, reviewers=None, agents=None):
+        reviewers = list(("first", "second") if reviewers is None else reviewers)
+        item = {"state": "qa", "assignee": "author",
+                "reviewer": reviewers[-1] if reviewers else "", "reviewers": reviewers}
         rows = [{"kind": "frozen", "at_ts": 1, "sha": frozen}]
         rows += [{"kind": "verdict", "at_ts": i + 2, "actor": actor,
                   "verdict": verdict, "sha": sha}
                  for i, (actor, verdict, sha) in enumerate(verdicts)]
-        return item, progress._work_item_milestones(item, [], [], rows)
+        return item, progress._work_item_milestones(item, [], [], rows, agents=agents)
 
     def test_each_reviewer_owes_a_current_verdict(self):
         a = "a" * 40
@@ -72,6 +73,71 @@ class ReviewWaitingTest(unittest.TestCase):
                 self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
                 self.assertEqual(progress.lot_state("qa", marks), "approved")
 
+    def test_blocked_verdict_of_a_withdrawn_reviewer_does_not_hold_the_lot(self):
+        a = "a" * 40
+        verdicts = [("first", "blocked", a), ("second", "ok", a)]
+        for ordered in (verdicts, verdicts[::-1]):
+            with self.subTest(ordered=ordered):
+                item, marks = self.marks(*ordered, reviewers=["second"])
+                self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+                self.assertEqual(progress.lot_state("qa", marks), "approved")
+                self.assertEqual(marks["pending_reviewers"], [])
+
+    def test_no_designation_or_waiver_keeps_a_current_blocker(self):
+        # #1979 : sans relecteur désigné (ou avec la dispense `-none`), un
+        # verdict bloqué courant demande une correction, pas une dispense.
+        for reviewers in ([], ["-none"]):
+            with self.subTest(reviewers=reviewers):
+                item, marks = self.marks(("first", "blocked", "a" * 40),
+                                         reviewers=reviewers)
+                self.assertTrue(marks["verdict_current"])
+                self.assertEqual(marks["verdict_kind"], "blocked")
+                # `waiting` nomme la correction due ; `lot_state` laisse le
+                # lot « review » (un bloquant courant n'est jamais approuvé).
+                self.assertEqual(progress.lot_state("qa", marks), "review")
+                self.assertEqual(stagnation.waiting(item, marks)["what"], "fix")
+
+    def test_human_prefixed_actor_matches_a_bare_designation(self):
+        # #2204/N4 : un humain peut être nommé sans préfixe ; #2346 ne garde
+        # cet alias que si le nom nu n'est pas un agent du registre.
+        a = "a" * 40
+        item, marks = self.marks(("first", "ok", a), ("human:second", "ok", a),
+                                 agents=set())
+        self.assertEqual(marks["pending_reviewers"], [])
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+        item, marks = self.marks(("first", "ok", a), ("second", "ok", a),
+                                 reviewers=["first", "human:second"], agents=set())
+        self.assertEqual(marks["pending_reviewers"], [])
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+
+    def test_agent_homonym_is_not_the_human_of_the_same_name(self):
+        """#2346 : `second` agent ne vaut ni l'approbation `human:second`, ni
+        le verdict attendu du relecteur `human:second`."""
+        a = "a" * 40
+        item, marks = self.marks(("first", "ok", a), ("human:second", "ok", a),
+                                 reviewers=["first", "second"], agents={"second"})
+        self.assertEqual(marks["pending_reviewers"], ["second"])
+        self.assertEqual(stagnation.waiting(item, marks)["who"], "second")
+        self.assertEqual(progress.lot_state("qa", marks), "review")
+        item, marks = self.marks(("first", "ok", a), ("second", "ok", a),
+                                 reviewers=["first", "human:second"], agents={"second"})
+        self.assertEqual(marks["pending_reviewers"], ["human:second"])
+        self.assertEqual(stagnation.waiting(item, marks)["who"], "human:second")
+        # Sans classification (agents=None), l'alias n'est pas deviné.
+        item, marks = self.marks(("first", "ok", a), ("human:second", "ok", a))
+        self.assertEqual(marks["pending_reviewers"], ["second"])
+
+    def test_human_aliases_share_the_latest_current_verdict(self):
+        a = "a" * 40
+        for bare, prefixed in (("second", "human:second"), ("human:second", "second")):
+            for latest, expected in (("ok", "merge"), ("blocked", "fix")):
+                with self.subTest(bare=bare, latest=latest):
+                    prior = "blocked" if latest == "ok" else "ok"
+                    item, marks = self.marks((bare, prior, a), (prefixed, latest, a),
+                                             reviewers=[bare], agents=set())
+                    self.assertEqual(stagnation.waiting(item, marks)["what"], expected)
+                    self.assertEqual(marks["verdict_kind"], latest)
+
     def test_waiver_is_not_a_reviewer_and_light_lots_can_merge(self):
         from ameesh import lot_class
         item, marks = self.marks()
@@ -123,11 +189,30 @@ class MultipleReviewersTest(PgTestCase):
         self.assertEqual(row["reviewers"], ["first"])
         self.assertEqual(row["reviewer"], "first")
 
+    def test_direct_sql_assignment_journals_the_cleared_reviewer(self):
+        self.designate("first")
+        self.designate("second")
+        self.db.execute("UPDATE work_items SET assignee = 'first' WHERE id = %s",
+                        (self.lot["id"],))
+        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
+        notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
+        self.assertIn("reviewer first cleared (they now hold the lot)", notes)
+
+    def test_redesignation_via_api_moves_the_existing_name_last(self):
+        for name in ("first", "second", "first"):
+            self.designate(name)
+        row = work.get(self.db, self.lot["id"])
+        self.assertEqual(row["reviewers"], ["second", "first"])
+        self.assertEqual(row["reviewer"], "first")
+
     def test_legacy_writer_accumulates_and_cannot_reintroduce_author(self):
         for name in ("first", "second", "first"):
             self.db.execute("UPDATE work_items SET reviewer = %s WHERE id = %s",
                             (name, self.lot["id"]))
-        self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["first", "second"])
+        # #2204/N2 : re-désigner un nom déjà présent le remet en dernier.
+        row = work.get(self.db, self.lot["id"])
+        self.assertEqual(row["reviewers"], ["second", "first"])
+        self.assertEqual(row["reviewer"], "first")
         self.db.execute("UPDATE work_items SET assignee = 'first' WHERE id = %s",
                         (self.lot["id"],))
         self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
@@ -204,8 +289,12 @@ class MultipleReviewersTest(PgTestCase):
     def test_pre_migration_reads_backfill_and_live_connection(self):
         from ameesh import db as db_mod
         migration = Path(REPO, "src/ameesh/migrations/0456_work_item_reviewers.sql").read_text()
+        audit = Path(REPO, "src/ameesh/migrations/0462_reviewer_audit.sql").read_text()
         self.db.execute("DROP TRIGGER work_item_reviewers_sync ON work_items")
+        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewers")
+        # LIFO : 0456 d'abord, puis 0462 qui rétablit le trigger d'audit.
+        self.addCleanup(self.db.execute, audit)
         self.addCleanup(self.db.execute, migration)
         self.db.__dict__.pop("_has_reviewers", None)
         self.db.execute("UPDATE work_items SET reviewer = 'first' WHERE id = %s",
@@ -294,3 +383,82 @@ class MultipleReviewersTest(PgTestCase):
         self.assertEqual([d["outcome"] for d in done], ["rendue"])
         self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
         self.assertIn("reviewer author cleared (they now hold the lot)", self.notes())
+
+    # -- #2346 : le drapeau d'audit ne couvre que l'UPDATE qui l'a posé
+
+    def cleared_notes(self):
+        return [e for e in work.events(self.db, self.lot["id"])
+                if " cleared " in e["note"]]
+
+    def assert_trigger_cleared(self, name):
+        cleared = [e for e in self.cleared_notes()
+                   if e["note"] == "reviewer %s cleared (they now hold the lot)" % name]
+        self.assertEqual([e["actor"] for e in cleared], ["db:reviewers_sync"],
+                         [e["note"] for e in self.cleared_notes()])
+
+    def test_assign_in_a_calling_transaction_does_not_mask_a_direct_removal(self):
+        self.designate("first")
+        self.designate("second")
+        with self.db.transaction() as tx:
+            storage.of(tx).work.assign(self.lot["id"], "chief", current="author",
+                                       note="take", actor="chief")
+            # Retrait SQL direct, plus loin dans la MÊME transaction : le
+            # drapeau d'audit du chemin Python ne doit plus le taire.
+            tx.execute("UPDATE work_items SET assignee = 'first' WHERE id = %s",
+                       (self.lot["id"],))
+        self.assert_trigger_cleared("first")
+
+    def test_delegate_in_a_calling_transaction_does_not_mask_a_direct_removal(self):
+        self.designate("first")
+        self.designate("second")
+        with self.db.transaction() as tx:
+            storage.of(tx).work.delegate(self.lot["id"], "first", current="author",
+                                         delegated_by="author", within_s=1800,
+                                         note="delegated", actor="author")
+            tx.execute("UPDATE work_items SET assignee = 'second' WHERE id = %s",
+                       (self.lot["id"],))
+        self.assert_trigger_cleared("second")
+
+    def test_expire_in_a_calling_transaction_does_not_mask_a_direct_removal(self):
+        self.designate("first")
+        self.designate("second")
+        out = work.delegate(self.db, self.lot["id"], "first", within=1800,
+                            actor="author", cfg=self.cfg)
+        self.designate("author")
+        with self.db.transaction() as tx:
+            done = storage.of(tx).work.resolve_delegation(
+                out["delegation"]["delegation_id"],
+                now_ts=out["delegation"]["due_ts"] + 1,
+                actor="runner", describe=None)
+            self.assertEqual(done["outcome"], "rendue")
+            tx.execute("UPDATE work_items SET assignee = 'second' WHERE id = %s",
+                       (self.lot["id"],))
+        self.assert_trigger_cleared("second")
+
+    # -- #2346 : un homonyme agent ne vaut pas l'humain `human:<nom>`
+
+    def test_snapshot_does_not_credit_a_human_verdict_to_an_agent(self):
+        sha = "a" * 40
+        self.designate("first")
+        work.milestone(self.db, self.lot["id"], "frozen", sha=sha, actor="author")
+        work.milestone(self.db, self.lot["id"], "verdict", sha=sha,
+                       actor="human:first", verdict="ok")
+        view = progress.snapshot(self.db, self.cfg, since="24h", gantt=False)
+        lot = next(row for row in view["lots"] if row["id"] == self.lot["id"])
+        self.assertEqual(lot["pending_reviewers"], ["first"])
+        self.assertEqual(lot["state"], "review")
+
+    def test_snapshot_does_not_credit_an_agent_verdict_to_a_human(self):
+        sha = "b" * 40
+        human = work.add(self.db, title="human review", assignee="author", app="ameesh")
+        work.move(self.db, human["id"], "build")
+        work.move(self.db, human["id"], "qa")
+        storage.of(self.db).work.designate_reviewer(human["id"], "human:first",
+                                                    actor="chief")
+        work.milestone(self.db, human["id"], "frozen", sha=sha, actor="author")
+        work.milestone(self.db, human["id"], "verdict", sha=sha,
+                       actor="first", verdict="ok")
+        view = progress.snapshot(self.db, self.cfg, since="24h", gantt=False)
+        lot = next(row for row in view["lots"] if row["id"] == human["id"])
+        self.assertEqual(lot["pending_reviewers"], ["human:first"])
+        self.assertEqual(lot["state"], "review")

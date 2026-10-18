@@ -61,7 +61,7 @@ Chaque commit de composition — une unité du paquet — porte une ligne
 `ameesh-work: <id>` par lot qu'il porte, en fin de message :
 
 ```
-vehicule 0400 : #2131 (ef22692ba6a3) — détachement conditionnel CAS et PR détachée
+vehicule 0400 : #2131 ef22692ba6a3 — détachement conditionnel CAS et PR détachée
 
 ameesh-work: 2131
 ```
@@ -82,6 +82,26 @@ scripts/paquet-compose.py --lot 2131 --source ef22692ba6a3 --cut 0400 \
 Sur fusion propre, il crée le commit et affiche son SHA. Sur conflit, il ne
 commite pas : le message complet est déjà dans `.git/MERGE_MSG` ; on résout, on
 `git add`, puis `git commit --no-edit`. Le trailer reste en fin de message.
+
+Le sujet nomme chaque lot avec la tête composée, `#<lot> <tête>` (#2360) : un
+`#N` seul n'est qu'une citation. Une fois les unités composées, le **corps du
+lot porteur** et le manifeste reprennent la ligne que le script imprime :
+
+```sh
+scripts/paquet-compose.py --units --base origin/main [--head <réf>]
+# 2 unités de fusion, 3 lots portés : #2131 ef22692ba6a3, #2140 0a1b2c3d4e5f, #2157 112233445566
+```
+
+Les unités de fusion sont les commits de fusion de première parente depuis
+`--base` qui portent `ameesh-work:` (tête = second parent) ; une mise à jour
+depuis la cible n'en est pas une. Une unité peut porter plusieurs lots, listés
+chacun avec sa tête ; un lot recomposé garde sa place, prend sa tête la plus
+récente et son unité est le commit de composition le plus récent. Le compteur
+annonce donc séparément les unités de fusion encore rattachées à un lot et les
+lots portés (#2387). C'est cette forme `#<lot> <tête>` que le moniteur lit dans
+le corps d'un porteur `integration/**` pour reconnaître qu'un lot attend la
+fusion du paquet (#2335) ; un porteur qui ne liste ses lots que par `#N` ne
+déclare aucune unité et leurs alertes restent.
 
 La convention vaut pour les unités composées à partir de maintenant : un paquet
 déjà validé n'est pas réécrit pour ce seul métadonné, son manifeste et son run

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 
-from ameesh import plan_git
+from ameesh import plan_git, planned_waits
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "paquet-compose.py"
@@ -84,7 +84,8 @@ class PaquetComposeTest(unittest.TestCase):
         self.assertEqual(parents[1].decode(), self.base)
         text = self.message()
         self.assertTrue(text.startswith(
-            "vehicule 0400 : #7/#8 (%s) — unité de banc\n" % short), text)
+            "vehicule 0400 : #7 %s, #8 %s — unité de banc\n" % (short, short)),
+            text)
         self.assertIn("\nameesh-work: 7\n", text)
         self.assertIn("\nameesh-work: 8\n", text)
         # le commit est déclarable par le code qui lit les trailers
@@ -103,7 +104,7 @@ class PaquetComposeTest(unittest.TestCase):
         message_path = self.repo / ".git" / "MERGE_MSG"
         prepared = message_path.read_text(encoding="utf-8")
         self.assertIn("ameesh-work: 9", prepared)
-        self.assertIn("vehicule 0400 : #9", prepared)
+        self.assertIn("vehicule 0400 : #9 %s" % source[:12], prepared)
         # résolution : le commit reprend le message préparé, trailer compris
         self.write("base.txt", "résolu\n")
         self.git("add", "base.txt")
@@ -130,6 +131,84 @@ class PaquetComposeTest(unittest.TestCase):
 
     def test_source_introuvable_refusee(self) -> None:
         proc = self.compose("--lot", "3", "--source", "deadbeefdeadbeef")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("introuvable", proc.stderr)
+
+    # -- #2360/#2387 : unités de fusion et lots « #<lot> <tête> » -------------
+    def test_units_liste_chaque_unite_avec_sa_tete(self) -> None:
+        self.git("switch", "-q", "-c", "integration/paquet-banc")
+        sept = self.lot_file(7, "sept.txt", "sept\n")
+        huit = self.lot_file(8, "huit.txt", "huit\n")
+        self.git("switch", "-q", "integration/paquet-banc")
+        for lot, source in ((7, sept), (8, huit)):
+            proc = self.compose("--lot", str(lot), "--source", source)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        # une mise à jour depuis la cible, sans trailer, n'est pas une unité
+        self.git("switch", "-q", "main")
+        self.write("cible.txt", "cible\n")
+        self.commit("#99 cité en prose sur la cible")
+        self.git("switch", "-q", "integration/paquet-banc")
+        self.git("merge", "-q", "--no-ff", "-m", "mise à jour : #99 deadbeef0", "main")
+        # remise de #7 recomposée : même place, tête la plus récente
+        self.git("switch", "-q", "lot/7")
+        self.write("sept.txt", "sept bis\n")
+        remise = self.commit("#7 remise")
+        self.git("switch", "-q", "integration/paquet-banc")
+        proc = self.compose("--lot", "7", "--source", remise)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        proc = self.compose("--units", "--base", self.base)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = proc.stdout.strip()
+        # #7 recomposé : une seule unité (la plus récente) et un seul lot
+        self.assertEqual(line, "2 unités de fusion, 2 lots portés : #7 %s, #8 %s"
+                         % (remise[:12], huit[:12]))
+        unit = getattr(planned_waits, "_UNIT", None)
+        if unit is not None:  # forme reconnue par les porteurs (#2335)
+            self.assertEqual({int(m.group(1)) for m in unit.finditer(line)}, {7, 8})
+
+    def test_units_compte_les_lots_d_une_fusion_multi_lot(self) -> None:
+        self.git("switch", "-q", "-c", "integration/paquet-banc")
+        sept = self.lot_file(7, "sept.txt", "sept\n")
+        huit = self.lot_file(8, "huit.txt", "huit\n")
+        neuf = self.lot_file(9, "neuf.txt", "neuf\n")
+        self.git("switch", "-q", "integration/paquet-banc")
+        # une fusion porte deux lots : une unité, deux lots listés
+        proc = self.compose("--lot", "7", "--lot", "8", "--source", sept)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.compose("--lot", "9", "--source", neuf)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.compose("--units", "--base", self.base)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip(),
+            "2 unités de fusion, 3 lots portés : #7 %s, #8 %s, #9 %s"
+            % (sept[:12], sept[:12], neuf[:12]))
+
+        # #8 recomposé seul : l'unité multi-lot reste comptée pour #7
+        self.git("switch", "-q", "lot/8")
+        self.write("huit.txt", "huit bis\n")
+        remise = self.commit("#8 remise")
+        self.git("switch", "-q", "integration/paquet-banc")
+        proc = self.compose("--lot", "8", "--source", remise)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.compose("--units", "--base", self.base)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip(),
+            "3 unités de fusion, 3 lots portés : #7 %s, #8 %s, #9 %s"
+            % (sept[:12], remise[:12], neuf[:12]))
+
+    def test_units_sans_unite_ou_mal_appele(self) -> None:
+        proc = self.compose("--units", "--base", self.base)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("aucune unité", proc.stderr)
+        proc = self.compose("--units")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--base", proc.stderr)
+        proc = self.compose("--units", "--base", self.base, "--lot", "3")
+        self.assertEqual(proc.returncode, 2)
+        proc = self.compose("--units", "--base", "introuvable")
         self.assertEqual(proc.returncode, 2)
         self.assertIn("introuvable", proc.stderr)
 

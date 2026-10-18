@@ -52,10 +52,18 @@ class RereadMaxTest(unittest.TestCase):
 
 
 class MaintenanceTest(unittest.TestCase):
-    def test_rotation_on_the_turn_ceiling(self):
+    def test_rotation_on_the_context_ceiling(self):
+        self.assertEqual(resident_runner.maintenance(
+            context=15_000_000, window=200_000, reread=15_000_000,
+            session_reread=15_000_000, cap=15_000_000), resident_runner.ROTATE)
+
+    def test_the_turn_sum_alone_does_not_rotate_a_small_context(self):
+        """#2336 : la somme des relectures du tour n'est pas une taille de
+        contexte ; un petit contexte ne tourne pas parce que le tour a
+        beaucoup d'étapes."""
         self.assertEqual(resident_runner.maintenance(
             context=1_000, window=200_000, reread=15_000_000,
-            session_reread=15_000_000, cap=15_000_000), resident_runner.ROTATE)
+            session_reread=15_000_000, cap=15_000_000), "")
 
     def test_alert_on_the_session_cumulative_reread(self):
         self.assertEqual(resident_runner.maintenance(
@@ -65,12 +73,12 @@ class MaintenanceTest(unittest.TestCase):
 
     def test_rotation_wins_over_compaction(self):
         self.assertEqual(resident_runner.maintenance(
-            context=190_000, window=200_000, reread=15_000_000,
+            context=15_000_000, window=200_000, reread=15_000_000,
             session_reread=15_000_000, cap=15_000_000), resident_runner.ROTATE)
 
     def test_hard_ceiling_wins_over_the_cumulative_alert(self):
         self.assertEqual(resident_runner.maintenance(
-            context=190_000, window=200_000, reread=15_000_000,
+            context=15_000_000, window=200_000, reread=15_000_000,
             session_reread=50_000_000, cap=15_000_000, reread_max=50_000_000),
             resident_runner.ROTATE)
 
@@ -116,7 +124,7 @@ class MaintenanceTest(unittest.TestCase):
             since_compact=601, compact_retry_s=600), resident_runner.COMPACT)
         # a fresh request never masks a harder bound
         self.assertEqual(resident_runner.maintenance(
-            context=100_000, window=200_000, reread=15_000_000,
+            context=15_000_000, window=200_000, reread=15_000_000,
             session_reread=15_000_000, cap=15_000_000,
             since_compact=10, compact_retry_s=600), resident_runner.ROTATE)
 
@@ -151,7 +159,15 @@ class ResidentMeasurementTest(unittest.TestCase):
         self.assertEqual(rp.maintenance_due(), resident_runner.COMPACT)
         rp.record_turn(_result(input_tokens=15_000_000, context_tokens=150_000,
                                context_window=200_000))
-        self.assertEqual(rp.maintenance_due(cap=15_000_000), resident_runner.ROTATE)
+        self.assertEqual(rp.maintenance_due(cap=150_000), resident_runner.ROTATE)
+
+    def test_the_turn_sum_does_not_rotate_a_small_context(self):
+        """#2336 : un tour qui a relu 15 M en plusieurs appels, dans une
+        session de 1 000 jetons, ne franchit pas le plafond de 15 M."""
+        rp = self._process()
+        rp.record_turn(_result(input_tokens=15_000_000, context_tokens=1_000,
+                               context_window=200_000))
+        self.assertEqual(rp.maintenance_due(cap=15_000_000), "")
 
     def test_maintenance_due_reads_the_cumulative_reread(self):
         rp = self._process()

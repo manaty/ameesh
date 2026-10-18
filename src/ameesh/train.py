@@ -199,6 +199,21 @@ class Engine:
             if not isinstance(merged["transports"], list) or not merged["transports"]:
                 raise TrainError("nonempty structured composition transports required")
             plan["transports"] = copy.deepcopy(merged["transports"])
+        if "migrations" in merged:
+            # #2400: the persisted mapping is what makes a reconstruction use
+            # the same numbers instead of allocating again.
+            entries = merged["migrations"]
+            if not isinstance(entries, list) or not entries:
+                raise TrainError("nonempty structured composition migrations required")
+            known = {r["work_item_id"] for r in members}
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("work_item_id") not in known:
+                    raise TrainError("composition migration mapping names an unknown member")
+                if not all(isinstance(entry.get(field), int)
+                           for field in ("reserved", "landed")):
+                    raise TrainError("composition migration mapping needs reserved and "
+                                     "landed numbers")
+            plan["migrations"] = copy.deepcopy(entries)
         state["plan"] = plan
         state["phase"] = "publishing"
         state["attempts"].append(dict(id=token, head=plan["head"], tree=plan["tree"],

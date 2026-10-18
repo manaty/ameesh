@@ -44,6 +44,7 @@ class BriefsTest(unittest.TestCase):
         self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
         self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        self.assertIn("ameesh work landing 42 --vehicle", text)
         self.assertIn('ameesh work note 42 "hold: <reason>"', text)
         # #2016 : la réassignation proposée porte le titulaire lu (instantané) ;
         # un second agent parti du même brief sera refusé si le lot a changé de
@@ -91,6 +92,7 @@ class BriefsTest(unittest.TestCase):
                                    auditor_names=["auditeur"])["orch"]
         self.assertIn("candidate for its merge packet/queue", text)
         self.assertIn("do not nudge its assignee or reassign it", text)
+        self.assertIn("ameesh work landing 42 --vehicle", text)
         self.assertNotIn("ameesh mail send dev1", text)
         self.assertNotIn("ameesh work assign 42", text)
         self.assertIn("ameesh work merged 42 --sha", text)

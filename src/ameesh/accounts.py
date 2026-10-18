@@ -121,10 +121,12 @@ Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
 de compte qui précède chaque tour ; Codex : les journaux de session du
 `CODEX_HOME` du compte. Une fenêtre dont `resets_at` est passé compte pour
 0 % (`Gauge.used_at`, L71) ; une fois **toutes** les fenêtres datées remises à
-zéro, le relevé redevient courant (0 %) et le compte replaçable. Un relevé
-seulement **partiel** ne place plus de session quand il est plus vieux que
-toute fenêtre encore ouverte (#1672, « Fraîcheur du relevé ») ; en deçà, il
-reste plaçable après les relevés courants.
+zéro — et aucune fenêtre non datée encore ouverte, qui ne prouve pas sa remise
+à zéro (#1566 N2) — le relevé redevient courant (0 %) et le compte replaçable.
+Un relevé seulement **partiel** ne place plus de session quand il est plus
+vieux que toute fenêtre encore ouverte (#1672, « Fraîcheur du relevé ») ; en
+deçà, s'il reste **informateur** (`_informative_partial`, #1566 N1), il
+concourt avec les relevés courants et peut passer devant eux.
 
 Chaque choix porte sa raison (`Choice.why`, « no reading: unverified, le plus
 en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
@@ -1586,8 +1588,8 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
     Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
     un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
     laisser un forfait inutilisé. Un relevé dont **toutes** les fenêtres
-    datées sont remises à zéro est courant (L71, 0 %) : le compte est
-    replaçable.
+    datées sont remises à zéro — et aucune fenêtre non datée encore ouverte
+    (#1566 N2) — est courant (L71, 0 %) : le compte est replaçable.
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
@@ -2223,6 +2225,13 @@ def report(cfg, db, book, *, now: float | None = None,
                     # effectif de la fenêtre et sa raison ; #1561 : `read_at`
                     # date le relevé, `stale` (posé par `_forecast`) dit qu'il
                     # n'est plus un instantané courant.
+                    # #1702 (N3) : un relevé repris de l'historique partagé
+                    # (`from_history`) expose son âge, pour qu'un hôte sans
+                    # lecture locale n'affiche pas une mesure ancienne comme
+                    # un instantané du jour. #1272 : la provenance voyage avec
+                    # la jauge jusqu'à l'affichage — `produced_at` None =
+                    # relevé non daté (rejeu du harnais ou flux sans marqueur),
+                    # jamais présenté comme une mesure fraîche.
                     {"key": g.key, "used": g.used_at(now), "last_used": g.used,
                      "cap": (result.limits.get(g.key)
                              or (g.pace_cap(now, result.profile.pace_multiplier,
@@ -2233,7 +2242,12 @@ def report(cfg, db, book, *, now: float | None = None,
                                         or Ceiling(result.profile.pace_ceiling)).reason,
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
                      "reset_passed": g.reset_passed(now),
-                     "read_at": getattr(g, "read_at", None)}
+                     "read_at": getattr(g, "read_at", None),
+                     "from_history": bool(getattr(g, "from_history", False)),
+                     "read_age_s": (now - float(g.read_at)
+                                    if getattr(g, "read_at", None) is not None else None),
+                     "produced_at": getattr(g, "produced_at", None),
+                     "source": getattr(g, "source", "")}
                     for g in result.gauges
                 ],
                 "_gauges": list(result.gauges),
@@ -2291,6 +2305,26 @@ def _forecast(rows: list[dict], items: list[Profile], now: float,
                           else reason_of(ranked, evaluations, now))
 
 
+def _mention_non_datee(row: dict, gauge: dict) -> str:
+    """#1272 : une jauge Claude sans instant de production se dit NON DATÉE.
+
+    La provenance d'un relevé Claude est l'instant de production publié par le
+    marqueur du tour (#1132). Sans lui — rejeu seul du harnais, ou flux sans
+    marqueur — l'affichage ne peut pas la présenter comme une mesure fraîche :
+    la valeur reste lisible, mais porte « non daté : provenance inconnue ».
+    La mention ne conclut pas « périmé » : aucune preuve de péremption n'est
+    inventée (ni âge maximal, ni mtime, ni plafond). Codex ne publie pas
+    d'instant de production ; ses jauges ne portent pas la mention. Le widget
+    omarchy (#1580) non plus, mais il date lui-même son relevé (`updatedAt`,
+    fraîcheur vérifiée par `widget_usage.read`) : ses jauges ne la portent pas.
+    """
+    from . import widget_usage
+    if row.get("harness") != "claude" or gauge.get("produced_at") is not None \
+            or gauge.get("source") == widget_usage.SOURCE:
+        return ""
+    return " [non daté : provenance inconnue]"
+
+
 def format_rows(rows: list[dict]) -> str:
     """Le tableau des comptes (texte)."""
     if not rows:
@@ -2300,13 +2334,18 @@ def format_rows(rows: list[dict]) -> str:
         actif = ("forced" if row["forced"] else "yes") if row["active"] else ""
         etat = "ok" if row["ok"] else "limit" if not row["problems"] else "invalid"
         gauges = ", ".join(
-            "%s %.0f%% (pace %.0f%%%s%s)" % (
+            "%s %.0f%% (pace %.0f%%%s%s%s)%s" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
                 # #1176 : le plafond effectif et sa raison, quand il est relevé
                 ", ceiling %.0f%%, %s" % (g["pace_ceiling"] * 100, g["ceiling_reason"])
                 if g.get("ceiling_reason") else "",
                 ", reset passed, last reading %.0f%%"
-                % (g.get("last_used", g["used"]) * 100) if g.get("reset_passed") else "")
+                % (g.get("last_used", g["used"]) * 100) if g.get("reset_passed") else "",
+                # #1702 (N3) : un relevé repris de l'historique partagé dit son
+                # âge — sans lecture locale, la valeur n'est pas un instantané.
+                ", read %s ago" % duration(g["read_age_s"])
+                if g.get("from_history") and g.get("read_age_s") is not None else "",
+                _mention_non_datee(row, g))
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
             row["harness"], row["account"], actif, etat, gauges))
