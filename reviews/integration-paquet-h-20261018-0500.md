@@ -87,3 +87,23 @@ Complément (03:07Z) : après la composition, l'auteur de #2340 a refreezé `18c
 - Le check requis `tests` doit être `success` avec des tests réellement exécutés (pas `skipped`/absent, #2271).
 - `main` est réservée pendant la CI (§12) : aucune autre fusion n'y entre. Si `main` bouge sans conflit, la branche est remise à jour, le manifeste réécrit et la tête gelée de nouveau ; l'ancien run est annulé, une seule suite effective sur la tête finale.
 - Fusion dès le vert par le composeur (`ameesh work merge-pr` sur la tête gelée, auto-merge GitHub désarmé), puis rattachement des unités au merge réel et clôture. Aucune opération hôte ici.
+
+## Adaptations de test après la CI rouge (03:21Z)
+
+La suite `39092863502` a rougi sur trois attentes/classements de test, hors du
+contenu fonctionnel des unités. Adaptations de test seules, aucun avis requis
+(§11 bis), même régime que l'adaptation `01435d13a4` :
+
+- `tests/test_cluster.py` : `work_landings` (migration 0453, #1945) n'était
+  classée ni accordée ni exclue ; elle reste fermée aux deux rôles
+  superviseur (état interne lu par `planned_waits`, sans contenu ni secret),
+  aucun GRANT modifié. Même classement que `review_catch_up` (#1448).
+- `tests/test_1467_train_policy.py` : #2338 attendait deux avis pour
+  `queue/**` ; la porte ne lit que le **chemin changé** (#2218, `bc130ae3`) et
+  la concurrence n'est pas un domaine à deux familles (SQL, sécurité, prod) :
+  `queue/**` reste sensible à un avis, `deploy/**` porte le plancher à deux.
+- `tests/test_l161f_plan.py` : `test_2340_auditeur_role`, ajouté à
+  `tests/parts/toujours.txt` par #2340, entre dans la liste attendue du plan.
+
+La composition des 14 unités, leurs têtes et leurs verdicts ne changent pas ;
+la tête de la branche après ce commit est celle de l'unique suite complète.

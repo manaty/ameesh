@@ -66,11 +66,13 @@ class VersionedPolicyTest(unittest.TestCase):
         return (provider or self.provider())(self.item, self.row, self.base, self.repo)
 
     def test_light_and_one_or_two_reviews_are_bound_to_exact_subject_and_policy(self):
-        # queue/** and deploy/** are critical (concurrency/production): the
-        # merge gate already demands two families there, so a one-review rule
-        # is floored to two. ui/** stays a non-critical one-review case.
+        # deploy/** is critical (production): the merge gate demands two
+        # families on the changed path, so a one-review rule is floored to
+        # two. queue/** is sensitive (concurrency) but not one of the critical
+        # domains (SQL, security, prod): its one-review rule stays one. ui/**
+        # stays a non-critical one-review case.
         for path, risk, count in (("docs/readme.md", "light", 0), ("ui/page.py", "sensitive", 1),
-                                  ("queue/lock.py", "sensitive", 2), ("private/keys.py", "sensitive", 2)):
+                                  ("queue/lock.py", "sensitive", 1), ("private/keys.py", "sensitive", 2)):
             # Each subsequent diff contains the preceding changes as well.
             result = self.qualify(path)
             self.assertEqual((result.risk, result.reviews), (risk, count))
