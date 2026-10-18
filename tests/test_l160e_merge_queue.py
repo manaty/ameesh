@@ -380,6 +380,42 @@ class EntryTest(_Base):
                                       ci=lambda branch: status, clone=clone)
                 self.assertEqual(self.fake.queue_rows, {})
 
+    def test_a_target_deleted_on_origin_is_refused_at_admission(self):
+        # #2278 : le premier passage garde la cible sous QUEUE_REF dans le
+        # clone ; quand origin ne la porte plus, `_class_of` la relit là et
+        # admet un lot light, que `run_pass` diffère ensuite à chaque passage
+        # (« target not found »). L'admission doit refuser, avec la cible nommée.
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        self.ready(1)
+        status = {"number": 7, "green": True, "head": self.tip(1)}
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=lambda branch: status,
+                          clone=clone)
+        self.fake.queue_rows.clear()
+        _git(self.repo, "checkout", "-q", "lot/1-a")
+        _git(self.repo, "branch", "-q", "-D", "main")
+        with self.assertRaisesRegex(merge_queue.QueueError,
+                                    "target main not found on origin"):
+            merge_queue.enter(None, 1, repo=agents, actor="orch",
+                              ci=lambda branch: status, clone=clone)
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_target_missing_without_origin_is_refused_too(self):
+        # Le repli hors admission (pas d'origin : les branches locales sont la
+        # seule copie) refuse la cible absente de la même façon (#2278).
+        self.fake.lots[1]["branch_target"] = "main"
+        self.ready(1)
+        _git(self.repo, "checkout", "-q", "lot/1-a")
+        _git(self.repo, "branch", "-q", "-D", "main")
+        with self.assertRaisesRegex(merge_queue.QueueError,
+                                    "target main not found on the repository"):
+            self.enter(1)
+
+    def test_no_target_is_refused(self):
+        with self.assertRaisesRegex(merge_queue.QueueError, "no target branch known"):
+            merge_queue.target_tip(self.repo, "", None)
+
     def test_merged_lot_is_refused(self):
         self.ready(1)
         self.fake.lots[1]["state"] = "merged"
@@ -529,8 +565,9 @@ class TargetResolutionTest(_Base):
 
     def setUp(self):
         super().setUp()
-        # la porte des avis lit le delta depuis la cible effective ; une
-        # cible déclarée doit exister dans le dépôt (#1515 B2)
+        # la porte des avis lit le delta depuis la cible effective (#1515 B2) ;
+        # la cible d'admission existe pour de vrai (#2278), et `-f` rend le
+        # montage idempotent quel que soit l'ordre des deux corrections.
         _git(self.repo, "branch", "-f", "develop", "main")
 
     def project(self):
