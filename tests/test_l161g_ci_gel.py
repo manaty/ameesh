@@ -8,7 +8,7 @@ fois, sur la tête gelée. Le déclencheur retenu est l'étiquette
 `types: [labeled]`) : un `workflow_dispatch` ne satisfait pas un check requis
 de PR. Ces témoins tiennent la décision seule (`ci.gel_plan`, `ci.cancel_plan`,
 la pose de `ci.cmd_ci_run`), sans réseau ni base : le faux `api` rend les cinq
-lectures GitHub (tête de branche, exécutions, PR, contenu du workflow, check
+lectures GitHub (têtes de branches, exécutions, PR, contenu du workflow, check
 requis), les jalons et le journal du lot sont posés à la main, et la
 transaction du faux `db` prend un verrou — deux `ci run` concurrents se
 sérialisent comme sur la ligne `work_items`.
@@ -70,7 +70,7 @@ PR = 1047
 LABEL = "ci-lot-%s" % GEL
 LABEL_FULL = "ci-full-%s" % GEL
 WORKFLOW = ("name: tests\n# #1343\non:\n  pull_request:\n    types: [labeled]\n"
-            "# ci-(lot|full)-<sha>\n")
+            "# ci-(lot|full)-<sha>\n# github.event.label.description\n")
 
 
 def lot(**extra) -> dict:
@@ -188,9 +188,10 @@ class FakeDb:
 class Github:
     """Les lectures GitHub de `gel_plan`/`cancel_plan`/`cmd_ci_run`, sans réseau."""
 
-    def __init__(self, *, head: str = GEL, runs=(), workflow: str | None = WORKFLOW,
+    def __init__(self, *, head: str = GEL, base=BASE, runs=(), workflow: str | None = WORKFLOW,
                  pulls=None, checks=None):
         self.head = head
+        self.base = base
         self.runs = list(runs)
         self.workflow = workflow
         self.pulls = [pull()] if pulls is None else pulls
@@ -211,7 +212,9 @@ class Github:
     def __call__(self, path: str) -> dict:
         self.paths.append(path)
         if path.startswith("repos/%s/branches/" % DEPOT):
-            return {"commit": {"sha": self.head}}
+            if unquote(path.split("/branches/", 1)[1]) == BRANCHE:
+                return {"commit": {"sha": self.head}}
+            return {"commit": {"sha": self.base() if callable(self.base) else self.base}}
         if "/actions/workflows/tests.yml/runs?" in path:
             runs = self.rows()
             found = re.search(r"[?&]head_sha=([0-9a-f]{40})", path)
@@ -253,7 +256,9 @@ class Gh:
         self.actor = actor
         self.refuse = tuple(refuse)
         self.repo_labels: set[str] = set(repo_labels)
+        self.descriptions = {name: "old description" for name in repo_labels}
         self.posed: list[str] = []
+        self.posed_bases: list[str] = []
         self.removed: list[str] = []
 
     def run(self, argv: list[str], stdin: str | None = None) -> tuple[int, str, str]:
@@ -268,21 +273,27 @@ class Gh:
         if argv[:3] == ["api", "-X", "POST"] and "/issues/%d/labels" % PR in argv[3]:
             names = json.loads(stdin or "{}").get("labels") or []
             self.posed += names
+            self.posed_bases += [self.descriptions[name] for name in names]
             self.repo_labels.update(names)
             return 0, "", ""
         if argv[:3] == ["api", "-X", "DELETE"] and "/issues/%d/labels/" % PR in argv[3]:
             self.removed.append(argv[3].rsplit("/", 1)[-1])
             return 0, "", ""
         if argv[:3] == ["api", "-X", "POST"] and argv[3] == "repos/%s/labels" % DEPOT:
-            name = json.loads(stdin or "{}").get("name") or ""
+            data = json.loads(stdin or "{}")
+            name = data.get("name") or ""
             self.repo_labels.add(name)
+            self.descriptions[name] = data.get("description") or ""
+            return 0, "", ""
+        if argv[:3] == ["api", "-X", "PATCH"] and argv[3].startswith("repos/%s/labels/" % DEPOT):
+            self.descriptions[unquote(argv[3].rsplit("/", 1)[-1])] = json.loads(stdin)["description"]
             return 0, "", ""
         if argv[:3] == ["api", "-X", "DELETE"] and argv[3].startswith("repos/%s/labels/" % DEPOT):
             self.repo_labels.discard(argv[3].rsplit("/", 1)[-1])
             return 0, "", ""
-        if argv[:2] == ["api", "repos/%s/labels/" % DEPOT]:
+        if argv[0] == "api" and argv[1].startswith("repos/%s/labels/" % DEPOT):
             # lecture d'existence : 0 si l'étiquette du dépôt existe déjà
-            return (0 if argv[2].rsplit("/", 1)[-1] in self.repo_labels else 1), "", ""
+            return (0 if unquote(argv[1].rsplit("/", 1)[-1]) in self.repo_labels else 1), "", ""
         return 0, "", ""
 
     def annulations(self) -> list[list[str]]:
@@ -400,10 +411,24 @@ class GelPlanTest(GelTestCase):
 
     def test_une_base_illisible_est_refusee(self):
         self.gele()
-        api = Github(pulls=[pull(base="pas-un-sha")])
+        api = Github(base="pas-un-sha")
         with self.assertRaises(ci.GelError) as caught:
             self.gel(api)
-        self.assertIn("unusable base commit", str(caught.exception))
+        self.assertIn("branch main not found", str(caught.exception))
+        self.assertEqual(api.ecrit(), [])
+
+    def test_la_pointe_cible_remplace_le_payload_perime(self):
+        self.gele()
+        api = Github(base=AUTRE, runs=[label_run(base=BASE)])
+        decision = self.gel(api)
+        self.assertEqual((decision["action"], decision["base"]), ("request", AUTRE))
+        self.assertIn("repos/%s/branches/main" % DEPOT, api.paths)
+
+    def test_la_cible_absente_est_refusee_sans_repli_sur_base_sha(self):
+        self.gele()
+        api = Github(pulls=[pull(base_ref="")])
+        with self.assertRaisesRegex(ci.GelError, "missing target branch"):
+            self.gel(api)
         self.assertEqual(api.ecrit(), [])
 
     def test_une_source_release_refuse_le_lot_et_impose_full(self):
@@ -635,6 +660,13 @@ class GelPlanTest(GelTestCase):
         with self.assertRaises(ci.GelError) as caught:
             self.gel(api)
         self.assertIn("does not carry the freeze request trigger", str(caught.exception))
+
+    def test_un_workflow_qui_lit_encore_la_base_perimee_est_refuse(self):
+        self.gele()
+        api = Github(workflow=WORKFLOW.replace("github.event.label.description",
+                                             "github.event.pull_request.base.sha"))
+        with self.assertRaisesRegex(ci.GelError, "pinned target base"):
+            self.gel(api)
 
     def test_une_exception_sans_gel_ni_avis_mais_marquee(self):
         api = Github(head=TETE, pulls=[pull(head=TETE)])
@@ -938,7 +970,24 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(gh.removed, [LABEL])
         self.assertEqual(gh.poses(), [LABEL])
+        self.assertEqual(gh.posed_bases, [BASE])
         self.assertIn(LABEL, gh.repo_labels, "l'étiquette du dépôt n'est pas supprimée")
+
+    def test_la_base_actuelle_est_transmise_malgre_le_payload_perime(self):
+        self.gele()
+        gh = Gh()
+        code, notes = self.run_cmd(Github(base=AUTRE), gh)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.posed_bases, [AUTRE])
+        self.assertIn("base %s" % AUTRE, self.marques("applied")[0])
+
+    def test_un_refus_d_actualisation_de_base_ne_pose_pas_l_etiquette(self):
+        self.gele()
+        gh = Gh(repo_labels={LABEL}, refuse=("PATCH repos/%s/labels/" % DEPOT,))
+        code, notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertIn("cannot update the label", notes[-1])
 
     def test_les_etiquettes_perimees_sont_retirees_et_supprimees(self):
         self.gele()
@@ -966,6 +1015,7 @@ class RequestTest(GelTestCase):
         self.assertEqual(gh.repo_labels, set())
         self.run_cmd(Github(), gh)
         self.assertEqual(gh.repo_labels, {LABEL})
+        self.assertEqual(gh.posed_bases, [BASE])
 
     def test_une_demande_deja_reservee_recule(self):
         # P2 R1 : la marque fraîche d'un autre fait reculer le second dès la
@@ -1017,7 +1067,8 @@ class RequestTest(GelTestCase):
 
     def test_la_base_bougee_sous_le_verrou_recule(self):
         self.gele()
-        api = Github(pulls=[pull(), pull(base=AUTRE)])
+        bases = iter((BASE, AUTRE))
+        api = Github(base=lambda: next(bases))
         gh = Gh()
         code, notes = self.run_cmd(api, gh)
         self.assertEqual(code, 1)

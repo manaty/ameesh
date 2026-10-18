@@ -1920,13 +1920,14 @@ def quota_line(state_dir, *, now=None) -> str | None:
 #     + contrat) ou `ci-full-<S>` (suite complète), posée par la commande sur
 #     la PR (`pull_request` `types: [labeled]`). Le job `plan` compare
 #     exactement ce SHA à `pull_request.head.sha`, vérifie que le checkout est
-#     le merge-ref composé de la base du payload et de cette tête (ses deux
-#     parents), et sélectionne contre la base du payload ;
+#     le merge-ref composé de la pointe cible figée dans la description de
+#     l'étiquette et de cette tête (ses deux parents), puis sélectionne contre
+#     cette base (#2328 : `pull_request.base.sha` peut être périmé) ;
 #   * le jeton `gh` doit produire l'événement `pull_request: labeled` : un
 #     `GITHUB_TOKEN` d'Actions (acteur `github-actions[bot]`) ne déclenche
 #     aucun workflow et est refusé ;
 #   * idempotence bornée au parcours PR et à la composition courante (numéro
-#     de PR, tête gelée S, base du payload, mode) : un vert ou un run en vol de
+#     de PR, tête gelée S, pointe cible demandée, mode) : un vert ou un run en vol de
 #     cette composition rend la main sans rien toucher ; un push vert de la
 #     même tête ne remplace pas le check de la PR, pas plus qu'un ancien
 #     dispatch ; une base qui a bougé demande une nouvelle demande ;
@@ -1975,7 +1976,7 @@ MAX_AVIS = 2
 RESERVE_TTL_S = 15 * 60
 #: l'étiquette qui demande la CI d'un gel : mode et SHA complet (#1343)
 LABEL_RE = re.compile(r"^ci-(?P<mode>lot|full)-(?P<sha>[0-9a-f]{40})$")
-#: le titre du run (run-name de tests.yml) : PR, étiquette, base du payload
+#: le titre du run (run-name de tests.yml) : PR, étiquette, pointe cible demandée
 PR_RUN_RE = re.compile(
     r"\[PR #(?P<number>\d+) (?P<label>ci-(?:lot|full)-[0-9a-f]{40}) "
     r"base (?P<base>[0-9a-f]{40})\]")
@@ -2161,7 +2162,7 @@ def _current_run(row: dict, frozen: str, number: int, base: str) -> bool:
 
 
 def _pr_of(api, repo: str, branch: str) -> dict:
-    """La PR ouverte de la branche : numéro, tête, base, refs, étiquettes."""
+    """La PR ouverte : numéro, tête, pointe cible actuelle, refs, étiquettes."""
     owner = repo.split("/", 1)[0]
     rows = api("repos/%s/pulls?state=open&head=%s:%s&per_page=10"
                % (repo, _q(owner), _q(branch)))
@@ -2174,13 +2175,20 @@ def _pr_of(api, repo: str, branch: str) -> dict:
         raise GelError("branch %s has %d open pull requests in %s: one only"
                        % (branch, len(rows), repo))
     pr = rows[0]
+    base_ref = ((pr.get("base") or {}).get("ref") or "").strip()
+    if not base_ref:
+        raise GelError("pull request #%s: missing target branch, the composition "
+                       "cannot be checked" % pr.get("number"))
+    # #2328 : pulls.base.sha peut encore nommer la base du dernier push de
+    # tête, alors que le merge-ref utilise déjà la nouvelle pointe cible.
+    base = _head_of(api, repo, base_ref)
     labels = [(lab.get("name") if isinstance(lab, dict) else str(lab))
               for lab in pr.get("labels") or ()]
     return {"number": int(pr.get("number") or 0),
             "head": ((pr.get("head") or {}).get("sha") or "").strip().lower(),
-            "base": ((pr.get("base") or {}).get("sha") or "").strip().lower(),
+            "base": base,
             "head_ref": ((pr.get("head") or {}).get("ref") or ""),
-            "base_ref": ((pr.get("base") or {}).get("ref") or ""),
+            "base_ref": base_ref,
             "labels": [name for name in labels if name]}
 
 
@@ -2201,7 +2209,8 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
         text = base64.b64decode(content).decode("utf-8", "replace")
     except (ValueError, TypeError):
         return False
-    return "types: [labeled]" in text and "ci-(lot|full)-" in text
+    return ("types: [labeled]" in text and "ci-(lot|full)-" in text
+            and "github.event.label.description" in text)
 
 
 def _short_run(row: dict) -> dict:
@@ -2482,7 +2491,8 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                            "nothing posed" % held["token"]}
     if not _carries_freeze_request(api, name, frozen_sha):
         raise GelError("the workflow at %s does not carry the freeze request trigger "
-                       "(#1343, ci-lot/ci-full label): rebase the lot on main before "
+                       "with a pinned target base (#1343/#2328, ci-lot/ci-full label): "
+                       "rebase the lot on main before "
                        "requesting the CI" % frozen_sha[:12])
     return {**decision, "action": "request",
             "why": ("%s verdict(s) on %s" % (len(reviews), frozen_sha[:12])
@@ -2565,18 +2575,25 @@ def _label_exists(gh, repo: str, name: str) -> bool:
     return code == 0
 
 
-def _ensure_label(gh, repo: str, name: str, mode: str, sha: str) -> None:
-    """Crée l'étiquette du dépôt si elle manque (une par demande, #1343)."""
-    if _label_exists(gh, repo, name):
-        return
-    payload = json.dumps({"name": name,
-                          "color": "0e8a16" if mode == "lot" else "1d76db",
-                          "description": "CI #1343 %s sur %s" % (mode, sha[:12])})
-    code, out, err = gh.run(["api", "-X", "POST", "repos/%s/labels" % repo,
-                             "--input", "-"], payload)
+def _ensure_label(gh, repo: str, name: str, mode: str, base: str) -> None:
+    """Fige la pointe cible dans la description avant l'événement labeled.
+
+    L'événement conserve cette description : le titre du run, le plan et les
+    parents du merge-ref portent ainsi la même base, même si pulls.base.sha
+    est périmé. Une reprise actualise aussi une étiquette existante (#2328).
+    """
+    exists = _label_exists(gh, repo, name)
+    payload = {"description": base}
+    path = "repos/%s/labels" % repo
+    if exists:
+        path += "/%s" % _q(name)
+    else:
+        payload.update({"name": name, "color": "0e8a16" if mode == "lot" else "1d76db"})
+    code, out, err = gh.run(["api", "-X", "PATCH" if exists else "POST", path,
+                             "--input", "-"], json.dumps(payload))
     if code != 0:
-        raise GelError("cannot create the label %s in %s: %s"
-                       % (name, repo, _gh_error(out, err)))
+        raise GelError("cannot %s the label %s in %s: %s"
+                       % ("update" if exists else "create", name, repo, _gh_error(out, err)))
 
 
 def _drop_label(gh, repo: str, number: int, name: str, *, delete_label: bool) -> list[str]:
@@ -2594,7 +2611,7 @@ def _drop_label(gh, repo: str, number: int, name: str, *, delete_label: bool) ->
     return failed
 
 
-def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> dict:
+def _pose_request(gh, repo: str, pr: dict, label: str, mode: str) -> dict:
     """Retire les étiquettes de demande périmées de la PR, puis pose la nôtre.
 
     Rend `{ok, dropped, failed, error}` ; ne lève pas : un refus est dit. Une
@@ -2616,7 +2633,7 @@ def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> d
             return {"ok": False, "dropped": dropped, "failed": failed,
                     "error": "cannot remove the label %s before posing it again" % label}
     try:
-        _ensure_label(gh, repo, label, mode, sha)
+        _ensure_label(gh, repo, label, mode, pr["base"])
     except GelError as exc:
         return {"ok": False, "dropped": dropped, "failed": failed, "error": str(exc)}
     code, out, err = gh.run(["api", "-X", "POST",
@@ -2789,7 +2806,7 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                    "run `ameesh ci run %d` again" % (base[:12], pr["base"][:12], item_id))
             note("released", why)
             return {"requested": False, "action": "refuse", "why": why}
-        posed = _pose_request(gh, decision["repo"], pr, label, mode, sha)
+        posed = _pose_request(gh, decision["repo"], pr, label, mode)
         if not posed["ok"]:
             note("released", posed["error"])
             return {"requested": False, "action": "refuse", "why": posed["error"]}
