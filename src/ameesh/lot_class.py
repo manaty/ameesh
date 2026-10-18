@@ -121,6 +121,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
     celui-ci : il est ignoré, pas compté comme un doute.
     """
     worst, why, files, ref = LIGHT, "", [], ""
+    critical_paths = set()
+    files_by_path = {}
     covered = False
     for canon in canons or ():
         root = str(getattr(canon, "root", "") or "")
@@ -143,13 +145,28 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
                     "doubt": True, "why": "cannot classify the change: %s" % exc}
         if not ref:
             ref = _ref(canon)
-        if RANK[result["class"]] > RANK[worst]:
+        critical_paths.update(entry["path"] for entry in result["files"]
+                              if entry.get("critical") is True)
+        for entry in result["files"]:
+            previous = files_by_path.get(entry["path"])
+            if previous is None or RANK[entry["class"]] > RANK[previous["class"]]:
+                files_by_path[entry["path"]] = entry
+        # #2374 : un diff entièrement léger garde ses chemins. Sans eux, la
+        # porte des avis (et l'ouverture de la relecture après fusion) ne peut
+        # pas constater un chemin critique que le canon a classé `light`.
+        if not files or RANK[result["class"]] > RANK[worst]:
             worst, files = result["class"], result["files"]
             why = "policy of %s" % (root or "canon")
     if not covered:
         return {"class": SENSITIVE, "files": [], "policy_ref": "", "doubt": True,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
+    # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
+    # léger) doit lire la classe la plus haute de chaque fichier, tous canons.
+    files = [files_by_path[entry["path"]] for entry in files]
+    for entry in files:
+        if entry["path"] in critical_paths:
+            entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
             "doubt": False}
 

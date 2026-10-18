@@ -75,6 +75,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   un lot faute d'autre preneur, la note d'attribution porte la trace du repli
   (#1739) ; en prise locale (#804, `agents` fourni, même vide), aucun repli :
   son orchestrateur reste exclu (L804).
+* En-cours : un agent ne détient pas plus de 2 lots en `build`, tous projets
+  confondus (canon §4). La prise refuse le troisième, `ameesh work wip
+  --apply` rend le surplus à la file (le lot garde sa branche), et une
+  exception pilote est explicite : `ameesh work assign <id> <agent>
+  --wip-exception "raison"`.
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
@@ -404,15 +409,22 @@ La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
 Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
 de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
 Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
-pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
-n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+pas. Depuis #1400, la branche enregistrée du lot est reconnue dans un vrai
+commit de fusion (forme GitHub `Merge pull request #N from
+<propriétaire>/<branche>` comprise ; le propriétaire doit être celui du
+dépôt canonique, la branche homonyme d'un fork ne prouve rien), et le
+constat — lot, projet, titre et sujet du commit — est affiché avant toute
+écriture ; aucun `--force`. Un refus affiche le projet et le titre du lot ;
+aucun état ni jalon n'est écrit. Le SHA abrégé accepté est conservé sous sa
+forme complète.
 Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
 dossier courant. La lecture reste locale : récupérer la cible au préalable
 si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
-<id>`. Un lot passé `promoted` par erreur : `ameesh work move <id> merged
+<id> | --done` (`--done` : lot livré sans fusion, sans branche). Un lot passé
+`promoted` par erreur : `ameesh work move <id> merged
 --correct "raison"` (humains, orchestrateurs et agents de conception
 seulement ; tracé au journal).
 
@@ -445,12 +457,27 @@ l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
 
+Le feu choisit cette voie d'après la **déclaration du projet**, jamais
+d'après la configuration locale de l'hôte qui a pris le bail `fire:<lot>`
+(#2256) : `land: local` ou `pr` entre en file ; une file partagée connue
+prime sur une déclaration locale `off`. La fusion directe exige `land: off`
+explicite et l'absence vérifiée de file partagée. Un hôte qui ne déclare pas
+le mode d'atterrissage s'abstient (`no-land`) s'il ne trouve pas non plus de
+ligne de file pour ce dépôt ; il ne fusionne jamais en direct par défaut.
+Une auto-fusion GitHub résiduelle est désarmée avant l'abstention ou l'entrée
+en file. Le bail est rendu, et un hôte qui connaît le projet agit au passage
+suivant.
+
 ## Intégration par paquets §12 : contrôle d'inclusion avant le feu
 
-Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
-lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
-et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
-à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+**Chaque heure**, le pilote compose un petit paquet avec les lots prêts, sans
+conflit et aux verdicts complets, sur la tête de la cible (canon
+`processus/lots.md` §§11 bis et 12) ; un nouveau paquet attend le précédent.
+Aux coupures de 11:00 et 23:00, la release prend la tête de la cible (ou le
+dernier commit vert), taguée et déployée en staging : elle ne compose plus de
+paquet. Avant la CI complète et le feu, le contrôle d'inclusion confronte la
+liste des lots admis ou routés au paquet aux lignes du manifeste **et** au
+contenu réel de l'arbre :
 
 ```sh
 scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
@@ -473,6 +500,9 @@ la remise du lot diffère du gel enregistré (#2157). `scripts/paquet-compose.py
 compose l'unité et écrit ce message, y compris sur conflit (`.git/MERGE_MSG`
 prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé n'est
 réécrit pour ce seul métadonné.
+Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
+ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
+un `#N` seul n'y déclare aucune unité (#2335).
 
 ## Le lot en cours
 
@@ -685,9 +715,9 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI and no CI per lot between cuts, sober proofs
-   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
-   reviewed commit.
+   hourly packages, review before CI and no CI per lot between packages, sober
+   proofs (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only
+   through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
    exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
    Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance
@@ -741,7 +771,21 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire
-   (`tests/test_l122_numeros_de_migration.py`, sans base).
+   (`tests/test_l122_numeros_de_migration.py`, sans base). À la composition
+   d'un paquet par le train (#2400), une migration ajoutée par un lot est
+   renumérotée au maximum de la cible + 1, jamais une migration historique :
+   le lot qui en modifie une est écarté avec un motif. Les fichiers compagnons
+   du même préfixe (rollback, test, banc) sont renommés avec elle, les
+   références par nom de fichier et les numéros en commentaire suivent ; les
+   littéraux de code ne changent pas. Un transport qualifié qui porterait une
+   migration ajoutée ou modifiée est refusé et le lot écarté : sa qualification
+   fige l'arbre et le delta, la renumérotation doit donc précéder la
+   qualification. La réservation L122 est déplacée avant
+   la publication (journal « before: … »), le plan porte la correspondance
+   (`reserved`/`landed`) et le commit final la ligne
+   `ameesh-migration: <lot> <ancien> <nouveau>`. Après promotion confirmée,
+   le numéro atterri est enregistré (`migration_landed`) et la réservation
+   libérée. Le train reste inactif : ce raccord ne l'active pas.
 6. **Geler le périmètre d'une release à son ouverture** (L750/L756, #561/#566).
    Quand le lot de release est ouvert, son périmètre se fige à un commit
    **nommé** de sa cible : `ameesh release open <lot> --base <commit>`. Les

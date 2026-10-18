@@ -23,10 +23,13 @@ class VersionedPolicyTest(unittest.TestCase):
             self.git(path, "config", "user.email", "fixture@example.invalid")
         self.document = dict(review_policies=dict(
             risk_classes=dict(default="light", projects=dict(example=dict(default="light", rules=[
-                dict(paths=["db/**", "private/**", "queue/**", "missing/**"], **{"class": "sensitive"})]))),
+                dict(paths=["db/**", "private/**", "queue/**", "missing/**", "deploy/**"],
+                     **{"class": "sensitive"})]))),
             train_reviews=dict(schema="ameesh-train-reviews-policy/1", projects=dict(example=dict(rules=[
                 dict(paths=["db/**", "private/**", "**/*.sql"], reviews=2),
-                dict(paths=["queue/**"], reviews=1)])))))
+                dict(paths=["queue/**"], reviews=1),
+                dict(paths=["deploy/**"], reviews=1),
+                dict(paths=["ui/**"], reviews=1)])))))
         self.version = self.save_policy()
         self.base = self.change("readme.md", "base")
         self.item = dict(id=7, app="example", type="evolution", branch_target="main")
@@ -63,13 +66,27 @@ class VersionedPolicyTest(unittest.TestCase):
         return (provider or self.provider())(self.item, self.row, self.base, self.repo)
 
     def test_light_and_one_or_two_reviews_are_bound_to_exact_subject_and_policy(self):
-        for path, risk, count in (("docs/readme.md", "light", 0), ("queue/lock.py", "sensitive", 1),
-                                  ("private/keys.py", "sensitive", 2)):
+        # deploy/** is critical (production): the merge gate demands two
+        # families on the changed path, so a one-review rule is floored to
+        # two. queue/** is sensitive (concurrency) but not one of the critical
+        # domains (SQL, security, prod): its one-review rule stays one. ui/**
+        # stays a non-critical one-review case.
+        for path, risk, count in (("docs/readme.md", "light", 0), ("ui/page.py", "sensitive", 1),
+                                  ("queue/lock.py", "sensitive", 1), ("private/keys.py", "sensitive", 2)):
             # Each subsequent diff contains the preceding changes as well.
             result = self.qualify(path)
             self.assertEqual((result.risk, result.reviews), (risk, count))
             self.assertEqual((result.lot, result.base, result.head, result.policy_commit),
                              (7, self.base, self.row["frozen_sha"], self.version))
+
+    def test_critical_domain_floor_raises_the_per_path_count_to_two_families(self):
+        # The merge gate requires two distinct families for deploy/**: the
+        # per-path rule says one, admission must not read it as one.
+        result = self.qualify("deploy/bascule.py")
+        self.assertEqual((result.risk, result.reviews), ("sensitive", 2))
+        self.assertEqual([(entry["path"], entry["class"]) for entry in result.files],
+                         [("deploy/bascule.py", "sensitive")])
+        self.assertIn("deploy/**", result.files[0]["rule"])
 
     def test_sensitive_path_without_a_count_is_refused_even_beside_covered_path(self):
         self.change("private/key.py")

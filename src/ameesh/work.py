@@ -39,6 +39,7 @@ from typing import Sequence
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
+from .storage import interface
 from .storage.postgres import work as _pg
 
 STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
@@ -47,8 +48,25 @@ TERMINAL = ("promoted", "closed")
 #: déjà fusionnés : une fusion constatée n'y change rien
 MERGED_STATES = ("merged", "promoted")
 #: raisons d'une fermeture explicite (`ameesh work close`) : abandonné,
-#: remplacé par un autre lot, ou livré hors cible avec sa tête relue (#988)
-CLOSE_REASONS = ("abandoned", "superseded", "delivered")
+#: remplacé par un autre lot, livré hors cible avec sa tête relue (#988),
+#: ou livré sans fusion (`done`, #1280)
+CLOSE_REASONS = ("abandoned", "superseded", "delivered", "done")
+#: la source d'un lot de relecture après fusion (review_lot.PREFIX) : un lot
+#: sans branche, dont l'identité est le parent relu. work.py ne peut pas
+#: importer review_lot (cycle), la constante est la même chaîne.
+REVIEW_SOURCE_PREFIX = "review-after-merge:"
+#: le titre d'un lot de relecture après fusion (review_lot.title_of), repris
+#: par les relectures ouvertes à la main : `REVUE #<parent> : …`.
+REVIEW_TITLE_RE = re.compile(r"^\s*REVUE\s*#\s*(\d+)\b", re.IGNORECASE)
+#: #1280 : les missions de relecture ouvertes à la main hors convention
+#: `REVUE #N` : `R1 <harnais> #<parent> …` (cas #1249), et ses variantes
+#: observées `R1 delta Codex #1037 r2`, `R1 Codex de #1066`. La forme est
+#: ancrée en tête (`R1`/`R2`) et le parent est le premier `#<id>` de
+#: l'en-tête, avant le `:` ou le tiret de la description : un titre qui
+#: commence par `R1`/`R2` sans `#<id>` reste une mission (parent inconnu,
+#: donc refusée), jamais un lot ordinaire.
+MANUAL_REVIEW_START_RE = re.compile(r"^\s*R[12]\b", re.IGNORECASE)
+MANUAL_REVIEW_TITLE_RE = re.compile(r"^\s*R[12]\b[^:—–#]*#\s*(\d+)\b", re.IGNORECASE)
 MAX_QA_LOOPS = 2
 FORWARD = {
     "intake": ("build",),
@@ -78,6 +96,26 @@ WAITING = {"blocked", "waiting_human"}
 CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
+#: §4 canon (owner 14/10/2026) : au plus 2 lots en développement (`build`) par
+#: agent ; les lots en surplus retournent à la file d'équipe. Règle générique,
+#: pour tous les projets et tous les agents.
+BUILD_LIMIT = 2
+#: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
+#: portée par la note de la dernière attribution du lot (jamais une exemption
+#: silencieuse de qui a assigné le lot).
+WIP_EXCEPTION_MARK = "WIP exception"
+#: préfixes d'une note d'attribution — le journal les relit pour savoir si la
+#: dernière attribution d'un lot porte le marqueur d'exception (`wip_exceptions`)
+#: et si un retour §4 lui est postérieur (`storage.interface.ASSIGN_NOTE_PREFIXES`)
+ASSIGN_NOTES = interface.ASSIGN_NOTE_PREFIXES
+#: §4 : début de la note de journal d'un lot RENDU à la file — un lot `build`
+#: sans assigné n'est prenable par la prise automatique que s'il a été rendu
+#: ainsi (`storage.interface.RETURNED_NOTE`)
+RETURN_NOTE = interface.RETURNED_NOTE
+#: §4 : états d'un lot que le geste `work return` rend à la file. Un lot en
+#: revue (`qa`), en attente d'un humain ou bloqué n'est pas de l'en-cours d'un
+#: agent : il ne se rend pas par ce geste.
+RETURN_STATES = ("intake", "build")
 #: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
 UNKNOWN_ACTOR = "inconnu"
 #: un commit de fusion déclaré (`merged --sha`)
@@ -583,7 +621,8 @@ def lot_repository(item: dict, cfg=None) -> str:
 def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
                       actor: str = "", cfg=None,
-                      skip_branches: tuple[str, ...] = ()) -> dict:
+                      skip_branches: tuple[str, ...] = (),
+                      skip_worktree: bool = False) -> dict:
     """L122, #443 : réserve au lot le numéro de sa migration, avant d'écrire
     le fichier, dans le dépôt du lot (`lot_repository`) : le dossier et la
     numérotation sont les siens, jamais ceux d'ameesh pour un autre dépôt.
@@ -599,7 +638,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
     en plus de celle du lot — la branche d'intégration d'un paquet en
     composition, dont les fichiers renumérotés ne doivent pas compter contre
-    la réservation. Rend le lot, avec `migration_file`. Une correction
+    la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail du
+    clone de lecture — le train y compose justement la migration à réserver.
+    Rend le lot, avec `migration_file`. Une correction
     concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
@@ -637,7 +678,8 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
         raise WorkError("--skip-branch %s: a trunk branch is always scanned" % trunks[0])
     present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
-                                      also_skip=tuple(skip_branches))
+                                      also_skip=tuple(skip_branches),
+                                      worktree=not skip_worktree)
     if number is None:
         floor = max(present or [0]) + 1
         note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
@@ -1082,8 +1124,13 @@ def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict
     # transitions se lisent dans l'ordre chronologique (`lot_transitions`),
     # pas le journal complet, qui rend le plus récent d'abord.
     from . import progress  # import tardif : progress importe ce module
-    transitions = storage.of(db).progress.lot_transitions([int(item_id)])
-    jalons = progress._jalons_de_lot(item, transitions, [], milestones(db, item_id))
+    store = storage.of(db)
+    transitions = store.progress.lot_transitions([int(item_id)])
+    # #2346 : `human:<nom>` et le nom nu ne sont le même acteur que si le nom
+    # nu n'est pas un agent du registre.
+    agents = {r["name"] for r in store.progress.agents(None) if r.get("name")}
+    jalons = progress._jalons_de_lot(item, transitions, [], milestones(db, item_id),
+                                     agents=agents)
     if jalons.get("verdict_kind") == "blocked" and jalons.get("verdict_current"):
         raise WorkError(
             "verdict not required refused: lot %s carries a current blocked "
@@ -1187,19 +1234,42 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
             "warning": "; ".join(warnings) or None}
 
 
+def is_pilot(cfg, db: Db, actor: str) -> bool:
+    """L'acteur a-t-il l'autorité du pilote ? — un humain, ou un orchestrateur
+    ou agent de conception (`assignments.is_orchestrator` avec
+    `CORRECTOR_ROLES`, la même autorité que `work move --correct`). Sert à
+    l'exception EXPLICITE à la limite d'en-cours (§4) : jamais une exemption
+    silencieuse."""
+    from . import assignments
+
+    name = (actor or "").strip()
+    if not name:
+        return False
+    if name.startswith(HUMAN_PREFIX):
+        return True
+    try:
+        return assignments.is_orchestrator(
+            cfg if cfg is not None else getattr(db, "cfg", None), db, name,
+            roles=CORRECTOR_ROLES)
+    except Exception:  # noqa: BLE001 - autorité illisible : pas d'exception
+        return False
+
+
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
            force: str | None = None, claim: bool = False,
-           if_holder: str | None = None) -> dict:
+           if_holder: str | None = None,
+           wip_exception: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
 
     L118 : `branch` (et `branch_target`) posent aussi la branche du lot ; avec
-    une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
-    la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
-    du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
-    pas son propre travail.
+    une branche, un lot déjà assigné à cet agent n'est pas une erreur : seule
+    la branche est posée, sans attribution — la délégation en cours (L40) et
+    l'exception pilote (§4) restent en place. #705 : si le nouvel assigné est le
+    relecteur désigné du lot, la désignation tombe (le journal le dit) — un
+    relecteur ne relit pas son propre travail.
 
     #1026 : `claim` n'attribue le lot que s'il est **sans assigné**. Un lot
     déjà pris est refusé en nommant son porteur, et l'écriture est
@@ -1214,7 +1284,14 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     d'une alerte) ; si le lot a changé de main depuis, la réassignation est
     refusée en nommant le porteur courant. Deux agents partis du même brief ne
     se volent plus le lot : le second relit le lot au lieu d'écraser le
-    premier."""
+    premier.
+
+    §4 : `wip_exception` (une raison non vide) pose une exception pilote
+    EXPLICITE à la limite d'en-cours — réservée à un humain ou à un pilote
+    (`is_pilot`), elle est écrite dans la note de la dernière attribution (même
+    assigné : c'est le geste qui la réécrit), et le balayage (`ameesh work
+    wip`) laisse alors le lot au-delà du plafond. Elle s'efface à l'attribution
+    suivante sans marqueur."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1229,20 +1306,36 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
                 "re-read the lot and retry" % (item_id, previous or "nobody",
                                                expected or "nobody"))
     _branch_args(branch, branch_target)
+    reason = " ".join(str(wip_exception).split()) if wip_exception is not None else ""
+    if wip_exception is not None and not reason:
+        raise WorkError("--wip-exception: a reason is required (the exception is "
+                        "explicit, never implicit)")
+    if reason and not is_pilot(cfg, db, actor):
+        raise WorkError("WIP exception refused: %s is neither a human nor an "
+                        "orchestrator/design agent; the exception to the §4 limit is "
+                        "explicit and reserved to the pilot" % (actor or "nobody"))
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
     if claim and previous:
         if previous == check["assignee"]:
-            if branch:
-                row = set_branch(db, item_id, branch, branch_target, actor=actor)
-                return {"item": row, "check": check, "previous": previous, "noop": True}
-            return {"item": item, "check": check, "previous": previous, "noop": True}
-        raise WorkError("lot %s already assigned to %s: claim refused, nothing changed"
-                        % (item_id, previous))
-    if previous == check["assignee"]:
-        if branch:
-            row = set_branch(db, item_id, branch, branch_target, actor=actor)
-            return {"item": row, "check": check, "previous": previous}
-        raise WorkError("lot %s already assigned to %s" % (item_id, previous))
+            if not reason:
+                if branch:
+                    row = set_branch(db, item_id, branch, branch_target, actor=actor)
+                    return {"item": row, "check": check, "previous": previous, "noop": True}
+                return {"item": item, "check": check, "previous": previous, "noop": True}
+            # la re-prise par le porteur avec une exception §4 explicite se
+            # journalise plus bas : l'attribution ne change pas.
+        else:
+            raise WorkError("lot %s already assigned to %s: claim refused, nothing changed"
+                            % (item_id, previous))
+    if previous == check["assignee"] and not reason:
+        if not branch:
+            raise WorkError("lot %s already assigned to %s" % (item_id, previous))
+        # L118 : le lot est déjà à cet agent — seule la branche est posée,
+        # sans attribution (ni note, ni annulation de délégation) : la
+        # délégation en cours (L40) et l'exception pilote (§4), portées par la
+        # dernière attribution, restent en place.
+        row = set_branch(db, item_id, branch, branch_target, actor=actor)
+        return {"item": row, "check": check, "previous": previous}
     note = "assigned to %s%s (before: %s)%s" % (
         check["assignee"],
         " — external session, owner %s" % check["responsible"] if check["externe"] else "",
@@ -1250,11 +1343,13 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # L40 (0030) : la réassignation efface la délégation en cours
         "; delegation from %s cancelled" % item["delegated_by"]
         if item.get("delegated_by") and item.get("due_ts") else "")
+    if reason:
+        note += "; %s (pilot, %s): %s" % (WIP_EXCEPTION_MARK, actor or UNKNOWN_ACTOR, reason)
     queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                           % (check["assignee"], previous or "nobody"))
     row = storage.of(db).work.assign(item_id, check["assignee"],
-                                     current=None if claim else previous, note=note,
-                                     actor=actor, queued_note=queued,
+                                     current=(None if claim and not previous else previous),
+                                     note=note, actor=actor, queued_note=queued,
                                      forced_note=queued and _forced_note(check, note, force,
                                                                          actor))
     if row is None:
@@ -1328,6 +1423,49 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
                 if item.get("state") != "intake" else
                 "an idle agent of team %s will take it (L165)" % team if team else
                 "it has no team: it waits for the orchestrator (%s)" % later))
+
+
+def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
+                    reason: str = "") -> dict:
+    """§4 : rend un lot à la file d'équipe — l'assignation est retirée (CAS sur
+    l'assigné lu ET l'état, journal dans la même transaction) ; branche, tête de
+    branche, gels et avis (jalons) restent. Le lot garde son état, donc un agent
+    libre le reprend avec sa branche (`unassigned_lots`).
+
+    Seuls un lot `intake` ou `build` se rendent (`RETURN_STATES`) : un lot en
+    revue (`qa`), en attente d'un humain ou bloqué n'est pas de l'en-cours d'un
+    agent.
+
+    Autorité : l'assigné lui-même, un humain, ou un pilote (`is_pilot`) — un
+    agent ne rend pas le lot d'un autre."""
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if item["state"] not in RETURN_STATES:
+        raise WorkError("lot %s is %s: only an intake or build lot returns to the team "
+                        "queue (§4)" % (item_id, item["state"]))
+    current = (item.get("assignee") or "").strip()
+    if not current:
+        raise WorkError("lot %s has no assignee: already in the team queue" % item_id)
+    who = (actor or "").strip()
+    if who != current and not who.startswith(HUMAN_PREFIX) and not is_pilot(cfg, db, who):
+        raise WorkError("return refused: %s is neither the assignee (%s), a human, nor "
+                        "an orchestrator/design agent" % (who or "nobody", current))
+    note = "%s by %s (§4: at most %d lots in build per agent)" % (
+        RETURN_NOTE, who or UNKNOWN_ACTOR, BUILD_LIMIT)
+    if reason.strip():
+        note += ": %s" % " ".join(str(reason).split())
+    row = storage.of(db).work.unassign(item_id, current=current, note=note,
+                                       actor=who or UNKNOWN_ACTOR,
+                                       states=RETURN_STATES)
+    if row is None:
+        raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    return row
+
+
+def count_builds(db: Db, assignee: str) -> int:
+    """§4 : les lots en `build` de l'agent (tous projets)."""
+    return storage.of(db).work.count_builds(assignee)
 
 
 # --------------------------------------------------------------------------
@@ -1762,14 +1900,21 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
 
 def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
-                           cfg=None) -> str:
-    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture."""
+                           cfg=None, announce=None) -> str:
+    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture.
+
+    `announce` (facultatif, #1400) : appelé avec le constat `{id, app, title,
+    sha, subject, how}` une fois la preuve lue et acceptée, AVANT que
+    l'appelant n'écrive quoi que ce soit ; un refus de preuve ne l'appelle
+    pas.
+    """
     from . import plan_git
     from .canon import GitError
 
     label = "lot #%s (%s: %s)" % (item["id"], item.get("app") or "?", item["title"])
     try:
-        checkout = _checkout(lot_repository(item, cfg), repo, cfg)
+        slug = lot_repository(item, cfg)
+        checkout = _checkout(slug, repo, cfg)
         commit = plan_git._commit(checkout, sha)
         if not commit:
             raise WorkError("commit %s not found in the lot's repository" % sha)
@@ -1793,22 +1938,32 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
             if cited.group("branch") != item["branch"]:
                 how = None
         if not how and item.get("branch"):
-            # A recorded agent/feature branch may also be named in a real
-            # merge title; a mere mention in a review body proves nothing.
+            # #1400 : une branche enregistrée du lot (agent/…) est reconnue
+            # dans un VRAI commit de fusion — forme GitHub « from
+            # <propriétaire>/<branche> » comprise —, à condition que le
+            # propriétaire soit celui du dépôt canonique du lot (une branche
+            # homonyme d'un fork ne prouve rien) ; une simple mention dans un
+            # corps de revue ou un commit ordinaire ne prouve rien.
             parents = plan_git._out(checkout, "show", "-s", "--format=%P", commit)
             if (parents and len(parents.split()) >= 2
-                    and plan_git._mentions(title, item["branch"])):
+                    and plan_git.recorded_branch_merge(
+                        title, item["branch"], owner=slug.split("/", 1)[0])):
                 how = "recorded branch"
         if not how:
             raise WorkError("commit does not designate this lot: use ameesh-work: %s "
                             "in the commit message (a PR number alone is not a lot)" % lot)
+        if announce is not None:
+            announce({"id": lot, "app": item.get("app") or "",
+                      "title": item.get("title") or "", "sha": commit,
+                      "subject": title, "how": how})
         return commit
     except (WorkError, GitError, plan_git.MergeProbeError) as exc:
         raise WorkError("%s: merge declaration refused: %s" % (label, exc)) from exc
 
 
 def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
-           repo: str | None = None, migration_landed: int | None = None, cfg=None) -> dict:
+           repo: str | None = None, migration_landed: int | None = None, cfg=None,
+           announce=None) -> dict:
     """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
     (fusion locale sur la branche cible) se déclare en une fois.
 
@@ -1819,6 +1974,13 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     remplacé) n'est jamais rouvert : WorkError. Rend le constat de
     `close_merged`. Le commit doit être lisible dans le dépôt du lot, désigner
     ce lot et être entré dans sa cible ; aucune lecture réseau ni force.
+
+    `announce` (facultatif, #1400) : le callback du constat, appelé avec
+    `{id, app, title, sha, subject, how}` après la lecture de la preuve (une
+    branche enregistrée est reconnue dans un vrai commit de fusion, GitHub
+    comprise) et AVANT toute écriture ; un refus de preuve ne l'appelle pas, un
+    refus d'écriture (gel déclaré entre-temps) l'a déjà appelé et laisse
+    l'état inchangé.
 
     `migration_landed` (#1567) : le numéro de migration réellement atterri,
     quand la renumérotation du paquet a changé celui de la réservation (452 au
@@ -1835,7 +1997,7 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     if item["state"] not in (*MERGED_STATES, "closed"):
-        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg)
+        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
@@ -1873,17 +2035,15 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         if item["state"] != "closed":
             raise WorkError(done["detail"])
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
-                        % (item_id, close_label(item), item_id))
+                        % (item_id, close_how(item.get("close_reason"),
+                                              item.get("superseded_by")), item_id))
     return done
 
 
 def close_label(item: dict) -> str:
     """Le libellé d'une fermeture (`closed`), pour les messages : abandonné,
-    remplacé par #N, ou livré hors cible (#988)."""
-    reason = item.get("close_reason")
-    if reason == "superseded":
-        return "superseded by #%s" % item.get("superseded_by")
-    return {"delivered": "delivered outside the target"}.get(reason, reason or "closed")
+    remplacé par #N, livré hors cible (#988), ou `done` (#1280)."""
+    return close_how(item.get("close_reason"), item.get("superseded_by"))
 
 
 def _landed_number(number) -> int:
@@ -1947,25 +2107,51 @@ def _record_landed(db: Db, item: dict, landed: tuple[int, str], *, actor: str,
 
 
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
-          delivered: bool = False, sha: str = "", note: str = "", actor: str = "") -> dict:
-    """Ferme un lot qui ne sera pas fusionné : abandonné, remplacé par un autre
-    lot, ou **livré hors cible** (#988 : un rapport, une note, un livrable dont
-    la tête relue reste sur sa branche, sans fusion dans la cible).
+          delivered: bool = False, done: bool = False, sha: str = "", note: str = "",
+          actor: str = "") -> dict:
+    """Ferme un lot qui ne sera pas fusionné : abandonné, remplacé par un
+    autre lot, **livré hors cible** (#988 : un rapport, une note, un livrable
+    dont la tête relue reste sur sa branche) ou `done` — livré sans fusion
+    (un avis, une analyse).
 
-    Les trois portes sont exclusives. `--delivered` exige `--sha <tête relue>`
+    Les quatre portes sont exclusives. `--delivered` exige `--sha <tête relue>`
     (7 à 64 caractères hexadécimaux) : le jalon `delivered` porte ce SHA et
-    compte comme livraison dans `estimates`. Un jalon `closed` est écrit dans
-    tous les cas ; rien ne reste ouvert par oubli.
+    compte comme livraison dans `estimates`. `done` refuse un lot qui porte
+    une branche ou une PR : un lot de code se fusionne, il ne se clôt pas. Il
+    refuse aussi un avis (`review-after-merge:#N`,
+    le titre `REVUE #N` des relectures ouvertes à la main, ou la mission
+    manuelle `R1`/`R2 <harnais> #<parent>`, cas #1249) dont le parent est
+    introuvable, et ne ferme un `merged` sans branche que si c'est un avis
+    rattaché (les fausses fusions historiques). Le titre rattache, il ne
+    prouve pas : la clôture `done` d'un avis exige le jalon `verdict` sur le
+    parent relu, rendu par le lecteur de la mission (son assigné, ou un
+    relecteur désigné) — quel qu'en soit le verdict, un `blocked` compris, qui
+    est une relecture livrée et pas un GO produit — sans ce verdict, la
+    relecture n'a pas eu lieu (arbitrage mesh-design 34598, 14/10 ; lecteur
+    lié à la mission, R codex3 #1280 B1). Sur un
+    avis déjà fermé « superseded by » son propre parent (#1043, #1218, #1249,
+    #1269), `done` rectifie la raison sans rouvrir : la fermeture, sa date et
+    son jalon restent, la rectification est journalisée. Jalon `closed` ; rien
+    ne reste ouvert par oubli.
+
+    Un lot de relecture après fusion (`issue_ref = review-after-merge:#<lot>`)
+    n'est livrable que lorsque les avis dus sur la fusion sont rendus : la
+    marque structurée de la relecture (au journal du lot fusionné) est relue
+    et les verdicts `ok` du lot source comptés à son sha
+    (`review_lot.guard_delivery`, #2374). Un lot antérieur, sans marque, garde
+    l'avis historique (un).
 
     Dans la MÊME transaction, les agents des lots qui déclarent ce lot en
     prérequis explicite et dont c'était la dernière attente reçoivent un
-    courrier durable (L385 suite) : l'abandon libère
-    l'attente sans prouver la livraison, le dépendant doit réévaluer son
-    prérequis. Un échec du courrier annule la fermeture (reprise) ; le verrou
-    de graphe empêche deux fermetures de se doubler."""
-    if sum((bool(abandoned), superseded_by is not None, bool(delivered))) != 1:
+    courrier durable (L385 suite) : l'abandon libère l'attente sans prouver la
+    livraison, le dépendant doit réévaluer son prérequis. Un échec du courrier
+    annule la fermeture (reprise) ; le verrou de graphe empêche deux
+    fermetures de se doubler."""
+    picks = sum((int(bool(abandoned)), int(superseded_by is not None),
+                 int(bool(delivered)), int(bool(done))))
+    if picks != 1:
         raise WorkError("pass one of --abandoned, --superseded-by <id>, "
-                        "--delivered --sha <reviewed head>")
+                        "--delivered --sha <reviewed head>, --done")
     head = (sha or "").strip().lower()
     if delivered and not _SHA_RE.match(head):
         raise WorkError("--delivered: the reviewed head (--sha, 7 to 64 hex characters), "
@@ -1985,14 +2171,47 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
         if get(db, superseded_by) is None:
             raise WorkError("superseding lot %s not found" % superseded_by)
     state = item["state"]
-    if state in MERGED_STATES or state == "closed":
+    review, parent = _review_parent(item)
+    if state == "closed":
+        row = _rectify_done(db, item, review=review, parent=parent, done=done,
+                            note=note, actor=actor)
+        if row is not None:
+            return row
+        raise WorkError("lot %s already closed: nothing to close" % item_id)
+    if done:
+        artifact = _code_artifact(item)
+        if artifact:
+            raise WorkError("lot %s carries %s: a code lot is merged, not closed "
+                            "done" % (item_id, artifact))
+        if review and (parent is None or get(db, parent) is None):
+            where = ("#%s" % parent) if parent is not None else (
+                item.get("issue_ref") or item.get("source") or "?")
+            raise WorkError("review #%s not attached to its parent (%s): nothing "
+                            "to close done" % (item_id, where))
+        if review and not _parent_verdict(db, parent, item):
+            raise WorkError("review #%s: no verdict milestone on its parent #%s from its "
+                            "reader (%s) — the title attaches, it does not prove; record "
+                            "the verdict on the parent first (ameesh work milestone %s "
+                            "verdict ok --sha <sha>)"
+                            % (item_id, parent, _reader_label(item), parent))
+        if state in MERGED_STATES and not review:
+            raise WorkError("lot %s already %s, without branch or review parent: "
+                            "nothing to close done" % (item_id, state))
+    elif state in MERGED_STATES:
         raise WorkError("lot %s already %s: nothing to close" % (item_id, state))
+    if delivered:
+        # #2374 : la clôture d'une relecture après fusion n'est pas un simple
+        # constat — les avis dus sur la fusion sont comptés avant d'écrire.
+        from . import review_lot
+        review_lot.guard_delivery(db, item)
     if abandoned:
         reason, base = "abandoned", "abandoned"
     elif superseded_by is not None:
         reason, base = "superseded", "superseded by #%s" % superseded_by
-    else:
+    elif delivered:
         reason, base = "delivered", "delivered (head %s)" % head[:12]
+    else:
+        reason, base = "done", "done"
     text = base + (" — %s" % note.strip() if note and note.strip() else "")
     from . import work_dependencies
     threads: list = []
@@ -2016,6 +2235,138 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
             raise _pinned_close_error(item_id, pinned)
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
+
+
+def _code_artifact(item: dict) -> str:
+    """#1280 : ce qui rattache un lot au code — `branch <nom>` ou `PR <réf>` —
+    ou "" : un lot qui en porte un se fusionne, il ne se clôt pas `done`."""
+    branch = str(item.get("branch") or "").strip()
+    if branch:
+        return "branch %s" % branch
+    pr = str(item.get("pr_ref") or "").strip()
+    return "PR %s" % pr if pr else ""
+
+
+def _rectify_done(db: Db, item: dict, *, review: bool, parent: int | None, done: bool,
+                  note: str, actor: str) -> dict | None:
+    """#1280 : régularise en `done` un avis fermé « superseded by » son propre
+    parent relu — le parent n'est pas un remplaçant (#1043, #1269). Rend la
+    ligne rectifiée, ou None si le lot n'est pas dans ce cas exact : la
+    fermeture, sa date et son jalon restent en place, seule la raison change."""
+    if not done or not review or parent is None:
+        return None
+    artifact = _code_artifact(item)
+    if artifact:
+        raise WorkError("lot %s carries %s: a code lot is merged, not closed done"
+                        % (item["id"], artifact))
+    current = item.get("superseded_by")
+    if (str(item.get("close_reason") or "") != "superseded" or current is None
+            or int(current) != int(parent)):
+        return None
+    if not _parent_verdict(db, parent, item):
+        raise WorkError("review #%s: no verdict milestone on its parent #%s from its "
+                        "reader (%s) — the rectification to done requires the delivered "
+                        "verdict" % (item["id"], parent, _reader_label(item)))
+    item_id = int(item["id"])
+    text = ("done (rectification: closed `superseded by #%d`, the reviewed parent, "
+            "not a replacement)" % parent)
+    if note and note.strip():
+        text += " — %s" % note.strip()
+    row = storage.of(db).work.rectify_close(
+        item_id, current_reason="superseded", reason="done", actor=actor, note=text)
+    if row is None:
+        raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    return row
+
+
+def close_how(reason: str | None, superseded_by: int | None = None) -> str:
+    """Le libellé d'une fermeture : `done` (livré sans fusion), `superseded by
+    #N`, `delivered outside the target` (#988), ou `abandoned` — jamais
+    « superseded by #None »."""
+    if reason == "done":
+        return "done (delivered without merge)"
+    if reason == "delivered":
+        return "delivered outside the target"
+    if reason == "superseded":
+        return ("superseded by #%s" % superseded_by) if superseded_by is not None \
+            else "superseded"
+    return "abandoned"
+
+
+def _mission_readers(item: dict) -> list[str]:
+    """Les lecteurs qui peuvent prouver une mission : son assigné, puis les
+    relecteurs désignés (#2076). L'ensemble est la preuve ; un verdict d'un
+    autre agent ne prouve pas que *cette* mission a été rendue (R codex3
+    #1280, B1 : mission assignée à un lecteur, verdict d'un autre)."""
+    names = []
+    assignee = str(item.get("assignee") or "").strip()
+    if assignee:
+        names.append(assignee)
+    from .work_reviewers import designated
+    names.extend(designated(item))
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def _reader_label(item: dict) -> str:
+    """Le(s) lecteur(s) attendu(s) d'une mission, pour un message de refus."""
+    return ", ".join(_mission_readers(item)) or "aucun lecteur assigné"
+
+
+def _parent_verdict(db: Db, parent: int | None, item: dict | None = None) -> bool:
+    """Le parent relu porte-t-il un jalon `verdict` **du lecteur de cette
+    mission**, rendu **après son ouverture** ? Le titre d'un avis rattache le
+    parent, il ne prouve pas que la relecture a été rendue ; un verdict d'un
+    autre lecteur ne prouve pas la mission de celui-ci (R codex3 #1280, B1) ;
+    et le verdict que le même lecteur a rendu avant la mission (sa R1, pour
+    une mission R2 de delta) ne la prouve pas non plus (R dev4 #1280, B1).
+    Sans lecteur, pas de preuve : la mission doit être assignée (ou ses
+    relecteurs désignés) avant `done`. Tout l'historique du parent est lu : un
+    verdict valide ne se perd pas derrière les cent derniers jalons."""
+    if parent is None:
+        return False
+    mission = item or {}
+    readers = set(_mission_readers(mission))
+    if not readers:
+        return False
+    opened = float(mission.get("created_ts") or 0)
+    for mark in milestones(db, parent, limit=None):
+        if mark.get("kind") != "verdict":
+            continue
+        if str(mark.get("actor") or "").strip() not in readers:
+            continue
+        if float(mark.get("at_ts") or 0) >= opened:
+            return True
+    return False
+
+
+def _review_parent(item: dict) -> tuple[bool, int | None]:
+    """(est-ce un avis après fusion, id du parent relu). L'id est None quand
+    la source nomme un avis sans id lisible ; (False, None) sinon. Les avis
+    ouverts à la main (`source=mail`, cas #1043/#1218) ne portent que le titre
+    `REVUE #<parent> : …`, la convention de `review_lot.title_of` ; les
+    missions `R1`/`R2 <harnais> #<parent>` (#1249) sont reconnues par
+    `MANUAL_REVIEW_TITLE_RE`. Le titre rattache le parent, il ne le prouve
+    pas : la clôture `done` exige en plus le jalon `verdict` (voir `close`)."""
+    for field in ("issue_ref", "source"):
+        text = str(item.get(field) or "")
+        if text.startswith(REVIEW_SOURCE_PREFIX):
+            tail = text[len(REVIEW_SOURCE_PREFIX):].strip().lstrip("#").strip()
+            return True, int(tail) if tail.isdigit() else None
+    title = str(item.get("title") or "")
+    match = REVIEW_TITLE_RE.match(title)
+    if match:
+        return True, int(match.group(1))
+    if MANUAL_REVIEW_START_RE.match(title):
+        match = MANUAL_REVIEW_TITLE_RE.match(title)
+        return True, (int(match.group(1)) if match else None)
+    return False, None
+
+
+def is_review(item: dict) -> bool:
+    """Ce lot est-il un avis (relecture après fusion, `REVUE #N`, mission
+    `R1`/`R2`) ? Sert à ne pas ouvrir la relecture d'une relecture (garde
+    anti-récursion, #1280 B2)."""
+    return _review_parent(item)[0]
 
 
 def get(db: Db, item_id: int) -> dict | None:
@@ -2087,7 +2438,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
-                        "--superseded-by <id> | --delivered --sha <reviewed head>")
+                        "--superseded-by <id> | --delivered --sha <reviewed head> | --done")
     reviewer = (reviewer or "").strip() or None
     reviewer_warning = ""
     if reviewer is not None:

@@ -37,6 +37,11 @@ et le démarrage n’a lieu qu’après preuve du point sûr (`ActiveState=inact
 et `MainPID=0`). Aucune fenêtre « idle » n’est attendue : une persona en tour
 ne bloque plus la mise à jour.
 
+Si l’unité est déjà en échec avant l’arrêt, `reset-failed` efface cet échec
+antérieur avant `stop`. Un échec de cette remise à zéro ou du drainage, un
+état final différent de `inactive` ou un `MainPID` non nul interdit toujours
+le démarrage. Un nouvel échec pendant l’arrêt n’est jamais effacé.
+
 Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
 interrupteur, pas un délai : un agent vu en tour reçoit **immédiatement**,
 avant l’arrêt prouvé ci-dessus, une pause opérateur courte et nommée (drain,

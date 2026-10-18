@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Temporary adapter for dsh 0.2.0-rc.2 / subprocess-local 0.1.5-rc.2.
+// Temporary adapter for dsh 0.2.0-rc.2 / subprocess-local 0.2.0-rc.2.
 // Check the actual imported provider, including profile-local overrides, then
 // modify only that module's bindings. No global child_process interception.
 'use strict';
@@ -12,12 +12,15 @@ const { createRequire, registerHooks, syncBuiltinESMExports } = nodeModule;
 const threads = require('node:worker_threads');
 
 const PROVIDER = '@deepseek-ai/dsh-subprocess-local';
-const VERSION = '0.1.5-rc.2';
-const INDEX_HASH = 'a3f85e92ce5eddc824348f83cf685d3e417a26c5f1ab602a81fe1bd13315fe2c';
-// Include the provider's imported helper code, not only its declared main.
+const VERSION = '0.2.0-rc.2';
+const INDEX_HASH = 'e40106ed35a1e1744c016e77f2cf59b07f87969bb7c4b424d26fb08da75e3922';
+// Include every provider module the entry imports (runner-launch-B2zsQ1Dz.js
+// and output.js), plus its separate ./runner export (runner.js); pinning the
+// latter is harmless although the entry does not import it (#2275, #2280).
 const HASHES = new Set([INDEX_HASH,
-  '674f0acce6cf7969a5cc9a5c188c7a8d76ff766434634b908d9a4b8a659b1c1a',
-  '16719698906a0508aa7163e8a200dd5eb023ba59fe64f451a2b570936e44d47b']);
+  '6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153',
+  '4e21528dfdb3e92bdce2340945dc4dcb202e4a4af0bbeb8b97585f67735d30c1',
+  '4f77ef6da608d36df168c99177e9b527e7145df1418845eba567635e64a4c2a3']);
 const CP_IMPORT = 'import { execFile, spawn, spawnSync } from "node:child_process";';
 
 function fail(error) {
@@ -288,6 +291,12 @@ function activate() {
 }
 
 module.exports = { verifySource, installLoader, scopedBindings };
+// Read-only pin record, used by the real-provider regression to prove that the
+// installed provider is the reviewed one (#2275). Not a permission input.
+module.exports.REVIEWED = Object.freeze({
+  provider: PROVIDER, version: VERSION, entry: INDEX_HASH,
+  files: Object.freeze([...HASHES])
+});
 if (process.platform === 'linux') {
   try {
     const targets = preloadTargets([...optionTokens(process.env.NODE_OPTIONS || ''), ...process.execArgv]);

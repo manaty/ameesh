@@ -33,13 +33,22 @@ from . import platform, storage
 from .db import Db
 
 #: valeurs par défaut prudentes des seuils (0028), quand la fiche Host n'en
-#: déclare pas : 1 Gio de mémoire disponible, 8 Gio de swap, 2×CPU de charge,
-#: 2 Gio de disque libre. Le plancher de mémoire est le signal de saturation ;
-#: le plafond de swap est haut parce qu'un poste de développement peut garder
-#: plusieurs Gio de swap ANCIEN sans pression réelle (l'incident de 0028 était
-#: à ~12 Go) ; l'hôte qui veut plus strict le déclare dans `policy.resources`.
+#: déclare pas : 1 Gio de mémoire disponible, 2×CPU de charge, 2 Gio de disque
+#: libre. Le plancher de mémoire est le signal de saturation. #2296 : pas de
+#: plafond de swap par défaut — un stock de swap n'est pas une pression, et le
+#: défaut de 0028 (8 Gio) faisait un faux « critical pressure » au démarrage,
+#: avant que la fiche Host ne soit lue (pc-smichea, auditeur 18/10) ; seul un
+#: hôte qui le déclare dans `policy.resources` a un plafond de swap.
 DEFAULT_MIN_MEM_AVAILABLE = 1024 ** 3
-DEFAULT_MAX_SWAP_USED = 8 * 1024 ** 3
+DEFAULT_MAX_SWAP_USED = None
+#: #2354 : le plafond de 0028 reste le repli d'un hôte qui ne peut pas mesurer
+#: PSI et ne déclare pas `max_swap_used`. Sans pression réelle, le stock de
+#: swap est le seul signal mémoire qui reste : la mémoire disponible peut
+#: rester au-dessus de son plancher pendant que les pages partent en swap.
+#: Il ne s'applique qu'à ce cas — un hôte qui mesure PSI n'a pas de plafond de
+#: swap par défaut (#2296), et un plafond déclaré l'emporte toujours
+#: (`swap_ceiling`).
+DEFAULT_MAX_SWAP_USED_WITHOUT_PSI = 8 * 1024 ** 3
 DEFAULT_MAX_LOAD_FACTOR = 2.0
 DEFAULT_MIN_DISK_FREE = 2 * 1024 ** 3
 #: #246: btrfs floors. On 2026-10-11 the host's btrfs was fully allocated
@@ -88,7 +97,23 @@ POWER_KEYS = ("min_battery_percent", "stop_battery_percent")
 #: percent). The load says how many tasks wait, not how long the user waits:
 #: on 10/10 a load of 43 for 12 CPU did not say how badly the workstation
 #: suffered, the PSI does. No default: a host declares it in its Host fiche.
-PRESSURE_KEYS = ("max_cpu_pressure",)
+#:
+#: #2296: ceiling on the host MEMORY pressure (PSI `memory some`, 60 s
+#: average, in percent), and the admission signal that follows the real
+#: pressure instead of the swap used. It DOES have a default, unlike
+#: `max_cpu_pressure`: an absent or unreadable threshold must not open the
+#: gate (`thresholds`). 10 % is already 6 s of memory stall per minute.
+PRESSURE_KEYS = ("max_cpu_pressure", "max_mem_pressure")
+DEFAULT_MAX_MEM_PRESSURE = 10.0
+#: #2296: a swap-used ceiling only counts with a real memory pressure — PSI
+#: memory above this share of its own ceiling (the capacity guard's
+#: `WARN_SHARE`, study L159). A swap STOCK is not a pressure: pages stay in
+#: swap until touched, so a ceiling on it latched after the pressure was gone
+#: (pc-smichea, 17/10: 22.3 GiB of swap while 6.2-6.9 GiB were available and
+#: memory PSI was 2.4-3.4 %). Without PSI (a host that cannot measure it), the
+#: ceiling keeps its old meaning: no real-pressure signal, the gate does not
+#: open on the stock alone.
+SWAP_PRESSURE_SHARE = 0.5
 #: #2022: early disk warning, well before `min_disk_free` pauses the agents
 #: (16/10: agents-1 reached 99 %, 11 agents paused, nobody warned before).
 #: A WARNING only: it alerts, it never closes a turn. Used share or free
@@ -1120,7 +1145,14 @@ def thresholds(policy=None) -> dict:
     `policy` peut être un `HostPolicy` (le canon) ou un mapping dont la clé
     `resources` porte les seuils. Chaque seuil absent ou illisible prend sa
     valeur par défaut : une politique incomplète n'ouvre pas la porte à une
-    absence de garde.
+    absence de garde. #2296 : c'est vrai aussi du plafond de pression mémoire
+    (`max_mem_pressure`, 10 % par défaut) — un hôte qui ne le déclare pas
+    garde le critère d'admission. Seule exception : `max_swap_used` n'a PAS
+    de défaut (None) — un stock de swap n'est pas une pression ; seul un hôte
+    qui déclare un plafond en a un, et ce plafond ne compte que corroboré par
+    la pression mémoire (`swap_ceiling_applies`). #2354 : un hôte qui ne peut
+    pas mesurer PSI garde le repli de 0028 (`swap_ceiling`), sans quoi il
+    n'aurait plus aucune garde sur le stock.
     """
     raw = None
     if policy is not None:
@@ -1137,6 +1169,7 @@ def thresholds(policy=None) -> dict:
     low = parse_percent(raw.get("min_battery_percent"))
     stop = parse_percent(raw.get("stop_battery_percent"))
     cpu_pressure = parse_percent(raw.get("max_cpu_pressure"))
+    mem_pressure = parse_percent(raw.get("max_mem_pressure"))
     unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
     headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
     zombies = parse_count(raw.get("max_zombies"))
@@ -1153,6 +1186,10 @@ def thresholds(policy=None) -> dict:
         "stop_battery_percent": DEFAULT_STOP_BATTERY_PERCENT if stop is None else stop,
         # L159d: no default, None = not watched
         "max_cpu_pressure": cpu_pressure,
+        # #2296: unlike the CPU pressure, never None — an absent or unreadable
+        # threshold takes the prudent default, it never removes the guard
+        "max_mem_pressure": (DEFAULT_MAX_MEM_PRESSURE if mem_pressure is None
+                             else mem_pressure),
         # L159d: the offer (`policy.lend`) caps the lendable capacity; None:
         # the host lends nothing
         "lend": lend_offer(policy),
@@ -1264,6 +1301,51 @@ def host_limits(canons, host: str) -> dict:
             "fiches": [label for label, _f in fiches]}
 
 
+def swap_ceiling(reading: dict, limits: dict) -> int | None:
+    """#2296/#2354 : le plafond de swap utilisé qui s'applique à un relevé.
+
+    Un plafond DÉCLARÉ (`max_swap_used`) l'emporte toujours. Sans plafond
+    déclaré : None quand l'hôte mesure PSI — un stock n'est pas une pression
+    (#2296), et le défaut de 0028 (8 Gio) faisait un faux « critical
+    pressure » au démarrage — mais le repli prudent de 0028
+    (`DEFAULT_MAX_SWAP_USED_WITHOUT_PSI`) quand l'hôte ne mesure pas PSI
+    (#2354) : le stock y est le seul signal mémoire qui reste, la mémoire
+    disponible pouvant rester au-dessus de son plancher pendant que les pages
+    partent en swap. Le repli suit chaque relevé : un hôte qui retrouve PSI
+    retrouve le critère de pression réelle.
+    """
+    declared = limits.get("max_swap_used")
+    if declared is not None:
+        return declared
+    if reading.get("psi_mem_some") is None:
+        return DEFAULT_MAX_SWAP_USED_WITHOUT_PSI
+    return None
+
+
+def swap_ceiling_applies(reading: dict, limits: dict) -> bool:
+    """#2296 : le plafond de swap utilisé compte-t-il pour ce relevé ?
+
+    Seulement pour un hôte qui a un plafond (`swap_ceiling` : déclaré, ou
+    repli de 0028 quand l'hôte ne mesure pas PSI, #2354), et avec une pression
+    mémoire mesurée au-dessus de `SWAP_PRESSURE_SHARE` de son propre plafond :
+    le swap utilisé est un STOCK, pas une pression (les pages y restent tant
+    qu'on ne les touche pas), donc un relevé où il dépasse le plafond après le
+    retour au calme ne doit plus retenir les tours. Sans PSI (hôte qui ne sait
+    pas le mesurer), le plafond garde son sens d'avant : pas de signal de
+    pression réelle, la porte ne s'ouvre pas sur le seul stock. Sans plafond
+    mémoire (appelant qui n'a pas calculé `thresholds`), même repli prudent.
+    Sans aucun plafond (hôte avec PSI, aucune fiche n'en déclare), il n'y a
+    rien à corroborer : le stock ne plafonne pas.
+    """
+    if swap_ceiling(reading, limits) is None:
+        return False
+    psi = reading.get("psi_mem_some")
+    limit = limits.get("max_mem_pressure")
+    if psi is None or limit is None:
+        return True
+    return psi > limit * SWAP_PRESSURE_SHARE
+
+
 def breaches(reading: dict, limits: dict) -> list[dict]:
     """Les seuils franchis par un relevé, du plus grave au moins grave.
 
@@ -1272,6 +1354,12 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     mesure CRITIQUE est franchie au-delà du facteur de gravité (voir les
     constantes `CRITICAL_*`) : l'exécuteur met alors en pause les agents les
     moins prioritaires, jamais au milieu d'un tour.
+
+    #2296 : le swap utilisé ne franchit son plafond que corroboré par une
+    pression mémoire réelle (`swap_ceiling_applies`) ; la pression mémoire
+    elle-même (PSI `memory some` 60 s) est le critère d'admission qui suit la
+    pression réelle. #2354 : sans PSI et sans plafond déclaré, le repli de
+    0028 s'applique (le stock est le seul signal) et le libellé le dit.
     """
     out: list[dict] = []
 
@@ -1300,7 +1388,9 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             out[-1]["path"] = path
 
     def ceiling(key, label, value, limit, critical_factor):
-        if value is None:
+        # #2296 : un plafond absent (None) ne plafonne rien — le stock de swap
+        # n'a pas de défaut ; les autres plafonds en ont un.
+        if value is None or limit is None:
             return
         if value > limit:
             out.append({"key": key, "label": label, "value": value, "limit": limit,
@@ -1308,8 +1398,16 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
 
     floor("min_mem_available", "available memory", reading.get("mem_available_bytes"),
           limits["min_mem_available"], CRITICAL_MEM_FACTOR)
-    ceiling("max_swap_used", "swap used", reading.get("swap_used_bytes"),
-            limits["max_swap_used"], CRITICAL_SWAP_FACTOR)
+    # #2296: swap used only counts with a measured memory pressure: a stock is
+    # not a pressure (see `swap_ceiling_applies`). #2354: on a host that cannot
+    # measure PSI and declares no ceiling, the 0028 conservative fallback is
+    # the only memory signal left, and the label says so.
+    if swap_ceiling_applies(reading, limits):
+        fallback = limits.get("max_swap_used") is None
+        ceiling("max_swap_used",
+                "swap used (no PSI: conservative default)" if fallback else "swap used",
+                reading.get("swap_used_bytes"), swap_ceiling(reading, limits),
+                CRITICAL_SWAP_FACTOR)
     ceiling("max_load", "1-min load", reading.get("load1"),
             limits["max_load"], CRITICAL_LOAD_FACTOR)
     volume_floor("min_disk_free", "free disk", "disk_free_bytes",
@@ -1329,6 +1427,15 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
         out.append({"key": "max_tmpfs_used", "label": "tmpfs %s used"
                     % (reading.get("tmp_path") or "/tmp"), "value": part, "limit": limit,
                     "critical": part >= limit + (1.0 - limit) / 2.0})
+    # #2296: memory pressure of the host (PSI some, 60 s): the admission
+    # signal that follows the real pressure; critical halfway to 100 %, like
+    # the CPU pressure.
+    mem_pressure, limit = reading.get("psi_mem_some"), limits.get("max_mem_pressure")
+    if mem_pressure is not None and limit is not None and mem_pressure > limit:
+        out.append({"key": "max_mem_pressure",
+                    "label": "memory pressure (PSI some 60 s)",
+                    "value": mem_pressure, "limit": limit,
+                    "critical": mem_pressure >= limit + (100.0 - limit) / 2.0})
     # L159d: CPU pressure of the host; critical halfway between the ceiling
     # and 100 %
     cpu_pressure, limit = reading.get("psi_cpu_some"), limits.get("max_cpu_pressure")
