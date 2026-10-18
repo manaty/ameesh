@@ -6,6 +6,7 @@ workstation venv, so no VM, unit, database or real mail is touched.
 """
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import io
 import json
@@ -388,6 +389,17 @@ class StagingTest(unittest.TestCase):
         journal = (self.state / 'calls.log').read_text()
         self.assertIn('Rapport de sonde (JSON)', journal)
         self.assertIn('"tour": "non remis"', journal)
+
+    def test_second_staging_is_refused_by_the_operator_lock(self):
+        """#2448 : une seule sequence staging a la fois, meme lancee a la main."""
+        folder = self.home / '.local/state/ameesh/mise-a-jour'
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / 'staging.lock', 'w') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            p = self.run_staging()
+        self.assertEqual(p.returncode, 75, p.stdout)
+        self.assertIn('staging deja en cours', p.stderr)
+        self.assertEqual(self.actions(), [])
 
     def test_preflight_failure_changes_nothing(self):
         (self.state / 'scenario').write_text('ko=ameesh-agents-2:verifier\n')
