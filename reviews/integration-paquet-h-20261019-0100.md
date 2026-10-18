@@ -70,7 +70,10 @@ leur delta propre. Aucun conflit de composition n'a été rencontré.
   attendus, 19 entrées de composition, 15 contenus présents, 2 partiels,
   1 vide, aucun défaut. Les trois contenus à lire sont expliqués ci-dessous ;
   aucun n'est une perte.
-- Tests ciblés de composition : à compléter avant la CI complète.
+- Tests ciblés de composition : `tests.test_1398_peek_boundaries` (9) et la
+  plus grande partie de `tests.test_1617_review_designation_pg` (26) sans
+  échec en psql, puis arrêt volontaire du run local (coût des passes
+  complètes) ; la suite complète du paquet en CI qualifie le reste.
 - Contenu : 60 fichiers, +3915/−412 hors manifeste ; aucune migration.
 
 ## Contenus à lire (avertissements d'inclusion)
