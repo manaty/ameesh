@@ -112,6 +112,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "account_identity",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
+                 # #2341 : un hôte dont l'échantillonneur s'est tu n'alimente plus
+                 # les autres alertes ; son propriétaire l'apprend
+                 "host_unsampled",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
@@ -196,6 +199,7 @@ TYPE_LABELS = {
     # #1107 (n2 P3 de #1035) : un lot que les passes d'alerte ne savent pas lire
     "lot_unreadable": "work item unreadable by the alert passes",
     "host_pressure": "host under pressure",
+    "host_unsampled": "host sampler silent",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",

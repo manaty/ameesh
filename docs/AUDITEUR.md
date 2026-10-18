@@ -348,8 +348,10 @@ Le texte qu'il donne à chaque sous-agent, avec l'angle et la période :
 Tu es un sous-agent en lecture seule de l'auditeur d'ameesh.
 Angle : <angle>. Période : <début> à <fin>.
 Tu lis seulement : les commandes de lecture `ameesh … --json` citées dans la
-consigne de l'auditeur, `psql "$AUDITEUR_DSN"` (rôle en lecture seule),
-`journalctl`, `gh … list` et `gh … view`, `git log`, `git show`, `git grep`,
+consigne de l'auditeur, `psql "$AUDITEUR_DSN"` (rôle en lecture seule, si et
+seulement si la variable est définie ; jamais `AGENT_MESH_DSN`, qui n'est pas
+borné à la lecture), `journalctl`, `gh … list` et `gh … view`, `git log`,
+`git show`, `git grep`,
 les fichiers du dépôt. Tu n'envoies aucun courrier et tu ne lances aucune
 commande qui écrit : ni `agent-mail send`, ni `ameesh resume|restart|set|budget|menage`,
 ni `ameesh work add|move|note|close`, ni l'option `--record`, ni
@@ -459,10 +461,14 @@ par lui-même (une lecture, pas un sous-agent) :
 ### Journaux et CI
 
 ```sh
-# exécuteurs d'un poste (unités utilisateur) et ameesh notify
-journalctl --user -u 'ameesh-runner-agent@*' -u ameesh-notify --since '-24h' \
-  --no-pager -o short-iso \
-  | grep -E 'rotation|harnais arrêté|harness stopped|SIGKILL|hôte non prêt|host not ready|bail perdu|lease lost|orphelin|orphan|pression|pressure|échec|fail|arrêté|stopped'
+# exécuteurs d'un poste : unités utilisateur, lues dans le journal SYSTÈME.
+# `journalctl --user` ne rend rien sur l'hôte de l'auditeur depuis le 11/10 ;
+# `--user-unit` lit le journal système filtré par unité utilisateur, et
+# `journalctl -t ameesh` reste le repli quand l'hôte journalise sous ce tag.
+filtre='rotation|harnais arrêté|harness stopped|SIGKILL|hôte non prêt|host not ready|bail perdu|lease lost|orphelin|orphan|pression|pressure|échec|fail|arrêté|stopped'
+journalctl --user-unit 'ameesh-runner-agent@*' --user-unit ameesh-notify \
+  --since '-24h' --no-pager -o short-iso | grep -E "$filtre"
+journalctl -t ameesh --since '-24h' --no-pager -o short-iso | grep -E "$filtre"
 # exécuteurs d'un serveur du mesh (unités système), par l'accès que l'hôte donne
 journalctl -u 'ameesh-runner@*' --since '-24h' --no-pager -o short-iso
 
@@ -477,9 +483,11 @@ gh pr list -R <dépôt> --state all --search 'updated:>=AAAA-MM-JJ' \
 
 ### Requêtes
 
-Sous le rôle en lecture seule (voir « Mise en service ») :
-`psql "$AUDITEUR_DSN" -X -c "<requête>"`. Période : 24 heures, à adapter. Les
-colonnes `body` du courrier et `note` des lots demandent le rôle des contenus.
+Sous le rôle en lecture seule (voir « Mise en service »), et **seulement si**
+le propriétaire l'a créé : `psql "${AUDITEUR_DSN:?rôle en lecture seule absent}"
+-X -c "<requête>"` (l'expansion échoue si la variable est vide : jamais de
+connexion par défaut). Période : 24 heures, à adapter. Les colonnes `body` du
+courrier et `note` des lots demandent le rôle des contenus.
 
 ```sql
 -- 1. courrier remis plus de 10 minutes après son dépôt, ou pas encore remis
@@ -792,7 +800,8 @@ contrôles verts, l'étape 9 ; sinon `retour`, par une unité transitoire de la
 même façon (`"$MAJ/poste.sh" retour`, `"$MAJ/vm.sh" retour`), puis une PR qui
 annule le correctif (`git revert`), menée par le même circuit, et une analyse
 profonde de l'incident. Le journal de l'unité reste lisible après sa fin :
-`journalctl --user -u ameesh-maj-<court>`.
+`journalctl --user-unit ameesh-maj-<court>` (ou, si l'hôte journalise sous ce
+tag, `journalctl -t ameesh | grep ameesh-maj-<court>`).
 Le code de sortie de l'unité ne prouve pas que les contrôles ont tourné : une
 unité arrêtée à la main finit aussi en `Result=success`, avec ExecMainStatus 0.
 Avant l'étape 9, il lit la sortie des contrôles dans ce journal, ou leurs codes
@@ -925,14 +934,38 @@ ameesh set auditeur effort=<niveau> session_policy=taille
 une permission), une fois en place les rôles du contrat de supervision
 (`deploy/sql/role-superviseur.sql` et `deploy/sql/role-superviseur-contenus.sql`) :
 
-```sql
-CREATE ROLE auditeur_lecture LOGIN IN ROLE ameesh_superviseur, ameesh_superviseur_contenus;
-ALTER ROLE auditeur_lecture SET default_transaction_read_only = on;
--- mot de passe : \password auditeur_lecture, puis une ligne dans ~/.pgpass de l'hôte
+```sh
+PGOPTIONS='-c search_path=<schéma ameesh>' \
+  psql "<DSN d'un rôle qui peut CREATE ROLE>" -v ON_ERROR_STOP=1 \
+       -f deploy/sql/role-auditeur.sql
+# mot de passe : jamais dans un fichier versionné ; puis une ligne ~/.pgpass (0600)
+psql "<DSN d'un rôle qui peut CREATE ROLE>"   # \password auditeur_lecture
 ```
 
-L'accès réseau et `pg_hba.conf` suivent ceux du rôle du mesh. Sans ce rôle,
-l'analyse se contente des commandes `ameesh … --json`.
+Le script est transactionnel et idempotent : il crée le rôle de connexion
+`auditeur_lecture` s'il manque, le rend membre des deux contrats et pose
+`default_transaction_read_only = on` ; il retire ses droits directs sur le
+schéma (seuls les contrats hérités comptent) et refuse une appartenance hors
+des deux rôles. Il refuse aussi toute propriété d'objet — schéma, table,
+séquence, fonction, type, base, privilèges par défaut, y compris par un des
+contrats hérités — car un propriétaire se redonne les droits que le `REVOKE`
+lui retire, ainsi que tout réglage `ALTER ROLE … IN DATABASE … SET
+default_transaction_read_only`, qui supplante celui du rôle. Il force aussi
+`INHERIT TRUE` sur les deux appartenances (PG 16+), même accordées sous
+NOINHERIT, et relit l'USAGE du schéma ainsi que la lecture effective d'une
+colonne d'état et d'une de contenus. Il ne pose aucun mot de passe.
+
+Vérifier depuis l'exécuteur de l'auditeur, une fois `AUDITEUR_DSN` posé :
+
+```sh
+psql "$AUDITEUR_DSN" -X -Atc 'SELECT 1'                     # doit rendre 1
+psql "$AUDITEUR_DSN" -X -Atc 'CREATE TEMP TABLE t(x int)'   # doit échouer : lecture seule
+```
+
+L'accès réseau et `pg_hba.conf` suivent ceux du rôle du mesh. Sans ce rôle
+(ou sans `AUDITEUR_DSN` dans le drop-in), l'analyse se contente des commandes
+`ameesh … --json` et le signale ; elle n'utilise jamais `AGENT_MESH_DSN`, qui
+n'est pas borné à la lecture.
 
 **Accès GitHub** : l'authentification `gh` de l'hôte doit lui permettre de
 lire la CI des dépôts surveillés, de pousser une branche, d'ouvrir et de
@@ -942,7 +975,9 @@ décider.
 
 **Environnement** de son exécuteur
 (`~/.config/systemd/user/ameesh-runner-agent@auditeur.service.d/auditeur.conf`),
-sans aucun secret :
+sans aucun secret. `AUDITEUR_DSN` ne se pose qu'une fois le rôle créé (voir
+« Mise en service ») ; sans lui, la consigne interdit `psql` et l'analyse reste
+sur `ameesh … --json` :
 
 ```ini
 [Service]

@@ -1103,8 +1103,13 @@ def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict
     # transitions se lisent dans l'ordre chronologique (`lot_transitions`),
     # pas le journal complet, qui rend le plus récent d'abord.
     from . import progress  # import tardif : progress importe ce module
-    transitions = storage.of(db).progress.lot_transitions([int(item_id)])
-    jalons = progress._jalons_de_lot(item, transitions, [], milestones(db, item_id))
+    store = storage.of(db)
+    transitions = store.progress.lot_transitions([int(item_id)])
+    # #2346 : `human:<nom>` et le nom nu ne sont le même acteur que si le nom
+    # nu n'est pas un agent du registre.
+    agents = {r["name"] for r in store.progress.agents(None) if r.get("name")}
+    jalons = progress._jalons_de_lot(item, transitions, [], milestones(db, item_id),
+                                     agents=agents)
     if jalons.get("verdict_kind") == "blocked" and jalons.get("verdict_current"):
         raise WorkError(
             "verdict not required refused: lot %s carries a current blocked "
