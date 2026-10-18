@@ -161,9 +161,10 @@ class HostInfo:
     executor_id: str
     #: limites physiques de l'hôte (contrat 1.1) : `{"max_agents": int |
     #: null, "resources": {"min_mem_available": octets, "max_swap_used":
-    #: octets, "max_load": nombre, "min_disk_free": octets}}` — `max_agents`
-    #: et `limits` de `resources.host_limits`, les seuils absents prenant
-    #: leur défaut prudent côté exécuteur (`resources.thresholds`)
+    #: octets, "max_load": nombre, "min_disk_free": octets, "max_mem_pressure":
+    #: pourcentage}}` — `max_agents` et `limits` de `resources.host_limits`,
+    #: les seuils absents prenant leur défaut prudent côté exécuteur
+    #: (`resources.thresholds`)
     limits: Mapping[str, Any]
     lease_ttl_s: float
     lease_renew_s: float

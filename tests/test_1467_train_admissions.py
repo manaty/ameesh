@@ -28,7 +28,9 @@ class TrainAdmissionsTest(PgTestCase):
             head=row["frozen_sha"], required=kw["required"])
         self.requirement = mock.Mock(side_effect=lambda item, row, base, path:
             train_admissions.Requirement(row["work_item_id"], base, row["frozen_sha"],
-                                         "sensitive", 2, "c" * 40))
+                                         "sensitive", 2, "c" * 40,
+                                         files=({"path": "content", "class": "sensitive",
+                                                 "rule": ["content"]},)))
         self.admissions = train_admissions.Admissions(
             self.db, self.project, self.history, policy=self.requirement)
         self.entry = self.enqueue()
@@ -104,7 +106,8 @@ class TrainAdmissionsTest(PgTestCase):
         with self.assertRaisesRegex(train.TrainError, "unknown historical author"):
             self.qualify()
 
-    def recorded_admission(self, *, light=False, reviewed=True):
+    def recorded_admission(self, *, light=False, reviewed=True, path="content",
+                           reviews=2, reviewers=(("r1", "claude"), ("r2", "deepseek"))):
         env = dict(os.environ, GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
                    GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
         def git(*args):
@@ -113,9 +116,13 @@ class TrainAdmissionsTest(PgTestCase):
         # Enrollment creates main at base after these commits.
         git("init", "-q", "-b", "fixture")
         def commit(content):
-            with open(os.path.join(self.tmp, "content"), "w") as fh:
+            destination = os.path.join(self.tmp, path)
+            folder = os.path.dirname(destination)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(destination, "w") as fh:
                 fh.write(content)
-            git("add", "content")
+            git("add", path)
             git("commit", "-qm", content)
             return git("rev-parse", "HEAD")
         with open(os.path.join(self.tmp, "federation.yaml"), "w") as fh:
@@ -124,7 +131,7 @@ class TrainAdmissionsTest(PgTestCase):
                     default="light" if light else "sensitive", rules=[])}),
                 train_reviews=dict(schema="ameesh-train-reviews-policy/1", projects={
                     self.project.name: dict(rules=[] if light else [
-                        dict(paths=["content"], reviews=2)])}))), fh)
+                        dict(paths=[path], reviews=reviews)])}))), fh)
         git("add", "federation.yaml")
         base, first, head = commit("base"), commit("author"), commit("correction")
         self.admissions.policy = train_policy.Versioned(self.tmp, base, self.project.name)
@@ -133,7 +140,7 @@ class TrainAdmissionsTest(PgTestCase):
         entry = self.ops.queue_add(item, target="main", frozen_sha=head, note="", actor="fixture",
                                   source=self.admissions.source, frozen_id=freeze["id"])
         receipts = {"commit:" + sha: dataclasses.asdict(author(sha)) for sha in (first, head)}
-        for reader, family in ((("r1", "claude"), ("r2", "deepseek")) if reviewed else ()):
+        for reader, family in (reviewers if reviewed else ()):
             mark = self.ops.add_milestone(item, "verdict", sha=head, actor=reader, verdict="ok", note="")
             _, receipt = verdict(mark["id"], reader, family, commit=head)
             receipt = dataclasses.replace(receipt, milestone={
@@ -308,6 +315,45 @@ class TrainAdmissionsTest(PgTestCase):
         base, _, _, entry = self.recorded_admission(reviewed=False)
         with self.assertRaisesRegex(train.TrainError, "missing independent final-head reviews"):
             self.admissions.qualify([entry], base, "packet")
+
+    def test_critical_sensitive_lot_with_two_same_family_reviews_is_refused_at_admission(self):
+        # deploy/** is a critical (production) path: the merge gate requires two
+        # distinct model families even when the per-path count rule says one.
+        # Admission must apply that same reading before the freeze, not let the
+        # lot enter a packet and withdraw it after the freeze.
+        base, _, _, entry = self.recorded_admission(
+            path="deploy/mise-a-jour/bascule.py", reviews=1,
+            reviewers=(("r1", "claude"), ("r2", "claude")))
+        with self.assertRaisesRegex(train.TrainError, "missing independent final-head reviews"):
+            self.admissions.qualify([entry], base, "packet")
+
+    def test_critical_sensitive_lot_with_two_families_is_admitted(self):
+        base, first, head, entry = self.recorded_admission(
+            path="deploy/mise-a-jour/bascule.py", reviews=1,
+            reviewers=(("r1", "claude"), ("r2", "deepseek")))
+        proof = self.admissions.qualify([entry], base, "packet")["members"][0]
+        self.assertEqual((proof["policy"]["risk"], proof["policy"]["reviews"]),
+                         ("sensitive", 2))
+        self.assertEqual(proof["policy"]["files"], (
+            {"path": "deploy/mise-a-jour/bascule.py", "class": "sensitive", "rule": None},))
+        self.assertEqual(set(proof["history"]["reviews"]["coverage"]), {first, head})
+        self.assertTrue(all(len(readers) == 2
+                            for readers in proof["history"]["reviews"]["coverage"].values()))
+
+    def test_requirement_refuses_a_critical_class_with_one_review(self):
+        valid = self.requirement(None, self.entry, BASE, self.tmp)
+        files = ({"path": "deploy/mise-a-jour/bascule.py", "class": "sensitive",
+                  "rule": ["deploy/**"]},)
+        with self.assertRaisesRegex(train.TrainError, "requires 2 independent"):
+            dataclasses.replace(valid, reviews=1, files=files).check(self.entry, BASE)
+        with self.assertRaisesRegex(train.TrainError, "understates"):
+            dataclasses.replace(valid, risk="light", reviews=0, files=files).check(
+                self.entry, BASE)
+        # An absent classification is never read as a reassuring light one.
+        with self.assertRaisesRegex(train.TrainError, "classified frozen paths required"):
+            dataclasses.replace(valid, files=()).check(self.entry, BASE)
+        self.assertEqual(dataclasses.replace(valid, files=files).check(self.entry, BASE),
+                         None)
 
     def test_light_admission_still_preserves_an_explicit_blockage(self):
         base, _, head, entry = self.recorded_admission(light=True, reviewed=False)

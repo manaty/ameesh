@@ -4,17 +4,48 @@
 The reviewed policy provider is mandatory: the canon's path classification
 alone does not encode the review count for SQL/security/production. Neither
 a journal note nor a caller-supplied receipt is used as a policy decision.
-No provider, runner hook or configuration is enabled by importing this module.
+The provider also supplies its classified reading of the exact frozen diff;
+admission rechecks the declared class and count against that same reading, so
+a critical SQL/security/production lot cannot enter with one family and be
+withdrawn after the freeze. No provider, runner hook or configuration is
+enabled by importing this module.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from . import land, lot_class, merge_queue, storage, work
+from . import land, lot_class, merge_queue, review, storage, work
 from .train import MemberDeferred, TrainError, identity
 from .train_review import SHA
 
 UNAVAILABLE = set(work.MERGED_STATES) | {"closed"} | work.WAITING
+_RISKS = ("light", "normal", "sensitive")
+
+
+def _classified(files):
+    """Validate the classified files of the exact frozen diff.
+
+    The policy reads the diff itself; admission rechecks that its declared
+    class and review count cannot be weaker than that same reading. A missing
+    or malformed reading refuses: an absent classification is never a light
+    one.
+    """
+    if not isinstance(files, (tuple, list)) or not files:
+        raise TrainError("classified frozen paths required")
+    out = []
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"path", "class", "rule"}:
+            raise TrainError("malformed classified frozen path")
+        path, cls, rule = entry["path"], entry["class"], entry["rule"]
+        if not isinstance(path, str) or not path or cls not in _RISKS:
+            raise TrainError("malformed classified frozen path")
+        if rule is not None and (not isinstance(rule, (list, tuple)) or not rule
+                                 or any(not isinstance(p, str) or not p for p in rule)):
+            raise TrainError("malformed classified frozen path")
+        out.append({"path": path, "class": cls, "rule": rule})
+    if len({entry["path"] for entry in out}) != len(out):
+        raise TrainError("duplicate classified frozen path")
+    return out
 
 
 @dataclass(frozen=True)
@@ -25,15 +56,27 @@ class Requirement:
     risk: str
     reviews: int
     policy_commit: str
+    #: the policy's reading of the exact frozen diff: [{path, class, rule}].
+    #: Admission recomputes the class minimum (critical SQL/security/prod
+    #: paths need two distinct families) instead of trusting the count alone.
+    files: tuple = ()
 
     def check(self, row, base):
         if (self.lot, self.base, self.head) != (row["work_item_id"], base, row["frozen_sha"]):
             raise TrainError("review policy covers another lot, base or frozen head")
         if not isinstance(self.policy_commit, str) or not SHA.fullmatch(self.policy_commit):
             raise TrainError("versioned review policy required")
-        if type(self.reviews) is not int or self.risk not in ("light", "normal", "sensitive") \
+        if type(self.reviews) is not int or self.risk not in _RISKS \
                 or self.reviews not in ({0} if self.risk == "light" else {1, 2}):
             raise TrainError("explicit known non-release review requirement expected")
+        files = _classified(self.files)
+        worst = max((entry["class"] for entry in files), key=review.RANK.__getitem__)
+        if review.RANK[worst] > review.RANK[self.risk]:
+            raise TrainError("review policy understates the class of the frozen content")
+        minimum = merge_queue.required_verdicts({"class": self.risk, "files": files})
+        if self.reviews < minimum:
+            raise TrainError("review policy requires %d independent review(s) for the frozen "
+                             "class, not %d" % (minimum, self.reviews))
 
 
 class Admissions:
