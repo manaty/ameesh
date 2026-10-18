@@ -27,7 +27,10 @@ number, the reviewers, the exact SHA and the authors of the frozen content;
 `recorded` re-reads it as-is, so the same freeze replayed returns the recorded
 designation without a second mail. A new freeze is another mark: the old one no
 longer counts, and the port refuses to write for a freeze that is no longer the
-latest (`StaleFreeze`) — no return to an old head.
+latest (`StaleFreeze`) — no return to an old head. A **forced** replay (#2487)
+writes a newer mark over a reported one, but still checks the mailbox: a review
+request or waiting notice already deposited for the same freeze is not sent
+again (#2541).
 """
 from __future__ import annotations
 
@@ -109,6 +112,56 @@ def _designation(lot: int, freeze_id: int, *, state: str, required: int, reviewe
         "authors": [dict(a) for a in authors or ()],
         "policy_ref": str(policy_ref or ""),
     }
+
+
+def _sent_review_mails(db, lot: int, freeze_id: int) -> tuple:
+    """Les courriels de désignation déjà déposés pour CE gel (#2541).
+
+    Rend `(destinataires des demandes de relecture, destinataires de l'avis
+    d'attente)`. La boîte est la preuve de l'envoi : la marque du gel ne la
+    donne pas (un destinataire inconnu au gel laisse une marque `waiting` sans
+    courrier, et une marque `carried` ne nomme que des relecteurs déjà
+    sollicités pour un **autre** gel). Le rejeu forcé écrit une marque plus
+    récente, mais un second réveil du même relecteur ou une seconde alerte de
+    capacité ne sont pas des faits nouveaux.
+    """
+    rows = db.query(
+        "SELECT recipient, kind, payload FROM agent_mailbox"
+        " WHERE work_item_id = %s"
+        "   AND payload->'review_designation'->>'freeze' = %s"
+        " ORDER BY id",
+        (str(int(lot)), str(int(freeze_id))))
+    requests: set = set()
+    waiting: set = set()
+    for row in rows or ():
+        recipient = str((row or {}).get("recipient") or "").strip()
+        if not recipient:
+            continue
+        payload = (row or {}).get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                continue
+        designation = (payload or {}).get("review_designation") or {}
+        if str(designation.get("freeze")) != str(int(freeze_id)):
+            continue
+        if str((row or {}).get("kind") or "") == "request":
+            requests.add(recipient)
+        elif str(designation.get("state") or "") == WAITING:
+            waiting.add(recipient)
+    return requests, waiting
+
+
+def _already_sent(message: Mapping, sent: tuple) -> bool:
+    """Ce courrier du rejeu est-il déjà parti pour le même gel (#2541) ?"""
+    recipient = str((message or {}).get("to") or "").strip()
+    if not recipient:
+        return False
+    requests, waiting = sent
+    if str((message or {}).get("kind") or "") == "request":
+        return recipient in requests
+    return bool((message or {}).get("capacity")) and recipient in waiting
 
 
 def _nested_transaction(db) -> bool:
@@ -219,7 +272,9 @@ class PgPort:
         waiting state is retryable and its notification leaves only once per
         freeze. `force` (#2487) writes a new mark even when the freeze already
         has one (a forced selection after a refused carry must supersede the
-        reported mark); the caller uses it only for an explicit replay."""
+        reported mark); the caller uses it only for an explicit replay. That
+        replay does not send a request or a waiting notice already deposited
+        for the same freeze (#2541): the port filters them on the mailbox."""
         lot = int(lot)
         if self.after_commit is not None:
             return self._write(self.db, lot, freeze=freeze, required=required,
@@ -279,6 +334,14 @@ class PgPort:
         if state == WAITING and reviewers:
             raise DesignationError("a waiting designation designates no reviewer")
         messages = [dict(message or {}) for message in messages or ()]
+        if force:
+            # #2541 : le rejeu forcé écrit une marque plus récente, mais ne
+            # renvoie pas les demandes de relecture ni l'avis d'attente déjà
+            # partis pour ce gel. Le filtre précède le contrôle des
+            # destinataires : un courrier déjà déposé n'a plus à être validé.
+            sent = _sent_review_mails(db, lot, freeze_id)
+            messages = [message for message in messages
+                        if not _already_sent(message, sent)]
         undelivered = []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
