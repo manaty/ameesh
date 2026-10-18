@@ -273,8 +273,12 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         # comptée en entier) doit être future. Nouveau gel, gel absent, véhicule
         # bloqué, retrait ou échéance dépassée : le signal stale revient, et le
         # pilote renouvelle explicitement la déclaration sur la nouvelle tête.
+        # #2171 N3 : le lot parké doit être EN REVUE (qa) — un atterrissage ne
+        # remplace que l'attente de fusion ; sorti de qa (build, blocked,
+        # waiting_human), le signal revient.
         landing = landing_by_item.get(ident)
-        if not landing:
+        if (not landing or row.get("state") != "qa"
+                or landing.get("admitted") is False):
             continue
         vehicle = int(landing["vehicle_id"])
         open_vehicle = landing.get("open")
@@ -296,29 +300,76 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     return waits
 
 
+def latest_freeze(rows):
+    """Le dernier gel d'un lot : `(at, id)` maximal, jamais l'ordre de lecture.
+
+    #2171 N2 : `set_landing` épingle avec `ORDER BY at DESC, id DESC` ; tous les
+    lecteurs doivent départager un ex aequo de la même façon, sinon la tête
+    comparée à `pinned_sha` peut différer à tort (sens sûr : l'alerte revient).
+    Les jalons non `frozen` ou sans sha ne comptent pas."""
+    freezes = [r for r in rows if r.get("kind") == "frozen"
+               and (r.get("sha") or "").strip()]
+    if not freezes:
+        return None
+    return max(freezes, key=lambda r: (float(r.get("at_ts") or 0),
+                                       int(r.get("id") or 0)))
+
+
+def _admitted(st, rows, landings):
+    """#2171 N3 (revue) : l'admission se relit sur le LOT, pas seulement au geste.
+
+    Le chemin groupé ne doit pas parquer un lot qui a perdu son gel ou son
+    verdict acquis depuis la déclaration (nouveau gel sans verdict, retour en
+    `qa` après un build) : même vérité que `progress._jalons_de_lot`, donc le
+    signal stale revient comme dans `progress`. Trois lectures groupées, pour
+    les seuls lots déclarés."""
+    if not landings:
+        return []
+    from . import progress
+    ids = sorted({int(l["work_item_id"]) for l in landings})
+    by_id = {int(r["id"]): r for r in rows}
+    transitions, actions, declared = {}, {}, {}
+    for row in st.progress.lot_transitions(ids):
+        transitions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_actions(ids):
+        actions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_milestones(ids):
+        declared.setdefault(int(row["work_item_id"]), []).append(row)
+    out = []
+    for landing in landings:
+        ident = int(landing["work_item_id"])
+        item = by_id.get(ident)
+        if item is None:
+            out.append(landing)
+            continue
+        jalons = progress._jalons_de_lot(
+            item, transitions.get(ident, []), actions.get(ident, []),
+            declared.get(ident, []))
+        admitted = (jalons.get("last_frozen") is not None
+                    and jalons.get("verdict_kind") == "ok"
+                    and bool(jalons.get("verdict_current")))
+        out.append(dict(landing, admitted=admitted))
+    return out
+
+
 def _with_heads(st, landings):
     """#1945 : la tête exacte du véhicule est son dernier gel, lu en base.
 
     Une lecture groupée pour tous les véhicules déclarés, comparée à chaque
     passe à la tête épinglée dans `work_landings` (`pinned_sha`) : un nouveau
-    gel ne prolonge donc rien sans renouvellement explicite. Les jalons non
-    `frozen` ou sans sha ne comptent pas."""
+    gel ne prolonge donc rien sans renouvellement explicite. Le départage à
+    égalité d'instant est celui de `latest_freeze` (#2171 N2)."""
     rows = list(landings)
     vehicles = sorted({int(l["vehicle_id"]) for l in rows})
-    heads: dict[int, tuple[float, str]] = {}
+    by_vehicle: dict[int, list] = {}
     if vehicles:
         for mark in st.progress.lot_milestones(vehicles):
-            sha = (mark.get("sha") or "").strip()
-            if mark.get("kind") != "frozen" or not sha:
-                continue
-            vid = int(mark["work_item_id"])
-            at = float(mark.get("at_ts") or 0)
-            if vid not in heads or at >= heads[vid][0]:
-                heads[vid] = (at, sha)
+            by_vehicle.setdefault(int(mark["work_item_id"]), []).append(mark)
+    heads = {vid: latest_freeze(marks) for vid, marks in by_vehicle.items()}
     out = []
     for landing in rows:
         head = heads.get(int(landing["vehicle_id"]))
-        out.append(dict(landing, head=head[1]) if head else landing)
+        out.append(dict(landing, head=head["sha"].strip()) if head else landing)
     return out
 
 
@@ -346,6 +397,7 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     if open_items is None:
         open_items = st.operations.open_lots_activity(None) if any(
             c.get("depends_on") for c in commitments) else []
-    landings = _with_heads(st, st.work_dependencies.landings_for([int(r["id"]) for r in rows]))
+    landings = _with_heads(st, _admitted(
+        st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
     return resolve(rows, dates, commitments, packages, open_items, now=now,
                    dependencies=dependencies, landings=landings, holds=holds)
