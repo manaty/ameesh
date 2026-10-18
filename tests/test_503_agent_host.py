@@ -19,6 +19,8 @@ SCRIPT = ROOT / 'deploy/mise-a-jour/vm.sh'
 SSH = r'''#!/usr/bin/env python3
 import os, subprocess, sys
 from pathlib import Path
+if os.environ.get('FAKE_STALL_SSH'):
+    __import__('signal').pause()  # live transport, remote command never finishes
 state = Path(os.environ['FAKE_STATE'])
 argv = sys.argv[1:]
 command = argv[-1]
@@ -43,7 +45,7 @@ assert sys.argv[1:4] == ['-u', 'ameesh', '--'], sys.argv
 os.execvp(sys.argv[4], sys.argv[4:])
 '''
 AMEESH = r'''#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, subprocess, sys, time
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 assert os.environ.get('FAKE_REMOTE') == '1', 'registry must be read on the host'
@@ -60,6 +62,15 @@ if sys.argv[1:] == ['resume', '--help']:
         print('usage: ameesh resume ... --operator --reason R')
     else:
         print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
+    sys.exit(0)
+if sys.argv[1:] == ['pause', '--help']:
+    # #2184/R3 : sans --not-after, la pose n'a pas de barrière ; le script
+    # désactive le drain plutôt que de poser sans échéance.
+    if (state / 'sans-not-after').exists():
+        print('usage: ameesh pause AGENT --reason R [--human H] [--json]')
+    else:
+        print('usage: ameesh pause AGENT --reason R [--human H] '
+              '[--not-after EPOCH] [--json]')
     sys.exit(0)
 if sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error': sys.exit(1)
@@ -93,6 +104,13 @@ elif sys.argv[1] == 'show':
     if scenario == 'default-owner': row['lease_owner'] = 'host-agents:123'
     if scenario == 'db-ahead': row['lease_expires_ts'] = time.time()+30
     if scenario == 'moved-before': row['host'] = 'elsewhere'
+    # #2184/N1 : le mode peut changer entre la liste et la relecture ; dev9
+    # était execute au listage et passe externe au show.
+    if scenario == 'mode-change' and name == 'dev9': row['mode'] = 'externe'
+    # #2184/N1 + 0459 : le mode change alors qu'un drain est déjà posé ; la
+    # relecture doit encore pouvoir constater et lever notre pause.
+    if scenario == 'mode-change-apres-drain' and name == 'dev9' and pause.exists():
+        row['mode'] = 'externe'
     if scenario == 'always-busy': row['status'] = 'running'
     # #2152 : un agent qui enchaîne les tours ne rend la main qu'une fois
     # drainé ; « chaines-toujours » ne la rend jamais.
@@ -101,7 +119,8 @@ elif sys.argv[1] == 'show':
                                        'drain-remplace', 'pause-reponse-perdue',
                                        'pause-coupee', 'pause-coupee-etat-perdu',
                                        'pause-perdue-sans-pose', 'drain-puis-stop-error',
-                                       'drain-refuse-identite') \
+                                       'drain-refuse-identite', 'pause-expiree-tardive',
+                                       'mode-change-apres-drain') \
             and not pause.exists():
         row['status'] = 'running'
     if name == 'dev9' and scenario in ('chaines-toujours', 'chaines-relance'):
@@ -115,6 +134,19 @@ elif sys.argv[1] == 'show':
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
+    # #2184/R3 : un créateur tardif indépendant (systemd-run retardé) rejoue
+    # la pose APRÈS la relecture. La base doit la refuser au-delà de
+    # --not-after ; sinon la pause resterait orpheline.
+    if scenario == 'pause-expiree-tardive' and (state / 'resume-seen').exists() \
+            and (state / ('motif-tardif-' + name)).exists() \
+            and not (state / 'createur-tardif-fait').exists():
+        (state / 'createur-tardif-fait').touch()
+        echeance = (state / ('echeance-' + name)).read_text().strip()
+        subprocess.run(
+            [sys.argv[0], 'pause', name,
+             '--reason', (state / ('motif-tardif-' + name)).read_text(),
+             '--not-after', echeance, '--json'],
+            env=dict(os.environ), capture_output=True, text=True)
 elif sys.argv[1] in ('pause', 'resume'):
     # #2152 : les gestes du drain, avec le « changed » que lit le script.
     name = sys.argv[2]
@@ -124,7 +156,24 @@ elif sys.argv[1] in ('pause', 'resume'):
     with (state / 'operateur.log').open('a') as f:
         f.write('%s %s %s\n' % (sys.argv[1], name, ' '.join(args)))
     if '--reason' not in args: sys.exit(2)
+    if sys.argv[1] == 'resume':
+        (state / 'resume-seen').touch()
     if sys.argv[1] == 'pause':
+        # #2184/R3 : la base refuse une pose au-delà de --not-after. Le banc
+        # compare à l'horloge injectée (HORLOGE_FICHIER) quand elle est posée.
+        echeance = None
+        if '--not-after' in args:
+            echeance = float(args[args.index('--not-after') + 1])
+        hf = os.environ.get('HORLOGE_FICHIER')
+        maintenant = float(Path(hf).read_text()) if hf and Path(hf).exists() else time.time()
+        if echeance is not None and maintenant >= echeance:
+            with (state / 'refus-tardif.log').open('a') as f:
+                f.write('%s not_after\n' % name)
+            print(json.dumps({'agent': name, 'mode': 'execute',
+                              'operator_paused': pause.exists(),
+                              'changed': False, 'event_id': None,
+                              'refusal': 'not_after'}))
+            sys.exit(0)
         if scenario == 'chaines-pause-error': sys.exit(1)
         if scenario == 'drain-refuse-identite':
             # Geste d'opérateur refusé : vm.sh tourne dans une session liée à
@@ -136,6 +185,14 @@ elif sys.argv[1] in ('pause', 'resume'):
             # R1 B2 : réponse perdue, la pose n'a PAS abouti.
             print('{bad-json')
             sys.exit(0)
+        if scenario == 'pause-expiree-tardive':
+            # Timeout de l'appel (rc 124) : la pose n'est pas encore commitée.
+            # Le créateur tardif rejouera cette commande avec la même échéance.
+            (state / ('motif-tardif-' + name)).write_text(
+                args[args.index('--reason') + 1])
+            if echeance is not None:
+                (state / ('echeance-' + name)).write_text(str(echeance))
+            sys.exit(124)
         motif.write_text(args[args.index('--reason') + 1])
         pause.touch()
         with (state / 'sequence.log').open('a') as f:
@@ -257,8 +314,26 @@ print(time.time() + (60 if scenario == 'db-ahead' else 0))
 '''
 
 #: #2152 : plus aucune attente de créneau « idle » (DRAIN_ATTENTE est un
-#: interrupteur) ; les attentes de bail (5 s) restent instantanées.
-SLEEP = '#!/bin/sh\nexit 0\n'
+#: interrupteur) ; les attentes de bail (5 s) restent instantanées. #2184/R3 :
+#: l'attente de l'échéance d'une pose incertaine avance l'horloge du banc.
+SLEEP = ('#!/bin/sh\n'
+         'if [ "$1" = 15 ]; then\n'
+         '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
+         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
+         '  fi\n'
+         '  exec %s 0.5\n'
+         'fi\n'
+         'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
+
+#: #2184/R3 : l'échéance absolue remise à la base suit l'horloge injectée,
+#: comme le faux CLI qui la compare. Sans fichier d'horloge, date réelle.
+DATE = ('#!/bin/sh\n'
+        'if [ -n "${HORLOGE_FICHIER:-}" ] && [ -r "$HORLOGE_FICHIER" ] '
+        '&& [ "$1" = +%%s ]; then\n'
+        '  cat "$HORLOGE_FICHIER"\n'
+        '  exit 0\n'
+        'fi\n'
+        'exec %s "$@"\n') % (shutil.which('date') or '/bin/date')
 
 
 class AgentHostTest(unittest.TestCase):
@@ -276,7 +351,7 @@ class AgentHostTest(unittest.TestCase):
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
                              ('systemctl', SYSTEMCTL), ('systemd-run', SYSTEMD_RUN), ('db-python', DB_PYTHON), ('sleep', SLEEP),
-                             ('id', '#!/bin/sh\necho 1001\n'),
+                             ('date', DATE), ('id', '#!/bin/sh\necho 1001\n'),
                              ('journalctl', '#!/bin/sh\nexit 0\n')]:
             path = self.bin / name; path.write_text(source); path.chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), BASCULE_ENV=str(self.config),
@@ -455,7 +530,7 @@ class AgentHostTest(unittest.TestCase):
         # #2152 / R1 B1 : la levée est conditionnée au motif exact de la pose.
         pose = [l for l in journal.splitlines() if l.startswith('pause dev9')][0]
         reprise = [l for l in journal.splitlines() if l.startswith('resume dev9')][0]
-        motif = pose.split('--reason ', 1)[1]
+        motif = pose.split('--reason ', 1)[1].split(' --human ', 1)[0]
         self.assertIn('--expect-reason ' + motif, reprise)
         # Posé avant le redémarrage, et redémarré seulement hors tour.
         self.assertLess(p.stdout.index('drain posé'), p.stdout.index('dev9 : redémarré'))
@@ -463,6 +538,105 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
         self.assertIn('reprise prouvée (operator_paused=false)', p.stdout)
         self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_a_live_ssh_client_is_bounded_by_the_drain_deadline(self):
+        """#2184/N3 : un client SSH vivant mais bloqué ne suspend pas le
+        balayage au-delà de DRAIN_APPEL_DELAI (borne locale du groupe)."""
+        self.env.update(DRAIN_APPEL_DELAI='1', FAKE_STALL_SSH='1')
+        proc = subprocess.Popen(['bash', str(SCRIPT), 'agents', 'redemarrer'],
+                                env=self.env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            _, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.communicate()
+            self.fail('drain call outlived its deadline with a live SSH client')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('appel de drain expiré', stderr)
+        self.assertEqual(self.units(), '')
+
+    def test_drain_carries_a_deadline_and_the_operator_actor(self):
+        """#2184/R3 et N6 : la pose porte une échéance absolue et l'acteur
+        humain du poste, jamais le compte `ameesh` de la VM."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='chaines')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        pose = [l for l in self.operateur().splitlines() if l.startswith('pause dev9')][0]
+        self.assertIn('--not-after ', pose)
+        self.assertIn('--human human:', pose)
+
+    def test_cli_without_not_after_never_poses_a_drain(self):
+        """#2184/R3 : un CLI cible sans --not-after ne peut pas porter la
+        barrière ; le drain est désactivé plutôt que posé sans échéance."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'sans-not-after').touch()
+        p = self.run_vm(scenario='chaines')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('drain #2152 indisponible', p.stderr)
+        self.assertIn('--not-after', p.stderr)
+        self.assertNotIn('pause dev9', self.operateur())
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_timed_out_pause_cannot_commit_after_the_deadline(self):
+        """#2184/R3 : un appel pause expiré (rc 124) peut encore créer son
+        unité après la dernière lecture. Le créateur tardif rejoue la pose
+        APRÈS la reprise : la barrière d'échéance côté base la refuse, sans
+        événement ni pause orpheline."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        self.env['DRAIN_ECHEANCE'] = '1'
+        self.env['DRAIN_BORNE_INSTRUCTION'] = '1'
+        self.env['DRAIN_DERIVE'] = '1'
+        (self.state / 'horloge').write_text('0')
+        self.env['HORLOGE_FICHIER'] = str(self.state / 'horloge')
+        p = self.run_vm(scenario='pause-expiree-tardive')
+        self.assertNotEqual(p.returncode, 0)
+        # Le créateur tardif a bien exécuté sa pose après le nettoyage…
+        self.assertTrue((self.state / 'createur-tardif-fait').exists())
+        # … et la base l'a refusée : aucune pause, aucun événement.
+        self.assertEqual((self.state / 'refus-tardif.log').read_text().strip(),
+                         'dev9 not_after')
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertIn('resume dev9 --operator', self.operateur())
+        self.assertIn('--expect-reason', self.operateur())
+
+    def test_drain_refused_does_not_stop_the_other_agents(self):
+        """#2184/N2 : un refus de pose ne condamne que cet agent. Les autres
+        agents du balayage sont redémarrés ; l'agent non drainé n'est ni
+        redémarré ni repris."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='chaines-pause-error')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('pose du drain refusée', p.stderr)
+        self.assertIn('--user start ameesh-runner-agent@dev8.service', self.units())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertNotIn('resume dev9', self.operateur())
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_non_execute_agent_is_skipped_before_restart(self):
+        """#2184/N1 : un agent passé en mode non-execute pendant le drain
+        n'est ni drainé ni redémarré ; le motif du skip le nomme."""
+        p = self.run_vm(scenario='mode-change')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('dev9 : déplacé ou mode non execute (mode=externe), ignoré',
+                      p.stdout)
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertEqual(self.operateur(), '')
+
+    def test_mode_change_after_a_drain_still_lifts_the_pause(self):
+        """#2184/N1 + 0459 : l'agent passe externe après la pose du drain ;
+        la pause de ce drain est levée et l'agent n'est pas redémarré."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='mode-change-apres-drain')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('dev9 : déplacé ou mode non execute (mode=externe), ignoré',
+                      p.stdout)
+        self.assertIn('dev9 : drain levé', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertIn('resume dev9 --operator', self.operateur())
 
     def test_foreign_pause_replacing_the_drain_is_not_lifted(self):
         """R1 B1 : notre drain est levé de l'extérieur puis une NOUVELLE pause
@@ -719,7 +893,7 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm(scenario='moved-before')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.units(), '')
-        self.assertIn('placement modifié', p.stdout)
+        self.assertIn('dev9 : déplacé ou mode non execute (hôte=elsewhere), ignoré', p.stdout)
 
     def test_host_change_after_restart_is_not_a_valid_proof(self):
         p = self.run_vm(scenario='moved')
