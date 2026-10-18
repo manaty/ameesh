@@ -451,9 +451,10 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
         "merged": str(row.get("state") or "").upper() == "MERGED",
         "merge_commit": _norm(commit.get("oid") if isinstance(commit, dict) else ""),
         "armed": row.get("autoMergeRequest") is not None, "url": row.get("url") or "",
+        # #1748 (a): what `ready_pr` needs to require the declared statuses;
         # #2271 : `ready_pr` lit les checks requis dans ce rollup, pas dans
         # `ci` seul (qui compte `SKIPPED` comme vert).
-        "rollup": rollup,
+        "branch": branch, "rollup": rollup,
     }
 
 
@@ -1105,9 +1106,17 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
                        % (status.get("number"), target or "the target", frozen[:12],
                           ", ".join(gaps)))
+    from . import radar
+    # #1748 (a): a head of a declared branch is green only with a `success`
+    # status of each required prefix; an unknown branch gets them all
+    statuses = radar.required_statuses(project, status.get("branch"))
+    if statuses and not radar.ci_green(status.get("rollup") or [], statuses):
+        return False, "PR #%s carries no successful %s status on the freeze %s " \
+            "(required_statuses)" % (status.get("number"),
+                                     " / ".join("%s*" % p for p in statuses), frozen[:12])
     if project is not None and getattr(project, "ci_required", False):
         try:
-            merge_queue._required_ci(project, frozen)
+            merge_queue._required_ci(project, frozen, branch=status.get("branch"))
         except merge_queue.QueueError as exc:
             return False, str(exc)
     return True, ""
