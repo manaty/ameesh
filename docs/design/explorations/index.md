@@ -34,6 +34,7 @@ after [home#52](https://github.com/manaty/home/pull/52) merges.
 - [Versioning for agents: explicit dependencies and per-change attestation](versionnement-agents.md)
 - [Talking to the outside: other meshes, off-mesh agents and humans](hors-mesh.md)
 - [A freeze that tolerates changes without effect](gel-tolerant.md)
+- [Triage of pull requests attached to no lot](pr-sans-lot.md)
 
 The `tests.test_l1124_explorations` guard checks the cards and the local
 references from plans, roadmaps and lots. It is part of the documentation
