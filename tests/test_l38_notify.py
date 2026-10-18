@@ -612,6 +612,71 @@ class FiabiliteTest(_Base):
         self.assertIn(identite_b, notifier.state["notified"])
         self.assertEqual(notifier.state["summary"], {})
 
+    def test_resume_de_debit_ne_redouble_pas_un_envoi_direct(self):
+        # #2395 B2 (relecture e828508e1) : un bucket de résumé resté en échec
+        # pendant que l'alerte se résout puis revient ne doit pas réémettre un
+        # `raised` déjà livré en direct dans la même passe.
+        ncfg = self.ncfg(default_human="human:proprio", rate_per_minute=1)
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        reel = notify.Sender(env=_sender_env(self.desk))
+
+        class Pannable:
+            panne = True
+
+            def send(self, channel, message):
+                if self.panne:
+                    raise notify.ChannelError("panne simulee")
+                return reel.send(channel, message)
+
+        sender = Pannable()
+        state = notify.empty_state()
+        state["rate"]["human:proprio"] = [4000.0]
+        notifier = self.notifier(ncfg, state, sender=sender)
+        self.now = 4000.0
+        self.passe(notifier, [alerte])
+        self.assertTrue(notifier.state["summary"])
+        self.now = 4001.0
+        self.passe(notifier, [])
+        self.now = 4061.0
+        sender.panne = False
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([(r["event"], r["delivery"]) for r in records],
+                         [("raised", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_resume_de_debit_ancien_membre_raccorde_a_l_entree_active(self):
+        # #2395 B2 (relecture e828508e1) : un membre synthétique de l'ancien
+        # format est raccordé à l'entrée active persistée quand elle est
+        # identifiable ; le résumé marque alors sa vraie identité, et le retour
+        # de l'alerte ne repart ni en direct ni en résumé.
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        state = notify.empty_state()
+        key = notify.key_of(alerte)
+        # état antérieur au lot : l'entrée active n'avait pas encore de
+        # `severity` persistée ; le raccord doit retrouver l'identité réelle.
+        state["active"][key] = {
+            "alert": alerte, "key": key,
+            "human": "human:proprio", "source": "alerte", "status": "resumee",
+            "raised_ts": 900.0, "channels": {}}
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 1}, "resolved": 0, "attempts": 0}
+        notifier = self.notifier(ncfg, state)
+        self.now = 3000.0
+        self.passe(notifier, [alerte])
+        identite = notify.Notifier._notified_id(
+            {"key": key, "severity": alert_ack.severity(alerte), "alert": alerte},
+            "human:proprio")
+        self.assertIn(identite, notifier.state["notified"])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        self.now = 3001.0
+        self.passe(notifier, [])
+        self.now = 3061.0
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([r for r in records if r["event"] in ("raised", "summary")], [])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+
     def test_ancien_resume_de_debit_est_rendu_une_fois(self):
         # état persisté avant #2395 : le compte par type reste rendu par le
         # résumé, puis le registre n'a plus de membre à retenir. Bucket d'un

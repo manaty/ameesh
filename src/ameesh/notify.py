@@ -1954,10 +1954,37 @@ class Notifier:
     def _summary_forbidden(self, human, kind) -> bool:
         return kind == "slo_breach" and self._owner_human(human)
 
+    def _legacy_summary_members(self, human, kind, count, exclude=()) -> list:
+        """Membres d'un ancien compte `{type: n}`.
+
+        Chaque compte est raccordé à une entrée active `resumee` du même
+        humain et du même type quand le raccord est identifiable (autant
+        d'entrées que de comptes) ; sinon l'identité reste synthétique : le
+        compte est rendu, sans prétendre dédoublonner une alerte précise."""
+        excluded = set(exclude)
+        candidates = []
+        for entry in (self.state.get("active") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("human") != human or entry.get("status") != "resumee":
+                continue
+            if (entry.get("alert") or {}).get("type") != kind:
+                continue
+            member = self._summary_member(entry, human)
+            if self._summary_member_id(member) not in excluded:
+                candidates.append(member)
+        candidates.sort(key=self._summary_member_id)
+        members = list(candidates) if len(candidates) <= count else []
+        for index in range(max(count - len(members), 0)):
+            members.append({"key": "legacy:%s:%s:%d" % (human, kind, index),
+                            "severity": None, "type": kind, "human": human})
+        return members
+
     def _normalize_summary_raised(self, human, raised) -> dict:
         out = {}
         if not isinstance(raised, dict):
             return out
+        legacy = {}
         for identity, member in raised.items():
             if isinstance(member, dict):
                 normalized = {"key": member.get("key") or str(identity),
@@ -1970,8 +1997,8 @@ class Notifier:
                 out[self._summary_member_id(normalized)] = normalized
                 continue
             # Ancien format `{type: compte}` : les identités n'étaient pas
-            # gardées. Un membre synthétique par alerte rend le compte, et
-            # permet au registre de retenir ce qui a été livré.
+            # gardées. On tente de les raccorder aux entrées actives encore
+            # présentes (même humain, même type) avant de synthétiser.
             kind = str(identity)
             count = int(member or 0)
             if self._summary_forbidden(human, kind):
@@ -1979,9 +2006,10 @@ class Notifier:
                     self.log("owner rate summary: %d slo_breach alert(s) filtered (#2395)"
                              % count)
                 continue
-            for index in range(max(count, 0)):
-                normalized = {"key": "legacy:%s:%s:%d" % (human, kind, index),
-                              "severity": None, "type": kind, "human": human}
+            legacy[kind] = legacy.get(kind, 0) + count
+        for kind, count in legacy.items():
+            for normalized in self._legacy_summary_members(human, kind, count,
+                                                           exclude=out):
                 out[self._summary_member_id(normalized)] = normalized
         return out
 
@@ -2055,9 +2083,40 @@ class Notifier:
                 if isinstance(member, dict):
                     self._mark_member_notified(member, now)
 
+    def _member_already_notified(self, member: dict) -> bool:
+        return self._summary_member_id(member) in (self.state.get("notified") or {})
+
+    def _active_member_ids(self, human: str) -> set:
+        ids = set()
+        for entry in (self.state.get("active") or {}).values():
+            if not isinstance(entry, dict) or entry.get("human") != human:
+                continue
+            alert = entry.get("alert") or {}
+            member = {"key": entry.get("key") or key_of(alert),
+                      "severity": entry.get("severity"),
+                      "type": alert.get("type"), "human": human}
+            ids.add(self._summary_member_id(member))
+        return ids
+
+    def _drop_notified_members(self, bucket: dict, human: str) -> None:
+        """Coordonne un résumé en attente avec le registre (#2395 B2, relecture
+        e828508e1) : un `raised` déjà livré — en direct dans cette passe ou par
+        un résumé précédent — ne repart pas ; une résolution dont l'alerte est
+        revenue (active) est dépassée et ne part pas non plus."""
+        active = self._active_member_ids(human)
+        raised = bucket.get("raised") or {}
+        for identity, member in list(raised.items()):
+            if isinstance(member, dict) and self._member_already_notified(member):
+                del raised[identity]
+        resolved = bucket.get("resolved") or {}
+        for identity in list(resolved):
+            if identity in active:
+                del resolved[identity]
+
     def _summaries(self, now: float) -> None:
         for human in list(self.state["summary"]):
             bucket = self._bucket(human)
+            self._drop_notified_members(bucket, human)
             if not bucket["raised"] and not bucket["resolved"]:
                 # Stock entièrement filtré (ancien résumé SLO owner, #2395 B1).
                 del self.state["summary"][human]
