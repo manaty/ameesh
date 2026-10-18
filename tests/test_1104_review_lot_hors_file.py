@@ -742,13 +742,30 @@ class CloseGuardWitnessTest(_Witness):
 
     def critical_review(self, sha):
         lot = self.merged_lot("porte de fusion", sha=sha)
-        out = review_lot.open_after_merge(
-            self.db, lot=lot,
-            klass={"class": "light", "why": "policy",
-                   "files": [{"path": "src/ameesh/merge_pr.py", "class": "light"}]},
-            merged_sha=sha)
+        with mock.patch.object(review_lot, "_author_at_freeze",
+                               return_value={"name": "claude1", "harness": "deepseek"}):
+            out = review_lot.open_after_merge(
+                self.db, lot=lot,
+                klass={"class": "light", "why": "policy",
+                       "files": [{"path": "src/ameesh/merge_pr.py", "class": "light"}]},
+                merged_sha=sha)
         self.assertTrue(out["created"], out)
         return lot, out["id"]
+
+    def test_deux_avis_sans_famille_auteur_connue_ne_suffisent_pas(self):
+        sha = "8" * 40
+        with mock.patch.object(review_lot, "_author_at_freeze",
+                               return_value={"name": "claude1", "harness": ""}):
+            lot = self.merged_lot("auteur non trace", sha=sha)
+            out = review_lot.open_after_merge(
+                self.db, lot=lot,
+                klass={"class": "light", "files": [
+                    {"path": "src/ameesh/merge_pr.py", "class": "light"}]},
+                merged_sha=sha)
+        self.verdict(lot, sha, "codex1")
+        self.verdict(lot, sha, "claude2")
+        with self.assertRaisesRegex(work.WorkError, "famille de l'auteur inconnue"):
+            work.close(self.db, out["id"], delivered=True, sha=sha, actor="codex1")
 
     def verdict(self, lot, sha, actor):
         work.milestone(self.db, lot, "verdict", sha=sha, actor=actor, verdict="ok")

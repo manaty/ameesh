@@ -667,6 +667,11 @@ def guard_delivery(db, item: dict) -> dict:
     sha = str(data.get("sha") or "").strip().lower() or _merged_sha(db, source)
     author = str(data.get("author") or source.get("assignee") or "").strip()
     author_family = str(data.get("author_family") or "").strip()
+    author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
+    if required >= 2 and not author_family and not author_human:
+        raise work.WorkError(
+            "lot #%s: famille de l'auteur inconnue ; indépendance des deux "
+            "avis non prouvée, clôture refusée" % item["id"])
     created = float(item.get("created_ts") or 0.0)
     repo = (_repo_of_agent(db, str(source.get("assignee") or ""))
             or lot_class.repository(getattr(db, "cfg", None), source) or "")
