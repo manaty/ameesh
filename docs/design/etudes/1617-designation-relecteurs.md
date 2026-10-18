@@ -272,6 +272,33 @@ failure of the column write leaves neither a designated mark nor a reviewer
 mail); a recovery still refuses an undeliverable waiting designation while the
 hook turns it into a waiting mark; the CLI freeze and the recovery command.
 
+## Verdict carry and the freeze designation (#2442 × #2487)
+
+The designation and the verdict carry run at the same freeze but in a fixed
+order: the designation is in the `frozen` transaction, the carry follows the
+COMMIT (it copies verdicts from an earlier head onto the new one). On a
+mechanically realigned freeze, the selection could therefore name reviewers
+other than the ones whose verdict is about to be carried: two useless reviewer
+mails, and `progress` waiting for a verdict that is not due.
+
+`work.milestone` now asks `verdict_carry.would_carry` for the head being frozen
+**before** opening the milestone transaction (the same proof as the carry:
+clean trial merge on the fresh target, mechanical history, same lot delta; no
+write, no lease). When the plan carries every pending verdict, the default hook
+receives it: it writes the `review-designation-carried:<lot>:<freeze>` mark,
+keeps the carried reviewers in `work_items.reviewers` and mails nobody. The
+carry then copies the verdicts and finds the same mark; a late carry (executor
+sweep) also resynchronises the column, so the gate and `progress` agree on any
+path. A plan that does not cover the head, or a proof that fails, keeps the
+normal designation.
+
+The CLI replays a real designation (`designate(force=True)`) when the carry
+refuses right after the freeze, and the executor does the same once when a
+freeze carries the mark but its carry keeps failing. Carried marks are
+automatic designations for the column: a later real freeze removes their names
+before writing the new selection. `ameesh work reviewers` shows the carried
+state, not "no designation".
+
 ## Remaining after activation (#2447)
 
 - port agreements secured: cx3 (#1467, 15/10 10:46) leaves the wiring of the
