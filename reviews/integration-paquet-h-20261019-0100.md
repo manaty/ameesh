@@ -75,6 +75,13 @@ leur delta propre. Aucun conflit de composition n'a été rencontré.
   échec en psql, puis arrêt volontaire du run local (coût des passes
   complètes) ; la suite complète du paquet en CI qualifie le reste.
 - Contenu : 60 fichiers, +3915/−412 hors manifeste ; aucune migration.
+- Correctif de composition (CI 39176999732) : `test_l107_executor_contract`
+  exigeait 396 refusées et 463 opérations d'interface, chiffres dérivés du
+  contrat de la tête ; #2504 avait mis à jour 395/462 sur une base qui ne
+  portait pas encore son refus. Les deux compteurs de
+  `docs/EXECUTEUR-MEDIEE.md` sont réalignés (aucun contenu de lot perdu) ;
+  le test est vert localement, puis le run complet est redemandé sur cette
+  tête.
 
 ## Contenus à lire (avertissements d'inclusion)
 
