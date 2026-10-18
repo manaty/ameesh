@@ -14,7 +14,7 @@ import re
 import time
 import unittest
 
-from ameesh import cost, progress, registry, storage, work
+from ameesh import cost, progress, registry, stagnation, storage, work
 
 from .support import PgTestCase
 
@@ -73,6 +73,17 @@ class JalonsTest(unittest.TestCase):
         self.assertEqual(j["blocks"], 1)              # blocked → waiting_human = une attente
         self.assertIsNone(j["merged"])
 
+    def test_livre_hors_cible(self):
+        """#988 : le jalon `delivered` date un lot livré hors cible ; `merged`
+        reste nul (la livraison n'est pas une fusion)."""
+        item = {"id": 2, "created_ts": 100.0, "state": "closed",
+                "close_reason": "delivered"}
+        j = progress._jalons_de_lot(item, [
+            ev("intake", 100), ev("build", 110), ev("closed", 400)], [], [
+            {"kind": "delivered", "at_ts": 400.0, "actor": "dev1"}])
+        self.assertEqual(j["delivered"], 400.0)
+        self.assertIsNone(j["merged"])
+
     def test_action_git_merge(self):
         actions = [{"connector": "git-merge", "state": "confirmed",
                     "approved_ts": 400.0, "finished_ts": 450.0},
@@ -83,17 +94,22 @@ class JalonsTest(unittest.TestCase):
 
     def test_regel_apres_approbation_repasse_en_revue(self):
         """Sonde codex3 B2 : qa 200 → build 300 → qa 400, action approuvée à 350.
-        Le verdict retenu précède le DERNIER gel : en revue, pas approuvé ; le
-        relecteur est l'auteur du verdict retenu (l'approbation), pas du rejet."""
+        Le verdict retenu précède le DERNIER gel : en revue, pas approuvé. Un
+        verdict périmé ne désigne personne (#1318) : sans désignation, la porte
+        est « un relecteur (non désigné) », ni l'auteur de l'approbation caduque
+        ni celui du rejet."""
         actions = [{"connector": "git-merge", "state": "approved", "approved_ts": 350,
                     "last_actor": "human:reviewer"}]
         events = [ev("intake", 100), ev("build", 110), ev("qa", 200),
                   ev("build", 300, "rev"), ev("qa", 400)]
         j = progress._jalons_de_lot(self.item, events, actions)
         self.assertEqual((j["frozen"], j["last_frozen"], j["verdict"]), (200, 400, 350))
-        self.assertEqual(j["reviewer"], "human:reviewer")
+        self.assertIsNone(j["reviewer"])
         self.assertFalse(j["verdict_current"])
         self.assertEqual(progress.lot_state("qa", j), "review")
+        # le relecteur désigné (#705), lui, reste nommé après un regel
+        j = progress._jalons_de_lot(dict(self.item, reviewer="rev2"), events, actions)
+        self.assertEqual(j["reviewer"], "rev2")
         # une approbation postérieure au regel, elle, approuve
         actions[0]["approved_ts"] = 450
         j = progress._jalons_de_lot(self.item, events, actions)
@@ -127,6 +143,69 @@ class JalonsTest(unittest.TestCase):
         self.assertEqual(j["requested"], 100.0)
         self.assertIsNone(j["frozen"])
         self.assertEqual(j["blocked_verdicts"], 0)
+
+    def test_gel_renouvele_meme_sha_preserve_le_verdict(self):
+        """#1389 : un gel administratif renouvelé au MÊME SHA ne refait pas le
+        verdict ; l'avis `ok` posté avant reste courant (lot approuvé)."""
+        sha = "a" * 40
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": sha, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": sha, "verdict": "ok", "actor": "rev1"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": sha, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertEqual(j["last_frozen"], 180.0)
+        self.assertEqual(j["verdict"], 170.0)
+        self.assertTrue(j["verdict_current"])
+        self.assertEqual(progress.lot_state("qa", j), "approved")
+        self.assertEqual(stagnation.waiting({"state": "qa", "assignee": "auteur"}, j)["what"],
+                         "merge")
+
+    def test_verdict_d_une_autre_tete_ne_compte_pas(self):
+        """Un avis nommant une autre tête ne vaut pas pour le gel courant."""
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": "a" * 40, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": "a" * 40, "verdict": "ok",
+             "actor": "rev1"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": "b" * 40, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertFalse(j["verdict_current"])
+        self.assertEqual(progress.lot_state("qa", j), "review")
+        self.assertEqual(stagnation.waiting({"state": "qa", "assignee": "auteur"}, j)["what"],
+                         "verdict")
+
+    def test_gel_renouvele_meme_sha_ne_masque_pas_un_no_go(self):
+        """Un verdict bloquant sur la tête gelée reste bloquant après un gel
+        renouvelé au même SHA : le NO-GO n'est pas masqué (#1389)."""
+        sha = "c" * 40
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": sha, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": sha, "verdict": "blocked",
+             "actor": "rev1"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": sha, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertEqual(j["verdict_kind"], "blocked")
+        self.assertTrue(j["verdict_current"])
+        self.assertEqual(stagnation.waiting({"state": "qa", "assignee": "auteur"}, j)["what"],
+                         "fix")
+
+    def test_plusieurs_lecteurs_le_dernier_avis_sur_la_tete_gagne(self):
+        """Plusieurs lecteurs sur la même tête : l'avis le plus récent tranche ;
+        un `ok` plus récent lève un `blocked` antérieur de la même tête."""
+        sha = "d" * 40
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": sha, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 160.0, "sha": sha, "verdict": "blocked",
+             "actor": "rev1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": sha, "verdict": "ok", "actor": "rev2"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": sha, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertEqual((j["verdict_kind"], j["reviewer"]), ("ok", "rev2"))
+        self.assertTrue(j["verdict_current"])
+        self.assertEqual(progress.lot_state("qa", j), "approved")
 
     def test_etats_du_lot(self):
         self.assertEqual(progress.lot_state("build", {}), "active")
@@ -187,6 +266,41 @@ class BudgetTest(unittest.TestCase):
         self.assertFalse(plan["exceeded"])        # 80 % utilisé pour un plafond de 90 %
         self.assertAlmostEqual(plan["pace_cap"], 0.9)
 
+    def test_le_plan_d_un_compte_declare_suit_son_compte_actif(self):
+        # #1028 P2 (R1 cx2) : le plan d'un harnais à comptes déclarés porte la
+        # jauge ET le rythme du compte ACTIF. Le croisement « jauge du dossier
+        # par défaut (80 %), multiplicateur du compte actif (m2) » publiait
+        # 80 % / plafond 30 % / dépassé alors qu'aucun compte n'est dans cet
+        # état : primaire 80 %/m1 (inactif), secondaire 20 %/m2 (actif).
+        window = 7 * 86400.0
+        primaire = cost.Gauge("codex", "week", 0.80, NOW + 0.9 * window, window)
+        secondaire = cost.Gauge("codex", "week", 0.20, NOW + 0.9 * window, window)
+        comptes = [
+            {"harness": "codex", "account": "primaire", "active": False,
+             "pace_multiplier": 1.0, "gauges": [], "_gauges": [primaire]},
+            {"harness": "codex", "account": "secondaire", "active": True,
+             "pace_multiplier": 2.0, "gauges": [], "_gauges": [secondaire]},
+        ]
+        b = progress.build_budget([], [primaire], NOW, accounts=comptes)
+        self.assertEqual(len(b["plans"]), 1)
+        plan = b["plans"][0]
+        self.assertEqual(plan["used"], 0.20)          # la jauge du compte actif
+        self.assertAlmostEqual(plan["pace_cap"], 0.30)  # 2 × 10 % + 10 %
+        self.assertFalse(plan["exceeded"])            # le primaire l'est, pas lui
+        # harnais sans compte déclaré : jauge et rythme nominaux, le
+        # multiplicateur du compte actif ne fuit pas
+        libre = cost.Gauge("claude", "five_hour", 0.05, NOW + 0.9 * 3600, 3600)
+        b = progress.build_budget([], [libre], NOW, accounts=comptes)
+        plans = {p["harness"]: p for p in b["plans"]}
+        self.assertAlmostEqual(plans["claude"]["pace_cap"], 0.20)  # 10 % + 10 %
+        self.assertEqual(plans["claude"]["used"], 0.05)
+        self.assertEqual(plans["codex"]["used"], 0.20)  # compte actif, sans fuite
+        # sans compte déclaré : rien ne change
+        nomme = cost.Gauge("codex", "week", 0.25, NOW + 0.9 * window, window)
+        b = progress.build_budget([], [nomme], NOW)
+        self.assertAlmostEqual(b["plans"][0]["pace_cap"], 0.20)
+        self.assertTrue(b["plans"][0]["exceeded"])
+
 
 def _snap(**over):
     snap = {
@@ -238,11 +352,97 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(json.loads(blob)["lots"][0]["title"], _snap()["lots"][0]["title"])
 
 
+class CiSuiteTest(unittest.TestCase):
+    """#1476 : durée médiane de la suite complète par dépôt (veilleur CI) :
+    médiane et p80, part couverte par le pool prioritaire de #1468, verdict
+    face à la cible de 15 min portée par la vue."""
+
+    @staticmethod
+    def _run(repo, branch, base, duration, ts, run_id=1, event="push"):
+        return {"repo": repo, "run_id": run_id, "branch": branch, "base": base,
+                "event": event, "duration_s": duration, "concluded_ts": ts}
+
+    def test_mediane_et_pool_prioritaire(self):
+        rows = [
+            self._run("manaty/ameesh", "integration/1204", "main", 720.0, 10, 1),
+            self._run("manaty/ameesh", "lot/1476", "integration/1204", 1080.0, 20, 2,
+                      event="pull_request"),
+            self._run("manaty/ameesh", "main", "main", 1800.0, 30, 3),
+            self._run("manaty/ameesh", "release/1.11.0", "main", 540.0, 40, 4),
+            self._run("manaty/nexlink", "main", "main", 3600.0, 50, 5),
+        ]
+        out = progress.build_ci_suite(rows)
+        self.assertEqual(out["schema"], progress.CI_SUITE_SCHEMA)
+        self.assertEqual(out["target_s"], progress.CI_SUITE_TARGET_S)
+        self.assertEqual(out["window_days"], progress.CI_SUITE_WINDOW_D)
+        self.assertEqual([r["repo"] for r in out["repos"]],
+                         ["manaty/ameesh", "manaty/nexlink"])
+        ameesh = out["repos"][0]
+        self.assertEqual(ameesh["runs"], 4)
+        self.assertEqual(ameesh["median_s"], 900.0)      # (720 + 1080) / 2
+        self.assertEqual(ameesh["p80_s"], 1368.0)        # interpolation sur 4 points
+        self.assertEqual(ameesh["priority_runs"], 3)     # source, cible, release
+        self.assertEqual(ameesh["priority_median_s"], 720.0)
+        self.assertEqual(ameesh["last_s"], 540.0)
+        self.assertEqual(ameesh["last_concluded_ts"], 40)
+        nexlink = out["repos"][1]
+        self.assertEqual(nexlink["priority_runs"], 0)
+        self.assertIsNone(nexlink["priority_median_s"])
+
+    def test_sans_duree_ni_ligne(self):
+        self.assertEqual(progress.build_ci_suite([])["repos"], [])
+        rows = [self._run("r", "main", "main", None, 10, 1),
+                self._run("r", "main", "main", 600.0, 5, 2)]
+        repo = progress.build_ci_suite(rows)["repos"][0]
+        self.assertEqual(repo["runs"], 1)                 # une durée inconnue ne compte pas
+        self.assertEqual(repo["median_s"], 600.0)
+        self.assertIsNone(repo["last_s"])                 # la dernière conclue n'a pas de durée
+        self.assertEqual(repo["last_concluded_ts"], 10)
+
+    def test_lignes_et_verdict(self):
+        rows = [
+            self._run("r/prioritaire", "integration/1", "main", 600.0, 1, 1),
+            self._run("r/prioritaire", "main", "main", 2400.0, 2, 2),
+            self._run("r/cible", "integration/1", "main", 600.0, 3, 3),
+            self._run("r/cible", "integration/1", "main", 720.0, 4, 4),
+            self._run("r/lente", "main", "main", 2400.0, 5, 5),
+            self._run("r/lente", "main", "main", 3000.0, 6, 6),
+        ]
+        lines = progress._ci_suite_lines(progress.build_ci_suite(rows), 60)
+        text = "\n".join(lines)
+        for line in text.splitlines():
+            self.assertLessEqual(len(line), 60, line)
+        plat = " ".join(text.split())          # le repli ne cache pas un verdict
+        self.assertIn("target ≤ 15 min", plat)
+        self.assertIn("r/cible: median 11 min", plat)
+        self.assertIn("target met", plat)
+        self.assertIn("r/prioritaire: median 25 min", plat)
+        self.assertIn("target met on the priority pool only", plat)
+        self.assertIn("r/lente: median 45 min", plat)
+        self.assertIn("target not met", plat)
+        vide = {"window_days": 7, "target_s": 900,
+                "repos": [{"repo": "r/vide", "runs": 0}]}
+        self.assertIn("r/vide: no concluded full suite",
+                      " ".join(" ".join(progress._ci_suite_lines(vide, 60)).split()))
+
+    def test_le_pool_prioritaire_suit_la_source_et_la_cible(self):
+        # #1468 : integration/** et release/** en source comme en cible ; main
+        # (poussée qui suit la fusion d'un paquet) ne l'est pas.
+        for branch, base, attendu in (("integration/1", "main", True),
+                                      ("lot/x", "integration/1", True),
+                                      ("release/1.11.0", "main", True),
+                                      ("lot/x", "release/1.11.0", True),
+                                      ("main", "main", False),
+                                      ("lot/x", "main", False)):
+            self.assertEqual(progress._ci_priority({"branch": branch, "base": base}),
+                             attendu, (branch, base))
+
+
 class ProgressPgTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("TRUNCATE action_events, action_attempts, actions, turn_costs, "
-                        "spend_pending RESTART IDENTITY CASCADE")
+                        "spend_pending, ci_runs RESTART IDENTITY CASCADE")
 
     def _book(self):
         return cost.CostBook(state_dir=self.state, codex_sessions=os.path.join(self.tmp, "codex"),
@@ -321,7 +521,9 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lots["lot en revue"]["state"], "review")
         self.assertEqual(lots["lot en revue"]["blocked_verdicts"], 1)
         self.assertEqual(lots["lot en revue"]["verdict"], "blocked")
-        self.assertEqual(lots["lot en revue"]["reviewer"], "rev")
+        # un verdict bloquant périmé (lot regelé) ne désigne plus son auteur
+        # (#1318) : sans relecteur désigné, la porte n'est nommée par personne.
+        self.assertIsNone(lots["lot en revue"]["reviewer"])
         self.assertEqual(lots["lot approuvé"]["state"], "approved")
         self.assertEqual(lots["lot approuvé"]["actions"], [act])
         self.assertEqual(lots["lot fusionné"]["state"], "merged")
@@ -329,7 +531,8 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lots["lot bloqué"]["blocks"], 1)
         m = lots["lot fusionné"]["milestones"]
         self.assertTrue(m["requested"] <= m["frozen"] <= m["verdict"] <= m["merged"])
-        self.assertEqual(set(m), {"requested", "frozen", "verdict", "merged"})
+        self.assertEqual(set(m), {"requested", "frozen", "verdict", "merged", "delivered"})
+        self.assertIsNone(m["delivered"])          # #988 : livré hors cible seulement
         self.assertEqual([x["id"] for x in snap["actions"]], [act])
 
         agents = {x["name"]: x for x in snap["agents"]}
@@ -429,13 +632,91 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lots["déduit"]["state"], "review")
         self.assertIsNotNone(lots["déduit"]["milestones"]["frozen"])
 
+    def test_gel_renouvele_meme_sha_garde_le_verdict(self):
+        """#1389 : regeler au MÊME SHA après l'avis ne refait pas le verdict ;
+        la frise reste `approved` et l'attente est la fusion, pas une relecture.
+        Un gel sur une AUTRE tête, lui, rouvre la revue."""
+        sha = "a" * 40
+        a = work.add(self.db, title="gel renouvelé", app="demo")
+        work.move(self.db, a["id"], "build")
+        work.move(self.db, a["id"], "qa")
+        work.milestone(self.db, a["id"], "frozen", sha=sha, actor="a1")
+        work.milestone(self.db, a["id"], "verdict", sha=sha, actor="rev1", verdict="ok")
+        work.milestone(self.db, a["id"], "frozen", sha=sha, actor="a1")
+        snap = progress.snapshot(self.db, self.cfg, book=self._book())
+        lot = {l["title"]: l for l in snap["lots"]}["gel renouvelé"]
+        self.assertEqual(lot["state"], "approved")
+        self.assertEqual(lot["waiting_for"]["what"], "merge")
+        # un gel sur une autre tête rouvre bien la revue
+        work.milestone(self.db, a["id"], "frozen", sha="b" * 40, actor="a1")
+        snap = progress.snapshot(self.db, self.cfg, book=self._book())
+        lot = {l["title"]: l for l in snap["lots"]}["gel renouvelé"]
+        self.assertEqual(lot["state"], "review")
+        self.assertEqual(lot["waiting_for"]["what"], "verdict")
+
+    def test_ci_suite_du_veilleur(self):
+        """#1476 : la vue ne compte que les suites complètes CONCLUES des
+        contextes qui les garantissent — release/**, integration/** (source ou
+        cible) et exécution manuelle ; une poussée sur main est écartée (voie
+        documentation seule possible, L161a). Annulée, remplacée, en cours et
+        hors fenêtre sont aussi écartées ; la borne de lecture est par
+        dépôt."""
+        def run(run_id, branch, base, status, *, repo="manaty/ameesh", minutes=10,
+                age_s=0, event="push"):
+            self.db.execute(
+                "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+                " status, url, first_seen_at, concluded_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, 'u',"
+                " to_timestamp(extract(epoch from now()) - %s),"
+                " CASE WHEN %s = 'running' THEN NULL"
+                "      ELSE to_timestamp(extract(epoch from now()) - %s) END)",
+                (repo, run_id, "0" * 40, branch, event, base, status,
+                 float(minutes * 60 + age_s), status, float(age_s)))
+        run(1, "main", "main", "success", minutes=10)          # voie doc possible
+        run(2, "release/1.11.0", "main", "failure", minutes=12)
+        run(3, "integration/1204", "main", "success", minutes=14)
+        run(4, "lot/1476", "integration/1204", "success", minutes=16, event="pull_request")
+        run(5, "lot/999", "main", "success", minutes=18, event="pull_request")  # impactés
+        run(6, "main", "main", "success", minutes=11, event="workflow_dispatch")
+        run(7, "main", "main", "cancelled", minutes=5)
+        run(8, "main", "main", "superseded", minutes=5)
+        run(9, "release/1.11.0", "main", "running", minutes=5)
+        run(10, "main", "main", "success", minutes=10, age_s=8 * 86400)
+        run(11, "release/2.0", "main", "success", minutes=10, repo="manaty/nexlink")
+        run(12, "integration/9", "main", "success", minutes=11, repo="manaty/nexlink")
+
+        st = storage.of(self.db).progress
+        # l'instant de référence vient de la base : aucune horloge locale
+        depuis = self.db.query("SELECT extract(epoch from now())::float8 AS epoch")[0]["epoch"] \
+            - 7 * 86400
+        rows = st.ci_suite(since_ts=depuis, limit=100)
+        self.assertEqual([r["run_id"] for r in rows], [12, 11, 6, 4, 3, 2])
+        attendu = {2: 720.0, 3: 840.0, 4: 960.0, 6: 660.0, 11: 600.0, 12: 660.0}
+        for row in rows:
+            self.assertAlmostEqual(row["duration_s"], attendu[row["run_id"]], delta=2)
+        # la borne est par dépôt : le dépôt actif ne chasse pas l'autre
+        self.assertEqual([r["run_id"] for r in st.ci_suite(since_ts=depuis, limit=1)],
+                         [12, 6])
+
+        snap = progress.snapshot(self.db, self.cfg, book=self._book())
+        self.assertEqual([r["repo"] for r in snap["ci_suite"]["repos"]],
+                         ["manaty/ameesh", "manaty/nexlink"])
+        ameesh = snap["ci_suite"]["repos"][0]
+        self.assertEqual(ameesh["runs"], 4)
+        self.assertEqual(ameesh["median_s"], 780.0)          # (720 + 840) / 2
+        self.assertEqual(ameesh["priority_runs"], 3)         # release/**, integration/**, cible
+        self.assertEqual(ameesh["priority_median_s"], 840.0)  # la main dispatchée n'en est pas
+        self.assertEqual(snap["ci_suite"]["repos"][1]["runs"], 2)
+
     def test_vide(self):
         snap = progress.snapshot(self.db, self.cfg, book=self._book())
         self.assertEqual((snap["lots"], snap["agents"], snap["actions"]), ([], [], []))
         self.assertEqual(snap["budget"]["spend"]["24h"]["total_usd"], 0.0)
+        self.assertEqual(snap["ci_suite"]["repos"], [])
         st = storage.of(self.db).progress
         self.assertEqual(st.lot_events([]), [])
         self.assertEqual(st.costs(since_ts=0, agents=[]), [])
+        self.assertEqual(st.ci_suite(since_ts=0, limit=10), [])
 
     def test_cli(self):
         item = work.add(self.db, title="lot cli", app="demo")

@@ -11,7 +11,10 @@ sur quoi, ce qui attend, ce qui est livré.
 ameesh reconnaît un orchestrateur de trois façons : sa fiche Agent du canon
 porte `roles: [orchestrateur]`, il est déclaré dans
 `AMEESH_ALERT_ORCHESTRATORS`, ou il a confié des lots (`work assign`,
-`work delegate`) dans les 30 derniers jours. La fiche est la voie durable.
+`work delegate`) dans les 30 derniers jours. Cette dernière déduction cesse
+dès qu'une fiche de son organisation (son canon) déclare des rôles (L242c) :
+la fiche est alors la seule voie durable. Seule compte la fiche de son
+propre canon, jamais une fiche homonyme d'un autre.
 
 ## Tout travail confié passe par un lot
 
@@ -25,6 +28,7 @@ lot**.
 | Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 2h` |
 | Demande d'un humain (L130) | `ameesh work add --title "RÉF : titre" --source "… « phrase exacte »" --priority N --estimate 2h`, puis le message `--lot <id>` |
 | Lot existant, sans agent | `ameesh mail send <agent> "…" --lot <id\|RÉF>` |
+| Prendre un lot sans agent (brief `stale_lot`/`idle_capacity`) | `ameesh work assign <id> <agent> --claim` : refusé si un autre l'a pris entre-temps, jamais de changement de main silencieux (#1026) |
 | Reprendre un lot à un autre agent | `ameesh work assign <id> <agent>`, puis le message `--lot <id>` |
 | Message sur un lot (relance, question) | `ameesh mail send <agent> "…" --lot <id>` |
 
@@ -38,13 +42,13 @@ lot**.
 * L'attribution passe par la garde habituelle : un agent non réveillable est
   refusé et rien n'est déposé.
 
-## Un agent au repos prend lui-même un lot de son équipe (L165)
+## Un agent au repos prend lui-même un lot de ses projets (L165)
 
 Constat du 11/10 : 9 agents Nexlink sur 13 au repos, dont un sans lot depuis
 1 h 30, alors que 3 lots Nexlink n'avaient pas d'agent. Désormais, `ameesh
 notify` ne laisse plus un lot attendre l'orchestrateur : **un agent
 réveillable au repos sans lot depuis 15 min prend lui-même le lot non
-assigné le plus prioritaire de son équipe qu'il sait faire**, et
+assigné le plus prioritaire de ses projets qu'il sait faire**, et
 l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
 
 * Lots concernés : `intake`, sans assigné, créés il y a plus de 5 min. Un lot
@@ -54,16 +58,70 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   aujourd'hui attend sa date (exemple : un bilan à deux semaines).
 * Réserver un lot à une attribution explicite : capacité exigée `decision` ou
   `production`. Exiger un harnais : capacité `harness:<nom>`.
+* Projet du lot, clé de la prise : son application (`--app`), sinon son
+  équipe. L'agent le prend s'il figure parmi les projets déclarés de sa fiche
+  (`projects`, L243) ; hors du projet primaire, il faut en plus que son
+  dossier de travail pour ce projet soit prêt (#811), sinon le lot reste en
+  file et une note nominative le dit, sans doublon pour le même agent sur le
+  lot — chaque agent qui le tente peut poser la sienne tant que #1538 n'a pas
+  ramené la note à une par lot.
 * Équipe du lot : la sienne, sinon celle de sa fiche (ou de la fiche
-  parente), sinon son application (`--app`). Un lot sans équipe connue
-  attend l'orchestrateur.
+  parente), sinon son application. Elle ne choisit plus le preneur : elle
+  désigne les orchestrateurs prévenus et sert au personnel et aux alertes. Un
+  lot sans équipe connue attend l'orchestrateur.
 * Ordre : priorité, puis dates prévues (début, fin, livraison), puis
-  ancienneté. Un orchestrateur ne se sert pas lui-même.
+  ancienneté. Un orchestrateur ne se sert pas lui-même. Lors d'un appel
+  central (`agents` absent), ses candidats passent en dernier et, s'il prend
+  un lot faute d'autre preneur, la note d'attribution porte la trace du repli
+  (#1739) ; en prise locale (#804, `agents` fourni, même vide), aucun repli :
+  son orchestrateur reste exclu (L804).
+* En-cours : un agent ne détient pas plus de 2 lots en `build`, tous projets
+  confondus (canon §4). La prise refuse le troisième, `ameesh work wip
+  --apply` rend le surplus à la file (le lot garde sa branche), et une
+  exception pilote est explicite : `ameesh work assign <id> <agent>
+  --wip-exception "raison"`.
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
   mesh). La file d'amélioration (L119) ne passe qu'ensuite, quand aucun lot du
   projet n'attend.
+
+## Au plus un lot non démarré par agent (#540)
+
+Un agent ne garde qu'**un seul lot non démarré en attente** : un lot ouvert,
+assigné, sans début mesuré (aucun tour de son assigné dessus, jamais passé en
+`build` ou `qa`). Attribuer un autre lot non démarré à un agent qui en a déjà
+un ne le lui donne pas : **le lot va dans la file d'équipe** (sans assigné, en
+`intake`), où un agent au repos du projet le prendra (L165 ci-dessus).
+
+* Concerne `ameesh work add --assignee`, `ameesh work assign`, `--lot` ou
+  `--new-lot` d'`agent-mail send`, et la prise automatique (L119, L165) : un
+  agent choisi au repos qui a reçu un lot non démarré entre-temps ne prend
+  rien, le lot reste en file pour le suivant. Le contrôle et l'écriture se font dans la
+  même transaction, sous un verrou par agent : deux attributions simultanées
+  ne donnent pas deux lots non démarrés au même agent.
+* `work add` et `work assign` réussissent, avec l'avertissement « lot #N put
+  in the team queue: X already has lot #M not started ». Un lot sans équipe
+  connue n'est pris par personne : il attend l'orchestrateur, qui le
+  réattribue une fois #M démarré.
+* `agent-mail send --lot` ou `--new-lot` : le lot va dans la file et **le
+  message n'est pas déposé** (code 2), pour qu'un agent ne travaille pas un
+  lot que L165 peut confier à un autre. Renvoyer le message sans `--lot`, ou
+  après le début de #M.
+* Forcer, pour tout appelant : `--force "<raison>"` (sur `work add`, `work
+  assign` et `agent-mail send`) donne le lot malgré tout. La raison et son
+  auteur sont écrits au journal du lot ; une raison vide ne force rien (même
+  sortie que sans `--force`). L'auteur est l'identité liée de la session :
+  un `--actor` ou un `--from` qui en nomme un autre est refusé ; une session
+  sans identité dit qui force, et seulement par une identité humaine
+  explicite (`--actor human:<id>`) : un nom d'agent y est refusé, un agent ne
+  force que depuis sa session liée (bail du runner ou `ameesh mail bind`).
+* Hors de la règle : un lot déjà démarré (réassigner un travail en cours reste
+  permis), un humain (`human:…`) ou un agent externe (`--externe`), le lot
+  d'une demande de décision (`ameesh decide ask --new-lot`, que son auteur
+  attend ; seul ce chemin en dispose, ce n'est pas un paramètre de
+  `work.add`), la délégation à échéance (L40) et son retour, la reprise sur pause
+  budget (L233b, dont le preneur n'a déjà aucun lot).
 
 ## Toute demande d'un humain devient un lot (L130)
 
@@ -259,7 +317,18 @@ Elle est posée sur le lot dès que le relevé la voit en avance sur sa cible.
 La fusion GitHub de cette branche (« Merge pull request #N from
 owner/lot/<id>-… ») ou une fusion locale (« Merge branch 'lot/<id>-…' »)
 ferme le lot, même après la suppression de la branche. Le relevé lit alors le
-corps de la PR (`gh`). Une PR qui ne livre qu'une partie d'un lot parapluie
+corps de la PR (`gh`).
+
+**Détacher une branche obsolète** (#2102). Quand la PR d'un lot est fermée ou
+supplantée et que le lot reste ouvert (vérification restante, autre
+livraison), sa branche sort du lot sans changer son état, son titulaire ni
+son relecteur : `ameesh work branch <id> --detach --reason "PR #N supplantée
+par #M"`. La ligne de journal garde le nom, le dernier commit vu, la cible et
+la raison ; Git n'est pas touché. Le radar ne lit plus cette branche, et le
+relevé ne l'associe plus implicitement, même si `lot/<id>-…` existe encore.
+Un lot sans branche peut nommer celle à ne plus deviner (`ameesh work branch
+<id> lot/<id>-… --detach --reason …`). La réassociation est explicite :
+`ameesh work branch <id> <branche> [--target T]`. Une PR qui ne livre qu'une partie d'un lot parapluie
 (#139) porte dans sa description :
 
 ```
@@ -283,6 +352,21 @@ après un échec de `gh`, il n'en lit plus d'autre dans ce dépôt, et la PR en
 plus). `ameesh work sync-github` suit les mêmes règles et ne retient que
 les PR dont la branche est dans le dépôt même, pas dans un fork.
 
+Un lot peut demander plusieurs PR, l'une après l'autre : une PR fusionnée ne
+le ferme plus si une autre PR ouverte, ou la branche déclarée du lot (autre
+que la sienne), y reste liée — le relevé écrit alors « stage merged » au
+journal du lot, qui reste ouvert (#759). La dernière étape lève cette retenue
+en se déclarant :
+
+```
+ameesh-work: <numéro du lot> final
+```
+
+`ameesh-work-partial:` l'emporte : une PR partielle ne ferme jamais, même
+avec `final`. Un lot fermé trop tôt par une PR d'étape se corrige
+(`ameesh work move <id> build --correct "raison"`), réservé aux humains,
+orchestrateurs et agents de conception.
+
 ## Fusion sans PR ni branche déclarée
 
 Une équipe qui fusionne en local sur sa branche d'intégration (`--no-ff`,
@@ -301,24 +385,46 @@ git merge --no-ff agent/claude1-veille -m "Merge #93 COMPUTE-IDLE" -m "ameesh-wo
   ameesh.target origin/develop` (fusions poussées puis récupérées) ou
   `develop` (fusions faites dans ce clone) quand l'équipe n'intègre pas sur
   la branche par défaut. Une cible introuvable est une erreur du relevé,
-  visible dans `ameesh work sync-branches`.
+  visible dans `ameesh work sync-branches`. Sans cible déclarée, le relevé
+  suit la cible réelle du projet (#746) : `develop`, `main`, `master` puis
+  `release/*` sont essayés, et une fusion citante y ferme le lot, la note
+  disant la ref trouvée. Une cible déclarée reste seule à foi : une fusion
+  constatée ailleurs n'est que signalée (note au lot, message à
+  l'assigné), jamais fermée.
 
 Le relevé passe toutes les 5 min dans le dossier de travail de l'assigné :
 le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
 commit de fusion et une note qui dit comment la fusion a été constatée.
 
 À la main, quand le relevé ne peut pas la voir (lot sans assigné, autre
-hôte, commit qui ne le désigne pas) :
+hôte), depuis un clone du dépôt du lot :
 
 ```
-ameesh work merged <id> --sha <commit de fusion> [--note "…"]
+ameesh work merged <id> --sha <commit de fusion> [--repo <clone local>] [--note "…"]
 ```
 
 depuis tout état ouvert, en une fois ; l'acteur est votre identité liée.
+La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
+(ou le dépôt configuré pour son projet), puis le commit dans sa cible.
+Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
+de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
+Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
+pas. Depuis #1400, la branche enregistrée du lot est reconnue dans un vrai
+commit de fusion (forme GitHub `Merge pull request #N from
+<propriétaire>/<branche>` comprise ; le propriétaire doit être celui du
+dépôt canonique, la branche homonyme d'un fork ne prouve rien), et le
+constat — lot, projet, titre et sujet du commit — est affiché avant toute
+écriture ; aucun `--force`. Un refus affiche le projet et le titre du lot ;
+aucun état ni jalon n'est écrit. Le SHA abrégé accepté est conservé sous sa
+forme complète.
+Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
+dossier courant. La lecture reste locale : récupérer la cible au préalable
+si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
-<id>`. Un lot passé `promoted` par erreur : `ameesh work move <id> merged
+<id> | --done` (`--done` : lot livré sans fusion, sans branche). Un lot passé
+`promoted` par erreur : `ameesh work move <id> merged
 --correct "raison"` (humains, orchestrateurs et agents de conception
 seulement ; tracé au journal).
 
@@ -350,6 +456,75 @@ dans le fil du lot. Un échec sort le lot de la file et réveille son agent ;
 l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
+
+Le feu choisit cette voie d'après la **déclaration du projet**, jamais
+d'après la configuration locale de l'hôte qui a pris le bail `fire:<lot>`
+(#2256) : `land: local` ou `pr` entre en file ; une file partagée connue
+prime sur une déclaration locale `off`. La fusion directe exige `land: off`
+explicite et l'absence vérifiée de file partagée. Un hôte qui ne déclare pas
+le mode d'atterrissage s'abstient (`no-land`) s'il ne trouve pas non plus de
+ligne de file pour ce dépôt ; il ne fusionne jamais en direct par défaut.
+Une auto-fusion GitHub résiduelle est désarmée avant l'abstention ou l'entrée
+en file. Le bail est rendu, et un hôte qui connaît le projet agit au passage
+suivant.
+
+## Intégration par paquets §12 : contrôle d'inclusion avant le feu
+
+**Chaque heure**, le pilote compose un petit paquet avec les lots prêts, sans
+conflit et aux verdicts complets, sur la tête de la cible (canon
+`processus/lots.md` §§11 bis et 12) ; un nouveau paquet attend le précédent.
+Aux coupures de 11:00 et 23:00, la release prend la tête de la cible (ou le
+dernier commit vert), taguée et déployée en staging : elle ne compose plus de
+paquet.
+
+La composition **part d'une liste calculée**, jamais des seuls courriers
+(#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans
+filtre d'assigné), leur gel effectif confronté à la tête **publiée**, les
+verdicts requis sur cette tête et un essai de fusion propre contre la cible. Un
+lot prêt absent du paquet doit figurer dans la table « Écartés (ce véhicule) »
+du manifeste avec un motif ; sinon il n'est ni composé ni visible. Si le calcul
+est incomplet (une lecture impossible), `--ready-out` est retiré, y compris un
+export précédent : le contrôle s'arrête plutôt que de lire une liste partielle.
+
+Avant la CI complète et le feu, le contrôle d'inclusion confronte cette liste
+calculée, les admissions ou routages du paquet, les lignes du manifeste **et**
+le contenu réel de l'arbre :
+
+```sh
+scripts/paquet-candidats.py --repo . --ready-out "$TMPDIR/prets-0800.txt"
+scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
+    --head origin/integration/paquet-23h-20261015 \
+    --ready-file "$TMPDIR/prets-0800.txt" \
+    --expected-file "$TMPDIR/admissions-23h.txt"
+```
+
+Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
+ni « écarté » motivé), ou si le contenu d'un lot composé a disparu de la tête
+(revert non consigné) — l'ascendance d'une tête ne suffit pas après un revert
+(#1638). Sans source de liste attendue ni de liste prête, il sort `2`, sauf
+`--no-expected` qui assume le contrôle partiel ; un fichier de lots prêts
+fourni mais vide est valide. Un contenu *partiel* ou *vide* est listé « à
+lire » (union, adaptation, remise fraîche) ; `--strict` le rend bloquant.
+Détail, format de la liste attendue et validation sur le paquet 11h :
+`docs/PAQUET-INCLUSION.md`.
+
+Un lot prêt que le paquet n'emporte pas ne disparaît pas : le manifeste
+l'écrit sous « Écartés (ce véhicule) » avec son motif (second avis dû, conflit
+à préparer, paquet complet, procédure de release…). Le contrôle d'inclusion
+lit cette table comme une explication forte, et refuse une ligne sans motif.
+Seul le lot **en tête de ligne** est le sujet d'une exclusion : un id cité
+dans le motif (« `#500` dépend de `#600` ») reste une référence faible.
+
+Chaque commit de composition (une unité du paquet) porte un trailer
+`ameesh-work: <id>` par lot qu'il porte : il devient déclarable nativement
+(`ameesh work merged --sha <commit>`, `sync-branches`) même quand
+la remise du lot diffère du gel enregistré (#2157). `scripts/paquet-compose.py`
+compose l'unité et écrit ce message, y compris sur conflit (`.git/MERGE_MSG`
+prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé n'est
+réécrit pour ce seul métadonné.
+Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
+ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
+un `#N` seul n'y déclare aucune unité (#2335).
 
 ## Le lot en cours
 
@@ -418,9 +593,12 @@ courrier les rappelle) :
   « go », « d'accord » restent des réponses, qui réveillent.
 * **`--urgent` seulement quand l'attente bloque** : le destinataire doit agir
   avant de continuer (build cassé sur la branche commune, fusion à arrêter,
-  question sans laquelle il tourne à vide). D'un expéditeur habilité
-  (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même un tour en cours :
-  à réserver aux vraies urgences.
+  question sans laquelle il tourne à vide). De l'owner (`human:*`) ou d'un
+  expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même
+  un tour en cours : à réserver aux vraies urgences. Depuis #795, la première
+  alerte d'échec d'un lot est elle-même un urgent vérifié en base qui
+  interrompt le tour de l'agent du lot ; le verdict (vert ou rouge), lui,
+  réveille sans couper (#514).
 * **Diffusions** : `agent-mail send all "…"` dépose une annonce lue au
   prochain tour de chacun, sans réveiller personne ; `--urgent` réveille toute
   l'équipe, rarement.
@@ -526,7 +704,10 @@ relis :
 ## Livraison et déploiements
 
 Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
-restée 4 h fusionnée sans être déployée :
+restée 4 h fusionnée sans être déployée, actualisées selon le
+[canon « Processus de lot » §14](https://github.com/manaty/home/blob/c838dd3e94bf/processus/lots.md#14-staging-et-prod-dameesh)
+(owner, 2026-10-14 vers 02:45, session bureau Claude
+`17076001-2b29-414c-a288-06791a5d9719`), source unique :
 
 1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
    propriétaire se fusionne avant tout nouveau chantier.
@@ -535,21 +716,34 @@ restée 4 h fusionnée sans être déployée :
    `deploy/mise-a-jour` (vérifier, sauvegarder, migrer, installer, redémarrer
    hors tour, contrôler, retour possible). Le propriétaire et les agents
    touchés sont prévenus après coup.
-3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,
+3. **Le staging d'ameesh se déploie sans go du propriétaire ni procédure de
+   release**, y compris sur pc-smichea, pour une nouvelle fonction, une version
+   mineure ou une migration additive. Suivre `deploy/mise-a-jour/` : migrations
+   additives avant de relancer les exécuteurs, VM d'agents d'abord, pc-smichea
+   en dernier et seulement si les VM sont saines (runners redémarrés publiant
+   leur vivacité, `ameesh doctor` vert et courrier test livré). Un hôte malsain
+   revient à la version précédente (étape `retour`) et le déploiement s'arrête.
+   Les hôtes ameesh-agents-1, ameesh-agents-2, manaty-mesh-1 et pc-smichea sont
+   le staging ; la prod est une installation utilisée hors du mesh qui construit
+   ameesh. **Un déploiement en prod se prépare entièrement** (nouvelle fonction,
    version mineure, migration qui change le comportement) : étiquette posée,
    `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
-   verifier <REF>` passés, plan de retour connu (étape `retour`). Ils sont
-   proposés au propriétaire dès son retour, en premier point, avec les choix
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Il est
+   proposé au propriétaire dès son retour, en premier point, avec les choix
    possibles : version seule ou `main` entier, migrations, risques. Une
-   consigne de veille ne se contente jamais d'interdire « tout déploiement »
-   sans le préparer. Les gestes en production d'un projet, les dépenses et les
+   consigne de veille prépare le staging sans lui appliquer cette attente.
+   Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
-   carries these rules and changes only through a reviewed commit.
-4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
-   un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
-   d'exécuteur du poste le lance dans une unité systemd distincte :
+   carries these rules and the working rules of the canon — integration by
+   hourly packages, review before CI and no CI per lot between packages, sober
+   proofs (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only
+   through a reviewed commit.
+4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
+   exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
+   Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance
+   donc dans une unité systemd distincte :
    `systemd-run --user --unit=ameesh-redemarrer-$(date +%s) bash
    deploy/mise-a-jour/poste.sh redemarrer <REF>`. Un `setsid` ou un `nohup`
    ne suffit pas : le script reste dans le groupe de contrôle de l'unité de
@@ -582,19 +776,73 @@ restée 4 h fusionnée sans être déployée :
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
    déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
-   `--release` libère. La réservation se lit dans `ameesh work show <lot>`
+   `--release` libère. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
+   branche au scan ignoré, en plus de celle du lot : à la composition d'un
+   paquet, la branche d'intégration porte déjà les fichiers renumérotés et
+   ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
+   numéro retenu par un autre lot reste refusé), et une branche de tronc
+   (`main`, `master`, `develop`, la branche par défaut d'`origin`) ne s'ignore
+   jamais. Un lot dont l'`issue_ref`
+   désigne un autre dépôt se corrige avant de réserver :
+   `ameesh work issue-ref <lot> owner/repo#N` (ou `--none` pour effacer),
+   réservé aux correcteurs comme `work set-app` et journalisé ; refusé tant
+   qu'une réservation est tenue dans l'ancien dépôt (`--release` d'abord). La réservation
+   se lit dans `ameesh work show <lot>`
    (ligne `migration`) et au journal du lot ; la description de la PR
    l'annonce.
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire
-   (`tests/test_l122_numeros_de_migration.py`, sans base).
-6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
+   (`tests/test_l122_numeros_de_migration.py`, sans base). À la composition
+   d'un paquet par le train (#2400), une migration ajoutée par un lot est
+   renumérotée au maximum de la cible + 1, jamais une migration historique :
+   le lot qui en modifie une est écarté avec un motif. Les fichiers compagnons
+   du même préfixe (rollback, test, banc) sont renommés avec elle, les
+   références par nom de fichier et les numéros en commentaire suivent ; les
+   littéraux de code ne changent pas. Un transport qualifié qui porterait une
+   migration ajoutée ou modifiée est refusé et le lot écarté : sa qualification
+   fige l'arbre et le delta, la renumérotation doit donc précéder la
+   qualification. La réservation L122 est déplacée avant
+   la publication (journal « before: … »), le plan porte la correspondance
+   (`reserved`/`landed`) et le commit final la ligne
+   `ameesh-migration: <lot> <ancien> <nouveau>`. Après promotion confirmée,
+   le numéro atterri est enregistré (`migration_landed`) et la réservation
+   libérée. Le train reste inactif : ce raccord ne l'active pas.
+6. **Geler le périmètre d'une release à son ouverture** (L750/L756, #561/#566).
+   Quand le lot de release est ouvert, son périmètre se fige à un commit
+   **nommé** de sa cible : `ameesh release open <lot> --base <commit>`. Les
+   fusions de `main` postérieures au gel vont à la release suivante ; seuls les
+   correctifs d'un bloquant de cette release sont cherry-pickés sur
+   `release/x.y`, chacun avec sa propre exécution impactée. La suite **complète**
+   tourne une fois sur la tête gelée — une PR de version seule ne lance rien, et
+   une PR peut n'avoir suivi que le plan impacté. Avant de fusionner la PR de
+   version, `ameesh release check <lot>` refuse une branche dont la base a
+   bougé après le gel (le merge-base avec la cible n'est plus le périmètre) et
+   l'absence d'une exécution de suite complète (poussée ou lancement manuel)
+   verte sur la **tête fraîche** exacte : un commit postérieur au gel (correctif
+   cherry-pické) est certifié lui-même, jamais par la CI de l'ancien gel. La
+   suite complète se **déclare** par ses fichiers de workflow dans
+   `radar.projects.<p>.full_suite` (une identité — le fichier —, jamais un nom
+   d'affichage libre) ; chacun doit avoir tourné sur le commit exact, vert
+   **jobs compris**. Une entrée peut nommer ses jobs requis
+   (`{"path": …, "jobs": ["plan", "psycopg *"], "tolerate": ["bilan des
+   impactés"]}`) : « nom * » couvre une famille de matrice (sinon égalité
+   stricte), un job requis doit exister et être vert, les autres doivent être
+   verts ou sautés (un job sauté par conception, `if:` sur l'événement ou les
+   chemins, ne bloque pas) et un job `tolerate` (`continue-on-error`) ne
+   certifie ni ne bloque. Une entrée réduite au chemin exige **tous** les jobs ;
+   un job illisible ne certifie rien, et le dispatch d'un workflow non déclaré
+   (docs seul) ne compte pas. Un écart
+   délibéré se justifie par `ameesh release reason <lot> --text "…"` ; le
+   périmètre et la raison vivent au journal du lot. La file de fusion applique
+   la même porte au lot de classe release qu'elle traverse
+   (`merge_queue.readiness`).
+7. **Essai à blanc avant toute étiquette de release.** Avant de poser une
    étiquette qui publie (application, installeur, image), le workflow de
    release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
    cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
    étiquette publiée : on pose la suivante.
-7. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
+8. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
    `deploy/mise-a-jour/poste.sh publier <sha>` pose l'étiquette annotée
    `v<version>` sur ce commit de `main` (le numéro est celui de son
    `pyproject.toml`), la pousse et crée la release GitHub. Les notes viennent

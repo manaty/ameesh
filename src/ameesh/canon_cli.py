@@ -53,6 +53,14 @@ confiance configurée d'un canon qui n'est pas le canon par défaut est la `ref`
 de SON entrée `canons` (AMEESH_CANONS n'en donne pas : amorçage par
 `canon sync --canon <id> --bootstrap-ref BRANCHE`). `--bootstrap-ref` ne sert
 qu'aux canons dont le registre n'est pas encore amorcé.
+
+L814 : le journal des authentificateurs est unique par canon, tous hôtes
+confondus. Avant de juger, `canon sync` (et la passe de l'exécuteur) rattrape
+le clone de l'hôte : quand un dernier commit appliqué est inconnu du dépôt,
+les dépôts du canon sont fetchés et le canon relu ; le checkout du clone
+canonique est ensuite avancé à la révision lue (fast-forward seulement). Un
+checkout qui ne peut pas la contenir (clone divergé, modifications locales)
+fait refuser l'écriture des authentificateurs — registre inchangé.
 """
 from __future__ import annotations
 
@@ -405,6 +413,8 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
                                  bootstrap_ref=args.bootstrap_ref or "")
     except canon_sync.CanonUnreadable as exc:
         return _print_unreadable(args, canon, exc, sink=sink)
+    except canon_sync.CanonStale as exc:
+        return _print_stale(args, canon, exc, sink=sink)
     auth_errors = report.authenticators.errors if report.authenticators else []
     if args.json:
         data = report.to_dict()
@@ -433,6 +443,8 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
               "ameesh placement check --agent A" % (tag, host, ", ".join(refused)))
     print(_status_line(host, report.status, report.diagnostic, recorded=True))
     _print_packages(report.packages)
+    _print_processes(report.processes)
+    _print_mechanics(report.mechanics)
     _print_authenticators(report.authenticators)
     if report.errors:
         print("canon INVALID — %s: the affected agents are not claimable "
@@ -459,6 +471,40 @@ def _print_packages(done) -> None:
         if done.relinked else ""))
     if done.skipped:
         print("  in error: %s (ameesh canon check)" % ", ".join(done.skipped))
+
+
+def _print_processes(done) -> None:
+    """#538 : les règles de travail (fiches Process) poussées par la synchro.
+
+    #1464 : un repère d'envoi figé (canon réécrit, repère d'un autre canon) est
+    dit ici — les envois sont arrêtés, et cela ne doit pas rester muet."""
+    if done is None:
+        return
+    if done.changed:
+        print("rules (Process) : %d pushed to the agents of the host: %s"
+              % (len(done.changed), ", ".join(done.changed)))
+    if done.error:
+        print("rules (Process) NOT pushed: %s" % done.error)
+
+
+def _print_mechanics(done) -> None:
+    """#1616 : les paramètres mécaniques compilés du canon appliqué (constat)."""
+    if done is None:
+        return
+    if done.status == "ok":
+        packets = "%d/jour" % len(done.packets) if done.packets else "aucun"
+        print("mechanics (#1616) : cutoffs %s %s; paquets %s; max_in_build %d; CI %s "
+              "(incident %s); families %s"
+              % (", ".join(done.cutoffs), done.timezone, packets, done.max_in_build,
+                 done.ci.get("packet", "?"), done.ci.get("incident_label", "?"),
+                 ", ".join(done.reviews.get("families") or [])))
+    elif done.status == "absent":
+        print("mechanics (#1616) : absent — the strict reader refuses; "
+              "consumers must not fall back (%s)" % done.error)
+    elif done.status == "invalid":
+        print("mechanics (#1616) : INVALID — %s" % done.error)
+    else:
+        print("mechanics (#1616) : no exact canon commit — not compiled")
 
 
 def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:
@@ -594,6 +640,31 @@ def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
     return code
 
 
+def _print_stale(args: argparse.Namespace, canon: canon_mod.Canon,
+                 exc: canon_sync.CanonStale, sink: list | None = None) -> int:
+    """Processus plus vieux que le paquet installé (L780) : rien n'a été écrit.
+
+    `canon_state`, responsables et placements restent au dernier passage
+    valide ; l'appelant demande un redémarrage entre deux tours."""
+    if args.json:
+        data = {
+            "host": exc.host, "source": canon.source_label(),
+            "untrusted": canon.untrusted,
+            "canon_status": "outdated", "diagnostic": exc.reason,
+            "actions": [], "errors": 0, "findings": [],
+        }
+        if sink is not None:
+            data.update(canon_id=canon.id, default=canon.is_default)
+            sink.append(data)
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 1
+    print("canon sync on %s — OUTDATED CODE (%s): registry unchanged "
+          "(canon_state, responsables, placements); restart between turns"
+          % (exc.host, exc.reason))
+    return 1
+
+
 def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
                       exc: canon_sync.CanonUnreadable, sink: list | None = None) -> int:
     """Canon illisible : seul l'état `unreadable` a été enregistré."""
@@ -682,7 +753,12 @@ def _taken_agent_names(canons: list, db) -> set:
     toujours (courrier, fils, lots et sessions continuent de le citer). Les
     alias de #423 s'ajouteront ici quand ils existeront."""
     names = {agent.title for canon in canons if canon.readable for agent in canon.agents}
-    names |= {row["name"] for row in registry.overview(db) if row.get("name")}
+    names |= {alias for c in canons if c.readable for agent in c.agents
+              for alias in (agent.aliases or [])}
+    for row in registry.overview(db):
+        if row.get("name"):
+            names.add(row["name"])
+        names.update(row.get("aliases") or [])
     return names
 
 

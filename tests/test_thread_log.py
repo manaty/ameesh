@@ -854,7 +854,7 @@ class FilPgTest(PgTestCase):
         env = self.env(AGENT_MAIL_NAME="alpha", AMEESH_THREADS=self.broken_threads())
         proc = self.cli("send", "beta", "toujours livré", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
+        self.assertEqual(proc.stdout.strip(), "delivered to beta")
         self.assertIn("thread write failed", proc.stderr)
         self.assertEqual(self.unread_count("beta"), 1)
 
@@ -863,7 +863,7 @@ class FilPgTest(PgTestCase):
         proc = self.cli("send", "beta", "via les fichiers", "--lot", "9",
                         env=self.env_bad(AGENT_MAIL_NAME="alpha", AMEESH_PROJECT="banc"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
+        self.assertEqual(proc.stdout.strip(), "delivered to beta")
         [fichier] = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
         with open(os.path.join(self.v0state, "inbox", "beta", fichier), encoding="utf-8") as fh:
             self.assertEqual(set(json.load(fh)), {"from", "to", "ts", "text", "host"})

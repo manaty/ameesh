@@ -26,6 +26,10 @@ CORRESPONDANCES = {
     },
     # états du journal qui marquent le premier passage « en cours »
     "etats_en_cours": ("build",),
+    # états où la date prévue reste pilotable par le porteur : la tâche est
+    # demandée ou en cours ; plus avancée (relecture, attente), elle ne l'est
+    # plus, et sa date ne déclenche donc pas d'alerte (#2342)
+    "etats_actifs": ("intake", "build"),
     # états d'une tâche livrée (l'effet a eu lieu) et d'une tâche abandonnée
     "etats_livres": tuple(work_mod.MERGED_STATES),
     "etats_abandonnes": ("closed",),
@@ -48,16 +52,27 @@ def milestone(generic: str) -> str:
     return CORRESPONDANCES["jalons"][generic]
 
 
-def delivered(state: str | None) -> bool:
-    return (state or "") in CORRESPONDANCES["etats_livres"]
+def delivered(state: str | None, close_reason: str | None = None) -> bool:
+    """Livrée : fusionnée, promue, ou livrée hors cible (#988 : `closed` +
+    `delivered`)."""
+    return ((state or "") in CORRESPONDANCES["etats_livres"]
+            or (state == "closed" and close_reason == "delivered"))
 
 
-def abandoned(state: str | None) -> bool:
-    return (state or "") in CORRESPONDANCES["etats_abandonnes"]
+def abandoned(state: str | None, close_reason: str | None = None) -> bool:
+    """Abandonnée : fermée sans livraison."""
+    return ((state or "") in CORRESPONDANCES["etats_abandonnes"]
+            and not delivered(state, close_reason))
 
 
 def in_progress(state: str | None) -> bool:
     return (state or "") in CORRESPONDANCES["etats_en_cours"]
+
+
+def active(state: str | None) -> bool:
+    """La date prévue reste pilotable par le porteur (tâche demandée ou en
+    cours) : plus avancée, elle attend un tiers et n'alerte pas (#2342)."""
+    return (state or "") in CORRESPONDANCES["etats_actifs"]
 
 
 def attend_decision(state: str | None) -> bool:
@@ -74,4 +89,5 @@ jalon = milestone
 livree = delivered
 abandonnee = abandoned
 en_cours = in_progress
+actif = active
 etat_generique = generic_state

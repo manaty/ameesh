@@ -125,6 +125,15 @@ limits are declarative, in `policy.resources` of the `Host` card
 (`min_mem_available`, `max_swap_used`, `max_load`, `min_disk_free`; sizes in
 bytes or with a unit such as `1GiB`), else prudent defaults.
 
+`max_swap_used` is a **stock**, not a pressure: pages stay in swap until they
+are touched, so the ceiling only counts with a corroborating memory pressure
+(PSI memory above half its own ceiling). A host that cannot measure PSI keeps
+the old meaning: with no declared ceiling, the stock is compared to the 0028
+prudent 8 GiB fallback (#2354). `max_mem_pressure` (PSI memory `some`, 60 s,
+10 % by default) is the admission signal that follows the real pressure; an
+absent or unreadable threshold takes the default, it never removes the guard
+(#2296).
+
 - Before each turn, a crossed limit **holds new turns**; running turns finish.
 - A **critical** crossing pauses the agents of lowest `priority` (an `Agent`
   card key, 0 by default) that have no running turn, never in the middle of a
@@ -147,8 +156,9 @@ bytes or with a unit such as `1GiB`), else prudent defaults.
   of the guest (the agents' slice) and of the application (everything else),
   and the capacity the host could lend, computed on the application's
   consumption over 7 days. `max_cpu_pressure` (no default) holds new turns
-  above that CPU PSI. `ameesh hosts` shows them; relocation ranks a lending
-  host by its lendable memory.
+  above that CPU PSI; `max_mem_pressure` (10 % by default) does the same for
+  memory PSI. `ameesh hosts` shows them; relocation ranks a lending host by its
+  lendable memory.
 
 ## Host gate and durable withdrawal
 
@@ -243,6 +253,24 @@ ameesh run stop <name>        # no new lease; the current turn finishes
 ```
 
 `canon sync` never lifts a stop set by `ameesh run stop`.
+
+## Working on several projects
+
+An agent with several declared `projects` keeps its registry `cwd` for the
+primary project. A lot of another project uses that project's Host
+`work_roots` or `work_root`, expanding `{agent}`; the agent's `work_dirs`
+override applies to the primary project. Prepare that directory before
+automatic pick-up: the runner does not clone a repository or create an empty
+directory. A missing or ambiguous secondary directory leaves the lot
+unassigned; an explicitly assigned lot waits until its directory is ready —
+the agent is not blocked: its primary turns and mail keep flowing, and only
+that lot is retried later. A lot whose project the agent has **not** declared
+(or an unknown lot) keeps the primary `cwd`, as before per-project
+directories. Each lot's parked session keeps its opening directory, so
+returning to it resumes there. Changing the directory starts a new session.
+Multi-project agents keep separate lot sessions even with
+`session_policy=jamais`. The mediated executor's single agent depot cannot
+run a secondary project.
 
 ## Seeing it
 

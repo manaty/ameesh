@@ -5,6 +5,8 @@ Constat : les tours DeepSeek étaient inscrits sans session (`sessionId` non
 lu), avec le modèle « inconnu » (aucun modèle passé ni annoncé), et l'usage par
 étape du flux `dsh` était ignoré (taille de session toujours nulle : jamais de
 rotation sur la taille). L'alerte `session_too_big` ne faisait qu'alerter.
+#2336 : le plafond de contexte mesure le contexte du dernier appel (la taille
+de la session), pas la somme des relectures du tour.
 Postgres réel ; faux harnais `dsh` du banc.
 """
 from __future__ import annotations
@@ -21,9 +23,9 @@ from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
 
-#: un tour qui relit 20 M jetons (deux étapes de 10 M), au-dessus du plafond 15 M
-GROS_TOUR = "100000,9900000,500;100000,9900000,700"
-#: un tour léger : 2 M relus
+#: un tour dont UN appel relit 16 M jetons de contexte, au-dessus du plafond 15 M
+GROS_TOUR = "100000,15900000,500"
+#: un tour léger : 2 M relus en deux étapes de 1 M (contexte 1 M)
 PETIT_TOUR = "50000,950000,100;50000,950000,100"
 
 
@@ -148,11 +150,11 @@ class GrandLivreDeepSeekTest(_Base):
         vrai_clear = registry.pending_spend_clear
         appels = []
 
-        def clear_en_panne(db, name):
+        def clear_en_panne(db, name, *reste):
             appels.append(name)
             if len(appels) == 1:
                 raise db_mod.DbError("connexion perdue après l'écriture")
-            return vrai_clear(db, name)
+            return vrai_clear(db, name, *reste)  # #1469 : effacement conditionnel
 
         with self._env(PETIT_TOUR), \
                 mock.patch.object(registry, "pending_spend_clear", clear_en_panne):
@@ -183,7 +185,7 @@ class GrandLivreDeepSeekTest(_Base):
         alertes = [a for a in exploitation.alerts(self.cfg, self.db)
                    if a["type"] == "session_too_big"]
         self.assertEqual([(a["agent"], a["value"], a["session"]) for a in alertes],
-                         [("ds-al", 20_000_000, "dsh-session-1")])
+                         [("ds-al", 16_000_000, "dsh-session-1")])
 
     def test_taille_de_session_mesuree_pour_deepseek(self):
         runner, worker = self._worker("ds-taille", session_min_turns=1,
@@ -238,17 +240,29 @@ class PlafondDeContexteTest(_Base):
             self.assertFalse(worker.maybe_rotate())
         self.assertEqual(registry.get(self.db, "ds-sous")["session_id"], "dsh-session-1")
 
+    def test_la_somme_des_appels_ne_tourne_pas(self):
+        """#2336 : 2 M relus en deux étapes de 1 M dans une session de 1 M ne
+        dépassent pas le plafond de 15 M — la somme du tour n'est pas une
+        taille de contexte."""
+        runner, worker = self._worker("ds-somme")
+        with self._env(PETIT_TOUR):
+            self.assertTrue(self._tour(worker))
+        self.assertEqual(worker.last_turn_reread, 2_000_000)
+        self.assertEqual(worker.last_turn_context_reread(),
+                         (1_000_000, "dsh-session-1"))
+        self.assertFalse(worker.context_rotation_due())
+
     def test_reglage_par_agent(self):
         runner, worker = self._worker("ds-reg")
         with self._env(PETIT_TOUR):
             self.assertTrue(self._tour(worker))
         self.assertFalse(worker.context_rotation_due())
-        # plafond abaissé pour cet agent : 2 M relus suffisent
-        proc = self.mesh("set", "ds-reg", "context_max_tokens=1.5M")
+        # plafond abaissé sous le contexte du dernier appel (1 M)
+        proc = self.mesh("set", "ds-reg", "context_max_tokens=900k")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("context=1500000", proc.stdout)
+        self.assertIn("context=900000", proc.stdout)
         worker.agent = registry.get(self.db, "ds-reg")
-        self.assertEqual(worker.context_max_tokens(), 1_500_000)
+        self.assertEqual(worker.context_max_tokens(), 900_000)
         self.assertTrue(worker.context_rotation_due())
         # 0 = désactivé
         self.assertEqual(self.mesh("set", "ds-reg", "context_max_tokens=0").returncode, 0)

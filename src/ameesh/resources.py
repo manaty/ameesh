@@ -33,13 +33,22 @@ from . import platform, storage
 from .db import Db
 
 #: valeurs par défaut prudentes des seuils (0028), quand la fiche Host n'en
-#: déclare pas : 1 Gio de mémoire disponible, 8 Gio de swap, 2×CPU de charge,
-#: 2 Gio de disque libre. Le plancher de mémoire est le signal de saturation ;
-#: le plafond de swap est haut parce qu'un poste de développement peut garder
-#: plusieurs Gio de swap ANCIEN sans pression réelle (l'incident de 0028 était
-#: à ~12 Go) ; l'hôte qui veut plus strict le déclare dans `policy.resources`.
+#: déclare pas : 1 Gio de mémoire disponible, 2×CPU de charge, 2 Gio de disque
+#: libre. Le plancher de mémoire est le signal de saturation. #2296 : pas de
+#: plafond de swap par défaut — un stock de swap n'est pas une pression, et le
+#: défaut de 0028 (8 Gio) faisait un faux « critical pressure » au démarrage,
+#: avant que la fiche Host ne soit lue (pc-smichea, auditeur 18/10) ; seul un
+#: hôte qui le déclare dans `policy.resources` a un plafond de swap.
 DEFAULT_MIN_MEM_AVAILABLE = 1024 ** 3
-DEFAULT_MAX_SWAP_USED = 8 * 1024 ** 3
+DEFAULT_MAX_SWAP_USED = None
+#: #2354 : le plafond de 0028 reste le repli d'un hôte qui ne peut pas mesurer
+#: PSI et ne déclare pas `max_swap_used`. Sans pression réelle, le stock de
+#: swap est le seul signal mémoire qui reste : la mémoire disponible peut
+#: rester au-dessus de son plancher pendant que les pages partent en swap.
+#: Il ne s'applique qu'à ce cas — un hôte qui mesure PSI n'a pas de plafond de
+#: swap par défaut (#2296), et un plafond déclaré l'emporte toujours
+#: (`swap_ceiling`).
+DEFAULT_MAX_SWAP_USED_WITHOUT_PSI = 8 * 1024 ** 3
 DEFAULT_MAX_LOAD_FACTOR = 2.0
 DEFAULT_MIN_DISK_FREE = 2 * 1024 ** 3
 #: #246: btrfs floors. On 2026-10-11 the host's btrfs was fully allocated
@@ -73,7 +82,7 @@ CRITICAL_LOAD_FACTOR = 2.0     # charge >= le double du plafond
 #: arrêtés au point sûr, consignes remises en attente, baux rendus) ; au retour
 #: du secteur, il reprend seul.
 #:
-#: 25 % : un tour dure jusqu'à 15 min (`session_max_turn_seconds`) et une
+#: 25 % : un tour dure jusqu'à 30 min (`turn_max_seconds`, 1 800 s) et une
 #: dizaine d'agents vident une batterie de portable en moins d'une heure
 #: (2026-10-10 : débranché à 11:06, « batterie faible » à 11:56, coupure à
 #: 12:10) — les tours en cours doivent pouvoir finir avant le seuil d'arrêt.
@@ -88,11 +97,47 @@ POWER_KEYS = ("min_battery_percent", "stop_battery_percent")
 #: percent). The load says how many tasks wait, not how long the user waits:
 #: on 10/10 a load of 43 for 12 CPU did not say how badly the workstation
 #: suffered, the PSI does. No default: a host declares it in its Host fiche.
-PRESSURE_KEYS = ("max_cpu_pressure",)
+#:
+#: #2296: ceiling on the host MEMORY pressure (PSI `memory some`, 60 s
+#: average, in percent), and the admission signal that follows the real
+#: pressure instead of the swap used. It DOES have a default, unlike
+#: `max_cpu_pressure`: an absent or unreadable threshold must not open the
+#: gate (`thresholds`). 10 % is already 6 s of memory stall per minute.
+PRESSURE_KEYS = ("max_cpu_pressure", "max_mem_pressure")
+DEFAULT_MAX_MEM_PRESSURE = 10.0
+#: #2296: a swap-used ceiling only counts with a real memory pressure — PSI
+#: memory above this share of its own ceiling (the capacity guard's
+#: `WARN_SHARE`, study L159). A swap STOCK is not a pressure: pages stay in
+#: swap until touched, so a ceiling on it latched after the pressure was gone
+#: (pc-smichea, 17/10: 22.3 GiB of swap while 6.2-6.9 GiB were available and
+#: memory PSI was 2.4-3.4 %). Without PSI (a host that cannot measure it), the
+#: ceiling keeps its old meaning: no real-pressure signal, the gate does not
+#: open on the stock alone.
+SWAP_PRESSURE_SHARE = 0.5
+#: #2022: early disk warning, well before `min_disk_free` pauses the agents
+#: (16/10: agents-1 reached 99 %, 11 agents paused, nobody warned before).
+#: A WARNING only: it alerts, it never closes a turn. Used share or free
+#: space, whichever comes first, on every volume.
+WARN_KEYS = ("warn_disk_used", "warn_disk_free")
+DEFAULT_WARN_DISK_USED = 0.85
+DEFAULT_WARN_DISK_FREE = 15 * 1024 ** 3
+#: #2022: the trend — `min_disk_free` reached within this horizon, by a least
+#: squares fit of the volume's free space over the last readings (critical
+#: within the shorter one); the fit needs enough points over enough time
+DISK_TREND_WINDOW_S = 6 * 3600.0
+DISK_TREND_HORIZON_S = 24 * 3600.0
+DISK_TREND_CRITICAL_S = 6 * 3600.0
+DISK_TREND_MIN_POINTS = 6
+DISK_TREND_MIN_SPAN_S = 3600.0
+#: #2022: zombies of a host at or over this count raise `host_zombies` — a
+#: warning, no pause (16/10, found by hand: 99 on ameesh-ci-3, 5 900 on the
+#: workstation, 11 000 on agents-1, #1749)
+ZOMBIE_KEYS = ("max_zombies",)
+DEFAULT_MAX_ZOMBIES = 200
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
 THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
                   "max_tmpfs_used", *POWER_KEYS, *PRESSURE_KEYS,
-                  *BTRFS_KEYS)
+                  *BTRFS_KEYS, *WARN_KEYS, *ZOMBIE_KEYS)
 #: L159c : plafonds mémoire des unités d'agent, dans `policy.resources` aussi.
 #: Ce ne sont pas des seuils de contre-pression : systemd les fait respecter
 #: (`MemoryMax`), `ameesh doctor` vérifie l'écart entre le canon et l'unité.
@@ -105,7 +150,7 @@ DEFAULT_AGENT_MEMORY_MAX = 6 * 1024 ** 3
 #: `MemoryHigh` (reprise de mémoire, ralentissement) à cette part du plafond dur
 AGENT_MEMORY_HIGH_RATIO = 0.9
 #: seuils exprimés en PART (0 < x <= 1, ou texte « 80% ») et non en octets
-FRACTION_KEYS = ("max_tmpfs_used",)
+FRACTION_KEYS = ("max_tmpfs_used", "warn_disk_used")
 #: dossier des sources d'alimentation (Linux) ; surchargé par les tests
 POWER_SUPPLY_ENV = "AMEESH_POWER_SUPPLY_DIR"
 POWER_SUPPLY_DIR = platform.host.POWER_SUPPLY_DIR
@@ -222,6 +267,28 @@ def finite_float(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def parse_count(value) -> int | None:
+    """#2022: a count (`max_zombies`): a positive integer, None otherwise.
+    ASCII digits only (`"²".isdigit()` is true, `int("²")` raises), and, like
+    every number of a host policy, one that fits a float (codex #212 r4)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not (text.isascii() and text.isdigit()):
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            # plus de chiffres que la limite de conversion des entiers de
+            # Python (4300 par défaut) : aucun compte, jamais une exception
+            # hors du lecteur de politique (#2120, codex #459 r4)
+            return None
+    if not isinstance(value, int) or value <= 0:
+        return None
+    return value if finite_float(value) is not None else None
+
+
 def parse_percent(value) -> float | None:
     """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None. Le signe
     `%` est unique et à la fin (codex #459 r1 : « 20%% » n'est pas 20)."""
@@ -284,6 +351,17 @@ def disk_free(path: str | None) -> int | None:
         return None
     try:
         return int(shutil.disk_usage(path).free)
+    except OSError:
+        return None
+
+
+def disk_total(path: str | None) -> int | None:
+    """#2022: size of the filesystem holding `path` (the used share of the
+    early warning), None when unreadable."""
+    if not path:
+        return None
+    try:
+        return int(shutil.disk_usage(path).total)
     except OSError:
         return None
 
@@ -508,7 +586,8 @@ def volumes(paths) -> list[dict]:
     unreadable or not btrfs); `unreadable` when the filesystem cannot be
     reached at all (#306); `fstype` from the mount table (L64: a btrfs whose
     allocation is not read is told apart from a filesystem that has none),
-    None without one."""
+    None without one; `disk_total_bytes` (#2022: the used share of the early
+    warning)."""
     out: list[dict] = []
     seen: dict[str, dict] = {}
     mounts = platform.mountinfo() if platform.is_linux() else []
@@ -529,6 +608,7 @@ def volumes(paths) -> list[dict]:
         else:
             probe = _probe(path)
             volume["disk_free_bytes"] = disk_free(probe)
+            volume["disk_total_bytes"] = disk_total(probe)
             volume.update(btrfs_usage(probe))
         seen[key] = volume
         out.append(volume)
@@ -735,6 +815,37 @@ def guest_memory(cgroups: list[str] | None = None) -> int | None:
         return 0
     values = [cgroup_memory_bytes(path) for path in cgroups]
     return None if any(v is None for v in values) else sum(values)
+
+
+#: #2022 (0455): the process counts of a reading
+PROCESS_FIELDS = ("procs_total", "procs_zombie", "runner_procs", "runner_zombies")
+
+
+def processes(root: int | None = None, table: list[dict] | None = None) -> dict:
+    """#2022: `procs_total` and `procs_zombie` of the host, `runner_procs` and
+    `runner_zombies` among the descendants of `root` (default: this
+    process, the runner); all None when the process table cannot be read —
+    an empty table would read as « nothing runs »."""
+    if table is None:
+        try:
+            table = platform.process_table()
+        except Exception:  # NotAvailable, or any read error: unmeasured
+            return dict.fromkeys(PROCESS_FIELDS)
+    root = os.getpid() if root is None else int(root)
+    kids: dict[int, list[dict]] = {}
+    for proc in table:
+        kids.setdefault(proc.get("ppid"), []).append(proc)
+    own, stack, seen = [], [root], {root}
+    while stack:
+        for child in kids.get(stack.pop(), ()):
+            if child["pid"] not in seen:
+                seen.add(child["pid"])
+                own.append(child)
+                stack.append(child["pid"])
+    return {"procs_total": len(table),
+            "procs_zombie": sum(1 for p in table if p.get("zombie")),
+            "runner_procs": len(own),
+            "runner_zombies": sum(1 for p in own if p.get("zombie"))}
 
 
 def lendable(reading: dict, basis: dict | None = None) -> dict:
@@ -1012,6 +1123,9 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None,
     reading.update(lendable(reading, basis))
     reading["guard_restart"] = guard_restart(now=now)
     reading.update({key: (gate or {}).get(key) for key in GATE_KEYS})
+    # #2022: zombies and processes, of the host and of this runner
+    reading.update(processes())
+    reading["runner_id"] = getattr(cfg, "runner_id", None) or getattr(cfg, "runner", None) or None
     storage.of(db).hosts.record(reading)
     return reading
 
@@ -1031,7 +1145,14 @@ def thresholds(policy=None) -> dict:
     `policy` peut être un `HostPolicy` (le canon) ou un mapping dont la clé
     `resources` porte les seuils. Chaque seuil absent ou illisible prend sa
     valeur par défaut : une politique incomplète n'ouvre pas la porte à une
-    absence de garde.
+    absence de garde. #2296 : c'est vrai aussi du plafond de pression mémoire
+    (`max_mem_pressure`, 10 % par défaut) — un hôte qui ne le déclare pas
+    garde le critère d'admission. Seule exception : `max_swap_used` n'a PAS
+    de défaut (None) — un stock de swap n'est pas une pression ; seul un hôte
+    qui déclare un plafond en a un, et ce plafond ne compte que corroboré par
+    la pression mémoire (`swap_ceiling_applies`). #2354 : un hôte qui ne peut
+    pas mesurer PSI garde le repli de 0028 (`swap_ceiling`), sans quoi il
+    n'aurait plus aucune garde sur le stock.
     """
     raw = None
     if policy is not None:
@@ -1048,8 +1169,12 @@ def thresholds(policy=None) -> dict:
     low = parse_percent(raw.get("min_battery_percent"))
     stop = parse_percent(raw.get("stop_battery_percent"))
     cpu_pressure = parse_percent(raw.get("max_cpu_pressure"))
+    mem_pressure = parse_percent(raw.get("max_mem_pressure"))
     unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
     headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
+    zombies = parse_count(raw.get("max_zombies"))
+    warn_used = parse_fraction(raw.get("warn_disk_used"))
+    warn_free = parse_bytes(raw.get("warn_disk_free"))
     cpus = cpu_count() or 1
     return {
         "min_mem_available": DEFAULT_MIN_MEM_AVAILABLE if mem is None else mem,
@@ -1061,6 +1186,10 @@ def thresholds(policy=None) -> dict:
         "stop_battery_percent": DEFAULT_STOP_BATTERY_PERCENT if stop is None else stop,
         # L159d: no default, None = not watched
         "max_cpu_pressure": cpu_pressure,
+        # #2296: unlike the CPU pressure, never None — an absent or unreadable
+        # threshold takes the prudent default, it never removes the guard
+        "max_mem_pressure": (DEFAULT_MAX_MEM_PRESSURE if mem_pressure is None
+                             else mem_pressure),
         # L159d: the offer (`policy.lend`) caps the lendable capacity; None:
         # the host lends nothing
         "lend": lend_offer(policy),
@@ -1068,12 +1197,18 @@ def thresholds(policy=None) -> dict:
                                   else unallocated),
         "min_btrfs_metadata_headroom": (DEFAULT_MIN_BTRFS_METADATA_HEADROOM
                                         if headroom is None else headroom),
+        # #2022: early disk warning (never a pause)
+        "warn_disk_used": DEFAULT_WARN_DISK_USED if warn_used is None else warn_used,
+        "warn_disk_free": DEFAULT_WARN_DISK_FREE if warn_free is None else warn_free,
+        # #2022: zombies of the host (a warning, never a pause)
+        "max_zombies": DEFAULT_MAX_ZOMBIES if zombies is None else zombies,
     }
 
 
 #: L43 (0031) : seuils PLANCHERS (plus strict = plus haut) ; les autres sont
 #: des plafonds (plus strict = plus bas)
-FLOOR_KEYS = ("min_mem_available", "min_disk_free", *POWER_KEYS, *BTRFS_KEYS)
+FLOOR_KEYS = ("min_mem_available", "min_disk_free", *POWER_KEYS, *BTRFS_KEYS,
+              "warn_disk_free")
 #: provenance d'une limite qu'aucune fiche Host ne déclare
 DEFAULT_ORIGIN = "défaut"
 
@@ -1088,6 +1223,7 @@ def declared(policy) -> dict:
     out: dict = {}
     for key in THRESHOLD_KEYS:
         value = (finite_float(raw.get(key)) if key == "max_load"
+                 else parse_count(raw.get(key)) if key in ZOMBIE_KEYS
                  else parse_fraction(raw.get(key)) if key in FRACTION_KEYS
                  else parse_percent(raw.get(key)) if key in POWER_KEYS + PRESSURE_KEYS
                  else parse_bytes(raw.get(key)))
@@ -1165,6 +1301,51 @@ def host_limits(canons, host: str) -> dict:
             "fiches": [label for label, _f in fiches]}
 
 
+def swap_ceiling(reading: dict, limits: dict) -> int | None:
+    """#2296/#2354 : le plafond de swap utilisé qui s'applique à un relevé.
+
+    Un plafond DÉCLARÉ (`max_swap_used`) l'emporte toujours. Sans plafond
+    déclaré : None quand l'hôte mesure PSI — un stock n'est pas une pression
+    (#2296), et le défaut de 0028 (8 Gio) faisait un faux « critical
+    pressure » au démarrage — mais le repli prudent de 0028
+    (`DEFAULT_MAX_SWAP_USED_WITHOUT_PSI`) quand l'hôte ne mesure pas PSI
+    (#2354) : le stock y est le seul signal mémoire qui reste, la mémoire
+    disponible pouvant rester au-dessus de son plancher pendant que les pages
+    partent en swap. Le repli suit chaque relevé : un hôte qui retrouve PSI
+    retrouve le critère de pression réelle.
+    """
+    declared = limits.get("max_swap_used")
+    if declared is not None:
+        return declared
+    if reading.get("psi_mem_some") is None:
+        return DEFAULT_MAX_SWAP_USED_WITHOUT_PSI
+    return None
+
+
+def swap_ceiling_applies(reading: dict, limits: dict) -> bool:
+    """#2296 : le plafond de swap utilisé compte-t-il pour ce relevé ?
+
+    Seulement pour un hôte qui a un plafond (`swap_ceiling` : déclaré, ou
+    repli de 0028 quand l'hôte ne mesure pas PSI, #2354), et avec une pression
+    mémoire mesurée au-dessus de `SWAP_PRESSURE_SHARE` de son propre plafond :
+    le swap utilisé est un STOCK, pas une pression (les pages y restent tant
+    qu'on ne les touche pas), donc un relevé où il dépasse le plafond après le
+    retour au calme ne doit plus retenir les tours. Sans PSI (hôte qui ne sait
+    pas le mesurer), le plafond garde son sens d'avant : pas de signal de
+    pression réelle, la porte ne s'ouvre pas sur le seul stock. Sans plafond
+    mémoire (appelant qui n'a pas calculé `thresholds`), même repli prudent.
+    Sans aucun plafond (hôte avec PSI, aucune fiche n'en déclare), il n'y a
+    rien à corroborer : le stock ne plafonne pas.
+    """
+    if swap_ceiling(reading, limits) is None:
+        return False
+    psi = reading.get("psi_mem_some")
+    limit = limits.get("max_mem_pressure")
+    if psi is None or limit is None:
+        return True
+    return psi > limit * SWAP_PRESSURE_SHARE
+
+
 def breaches(reading: dict, limits: dict) -> list[dict]:
     """Les seuils franchis par un relevé, du plus grave au moins grave.
 
@@ -1173,6 +1354,12 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     mesure CRITIQUE est franchie au-delà du facteur de gravité (voir les
     constantes `CRITICAL_*`) : l'exécuteur met alors en pause les agents les
     moins prioritaires, jamais au milieu d'un tour.
+
+    #2296 : le swap utilisé ne franchit son plafond que corroboré par une
+    pression mémoire réelle (`swap_ceiling_applies`) ; la pression mémoire
+    elle-même (PSI `memory some` 60 s) est le critère d'admission qui suit la
+    pression réelle. #2354 : sans PSI et sans plafond déclaré, le repli de
+    0028 s'applique (le stock est le seul signal) et le libellé le dit.
     """
     out: list[dict] = []
 
@@ -1201,7 +1388,9 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             out[-1]["path"] = path
 
     def ceiling(key, label, value, limit, critical_factor):
-        if value is None:
+        # #2296 : un plafond absent (None) ne plafonne rien — le stock de swap
+        # n'a pas de défaut ; les autres plafonds en ont un.
+        if value is None or limit is None:
             return
         if value > limit:
             out.append({"key": key, "label": label, "value": value, "limit": limit,
@@ -1209,8 +1398,16 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
 
     floor("min_mem_available", "available memory", reading.get("mem_available_bytes"),
           limits["min_mem_available"], CRITICAL_MEM_FACTOR)
-    ceiling("max_swap_used", "swap used", reading.get("swap_used_bytes"),
-            limits["max_swap_used"], CRITICAL_SWAP_FACTOR)
+    # #2296: swap used only counts with a measured memory pressure: a stock is
+    # not a pressure (see `swap_ceiling_applies`). #2354: on a host that cannot
+    # measure PSI and declares no ceiling, the 0028 conservative fallback is
+    # the only memory signal left, and the label says so.
+    if swap_ceiling_applies(reading, limits):
+        fallback = limits.get("max_swap_used") is None
+        ceiling("max_swap_used",
+                "swap used (no PSI: conservative default)" if fallback else "swap used",
+                reading.get("swap_used_bytes"), swap_ceiling(reading, limits),
+                CRITICAL_SWAP_FACTOR)
     ceiling("max_load", "1-min load", reading.get("load1"),
             limits["max_load"], CRITICAL_LOAD_FACTOR)
     volume_floor("min_disk_free", "free disk", "disk_free_bytes",
@@ -1230,6 +1427,15 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
         out.append({"key": "max_tmpfs_used", "label": "tmpfs %s used"
                     % (reading.get("tmp_path") or "/tmp"), "value": part, "limit": limit,
                     "critical": part >= limit + (1.0 - limit) / 2.0})
+    # #2296: memory pressure of the host (PSI some, 60 s): the admission
+    # signal that follows the real pressure; critical halfway to 100 %, like
+    # the CPU pressure.
+    mem_pressure, limit = reading.get("psi_mem_some"), limits.get("max_mem_pressure")
+    if mem_pressure is not None and limit is not None and mem_pressure > limit:
+        out.append({"key": "max_mem_pressure",
+                    "label": "memory pressure (PSI some 60 s)",
+                    "value": mem_pressure, "limit": limit,
+                    "critical": mem_pressure >= limit + (100.0 - limit) / 2.0})
     # L159d: CPU pressure of the host; critical halfway between the ceiling
     # and 100 %
     cpu_pressure, limit = reading.get("psi_cpu_some"), limits.get("max_cpu_pressure")
@@ -1246,6 +1452,128 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
                     "critical": False, "power": etat["state"]})
     out.sort(key=lambda b: (not b["critical"], b["key"]))
     return out
+
+
+def disk_floor_eta(points, floor: int) -> float | None:
+    """#2022: seconds until the free space reaches `floor`, by a least squares
+    fit of `points` ((ts, free bytes), any order) — None when the fit has too
+    few points or too short a span (`DISK_TREND_MIN_*`), or when the space is
+    not shrinking; 0 when already at or under the floor. Counted from the
+    last point."""
+    pts = sorted((float(ts), float(free)) for ts, free in points or ()
+                 if ts is not None and free is not None)
+    if len(pts) < DISK_TREND_MIN_POINTS or pts[-1][0] - pts[0][0] < DISK_TREND_MIN_SPAN_S:
+        return None
+    n = len(pts)
+    mean_t = sum(t for t, _f in pts) / n
+    mean_f = sum(f for _t, f in pts) / n
+    var = sum((t - mean_t) ** 2 for t, _f in pts)
+    if var <= 0:
+        return None
+    slope = sum((t - mean_t) * (f - mean_f) for t, f in pts) / var
+    if slope >= 0:
+        return None
+    # from the fitted value at the last point: one noisy last reading does
+    # not move the estimate
+    fitted = mean_f + slope * (pts[-1][0] - mean_t)
+    return max(0.0, (fitted - floor) / -slope)
+
+
+def _volume_series(history, path: str) -> list[tuple[float, int]]:
+    """(ts, free) of the volume `path` along `history` (readings); a reading
+    from before 0359 (no `volumes`) counts when its `disk_path` is `path`."""
+    out = []
+    for past in history or ():
+        ts = past.get("sampled_ts")
+        vols = past.get("volumes") or []
+        match = next((v for v in vols if isinstance(v, dict) and (
+            v.get("path") == path or path in (v.get("paths") or ()))), None)
+        if match is not None:
+            out.append((ts, match.get("disk_free_bytes")))
+        elif not vols and past.get("disk_path") == path:
+            out.append((ts, past.get("disk_free_bytes")))
+    return out
+
+
+def disk_warnings(reading: dict, limits: dict, history=()) -> list[dict]:
+    """#2022: the volumes of `reading` to warn about BEFORE `min_disk_free`
+    pauses the agents, one entry per volume: `path`, `free`, `total`,
+    `used` (share, None without a total), `reasons` (`used`: share at or
+    over `warn_disk_used`; `free`: under `warn_disk_free`; `trend`: the floor
+    reached within `DISK_TREND_HORIZON_S` by the fit of `history`, the
+    readings of the last `DISK_TREND_WINDOW_S`), `floor_eta_s` (None without
+    a trend) and `critical` (floor already crossed, or reached within
+    `DISK_TREND_CRITICAL_S`). A warning, never a breach: `pressure` ignores
+    it. A volume without a reading is skipped: nothing is guessed."""
+    floor = limits.get("min_disk_free") or 0
+    warn_used = limits.get("warn_disk_used")
+    warn_free = limits.get("warn_disk_free")
+    vols = reading.get("volumes") or []
+    if not vols and reading.get("disk_free_bytes") is not None:
+        vols = [{"path": reading.get("disk_path"),
+                 "disk_free_bytes": reading.get("disk_free_bytes")}]
+    out = []
+    for vol in vols:
+        free = vol.get("disk_free_bytes") if isinstance(vol, dict) else None
+        if free is None:
+            continue
+        total = vol.get("disk_total_bytes")
+        used = (1.0 - free / total) if total else None
+        reasons = []
+        if used is not None and warn_used is not None and used >= warn_used:
+            reasons.append("used")
+        if warn_free is not None and free < warn_free:
+            reasons.append("free")
+        series = _volume_series(history, vol.get("path"))
+        if reading.get("sampled_ts") is not None:
+            series.append((reading["sampled_ts"], free))
+        eta = disk_floor_eta(series, floor)
+        if eta is not None and eta <= DISK_TREND_HORIZON_S:
+            reasons.append("trend")
+        else:
+            eta = None
+        if not reasons:
+            continue
+        out.append({"path": vol.get("path"), "free": free, "total": total, "used": used,
+                    "reasons": reasons, "floor_eta_s": eta,
+                    "critical": free < floor or (eta is not None
+                                                 and eta <= DISK_TREND_CRITICAL_S)})
+    out.sort(key=lambda w: (not w["critical"], w["floor_eta_s"] is None,
+                            w["floor_eta_s"] or 0.0, w["free"]))
+    return out
+
+
+#: #2022: a host whose last reading is older than this is `stale` in the
+#: fleet summary (16/10: manaty-mesh-1 unmeasured for 3 days, ameesh-tests
+#: deleted but still listed)
+FLEET_STALE_S = 3600.0
+
+
+def fleet_line(reading: dict, limits: dict, history=(), *, now: float) -> dict:
+    """#2022: one host of the fleet summary (`ameesh hosts --fleet`): `host`,
+    `age_s` (None without a reading), `stale`, `disk` (the worst volume: path, free, used share),
+    `disk_warnings` (`disk_warnings`), `zombies`, `procs`, `breaches` (the
+    keys of the pressure verdict) and `ok` (nothing to say)."""
+    sampled = reading.get("sampled_ts")
+    age = None if sampled is None else max(0.0, now - float(sampled))
+    vols = [v for v in reading.get("volumes") or () if isinstance(v, dict)
+            and v.get("disk_free_bytes") is not None]
+    low = min(vols, key=lambda v: v["disk_free_bytes"]) if vols else None
+    disk = None if low is None else {
+        "path": low.get("path"), "free": low["disk_free_bytes"],
+        "used": (1.0 - low["disk_free_bytes"] / low["disk_total_bytes"])
+        if low.get("disk_total_bytes") else None}
+    warnings = disk_warnings(reading, limits, history)
+    breaches = [b["key"] for b in pressure(reading, limits=limits)["breaches"]]
+    zombies = reading.get("procs_zombie")
+    many = zombies is not None and limits.get("max_zombies") is not None \
+        and zombies >= limits["max_zombies"]
+    stale = age is None or age > FLEET_STALE_S
+    return {"host": reading.get("host"), "age_s": None if age is None else round(age),
+            "stale": stale,
+            "disk": disk, "disk_warnings": warnings, "zombies": zombies,
+            "procs": reading.get("procs_total"), "breaches": breaches,
+            "ok": not (stale or warnings or breaches or many)}
 
 
 def power_state(reading: dict | None, limits: dict | None = None) -> dict:
@@ -1293,6 +1621,8 @@ def fmt_value(key: str, value) -> str:
         return "—"
     if key == "max_load":
         return "%.2f" % float(value)
+    if key in ZOMBIE_KEYS:
+        return "%d" % int(value)
     if key in FRACTION_KEYS:
         return "%d %%" % round(float(value) * 100)
     if key in POWER_KEYS:

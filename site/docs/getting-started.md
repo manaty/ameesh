@@ -52,6 +52,14 @@ scripts/test.sh tests.test_bout_en_bout    # only the end-to-end test
 `psql` driver, then creates a local `.venv` with `psycopg` (and `cryptography`)
 and runs it again with the `psycopg` driver.
 
+Each run takes a throwaway `agent_mesh_test_*` database on the bench. When
+`~/.pgpass` (or `PGPASSFILE`) only covers `agent_mesh`, the script derives a
+private temporary passfile (mode `0600`, removed on exit) for the bench's
+databases from the existing entry; it never edits `~/.pgpass` or stores a
+secret in the repository. A wildcard entry
+`127.0.0.1:55432:*:agent_mesh:<password>` also covers the bench, and
+`PGPASSWORD` keeps working.
+
 ## 4. Try the commands by hand
 
 Repository-local wrappers live in `bin/` (`bin/ameesh`, `bin/agent-runner`,
@@ -95,6 +103,7 @@ python3 -m ameesh progress
 
 ## Next steps
 
+- Install ameesh for real: [Install on a workstation](guides/install.md).
 - Understand the model: [Concepts](concepts/index.md).
 - Describe your own team: [Write a canon](guides/write-a-canon.md).
 - Every command: [CLI reference](reference/cli.md).

@@ -19,6 +19,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/actions/{action}/approval-request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** File the approval request of an action with ameesh-approve; returns the link (approval stays a passkey on ameesh-approve's origin) */
+        post: operations["post_actions_action_approval_request"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/agents": {
         parameters: {
             query?: never;
@@ -53,6 +70,109 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agents/{agent}/chat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An agent's shared conversation (`ameesh chat <agent>`, L78/L83) */
+        get: operations["agents_agent_chat"];
+        put?: never;
+        /** A message to an agent's shared conversation (L83: the server writes the entry and wakes the agent by mail) */
+        post: operations["post_agents_agent_chat"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agents/{agent}/interrupt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Interrupt an agent's turn (`ameesh interrupt`; the human must be in AMEESH_INTERRUPT_SENDERS) */
+        post: operations["post_agents_agent_interrupt"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agents/{agent}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Message to an agent: its mailbox and its thread (`agent-mail send`) */
+        post: operations["post_agents_agent_messages"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agents/{agent}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Operator pause: finish this turn, start no new one */
+        post: operations["post_agents_agent_pause"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agents/{agent}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Lift only the operator pause; do not restart a stopped agent */
+        post: operations["post_agents_agent_resume"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agents/{agent}/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stop an agent by hand, with a reason (0030 §4: `manuel`) */
+        post: operations["post_agents_agent_stop"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/alerts": {
         parameters: {
             query?: never;
@@ -64,6 +184,23 @@ export interface paths {
         get: operations["alerts"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/alerts/{key}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge an alert as its human recipient; the alert remains visible */
+        post: operations["post_alerts_key_ack"];
         delete?: never;
         options?: never;
         head?: never;
@@ -87,6 +224,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/budget/caps": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Lower a cap of the mesh or of an agent (never raise one) */
+        post: operations["post_budget_caps"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/decisions": {
         parameters: {
             query?: never;
@@ -96,6 +250,23 @@ export interface paths {
         };
         /** Decisions waiting for the human (`ameesh decisions --for --json`) */
         get: operations["decisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Event stream (Server-Sent Events): lots, turns, costs, threads, decisions, alerts */
+        get: operations["events"];
         put?: never;
         post?: never;
         delete?: never;
@@ -138,6 +309,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/hosts/{host}/drain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stop placing sessions on a host (`ameesh host drain`) */
+        post: operations["post_hosts_host_drain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/lots": {
         parameters: {
             query?: never;
@@ -166,6 +354,23 @@ export interface paths {
         get: operations["lots_id"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/lots/{id}/assign": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent) */
+        post: operations["post_lots_id_assign"];
         delete?: never;
         options?: never;
         head?: never;
@@ -250,7 +455,8 @@ export interface paths {
         /** Project thread (`ameesh fil show PROJECT`) */
         get: operations["threads_project"];
         put?: never;
-        post?: never;
+        /** Publish in a project's thread */
+        post: operations["post_threads_project"];
         delete?: never;
         options?: never;
         head?: never;
@@ -267,7 +473,8 @@ export interface paths {
         /** Lot thread (`ameesh fil show PROJECT LOT`) */
         get: operations["threads_project_lot"];
         put?: never;
-        post?: never;
+        /** Publish in a lot's thread */
+        post: operations["post_threads_project_lot"];
         delete?: never;
         options?: never;
         head?: never;
@@ -278,6 +485,14 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        "ameesh-action-1": {
+            action: string;
+            by: string;
+            for: string;
+            result: Record<string, never>;
+            /** @constant */
+            schema: "ameesh-action/1";
+        };
         "ameesh-agent-detail-1": {
             agent: {
                 key_ready: boolean;
@@ -295,6 +510,9 @@ export interface components {
         };
         "ameesh-alerts-1": {
             alerts: {
+                acknowledged: boolean;
+                acknowledgement?: Record<string, never> | null;
+                key: string;
                 /** @constant */
                 schema: "ameesh-alert/1";
                 type: string;
@@ -306,6 +524,30 @@ export interface components {
             limits: Record<string, never>;
             /** @constant */
             schema: "ameesh-budget/1";
+        };
+        "ameesh-conversation-1": {
+            agent: string;
+            entries: {
+                author: string;
+                event_id?: string | null;
+                kind: string;
+                lot?: string | null;
+                meta?: Record<string, never>;
+                project?: string;
+                seq: number;
+                session?: string | null;
+                text: string;
+                truncated?: boolean;
+                ts: number;
+                turn?: string | null;
+            }[];
+            gap: boolean;
+            last_seq: number;
+            more: boolean;
+            next_seq: number;
+            oldest_seq: number | null;
+            /** @constant */
+            schema: "ameesh-conversation/1";
         };
         "ameesh-decisions-1": {
             approvals: Record<string, never>[];
@@ -332,6 +574,15 @@ export interface components {
             message: string;
             /** @constant */
             schema: "ameesh-error/1";
+        };
+        "ameesh-event-1": {
+            data: Record<string, never>;
+            id: number;
+            object: string;
+            project: string | null;
+            ts: number;
+            /** @enum {unknown} */
+            type: "lot.updated" | "turn.started" | "turn.ended" | "agent.updated" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];
@@ -433,6 +684,116 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ameesh-discovery-1"];
+                };
+            };
+        };
+    };
+    post_actions_action_approval_request: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                action: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description File the approval request of an action with ameesh-approve; returns the link (approval stays a passkey on ameesh-approve's origin) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
                 };
             };
         };
@@ -542,6 +903,744 @@ export interface operations {
             };
         };
     };
+    agents_agent_chat: {
+        parameters: {
+            query?: {
+                /** @description entries after this sequence number (default 0) */
+                after?: number;
+                /** @description entries at most (default 100) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An agent's shared conversation (`ameesh chat <agent>`, L78/L83) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-conversation-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_agents_agent_chat: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    lot?: number | null;
+                    text: string;
+                };
+            };
+        };
+        responses: {
+            /** @description A message to an agent's shared conversation (L83: the server writes the entry and wakes the agent by mail) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_agents_agent_interrupt: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    text: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Interrupt an agent's turn (`ameesh interrupt`; the human must be in AMEESH_INTERRUPT_SENDERS) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_agents_agent_messages: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    lot?: number | null;
+                    text: string;
+                    urgent?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Message to an agent: its mailbox and its thread (`agent-mail send`) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_agents_agent_pause: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    reason: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Operator pause: finish this turn, start no new one */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_agents_agent_resume: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    reason: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Lift only the operator pause; do not restart a stopped agent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_agents_agent_stop: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    reason: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Stop an agent by hand, with a reason (0030 §4: `manuel`) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
     alerts: {
         parameters: {
             query?: never;
@@ -571,6 +1670,116 @@ export interface operations {
             };
             /** @description token missing or refused */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_alerts_key_ack: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Acknowledge an alert as its human recipient; the alert remains visible */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -636,6 +1845,119 @@ export interface operations {
             };
         };
     };
+    post_budget_caps: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    agent?: string | null;
+                    usd: number;
+                    /** @enum {unknown} */
+                    window: "hour" | "day";
+                };
+            };
+        };
+        responses: {
+            /** @description Lower a cap of the mesh or of an agent (never raise one) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
     decisions: {
         parameters: {
             query?: {
@@ -676,6 +1998,56 @@ export interface operations {
                 };
             };
             /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    events: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description resume strictly after this position (the last `id:` received, "tx-id-cluster"); without it, the new events only */
+                "Last-Event-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description text/event-stream: `id: <tx-id-cluster>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended), `event: delayed` (events wait for an open transaction); a comment every 20 s */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable, or too many streams (Retry-After) */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -791,6 +2163,118 @@ export interface operations {
             };
         };
     };
+    post_hosts_host_drain: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                host: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    duration_s?: number | null;
+                };
+            };
+        };
+        responses: {
+            /** @description Stop placing sessions on a host (`ameesh host drain`) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
     lots: {
         parameters: {
             query?: {
@@ -885,6 +2369,118 @@ export interface operations {
             };
             /** @description not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_lots_id_assign: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    assignee: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1142,6 +2738,118 @@ export interface operations {
             };
         };
     };
+    post_threads_project: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    text: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Publish in a project's thread */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
     threads_project_lot: {
         parameters: {
             query?: {
@@ -1186,6 +2894,119 @@ export interface operations {
             };
             /** @description not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_threads_project_lot: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                lot: string;
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    text: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Publish in a lot's thread */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

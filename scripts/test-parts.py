@@ -8,6 +8,8 @@
                                 [--flow F.jsonl] [--label "psql 1/6"]
                                 [--measure DIR] [--map carte.json.gz]
     scripts/test-parts.py run   --plan plan.json --part K --driver psql [--flow F.jsonl]
+    scripts/test-parts.py plan  --out plan.json --parts "mesure-psycopg-1 …"
+                                [--list-psql F] [--map carte.json.gz] [--summary F]
     scripts/test-parts.py durations --driver psql F.json [F.json…]
 
 La répartition est **déterministe** et se fait **par module** de test
@@ -20,9 +22,12 @@ Un module absent de la table (nouveau) est pesé par son nombre de tests
 repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
 
 `--list` restreint la suite aux modules d'un fichier (un nom par ligne, `#`
-pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR. La liste
-est additive (L160a) : noms en ordre alphabétique et sans doublon, sinon
-refusée.
+pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
+plan de repli le demande par `pilot_list` ; une PR de release garde la suite
+complète, scripts/test-plan.py). La liste
+est additive (L160a) : on écrit un nom par ligne, en ordre alphabétique et
+sans doublon ; la lecture range et dédoublonne ce qu'une fusion `union`
+(.gitattributes) produit, et refuse toujours un nom inconnu.
 
 `run` exécute la part dans ce processus (`unittest`, verbeux) et mesure la
 durée de chaque module ; `durations` fusionne ces mesures dans la table.
@@ -57,9 +62,26 @@ L161f — **plan**: with `--plan plan.json` (written once per CI run by
 their classes from the plan: every part reads the same split, computed once
 from the map. `--parts`, `--list`, `--since` and `--map` are then
 ignored; a plan without a module list for the part (fallback plan) gives
-the L116 split. With `--flow`, the part writes an `impacted` event once its
-P0 and P1 modules are done (`statut`: `vert` or `rouge`): the provisional
-green, when every part says `vert`.
+the L116 split. On a lot branch (L1211), the plan holds only the impacted
+modules and the contract list: the part runs them, the rest of the suite
+runs on main, `release/**` and the package integration branch; a release
+pull request (same branches, source or target) keeps the full suite. With
+`--flow`, the part writes an `impacted` event once its P0 and P1 modules are
+done (`statut`: `vert` or `rouge`): the provisional green, when every part
+says `vert`.
+
+#1341 R1 — **plan de mesure**: `plan` lit la carte une seule fois et écrit le
+découpage de toutes les parts attendues (`--parts` : les noms d'artefacts du
+workflow, ex. `mesure-psycopg-1 …`) ; chaque part le lit ensuite
+(`run --plan`). Avant, chaque part de `carte.yml` restaurait la carte et
+recalculait son découpage : deux jobs pouvaient lire deux cartes différentes
+(cache écrit entre-temps) et produire des parts disjointes — un module omis,
+un autre doublé — toutes avec des `durees.json` non vides.
+
+#2224 — avec `--plafond-min N` (le `timeout-minutes` du job de mesure), le plan
+signale (`::warning::`) une part dont l'estimation × `SURCOUT_CHARGE` dépasse
+le plafond : la carte source est mesurée dans un autre contexte et sous-estime
+une part chargée (psycopg 3/6 annulée à 40m46, aucune carte publiée).
 """
 from __future__ import annotations
 
@@ -81,10 +103,25 @@ TESTS = REPO / "tests"
 TABLE = TESTS / "parts" / "durees.json"
 #: durée par test quand la table n'a rien pour le pilote (repli du repli)
 DEFAULT_PER_TEST = 0.5
+#: #1476 : poids plancher d'un module mesuré. La table arrondit au dixième et
+#: ne compte ni l'import ni setUpClass : 73 modules psql et 67 psycopg y pèsent
+#: 0,0 s. À poids nul, `split` les donnait tous à la même part (la première à
+#: égalité), qui portait alors seule leur coût réel de démarrage.
+MIN_WEIGHT = 1.0
 #: schéma des lignes du flux (docs/design/etudes/l161-tests-par-impact.md)
 FLOW_SCHEMA = "ameesh-test-event/1"
+#: modules « pilote » psql (découpage de la mesure, #1341 R1)
+PILOTE_PSQL = TESTS / "parts" / "pilote-psql.txt"
+#: schéma d'un plan de tests (scripts/test-plan.py, L161f)
+PLAN_SCHEMA = "ameesh-test-plan/1"
+#: #1341 R1 — une part de mesure : `mesure-<pilote>-<n>` (PARTS_MESURE, carte.yml)
+PART_MESURE = re.compile(r"mesure-(psycopg|psql)-(\d+)$")
 #: lignes de trace gardées dans l'extrait d'un échec
 EXCERPT_LINES = 40
+#: #2224 — surcoût de charge d'une part de mesure : run 39015105210, psycopg
+#: 3/6 estimée 1 588,7 s, 2 316 s de tests réels (×1,46) ; une part dont
+#: l'estimation × ce facteur dépasse le plafond du job est signalée par le plan
+SURCOUT_CHARGE = 1.5
 
 
 def modules(tests: pathlib.Path = TESTS) -> list[str]:
@@ -101,11 +138,11 @@ def read_list(chemin: str | os.PathLike, connus: list[str]) -> list[str]:
     inconnus = sorted(set(noms) - set(connus))
     if inconnus:
         raise SystemExit(f"{chemin} : module(s) inconnu(s) : {', '.join(inconnus)}")
-    # L160a: kept sorted and unique so that two additions never touch the same line
-    if noms != sorted(set(noms)):
-        raise SystemExit(f"{chemin} : liste non rangée (ordre alphabétique, sans doublon) ; "
-                         f"attendu : {', '.join(sorted(set(noms)))}")
-    return noms
+    # L160a : on écrit une entrée par ligne, à sa place alphabétique. #1517 :
+    # la fusion `union` (.gitattributes) de deux ajouts au même endroit garde
+    # les deux lignes dans l'ordre des côtés, ou deux fois la même : la
+    # lecture range et dédoublonne au lieu de refuser.
+    return sorted(set(noms))
 
 
 def test_count(module: str, tests: pathlib.Path = TESTS) -> int:
@@ -138,9 +175,22 @@ def map_durations(chemin: str | os.PathLike) -> dict:
 
 def weight(mods: list[str], pilote: str, table: dict | None = None,
           tests: pathlib.Path = TESTS) -> tuple[dict[str, float], list[str]]:
-    """Poids de chaque module, et la liste de ceux pesés par le repli."""
+    """Poids de chaque module, et la liste de ceux pesés par le repli.
+
+    #1476 : la carte ne mesure pas tous les modules sous chaque pilote (le
+    psql complet n'est pas sous mesure). La table statique des durées comble
+    ces trous ; la carte reste prioritaire quand elle a une durée. Sans cela,
+    un module non mesuré était pesé par son nombre de tests — un module
+    d'intégration lourd (des dizaines de secondes par test) passait pour léger
+    et déséquilibrait une part.
+    """
     if table is None:
         table = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
+    else:
+        base = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
+        for driver, mesures in table.items():
+            base.setdefault(driver, {}).update(mesures)
+        table = base
     mesures = table.get(pilote, {})
     connus = [m for m in mesures if m in set(mods)]
     total_tests = sum(test_count(m, tests) for m in connus)
@@ -148,7 +198,7 @@ def weight(mods: list[str], pilote: str, table: dict | None = None,
     resultat, repli = {}, []
     for m in mods:
         if m in mesures:
-            resultat[m] = float(mesures[m])
+            resultat[m] = max(float(mesures[m]), MIN_WEIGHT)
         else:
             resultat[m] = test_count(m, tests) * par_test
             repli.append(m)
@@ -264,6 +314,80 @@ def selection(args) -> tuple[list[str], float, list[str], dict[str, float]]:
     pesees, repli = weight(mods, args.driver, table)
     part = split(pesees, args.parts)[args.part - 1]
     return part, sum(pesees[m] for m in part), [m for m in repli if m in part], pesees
+
+
+def parts_du_plan(noms: list[str]) -> dict[str, int]:
+    """#1341 R1 — les parts attendues (`mesure-<pilote>-<n>`, la liste
+    `PARTS_MESURE` du workflow) → le nombre de parts de chaque pilote.
+
+    Un nom inconnu ou une numérotation non contiguë est refusé : un plan
+    incomplet doit échouer, jamais laisser des parts que personne ne lit."""
+    par_pilote: dict[str, set[int]] = collections.defaultdict(set)
+    for nom in noms:
+        m = PART_MESURE.fullmatch(nom)
+        if m is None:
+            raise SystemExit(f"part inconnue : {nom!r} (attendu mesure-<pilote>-<n>)")
+        par_pilote[m.group(1)].add(int(m.group(2)))
+    sortie = {}
+    for pilote, parts in sorted(par_pilote.items()):
+        if sorted(parts) != list(range(1, max(parts) + 1)):
+            raise SystemExit(f"parts {pilote} non contiguës : {sorted(parts)}")
+        sortie[pilote] = max(parts)
+    return sortie
+
+
+def plan(args) -> int:
+    """#1341 R1 — le plan de la mesure, calculé une seule fois par run.
+
+    La carte est lue ici, une fois ; le découpage pondéré (A, `--map`) est
+    figé dans le plan, que toutes les parts lisent ensuite (`run --plan`).
+    Chaque part restaurait auparavant la carte et recalculait son découpage :
+    deux jobs pouvaient lire deux cartes différentes et produire des parts
+    disjointes (module omis ou doublé), toutes avec des `durees.json` non
+    vides — la garde D publiait alors une carte incomplète avec une matrice
+    verte (témoin K1/K2 de la R1)."""
+    mods = modules()
+    table = map_durations(args.map) if args.map else None
+    parts = parts_du_plan(args.parts.replace(",", " ").split())
+    sortie: dict = {"schema": PLAN_SCHEMA, "kind": "mesure", "parts": {}, "classes": {},
+                    "poids": {}}
+    for pilote, n in sorted(parts.items()):
+        sel = read_list(args.list_psql, mods) if pilote == "psql" else mods
+        table_pilote = table
+        if table_pilote is not None and not table_pilote.get(pilote):
+            table_pilote = None  # la carte ne porte pas ce pilote : table statique
+        poids, repli = weight(sel, pilote, table_pilote)
+        sortie["parts"][pilote] = [
+            {"part": i, "of": n, "modules": part, "label": f"{pilote} {i}/{n}",
+             "estimate_s": round(sum(poids[m] for m in part), 1),
+             "pilot_list": pilote == "psql"}
+            for i, part in enumerate(split(poids, n), 1)]
+        sortie["poids"][pilote] = {
+            "modules": len(sel), "repli": len(repli),
+            "source": "carte" if (table or {}).get(pilote) else "statique"}
+    pathlib.Path(args.out).write_text(json.dumps(sortie, indent=1, ensure_ascii=False) + "\n",
+                                      encoding="utf-8")
+    lignes = ["## plan de mesure"]
+    for pilote, n in sorted(parts.items()):
+        infos = sortie["poids"][pilote]
+        charges = [entree["estimate_s"] for entree in sortie["parts"][pilote]]
+        lignes.append(f"* {pilote} : {infos['modules']} module(s) en {n} parts "
+                      f"(poids {infos['source']}, {infos['repli']} en repli), "
+                      f"max ~{max(charges):.0f} s")
+        for entree in sortie["parts"][pilote] if args.plafond_min else ():
+            if entree["estimate_s"] * SURCOUT_CHARGE > args.plafond_min * 60:
+                print(f"::warning::mesure {entree['label']} estimée "
+                      f"{entree['estimate_s']:.0f} s : ×{SURCOUT_CHARGE} sous charge, "
+                      f"au-delà du plafond de {args.plafond_min} min", flush=True)
+                lignes.append(f"  * ⚠ {entree['label']} : ~{entree['estimate_s']:.0f} s, "
+                              f"marge ×{SURCOUT_CHARGE} au-delà du plafond "
+                              f"{args.plafond_min} min")
+    texte = "\n".join(lignes) + "\n"
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as fh:
+            fh.write(texte)
+    print(texte, end="")
+    return 0
 
 
 def _module_of(test) -> str:
@@ -623,9 +747,26 @@ def main(argv: list[str] | None = None) -> int:
     p = sous.add_parser("durations")
     p.add_argument("--driver", choices=("psql", "psycopg"), required=True)
     p.add_argument("files", nargs="+")
+    # #1341 R1 — le plan de la mesure, lu une fois par run (job `plan-mesure`) :
+    # `run --plan` le consomme dans chaque part.
+    p = sous.add_parser("plan", help="découpage de toutes les parts d'une mesure, "
+                         "calculé une seule fois par run (#1341 R1)")
+    p.add_argument("--out", required=True, help="écrit le plan (JSON)")
+    p.add_argument("--parts", required=True,
+                   help="parts attendues (noms d'artefacts, ex. « mesure-psycopg-1 … »)")
+    p.add_argument("--list-psql", default=str(PILOTE_PSQL),
+                   help="modules « pilote » psql (défaut tests/parts/pilote-psql.txt)")
+    p.add_argument("--map", help="carte (carte.json.gz) : durées sous mesure ; "
+                   "tests/parts/durees.json en repli")
+    p.add_argument("--summary", help="écrit aussi le résumé Markdown dans ce fichier")
+    p.add_argument("--plafond-min", type=int,
+                   help="timeout-minutes du job de mesure : signale une part trop "
+                   "proche du plafond (#2224)")
     args = ap.parse_args(argv)
     if args.commande == "run" and not args.parts and not args.plan:
         ap.error("run: --parts or --plan required")
+    if args.commande == "plan":
+        return plan(args)
     if args.commande == "split":
         part, estimee, _, _ = selection(args)
         print("\n".join(f"tests.{m}" for m in part))

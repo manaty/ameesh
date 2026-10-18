@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import tempfile
 from dataclasses import dataclass
 
@@ -50,6 +51,9 @@ class Binding:
     #: L41 (0030) : la liaison de session (ligne `session_bindings`) si
     #: source == "session"
     session: dict | None = None
+    #: #811 : les projets de l'agent, quand la lecture du bail les a ramenés
+    #: (`projects`, `team`, `chantier`) ; None si le backend ne les porte pas.
+    projects: tuple[str, ...] | None = None
 
     @property
     def bound_to_lease(self) -> bool:
@@ -102,6 +106,18 @@ def legacy_name(cwd: str | None, cfg: Config) -> str:
     return base[:64] or "racine"
 
 
+def _projects_of(row: dict | None) -> tuple[str, ...] | None:
+    """#811 : les projets de l'agent quand le bail les a ramenés.
+
+    `None` si la ligne ne porte aucun des faits attendus (`projects`, `team`,
+    `chantier`) : un backend médié peut ne rendre que le bail, et l'appelant
+    doit alors relire le registre comme avant."""
+    if not row or not any(key in row for key in ("projects", "team", "chantier")):
+        return None
+    from . import projects  # import tardif : identité ne dépend pas du registre
+    return tuple(projects.agent_projects(row))
+
+
 def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
                     session_id: str | None = None) -> Binding:
     """L'identité de cette session : explicite, et liée au bail si le runner l'a posée.
@@ -119,6 +135,7 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
         return _session_binding(cfg, db, harness, session_id)
     if not NAME_RE.match(name):
         return Binding(reason="AGENT_MAIL_NAME not set (the runner sets it for the harness)")
+    from .agent_names import resolve
     runner_id = os.environ.get("AMEESH_RUNNER_ID") or os.environ.get("AGENT_MESH_RUNNER_ID") or ""
     epoch_text = (os.environ.get("AMEESH_LEASE_EPOCH")
                   or os.environ.get("AGENT_MESH_LEASE_EPOCH") or "")
@@ -129,10 +146,37 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
             return Binding(name=name, source="runner", runner_id=runner_id,
                            reason="unreadable AMEESH_LEASE_EPOCH")
         from . import registry  # import tardif : identity ne dépend pas de la base
-        ok, reason = registry.lease_matches(db, name, runner_id, epoch)
-        return Binding(name=name, source="runner", runner_id=runner_id, epoch=epoch,
-                       ok=ok, reason=reason)
+        ok, reason, row = registry.lease_agent(db, name, runner_id, epoch)
+        canonical = (row or {}).get("name") or name
+        return Binding(name=canonical, source="runner", runner_id=runner_id, epoch=epoch,
+                       ok=ok, reason=reason, projects=_projects_of(row))
+    name = resolve(name, db=db, cfg=cfg, operation="identity.binding")
     return Binding(name=name, source="explicit", ok=True)
+
+
+#: L244 (#420) : sources acceptées pour signer un geste de droits — le bail du
+#: runner (le plus fort), ou une liaison de session explicite (L41). Une simple
+#: variable `AGENT_MAIL_NAME` (source `explicit`) est auto-déclarée.
+BOUND_SOURCES = ("runner", "session")
+
+
+def require_bound(cfg: Config, db=None, *, what: str = "this command",
+                  sources: tuple[str, ...] = BOUND_SOURCES) -> Binding:
+    """L'identité liée qu'exige un geste de droits (L244, #420).
+
+    Refuse une identité absente, un bail qui ne correspond pas, ou une source
+    seulement explicite : une signature de droits ne se contente pas d'un nom
+    auto-déclaré."""
+    binding = resolve_binding(cfg, db)
+    if not binding.name or not binding.ok or binding.source not in sources:
+        if binding.name and not binding.ok:
+            reason = binding.reason or "identity does not match a live lease"
+        elif binding.name:
+            reason = "identity %s is %s, not bound" % (binding.name, binding.source)
+        else:
+            reason = binding.reason or "no bound session identity"
+        raise ValueError("%s requires a bound session identity (%s)" % (what, reason))
+    return binding
 
 
 _UNBOUND = ("AGENT_MAIL_NAME not set (the runner sets it for the harness) and no "
@@ -185,6 +229,55 @@ def workstream_of(name: str, cfg: Config) -> str:
 
 #: L148 (stage 2c): old spelling kept for the callers not yet renamed.
 chantier_of = workstream_of
+
+#: Domaine des adresses git des agents — jamais routable, le même que celui de
+#: l'agent côté appareil (`mediated_executor/work_repo.py`).
+GIT_EMAIL_DOMAIN = "ameesh.invalid"
+
+
+def git_identity(name: str) -> dict:
+    """L'identité git d'une session (#834) : auteur ET committer.
+
+    Une session la porte par l'**environnement** (`GIT_AUTHOR_*`,
+    `GIT_COMMITTER_*`), jamais par `git config` : les worktrees d'un même
+    dépôt partagent `.git/config`, donc un `user.name` écrit par un agent
+    vaut pour tous les autres (incident du 13/10/2026 : une session reprise
+    sans identité commitait sous le nom d'un autre agent). Les variables
+    d'environnement priment sur la configuration ; la valeur vient du nom
+    d'agent du bail — la même source que `AGENT_MAIL_NAME` — donc aucune
+    configuration git n'est lue.
+    """
+    adresse = "%s@%s" % (name, GIT_EMAIL_DOMAIN)
+    return {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": adresse,
+            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": adresse}
+
+
+def repo_config_identity(cwd: str) -> dict:
+    """L'identité git écrite dans la configuration PARTAGÉE du dépôt (#896).
+
+    Les worktrees d'un même dépôt partagent `.git/config` : un `user.name`
+    posé par un agent vaut pour tous les autres (incident du 13/10/2026, où
+    une session reprise commitait sous le nom d'un tiers). Le tour ne s'en
+    sert jamais — il pose `GIT_AUTHOR_*`/`GIT_COMMITTER_*` (#834) — mais un
+    commit lancé hors harnais depuis ce dossier serait signé de ce nom :
+    l'appelant le signale. Rend les valeurs posées, jamais pour s'en servir ;
+    `{}` si le dossier n'est pas un dépôt, si git manque ou répond trop
+    lentement.
+    """
+    try:
+        fait = subprocess.run(
+            ["git", "-C", cwd, "config", "--local", "--get-regexp", r"^user\."],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if fait.returncode != 0:
+        return {}
+    pose: dict[str, str] = {}
+    for ligne in fait.stdout.splitlines():
+        cle, _, valeur = ligne.partition(" ")
+        if valeur.strip():
+            pose[cle] = valeur.strip()
+    return pose
 
 
 def write_alias(cfg: Config, name: str, directory: str, workstream: str = "") -> str:

@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 
 from .. import interface
+from .packages import WorkPackages
 from .placement import PROFILE_PARAMS_SQL, profile_params, profile_sql
+from .registry import NAME_LOCK_CTE, name_lock_key
 
 _CAPS_SQL = ("CASE WHEN %s::text IS NULL THEN NULL "
              "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END")
@@ -64,7 +66,7 @@ class Canon(interface.Canon):
         )
 
     _STATE_COLUMNS = """
-        host, canon, canon_id, status, root, source, last_good_commit, diagnostic,
+        host, canon, canon_id, status, root, source, last_good_commit, process_commit, diagnostic,
         extract(epoch from last_good_at)::float8 AS last_good_ts,
         extract(epoch from checked_at)::float8   AS checked_ts,
         auth_status, auth_diagnostic,
@@ -82,6 +84,14 @@ class Canon(interface.Canon):
         return self.db.query(
             "SELECT %s FROM canon_state WHERE host = %%s ORDER BY canon" % self._STATE_COLUMNS,
             (host,))
+
+    def claim_commit(self, host, old, new, canon="") -> bool:
+        rows = self.db.query(
+            "UPDATE canon_state SET process_commit = %s "
+            "WHERE host = %s AND canon = %s"
+            " AND coalesce(process_commit, last_good_commit, '') = %s RETURNING host",
+            (new, host, canon or "", old))
+        return bool(rows)
 
     def key_for_root(self, host, root) -> str | None:
         rows = self.db.query(
@@ -134,10 +144,19 @@ class Canon(interface.Canon):
         L44 (0031) : le canon des actions (`actions.canon`, '' = canon par
         défaut) suit de même — '' passe à `previous`, puis `new_default` (id
         du nouveau canon par défaut) passe à '' : un reçu d'une action garde
-        les authentificateurs de son canon."""
+        les authentificateurs de son canon.
+
+        #1464 (N2 #793) : la copie emporte `process_commit`, le repère d'envoi
+        des règles Process. Sans lui, l'état recopié retombait sur
+        `last_good_commit`, plus ancien, et les règles déjà poussées
+        repartaient une fois."""
         # L46 (0036) : `actions.canon` est immuable sauf pendant CE rebase ; le
         # réglage ne vaut que pour la transaction de l'appelant (SET LOCAL),
         # que `adopt_default` ouvre.
+        # #831 : la bascule écrit `work_packages.canon` ; sans le verrou de
+        # synchronisation, un sync du canon par défaut parti avant elle pouvait
+        # réécrire NULL après. Même verrou que `canon sync` (par schéma).
+        WorkPackages(self.db).lock_sync()
         self.db.execute("SET LOCAL ameesh.rebase_default = 'on'")
         moved_actions = self.db.query(
             "UPDATE actions SET canon = %s WHERE canon = '' RETURNING action_id", (previous,))
@@ -165,10 +184,12 @@ class Canon(interface.Canon):
         self.db.query(
             """
             INSERT INTO canon_state
-                (host, canon, canon_id, status, root, source, last_good_commit, last_good_at,
-                 diagnostic, checked_at, auth_status, auth_diagnostic, auth_checked_at)
-            SELECT host, %s::text, %s::text, status, root, source, last_good_commit, last_good_at,
-                   diagnostic, checked_at, auth_status, auth_diagnostic, auth_checked_at
+                (host, canon, canon_id, status, root, source, last_good_commit,
+                 process_commit, last_good_at, diagnostic, checked_at, auth_status,
+                 auth_diagnostic, auth_checked_at)
+            SELECT host, %s::text, %s::text, status, root, source, last_good_commit,
+                   process_commit, last_good_at, diagnostic, checked_at, auth_status,
+                   auth_diagnostic, auth_checked_at
               FROM canon_state WHERE host = %s AND canon = ''
             ON CONFLICT (host, canon) DO NOTHING
             RETURNING host
@@ -181,6 +202,7 @@ class Canon(interface.Canon):
     def host_rows(self, host, names) -> list[dict]:
         sql = """
             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, projects,
+                   aliases, roles,
                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
                    admitted_hosts, admitted_tags, memory_repository,
                    visibility_ok, visibility_diagnostic,
@@ -210,18 +232,22 @@ class Canon(interface.Canon):
         ahosts = _caps_param(values.get("admitted_hosts"))
         atags = _caps_param(values.get("admitted_tags"))
         projects = _caps_param(values.get("projects"))
+        aliases = _caps_param(values.get("aliases"))
+        roles = _caps_param(values.get("roles"))
         rows = self.db.query(
             """
+            __LOCK__
             INSERT INTO agent_registry
                 (name, harness, host, cwd, model, budget_usd, responsible, team, provider,
                  credential_mode, capabilities, canon_ref, ephemeral, ephemeral_expires_at,
                  priority, admitted_hosts, admitted_tags, memory_repository,
                  visibility_ok, visibility_diagnostic,
                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon,
-                 projects)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
-                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
-                    __PROJECTS__)
+                 projects, aliases, roles)
+            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
+                   %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
+                   __PROJECTS__, __ALIASES__, __ROLES__
+              FROM l
             ON CONFLICT (name) DO UPDATE SET
                 harness         = excluded.harness,
                 host            = excluded.host,
@@ -231,6 +257,8 @@ class Canon(interface.Canon):
                 responsible     = excluded.responsible,
                 team            = excluded.team,
                 projects        = excluded.projects,
+                aliases         = excluded.aliases,
+                roles           = excluded.roles,
                 provider        = excluded.provider,
                 credential_mode = excluded.credential_mode,
                 capabilities    = excluded.capabilities,
@@ -254,19 +282,24 @@ class Canon(interface.Canon):
                    OR NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
                                   AND h.state NOT IN ('verified','cancelled')))
             RETURNING name
-            """.replace("__CAPS__", _CAPS_SQL)
+            """.replace("__LOCK__", NAME_LOCK_CTE)
+               .replace("__CAPS__", _CAPS_SQL)
                .replace("__AHOSTS__", _CAPS_SQL)
                .replace("__ATAGS__", _CAPS_SQL)
                .replace("__PROJECTS__", _CAPS_SQL)
+               .replace("__ALIASES__", _CAPS_SQL)
+               .replace("__ROLES__", _CAPS_SQL)
                .replace("__PROFILE__", PROFILE_PARAMS_SQL),
-            (name, values["harness"], values["host"], values["cwd"], values["model"],
+            (name_lock_key(name),
+             name, values["harness"], values["host"], values["cwd"], values["model"],
              values["budget_usd"], values["responsible"], values["team"], values["provider"],
              values["credential_mode"], caps, caps, values["canon_ref"],
              int(values.get("priority") or 0), ahosts, ahosts, atags, atags,
              values.get("memory_repository"),
              values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
-            + profile_params(values) + (values.get("canon"), projects, projects,
+            + profile_params(values) + (values.get("canon"), projects, projects, aliases, aliases,
+                                       roles, roles,
                                        values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
         return bool(rows)
@@ -432,6 +465,7 @@ class Ephemerals(interface.Ephemerals):
         est encore le profil évalué."""
         created = self.db.query(
             """
+            __LOCK__
             INSERT INTO agent_registry
                 (name, chantier, harness, host, cwd, model, responsible, team, projects, provider,
                  credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
@@ -460,6 +494,7 @@ class Ephemerals(interface.Ephemerals):
                    -- L42 (0031) : l'éphémère appartient au canon de son créateur
                    c.canon
               FROM agent_registry c
+             CROSS JOIN l
              WHERE c.name = %s
                AND coalesce(c.responsible, '') <> ''
                AND c.status <> 'stopped'
@@ -468,8 +503,8 @@ class Ephemerals(interface.Ephemerals):
             RETURNING name, responsible, host, harness, capabilities, created_by,
                       placement_ok, placement_diagnostic,
                       extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts
-            """.replace("__NOW__", profile_sql("c")),
-            (name, cwd, ttl_seconds, ttl_seconds, creator),
+            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__NOW__", profile_sql("c")),
+            (name_lock_key(name), name, cwd, ttl_seconds, ttl_seconds, creator),
         )
         return created[0] if created else None
 

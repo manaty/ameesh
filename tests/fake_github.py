@@ -23,10 +23,42 @@ Seule l'expression `--jq '.[] | @json'` est comprise (un objet par ligne).
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 
 WRITE_METHODS = ("POST", "PATCH", "DELETE", "PUT")
+
+#: en-têtes de quota du faux `gh api -i` (#848) ; reset lointain et fixe.
+#: Graphie réelle de `gh` (Go : `X-Ratelimit-*`, `Etag`), pas la camel-case
+#: de l'API : le repli doit lire sans dépendre de la casse (R1 #848, B1).
+QUOTA_HEAD = ("X-Ratelimit-Limit: 5000", "X-Ratelimit-Remaining: 4999",
+              "X-Ratelimit-Used: 1", "X-Ratelimit-Reset: 4102444800",
+              "X-Ratelimit-Resource: core")
+
+
+def _with_headers(argv: list, code: int, out: str, err: str) -> tuple[int, str, str]:
+    """Enveloppe une réponse du faux `gh` comme `gh api -i` (#848).
+
+    L'ETag est le condensé du corps ; un `If-None-Match` qui le reprend rend
+    un 304 sans corps (code 1, comme `gh`), ce qui laisse le cache partagé
+    revalider sans consommer de quota."""
+    etag = '"%s"' % hashlib.sha1(out.encode("utf-8")).hexdigest()[:16]
+    sent = None
+    if "-H" in argv:
+        index = argv.index("-H")
+        if index + 1 < len(argv):
+            name, _, value = argv[index + 1].partition(":")
+            if name.strip().lower() == "if-none-match":
+                sent = value.strip()
+    if code == 0 and sent is not None and sent == etag:
+        return 1, "HTTP/2.0 304 Not Modified\r\n" + "\r\n".join(QUOTA_HEAD) + "\r\n\r\n", ""
+    if code != 0:
+        status = 404 if "404" in err else 502
+        head = ["HTTP/2.0 %d Error" % status, *QUOTA_HEAD]
+        return code, "\r\n".join(head) + "\r\n\r\n", err
+    head = ["HTTP/2.0 200 OK", *QUOTA_HEAD, "Etag: %s" % etag]
+    return 0, "\r\n".join(head) + "\r\n\r\n" + out, ""
 
 
 def _repo(state: dict, name: str) -> dict:
@@ -74,6 +106,11 @@ def handle(state: dict, argv: list, stdin: str | None = None) -> tuple[int, str,
             if wanted != "ALL" and pr.get("state", "OPEN") != wanted:
                 continue
             rows.append(dict(pr, number=int(number)))
+        # `--limit` est un plafond réel de `gh pr list` (#759) : le faux doit
+        # le respecter, sinon un plafond tronqué passerait inaperçu au banc.
+        limit = _option(argv, "--limit")
+        if limit:
+            rows = rows[:int(limit)]
         return 0, json.dumps(rows), ""
     if not argv or argv[0] != "api":
         return 2, "", "faux gh : commande non prise en charge : %s" % " ".join(argv)
@@ -102,6 +139,24 @@ def handle(state: dict, argv: list, stdin: str | None = None) -> tuple[int, str,
         repo = _repo(state, whole.group(1))
         return 0, json.dumps({"full_name": whole.group(1), "visibility": repo["visibility"],
                               "private": repo["visibility"] != "public"}), ""
+    # #759 : les PR ouvertes sont lues en REST paginé (`repos/R/pulls`) pour
+    # être exhaustives ; `--paginate` côté faux rend toutes les pages d'un coup.
+    pulls = re.fullmatch(r"repos/([^/]+/[^/]+)/pulls", route)
+    if pulls and method == "GET":
+        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        wanted = (params.get("state") or "open").upper()
+        rows = []
+        for key, pr in sorted(state.get("prs", {}).items()):
+            name, _, number = key.partition("#")
+            if name != pulls.group(1) or pr.get("state", "OPEN") != wanted:
+                continue
+            head_repo = ({"full_name": "fork/" + name} if pr.get("isCrossRepository")
+                         else {"full_name": name})
+            rows.append({"number": int(number), "state": "open",
+                         "head": {"ref": pr.get("headRefName") or "", "repo": head_repo},
+                         "base": {"repo": {"full_name": name}},
+                         "body": pr.get("body") or "", "html_url": pr.get("url") or ""})
+        return 0, _lines(rows), ""
     match = re.fullmatch(r"repos/([^/]+/[^/]+)/(labels|issues)(?:/(\d+))?"
                          r"(?:/(sub_issues|sub_issue|comments))?", route)
     if not match:
@@ -193,7 +248,10 @@ class FakeGh:
         if self.fail is not None and self.fail(list(argv)):
             self.state.setdefault("calls", []).append(list(argv))
             return 1, "", "gh: Server Error (HTTP 502)"
-        return handle(self.state, list(argv), stdin)
+        code, out, err = handle(self.state, list(argv), stdin)
+        if "-i" in argv:
+            return _with_headers(list(argv), code, out, err)
+        return code, out, err
 
     # -- observation -------------------------------------------------------
     def calls(self) -> list:

@@ -76,6 +76,8 @@ def upsert(
     `mode` (L37, 0030) ne s'applique qu'à la CRÉATION : un hook sans bail crée
     un agent `externe`, mais n'écrase jamais le mode d'un agent existant
     (`set_mode` / `ameesh set <agent> mode=…` pour le changer)."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.upsert")
     _check_name(name)
     if mode is not None and mode not in MODES:
         raise ValueError("unknown agent mode: %r (%s)" % (mode, " | ".join(MODES)))
@@ -101,6 +103,8 @@ def upsert_unleased(db: Db, name: str, *, chantier: str | None = None,
 
     Une seule instruction : pas de course entre la lecture du mode et
     l'écriture."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.upsert_unleased")
     _check_name(name)
     return storage.of(db).agents.upsert_unleased(
         name, chantier=chantier, harness=harness, host=host, cwd=cwd,
@@ -109,6 +113,23 @@ def upsert_unleased(db: Db, name: str, *, chantier: str | None = None,
 
 def get(db: Db, name: str) -> dict | None:
     return storage.of(db).agents.get(name)
+
+
+def live_harness(row: dict | None) -> str:
+    """#1037 : le harnais de la session VIVANTE d'un agent.
+
+    `session_harness` (0384) est le harnais d'ouverture de la session active,
+    tenu égal à `session_origin` par déclencheur ; `harness`, lui, est
+    DÉCLARÉ (canon, `agent-runner register`, `adopt`) et ne dit pas sous
+    lequel la session tourne (L242b : harnais emprunté). Sans session ouverte
+    — origine inconnue — le harnais déclaré reste le seul connu.
+
+    C'est le harnais de la session courante. La porte §2 « autre famille de
+    modèle » ne l'utilise plus telle quelle : #1053/#1777 relit les tours du
+    gel (`review_lot._author_at_freeze`), qui seuls prouvent une famille
+    historique ; ce lecteur reste l'API du registre pour l'état courant."""
+    row = row or {}
+    return str(row.get("session_harness") or row.get("harness") or "")
 
 
 def overview(db: Db) -> list[dict]:
@@ -120,6 +141,11 @@ def overview(db: Db) -> list[dict]:
     réclamation liée au canon est remplie).
     """
     return storage.of(db).agents.overview()
+
+
+def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> None:
+    """Preuve de vie du runner, indépendante du bail (#508)."""
+    storage.of(db).agents.runner_seen(host, owner, names)
 
 
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
@@ -139,9 +165,34 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     responsable résolu quand il est requis, prédicat du canon — dans la même
     instruction : la course `claimable` → `claim` est fermée.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.claim")
     _check_name(name)
     return storage.of(db).leases.claim(
         name, owner, ttl_seconds, require_responsible=_responsible_required(db))
+
+
+def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+    """Bail vivant et détenu par ce runner, AVEC la ligne lue au passage.
+
+    #811 : le hook a besoin des projets de l'agent (mono/multi) pour son
+    budget de remise (L61) ; la lecture du bail les ramène déjà (`state` porte
+    `projects`, `team`, `chantier`), le troisième élément évite une seconde
+    lecture du registre. `None` quand le backend ne les porte pas.
+    """
+    row = storage.of(db).leases.state(name)
+    if row is None:
+        return False, "agent %s not in the registry" % name, None
+    if row.get("status") == "stopped":
+        return False, "agent stopped", row
+    if (row.get("lease_owner") or "") != owner:
+        return False, "lease held by %s" % (row.get("lease_owner") or "nobody"), row
+    if int(row.get("lease_epoch") or 0) != int(epoch):
+        return (False, "epoch %s in the registry, %s in the session"
+                % (row.get("lease_epoch"), epoch), row)
+    if not row.get("live"):
+        return False, "lease expired", row
+    return True, "", row
 
 
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
@@ -151,18 +202,8 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     une session dont le bail a expiré ou a changé de main ne peut plus
     consommer le courrier de l'agent.
     """
-    row = storage.of(db).leases.state(name)
-    if row is None:
-        return False, "agent %s not in the registry" % name
-    if row.get("status") == "stopped":
-        return False, "agent stopped"
-    if (row.get("lease_owner") or "") != owner:
-        return False, "lease held by %s" % (row.get("lease_owner") or "nobody")
-    if int(row.get("lease_epoch") or 0) != int(epoch):
-        return False, "epoch %s in the registry, %s in the session" % (row.get("lease_epoch"), epoch)
-    if not row.get("live"):
-        return False, "lease expired"
-    return True, ""
+    ok, reason, _ = lease_agent(db, name, owner, epoch)
+    return ok, reason
 
 
 def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
@@ -172,11 +213,15 @@ def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> floa
     l'écriture : un renouvellement qui a attendu le verrou au-delà de
     l'expiration est refusé (grille codex3).
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.renew")
     return storage.of(db).leases.renew(name, owner, epoch, ttl_seconds)
 
 
 def release(db: Db, name: str, owner: str, epoch: int) -> bool:
     """Rend le bail (arrêt propre). L'epoch avance : tout ancien détenteur est caduc."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.release")
     return storage.of(db).leases.release(name, owner, epoch)
 
 
@@ -188,6 +233,8 @@ def turn_in_progress(db: Db, name: str) -> bool:
     un bail vivant — `begin_turn` le pose pour tout tour, `attach` pour sa
     session, `end_turn` / `release` le retirent.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.turn_in_progress")
     return storage.of(db).leases.turn_in_progress(name)
 
 
@@ -208,6 +255,8 @@ def attach_claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | No
     interactive, ce qu'est précisément un agent externe. Le bail d'attach ne
     change pas son mode : rendu, l'agent reste hors de portée de l'exécuteur.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.attach_claim")
     _check_name(name)
     return storage.of(db).leases.attach_claim(
         name, owner, ttl_seconds, require_responsible=_responsible_required(db))
@@ -219,6 +268,8 @@ def mark_event_wake(db: Db, name: str) -> None:
     Cet état vit en base (et non dans l'exécuteur) : un redémarrage ne remet
     pas à zéro la fenêtre de regroupement.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.mark_event_wake")
     storage.of(db).agents.mark_event_wake(name)
 
 
@@ -236,6 +287,9 @@ def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
     n'est réclamable que si le dernier état du canon de son hôte est `ok`
     (`canon_claim_predicate_sql`).
     """
+    if names is not None:
+        from .agent_names import resolve
+        names = list(dict.fromkeys(resolve(n, db=db, operation="lease.claimable") for n in names))
     if require_responsible is None:
         cfg = getattr(db, "cfg", None)
         require_responsible = bool(cfg is not None and cfg.responsible_required)
@@ -253,12 +307,16 @@ def set_session(db: Db, name: str, session_id: str, account: str | None = None, 
     """Enregistre la session et, L39 (0030), le compte sous lequel elle tourne
     (`session_account` ; None : aucun compte déclaré pour le harnais) ; #408,
     le harnais et le dossier de son ouverture s'ils sont donnés."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_session")
     storage.of(db).agents.set_session(name, session_id, account, harness=harness, cwd=cwd)
 
 
 def set_session_account(db: Db, name: str, account: str | None) -> bool:
     """Le compte de la session courante change sans changer de session : reprise
     portable sous un autre compte (L39). Faux sans session enregistrée."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_session_account")
     return storage.of(db).agents.set_session_account(name, account)
 
 
@@ -271,7 +329,25 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     l'échéance est recontrôlée avec `clock_timestamp()` dans l'écriture, comme
     les autres opérations de bail.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.clear_session")
     return storage.of(db).leases.clear_session(name, owner, epoch)
+
+
+def adopt_session_origin(db: Db, name: str, session_id: str, lot: str, owner: str,
+                         epoch: int, *, harness: str | None = None,
+                         cwd: str | None = None) -> bool:
+    """#1900 B1 : note l'origine d'une session sans origine, **fencé**.
+
+    Sous verrou de ligne et bail vivant (owner, epoch, échéance recontrôlée
+    après l'attente), et seulement si la ligne porte encore `session_id` et
+    `lot` : une session remplacée entre-temps (rotation, remplaçant, autre lot)
+    n'est jamais réécrite. N'écrit que l'origine, le dossier et le harnais.
+    Renvoie False si le bail n'est plus le nôtre, s'il a expiré pendant
+    l'attente du verrou, ou si la session/le lot ont changé.
+    """
+    return storage.of(db).leases.adopt_session_origin(
+        name, owner, epoch, session_id, lot, harness=harness, cwd=cwd)
 
 
 def record_session_history(db: Db, name: str, session_id: str,
@@ -295,12 +371,16 @@ def pause(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
     réclamer la ligne et lancer son tour), ou si un tour est en cours : une
     pause ne coupe jamais un tour (0028). Verrou pris d'abord, conditions
     recontrôlées dans l'écriture."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.pause")
     return storage.of(db).leases.pause(name, owner, epoch, status_text)
 
 
 def hold_note(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
     """Dit pourquoi le prochain tour attend (L31b), statut inchangé, sous un
     bail vivant détenu par ce worker ; refusé hors `idle`/`queued`."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.hold_note")
     return storage.of(db).leases.hold_note(name, owner, epoch, status_text)
 
 
@@ -309,13 +389,47 @@ def release_hold(db: Db, name: str, owner: str, epoch: int, status_text: str,
     """Lève l'attente ou la pause de pression (L31b) si son texte est toujours
     en place ; une pause `blocked` repasse `queued`/`idle`, le texte d'avant
     (`restore`) revient."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.release_hold")
     return storage.of(db).leases.release_hold(name, owner, epoch, status_text, restore)
 
 
 def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = None,
-                      model: str | None = None) -> bool:
-    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne."""
-    return storage.of(db).pending_spend.put(name, start_index, turn, model)
+                      model: str | None = None,
+                      work_item_id: int | str | None = None,
+                      turn_id: str | None = None) -> bool:
+    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne.
+
+    `work_item_id` (#796) : le lot du tour, écrit avec le marqueur pour que la
+    ligne du grand livre — y compris réparée par un autre worker — porte la
+    même attribution. `turn_id` : l'identifiant du tour
+    (`turn_resources.turn_id`), pour la même raison."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.pending_spend_put")
+    return storage.of(db).pending_spend.put(name, start_index, turn, model, work_item_id,
+                                            turn_id)
+
+
+def pending_spend_begin(db: Db, name: str, start_index: int, turn: str | None = None,
+                        model: str | None = None,
+                        work_item_id: int | str | None = None,
+                        turn_id: str | None = None) -> dict | None:
+    """Write and capture one marker atomically on PostgreSQL (#1469).
+
+    The mediated backend keeps its fenced write; its operations are separate.
+    `work_item_id`/`turn_id` (#796) partent avec le marqueur, comme
+    `pending_spend_put`.
+    """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.pending_spend_begin")
+    api = storage.of(db).pending_spend
+    if hasattr(api, "put_get"):
+        return _pending_spend_row(api.put_get(name, start_index, turn, model,
+                                              work_item_id=work_item_id,
+                                              turn_id=turn_id))
+    if not api.put(name, start_index, turn, model, work_item_id, turn_id):
+        return None
+    return pending_spend_get(db, name)
 
 
 def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
@@ -326,12 +440,29 @@ def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
     réellement utilisé, pas celui du lancement. Faux si aucun marqueur n'existe
     (rien n'a été mis à jour) : l'appelant le traite comme un échec.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.pending_spend_set_model")
     return storage.of(db).pending_spend.set_model(name, model)
+
+
+def pending_spend_set_resident_usage(db: Db, name: str, usage: dict | None,
+                                     created_ts: float | None = None) -> bool:
+    """Pose (ou efface avec None) l'événement `resident.turn` du marqueur (L80a).
+
+    L'état durable du tour incomplet : un worker de remplacement y retrouve la
+    mesure et peut écrire l'événement puis la ligne du grand livre. `created_ts`
+    borne l'écriture au marqueur de ce tour, jamais celui d'un remplaçant."""
+    return storage.of(db).pending_spend.set_resident_usage(name, usage, created_ts)
 
 
 def pending_spend_get(db: Db, name: str) -> dict | None:
     """Le marqueur comptable en attente, ou None (aucun travail suspendu)."""
-    row = storage.of(db).pending_spend.get(name)
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.pending_spend_get")
+    return _pending_spend_row(storage.of(db).pending_spend.get(name))
+
+
+def _pending_spend_row(row: dict | None) -> dict | None:
     if row is None:
         return None
     return {
@@ -340,15 +471,37 @@ def pending_spend_get(db: Db, name: str) -> dict | None:
         "turn": row.get("turn") or "",
         "model": row.get("model"),
         "created_ts": row.get("created_ts"),
+        # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
+        "work_item_id": row.get("work_item_id"),
+        # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
+        "turn_id": row.get("turn_id"),
+        # L80a : mesure durable d'un tour résident non encore réglé
+        "resident_usage": row.get("resident_usage"),
     }
 
 
-def pending_spend_clear(db: Db, name: str) -> bool:
-    return storage.of(db).pending_spend.clear(name)
+def pending_spend_clear(db: Db, name: str, created_ts: float | None = None) -> bool:
+    """Efface le marqueur ; avec `created_ts` (#1469), seulement s'il est encore
+    celui de ce tour — un worker en retard n'efface pas celui de son remplaçant."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.pending_spend_clear")
+    api = storage.of(db).pending_spend
+    if created_ts is None:
+        return api.clear(name)
+    if hasattr(api, "clear_if"):
+        return api.clear_if(name, created_ts)
+    # backend médié : pas d'opération conditionnelle, le bail est fencé au serveur
+    row = api.get(name)
+    if row is None or row.get("created_ts") is None \
+            or abs(float(row["created_ts"]) - float(created_ts)) >= 0.0000005:
+        return False
+    return api.clear(name)
 
 
 def cwd_used(db: Db, cwd: str, exclude: str) -> bool:
     """Ce dossier de travail est-il déjà celui d'un autre agent ? (0018)"""
+    from .agent_names import resolve as resolve_agent_name
+    exclude = resolve_agent_name(exclude, db=db, operation="registry.cwd_used")
     return storage.of(db).agents.cwd_used(cwd, exclude)
 
 
@@ -359,6 +512,8 @@ def set_status(
     """Pose le statut. `stop_reason` (L37, 0030) dit pourquoi un agent passe
     `stopped`/`dead` ; il est effacé pour tout autre statut (déclencheur de la
     migration 0030), donc dès que l'agent repart."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_status")
     if stop_reason is not None and stop_reason not in STOP_REASONS:
         raise ValueError("unknown stop reason: %r (%s)"
                          % (stop_reason, " | ".join(STOP_REASONS)))
@@ -367,6 +522,8 @@ def set_status(
 
 def set_mode(db: Db, name: str, mode: str) -> bool:
     """Change le mode d'un agent (`ameesh set <agent> mode=…`, L37)."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_mode")
     if mode not in MODES:
         raise ValueError("unknown agent mode: %r (%s)" % (mode, " | ".join(MODES)))
     return storage.of(db).agents.set_mode(name, mode)
@@ -375,7 +532,13 @@ def set_mode(db: Db, name: str, mode: str) -> bool:
 def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
     """`wakeable`, plus une remarque non bloquante (L46) : `(ok, raison,
     remarque)`. La remarque dit qu'un agent réveillable n'est pas réclamable
-    À L'INSTANT parce que le canon de son hôte n'est pas `ok`."""
+    À L'INSTANT parce que le canon de son hôte n'est pas `ok`.
+
+    #2200 : une pause opérateur n'est PAS réveillable — le geste humain dit
+    « aucun nouveau tour » et `claim` la respecte déjà ; la disponibilité
+    partagée (attribution, courrier, adoption, alertes) la nomme donc."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.wake_status")
     row = storage.of(db).agents.wake_check(name)
     if row is None:
         return False, "%s is not in the registry (unknown agent)" % name, ""
@@ -383,6 +546,16 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         return False, ("%s is an external agent (human session, cannot be woken)%s"
                        % (name, "" if row.get("responsible")
                           else " and has no human owner")), ""
+    if row.get("operator_paused"):
+        # #2200 : une pause opérateur est un geste humain explicite (« aucun
+        # nouveau tour »). `claim` la respecte déjà en SQL ; la disponibilité
+        # partagée doit dire la même chose, sinon un lot est confié à un agent
+        # qui ne le prendra pas. `resume --operator` la lève nommément.
+        reason = (row.get("operator_pause_reason") or "").strip()
+        by = (row.get("operator_pause_by") or "").strip()
+        return False, ("%s is under operator pause%s%s"
+                       % (name, " by %s" % by if by else "",
+                          ": %s" % reason if reason else "")), ""
     if not row.get("alive"):
         return False, "%s is an expired ephemeral agent" % name, ""
     if cfg is None:
@@ -392,7 +565,14 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         return False, "%s has no human owner (required with a canon)" % name, ""
     if not row.get("placement_admitted"):
         if row.get("placement_ok") is True:
-            why = "profile diverged since evaluation (next canon sync)"
+            # #1219 : nommer la divergence (profils évalué et courant) — le même
+            # diagnostic que `ameesh list`/`canon check`, au lieu d'un texte
+            # court qui cache la cause et promet un canon sync qui ne corrige
+            # pas une inscription qui re-divergera.
+            from .placement import recorded as _recorded  # import tardif : pas de cycle
+            verdict = (_recorded(db, row.get("host")) or {}).get(name) or {}
+            why = verdict.get("placement_diagnostic") or (
+                "profile diverged since evaluation (next canon sync)")
         else:
             why = row.get("placement_diagnostic") or (
                 "placement not evaluated" if row.get("placement_ok") is None
@@ -422,18 +602,31 @@ def wakeable(db: Db, cfg, name: str) -> tuple[bool, str]:
     momentanément invalide ne doit pas bloquer une attribution ; la
     réclamation, elle, reste fermée tant qu'il n'est pas `ok` (`claim`).
     `wake_status` rend en plus la remarque correspondante.
+
+    #1021 : la tenue budget/rythme n'entre pas ici — elle se juge là où la
+    garde de l'exécuteur la calcule (`account_turn.turn_hold`, sur la ligne du
+    registre et les comptes de l'hôte) et `work.check_assignee` la refuse :
+    un agent réveillable peut être en pause budget, et un lot ne doit pas lui
+    être confié pour autant. `resume`, lui, reste permis (c'est le geste de
+    reprise, la pause se lèvera d'elle-même).
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.wakeable")
     ok, why, _note = wake_status(db, cfg, name)
     return ok, why
 
 
 def set_pending_prompt(db: Db, name: str, prompt: str | None) -> None:
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_pending_prompt")
     storage.of(db).agents.set_pending_prompt(name, prompt)
 
 
 def set_marked_block(db: Db, name: str, owner: str, epoch: int, status_text: str,
                      error: str, error_prefix: str) -> str:
     """Blocage marqué fencé par le bail (L35) : "done" | "kept" | "lease"."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_marked_block")
     return storage.of(db).leases.set_marked_block(name, owner, epoch, status_text,
                                                   error, error_prefix)
 
@@ -441,6 +634,8 @@ def set_marked_block(db: Db, name: str, owner: str, epoch: int, status_text: str
 def clear_marked_block(db: Db, name: str, owner: str, epoch: int, status_text: str,
                        error_prefix: str) -> str:
     """Levée du blocage marqué fencée par le bail (L35) : "done" | "kept" | "lease"."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.clear_marked_block")
     return storage.of(db).leases.clear_marked_block(name, owner, epoch, status_text,
                                                     error_prefix)
 
@@ -452,10 +647,14 @@ def take_pending_prompt(db: Db, name: str, owner: str, epoch: int) -> str | None
     l'écriture (grille codex3) : une consigne n'est pas consommée sous un bail
     expiré pendant l'attente du verrou.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.take_pending_prompt")
     return storage.of(db).leases.take_pending_prompt(name, owner, epoch)
 
 
 def begin_turn(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.begin_turn")
     return storage.of(db).leases.begin_turn(name, owner, epoch, status_text)
 
 
@@ -465,6 +664,8 @@ def restore_prompt(db: Db, name: str, owner: str, epoch: int) -> bool:
     Si une consigne était déjà en attente, les deux sont conservées (l'ancienne
     d'abord) : un `coalesce` perderait la consigne du tour interrompu.
     """
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.restore_prompt")
     return storage.of(db).leases.restore_prompt(name, owner, epoch)
 
 
@@ -480,6 +681,8 @@ def end_turn(
     cost_usd: float | None = None,
 ) -> bool:
     """Clôt un tour *seulement si le bail est encore détenu* (fencing)."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.end_turn")
     return storage.of(db).leases.end_turn(name, owner, epoch, status=status,
                                           status_text=status_text, error=error,
                                           cost_usd=cost_usd)

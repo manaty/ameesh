@@ -100,3 +100,38 @@ class ModuleStore:
             "AND w.type IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
             "AND w.state <> 'closed' ORDER BY w.id",
             (evidence_kind, subject_kind, project, module, json.dumps(list(types))))
+
+    def policy(self, project, module):
+        """Installed policy of a project module, or None when it is not active."""
+        rows = self.db.query("SELECT project, module, canon, types, schemas, rules "
+                             "FROM project_modules WHERE project = %s AND module = %s",
+                             (project, module))
+        return rows[0] if rows else None
+
+    def audit_qa(self, project, module, types, subject_kind, evidence_kind, states):
+        """Current declaration and latest evidence of lots in the given states (L244).
+
+        One snapshot: a lot whose current declaration has no matching `ok`
+        evidence, or whose evidence is bound to an earlier declaration, is a
+        deviation the module decides how to report."""
+        return self.db.query(
+            "SELECT w.id, w.title, w.type, w.state, w.assignee, "
+            "extract(epoch from w.created_at)::float8 AS created_ts, "
+            "d.id AS declaration_id, d.subject, "
+            "extract(epoch from d.at)::float8 AS declaration_ts, "
+            "e.id AS evidence_id, e.binding_id AS evidence_binding, "
+            "e.payload->>'verdict' AS evidence_verdict "
+            "FROM work_items w JOIN project_modules p "
+            "ON p.project = coalesce(nullif(w.app, ''), w.workstream, '') "
+            "LEFT JOIN LATERAL (SELECT id, subject, at FROM work_module_milestones "
+            "WHERE work_item_id = w.id AND module = p.module AND kind = %s "
+            "ORDER BY id DESC LIMIT 1) d ON true "
+            "LEFT JOIN LATERAL (SELECT id, binding_id, payload FROM work_module_milestones "
+            "WHERE work_item_id = w.id AND module = p.module AND kind = %s "
+            "ORDER BY id DESC LIMIT 1) e ON true "
+            "WHERE p.project = %s AND p.module = %s "
+            "AND w.type IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
+            "AND w.state IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
+            "ORDER BY w.id",
+            (subject_kind, evidence_kind, project, module,
+             json.dumps(list(types)), json.dumps(list(states))))

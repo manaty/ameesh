@@ -22,7 +22,7 @@ from ameesh import background, capacity_guard, config as config_mod, host_gate, 
 from ameesh import relocation, storage
 from ameesh.runner import AgentWorker
 
-from .support import REPO, PgTestCase
+from .support import EMPTY_CONFIG, REPO, PgTestCase
 
 GOLDEN = os.path.join(REPO, "tests", "dore", "capacity_guard")
 
@@ -119,7 +119,7 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(capacity_guard.ACK_PATH, "/run/ameesh-gate/ack/ack.json")
 
     def test_environment(self):
-        env = {"AMEESH_CONFIG": "/nulle-part.json", "AMEESH_HOST_GATE": "File",
+        env = {"AMEESH_CONFIG": EMPTY_CONFIG, "AMEESH_HOST_GATE": "File",
                "AMEESH_HOST_GATE_FALLBACK": "stopped", "AMEESH_HOST_GATE_DRAIN": "45",
                "AMEESH_HOST_GATE_PATH": "/g/state/state.json"}
         cfg = config_mod.load(env=env)
@@ -878,13 +878,17 @@ class OnceTurnTest(PgTestCase):
         worker = types.SimpleNamespace(
             watchdog_stop=threading.Event(), lease_lost=threading.Event(),
             db=None, name="a1", epoch=7, runner=types.SimpleNamespace(runner_id="r1"),
-            _depot_push=mock.Mock())
+            _depot_push=mock.Mock(),
+            _release_session_lock=mock.Mock(),  # L82: released with the lease
+            _close_resident=mock.Mock())   # L76: nothing outlives the lease
         worker.lease_lost.set()
         with mock.patch.object(runner_mod.registry, "release",
                                side_effect=db_mod.DbError("down")) as release:
             self.assertFalse(runner_mod.AgentWorker.release_lease(worker))
         release.assert_called_once_with(None, "a1", "r1", 7)
         worker._depot_push.assert_called_once_with(final=True)
+        worker._release_session_lock.assert_called_once_with()
+        worker._close_resident.assert_called_once_with("lease released")
         with mock.patch.object(runner_mod.registry, "release", return_value=False):
             self.assertTrue(runner_mod.AgentWorker.release_lease(worker))  # not ours
 

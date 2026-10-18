@@ -65,11 +65,26 @@ ameesh work list [--stale-after 6h] [--json]       EPIC column, waiting, stagnat
 ameesh work show <id> [--json]                     card, epic, PR, waiting
 ameesh work close <id> --abandoned                 lot that will not be done
 ameesh work close <id> --superseded-by <id2>       lot replaced or absorbed by another
+ameesh work close <id> --delivered --sha <head>    lot delivered outside the target (#988)
+ameesh work close <id> --done                      delivered without a merge (no branch)
 ```
 
 `close` moves the lot to the terminal state `closed` and records a `closed` milestone:
 nothing stays open by oversight. A closed lot is **never reopened** by a
-merge observed later (the observation is reported).
+merge observed later (the observation is reported). `--done` (#1280) closes a
+lot delivered without a merge — a review, an analysis — and is refused when
+the lot carries a branch or a PR; on a review already closed `superseded by`
+its own reviewed parent, it rectifies the reason without reopening. For a
+review, the title only attaches the parent — `REVUE #N`, or the manual mission
+`R1`/`R2 <harnais> #<parent>` (#1249) — and `--done` also requires the
+review's `verdict` milestone on that parent (a `blocked` verdict counts: it is
+a delivered review, not a product GO), so a delivered review is proven, never
+deduced from its title.
+
+`--delivered --sha <reviewed head>` closes a lot whose deliverable (report, note,
+rehearsal) lives on a reviewed branch, without a merge into the target: the
+`delivered` milestone carries the reviewed head and the closing actor, and it
+counts as a delivery in `ameesh work estimates` (#988).
 
 For each unmerged lot, ameesh says **what it is waiting for and from whom**
 (`waiting_for`: `{what, who, label}`), derived from the state, the milestones (L10) and
@@ -79,6 +94,46 @@ human decision (by the card's lead), unblocking. An action of the lot
 waiting for a human (approval, reconciliation) takes precedence over everything; a
 blocking verdict only counts if it follows the last freeze. When ameesh does not know
 who, it says so ("relecteur non désigné" (reviewer not assigned)) instead of guessing.
+The reviewer of a review can be **designated on entry to `qa`** (#705):
+`ameesh work move <id> qa --reviewer <agent>` — a registry name, or a human
+(`human:…`). A lot already in `qa` gets its reviewer with `ameesh work reviewer
+<id> <agent>`, without a build/`qa` round trip; only a human, an orchestrator or
+a design agent designates, never the lot's assignee. The wait then names that
+reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
+with no designated reviewer alerts the project's orchestrators, who must
+designate one. A reviewer whose **declared harness** is the author's (claude,
+codex and deepseek are distinct families) gets an indicative warning on
+stderr (#800): the designation is kept — canon §2 asks for another model
+family, and the real family is judged on the review turn (decision 18855a).
+Two corrections are gestures of the same authority (#1979):
+`ameesh work reviewer <id> --remove` removes all designations made by mistake
+(the lot goes back to waiting for a reviewer, and the alert asks for one
+again); `ameesh work reviewer <id> --no-verdict` marks "verdict not required"
+when no re-verdict is due (mechanical composition resolution, canon §11
+bis/#87, a verdict kept from a reviewed head) — the lot then waits only for
+its merge and no reminder reaches a reviewer. Designating a reviewer lifts
+the waiver; a current blocking verdict refuses it (a fix is due).
+
+The **review class** of the lot (canon §2, #1822) routes that wait too: a light
+lot's review happens after the merge, so a light lot with no current verdict
+waits for the merge, not for a verdict — even when a reviewer is designated.
+The class is read once per pass, and only for lots whose wait would otherwise
+be a verdict; when it cannot be read (no repository, no freeze, unreadable
+policy), the prudent verdict wait is kept instead of guessing a class.
+
+Several reviewers can be designated for the same lot (#2076): repeat
+`ameesh work reviewer <id> <agent>` to add a name. `work show` and the JSON
+`reviewers` list retain them all. The wait and alerts name each reviewer
+whose verdict on the frozen head is still due; one GO does not complete the
+other reviews. Withdraw a designation explicitly with
+`ameesh work reviewer <id> <agent> --remove` (the same authority is required);
+a removal that removes nothing (an undesignated name, or an empty list)
+changes nothing and writes no journal line. Assigning or delegating the lot
+to a reviewer removes that person's designation and preserves the others;
+the journal names each removed reviewer. Migration 0456 keeps the legacy `reviewer` field for older
+runners during an upgrade. An older runner that writes `reviewer` as a
+replacement therefore *adds* a name instead: the previous designation is
+kept, and is withdrawn explicitly with `--remove` (or by upgrading the runner).
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
@@ -88,7 +143,7 @@ duration, and the timeline no longer draws it as active.
 These rules live in a single module, `ameesh.stagnation`, called by
 `ameesh progress`, `ameesh work list/show` and the `stale_lot` alert of
 `ameesh alerts` (which keeps its one-word `waiting_for` field and adds
-`waiting`, the detailed form).
+`waiting`, the detailed form, and `project`).
 
 ## Observed merge: automatic closing
 
@@ -102,8 +157,15 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
 2. **the content**, in a local clone (read-only, no `fetch`):
 
    ```
-   ameesh work sync-merges --git-dir D [--target origin/main] [--repo owner/repo] [--dry-run] [--json]
+   ameesh work sync-merges --git-dir D [--target T] [--repo owner/repo] [--dry-run] [--json]
    ```
+
+   Without `--target`, the target is the lot's (`branch_target`), else the
+   repository's declared `git config ameesh.target`, else its default branch
+   (`origin/HEAD`, then main/master); when nothing is declared and that ref does
+   not carry the freeze, the integration refs (`develop`, `main`, `master`,
+   `release/*`) are tried and the closing names the one that delivered. An
+   explicit `--target` stays alone authoritative (a missing one is an error).
 
    only the lot's **last freeze** is authoritative (most recent `frozen`
    milestone, with its commit): an earlier freeze already merged proves nothing
@@ -113,7 +175,15 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    diff of the freeze is one commit of the target (**squash**). `--verbatim` does not
    normalize any whitespace (`--stable` would confuse `"a b"` and `"ab"`): false
    negative rather than false positive; without it (git < 2.40), only ancestry
-   proves. Closing is conditioned in the database on the examined freeze: a new
+   proves. Each of these proofs is voided by an **effective revert** (#1825): a
+   later `Revert "…"` that cites the commit carrying the content, undoes exactly
+   its patch, and is reapplied by no later commit — the content is not delivered
+   and the lot stays open (`how: reverted`). Detection is best-effort, not a
+   guarantee: it scans only the most recent commits of the target (200) and
+   requires `git patch-id --verbatim` (git ≥ 2.40); a revert outside that window,
+   or an ancestry proof without `--verbatim`, still closes a reverted lot
+   wrongly. `sync-branches` and `sync-merges` carry the same guard. Closing is
+   conditioned in the database on the examined freeze: a new
    freeze declared in the meantime prevents it (`refrozen`);
 3. **the linked PR** (as a fallback, or alone):
 
@@ -152,7 +222,9 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
 
    any open state → `merged`, in one step, `merged` milestone with the commit.
 
-A lot absorbed by another is closed with `--superseded-by`.
+A lot absorbed by another is closed with `--superseded-by`; a lot delivered
+outside the target (its reviewed head stays on its branch) with
+`--delivered --sha <reviewed head>` (#988).
 
 ## GitHub projection
 
@@ -221,7 +293,11 @@ reality. Migration 0044.
   commitments, pending decisions, today line, delays, source of each
   item; plus "who is advancing on what".
 * **Alert** `engagement_overdue` (pushed by `ameesh notify`): a
-  commitment or planned date passed without the item being reached.
+  commitment or a date set by a person passed without the item being
+  reached. Dates computed by `work schedule` (source `reference p80…`) are
+  re-dated on its next pass, and a lot no longer driven by its holder
+  (blocked, under review, or held by a planned wait) raises no date alert;
+  a lot with both a date and an engagement gives one alert (the engagement).
 
 Project tracking is in the **generic core**: the roadmap code
 names no business state or milestone; the mapping to the
@@ -261,27 +337,71 @@ Safeguards:
 * **never an irreversible or production action**: the pick-up mail
   forbids it (deployment, merge, data deletion, production
   server, committed spending); the agent proposes it to a human;
-* plans first; the token only with `--take-paid`, never during
-  `balance_low`; nothing under a reached cap nor on a host under pressure,
-  on low battery or not ready; at most `--take-max-per-hour` (2) pick-ups
-  per sliding hour for the whole mesh.
+* plans first; what they leave is taken by the pay-per-token agents in the
+  same pass, never during `balance_low`; nothing under a reached cap nor on a
+  host under pressure, on low battery or not ready; at most
+  `--take-max-per-hour` (2) pick-ups per sliding hour for the whole mesh.
 
 When agents are idle and the queue is empty (and no lot of the
 project is waiting), the `backlog_empty` alert invites the human lead to
 fill it.
 
-### Handoff on a budget pause (L233b)
+### WIP limit: at most 2 lots in `build` per agent (§4)
 
-On each pass, before any pick-up, `ameesh notify` hands the `intake` and
-`build` lots of a **non-critical Claude agent paused on budget** (status
-`blocked`, `budget : …`) to a **free DeepSeek agent of the same project**,
-within its budget and able to do the lot (team, capabilities): one lot per
-taker, longest idle first, at most `--handoff-max-per-hour` (4) per sliding
-hour for the whole mesh (`0` turns it off; `--handoff-idle`, 5 min, is the
-taker's minimum rest). Critical agents are those of L242b (declared,
-orchestrators, design, auditors). The assignment stays guarded and
-conditional on the assignee and the state; a note goes on the lot and an
-`event` mail to both agents. Never handed:
+Owner 14/10/2026, canon §4: an agent holds at most
+`ameesh.work.BUILD_LIMIT` (2) lots in `build`, **all projects
+confused** (the cap is global, not per team). Two guards:
+
+* **the automatic pick-up refuses the third lot**: the count and the
+  assignment are written in one transaction under the agent's advisory
+  lock (`assign_capped`), so two simultaneous pick-ups cannot cross the cap;
+* **the sweep returns the surplus**: `ameesh work wip [--apply] [--limit N]
+  [--json]` gives back to the team queue the lots of an agent above the
+  cap, the least recently active first. Without `--apply` it only shows
+  what would be returned (dry run, nothing written). Each return is
+  revalidated **under the agent's lock** (`unassign_surplus`): the lot must
+  still be `build`, still assigned to that agent, carry no pilot exception,
+  and the surplus must still be real — two concurrent sweeps never return
+  more than the surplus, and a lot moved to `qa` or pulled back meanwhile is
+  left alone. A returned lot keeps its state, its branch, its branch head
+  and its reviews; an `event` mail tells the agent, and a free agent of its
+  team can take it as it is.
+
+An agent can hand back an `intake` or `build` lot itself: `ameesh work
+return <id> [--reason T]` (the assignee, a human, or a pilot); a lot under
+review (`qa`), waiting for a human or blocked is not handed back that way.
+The pilot's **explicit** exception is recorded on the lot's last assignment
+by `ameesh work assign <id> <agent> --wip-exception "why"` (human or
+orchestrator/design); the sweep leaves that lot alone. Every note that hands
+a lot over counts as an assignment (assignment, delegation, automatic
+pick-ups, budget handoff), so the next one without the marker removes the
+exception; `work assign` on the same agent with a branch only sets the
+branch, leaving the running delegation and the pilot exception in place.
+`ameesh list` shows a per-agent `BUILD` column (flagged with `!` above the
+cap), `ameesh progress` carries `builds`, and `ameesh notify` can run the
+sweep (`--wip-max-returns N`, off by default; `--wip-apply` returns the
+lots, without it the pass is a dry run).
+
+### Handoff on a budget pause (L233b, L165)
+
+On each pass, before any pick-up, `ameesh notify` handles the lots of a
+**non-critical Claude agent paused on budget** (status `blocked`,
+`budget : …`):
+
+* its **non-started lots (`intake`) are returned to the team queue**:
+  assignee cleared, a journal note says why; the automatic take (L165) then
+  gives them to any free capable agent of the team, DeepSeek or Codex, within
+  its budget and review class — no taker needs to be free at that moment;
+* its **started lots (`build`) are handed** to a **free DeepSeek or Codex
+  agent of the same project**, within its budget and able to do the lot
+  (team, capabilities): one lot per taker, longest idle first,
+  `--handoff-idle` (5 min) is the taker's minimum rest.
+
+At most `--handoff-max-per-hour` (4) returns and handoffs per sliding hour
+for the whole mesh (`0` turns it off). Critical agents are those of L242b
+(declared, orchestrators, design, auditors). A returned lot gets its journal
+note only (the automatic take warns the taker); a handed `build` lot also
+gets an `event` mail to both agents. Never handled:
 
 * a lot under review or frozen (`qa`, or a freeze milestone);
 * a sensitive lot: reserved capability (`decision`, `production`), or a
@@ -296,4 +416,4 @@ conditional on the assignee and the state; a note goes on the lot and an
   host.
 
 When the pause ends, nothing comes back on its own: the note says so, and
-the orchestrator decides. The codex review stays required.
+the orchestrator decides. A review by another family stays required.
