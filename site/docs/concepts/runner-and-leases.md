@@ -127,10 +127,12 @@ bytes or with a unit such as `1GiB`), else prudent defaults.
 
 `max_swap_used` is a **stock**, not a pressure: pages stay in swap until they
 are touched, so the ceiling only counts with a corroborating memory pressure
-(PSI memory above half its own ceiling); a host that cannot measure PSI keeps
-the old meaning. `max_mem_pressure` (PSI memory `some`, 60 s, 10 % by default)
-is the admission signal that follows the real pressure; an absent or unreadable
-threshold takes the default, it never removes the guard (#2296).
+(PSI memory above half its own ceiling). A host that cannot measure PSI keeps
+the old meaning: with no declared ceiling, the stock is compared to the 0028
+prudent 8 GiB fallback (#2354). `max_mem_pressure` (PSI memory `some`, 60 s,
+10 % by default) is the admission signal that follows the real pressure; an
+absent or unreadable threshold takes the default, it never removes the guard
+(#2296).
 
 - Before each turn, a crossed limit **holds new turns**; running turns finish.
 - A **critical** crossing pauses the agents of lowest `priority` (an `Agent`

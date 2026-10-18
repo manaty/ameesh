@@ -13,6 +13,11 @@ verdicts requis et la composition de la PR, puis pose sur elle l'étiquette
 (`pull_request` `types: [labeled]`) sur la tête gelée ; `ci cancel` annule les
 runs périmés d'un lot.
 
+#2333 (canon §11 bis, décision owner 18/10/2026 « tout passe par paquet ») :
+`ci run` en mode lot (`ci-lot-<sha>`) est refusé entre deux paquets, sauf
+`--full` (la suite du paquet) ou exception `incident|unblock` motivée et
+journalisée dans la note du lot (`packet_guard`).
+
 Étude L161 (docs/design/etudes/l161-tests-par-impact.md, section 3), voie A :
 pendant les tests, chaque part de la CI publie un check run « tests (flux) »
 (`scripts/ci-flow.py publish`) dont la sortie porte, en JSON lignes, chaque
@@ -108,7 +113,7 @@ import secrets
 import time
 from datetime import datetime
 
-from . import storage
+from . import packet_guard, storage
 
 #: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
 #: workflow des tests L161 : comportement historique, compatible ameesh.
@@ -1920,13 +1925,14 @@ def quota_line(state_dir, *, now=None) -> str | None:
 #     + contrat) ou `ci-full-<S>` (suite complète), posée par la commande sur
 #     la PR (`pull_request` `types: [labeled]`). Le job `plan` compare
 #     exactement ce SHA à `pull_request.head.sha`, vérifie que le checkout est
-#     le merge-ref composé de la base du payload et de cette tête (ses deux
-#     parents), et sélectionne contre la base du payload ;
+#     le merge-ref composé de la pointe cible figée dans la description de
+#     l'étiquette et de cette tête (ses deux parents), puis sélectionne contre
+#     cette base (#2328 : `pull_request.base.sha` peut être périmé) ;
 #   * le jeton `gh` doit produire l'événement `pull_request: labeled` : un
 #     `GITHUB_TOKEN` d'Actions (acteur `github-actions[bot]`) ne déclenche
 #     aucun workflow et est refusé ;
 #   * idempotence bornée au parcours PR et à la composition courante (numéro
-#     de PR, tête gelée S, base du payload, mode) : un vert ou un run en vol de
+#     de PR, tête gelée S, pointe cible demandée, mode) : un vert ou un run en vol de
 #     cette composition rend la main sans rien toucher ; un push vert de la
 #     même tête ne remplace pas le check de la PR, pas plus qu'un ancien
 #     dispatch ; une base qui a bougé demande une nouvelle demande ;
@@ -1958,6 +1964,12 @@ def quota_line(state_dir, *, now=None) -> str | None:
 #
 # `ameesh ci cancel <lot>` fait la même annulation seule (`--all` : tout, y
 # compris le run de la composition gelée).
+#
+# #2364 : une demande dont le run-name est illisible (ancien workflow/CLI : la
+# base du titre n'est pas un SHA, mais la description de l'étiquette) reste
+# corrélable par sa tête et son libellé `ci-lot|full-<sha>`. Un tel run
+# matérialise la réservation — `--force` reprend au lieu de répondre « already
+# reserved » — sans jamais verdir la composition, dont la base reste inconnue.
 
 GEL_SCHEMA = "ameesh-ci-gel/1"
 CANCEL_SCHEMA = "ameesh-ci-cancel/1"
@@ -1975,10 +1987,15 @@ MAX_AVIS = 2
 RESERVE_TTL_S = 15 * 60
 #: l'étiquette qui demande la CI d'un gel : mode et SHA complet (#1343)
 LABEL_RE = re.compile(r"^ci-(?P<mode>lot|full)-(?P<sha>[0-9a-f]{40})$")
-#: le titre du run (run-name de tests.yml) : PR, étiquette, base du payload
+#: le titre du run (run-name de tests.yml) : PR, étiquette, pointe cible demandée
 PR_RUN_RE = re.compile(
     r"\[PR #(?P<number>\d+) (?P<label>ci-(?:lot|full)-[0-9a-f]{40}) "
     r"base (?P<base>[0-9a-f]{40})\]")
+#: le libellé d'une demande dans un titre dont la base est illisible (#2364) :
+#: un ancien workflow y mettait la description de l'étiquette au lieu de la base.
+CARRIED_RE = re.compile(r"\bci-(?P<mode>lot|full)-(?P<sha>[0-9a-f]{40})\b")
+#: le numéro de PR d'un titre, même quand sa base n'est pas un SHA
+CARRIED_PR_RE = re.compile(r"\[PR #(?P<number>\d+)\b")
 #: la marque de demande dans le journal du lot : `reserve` prend le verrou de
 #: la ligne, `applied` la referme sur une étiquette posée, `released` sur un
 #: refus. Le motif ne dépend pas du texte qui suit. Une marque `applied` porte
@@ -2008,6 +2025,14 @@ def _q(value: str) -> str:
 
 def _sha_ok(sha: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{40}", sha or ""))
+
+
+def _run_id(row: dict) -> int:
+    """L'identifiant entier d'une exécution, 0 s'il est illisible (P2-3)."""
+    try:
+        return int(row.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def label_name(mode: str, sha: str) -> str:
@@ -2137,14 +2162,53 @@ def pr_run(row: dict) -> dict | None:
             "conclusion": (row.get("conclusion") or "").strip().lower()}
 
 
-def _pr_runs(api, repo: str, number: int, sha: str, branch: str) -> list[dict]:
-    """Les demandes de gel déjà vues pour cette PR et cette tête."""
-    out = []
+def carried_request(row: dict, number: int, sha: str) -> str:
+    """Le mode d'une demande visible dont le run-name est illisible, ou "" (#2364).
+
+    Un ancien workflow composait le run-name avec la description de l'étiquette
+    (« base CI #1343 full sur <sha court> ») au lieu de la base du payload :
+    `pr_run` refuse ce run, faute de base lisible. Il porte pourtant la même
+    tête et le même libellé `ci-lot|full-<sha>` que la demande ; il matérialise
+    donc sa réservation, sans jamais prouver sa composition ni verdir un check.
+    """
+    if (row.get("event") or "").strip() != "pull_request":
+        return ""
+    title = str(row.get("display_title") or "")
+    found = CARRIED_RE.search(title)
+    if not found or found.group("sha") != sha:
+        return ""
+    number_m = CARRIED_PR_RE.search(title)
+    if number_m and int(number_m.group("number")) != int(number):
+        return ""
+    head = (row.get("head_sha") or "").strip().lower()
+    heads = [((pr.get("head") or {}).get("sha") or "").strip().lower()
+             for pr in row.get("pull_requests") or ()]
+    if head != sha and sha not in heads:
+        return ""
+    return found.group("mode")
+
+
+def _pr_request_runs(api, repo: str, number: int, sha: str,
+                     branch: str) -> tuple[list[dict], list[dict]]:
+    """Les demandes de gel de cette PR et cette tête, lues en un seul appel.
+
+    Rend `(lisibles, illisibles)` : les premières prouvent leur composition
+    (PR, tête, base, mode) ; les secondes ne portent que la tête et le libellé
+    d'un run-name illisible (#2364). Une demande illisible matérialise la
+    réservation de la même composition, sans verdir ni comparer aucune base.
+    """
+    readable, carried = [], []
     for row in _runs_of(api, repo, branch=branch, event="pull_request"):
         info = pr_run(row)
         if info and info["number"] == number and info["sha"] == sha:
-            out.append(info)
-    return out
+            readable.append(info)
+            continue
+        mode = carried_request(row, number, sha)
+        if mode:
+            carried.append({"row": row, "id": _run_id(row), "mode": mode,
+                            "status": (row.get("status") or "").strip().lower(),
+                            "conclusion": (row.get("conclusion") or "").strip().lower()})
+    return readable, carried
 
 
 def _current_run(row: dict, frozen: str, number: int, base: str) -> bool:
@@ -2163,7 +2227,7 @@ def _current_run(row: dict, frozen: str, number: int, base: str) -> bool:
 
 
 def _pr_of(api, repo: str, branch: str) -> dict:
-    """La PR ouverte de la branche : numéro, tête, base, refs, étiquettes."""
+    """La PR ouverte : numéro, tête, pointe cible actuelle, refs, étiquettes."""
     owner = repo.split("/", 1)[0]
     rows = api("repos/%s/pulls?state=open&head=%s:%s&per_page=10"
                % (repo, _q(owner), _q(branch)))
@@ -2176,13 +2240,20 @@ def _pr_of(api, repo: str, branch: str) -> dict:
         raise GelError("branch %s has %d open pull requests in %s: one only"
                        % (branch, len(rows), repo))
     pr = rows[0]
+    base_ref = ((pr.get("base") or {}).get("ref") or "").strip()
+    if not base_ref:
+        raise GelError("pull request #%s: missing target branch, the composition "
+                       "cannot be checked" % pr.get("number"))
+    # #2328 : pulls.base.sha peut encore nommer la base du dernier push de
+    # tête, alors que le merge-ref utilise déjà la nouvelle pointe cible.
+    base = _head_of(api, repo, base_ref)
     labels = [(lab.get("name") if isinstance(lab, dict) else str(lab))
               for lab in pr.get("labels") or ()]
     return {"number": int(pr.get("number") or 0),
             "head": ((pr.get("head") or {}).get("sha") or "").strip().lower(),
-            "base": ((pr.get("base") or {}).get("sha") or "").strip().lower(),
+            "base": base,
             "head_ref": ((pr.get("head") or {}).get("ref") or ""),
-            "base_ref": ((pr.get("base") or {}).get("ref") or ""),
+            "base_ref": base_ref,
             "labels": [name for name in labels if name]}
 
 
@@ -2203,7 +2274,8 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
         text = base64.b64decode(content).decode("utf-8", "replace")
     except (ValueError, TypeError):
         return False
-    return "types: [labeled]" in text and "ci-(lot|full)-" in text
+    return ("types: [labeled]" in text and "ci-(lot|full)-" in text
+            and "github.event.label.description" in text)
 
 
 def _reviews_at(api, repo: str, ref: str) -> set[str] | None:
@@ -2310,14 +2382,6 @@ def request_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
     return sorted(out, key=lambda e: e["id"])
 
 
-def _run_id(row: dict) -> int:
-    """L'identifiant entier d'une exécution, 0 s'il est illisible (P2-3)."""
-    try:
-        return int(row.get("id") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _materialized(mark: dict, runs) -> bool:
     """Une exécution visible matérialise-t-elle cette marque (P2-3) ?
 
@@ -2327,12 +2391,14 @@ def _materialized(mark: dict, runs) -> bool:
     qu'après elle, donc la demande a produit son exécution et ne tient plus la
     clé. `runs` porte des couples (identifiant, mode) : la couverture des modes
     suit celle des exécutions (§ `_covers`) — un run de lot ne matérialise pas
-    une demande de suite complète, seul un `full` le fait (P2-3, cx2). Une
-    marque sans `seen=` (écrite avant #1343) n'est pas corrélable : elle tient
-    la clé jusqu'au `ttl`, jamais libérée par une comparaison entre l'horloge
-    de la base (marque, fractionnaire) et celle de GitHub (run, à la seconde) —
-    c'est cette comparaison qui bloquait la reprise d'un run rouge né dans la
-    même seconde que sa marque.
+    une demande de suite complète, seul un `full` le fait (P2-3, cx2). Un run
+    au run-name illisible y entre aussi, avec le mode lu dans son libellé
+    (#2364) : la marque qu'il a produite ne tient plus la clé, même si sa base
+    n'est pas comparable. Une marque sans `seen=` (écrite avant #1343) n'est
+    pas corrélable : elle tient la clé jusqu'au `ttl`, jamais libérée par une
+    comparaison entre l'horloge de la base (marque, fractionnaire) et celle de
+    GitHub (run, à la seconde) — c'est cette comparaison qui bloquait la
+    reprise d'un run rouge né dans la même seconde que sa marque.
     """
     seen = mark.get("seen")
     if seen is None:
@@ -2477,7 +2543,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                        % (pr["number"], pr["head_ref"] or "—", pr["base_ref"] or "—"))
     base = pr["base"]
     label = label_name(mode, frozen_sha)
-    runs = _pr_runs(api, name, pr["number"], frozen_sha, branch)
+    runs, carried = _pr_request_runs(api, name, pr["number"], frozen_sha, branch)
     #: P1 R1 : la composition compte — même tête mais autre base, ou mode
     #: insuffisant (`lot` ne prouve pas le `full`), ne verdit pas.
     applicable = [r for r in runs if r["base"] == base and _covers(r["mode"], mode)]
@@ -2490,6 +2556,9 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                 "exception": exception, "reason": reason.strip(), "avis": avis,
                 "verdicts": sorted((m.get("actor") or "") for m in reviews),
                 "frozen": bool(freeze), "runs": len(runs),
+                "unreadable": [{"id": r["id"], "mode": r["mode"],
+                                "conclusion": r["conclusion"] or r["status"] or "?"}
+                               for r in carried],
                 "requested": [{"id": r["row"].get("id"), "mode": r["mode"],
                                "base": r["base"],
                                "conclusion": r["conclusion"] or r["status"]}
@@ -2535,16 +2604,41 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                                             for r in applicable}))))
     if not applicable:
         #: P2 R1 : GitHub ne montre pas un run aussitôt ; une étiquette déjà
-        #: posée par un autre processus est dite, jamais reposée.
+        #: posée par un autre processus est dite, jamais reposée. Un run
+        #: illisible, lui, matérialise la marque qui l'a produit (#2364).
         held = reservation_holder(request_events(db, item_id), frozen_sha, base, mode, "",
-                                  now=time.time())
+                                  now=time.time(),
+                                  runs=tuple((r["id"], r["mode"]) for r in carried))
         if held:
             return {**decision, "action": "running",
                     "why": "a request of this composition was already reserved (token %s): "
                            "nothing posed" % held["token"]}
+        if carried:
+            #: #2364 : un run dont le run-name est illisible (ancien
+            #: workflow/CLI) porte la tête et le libellé de la demande, jamais
+            #: sa base. Vivant, il se surveille ; terminé, il ne vaut ni vert
+            #: ni rouge applicable : seule une reprise explicite le remplace.
+            live_carried = [r for r in carried if r["status"] in OPEN_STATUSES]
+            if live_carried:
+                return {**decision, "action": "running",
+                        "why": "a request of this composition (PR #%d, %s) is visible "
+                               "but its run-name is unreadable (run %s, mode %s): its "
+                               "state cannot be checked; nothing posed"
+                               % (pr["number"], frozen_sha[:12], live_carried[0]["id"],
+                                  live_carried[0]["mode"]),
+                        "run": _short_run(live_carried[0]["row"])}
+            if not force:
+                raise GelError("lot #%s: a request already ran on PR #%d for %s (run %s, "
+                               "mode %s), but its run-name is unreadable (base is not a "
+                               "SHA: old workflow/CLI), so its composition cannot be "
+                               "checked: --force to request the CI again (explicit "
+                               "resumption)"
+                               % (item_id, pr["number"], frozen_sha[:12],
+                                  carried[0]["id"], carried[0]["mode"]))
     if not _carries_freeze_request(api, name, frozen_sha):
         raise GelError("the workflow at %s does not carry the freeze request trigger "
-                       "(#1343, ci-lot/ci-full label): rebase the lot on main before "
+                       "with a pinned target base (#1343/#2328, ci-lot/ci-full label): "
+                       "rebase the lot on main before "
                        "requesting the CI" % frozen_sha[:12])
     return {**decision, "action": "request",
             "why": ("%s verdict(s) on %s" % (len(reviews), frozen_sha[:12])
@@ -2627,18 +2721,25 @@ def _label_exists(gh, repo: str, name: str) -> bool:
     return code == 0
 
 
-def _ensure_label(gh, repo: str, name: str, mode: str, sha: str) -> None:
-    """Crée l'étiquette du dépôt si elle manque (une par demande, #1343)."""
-    if _label_exists(gh, repo, name):
-        return
-    payload = json.dumps({"name": name,
-                          "color": "0e8a16" if mode == "lot" else "1d76db",
-                          "description": "CI #1343 %s sur %s" % (mode, sha[:12])})
-    code, out, err = gh.run(["api", "-X", "POST", "repos/%s/labels" % repo,
-                             "--input", "-"], payload)
+def _ensure_label(gh, repo: str, name: str, mode: str, base: str) -> None:
+    """Fige la pointe cible dans la description avant l'événement labeled.
+
+    L'événement conserve cette description : le titre du run, le plan et les
+    parents du merge-ref portent ainsi la même base, même si pulls.base.sha
+    est périmé. Une reprise actualise aussi une étiquette existante (#2328).
+    """
+    exists = _label_exists(gh, repo, name)
+    payload = {"description": base}
+    path = "repos/%s/labels" % repo
+    if exists:
+        path += "/%s" % _q(name)
+    else:
+        payload.update({"name": name, "color": "0e8a16" if mode == "lot" else "1d76db"})
+    code, out, err = gh.run(["api", "-X", "PATCH" if exists else "POST", path,
+                             "--input", "-"], json.dumps(payload))
     if code != 0:
-        raise GelError("cannot create the label %s in %s: %s"
-                       % (name, repo, _gh_error(out, err)))
+        raise GelError("cannot %s the label %s in %s: %s"
+                       % ("update" if exists else "create", name, repo, _gh_error(out, err)))
 
 
 def _drop_label(gh, repo: str, number: int, name: str, *, delete_label: bool) -> list[str]:
@@ -2656,7 +2757,7 @@ def _drop_label(gh, repo: str, number: int, name: str, *, delete_label: bool) ->
     return failed
 
 
-def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> dict:
+def _pose_request(gh, repo: str, pr: dict, label: str, mode: str) -> dict:
     """Retire les étiquettes de demande périmées de la PR, puis pose la nôtre.
 
     Rend `{ok, dropped, failed, error}` ; ne lève pas : un refus est dit. Une
@@ -2678,7 +2779,7 @@ def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> d
             return {"ok": False, "dropped": dropped, "failed": failed,
                     "error": "cannot remove the label %s before posing it again" % label}
     try:
-        _ensure_label(gh, repo, label, mode, sha)
+        _ensure_label(gh, repo, label, mode, pr["base"])
     except GelError as exc:
         return {"ok": False, "dropped": dropped, "failed": failed, "error": str(exc)}
     code, out, err = gh.run(["api", "-X", "POST",
@@ -2776,14 +2877,18 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                                     avis=int(decision.get("avis") or 0), seen=seen))
 
         note("reserve", "freeze CI requested")
-        known = _pr_runs(api, decision["repo"], number, sha, decision["branch"])
+        known, carried = _pr_request_runs(api, decision["repo"], number, sha,
+                                          decision["branch"])
         #: P2-3 : le plus grand identifiant d'exécution déjà connu avant la pose
         #: est la marque de l'instant ; le run de cette demande, créé après,
         #: portera un identifiant supérieur. La marque `applied` l'enregistre
         #: (`seen=`) et la reprise d'un run rouge se libère par cette
         #: corrélation, sans jamais comparer l'horodatage (base, fractionnaire)
-        #: au `created_at` du run (GitHub, à la seconde).
-        watermark = max((_run_id(r["row"]) for r in known), default=0)
+        #: au `created_at` du run (GitHub, à la seconde). Les runs au run-name
+        #: illisible entrent aussi dans le `seen=` (#2364) : la marque posée
+        #: ensuite ne sera pas libérée par eux.
+        watermark = max([_run_id(r["row"]) for r in known]
+                        + [r["id"] for r in carried], default=0)
         runs = [r for r in known if r["base"] == base and _covers(r["mode"], mode)]
         live = [r for r in runs if r["status"] in OPEN_STATUSES]
         green = [r for r in runs if r["status"] == "completed" and r["conclusion"] == "success"]
@@ -2823,15 +2928,35 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
         #: rouge court) ne tient plus la clé ; seule une demande encore
         #: invisible tient, et la corrélation est le couple (identifiant, mode)
         #: du run, pas l'horloge — un run de lot ne matérialise pas un `full`.
+        #: Un run au run-name illisible matérialise la marque de sa composition
+        #: (#2364), avec le mode lu dans son libellé.
         held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
                                   now=time.time(),
-                                  runs=tuple((_run_id(r["row"]), r["mode"]) for r in runs))
+                                  runs=tuple([(_run_id(r["row"]), r["mode"]) for r in runs]
+                                             + [(r["id"], r["mode"]) for r in carried]))
         if held:
             note("released", "another request (token %s) already holds this composition"
                  % held["token"])
             return {"requested": False, "action": "running",
                     "why": "a request of this composition was already reserved (token %s): "
                            "nothing posed" % held["token"]}
+        #: #2364 : le run illisible porte la tête et le libellé, pas la base ;
+        #: vivant, il se surveille ; terminé sans `--force`, il demande la
+        #: reprise explicite au lieu de laisser la marque tenue pour toujours.
+        live_carried = [r for r in carried if r["status"] in OPEN_STATUSES]
+        if live_carried:
+            return {"requested": False, "action": "running",
+                    "why": "a request is visible but its run-name is unreadable "
+                           "(run %s, mode %s): its state cannot be checked; nothing posed"
+                           % (live_carried[0]["id"], live_carried[0]["mode"]),
+                    "run": _short_run(live_carried[0]["row"])}
+        if carried and not runs and not force:
+            return {"requested": False, "action": "refuse",
+                    "why": "a request already ran on PR #%d (run %s, mode %s), but its "
+                           "run-name is unreadable (base is not a SHA: old workflow/CLI), "
+                           "so its composition cannot be checked: --force to request the "
+                           "CI again (explicit resumption)"
+                           % (number, carried[0]["id"], carried[0]["mode"])}
         try:
             _revalidate(tx, int(item_id), decision)
         except GelError as exc:
@@ -2853,7 +2978,7 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                    "run `ameesh ci run %d` again" % (base[:12], pr["base"][:12], item_id))
             note("released", why)
             return {"requested": False, "action": "refuse", "why": why}
-        posed = _pose_request(gh, decision["repo"], pr, label, mode, sha)
+        posed = _pose_request(gh, decision["repo"], pr, label, mode)
         if not posed["ok"]:
             note("released", posed["error"])
             return {"requested": False, "action": "refuse", "why": posed["error"]}
@@ -2895,6 +3020,10 @@ def _render_gel(decision: dict) -> list[str]:
     if decision.get("requested"):
         lines.append("  request(s) seen: %s" % ", ".join(
             "%s %s" % (r["mode"], r["conclusion"] or "?") for r in decision["requested"]))
+    if decision.get("unreadable"):
+        lines.append("  unreadable request(s): %s" % ", ".join(
+            "run %s %s %s" % (r["id"], r["mode"], r["conclusion"])
+            for r in decision["unreadable"]))
     run = decision.get("run") or {}
     if run.get("id"):
         lines.append("  run %s %s %s" % (run.get("id"), run.get("status"),
@@ -2903,14 +3032,37 @@ def _render_gel(decision: dict) -> list[str]:
 
 
 def cmd_ci_run(cfg, args) -> int:
-    """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois."""
-    from . import plan_github
+    """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois.
+
+    #2333 (canon §11 bis) : aucune étiquette `ci-lot-<sha>` entre deux paquets.
+    La garde passe avant le plan — un `--dry-run` la montre aussi — et ne
+    laisse partir que `--full` ou une exception `incident|unblock` motivée,
+    journalisée dans la note du lot à la tête réellement testée."""
+    from . import plan_github, work
     from .db import open_db
     db = open_db(cfg)
     gh = plan_github.Gh()
 
     def api(path: str):
         return plan_github._json(gh, ["api", path])
+
+    item = work.get(db, args.id) if args.id else None
+    if item is not None:
+        freeze = frozen_of(db, args.id)
+        declared_sha = ((args.sha or "") or ((freeze or {}).get("sha") or "")).strip().lower()
+        try:
+            packet_guard.check_ci(db, args.id, item.get("branch") or "",
+                                  mode="full" if args.full else "lot",
+                                  sha=declared_sha,
+                                  exception=args.exception or "", reason=args.reason or "")
+        except packet_guard.PacketGuardError as exc:
+            if getattr(args, "json", False):
+                print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                                  "action": "refuse", "why": str(exc)},
+                                 ensure_ascii=False, indent=1))
+            else:
+                print("ameesh ci run: %s" % exc)
+            return 1
 
     try:
         decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
@@ -2934,6 +3086,11 @@ def cmd_ci_run(cfg, args) -> int:
         return 0
     # canon §3 : un run de la branche hors de la composition courante (autre
     # SHA, autre base) est périmé ; jamais celui de la composition demandée.
+    # #2333 : l'exception est journalisée à la tête que le plan a retenue
+    # (celle que la demande va tester), avant la pose de l'étiquette.
+    if decision.get("exception"):
+        packet_guard.declare(db, args.id, decision["exception"], decision["reason"],
+                             decision["sha"], actor=getattr(args, "actor", "") or "")
     stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "",
                         number=decision["pr"], base=decision["base"])["runs"]
     if stale:

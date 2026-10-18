@@ -676,7 +676,7 @@ class IdleCapacityToOrchestratorTest(_Base):
         rows = self.unread("orch")
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["kind"], "event")
-        self.assertIn("without a lot", rows[0]["body"])
+        self.assertIn("without an actionable lot", rows[0]["body"])
         notifier.run_pass(self.db, thresholds=seuils)       # même alerte : pas de doublon
         self.assertEqual(len(self.unread("orch")), 1)
 

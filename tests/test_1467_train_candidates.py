@@ -102,7 +102,10 @@ class PreparationTest(unittest.TestCase):
                          branch_target="origin/main", type="improvement", title="member")
         self.ops.get.return_value = self.item
         self.requirement = train_admissions.Requirement(1, self.base, self.head,
-                                                       "sensitive", 2, self.base)
+                                                       "sensitive", 2, self.base,
+                                                       files=({"path": "content",
+                                                               "class": "sensitive",
+                                                               "rule": None},))
         self.policy = mock.Mock(return_value=self.requirement)
         self.preparation = train_candidates.Preparation(None, self.project,
             repository=self.repository, history=self.history, policy=self.policy)
@@ -171,7 +174,9 @@ class PreparationTest(unittest.TestCase):
 
     def test_light_without_review_passes_but_explicit_blockage_is_preserved(self):
         self.marks[:] = [self.marks[0]]
-        self.policy.return_value = dataclasses.replace(self.requirement, risk="light", reviews=0)
+        self.policy.return_value = dataclasses.replace(
+            self.requirement, risk="light", reviews=0,
+            files=({"path": "content", "class": "light", "rule": None},))
         self.assertEqual(self.prepare()["history"]["reviews"]["coverage"],
                          {self.first: [], self.head: []})
         self.marks.append(dict(id=4, kind="verdict", actor="blocked-reader", at_ts=9,

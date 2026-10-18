@@ -85,6 +85,14 @@ MAX_ACTIONS = 500
 #: longueur d'une tâche affichée (consigne en cours, libellé)
 TASK_CHARS = 140
 
+#: #1476 : cible de la durée bout en bout d'une suite complète (demande du
+#: bureau, 15/10/2026), en secondes, et fenêtre de la médiane affichée (jours)
+#: avec sa borne de lecture par dépôt
+CI_SUITE_TARGET_S = 15 * 60
+CI_SUITE_WINDOW_D = 7
+CI_SUITE_LIMIT = 500
+CI_SUITE_SCHEMA = "ameesh-ci-suite/1"
+
 #: états du lot rendus par la vue (décision 0024)
 LOT_STATES = ("active", "review", "blocked", "approved", "merged", "closed")
 #: états d'agent rendus par la vue
@@ -153,7 +161,8 @@ def parse_since(text: str | None, now: float) -> float:
 # --------------------------------------------------------------------------
 
 def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
-                          declared: Iterable[dict] | None = None) -> dict:
+                          declared: Iterable[dict] | None = None, *,
+                          agents: Iterable[str] | None = None) -> dict:
     """Les jalons d'un lot : requested / frozen / verdict / merged / delivered.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
@@ -189,7 +198,13 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
+
+    `agents` : les noms d'agents du registre (#2346). `seb` et `human:seb` ne
+    nomment le même acteur que si `seb` n'est PAS un agent ; sans cette
+    classification (None), aucun alias n'est admis — le sens est restreint,
+    jamais deviné.
     """
+    agents = None if agents is None else set(agents)
     requested = item.get("created_ts")
     merged = None
     blocks = 0
@@ -277,7 +292,10 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     reviewer = (last["actor"] if last else None) if verdict_current else designated
     from .work_reviewers import designated as designated_reviewers
     reviewers = designated_reviewers(item)
-    current = {v["actor"]: v for v in verdicts if _verdict_applies(v, last_frozen)}
+    # Key by designation: aliases share one latest verdict, and withdrawn
+    # reviewers cannot supply the aggregate verdict after their removal.
+    current = {name: v for v in verdicts if _verdict_applies(v, last_frozen)
+               for name in reviewers if _same_actor(name, v["actor"], agents)}
     pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
                if item.get("reviewers") is not None else [])
     # Every designated reviewer owes their own verdict on the frozen head.
@@ -322,6 +340,29 @@ def _same_commit(a: str | None, b: str | None) -> bool:
     Un identifiant vide n'est jamais « le même commit »."""
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
     return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _same_actor(left: str | None, right: str | None,
+                agents: set[str] | None = None) -> bool:
+    """#2204/N4, #2346 : `seb` et `human:seb` ne nomment le même acteur que si
+    `seb` n'est pas un agent du registre. Un agent nommé `seb` ne peut donc ni
+    valider l'approbation humaine `human:seb`, ni fournir le verdict attendu
+    d'un relecteur `human:seb`. `agents` None (classification inconnue) :
+    aucun alias — on restreint plutôt que de deviner."""
+    left, right = (left or "").strip(), (right or "").strip()
+    if left == right:
+        return True
+    if not left or not right:
+        return False
+    if left.startswith("human:"):
+        bare, other = left[len("human:"):], right
+    elif right.startswith("human:"):
+        bare, other = right[len("human:"):], left
+    else:
+        return False
+    if not bare or other != bare:
+        return False
+    return agents is not None and bare not in agents
 
 
 def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
@@ -399,8 +440,9 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               planned_wait: dict | None = None,
               dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
-              agent_externals: dict[str, str | None] | None = None) -> dict:
-    jalons = _work_item_milestones(item, events, actions, declared)
+              agent_externals: dict[str, str | None] | None = None,
+              agents: Iterable[str] | None = None) -> dict:
+    jalons = _work_item_milestones(item, events, actions, declared, agents=agents)
     packages = packages or {}
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
@@ -786,6 +828,48 @@ def _real_spend(db, paid: Iterable[str], since_ts: float, now: float) -> list[di
 # l'instantané
 # --------------------------------------------------------------------------
 
+def _ci_priority(row: dict) -> bool:
+    """#1468 : le pool prioritaire de runners couvre `integration/**` et
+    `release/**` (source ou cible d'une PR) ; une poussée sur `main` suit la
+    fusion d'un paquet déjà validé sur sa branche d'intégration et n'est pas
+    le chemin critique de la cible ; une exécution manuelle sur `main` non
+    plus (elle ne prend pas le pool prioritaire)."""
+    return any((row.get(ref) or "").startswith(("release/", "integration/"))
+               for ref in ("branch", "base"))
+
+
+def build_ci_suite(rows: list[dict]) -> dict:
+    """#1476 : durée médiane (et p80) des suites complètes conclues, par
+    dépôt, et la part couverte par le pool prioritaire.
+
+    La durée est celle du veilleur CI (`ci_runs`) : du premier relevé de
+    l'exécution à celui de sa conclusion. L'instant de création GitHub n'est
+    pas gardé ; l'écart est borné par l'intervalle de `ameesh notify`, et il
+    porte des deux côtés, donc la médiane reste juste à un relevé près.
+    """
+    by_repo: dict = {}
+    for row in rows:
+        by_repo.setdefault(row.get("repo") or "?", []).append(row)
+    repos = []
+    for repo, runs in sorted(by_repo.items()):
+        durees = [r["duration_s"] for r in runs if r.get("duration_s") is not None]
+        prio = [r["duration_s"] for r in runs
+                if r.get("duration_s") is not None and _ci_priority(r)]
+        last = max(runs, key=lambda r: (r.get("concluded_ts") or 0, r.get("run_id") or 0))
+        repos.append({
+            "repo": repo,
+            "runs": len(durees),
+            "median_s": estimates_mod.quantile(durees, 0.5),
+            "p80_s": estimates_mod.quantile(durees, 0.8),
+            "last_s": last.get("duration_s"),
+            "last_concluded_ts": last.get("concluded_ts"),
+            "priority_runs": len(prio),
+            "priority_median_s": estimates_mod.quantile(prio, 0.5),
+        })
+    return {"schema": CI_SUITE_SCHEMA, "window_days": CI_SUITE_WINDOW_D,
+            "target_s": CI_SUITE_TARGET_S, "repos": repos}
+
+
 def _truncation(rows: list[dict], limit: int) -> dict | None:
     """`{shown, total, limit}` si la borne de rendu a coupé, sinon None."""
     total = int(rows[0].get("total") or len(rows)) if rows else 0
@@ -873,7 +957,11 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     packages = {p["id"]: p for p in package_rows}
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
-    states, externals = stagnation.availability_of(st.agents(None))
+    all_agents = st.agents(None)
+    states, externals = stagnation.availability_of(all_agents)
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur. Cette table classe les homonymes pour `_same_actor`.
+    agent_names = {row["name"] for row in all_agents if row.get("name")}
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
@@ -891,7 +979,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
                       events_ts=last_events.get(int(item["id"])), agent_states=states,
                       planned_wait=waits.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
-                      agent_externals=externals)
+                      agent_externals=externals, agents=agent_names)
             for item in items]
     # #1822 : un lot léger sans verdict courant attend la fusion, pas un
     # verdict ; la classe n'est lue — une fois par passage — que pour ces lots.
@@ -906,7 +994,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
             continue
         rid = int(item["id"])
         acts = by_item.get(rid, [])
-        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid))
+        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid),
+                                       agents=agent_names)
         lot["waiting_for"] = stagnation.with_availability(
             stagnation.waiting(item, jalons, acts,
                                responsible=(packages.get(item.get("package_id"))
@@ -980,6 +1069,11 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         version_view = versions_mod.empty(
             "versions: unreadable (%s)" % " ".join(str(exc).split())[:200])
 
+    # #1476 : la durée médiane des suites complètes, par dépôt (veilleur CI) ;
+    # la cible de 15 min est portée par la vue, jamais inventée.
+    ci_suite = build_ci_suite(
+        st.ci_suite(since_ts=now - CI_SUITE_WINDOW_D * 86400.0, limit=CI_SUITE_LIMIT))
+
     return {
         "schema": SCHEMA,
         "generated_ts": _round(now),
@@ -998,6 +1092,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "decisions": pending,
         # L160f (#497) : versions publiées et prochaines releases par produit
         "versions": version_view,
+        # #1476 (champ ajouté) : durée médiane des suites complètes, cible 15 min
+        "ci_suite": ci_suite,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -1039,6 +1135,35 @@ def _duration(seconds) -> str:
     return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
+def _ci_suite_lines(ci: dict, width: int) -> list[str]:
+    """#1476 : la durée médiane des suites complètes, par dépôt, face à la
+    cible ; la part couverte par le pool prioritaire de #1468 est dite."""
+    target = int(ci.get("target_s") or CI_SUITE_TARGET_S)
+    out = [textwrap.fill("CI FULL SUITE (median over %d d, target ≤ %s)" % (
+        int(ci.get("window_days") or CI_SUITE_WINDOW_D), _duration(target)), width)]
+    for r in ci.get("repos", []):
+        if not r.get("runs"):
+            out.append(textwrap.fill("%s: no concluded full suite" % r["repo"], width,
+                                     subsequent_indent="  "))
+            continue
+        if r["median_s"] <= target:
+            verdict = "target met"
+        elif r.get("priority_median_s") is not None and r["priority_median_s"] <= target:
+            verdict = "target met on the priority pool only"
+        else:
+            verdict = "target not met"
+        out.append(textwrap.fill(
+            "%s: median %s · p80 %s (%d runs, %s)" % (
+                r["repo"], _duration(r["median_s"]), _duration(r.get("p80_s")),
+                r["runs"], verdict), width, subsequent_indent="  "))
+        if r.get("priority_runs"):
+            out.append(textwrap.fill(
+                "priority pool (integration/release): median %s over %d runs" % (
+                    _duration(r.get("priority_median_s")), r["priority_runs"]),
+                width, initial_indent="  ", subsequent_indent="    "))
+    return out
+
+
 def format_text(snap: dict, width: int | None = None) -> str:
     """La sortie lisible : une colonne, coupée à la largeur du terminal."""
     if width is None:
@@ -1069,6 +1194,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
         # L160f (#497) : dernières versions publiées et prochaines releases
         out.append("")
         out.extend(versions_mod.format_lines(snap["versions"], width))
+
+    if (snap.get("ci_suite") or {}).get("repos"):
+        # #1476 : durée médiane des suites complètes, cible de 15 min
+        out.append("")
+        out.extend(_ci_suite_lines(snap["ci_suite"], width))
 
     if snap.get("roadmap"):
         # L96 : la feuille de route (Gantt texte), avant le détail des lots
