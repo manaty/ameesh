@@ -185,6 +185,43 @@ class AlerteTest(_Base):
         self.age(4 * HEURE)
         self.assertEqual(self.slo(), [])
 
+    def test_bloquant_fusionne_le_delai_part_de_la_levee(self):
+        # #2551 : #2198/#2498 — un lot assigné depuis 13 h mais retenu par
+        # #2184 ne doit pas escalader au niveau 3 à la seconde où le bloqueur
+        # fusionne : la mesure d'intake part de la fusion.
+        bloqueur = work.add(self.db, title="bloqueur", assignee="human:proprio")
+        work_dependencies.add(self.db, self.lot["id"], bloqueur["id"], actor="test")
+        self.age(13 * HEURE)
+        self.assertEqual(self.slo(), [])
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (bloqueur["id"],))
+        merged = time.time()
+        self.now = merged + 60
+        self.assertEqual(self.slo(), [])
+        self.now = merged + 1.5 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("intake_started", 1, ["assignee"])])
+        self.assertAlmostEqual(alerts[0]["since"], merged, delta=5)
+        self.assertAlmostEqual(alerts[0]["value"], 1800, delta=5)
+
+    def test_bloquant_clos_le_delai_part_de_la_cloture(self):
+        # #2551 : la fermeture d'un prérequis (abandon, remplacement) le rend
+        # non bloquant, comme la fusion : le délai part de sa clôture.
+        bloqueur = work.add(self.db, title="bloqueur", assignee="human:proprio")
+        work_dependencies.add(self.db, self.lot["id"], bloqueur["id"], actor="test")
+        self.age(13 * HEURE)
+        self.assertEqual(self.slo(), [])
+        work.close(self.db, bloqueur["id"], abandoned=True, actor="test")
+        closed = time.time()
+        self.now = closed + 60
+        self.assertEqual(self.slo(), [])
+        self.now = closed + 1.5 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"]) for a in alerts],
+                         [("intake_started", 1)])
+        self.assertAlmostEqual(alerts[0]["since"], closed, delta=5)
+
     def test_etapes_tenues_puis_verdict_recent(self):
         # créé il y a 4 h, démarré 30 min plus tard, verdict ok il y a 5 min :
         # aucune étape en dépassement, seule la fusion reste à faire

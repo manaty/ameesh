@@ -161,6 +161,29 @@ class MesureTest(unittest.TestCase):
                     self.assertEqual(intake[0]["elapsed_s"], offset)
                     self.assertEqual(intake[0]["level"], expected)
 
+    def test_intake_planifie_et_prerequis_combines(self):
+        from ameesh.plan import day_start_ts
+        planned = day_start_ts("2026-10-19")
+        item = _item(assignee="executant", planned_start="2026-10-19")
+        cases = (
+            (True, None, planned + 10800, None),
+            (False, planned - 3600, planned - 1, None),
+            (False, planned - 3600, planned + 1800, planned),
+            (False, planned + 3600, planned + 5400, planned + 3600),
+        )
+        for blocking, satisfied, now, expected in cases:
+            with self.subTest(blocking=blocking, satisfied=satisfied, now=now):
+                edges = [{"blocking": blocking, "satisfied_ts": satisfied}]
+                rows = slo.lot_steps(item, _jalons(item, []), [], now=now,
+                                     dependencies=edges)
+                intake = [r for r in rows if r["step"] == "intake_started"]
+                if expected is None:
+                    self.assertEqual(intake, [])
+                else:
+                    self.assertEqual(intake[0]["started_ts"], expected)
+                    self.assertEqual(intake[0]["elapsed_s"], 1800)
+                    self.assertEqual(intake[0]["level"], 0)
+
     def test_intake_assignation_apres_date_planifiee(self):
         from ameesh.plan import day_start_ts
         planned = day_start_ts("2026-10-19")
@@ -192,6 +215,56 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(before["elapsed_s"], 900)
         self.assertEqual(after["started_ts"], before["started_ts"])
         self.assertEqual(after["elapsed_s"], before["elapsed_s"])
+
+    def test_intake_avec_prerequis_bloquant_ouvert_ne_court_pas(self):
+        # #2551 : un lot retenu par une dépendance bloquante ouverte n'est pas
+        # « prêt » ; son porteur ne peut rien y faire, aucun retard intake.
+        events = [_ev("intake", T0)]
+        item = _item(assignee="executant")
+        edges = [{"blocker_id": 7, "blocking": True, "satisfied_ts": None}]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 13 * 3600, dependencies=edges)
+        self.assertEqual([r for r in rows if r["step"] == "intake_started"], [])
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_intake_prerequis_satisfait_compte_depuis_la_levee(self):
+        # #2551 : le blocage a duré 10 h ; le délai part de la fusion du
+        # bloqueur, pas de l'attribution (sinon niveau 3 à la seconde).
+        events = [_ev("intake", T0)]
+        item = _item(assignee="executant")
+        unblocked = T0 + 10 * 3600
+        edges = [{"blocker_id": 7, "blocking": False, "satisfied_ts": unblocked}]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=unblocked + 1800, dependencies=edges)
+        row = self._row(rows, "intake_started")
+        self.assertEqual(row["started_ts"], unblocked)
+        self.assertEqual(row["elapsed_s"], 1800)
+        self.assertEqual(row["level"], 0)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=unblocked + 3660, dependencies=edges)
+        self.assertEqual(self._row(rows, "intake_started")["level"], 1)
+
+    def test_intake_dernier_prerequis_satisfait_gouverne(self):
+        # #2551 : c'est la levée du DERNIER bloqueur qui rend le lot prêt.
+        events = [_ev("intake", T0)]
+        item = _item(assignee="executant")
+        edges = [{"blocker_id": 7, "blocking": False, "satisfied_ts": T0 + 100},
+                 {"blocker_id": 8, "blocking": False, "satisfied_ts": T0 + 200}]
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 300,
+                             dependencies=edges)
+        self.assertEqual(self._row(rows, "intake_started")["started_ts"], T0 + 200)
+
+    def test_intake_demarre_ne_reecrit_pas_sa_mesure(self):
+        # #2551 : une dépendance ajoutée après le début ne réécrit pas la
+        # mesure d'intake déjà acquise.
+        events = [_ev("intake", T0), _ev("build", T0 + 1800)]
+        item = _item(state="build", assignee="executant", updated_ts=T0 + 1800)
+        edges = [{"blocker_id": 7, "blocking": True, "satisfied_ts": None}]
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7200,
+                             dependencies=edges)
+        row = self._row(rows, "intake_started")
+        self.assertEqual(row["started_ts"], T0)
+        self.assertEqual(row["done_ts"], T0 + 1800)
 
     def test_intake_passee_sans_evenement_build_n_est_pas_un_retard(self):
         # #1982 : un lot en build ou en qa sans événement `build` a franchi
