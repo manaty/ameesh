@@ -464,7 +464,8 @@ class CanonAliasTest(_TmpMixin, unittest.TestCase):
 
 
 from .test_canon import _CanonDbCase
-from .test_l108_executor_server import ServeurExecTest, TOKEN, SESSION, OTHER_TOKEN, OWNER
+from . import test_l108_executor_server as _server
+from .test_l108_executor_server import TOKEN, SESSION, OTHER_TOKEN, OWNER
 
 
 class CanonAliasSyncTest(_CanonDbCase):
@@ -537,7 +538,7 @@ class CanonAliasSyncTest(_CanonDbCase):
         self.assertEqual(agent_names.resolve('new-worker', canon=self.load()), 'ouvrier')
 
 
-class MediatedAgentAliasTest(ServeurExecTest):
+class MediatedAgentAliasTest(_server.ServeurExecTest):
     def setUp(self):
         super().setUp()
         self.db.execute("UPDATE agent_registry SET aliases=ARRAY['old-worker'] WHERE name='inge-front'")

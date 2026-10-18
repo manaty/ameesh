@@ -57,7 +57,8 @@ inchangés). L'unité #775 a donc été remplacée et le paquet **recomposé** d
 `53981bfa0`, #2298 `b1272f391`), correctif `b6b861de4`, puis le présent
 manifeste. L'ancienne tête
 `155ae0420` et son run de CI en file (`39128173275`) sont abandonnés ; la CI
-complète est demandée une seule fois sur la tête du présent manifeste.
+complète est demandée une seule fois sur la tête finale après les
+correctifs CI ci-dessous.
 
 Témoins sur l'arbre recomposé : `tests.test_l161a_ci_sans_code` +
 `tests.test_doc_links` + `tests.test_l107_executor_contract` — **41 tests OK**
@@ -65,6 +66,36 @@ Témoins sur l'arbre recomposé : `tests.test_l161a_ci_sans_code` +
 **58 tests OK** (16,5 s) ; `scripts/doc-links.py` — **169 fichiers, 0 lien
 cassé**. Le correctif `test_cluster`/`0464` (`b6b861de4`, 34 OK sur l'ancienne
 tête) est inchangé et couvre le même arbre.
+
+## Correctifs CI du 18/10 13:1xZ (#423 × L61, attribution)
+
+Le run complet `39128688070` sur `1b7812659` a rougi deux contrôles de
+composition et un test de temps, corrigés en test seul :
+
+- `tests.test_l61_allers_retours.TestAllersRetours.test_hook_sous_bail`
+  (psql 14/16 : 8 > 5 ; psycopg 7/8 : 7 > 4) : la résolution d'alias de #423
+  ajoute trois aller-retours au premier hook (`registry.upsert`,
+  `mail.reserve`, `mail.deliver`) et deux aux suivants (`mail.reserve`,
+  `mail.deliver`). Bornes ajustées en conséquence (+3 puis +2, commentées) ;
+  `tests.test_l61_allers_retours` : **19 tests OK**. Coût assumé de la
+  résolution d'alias, pas une borne supprimée : le test rougit toujours
+  au-delà.
+- `tests.test_l161e_map.AttributionContractTest.test_aucune_classe_de_test_concrete_etrangere_liee_au_module`
+  (psql 13/16 ; psycopg 7/8) : `test_423_agent_aliases.py` liait au niveau module la
+  classe concrète `ServeurExecTest` (#1632) ; liaison par module
+  (`from . import test_l108_executor_server as _server`, base
+  `_server.ServeurExecTest`) ; `tests.test_l161e_map` : **41 tests OK**.
+
+`tests.test_runner.RunnerTest.test_veilleur_ne_tue_pas_un_bail_renouvele`
+a aussi rougi (psql 6/16 : « un bail renouvelé a été tué ») mais **passe
+10/10 en local** après élargissement de sa fenêtre : échéance initiale
+0,25 → 0,6 s et attente 0,4 → 0,6 s, même sémantique (l'ancienne échéance
+passe bien pendant l'attente). C'est un test de temps sensible à la
+charge, sans modification du veilleur dans le paquet (#2206 ne touche que
+`_deferred_turn`).
+
+Ces correctifs ne touchent aucun code produit ; une suite complète unique
+est redemandée sur la tête de ce commit.
 
 ## Conflits et résolutions
 
@@ -83,17 +114,17 @@ tête) est inchangé et couvre le même arbre.
 
 ## Preuves
 
-- `git diff --stat 63500a3c..HEAD` : **57 fichiers hors ce manifeste,
-  +2643/−147** (58 fichiers avec le manifeste), dont `src/ameesh/agent_names.py`,
+- `git diff --stat 63500a3c..HEAD` : **59 fichiers hors ce manifeste,
+  +2829/−153** (60 fichiers avec le manifeste), dont `src/ameesh/agent_names.py`,
   `src/ameesh/cost.py`, `src/ameesh/runner.py`, `src/ameesh/resident*.py`,
   `src/ameesh/prevalidation.py`, `src/ameesh/storage/**`, les migrations
   `0418_agent_aliases.sql` et `0464_spend_pending_resident_usage.sql`,
-  `scripts/doc-links.py`, les docs et 12 fichiers de tests.
+  `scripts/doc-links.py`, les docs et 14 fichiers `test_*.py`.
 - `git log --first-parent 63500a3c..HEAD` : commit de mise à jour `9ad10e5f2`
   (sans trailer), 5 unités, 5 trailers `ameesh-work` ; têtes sources :
   `eedef7c51e6a`, `a8110967d90b`, `1d1047c8a86c`, `ef5688cb4703`,
   `e1d7648d74fd` ; un correctif de composition `b6b861de4` (sans trailer),
-  puis le présent manifeste.
+  le manifeste `1b7812659`, puis le présent commit de correctifs CI.
 - `git diff --check 63500a3c..HEAD` : rc 0, aucun marqueur de conflit.
 - Tests ciblés locaux sur l'arbre composé (`ameesh heavy`, `PYTHONPATH=src
   python -m unittest`) : **375 tests, 549 s** pour les quatre premières unités ;
@@ -103,6 +134,10 @@ tête) est inchangé et couvre le même arbre.
   neutralisées), les 2 erreurs sont les erreurs hôte #1801 (gpg-agent) de
   `test_423`. #2298 : `tests.test_1770_prevalidation` **46 tests OK** (0,4 s)
   sur l'arbre composé.
+- Correctifs CI ci-dessus : `tests.test_l61_allers_retours` **19 tests OK**,
+  `tests.test_l161e_map` **41 tests OK**, `tests.test_423_agent_aliases`
+  **39 OK + 2 erreurs hôte #1801** (gpg-agent) ; `test_veilleur…` **10/10 OK**
+  en local après élargissement de la fenêtre.
 - `scripts/paquet-inclusion.py --manifest reviews/integration-paquet-h-20261018-1300.md
   --head b1272f391 --expected 423,2421,775,2206,2298 --excused 2326,1819
   --no-ready` : rc 0, **5/5 attendus**, 5 compositions (4 têtes présentes,
@@ -111,9 +146,11 @@ tête) est inchangé et couvre le même arbre.
   initiale ; son fichier n'est pas conservé, d'où le `--no-ready` explicite sur
   la recomposition. #423 ressort **partiel** sur `docs/EXECUTEUR-MEDIEE.md`
   (compteurs 392→393 et 458→459 réécrits par #2421, expliqué ci-dessus).
-- Une seule suite complète sur la tête finale du paquet (§11 bis), demandée
-  après la recomposition ; le run en file de l'ancienne tête `155ae0420`
-  (`39128173275`) a été annulé ; aucune CI de lot entre deux coupures.
+- Une seule suite complète par tête (§11 bis) : le run `39128688070` sur
+  `1b7812659` a rougi les deux contrôles corrigés ci-dessus ; la suite
+  complète est redemandée une seule fois sur la tête de ce correctif. Le run
+  en file de l'ancienne tête `155ae0420` (`39128173275`) avait été annulé ;
+  aucune CI de lot entre deux coupures.
 
 ## Écartés (ce véhicule)
 

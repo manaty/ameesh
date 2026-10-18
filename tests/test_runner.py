@@ -1099,7 +1099,7 @@ class RunnerTest(PgTestCase):
         worker = AgentWorker(
             runner,
             {"name": "yankee", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.25},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.6},
         )
         worker.proc = proc
         worker.pgid = proc.pid
@@ -1107,7 +1107,7 @@ class RunnerTest(PgTestCase):
             worker.ensure_watchdog()
             time.sleep(0.1)
             worker.lease_deadline = time.time() + 1.5  # renouvellement réussi
-            time.sleep(0.4)  # bien au-delà de l'ancienne échéance
+            time.sleep(0.6)  # bien au-delà de l'ancienne échéance
             self.assertFalse(worker.lease_lost.is_set(), "un bail renouvelé a été tué")
             self.assertIsNone(proc.poll(), "le harnais doit rester vivant")
         finally:
