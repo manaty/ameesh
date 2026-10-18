@@ -93,10 +93,9 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 
 #: la classe « sensible » demande un avis d'une autre famille ; **SQL, sécurité
 #: et prod** en demandent deux, indépendants (canon §2, décision 18855a). Ces
-#: trois domaines se lisent sur le diff classé (`klass["files"]` : le chemin et
-#: la portée qui l'a classé), avec des motifs larges : un chemin critique non
-#: reconnu coûterait un avis manquant, un chemin reconnu à tort ne coûte qu'un
-#: avis de trop.
+#: trois domaines se lisent sur les chemins du diff classé (`klass["files"]`).
+#: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
+#: Les motifs de domaine restent larges pour ne pas omettre un chemin critique.
 CRITICAL_SCOPE = (
     # SQL, migrations, stockage
     re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
@@ -104,7 +103,8 @@ CRITICAL_SCOPE = (
     # sécurité : droits, identité, clés, secrets, décisions
     re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
                r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
-               r"(^|/)(keys?|secrets?)(/|$)"),
+               r"(^|/)(keys?|secrets?)(/|$)|"
+               r"^src/ameesh/(approve_check|approve_client|config)\.py$"),
     # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
     re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
                r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
@@ -123,13 +123,15 @@ def critical_scope(klass) -> bool:
     Un doute de classe (politique ou diff illisible, `files` vide) ne se
     suppose jamais rassurant : `required_verdicts` le compte alors comme un
     domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
-    for entry in (klass or {}).get("files") or ():
+    files = (klass or {}).get("files") or ()
+    if not files:
+        return True
+    for entry in files:
         if str(entry.get("class") or "") == "light":
             continue
-        candidates = [entry.get("path")] + [str(p) for p in (entry.get("rule") or ())]
-        for candidate in candidates:
-            if any(rx.search(str(candidate or "")) for rx in CRITICAL_SCOPE):
-                return True
+        path = str(entry.get("path") or "")
+        if not path or any(rx.search(path) for rx in CRITICAL_SCOPE):
+            return True
     return False
 
 
@@ -202,6 +204,59 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
                   key=_mark_order)
 
 
+def _waiver(db, item) -> tuple:
+    """#2281/B1 : la dispense de re-verdict lue **à la porte**, après les jalons.
+
+    `item` peut être une ligne lue avant les jalons : si un gel d'une autre
+    tête a été committé entre-temps, le stockage a effacé la marque
+    (`_lapse_waiver`) mais cette copie la porte encore. La porte relit donc la
+    ligne ici — l'appelant a déjà lu les jalons qu'il nous passe — et une
+    dispense périmée ne couvre jamais la nouvelle tête. Une relecture
+    impossible ne prouve rien : la dispense est alors tenue pour absente.
+
+    N1 : l'auteur du geste se lit au **journal du lot** (`work.get` ne rend pas
+    les événements), pour que la note de file nomme le pilote en usage réel.
+
+    Rend `(waived, waived_by, row)` ; `row` est la ligne fraîche quand elle a
+    pu être relue.
+    """
+    row = item or {}
+    lot = row.get("id")
+    waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+              or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    if waived and lot is not None:
+        # Seule une ligne qui *réclame* la dispense peut périmer dans le
+        # mauvais sens : relire la base après les jalons ferme la course. Une
+        # ligne sans dispense ne peut qu'être plus stricte, rien à relire.
+        try:
+            fresh = work.get(db, int(lot))
+        except Exception:  # noqa: BLE001 - lecture impossible : aucune preuve
+            fresh = None
+        if fresh is None:
+            row = dict(row, reviewer="", reviewers=[])
+        else:
+            row = fresh
+        waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+                  or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    waived_by = ""
+    if waived and lot is not None:
+        try:
+            events = storage.of(db).work.events_noted(
+                "verdict not required", 0.0, ids=[int(lot)])
+        except Exception:  # noqa: BLE001 - journal illisible : nom générique
+            events = []
+        for event in events:
+            actor = str(event.get("actor") or "").strip()
+            if actor:
+                waived_by = actor
+    if not waived_by:
+        for event in row.get("events") or ():
+            if str(event.get("note") or "").startswith("verdict not required"):
+                waived_by = str(event.get("actor") or "").strip()
+                break
+    return waived, waived_by, row
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
@@ -221,17 +276,31 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
     décision 18855a).
 
-    Rend `{ok, why, class, required, accepted, blocked, author, author_family,
-    on_freeze}` ; ne lève jamais.
+    #1979 : le pilote peut marquer « verdict non requis » (`work.reviewer
+    --no-verdict`, colonne `reviewer = -none`, geste d'autorité journalisé) ;
+    la marque lève alors l'exigence d'avis **de cette tête gelée** — le
+    stockage la périme à un nouveau gel (`_lapse_waiver`). #2281 : la marque
+    est relue à la porte, **après** les jalons, pour qu'une ligne lue avant un
+    gel ne couvre jamais la nouvelle tête. Un verdict bloquant courant, lui,
+    n'est jamais levé par la dispense : la correction reste due.
+
+    Rend `{ok, why, class, required, accepted, blocked, waived, author,
+    author_family, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     frozen = str(frozen or "").strip().lower()
-    row = item or {}
+    # #1979/#2281 : la dispense de re-verdict du pilote (`-none`) lève la
+    # porte, comme elle lève l'attente dans `progress` ; elle ne survit pas à
+    # un nouveau gel (stockage `_lapse_waiver`) et ne lève jamais un blocage.
+    # La marque est relue après les jalons (`_waiver`) pour ne pas appliquer
+    # une copie antérieure au gel.
+    waived, waived_by, row = _waiver(db, item)
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
-           "blocked": [], "author": author, "author_family": "", "on_freeze": 0}
+           "blocked": [], "waived": waived, "waived_by": waived_by,
+           "author": author, "author_family": "", "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -254,6 +323,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       "not lifted: %s"
                       % (frozen[:12], cls, ", ".join(sorted(
                           str(m.get("actor") or "relecteur sans nom") for m in blocked))))
+        return out
+    if waived:
+        out["ok"] = True
         return out
     if required == 0:
         out["ok"] = True
@@ -322,6 +394,42 @@ def _remote_branch(name: str) -> str:
         if name.startswith(prefix):
             return name[len(prefix):]
     return name
+
+
+def _class_base(repo: str, target: str, *, queue: bool = False) -> str | None:
+    """La référence de cible qui explique la classe d'un lot, ou None.
+
+    #2207 : un `main` local en retard sur `origin/main` faisait entrer dans le
+    diff des commits déjà fusionnés (dont des chemins sensibles) et classait
+    `sensitive` un lot léger. La cible distante dit ce que la file va
+    fusionner : `origin/<cible>` avant la cible locale dans un checkout.
+
+    Dans le clone de la file (`queue=True`), **seule** la cible récupérée
+    fraîchement sous `QUEUE_REF` fait foi : `origin/<cible>` y est la copie que
+    le clone `--shared` a prise du checkout des agents, donc la cible locale
+    périmée de sa source, jamais l'origin du projet (P2-1 de la revue R1)."""
+    wanted = _remote_branch(target)
+    candidates = ([QUEUE_REF + wanted] if queue
+                  else ["origin/" + wanted, wanted])
+    for candidate in candidates:
+        if plan_git._commit(repo, candidate):
+            return candidate
+    return None
+
+
+def _class_ref(repo: str, target: str, sha: str, *, queue: bool = False) -> str:
+    """La référence de `repo` qui nomme la cible fraîche `sha`, sinon le commit.
+
+    Le diff de classe se lit toujours entre **les mêmes** deux commits : une
+    source dont la référence de cible ne pointe pas sur `sha` est périmée et
+    ne doit pas fournir une autre borne (P2-2 de la revue R1)."""
+    wanted = _remote_branch(target)
+    candidates = ([QUEUE_REF + wanted] if queue
+                  else ["origin/" + wanted, wanted])
+    for candidate in candidates:
+        if plan_git._commit(repo, candidate) == sha:
+            return candidate
+    return sha
 
 
 _SCP = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
@@ -447,8 +555,8 @@ def target_tip(repo: str, target: str, clone=None) -> tuple[str | None, str]:
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
               commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
-    pr, class, class_why}`; QueueError says what is missing. Commit ids are
-    resolved to full ones before being compared; `ci` (`radar.github_ci(...,
+    pr, class, class_why, waived}`; QueueError says what is missing. Commit ids
+    are resolved to full ones before being compared; `ci` (`radar.github_ci(...,
     strict=True)`) must report the PR green on the frozen commit itself, and
     an error reading it refuses the lot. A project with `ci_required` (L160g)
     also needs GitHub's CI green on the frozen commit itself, PR or not
@@ -464,6 +572,15 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     classification and the admission (revue #544 r2), and must exist **fresh**
     on origin: an absent target is refused here, not deferred at every pass
     (#2278, `target_tip`).
+
+    #2207 : la branche **et la cible** sont récupérées fraîches dans le clone
+    du radar ; la classe, comme toutes les lectures comparées, se lit contre
+    ce même commit de cible, jamais contre la cible locale d'un checkout.
+
+    #2281 : un lot dont le pilote a marqué « verdict non requis » (#1979,
+    `reviewer = -none`) entre sans avis, comme le veut la marque ; le gel
+    d'une autre tête la périme (stockage) et un verdict bloquant courant la
+    surclasse. `waived` le dit à la note de file.
 
     L756 (#566): a lot of class **release** must additionally certify its
     frozen head with a **full-suite** run — a push or a manual dispatch,
@@ -516,10 +633,25 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     if not freeze or not freeze.get("sha"):
         raise QueueError("lot #%d is not frozen: ameesh work milestone %d frozen --sha <commit>"
                          % (lot, lot))
-    tip, where = branch_tip(repo, row["branch"], clone)
+    # #2207 : la cible est récupérée avec la branche, dans le même fetch. Le
+    # clone `--shared` a pris `origin/<cible>` du checkout des agents, qui peut
+    # être en retard : sans cette récupération, la classe et la fusion se
+    # lisaient sur une cible périmée (P2-1 de la R1).
+    names = [row["branch"]] + ([target] if target else [])
+    try:
+        tips, where = fetch_fresh(repo, names, clone)
+    except QueueError as exc:
+        raise QueueError("cannot fetch branch %s%s from origin: %s"
+                         % (row["branch"], " and target %s" % target if target else "",
+                            str(exc))) from exc
+    tip = tips.get(row["branch"])
     if not tip:
+        if where != repo:
+            raise QueueError("cannot fetch branch %s from origin (no such branch there): push "
+                             "it again" % row["branch"])
         raise QueueError("branch %s of lot #%d is neither local nor on origin"
                          % (row["branch"], lot))
+    fresh_target = tips.get(target) if target else None
     frozen = pinned(where, freeze["sha"])
     if frozen is None and not _HEX.fullmatch(freeze["sha"].strip().lower()):
         raise QueueError("the freeze of lot #%d names %r, not a commit id: freeze it again "
@@ -531,12 +663,23 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
     # #2278 : la cible doit exister fraîchement, sinon `_class_of` relit la
-    # ref gardée dans le clone et admet le lot pour un report éternel.
-    target_tip(repo, target, clone)
-    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
+    # ref gardée dans le clone et admet le lot pour un report éternel. #2207
+    # l'a récupérée avec la branche : c'est `fresh_target` qui fait foi.
+    if not target:
+        raise QueueError("no target branch known: the merge queue cannot admit a lot "
+                         "without a target (set the lot's target or the project's)")
+    if fresh_target is None:
+        place = "origin" if where != repo else "the repository"
+        raise QueueError("target %s not found on %s: the merge queue refuses a lot whose "
+                         "target no longer exists (deleted or renamed). Push the target, point "
+                         "the lot at an existing branch, then ameesh work queue add the lot "
+                         "again" % (_remote_branch(target), place))
+    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg,
+                      base=fresh_target)
     # #1374 : la même porte que le feu — avis comptés par classe, indépendants
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
-    # `blocked` d'un autre relecteur (P1-1).
+    # `blocked` d'un autre relecteur (P1-1). #2281 : la dispense de re-verdict
+    # du pilote (#1979) lève l'exigence d'avis sur cette tête gelée.
     gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row)
     if not gate["ok"]:
         raise QueueError("lot #%d: %s" % (lot, gate["why"]))
@@ -569,9 +712,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-        if gate["required"] == 0 and status.get("draft"):
-            raise QueueError("PR #%s is a draft: a light lot merges only from a "
-                             "non-draft PR" % status.get("number"))
+        if (gate["required"] == 0 or gate["waived"]) and status.get("draft"):
+            raise QueueError("PR #%s is a draft: a lot without a review verdict merges only "
+                             "from a non-draft PR" % status.get("number"))
     proof = None
     if needs_commit_ci:
         if parts is None and getattr(project, "ci_parts", None):
@@ -580,38 +723,68 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),
-            "class_why": klass.get("why") or "", "parts": proof}
+            "class_why": klass.get("why") or "", "parts": proof,
+            "waived": bool(gate.get("waived")),
+            "waived_by": gate.get("waived_by") or ""}
 
 
 def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
-              tip: str, *, cfg=None) -> dict:
+              tip: str, *, cfg=None, base: str | None = None) -> dict:
     """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
 
-    Le clone de la file range les branches sous `QUEUE_REF` ; à défaut la
-    référence de la cible y est tentée, puis le dépôt du projet. `cfg` absent
-    ou dépôt illisible : `lot_class.of_lot` rend un doute (`sensitive`, drapeau
-    `doubt`), et la file garde l'exigence de verdict.
+    La classe se lit entre la cible **fraîche** et la tête gelée. La cible
+    fraîche vient de l'admission (`base`, le commit récupéré par `readiness`),
+    sinon de la cible que le radar a récupérée sous `QUEUE_REF` dans son clone ;
+    à défaut seulement, de `origin/<cible>` du dépôt des agents, puis de sa
+    cible locale. La copie `origin/<cible>` du clone `--shared` n'est jamais
+    une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
 
-    Les lectures sont **toutes** comparées : la plus haute l'emporte, une
-    lecture calculée ne se rétrograde jamais devant une autre, et un doute ne
-    se lit pas comme une classe sensible (le clone radar peut voir des
-    changements sensibles que le checkout de l'auteur ne voit plus — revue
-    #544 r1)."""
+    Toutes les lectures comparées portent sur **la même** cible fraîche : une
+    source qui ne la porte pas (référence périmée, objet absent) est écartée
+    plutôt que comparée avec une autre borne — un `main` en retard ajouterait
+    des commits déjà fusionnés, dont des chemins sensibles, et surclasserait
+    la lecture fraîche (#2207, P2-2). Entre lectures de même borne, la plus
+    haute l'emporte, une lecture calculée ne se rétrograde jamais devant une
+    autre, et un doute ne se lit pas comme une classe sensible (revue #544 r1).
+
+    `cfg` absent ou dépôt illisible : `lot_class.of_lot` rend un doute
+    (`sensitive`, drapeau `doubt`), et la file garde l'exigence de verdict."""
     from . import lot_class
+    # La borne de diff peut être un commit ou un ref de file : l'axe release se
+    # lit sur la cible résolue, que la ligne du lot ne porte pas toujours.
+    item = row
+    if target and not row.get("branch_target"):
+        item = dict(row, branch_target=target)
     paths = []
     if target:
-        base_repo = where or repo
-        for candidate in (QUEUE_REF + target, target):
-            if plan_git._commit(base_repo, candidate):
-                paths.append((base_repo, candidate))
-                break
-        if where and where != repo:
-            paths.append((repo, target))
-    if not paths:
+        source = where or repo
+        cloned = bool(where and where != repo)
+        fresh = base
+        if fresh is None and cloned:
+            ref = _class_base(where, target, queue=True)
+            fresh = plan_git._commit(where, ref) if ref else None
+        if fresh is None:
+            ref = _class_base(repo, target)
+            fresh = plan_git._commit(repo, ref) if ref else None
+        repos = [source] + ([repo] if cloned else [])
+        for path in repos:
+            # Une source ne parle du lot que si elle porte les deux bornes :
+            # sa cible peut être en retard et ses objets absents (le fetch de
+            # `readiness` n'écrit que dans le clone).
+            if fresh and plan_git._commit(path, fresh) and plan_git._commit(path, tip):
+                paths.append((path, _class_ref(path, target, fresh,
+                                               queue=cloned and path == source)))
+        if not paths:
+            # aucune cible fraîche lisible : repli explicite sur les refs de
+            # cible disponibles ; `of_lot` rendra un doute, jamais un `light`.
+            paths.append((source, _class_base(source, target, queue=cloned) or target))
+            if cloned:
+                paths.append((repo, _class_base(repo, target) or target))
+    else:
         paths.append((repo, target))
     best = None
-    for path, base in paths:
-        current = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base,
+    for path, base_ref in paths:
+        current = lot_class.of_lot(db, lot, cfg=cfg, item=item, repo=path, base=base_ref,
                                    head=tip)
         if best is None or _class_worse(current, best):
             best = current
@@ -793,18 +966,25 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
         parts_note = ", parts %s@%s (%d due)" % (proof.get("selector") or "?",
                                                  (proof.get("base") or "?")[:12],
                                                  len(proof.get("due") or ()))
+    # #2281 : la dispense de re-verdict du pilote (#1979) est nommée dans la
+    # note de file, avec l'auteur du geste lu au journal du lot.
+    waived_note = ""
+    if ready.get("waived"):
+        waived_note = ", verdict waived by %s (#1979)" % (
+            ready.get("waived_by") or "pilot")
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s" % (
+        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
             ready["target"], ready["frozen_sha"][:12],
             ", PR #%s green" % ready["pr"] if ready["pr"] else "",
             ready.get("class") or "?", " (%s)" % ready["class_why"]
-            if ready.get("class_why") else "", parts_note), actor=actor)
+            if ready.get("class_why") else "", parts_note, waived_note), actor=actor)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
     row["class"] = ready.get("class")
     row["class_why"] = ready.get("class_why")
+    row["waived"] = bool(ready.get("waived"))
     return row
 
 
