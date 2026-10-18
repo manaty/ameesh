@@ -818,6 +818,40 @@ class MenageDbTest(PgTestCase):
                     if note.startswith("tmp %s kept: git work —" % root)]
             self.assertEqual(len(kept), 1, rapport["skipped"])
 
+    def test_clone_dont_le_remote_est_dans_le_dossier_tmp_est_garde(self):
+        """#2493 (relecture) : les refs de suivi ne prouvent rien si le remote
+        vit dans le dossier temporaire supprimé : le clone et son origin
+        partiraient ensemble. Le dossier reste, avec la raison."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "a1+abcd9993")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9993", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        origin = os.path.join(root, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin],
+                       check=True)
+        amont = os.path.join(self.tmp, "amont")
+        subprocess.run(["git", "clone", "-q", origin, amont], check=True,
+                       capture_output=True)
+        _git("commit", "-q", "--allow-empty", "-m", "racine", cwd=amont)
+        _git("push", "-q", "origin", "main", cwd=amont)
+        clone = os.path.join(root, "clone")
+        subprocess.run(["git", "clone", "-q", origin, clone], check=True,
+                       capture_output=True)
+        _age_tree(root, 3 * 3600)
+        self.assertIn("inside the temporary directory", menage.tmp_git_work(root))
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertTrue(os.path.isdir(clone))
+        self.assertTrue(os.path.isdir(origin))
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1, rapport["skipped"])
+        self.assertIn("inside the temporary directory", kept[0])
+
     def _suivi(self, main: str, nom: str, lot: int | None) -> str:
         wt = os.path.join(self.tmp, nom)
         _git("worktree", "add", "-q", wt, "-b", nom, cwd=main)

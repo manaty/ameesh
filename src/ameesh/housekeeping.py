@@ -1845,14 +1845,37 @@ def tmp_recovery_command(path: str) -> str:
     return " ; ".join(commands)
 
 
+def _clone_remote_inside(path: str, entry: str) -> str:
+    """#2493 : why the remotes of this CLONE do not prove it saved: one lives
+    inside the temporary directory `entry` that is about to be removed, so
+    the commits its remote-tracking refs vouch for go with it. Empty when
+    every remote is outside (or is not a local path)."""
+    urls = _git(["config", "--get-regexp", r"^remote\..*\.url$"], path)
+    if urls is None or urls.returncode not in (0, 1):
+        return "remote URLs unreadable"
+    root = _real(entry)
+    for line in urls.stdout.splitlines():
+        _key, _sep, value = line.partition(" ")
+        value = value.strip()
+        if value.startswith("file://"):
+            value = value[len("file://"):]
+        if not (os.path.isabs(value) or value.startswith(".") or value.startswith("~")):
+            continue
+        local = _real(os.path.join(path, os.path.expanduser(value)))
+        if _under(local, root):
+            return "remote %s lives inside the temporary directory" % value
+    return ""
+
+
 def tmp_git_work(path: str, rules=()) -> str:
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
     empty when every copy is safe to recover: unlocked, readable, clean (no
     modified or untracked file, no ignored file outside the build output
     `rules`, like the worktree pass), pushed or integrated, for a clone also
-    no unpushed local branch, stash nor other linked worktree, without
-    submodules and with no process inside. A directory is never deleted merely because its
-    agent left the registry; this check is the second condition."""
+    no unpushed local branch, stash, other linked worktree nor remote inside
+    the directory, without submodules and with no process inside. A
+    directory is never deleted merely because its agent left the registry;
+    this check is the second condition."""
     for copy in _git_copies(path):
         st = worktree_state(copy)
         if not st["exists"]:
@@ -1896,6 +1919,9 @@ def tmp_git_work(path: str, rules=()) -> str:
                 return "%s: stash unreadable" % copy
             if stash.returncode == 0:
                 return "%s: has a stash" % copy
+            remote = _clone_remote_inside(copy, path)
+            if remote:
+                return "%s: %s" % (copy, remote)
         if worktree_in_use(copy):
             return "%s: a process is working in it" % copy
     return ""
