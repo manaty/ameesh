@@ -271,6 +271,13 @@ def wait_label(wait):
         return label
     if wait["what"] == "landing":
         return landing_label(wait, wait.get("head"))
+    if wait["what"] == "packet":
+        # #2335 : le lot n'attend pas un exécuteur de lot mais la fusion du
+        # porteur `integration/**` (le composeur/pilote la porte).
+        label = "waiting for packet merge #%s" % wait.get("vehicle")
+        if wait.get("branch"):
+            label += " (%s)" % wait["branch"]
+        return label
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 

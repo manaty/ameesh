@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import socket
+from urllib.parse import quote
 
 from . import land, lot_class, merge_queue, plan_git, storage, work
 
@@ -336,6 +337,9 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
         "merged": str(row.get("state") or "").upper() == "MERGED",
         "merge_commit": _norm(commit.get("oid") if isinstance(commit, dict) else ""),
         "armed": row.get("autoMergeRequest") is not None, "url": row.get("url") or "",
+        # #2271 : `ready_pr` lit les checks requis dans ce rollup, pas dans
+        # `ci` seul (qui compte `SKIPPED` comme vert).
+        "rollup": rollup,
     }
 
 
@@ -494,17 +498,353 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     return True, "", klass
 
 
-def ready_pr(status: dict, *, target: str, project, frozen: str) -> tuple:
+def _rollup_name(entry) -> str:
+    """Le nom d'une entrée de `statusCheckRollup` : `name` d'un check run,
+    `context` d'un statut de commit."""
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("name") or entry.get("context") or "")
+
+
+def _rollup_state(entry) -> str:
+    """L'état d'une entrée de `statusCheckRollup`, en majuscules : un statut
+    de commit porte `state`, un check run `status` et `conclusion`."""
+    if not isinstance(entry, dict):
+        return ""
+    if entry.get("__typename") == "StatusContext" or \
+            ("state" in entry and "conclusion" not in entry):
+        return str(entry.get("state") or "").upper()
+    if str(entry.get("status") or "").upper() != "COMPLETED":
+        return "PENDING"
+    return str(entry.get("conclusion") or "").upper()
+
+
+def _same_head(left, right) -> bool:
+    """Deux identifiants du même commit : égaux, ou l'un abrégé de l'autre
+    (un gel peut citer `48c6372e` quand la PR rend le SHA complet)."""
+    left, right = _norm(left), _norm(right)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    short, long = (left, right) if len(left) < len(right) else (right, left)
+    return len(short) >= 7 and long.startswith(short)
+
+
+def _required_pairs(required) -> tuple:
+    """Les checks requis sous la forme `(contexte, app_id)` : un nom seul vaut
+    `(nom, None)` (aucune application imposée). Un contexte est un nom exact :
+    ses espaces significatifs sont conservés, `tests ` n'est pas `tests`."""
+    values = (required,) if isinstance(required, str) else tuple(required or ())
+    pairs = []
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            pairs.append((value, None))
+            continue
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            name, app_id = value
+            if isinstance(name, str) and name.strip() \
+                    and (app_id is None or (isinstance(app_id, int)
+                                            and not isinstance(app_id, bool)
+                                            and app_id > 0)):
+                pairs.append((name, app_id))
+                continue
+        raise land.LandError("invalid required check %r" % (value,))
+    return tuple(pairs)
+
+
+def _required_gap(required, rollup, provenance=None) -> list:
+    """Les checks requis que `rollup` et `provenance` ne prouvent pas.
+
+    `provenance` porte les check runs de la tête exacte avec leur application
+    source. Un couple `(contexte, app_id)` n'est vert que si un check run de
+    ce nom **et de cette application** est `SUCCESS` ; une entrée sans source
+    (statut de commit) ou d'une autre application ne prouve rien. Sans
+    application imposée (`app_id` à `None`), tout check ou statut du nom exigé
+    compte, et un même nom porté par plusieurs entrées n'est vert que si
+    toutes le sont : le doute ne verdit pas la porte."""
+    gaps = []
+    for name, app_id in _required_pairs(required):
+        if app_id is None:
+            states = [_rollup_state(entry) for entry in rollup or ()
+                      if _rollup_name(entry) == name]
+            if not states:
+                gaps.append("%s (absent)" % name)
+                continue
+            bad = sorted({state or "?" for state in states if state != "SUCCESS"})
+            if bad:
+                gaps.append("%s (%s)" % (name, ", ".join(bad)))
+            continue
+        runs = [entry for entry in provenance or ()
+                if _rollup_name(entry) == name and entry.get("app_id") == app_id]
+        if not runs:
+            providers = sorted({str(entry.get("app_id")) for entry in provenance or ()
+                                if _rollup_name(entry) == name
+                                and entry.get("app_id") is not None})
+            if providers:
+                gaps.append("%s (app %s, expected %d)"
+                            % (name, ", ".join(providers), app_id))
+            elif any(_rollup_name(entry) == name for entry in provenance or ()) \
+                    or any(_rollup_name(entry) == name for entry in rollup or ()):
+                gaps.append("%s (source absent)" % name)
+            else:
+                gaps.append("%s (absent)" % name)
+            continue
+        bad = sorted({_rollup_state(entry) or "?" for entry in runs
+                      if _rollup_state(entry) != "SUCCESS"})
+        if bad:
+            gaps.append("%s (%s)" % (name, ", ".join(bad)))
+    return gaps
+
+
+def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
+    """Les check runs de la tête **exacte** `sha`, avec l'application qui les a
+    produits. `statusCheckRollup` ne porte pas cette source : elle se lit sur
+    le commit (`commits/<sha>/check-runs`). Les noms sont rendus exactement,
+    espaces significatifs compris : `tests ` n'est pas le contexte `tests`.
+    Une lecture impossible ou malformée lève `land.LandError` : une source
+    absente ne prouve rien."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the source of the checks "
+                             "of %s cannot be read" % (sha or "the head"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the source of the checks of %s "
+                             "cannot be read" % (sha or "the head"))
+    if not sha:
+        raise land.LandError("no frozen head: the source of the required checks "
+                             "cannot be read")
+    path = "repos/%s/commits/%s/check-runs" % (slug, quote(sha, safe=""))
+    proc = gh(["api", "--paginate", "--slurp", path + "?per_page=100"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise land.LandError("gh api %s: %s"
+                             % (path, detail or "exit %d" % proc.returncode))
+    pages = land._json(proc, "gh api %s" % path, list)
+    runs = []
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
+            raise land.LandError("gh api %s: malformed response" % path)
+        for run in page["check_runs"]:
+            if not isinstance(run, dict) or not isinstance(run.get("name"), str) \
+                    or not run["name"].strip():
+                raise land.LandError("gh api %s: malformed check run" % path)
+            head = _norm(run.get("head_sha"))
+            if head and not _same_head(head, sha):
+                raise land.LandError("gh api %s: a check run of %s is on %s"
+                                     % (path, run["name"], head))
+            app = run.get("app")
+            app_id = app.get("id") if isinstance(app, dict) else None
+            if app_id is not None and (isinstance(app_id, bool)
+                                       or not isinstance(app_id, int)):
+                raise land.LandError("gh api %s: malformed check run app" % path)
+            runs.append({"name": run["name"],
+                         "status": str(run.get("status") or ""),
+                         "conclusion": str(run.get("conclusion") or ""),
+                         "app_id": app_id})
+    return runs
+
+
+def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
+    """Les checks requis par la protection classique de `target`, lus à la
+    forge, sous la forme `(contexte, app_id)` : `app_id` est l'application
+    GitHub que la protection impose (`checks[].app_id`), `None` quand elle
+    n'impose aucun fournisseur (ancienne liste `contexts`). Perdre `app_id`
+    accepterait un check homonyme produit par n'importe qui. Le contexte est
+    rendu exactement, espaces significatifs compris : `tests ` n'est pas
+    `tests`.
+
+    Un 404 « Branch not protected » est une réponse (aucun check requis) ;
+    toute autre lecture — droits, branche absente, réponse malformée — lève
+    `land.LandError` : l'absence de garde ne se suppose jamais."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the required checks of %s "
+                             "cannot be read" % (target or "the target"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the required checks of %s cannot be read"
+                             % target)
+    path = "repos/%s/branches/%s/protection" % (slug, quote(target, safe=""))
+    proc = gh(["api", path])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        if "Branch not protected" in detail:
+            return ()
+        raise land.LandError("gh api %s: %s"
+                             % (path, detail or "exit %d" % proc.returncode))
+    data = land._json(proc, "gh api %s" % path, dict)
+    required = data.get("required_status_checks")
+    if required is None:
+        return ()
+    if not isinstance(required, dict):
+        raise land.LandError("gh api %s: required_status_checks is not an object" % path)
+    contexts = required.get("contexts") or ()
+    checks = required.get("checks") or ()
+    if not isinstance(contexts, (list, tuple)) or not isinstance(checks, (list, tuple)):
+        raise land.LandError("gh api %s: malformed required_status_checks" % path)
+    pairs = []
+    scoped = set()
+    for check in checks:
+        if not isinstance(check, dict) or not isinstance(check.get("context"), str) \
+                or not check["context"].strip():
+            raise land.LandError("gh api %s: invalid required check" % path)
+        app_id = check.get("app_id")
+        if app_id is not None and (isinstance(app_id, bool)
+                                   or not isinstance(app_id, int) or app_id <= 0):
+            raise land.LandError("gh api %s: invalid required check app_id" % path)
+        context = check["context"]
+        pairs.append((context, app_id))
+        scoped.add(context)
+    for context in contexts:
+        if not isinstance(context, str) or not context.strip():
+            raise land.LandError("gh api %s: invalid required context" % path)
+        # `checks` porte la même liste avec l'application : ne pas la doubler
+        # d'une exigence sans fournisseur qui n'ajouterait aucune garantie.
+        if context not in scoped:
+            pairs.append((context, None))
+    return tuple(dict.fromkeys(pairs))
+
+
+def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
+    """Les checks requis de la branche cible, sous la forme `(contexte,
+    app_id)` : la protection lue à la forge, complétée par la déclaration
+    `radar.projects.<p>.required_checks` (des noms, sans application imposée).
+
+    Quand la protection ne peut pas être lue (jeton sans droits, forge
+    muette), la déclaration du projet la remplace ; sans déclaration, la
+    lecture refuse. La déclaration ne peut jamais retirer un check que la
+    forge exige : elle s'ajoute. Les noms sont exacts de bout en bout :
+    la déclaration `tests ` ne vaut pas le contexte `tests`."""
+    declared = tuple((str(name), None) for name in
+                     (getattr(project, "required_checks", ()) or ())
+                     if str(name).strip())
+    if not target:
+        if declared:
+            return declared
+        raise land.LandError("no target branch known: its required checks cannot be read")
+    try:
+        forged = _protection_required(slug, target, gh=gh)
+    except land.LandError:
+        if declared:
+            return declared
+        raise
+    return tuple(dict.fromkeys(forged + declared))
+
+
+def _head_statuses(slug: str | None, sha: str, *, gh) -> list:
+    """Les statuts de commit de la tête **exacte** `sha`, sous la forme d'une
+    entrée de `statusCheckRollup` (`context`, `state`).
+
+    L'endpoint `status` rend le dernier statut de chaque contexte ; un nom
+    exact traverse tel quel. Une lecture impossible, malformée ou tronquée
+    lève `land.LandError` : une source absente ne prouve rien."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the statuses of %s "
+                             "cannot be read" % (sha or "the head"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the statuses of %s cannot be read"
+                             % (sha or "the head"))
+    if not sha:
+        raise land.LandError("no frozen head: the statuses of the required checks "
+                             "cannot be read")
+    path = "repos/%s/commits/%s/status" % (slug, quote(sha, safe=""))
+    proc = gh(["api", path + "?per_page=100"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise land.LandError("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
+    data = land._json(proc, "gh api %s" % path, dict)
+    statuses = data.get("statuses")
+    total = data.get("total_count")
+    if not isinstance(statuses, list) or type(total) is not int \
+            or total != len(statuses) or total >= 100:
+        raise land.LandError("gh api %s: malformed or truncated statuses" % path)
+    out = []
+    for status in statuses:
+        if not isinstance(status, dict) or not isinstance(status.get("context"), str) \
+                or not status["context"].strip() \
+                or status.get("state") not in ("success", "pending", "failure", "error"):
+            raise land.LandError("gh api %s: invalid commit status" % path)
+        out.append({"__typename": "StatusContext", "context": status["context"],
+                    "state": status["state"]})
+    return out
+
+
+def required_on_head(project, target: str, sha: str, *, gh) -> list:
+    """#2286 : les checks requis de la cible que la tête **exacte** `sha` ne
+    prouve pas, pour la voie file de fusion (`land`).
+
+    La source est la déclaration `radar.projects.<p>.required_checks` du
+    projet, complétée par la protection de la forge quand elle se lit (mêmes
+    règles que `required_checks`) : un projet qui ne déclare aucun check n'a
+    rien à prouver ici, et la protection seule reste portée par la forge au
+    moment de la fusion d'une PR. Sans déclaration, cette garde ne retire
+    jamais rien au comportement existant ; avec une déclaration, elle
+    s'applique à **tout** atterrissage de la file, `ci_required` ou non —
+    c'est le trou de la voie file (Nexlink n'a pas de protection de branche).
+
+    Rend la liste des manques (`tests (absent)`, `coverage (FAILURE)`…) ;
+    lève `land.LandError` quand les checks ou leur source ne peuvent pas être
+    lus : un vert ne se suppose jamais."""
+    from . import radar
+    declared = tuple(getattr(project, "required_checks", ()) or ())
+    if not declared:
+        return []
+    slug = radar.github_slug(project)
+    required = required_checks(slug, target, project, gh=gh)
+    if not required:
+        return []
+    runs = _head_check_runs(slug, sha, gh=gh)
+    statuses = _head_statuses(slug, sha, gh=gh)
+    rollup = ([{"__typename": "CheckRun", "name": run["name"], "status": run["status"],
+                "conclusion": run["conclusion"]} for run in runs] + statuses)
+    return _required_gap(required, rollup, runs)
+
+
+def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
+             slug: str | None = None, gh=None) -> tuple:
     """Les portes qui dépendent de la PR : brouillon, cible, CI verte sur la
-    tête gelée, CI du commit gelé quand le projet l'exige (L160g)."""
+    tête gelée, **checks requis de la branche cible** présents et `SUCCESS`
+    sur cette tête (protection de la forge ou déclaration du projet), CI du
+    commit gelé quand le projet l'exige (L160g).
+
+    La protection peut imposer une application GitHub pour un contexte
+    (`checks[].app_id`) : la provenance se lit alors sur la tête exacte, et un
+    check homonyme produit par une autre application — ou un statut de commit,
+    sans source — ne prouve rien. La tête de la PR doit être le gel.
+
+    `required` remplace la lecture (tests, appelant qui l'a déjà faite) ;
+    `slug`/`gh` la permettent. Sans l'un ou l'autre, la porte refuse : un
+    check requis inconnu ne se suppose pas vert."""
     if status.get("draft"):
         return False, "PR #%s is a draft" % status.get("number")
     if target and status.get("base") and status["base"] != target:
         return False, "PR #%s targets %s, not %s" % (status.get("number"), status["base"],
                                                      target)
+    head, frozen_head = _norm(status.get("head")), _norm(frozen)
+    if head and frozen_head and not _same_head(head, frozen_head):
+        return False, ("PR #%s is on %s, not the freeze %s"
+                       % (status.get("number"), head[:12], frozen_head[:12]))
     if status.get("ci") != "green":
         return False, "the CI of PR #%s is %s on the freeze %s" % (
             status.get("number"), status.get("ci"), frozen[:12])
+    if required is None:
+        try:
+            required = required_checks(slug, target, project, gh=gh)
+        except land.LandError as exc:
+            return False, ("the required checks of %s on the freeze %s cannot be proven: %s"
+                           % (target or "the target", frozen[:12], exc))
+    pairs = _required_pairs(required)
+    provenance = None
+    if any(app_id is not None for _, app_id in pairs):
+        try:
+            provenance = _head_check_runs(slug, head or frozen_head, gh=gh)
+        except land.LandError as exc:
+            return False, ("the source of the required checks of %s on the freeze %s "
+                           "cannot be proven: %s"
+                           % (target or "the target", frozen[:12], exc))
+    gaps = _required_gap(pairs, status.get("rollup") or (), provenance)
+    if gaps:
+        return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
+                       % (status.get("number"), target or "the target", frozen[:12],
+                          ", ".join(gaps)))
     if project is not None and getattr(project, "ci_required", False):
         try:
             merge_queue._required_ci(project, frozen)
@@ -514,7 +854,7 @@ def ready_pr(status: dict, *, target: str, project, frozen: str) -> tuple:
 
 
 def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
-          project, target: str) -> tuple:
+          project, target: str, gh=None) -> tuple:
     """Les deux portes réunies : verdicts puis PR/CI. Rend `(ok, raison,
     classe)` ; `status` peut être None (aucune PR lue : seule la porte des
     verdicts est évaluée)."""
@@ -523,7 +863,8 @@ def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
     if not ok or status is None:
         return ok, why, klass
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
-    ok, why = ready_pr(status, target=target, project=project, frozen=frozen)
+    ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
+                       slug=_slug(cfg, row, repo), gh=gh or land._gh)
     return ok, why, klass
 
 
@@ -966,7 +1307,8 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     le gel et les verdicts sont relus juste avant le geste (P1-3)."""
     lot = int(row["id"])
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
-    ok, why = ready_pr(status, target=target, project=project, frozen=frozen)
+    ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
+                       slug=slug, gh=gh)
     if not ok:
         return _not_ready(db, row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
                           handle=handle)
@@ -1102,16 +1444,28 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
 # le dernier geste de l'atterrissage
 # --------------------------------------------------------------------------
 
-def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None) -> tuple:
+def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None,
+               project=None, target: str = "", gh=None) -> tuple:
     """Le dernier contrôle avant le geste d'atterrissage (#1374, P1-2) : un lot
     qui a porté un feu ne s'atterrit que sous un feu actif couvrant la tête
     gelée de sa file, et jamais sous un blocage non levé.
+
+    #2286 : pour un atterrissage **local** (`project.land == "local"`, la voie
+    file de Nexlink), les checks requis **déclarés** du projet
+    (`radar.projects.<p>.required_checks`) sont aussi exigés sur le gel : la
+    poussée directe ne passe par aucune protection de branche, et cette
+    déclaration est la seule source de la cible (Nexlink n'en a pas). La garde
+    vaut pour tout atterrissage, `ci_required` ou non ; un projet qui ne
+    déclare aucun check garde le comportement d'avant, et la voie `pr` reste
+    tenue par la forge (et par `ready_pr` au feu) : ses checks de PR vivent
+    sur la ref de fusion, pas sur le commit gelé.
 
     Rend `(ok, raison)`. La garde est appelée par `land` juste avant la poussée
     ou la fusion de la PR, sous son propre bail : la ligne de file peut avoir
     été retirée par le passage du feu, mais la course entre les deux reste
     fermée ici. Sans aucun jalon de feu, la file d'équipe garde son cours : la
-    garde ne concerne que les lots que le feu a autorisés.
+    garde du feu ne concerne que les lots que le feu a autorisés (les checks
+    requis, eux, valent pour tout atterrissage local).
     """
     lot = int(lot)
     try:
@@ -1119,21 +1473,31 @@ def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None) -> tup
     except Exception as exc:  # noqa: BLE001 - lecteur illisible : on refuse
         return False, ("cannot read the fire of lot #%d (%s: %s): landing refused"
                        % (lot, type(exc).__name__, str(exc)[:120]))
-    if not markers(marks):
-        return True, ""
-    fire = active(marks)
-    if fire is None:
-        return False, ("the fire of lot #%d was withdrawn or invalidated: no automatic landing"
-                       % lot)
-    if not same_commit(fire.get("sha"), frozen_sha, repo):
-        return False, ("the fire of lot #%d covers %s, not the queued freeze %s: freeze and "
-                       "fire again" % (lot, _norm(fire.get("sha"))[:12],
-                                       str(frozen_sha or "")[:12] or "—"))
-    blocked = merge_queue.blocked_verdicts(marks, frozen_sha, repo=repo)
-    if blocked:
-        return False, ("blocked verdict(s) on the freeze %s not lifted: %s: no automatic landing"
-                       % (str(frozen_sha or "")[:12],
-                          ", ".join(sorted(str(m.get("actor") or "?") for m in blocked))))
+    if markers(marks):
+        fire = active(marks)
+        if fire is None:
+            return False, ("the fire of lot #%d was withdrawn or invalidated: no automatic "
+                           "landing" % lot)
+        if not same_commit(fire.get("sha"), frozen_sha, repo):
+            return False, ("the fire of lot #%d covers %s, not the queued freeze %s: freeze and "
+                           "fire again" % (lot, _norm(fire.get("sha"))[:12],
+                                           str(frozen_sha or "")[:12] or "—"))
+        blocked = merge_queue.blocked_verdicts(marks, frozen_sha, repo=repo)
+        if blocked:
+            return False, ("blocked verdict(s) on the freeze %s not lifted: %s: no automatic "
+                           "landing" % (str(frozen_sha or "")[:12],
+                                        ", ".join(sorted(str(m.get("actor") or "?")
+                                                         for m in blocked))))
+    if project is not None and target and getattr(project, "land", "") == "local":
+        sha = _norm(frozen_sha)
+        try:
+            gaps = required_on_head(project, target, sha, gh=gh)
+        except land.LandError as exc:
+            return False, ("the required checks of %s on %s cannot be proven: %s: landing "
+                           "refused" % (target, sha[:12] or "—", exc))
+        if gaps:
+            return False, ("the required checks of %s are not proven on %s: %s: landing "
+                           "refused" % (target, sha[:12] or "—", ", ".join(gaps)))
     return True, ""
 
 

@@ -125,6 +125,10 @@ FERMEES = {
     # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
     "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
     "work_item_events": {"command_id", "evidence", "workflow_stage", "workflow_version"},
+    # #1104 (0438) : la borne d'activation du rattrapage des relectures après
+    # fusion est un état interne, lu par les exécuteurs et non par le rôle
+    # superviseur externe ; classement fermé, aucun GRANT modifié.
+    "review_catch_up": {"id", "bound_at", "actor"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

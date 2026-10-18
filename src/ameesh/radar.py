@@ -20,6 +20,8 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
    déjà sous un autre nom. Seules les migrations du **delta propre** du lot
    comptent (celles que la cible ne porte pas déjà) : une migration de la
    cible ramenée par une fusion dans la branche n'est à personne (#1333).
+   Une copie identique héritée d'un autre lot suivi reste attribuée à ce
+   constituant, sans doublon ni réservation supplémentaire pour le paquet (#2279).
 
 Les fusions d'essai n'écrivent rien dans le dépôt des agents : leurs objets
 vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
@@ -67,12 +69,13 @@ import time
 from dataclasses import dataclass, field
 
 from . import plan_git
-from .canon import GIT_TIMEOUT, GitError, _git, _git_env
+from .canon import GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
-                "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts")
+                "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
+                "required_checks")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -194,6 +197,10 @@ class Project:
     #: sélecteur versionné du dépôt (`CiParts`) ; None : aucune preuve de
     #: complétude n'est demandée
     ci_parts: CiParts | None = None
+    #: #2271 : les contextes de check requis, par nom exact. La protection de
+    #: la branche cible est lue à la forge ; cette déclaration la complète et
+    #: la remplace quand elle ne peut pas être lue (jamais pour l'affaiblir).
+    required_checks: tuple = ()
 
 
 @dataclass
@@ -382,6 +389,19 @@ def parse_settings(raw) -> Settings:
         ci_required = value.get("ci_required", False)
         if not isinstance(ci_required, bool):
             raise SettingsError("%s.ci_required: true or false expected" % where)
+        required_checks = value.get("required_checks", ())
+        if required_checks is None:
+            required_checks = ()
+        if isinstance(required_checks, str):
+            required_checks = (required_checks,)
+        if not isinstance(required_checks, (list, tuple)) or not all(
+                isinstance(name, str) and name.strip() for name in required_checks):
+            raise SettingsError("%s.required_checks: a list of check names expected" % where)
+        # Un nom de check est un contexte exact : ne pas rogner ses espaces
+        # significatifs, `tests ` n'est pas `tests` pour la forge.
+        required_checks = tuple(required_checks)
+        if len(set(required_checks)) != len(required_checks):
+            raise SettingsError("%s.required_checks: duplicate check name" % where)
         ci_parts = None
         if value.get("ci_parts") is not None:
             ci_parts = parse_ci_parts(value["ci_parts"], where)
@@ -471,7 +491,8 @@ def parse_settings(raw) -> Settings:
                                  full_suite=tuple(full_suite),
                                  full_suite_required=tuple(required_jobs),
                                  full_suite_tolerated=tuple(tolerated_jobs),
-                                 ci_parts=ci_parts)
+                                 ci_parts=ci_parts,
+                                 required_checks=required_checks)
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
@@ -893,19 +914,64 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if not one.get("target_certified", True):
             uncertified.setdefault((one["target"], one["target_ref"]),
                                    one.get("target_reason") or "")
+    migration_branches = (_native_migration_additions(repo, branches, migrations)
+                          if migrations else branches)
     report = {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
                                          for b in branches],
               "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
               "against_target": against,
               "uncertified_targets": [{"target": target, "ref": ref, "reason": why}
                                       for (target, ref), why in sorted(uncertified.items())],
-              "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+              "migrations": migration_probe(repo, migration_branches, migrations)
+              if migrations else []}
     if migrations and shallow:
         report["migration_probe"] = "suspended: shallow repository (history is incomplete)"
     if reservations is not None:
         report["unreserved_migrations"] = reservations(
-            [b for b in branches if b.get("target_certified", True)])
+            [b for b in migration_branches if b.get("target_certified", True)])
     return report
+
+
+def _native_migration_additions(repo: str, branches: list[dict], directory: str) -> list[dict]:
+    """#2279: attribute an unchanged inherited migration to its constituent.
+
+    Only a strict ancestor with the same path, blob and certified target
+    proves inheritance. Equal tips, independent additions, modified SQL and
+    unreadable evidence keep their warnings. Both probes use this view;
+    branch diffs in the report keep their full scope.
+    """
+    groups: dict = {}
+    for one in branches:
+        if not one.get("target_certified", True):
+            continue
+        for path in one.get("added") or ():
+            if (os.path.dirname(path) == directory
+                    and MIGRATION_RE.fullmatch(os.path.basename(path))):
+                groups.setdefault((one["target"], one["target_head"], path), []).append(one)
+    inherited, ancestors, blobs = {}, {}, {}
+    for (_, _, path), holders in groups.items():
+        if len(holders) < 2:
+            continue
+        for one in holders:
+            for other in holders:
+                pair = (other["tip"], one["tip"])
+                if pair[0] == pair[1]:
+                    continue
+                if pair not in ancestors:
+                    ancestors[pair] = _git(repo, "merge-base", "--is-ancestor", *pair,
+                                            env_extra=NO_LAZY_FETCH).returncode == 0
+                if not ancestors[pair]:
+                    continue
+                for tip in pair:
+                    if (tip, path) not in blobs:
+                        proc = _git(repo, "rev-parse", "--verify", tip + ":" + path,
+                                    env_extra=NO_LAZY_FETCH)
+                        blobs[tip, path] = proc.stdout.strip() if proc.returncode == 0 else None
+                if blobs[pair[0], path] and blobs[pair[0], path] == blobs[pair[1], path]:
+                    inherited.setdefault(one["work_item"], set()).add(path)
+    return [dict(one, added=[path for path in one.get("added") or ()
+                            if path not in inherited.get(one["work_item"], ())])
+            for one in branches]
 
 
 def migration_probe(repo: str, branches: list[dict], directory: str) -> list[dict]:
@@ -1561,7 +1627,26 @@ def gates_for(project, files) -> tuple:
 
 def conflicts_of(report: dict) -> dict:
     """{clé: conflit} d'un rapport : paires en conflit, lots en conflit avec
-    leur cible, numéros de migration en double (mêmes clés que `_states`)."""
+    leur cible, numéros de migration en double (mêmes clés que `_states`).
+
+    #2238: a pair, a stale resolution and a conflict with the target carry
+    their `fingerprint` — the lots' heads, their target's head and the
+    resolution commit, never the replay state (which can vary from one pass
+    to the next while nothing changes); `send_mail` does not resend a notice
+    whose inputs have not moved."""
+    heads = {b["work_item"]: b for b in report.get("branches") or ()}
+
+    def fingerprint(lots, tips=(), resolution=None) -> str:
+        tips = list(tips or ())
+        parts = []
+        for i, lot in enumerate(lots):
+            one = heads.get(lot) or {}
+            tip = (tips[i] if i < len(tips) else None) or one.get("tip") or ""
+            parts.append("%d:%s@%s" % (lot, tip, one.get("target_head") or ""))
+        if resolution:
+            parts.append("resolution:%s" % resolution)
+        return "|".join(parts)
+
     out = {}
     for pair in report.get("pairs") or ():
         if pair["state"] in ("conflict", "unclassified"):
@@ -1569,19 +1654,24 @@ def conflicts_of(report: dict) -> dict:
                 "kind": "pair", "lots": list(pair["lots"]),
                 "files": pair["files"] or pair.get("uncertain_files") or [],
                 "target": pair["target"], "resolver": pair.get("resolver"),
-                "attribution_pending": pair.get("attribution_pending", False)}
+                "attribution_pending": pair.get("attribution_pending", False),
+                "fingerprint": fingerprint(pair["lots"], pair.get("tips"),
+                                           (pair.get("resolution") or {}).get("commit"))}
         elif pair["state"] == "stale":
             # L160d: only the lot that prepared the resolution is told
             resolution = pair["resolution"]
             out["stale:%d-%d" % tuple(pair["lots"])] = {
                 "kind": "stale", "lots": [resolution["by"]], "pair": list(pair["lots"]),
                 "files": resolution.get("remaining") or pair["files"],
-                "target": pair["target"], "commit": resolution["commit"]}
+                "target": pair["target"], "commit": resolution["commit"],
+                "fingerprint": fingerprint(pair["lots"], pair.get("tips"),
+                                           resolution["commit"])}
     for one in report.get("against_target") or ():
         if one["state"] == "conflict":
             out["target:%d" % one["work_item"]] = {
                 "kind": "target", "lots": [one["work_item"]], "files": one["files"],
-                "target": one["target"]}
+                "target": one["target"],
+                "fingerprint": fingerprint([one["work_item"]], [one.get("tip")])}
     for dup in report.get("migrations") or ():
         out["migration:%s:%s" % (dup["target"], dup["number"])] = {
             "kind": "migration", "lots": sorted({h["work_item"] for h in dup["lots"]}),
@@ -1721,10 +1811,31 @@ def _merged_partners(db, lot: int, keys, present) -> list[int]:
     return merged
 
 
+def _key_lots(key: str) -> list[int] | None:
+    """The lots a conflict key names (`pair:a-b`, `stale:a-b`, `target:n`),
+    or None for a key without readable lots (migrations)."""
+    kind, _, rest = key.partition(":")
+    try:
+        if kind in ("pair", "stale"):
+            return [int(n) for n in rest.split("-")]
+        if kind == "target":
+            return [int(rest)]
+    except ValueError:
+        return None
+    return None
+
+
 def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[dict]:
     """Le courrier d'un passage : un message par lot concerné et par conflit
     nouveau (passif), puis un réveil quand un conflit avec la cible bloque
-    une PR verte. Rend les envois `{key, lot, to, level, message_id}`."""
+    une PR verte. Rend les envois `{key, lot, to, level, message_id}`.
+
+    #2238: a conflict that leaves a pass while all its lots stay on the radar
+    (the resolution replay read in one pass, not in the next) is kept
+    "dormant" with its `fingerprint`; if it comes back on the same inputs
+    (heads, target, resolution), no notice is resent. It is new again only
+    when its inputs changed, or when one of its lots left the radar (merged,
+    closed)."""
     from . import mail, work
     if ci == "github":
         ci = github_ci(project)
@@ -1735,6 +1846,10 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
     sent: list[dict] = []
     for key, conflict in sorted(current.items()):
         done = dict(before.get(key) or {})
+        fingerprint = conflict.get("fingerprint")
+        if done.pop("dormant", False) and done.get("fp") != fingerprint:
+            # #2238: back on other inputs than the notice already sent
+            done = {}
         for lot in conflict["lots"]:
             one = branches.get(lot) or {}
             to = one.get("assignee")
@@ -1769,7 +1884,17 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
             sent.append({"key": key, "lot": lot, "to": to, "level": level,
                          "message_id": message_id})
         if done:
+            if fingerprint is not None:
+                done["fp"] = fingerprint
             keys[key] = done
+    # #2238: a conflict absent from this pass whose lots all stay on the
+    # radar keeps its notice, dormant, instead of being forgotten.
+    for key, done in before.items():
+        if key in current or "fp" not in done:
+            continue
+        lots = _key_lots(key)
+        if lots and all(n in branches for n in lots):
+            keys[key] = dict(done, dormant=True)
     if keys != before:
         _write_notified(cfg, project.name, keys)
     return sent
