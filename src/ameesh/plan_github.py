@@ -1065,17 +1065,19 @@ def _iso_ts(text: str | None) -> float | None:
 
 
 def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
-                   by_issue: dict | None = None, *, union_packages: bool = False):
+                   by_issue: dict | None = None):
     """Les lots qu'une PR désigne : lignes `ameesh-work:`, `Closes #n` (via
     `issue_ref`), fiches (`packages_of_pr`), et branche `lot/<id>-…` d'un
     dépôt même sans fiche. Rend `(targets, by_issue)` — `by_issue` n'est
     construit qu'à la demande (une fois par relevé).
 
-    #1693 (N2) : `union_packages` ajoute les lots des fiches nommées à ceux
-    des lignes explicites au lieu de les ignorer. La rétention d'une PR
-    ouverte (`open_lots`) couvre ainsi toute la fiche qu'elle livre, même si
-    elle ne nomme qu'un de ses lots ; la fermeture, elle, reste précise et
-    garde la ligne explicite pour seul verdict (`union_packages=False`)."""
+    #2317 (N7) : un lot explicitement nommé (`ameesh-work:`) l'emporte sur la
+    fiche — la rétention d'une PR ouverte est la SYMÉTRIE de sa fermeture :
+    elle retient exactement les lots qu'elle fermerait si on la fusionnait
+    maintenant. Sans ligne explicite, une PR de fiche (`lot/<fiche>…` ou
+    `ameesh-lot:`) désigne tous les lots de la fiche. Unir les deux faisait
+    qu'une PR de fiche oubliée, portant `ameesh-work: X`, retenait Y et Z de
+    la fiche alors que leurs propres PR étaient fusionnées."""
     explicit = work_items_of_pr(pr)
     closes = issues_of_pr(pr, repo)
     if closes:
@@ -1097,15 +1099,10 @@ def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
                     st, int(head.group(1)), pr["headRefName"])) \
                     or short_branch(item.get("branch")) == pr["headRefName"]:
                 explicit = [int(head.group(1))]
-    if explicit and not union_packages:
-        return [(i, None) for i in explicit], by_issue
-    package_targets = [(int(item["id"]), pid) for pid in packages
-                       for item in st.work.by_package(pid)]
     if explicit:
-        targets = [(i, None) for i in explicit]
-        seen = {i for i, _pid in targets}
-        return targets + [(i, pid) for i, pid in package_targets if i not in seen], by_issue
-    return package_targets, by_issue
+        return [(i, None) for i in explicit], by_issue
+    return ([(int(item["id"]), pid) for pid in packages
+             for item in st.work.by_package(pid)], by_issue)
 
 
 #: #1693 (N3) : profondeur de journal relue avant de reposer un constat
@@ -1113,8 +1110,8 @@ def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
 #: constat, sans relire tout le journal d'un lot à chaque relevé.
 _STAGE_DEDUP_EVENTS = 50
 
-#: #1693 (N1) : préfixe de la note qui annule une fusion (work.CORRECTIONS).
-_ANNULMENT_NOTE = "correction: merged → build"
+#: #1693 (N1) : une fusion est annulée par une correction `merged → build`
+#: du journal (vue `WorkItems.corrections`, qui lit la transition, pas la note).
 
 
 def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None,
@@ -1132,12 +1129,16 @@ def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None,
     sa fusion a été annulée, et le lot attend un transport fusionné APRÈS la
     correction. Le critère d'instant couvre les corrections répétées, qu'un
     simple `pr_ref` laisserait passer (il ne porte que la dernière PR fermante,
-    pas l'historique) ; l'égalité `pr_ref == ref` reste le repli quand la date
-    de fusion manque."""
+    pas l'historique).
+
+    #2317 (N3) : l'égalité `pr_ref == ref` n'est qu'un REPLI quand la date de
+    fusion manque (`merged_ts is None`). Avec `mergedAt`, l'instant décide : un
+    repli joué en plus affichait « rouvert depuis » sur une PR pourtant
+    postérieure à la correction, et la fermait à tort."""
     if annulled_ts is not None and merged_ts is not None and merged_ts <= annulled_ts:
         return ("stage merged: PR %s — fusion antérieure à la dernière correction "
                 "merged → build, transport suivant attendu" % ref)
-    if ref and (item.get("pr_ref") or "") == ref:
+    if ref and merged_ts is None and (item.get("pr_ref") or "") == ref:
         return ("stage merged: PR %s a déjà fermé ce lot (rouvert depuis), "
                 "transport suivant attendu" % ref)
     if int(item["id"]) in final_lots(pr.get("body")):
@@ -1186,11 +1187,12 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     journal porte `stage merged`. #1693 (N1) : la PR qui a déjà fermé le lot
     (rouvert par correction `merged → build`) ne le referme pas.
 
-    #1693 (N2) : une PR OUVERTE qui nomme une **fiche** (branche
-    `lot/<fiche>-…` ou ligne `ameesh-lot: <fiche>`) retient tous les lots de
-    la fiche, même si son corps ne nomme qu'un lot (`union_packages`). La
-    fermeture garde sa règle précise : la ligne `ameesh-work:` fait foi, et
-    sans elle la fiche ferme ses lots (`packages_of_pr`, L29).
+    #1693 (N2)/#2317 (N7) : une PR OUVERTE retient exactement les lots
+    # qu'elle fermerait si on la fusionnait maintenant — la symétrie de
+    # `_targets_of_pr` : ligne `ameesh-work:` d'abord, sinon tous les lots de
+    # la fiche (`lot/<fiche>-…`, `ameesh-lot:`). Une ligne explicite ne fait
+    # donc pas retenir le reste de la fiche : une PR de fiche oubliée ne
+    # bloque plus les lots dont la propre PR est déjà fusionnée.
     """
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
@@ -1201,25 +1203,30 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     open_prs = open_prs_of_repo(gh, repo)
     st = storage.of(db)
     idents = [p["id"] for p in st.packages.all() if p.get("kind") in work_mod.LINKABLE_KINDS]
+    # #2317 (N4) : la lecture des corrections est bornée aux lots qu'une PR
+    # fusionnée peut fermer. Collecter ces lots d'abord évite un LIKE sur tout
+    # `work_item_events` à chaque relevé (l'ancien `events_noted(…, 0.0)`).
+    targets_by_pr: dict[int, list] = {}
+    candidates: set[int] = set()
+    by_issue: dict | None = None
+    for pr in prs:
+        if (pr.get("state") or "MERGED") != "MERGED":
+            continue
+        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
+        targets_by_pr[int(pr.get("number") or 0)] = targets
+        candidates.update(int(item_id) for item_id, _pid in targets)
     # #1693 (N1, cx2) : une PR fusionnée AVANT la dernière correction
     # `merged → build` d'un lot ne peut plus le fermer — sa fusion a été
     # annulée, quel que soit le nombre de corrections et de transports depuis
-    # (le seul `pr_ref` ne porte que la dernière PR, pas l'historique). Un
-    # relevé global suffit : les corrections sont rares (`work.CORRECTIONS`).
-    annulled: dict[int, float] = {}
-    for ev in st.work.events_noted(_ANNULMENT_NOTE, 0.0):
-        if ev.get("state") == "build":
-            item_id = int(ev["work_item_id"])
-            annulled[item_id] = max(annulled.get(item_id, 0.0),
-                                    float(ev.get("created_ts") or 0.0))
+    # (le seul `pr_ref` ne porte que la dernière PR, pas l'historique). La
+    # correction se lit à la TRANSITION du journal (#2317/N2), pas à sa note.
+    annulled: dict[int, float] = st.work.corrections(candidates)
     results: list[dict] = []
-    by_issue: dict | None = None
     # #759 : les lots encore désignés par une PR ouverte ne se ferment pas
     open_lots: dict[int, list[str]] = {}
     for pr in sorted(open_prs, key=lambda p: int(p.get("number") or 0)):
         ref = "%s#%s" % (repo, pr.get("number"))
-        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue,
-                                           union_packages=True)
+        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
         # L118b : une PR ouverte qui ne livre qu'une partie du lot le retient
         # aussi — `ameesh-work-partial:` n'est pas une ligne `ameesh-work:`,
         # elle n'apparaît donc pas dans `targets` (#759, incident #147).
@@ -1235,7 +1242,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                  else None)
         actor = "github:%s" % login if login else "github"
         merged_ts = _iso_ts(pr.get("mergedAt"))
-        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
+        targets = targets_by_pr.get(int(pr.get("number") or 0), [])
         # L118b : une PR qui ne livre qu'une partie d'un lot ne le ferme pas
         partial = partial_lots(pr.get("body"))
         targets = [(i, pid) for i, pid in targets if i not in partial]

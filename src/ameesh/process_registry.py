@@ -1366,8 +1366,14 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
          "sha": str(row["sha"] or ""), "verdict": row["verdict"],
          "note": str(row["note"] or ""), "actor": str(row["actor"] or "")}
         for row in db.query(
+            # #2317 (N5) : un jalon `merged` annulé par une correction
+            # `merged → build` n'est plus une révision livrée ; il ne doit ni
+            # servir de `merged_of` ni de `revision_of` (fonction 0463).
             "SELECT id, kind, sha, verdict, note, actor FROM work_item_milestones"
-            " WHERE work_item_id = %s ORDER BY id", (item_id,))]
+            " WHERE work_item_id = %s"
+            "   AND (kind <> 'merged'"
+            "        OR NOT agent_mesh_merged_annulled(work_item_id, at))"
+            " ORDER BY id", (item_id,))]
     receipts: list[dict[str, Any]] = []
     for row in db.query(
             "SELECT id, command_id::text AS command_id, workflow_stage,"
