@@ -122,6 +122,10 @@ def same_commit(a, b, repo=None) -> bool:
         full_right = merge_queue.pinned(repo, right)
         if full_left and full_right:
             return full_left == full_right
+        # Un côté résolu compare par son SHA complet : une tête inconnue du
+        # dépôt (poussée, pas encore lue) qui partage l'abréviation du feu
+        # n'est pas le commit que le dépôt connaît sous cette abréviation.
+        left, right = full_left or left, full_right or right
     # Pas de dépôt (ou un commit qu'il ne peut pas résoudre) : deux
     # abréviations du même commit sont préfixes l'une de l'autre (#1756).
     return plan_git.same_commit(left, right)
