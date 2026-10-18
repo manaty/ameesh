@@ -138,6 +138,24 @@ class RewriteTest(unittest.TestCase):
                                      out["tree"] + ":supabase/migrations/518_b.sql"))
         train_migrations.audit(self.repo, self.base, out["tree"], self.layout)
 
+    def test_overlapping_renames_preserve_contents_and_references(self):
+        _write(self.repo, "supabase/migrations/518_base.sql", "-- base\n")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "base 518")
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+        _, head = self.merge("lot/1", {
+            "supabase/migrations/518_step.sql": "select 'first';\n",
+            "supabase/migrations/519_step.sql": "select 'second';\n",
+            "backend/refs.txt": "518_step.sql 519_step.sql\n",
+        })
+        out = train_migrations.rewrite(self.repo, self.base, head, self.layout, self.row)
+        for number, content in ((519, "first"), (520, "second")):
+            self.assertIn(content, _git(self.repo, "show", out["tree"]
+                                       + ":supabase/migrations/%s_step.sql" % number))
+        self.assertEqual(_git(self.repo, "show", out["tree"] + ":backend/refs.txt"),
+                         "519_step.sql 520_step.sql")
+        train_migrations.audit(self.repo, self.base, out["tree"], self.layout)
+
     def test_history_is_never_changed(self):
         _, changed = self.merge("lot/2", {"supabase/migrations/516_base.sql": "-- changed\n"})
         with self.assertRaisesRegex(train.MemberDeferred, "historical migration"):

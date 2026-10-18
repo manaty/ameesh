@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 
 from . import migrations, plan_git, resolutions
@@ -277,6 +278,8 @@ def rewrite(path: str, base: str, head: str, target: Layout, row: dict, *,
                     migrations=entries)
     names = {os.path.basename(old_name): os.path.basename(new_name)
              for old_name, new_name in renames.items()}
+    name_pattern = re.compile("|".join(re.escape(name) for name in
+                                     sorted(names, key=len, reverse=True)))
     rewritten: dict[str, bytes] = {}
     for status, name in changes:
         if status not in ("A", "M"):
@@ -288,9 +291,7 @@ def rewrite(path: str, base: str, head: str, target: Layout, row: dict, *,
             if name in renames:
                 raise _rename(row, name, "a renamed artifact must be UTF-8")
             continue
-        changed = text
-        for old_name, new_name in names.items():
-            changed = changed.replace(old_name, new_name)
+        changed = name_pattern.sub(lambda match: names[match.group()], text)
         if name in renames:
             changed = _comment_numbers(changed, source_old[name], new_for_old[source_old[name]])
         if changed != text:
@@ -299,10 +300,18 @@ def rewrite(path: str, base: str, head: str, target: Layout, row: dict, *,
                        "checkout migration composition")
     for name, content in rewritten.items():
         _write(path, "HEAD", name, content)
-    for old_name, new_name in renames.items():
-        destination = os.path.join(path, new_name)
-        os.makedirs(os.path.dirname(destination), exist_ok=True)
-        os.replace(os.path.join(path, old_name), destination)
+    # Stage every source before writing destinations: one destination may
+    # still be another migration's source. Moving preserves executable modes.
+    with tempfile.TemporaryDirectory(prefix=".migration-renames-", dir=path) as tmp:
+        staged = []
+        for index, (old_name, new_name) in enumerate(renames.items()):
+            source = os.path.join(tmp, str(index))
+            os.replace(os.path.join(path, old_name), source)
+            staged.append((source, new_name))
+        for source, new_name in staged:
+            destination = os.path.join(path, new_name)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            os.replace(source, destination)
     touched = sorted(set(rewritten) | set(renames) | set(renames.values()))
     proc = _run(path, "add", "-A", "--", *touched)
     if proc.returncode:
