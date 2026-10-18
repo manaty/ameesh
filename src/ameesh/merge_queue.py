@@ -771,12 +771,16 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
               tip: str, *, cfg=None, base: str | None = None) -> dict:
     """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
 
-    La classe se lit entre la cible **fraîche** et la tête gelée. La cible
-    fraîche vient de l'admission (`base`, le commit récupéré par `readiness`),
-    sinon de la cible que le radar a récupérée sous `QUEUE_REF` dans son clone ;
-    à défaut seulement, de `origin/<cible>` du dépôt des agents, puis de sa
-    cible locale. La copie `origin/<cible>` du clone `--shared` n'est jamais
-    une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
+    La classe se lit entre la cible **fraîche** et la tête gelée. Seul `base`
+    est une cible fraîche : le commit que l'appelant vient de récupérer
+    (`readiness`), ou `target` quand il nomme déjà un commit. Sinon, la borne
+    est la cible que le radar a laissée sous `QUEUE_REF` dans son clone, à défaut
+    `origin/<cible>` du dépôt des agents, puis sa cible locale : c'est la
+    cible du **dernier** fetch connu, que rien ne prouve fraîche — un fetch
+    antérieur, une cible supprimée depuis sur origin (le fetch ne nettoie pas)
+    ou déjà avancée par la fusion du lot. La lecture garde sa classe, mais son
+    `why` le dit (#2379). La copie `origin/<cible>` du clone `--shared` n'est
+    jamais une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
 
     Toutes les lectures comparées portent sur **la même** cible fraîche : une
     source qui ne la porte pas (référence périmée, objet absent) est écartée
@@ -832,6 +836,11 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
                                    head=tip)
         if best is None or _class_worse(current, best):
             best = current
+    if (target and base is None and best is not None
+            and not _HEX.fullmatch(target.strip().lower())):
+        best = dict(best, why="%s; borne %s non prouvée fraîche (dernier fetch connu, "
+                    "aucune cible récupérée par l'appelant)"
+                    % (best.get("why") or "?", best.get("target") or target))
     return best
 
 

@@ -649,7 +649,7 @@ class ClassOfSourcesTest(unittest.TestCase):
         with mock.patch.object(plan_git, "_commit", return_value="c" * 40), \
                 mock.patch.object(lot_class, "of_lot", side_effect=fake):
             out = merge_queue._class_of(None, 1, {"app": "ameesh"}, "depot", "clone",
-                                        "main", "f" * 40)
+                                        "main", "f" * 40, base="c" * 40)
         return out, calls
 
     def test_la_plus_haute_des_lectures_l_emporte(self):
@@ -844,6 +844,31 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
                                             target, c, cfg=None)
                 self.assertEqual(out["class"], "light")
                 self.assertFalse(out["doubt"])
+
+    def test_a_queue_ref_left_by_an_earlier_fetch_is_not_called_fresh(self):
+        """#2379 : sans `base`, la borne est le `QUEUE_REF` du dernier fetch,
+        ici antérieur à B ; la lecture garde sa classe mais ne se dit pas
+        fraîche. Avec la cible récupérée par l'appelant, rien n'est signalé."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                clone = self.clone(agents, target)
+                merge_queue.fetch_fresh(agents, ["lot/light", target], clone)
+                # un fetch antérieur : le clone garde A sous QUEUE_REF
+                _git(clone.path, "update-ref", merge_queue.QUEUE_REF + target, a)
+                self.lot(target)
+                stale = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                              target, c, cfg=None)
+                self.assertIn("non prouvée fraîche", stale["why"])
+                self.assertIn(merge_queue.QUEUE_REF + target, stale["why"])
+                fresh = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                              target, c, cfg=None, base=b)
+                self.assertEqual(fresh["class"], "light")
+                self.assertNotIn("non prouvée fraîche", fresh["why"])
+                # une borne déjà nommée par un commit n'est pas une ref périmée
+                exact = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                              b, c, cfg=None)
+                self.assertNotIn("non prouvée fraîche", exact["why"])
 
 
 class OrderTest(unittest.TestCase):
