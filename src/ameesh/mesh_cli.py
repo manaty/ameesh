@@ -550,10 +550,27 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             def tag(key: str) -> str:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
-            print("  thresholds memory ≥ %s%s; swap ≤ %s%s (counts only under memory"
-                  " pressure); load ≤ %.2f%s; disk ≥ %s%s; tmpfs ≤ %s%s"
+            # #2354: the effective ceiling is resources' call (`swap_ceiling`):
+            # the declared one, the 0028 fallback when the host cannot measure
+            # PSI, or none at all. Say which case applies instead of a bare "—".
+            declared = limits["max_swap_used"]
+            swap = res.swap_ceiling(latest, limits)
+            if declared is not None:
+                # #2296: "— [défaut]" would claim a default value that does
+                # not exist for an undeclared ceiling
+                swap_tag = tag("max_swap_used")
+                swap_note = "counts only under memory pressure"
+            elif swap is None:
+                swap_tag = " [no default]"
+                swap_note = "counts only under memory pressure"
+            else:
+                swap_tag = " [fallback: no PSI]"
+                swap_note = "counts alone, no PSI"
+
+            print("  thresholds memory ≥ %s%s; swap ≤ %s%s (%s); load ≤ %.2f%s; disk ≥ %s%s"
+                  "; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
-                     _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
+                     _fmt_bytes(swap), swap_tag, swap_note,
                      limits["max_load"], tag("max_load"),
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
