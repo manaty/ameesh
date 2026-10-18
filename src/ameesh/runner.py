@@ -2519,7 +2519,8 @@ class AgentWorker(threading.Thread):
     def _lot_brief(self, lot: str, courant: str, out: dict) -> str | None:
         """#794 : le brief MINIMAL d'une session neuve dédiée au lot `lot` :
         canon, fiche du lot, diff de sa branche, fil du lot réduit aux
-        décisions et messages non lus (décision du bureau, 2026-10-13)."""
+        décisions, messages non lus et courriers déjà livrés pour ce lot
+        (#2539 ; décision du bureau, 2026-10-13)."""
         try:
             from . import reprise, work as work_mod
             item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
