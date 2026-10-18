@@ -897,8 +897,16 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                 "policy_ref": "", "repo": where or "", "target": target or "",
                 "frozen_sha": "", "doubt": True}
     try:
-        return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None), item=item,
-                                repo=where or None, base=base or None, head=head or None)
+        # #2464 : la base est un commit, illisible pour l'axe release ; la
+        # cible déjà résolue (`target`) porte cet axe quand la ligne du lot ne
+        # le fait pas. Sans elle, `of_lot` relirait `origin/HEAD` — ou ne
+        # verrait plus une release.
+        class_item = item
+        if target and not item.get("branch_target"):
+            class_item = dict(item, branch_target=target)
+        return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None),
+                                item=class_item, repo=where or None,
+                                base=base or None, head=head or None)
     except Exception as exc:  # noqa: BLE001 - un doute, jamais une exception
         return {"class": "", "why": "%s: %s" % (type(exc).__name__, str(exc)[:200]),
                 "doubt": True}

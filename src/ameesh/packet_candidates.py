@@ -106,6 +106,49 @@ def _row_target(row: dict, target: str) -> str:
     return merge_queue._remote_branch(row.get("branch_target") or target)
 
 
+def _release_target(branch: str) -> bool:
+    value = lot_class._normalized_target(branch)
+    return value == lot_class.RELEASE or value.startswith(lot_class.RELEASE + "/")
+
+
+def resolve_target(project, repo: str, target: str | None = None) -> tuple[str, str]:
+    """La cible du paquet et sa provenance (#2464).
+
+    L'option `--target` prime, puis la cible déclarée du projet
+    (`radar.projects.<nom>.target`), puis `origin/HEAD` du clone. Un
+    `origin/HEAD` qui nomme `release/*` **sans cible déclarée** est une erreur
+    de lecture, pas une classe : sur le clone radar de pc-smichea il pointait
+    `release/1.11.0` (périmé depuis le 15/10), et `lot_class` rendait
+    « release » chaque lot sans `branch_target` — donc tous écartés en silence.
+    Le bureau remet `origin/HEAD` à jour ; ce calcul, lui, refuse de conclure
+    sur cette ref.
+
+    Rend `(branche, provenance)` avec une provenance `option`, `project` ou
+    `origin/HEAD`.
+    """
+    declared = str(target or getattr(project, "target", "") or "").strip()
+    if declared:
+        return merge_queue._remote_branch(declared), ("option" if target else "project")
+    try:
+        fallback = plan_git.default_target(repo)
+    except plan_git.MergeProbeError as exc:
+        # Cible déclarée introuvable (`ameesh.target`) : erreur de lecture,
+        # pas un repli silencieux sur main (#2464).
+        raise CandidateError(str(exc)) from exc
+    if not fallback:
+        raise CandidateError(
+            "no target branch: pass --target or declare the target of project %r"
+            % (getattr(project, "name", "") or "?"))
+    branch = merge_queue._remote_branch(fallback)
+    if _release_target(branch):
+        raise CandidateError(
+            "origin/HEAD of %s resolves to %s, a release branch, and no target is "
+            "declared (radar.projects.%s.target or --target): a clone's stale "
+            "origin/HEAD is not a package target"
+            % (repo, branch, getattr(project, "name", "") or "?"))
+    return branch, "origin/HEAD"
+
+
 def default_app(repo: str) -> str:
     """Le projet d'un dépôt sans `radar.projects` : le nom du dépôt d'origine."""
     try:
@@ -147,7 +190,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     branches et la cible sont lues **fraîches** de `origin`. `target` et `app`
     remplacent ceux du projet ; `base` force le commit de base de l'essai de
     fusion (reproduction d'un manifeste) au lieu de la tête fraîche de la
-    cible.
+    cible. La cible est résolue par `resolve_target` : un `origin/HEAD`
+    `release/*` sans cible déclarée lève `CandidateError` (#2464).
 
     Rend le schéma `ameesh-packet-candidates/1` : `candidates` (tous les lots
     `qa` du projet, prêts ou refusés avec leurs codes), `ready` (ids, ordre de
@@ -155,10 +199,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     composer). Aucune écriture, aucun effet hors du clone `clone`.
     """
     app = (app or getattr(project, "name", "") or default_app(repo)).strip()
-    target_branch = merge_queue._remote_branch(
-        (target or getattr(project, "target", "") or plan_git.default_target(repo) or "").strip())
-    if not target_branch:
-        raise CandidateError("no target branch: pass --target or declare the project's target")
+    target_branch, target_source = resolve_target(project, repo, target)
     rows = _items(db, app)
     ids = [int(row["id"]) for row in rows]
     marks = _marks(db, ids)
@@ -199,6 +240,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
         "repo": repo,
         "clone": where,
         "target": target_branch,
+        "target_source": target_source,
         "target_head": fetched_target,
         "base": package_base,
         "base_source": base_source,
@@ -283,7 +325,11 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
             "freeze %s is not the published head %s: freeze again, then review"
             % (frozen[:12], tip[:12])))
     try:
-        klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=where,
+        # La classe se lit sur la cible **résolue du paquet** (#2464), comme la
+        # file de fusion : sans `branch_target` sur la ligne du lot, `of_lot`
+        # relirait `origin/HEAD` du clone radar et surclasserait le lot.
+        class_row = row if row.get("branch_target") else dict(row, branch_target=target)
+        klass = lot_class.of_lot(db, lot, cfg=cfg, item=class_row, repo=where,
                                  base=package_base, head=tip, milestones=marks,
                                  canons=canons)
     except Exception as exc:  # noqa: BLE001 - classification impossible
