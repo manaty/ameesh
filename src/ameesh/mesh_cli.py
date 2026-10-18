@@ -2098,6 +2098,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                       % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
             elif state == "unavailable":
                 print("review designation unavailable: %s" % (outcome.get("why") or ""))
+            if args.kind == "frozen":
+                # #2442 : un réalignement mécanique sur la cible garde les
+                # verdicts de la tête relue ; sinon l'exécuteur retente.
+                from . import verdict_carry
+                carried = verdict_carry.carry(cfg, db, args.id)
+                if carried["result"] != "idle":
+                    print(verdict_carry.describe(carried))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2

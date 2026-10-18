@@ -6815,6 +6815,7 @@ class Runner:
         take_interval: float = TAKE_INTERVAL_S,
         take_balance: dict | None = None,
         train_passages=(),
+        train_service_lease=None,
         cfg_overrides: dict | None = None,
     ):
         from .host_gate import gate_choice
@@ -6855,6 +6856,8 @@ class Runner:
         self._take_next = 0.0
         # #1467: explicit qualified passages only; no live policy selected here.
         self.train_passages = tuple(train_passages)
+        # #2446: the exclusive service lease assembled from `train.host`.
+        self.train_service_lease = train_service_lease
         self.train_service = None
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
@@ -8607,6 +8610,7 @@ class Runner:
                     log_async("work item #%s delivered: %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            self.carry_once(db)
             self.fire_once(db)
             if not self.dry_run:
                 self.measure_once(db)
@@ -8626,6 +8630,30 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def carry_once(self, db) -> None:
+        """#2442 : reporte sur la tête gelée les verdicts d'une tête dont elle
+        n'est qu'un réalignement mécanique sur la cible, avant le passage du
+        feu qui lit la porte des avis. Ne lève jamais ; une même erreur n'est
+        dite qu'une fois."""
+        from . import verdict_carry
+        try:
+            report = verdict_carry.run_pass(fresh_radar(self.cfg), db, dry_run=self.dry_run)
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            report = [{"lot": "?", "result": "error",
+                       "detail": "%s: %s" % (type(exc).__name__, exc)}]
+        seen = getattr(self, "_carry_errors", set())
+        errors = set()
+        for entry in report:
+            if entry.get("result") not in verdict_carry.LOUD:
+                continue
+            line = "verdict carry: lot #%s %s" % (entry["lot"], verdict_carry.describe(entry))
+            if entry["result"] == "error":
+                errors.add(line)
+                if line in seen:
+                    continue
+            log_async(line)
+        self._carry_errors = errors
 
     def fire_once(self, db) -> None:
         """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
@@ -8746,11 +8774,16 @@ class Runner:
         passages = tuple(p for p in getattr(self, "train_passages", ()) if p.policy.enabled)
         if not passages:
             return
-        if any(getattr(p, "reservation", None) is None for p in passages):
+        # #2446: a shadow passage is read-only and needs no packet reservation;
+        # the active passage keeps the #1467 requirement.
+        if any(getattr(p, "reservation", None) is None
+               for p in passages if not getattr(p, "shadow", False)):
             log_async("train service requires an explicit qualified packet reservation and deadline")
             return
         from .train_runner import Service
-        self.train_service = Service(self.cfg, passages, stop=self.stop, report=log_async)
+        self.train_service = Service(
+            self.cfg, passages, stop=self.stop, report=log_async,
+            lease=getattr(self, "train_service_lease", None))
         self.train_service.start()
 
     def start_branch_sweep_poll(self) -> None:
@@ -10831,12 +10864,26 @@ def main(argv: list[str] | None = None) -> int:
             print("agent-runner: %s" % exc, file=sys.stderr)
             return 1
         agents = [a for a in (parsed.agents or "").split(",") if a] or None
+        # #2446 : assemble the train service from the host configuration
+        # before the runner starts. A missing or malformed piece is a named
+        # refusal, never a fallback passage; the agent service keeps working.
+        train_passages, train_lease = (), None
+        if not (parsed.once or parsed.dry_run or mediated):
+            try:
+                from . import train as train_mod, train_assembly
+                assembly = train_assembly.assemble(cfg, notify=log_async)
+                train_passages, train_lease = assembly.passages, assembly.lease
+                log_async("train service: %s" % assembly.reason)
+            except train_mod.TrainError as exc:
+                log_async("train service disabled: %s" % exc)
         try:
             runner = Runner(
                 cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
                 dry_run=parsed.dry_run, max_turns=parsed.max_turns,
                 take=_take_settings(parsed), take_interval=parsed.take_interval,
                 take_balance=_take_balance(parsed),
+                train_passages=train_passages,
+                train_service_lease=train_lease,
                 cfg_overrides=overrides,
             )
         except db_mod.DbError as exc:
