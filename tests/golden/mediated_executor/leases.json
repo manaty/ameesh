@@ -629,7 +629,8 @@
       "lease_owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "lease_epoch": 42,
       "status": "running",
-      "live": true
+      "live": true,
+      "name": "inge-front"
      },
      "server_ts": 1791640000.12
     }
