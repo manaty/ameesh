@@ -1489,7 +1489,17 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     if not branch:
         out.update(result="no-branch", detail="lot without branch: no PR to arm")
         return out
-    work_repo = _checkout(repo) if repo else _repo_of(db, row)
+    work_repo = _repo_of(db, row) if repo is None else _checkout(repo)
+    # #2535 : un `--repo` explicite qui n'est pas un checkout est un refus,
+    # jamais un repli silencieux sur le clone que le projet déclare
+    # (`radar.projects.<p>.repo`). Le pilote qui se trompe de dépôt verrait
+    # sinon le feu lire une autre copie que celle demandée et rendre un
+    # verdict de préparation trompeur.
+    if repo is not None and work_repo is None:
+        out.update(result="no-repository", detail=(
+            "--repo %s is not a git checkout: pass a path inside the lot's repository "
+            "(#2535: refusing to read the project's declared clone instead)" % repo))
+        return out
     slug = _slug(cfg, row, work_repo)
     if not slug:
         out.update(result="no-repository", detail="no GitHub repository known for this lot")
