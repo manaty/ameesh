@@ -48,11 +48,13 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
+import stat
 import sys
-import tempfile
 import textwrap
 import time
+from typing import Iterable
 
 from . import config as config_mod
 from . import db as db_mod
@@ -384,13 +386,15 @@ def _source_view(kind: str | None, ref: str | None, label: str | None = None) ->
 
 
 def real_milestones(item: dict, events: list[dict], actions: list[dict],
-                    declared: list[dict] | None) -> dict:
+                    declared: list[dict] | None, *,
+                    agents: Iterable[str] | None = None) -> dict:
     """Les jalons RÉELS génériques d'une tâche, depuis ce qu'ameesh mesure
     déjà (journal, table des jalons, actions) : `{demandee, debut, soumise,
-    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint)."""
+    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint).
+    `agents` : le registre, pour la correspondance `seb` / `human:seb` (#2346)."""
     from . import progress  # import tardif : progress importe ce module
 
-    jalons = progress._jalons_de_lot(item, events, actions, declared)
+    jalons = progress._jalons_de_lot(item, events, actions, declared, agents=agents)
     started = next((e.get("created_ts") for e in events if dev.en_cours(e.get("state"))), None)
     out = {key: jalons.get(dev.jalon(key)) for key in ("demandee", "soumise", "verdict",
                                                        "livree")}
@@ -511,6 +515,9 @@ def build(db, *, now: float | None = None, project: str | None = None,
     now = time.time() if now is None else float(now)
     base = today(now)
     st = storage.of(db)
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur, pour que `lot_state` ne diverge pas de progress.
+    agents = {r["name"] for r in st.progress.agents(None) if r.get("name")}
     done_states = (dev.CORRESPONDANCES["etats_livres"]
                    + dev.CORRESPONDANCES["etats_abandonnes"])
     filters = {"project": project} if project else {}
@@ -552,8 +559,9 @@ def build(db, *, now: float | None = None, project: str | None = None,
     for item in rows:
         iid = int(item["id"])
         evs, acts = events.get(iid, []), actions.get(iid, [])
-        real = real_milestones(item, evs, acts, declared.get(iid))
-        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid))
+        real = real_milestones(item, evs, acts, declared.get(iid), agents=agents)
+        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid),
+                                         agents=agents)
         shown = progress.lot_state(item.get("state") or "", jalons)
         tasks.append(build_task(item, real, base=base,
                                 epic=plan_mod.epic_of(item.get("package_id"), by_pkg),
@@ -646,6 +654,14 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
     ligne : `{reason, what, due, days, commitment, lot, package, owner,
     assignee, responsible}` — `reason` : `engagement` ou `date_prevue`.
 
+    Une date prévue ne lève que si une personne l'a posée et si le lot est
+    encore piloté par son porteur : les dates calculées par la table de
+    référence (`planned_source` « reference p80… ») sont re-datées à la passe
+    suivante de `work schedule --apply`, jamais alertées ; un lot en attente
+    (bloqué, en relecture, ou retenu par une attente planifiée) ne l'est pas
+    non plus. Un lot daté et engagé ne produit qu'une alerte : l'engagement
+    explicite l'emporte sur la date.
+
     Lecture légère (aucun journal) : l'alerte tourne à chaque passe."""
     now = time.time() if now is None else float(now)
     base = today(now)
@@ -673,11 +689,33 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
                     "days": (base - due).days, "commitment": row["id"], "lot": lot,
                     "package": row.get("package_id"), "owner": row.get("owner"),
                     "assignee": (item or {}).get("assignee"), "project": row.get("project")})
+    # #2342 : un lot daté et engagé est une seule alerte (l'engagement est la
+    # promesse explicite) ; sinon la date posée par une personne reste la sienne.
+    engaged = {r["lot"] for r in out if r["reason"] == "engagement" and r["lot"] is not None}
+    from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
+    dated = []
     for item in rows:
         key = "planned_delivery" if item.get("planned_delivery") else (
             "planned_end" if item.get("planned_end") else None)
         due = _date(item.get(key)) if key else None
-        if not due or base <= due:
+        if not due or base <= due or int(item["id"]) in engaged:
+            continue
+        # a date computed by the schedule is re-dated by its next pass; a lot
+        # waiting (held, under review, waiting for its package or a dependency)
+        # has no gesture on its date, so it is not a date-driven alert
+        if not dev.active(item.get("state")):
+            continue
+        # The scheduler only writes start/end; delivery remains a manual
+        # date even when those fields still carry the scheduler's source.
+        if key != "planned_delivery" and str(item.get("planned_source") or "").startswith(SOURCE):
+            continue
+        dated.append((item, key, due))
+    waits = {}
+    if dated:
+        from . import planned_waits
+        waits = planned_waits.read(db, [item for item, _, _ in dated], now=now)
+    for item, key, due in dated:
+        if int(item["id"]) in waits:
             continue
         out.append({"reason": "date_prevue", "what": "%s of task #%d \"%s\"" % (
             LABELS["delivery" if key == "planned_delivery" else "end"], int(item["id"]),
@@ -1127,12 +1165,29 @@ def _read_plan_text(filename: str) -> str:
 def _write_atomic(filename: str, text: str) -> None:
     """Write the export beside its target, then replace it in one step."""
     target = Path(filename)
+    # A symlinked target is written through, as a plain ``write_text`` did:
+    # replacing the link itself would silently turn it into a regular file.
+    if target.is_symlink():
+        target = Path(os.path.realpath(target))
+    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
-                                   dir=str(target.parent))
-    except OSError as exc:
-        raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
-    try:
+        # New exports honour the umask. Replacements inherit the target's
+        # permissions from creation, before any private content is written.
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            mode = 0o666
+        fd = None
+        for _ in range(16):
+            candidate = str(target.parent / ("%s.%s.tmp" % (target.name, secrets.token_hex(8))))
+            try:
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            except FileExistsError:
+                continue
+            tmp = candidate
+            break
+        if fd is None:
+            raise OSError("cannot create a temporary file beside %s" % target)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
             stream.write(text)
             stream.flush()
@@ -1141,10 +1196,11 @@ def _write_atomic(filename: str, text: str) -> None:
             shutil.copymode(target, tmp)
         os.replace(tmp, target)
     except OSError as exc:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if tmp is not None and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
 
 

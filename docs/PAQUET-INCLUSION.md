@@ -2,9 +2,9 @@
 
 Ce document décrit le contrôle à passer **avant la CI complète et le feu** d'un
 paquet d'intégration (canon `manaty/home`, `processus/lots.md` §12) : vérifier
-qu'aucun lot admis ou routé vers la coupure n'a été silencieusement omis à la
-composition, et que le contenu des lots composés est réellement dans l'arbre de
-la tête.
+qu'aucun lot admis, routé vers la coupure ou **prêt** n'a été silencieusement
+omis à la composition, et que le contenu des lots composés est réellement dans
+l'arbre de la tête.
 
 ## Le constat
 
@@ -15,6 +15,66 @@ ont été omis à la composition, sans note de retrait ni revert : #1124, #1056,
 plus : après un revert, la tête du lot reste ancêtre de la tête du paquet
 (#1638). Il faut donc confronter **les admissions**, **les lignes du manifeste**
 et **le contenu de l'arbre**.
+
+## Le constat #2404
+
+Aux paquets ameesh h-0800 et h-0900 (18/10/2026), six lots cités par
+l'auditeur comme prêts ou admis ont attendu un paquet de 1 h à 20 h : #2374,
+#2377, #1280, #2274, #2282, #1272. La composition partait des lots cités par
+les courriers (orchestrateur, pilote, auteurs) : un lot prêt que personne
+n'avait cité n'entrait ni au manifeste ni dans ses « écartés ». #2374 y était
+même « écarté » pour « verdicts anciens » alors que le pilote l'avait admis.
+
+La correction a deux jambes, toutes deux dans ce dépôt :
+
+1. `scripts/paquet-candidats.py` **calcule** la liste des lots prêts (état
+   `qa`, gel effectif égal à la tête **publiée**, verdicts requis acquis sur
+   cette tête, essai de fusion propre contre la cible). C'est la liste de
+   départ de la composition ; un courrier peut ajouter une admission, jamais
+   retirer un lot prêt du calcul.
+2. `scripts/paquet-inclusion.py --ready-file` confronte cette liste au
+   manifeste : tout lot prêt doit être **composé**, ou figurer dans la table
+   « Écartés (ce véhicule) » avec un **motif**. Une ligne sans motif ne compte
+   pas.
+
+## Partir de la liste calculée
+
+```sh
+# 1. la liste calculée, lue fraîche de origin (aucun filtre d'assigné)
+scripts/paquet-candidats.py --repo . --ready-out "$TMPDIR/prets-0800.txt"
+
+# 2. la composition part de ces lots (et des admissions du pilote) ; un lot
+#    prêt non composé s'écrit au manifeste :
+#
+#    ## Écartés (ce véhicule)
+#
+#    | lot | motif |
+#    |---|---|
+#    | #2377 | second avis dû sur 5943fe46 (deux familles) |
+
+# 3. le contrôle d'inclusion, avant la CI complète et le feu
+scripts/paquet-inclusion.py --manifest reviews/integration-paquet-h-…md \
+    --head origin/integration/paquet-h-… \
+    --ready-file "$TMPDIR/prets-0800.txt" \
+    --expected-file "$TMPDIR/admissions-0800.txt"
+```
+
+Sans source `--ready`/`--ready-file`, le contrôle s'arrête en `2` ; une source
+fournie mais vide (« aucun lot prêt ») est un calcul valide, pas une absence.
+`--no-ready` est le seul moyen d'assumer un contrôle sans liste calculée (audit
+hors base, par exemple).
+
+`paquet-candidats.py` ne compose rien et n'écrit dans aucun dépôt : il lit la
+base, les jalons et Git (clone privé du radar, ou clone jetable),
+et son code de retour est `1` si une lecture a échoué — une liste incomplète
+ne doit pas servir de base à un paquet. Dans ce cas `--ready-out` est retiré,
+y compris un export d'une exécution précédente : `paquet-inclusion.py`
+s'arrête alors sur un fichier absent (code `2`) au lieu de lire une liste
+partielle. `--json` rend le schéma
+`ameesh-packet-candidates/1` avec, par lot, la tête publiée, le gel effectif,
+la classe, la porte des avis, l'essai de fusion et les **codes** de refus
+(`freeze-not-head`, `verdicts-missing`, `conflict`, `already-in-target`, …).
+Un lot y est dit prêt quand **aucun** refus n'est calculé.
 
 ## Usage
 
@@ -28,6 +88,9 @@ scripts/paquet-inclusion.py \
 # ou directement, et en JSON pour un rapport de tour
 scripts/paquet-inclusion.py --manifest … --head <sha> \
     --expected 1124,1056,388,795 --json
+
+# liste calculée des lots prêts (sortie de paquet-candidats.py --ready-out)
+scripts/paquet-inclusion.py … --ready-file "$TMPDIR/prets-0800.txt"
 
 # variante stricte : un contenu partiel ou vide compte comme un défaut bloquant
 scripts/paquet-inclusion.py … --strict
@@ -43,9 +106,18 @@ scripts/paquet-inclusion.py … --no-expected
   tableau** : le manifeste devient auto-porteur, c'est la forme recommandée.
   Sans aucune de ces sources, le contrôle s'arrête en `2` : une sortie `0`
   laisserait croire que le contrôle « admissions × manifeste » a eu lieu.
-- `--no-expected` : assume explicitement un contrôle sans liste attendue ; le
-  rapport dit alors « admissions × manifeste NON effectué » et seuls les
-  contrôles « manifeste × arbre » et « cohérence » sont rendus.
+- `--ready` / `--ready-file` : la liste **calculée** des lots prêts (#2404),
+  telle que la produit `scripts/paquet-candidats.py --ready-out` (un id par
+  ligne). Tout lot prêt doit être composé ou écarté avec un motif ; c'est la
+  liste de départ de la composition, pas une seconde liste d'admissions. Un
+  fichier fourni mais vide est un calcul valide (« aucun lot prêt »).
+- `--no-ready` : assume explicitement un contrôle sans liste calculée des lots
+  prêts ; le rapport dit alors « prêts × manifeste NON effectué ». Sans cette
+  option, l'absence de source prête arrête le contrôle en `2` : la composition
+  part de la liste calculée (#2404), elle ne suppose pas qu'elle est vide.
+- `--no-expected` : assume explicitement un contrôle sans liste d'admissions ;
+  le rapport dit alors « admissions × manifeste NON effectué ». Si une liste
+  de lots prêts est fournie, le contrôle « prêts × manifeste » reste rendu.
 - `--excused` / `--excused-file` : les lots dont le report ou le retrait a été
   décidé hors manifeste (par exemple un `REPORT 23h` du pilote).
 - `--repo` (défaut `.`), `--head` (SHA ou réf), `--json`, `--strict`,
@@ -61,7 +133,7 @@ Chaque commit de composition — une unité du paquet — porte une ligne
 `ameesh-work: <id>` par lot qu'il porte, en fin de message :
 
 ```
-vehicule 0400 : #2131 (ef22692ba6a3) — détachement conditionnel CAS et PR détachée
+vehicule 0400 : #2131 ef22692ba6a3 — détachement conditionnel CAS et PR détachée
 
 ameesh-work: 2131
 ```
@@ -83,21 +155,46 @@ Sur fusion propre, il crée le commit et affiche son SHA. Sur conflit, il ne
 commite pas : le message complet est déjà dans `.git/MERGE_MSG` ; on résout, on
 `git add`, puis `git commit --no-edit`. Le trailer reste en fin de message.
 
+Le sujet nomme chaque lot avec la tête composée, `#<lot> <tête>` (#2360) : un
+`#N` seul n'est qu'une citation. Une fois les unités composées, le **corps du
+lot porteur** et le manifeste reprennent la ligne que le script imprime :
+
+```sh
+scripts/paquet-compose.py --units --base origin/main [--head <réf>]
+# 2 unités de fusion, 3 lots portés : #2131 ef22692ba6a3, #2140 0a1b2c3d4e5f, #2157 112233445566
+```
+
+Les unités de fusion sont les commits de fusion de première parente depuis
+`--base` qui portent `ameesh-work:` (tête = second parent) ; une mise à jour
+depuis la cible n'en est pas une. Une unité peut porter plusieurs lots, listés
+chacun avec sa tête ; un lot recomposé garde sa place, prend sa tête la plus
+récente et son unité est le commit de composition le plus récent. Le compteur
+annonce donc séparément les unités de fusion encore rattachées à un lot et les
+lots portés (#2387). C'est cette forme `#<lot> <tête>` que le moniteur lit dans
+le corps d'un porteur `integration/**` pour reconnaître qu'un lot attend la
+fusion du paquet (#2335) ; un porteur qui ne liste ses lots que par `#N` ne
+déclare aucune unité et leurs alertes restent.
+
 La convention vaut pour les unités composées à partir de maintenant : un paquet
 déjà validé n'est pas réécrit pour ce seul métadonné, son manifeste et son run
 restent la preuve de ses lots.
 
 ## Ce qu'il vérifie
 
-1. **Admissions × manifeste.** Chaque lot attendu doit avoir une ligne de
-   composition, ou une exclusion consignée : ligne de la table de composition
-   dont la note dit retrait/revert/report, table dont l'en-tête dit
-   « retiré/revert », ou mention en prose sous un titre « Retrait »/« Report ».
-   Sinon : *inclusion manquante* (défaut bloquant). Une mention en prose qui ne
-   retire pas le lot (pas de mot-clé de retrait, ou lot qui n'est pas le sujet
-   de la ligne) est une **explication faible** : elle ne lève jamais une
-   inclusion manquante ; elle n'explique qu'un contenu partiel ou absent d'un
-   lot composé, affiché « à confirmer ».
+1. **Admissions et lots prêts × manifeste.** Chaque lot attendu ou **prêt**
+   doit avoir une ligne de composition, ou une exclusion consignée : ligne de
+   la table de composition dont la note dit retrait/revert/report, table dont
+   l'en-tête dit « retiré/revert », table sous un titre « Écartés » /
+   « Retraits » / « Reportés » — avec un **motif non vide** — ou mention en
+   prose sous ces titres. Sinon : *inclusion manquante* (défaut bloquant), et
+   pour un lot prêt le rapport le dit « ni composé ni écarté au manifeste ».
+   Une ligne « écartée » sans motif, ou une mention en prose qui ne fait pas
+   du lot le sujet de la ligne (pas de mot-clé de retrait, ou lot cité au
+   passage) est une **explication faible** : elle ne lève jamais une inclusion
+   manquante ; elle n'explique qu'un contenu partiel ou absent d'un lot
+   composé, affiché « à confirmer ». Seul le lot **en tête de ligne** est le
+   sujet d'une exclusion : un id cité dans le motif (« `#500` dépend de
+   `#600` ») reste une référence faible et ne lève pas l'omission de `#600`.
 2. **Manifeste × arbre.** Pour chaque entrée de composition, le delta du commit
    (`commit^..commit`, premier parent) doit encore être présent à la tête,
    vérifié **ligne par ligne**, pas par ascendance : toutes les lignes ajoutées
@@ -113,10 +210,12 @@ restent la preuve de ses lots.
    expliqués.
 
 Sortie : un rapport lisible ou `--json` (schéma `ameesh-paquet-inclusion/1`).
-Codes de retour : `0` aucun défaut ; `1` une inclusion manquante, un contenu
-absent non expliqué ou un commit introuvable, ou bien, sous `--strict`, un
-contenu partiel ou vide non expliqué ; `2` entrée invalide (manifeste ou tête
-introuvable, ou aucune liste attendue sans `--no-expected`).
+Codes de retour : `0` aucun défaut ; `1` une inclusion manquante, un lot prêt
+ni composé ni écarté avec un motif, un contenu absent non expliqué ou un commit
+introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
+expliqué ; `2` entrée invalide (manifeste ou tête introuvable, fichier de lots
+absent ou illisible, aucune source de liste prête sans `--no-ready`, ou aucune
+source de liste attendue sans `--no-expected`).
 
 ## Ce qu'il ne prouve pas
 
@@ -130,7 +229,9 @@ introuvable, ou aucune liste attendue sans `--no-expected`).
   changement de mode seul n'est pas un binaire et ne crée pas de faux signal.
 - Le contrôle ne juge ni les avis, ni les familles de relecture, ni les
   dépendances : il ne remplace pas la qualification du pilote (§12), il évite
-  qu'une omission passe inaperçue.
+  qu'une omission passe inaperçue. Il ne juge pas non plus la **sincérité** du
+  motif d'un « écarté » : il exige qu'il existe, et que la liste calculée des
+  lots prêts ait été confrontée au manifeste.
 
 ## Validation sur le paquet 11h (réel, lecture seule)
 

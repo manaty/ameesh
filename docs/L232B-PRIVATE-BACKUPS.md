@@ -80,6 +80,17 @@ and removes staging credentials. Retrieval proves artifact integrity;
 The expected digest and inventory must come from the pinned recovery set,
 not from an untrusted remote response.
 
+`pull --output ARCHIVE --sha256 SHA256 [--bytes N] [--timeout SECONDS]`
+receives a gzip-compressed archive on standard input — the guarded local dump
+that `ameesh-sauvegarde` already produced on the VM, streamed over SSH — and
+decompresses it in a private staging directory. The archive is published
+atomically only after its exact attested size and SHA-256 match — the
+attestation comes from the same SSH-authenticated host as the stream, so it
+proves the integrity of the transport, not the authenticity of the artifact
+vis-à-vis the pinned recovery set; a timeout reports the bytes already
+written. It runs no database client and receives no DSN: the poste's backup
+path no longer sends `pg_dump` through WireGuard.
+
 `retention-privee.py --root DIRECTORY register ARTIFACT FILE... --expires-at
 EPOCH --rollback-until EPOCH` registers a local recovery set with hashes and
 policy dates supplied by the enrolled controller. Include its dump, inventory

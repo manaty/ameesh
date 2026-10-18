@@ -2376,6 +2376,8 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of,
             number = issue_of(int(other))
             return ("Work item %d superseded by work item %d%s: issue closed by ameesh."
                     % (n, int(other), " (#%d)" % number if number else ""))
+        if item.get("close_reason") == "done":
+            return "Work item %d delivered: issue closed by ameesh." % n
         return "Work item %d abandoned: issue closed by ameesh." % n
     return None
 

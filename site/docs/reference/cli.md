@@ -357,7 +357,7 @@ ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agen
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
-ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA)
+ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA | --done)
 ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
 ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)

@@ -129,6 +129,18 @@ FERMEES = {
     # fusion est un état interne, lu par les exécuteurs et non par le rôle
     # superviseur externe ; classement fermé, aucun GRANT modifié.
     "review_catch_up": {"id", "bound_at", "actor"},
+    # #1945 (0453) : attente d'atterrissage planifiée — un lot, son véhicule,
+    # la tête épinglée, l'échéance et l'auteur. État interne lu par l'exécuteur
+    # (`planned_waits`), sans contenu ni secret ; fermé aux deux rôles
+    # superviseur, aucun GRANT modifié.
+    "work_landings": {"work_item_id", "vehicle_id", "pinned_sha", "until_on",
+                      "created_by", "created_at"},
+    # #1770 (0450) : le rapport de prévalidation au gel (sélection, tests, hôte,
+    # chemin du plan) est une preuve interne lue par l'exécuteur, pas un état
+    # de supervision ; table fermée aux deux rôles, aucun GRANT modifié.
+    "prevalidation_reports": {"work_item_id", "head_sha", "base_sha", "card_commit",
+                              "schema", "outcome", "ok", "causes", "report",
+                              "recorded_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

@@ -103,6 +103,11 @@ TESTS = REPO / "tests"
 TABLE = TESTS / "parts" / "durees.json"
 #: durée par test quand la table n'a rien pour le pilote (repli du repli)
 DEFAULT_PER_TEST = 0.5
+#: #1476 : poids plancher d'un module mesuré. La table arrondit au dixième et
+#: ne compte ni l'import ni setUpClass : 73 modules psql et 67 psycopg y pèsent
+#: 0,0 s. À poids nul, `split` les donnait tous à la même part (la première à
+#: égalité), qui portait alors seule leur coût réel de démarrage.
+MIN_WEIGHT = 1.0
 #: schéma des lignes du flux (docs/design/etudes/l161-tests-par-impact.md)
 FLOW_SCHEMA = "ameesh-test-event/1"
 #: modules « pilote » psql (découpage de la mesure, #1341 R1)
@@ -170,9 +175,22 @@ def map_durations(chemin: str | os.PathLike) -> dict:
 
 def weight(mods: list[str], pilote: str, table: dict | None = None,
           tests: pathlib.Path = TESTS) -> tuple[dict[str, float], list[str]]:
-    """Poids de chaque module, et la liste de ceux pesés par le repli."""
+    """Poids de chaque module, et la liste de ceux pesés par le repli.
+
+    #1476 : la carte ne mesure pas tous les modules sous chaque pilote (le
+    psql complet n'est pas sous mesure). La table statique des durées comble
+    ces trous ; la carte reste prioritaire quand elle a une durée. Sans cela,
+    un module non mesuré était pesé par son nombre de tests — un module
+    d'intégration lourd (des dizaines de secondes par test) passait pour léger
+    et déséquilibrait une part.
+    """
     if table is None:
         table = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
+    else:
+        base = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
+        for driver, mesures in table.items():
+            base.setdefault(driver, {}).update(mesures)
+        table = base
     mesures = table.get(pilote, {})
     connus = [m for m in mesures if m in set(mods)]
     total_tests = sum(test_count(m, tests) for m in connus)
@@ -180,7 +198,7 @@ def weight(mods: list[str], pilote: str, table: dict | None = None,
     resultat, repli = {}, []
     for m in mods:
         if m in mesures:
-            resultat[m] = float(mesures[m])
+            resultat[m] = max(float(mesures[m]), MIN_WEIGHT)
         else:
             resultat[m] = test_count(m, tests) * par_test
             repli.append(m)

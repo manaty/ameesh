@@ -50,6 +50,11 @@ elif args[0] == "show":
     prop = args[args.index("-p") + 1] if "-p" in args else ""
     if prop == "ActiveState":
         operation("show ActiveState")
+        # #2288 : la première lecture peut échouer (systemctl indisponible) ;
+        # le marqueur ne vaut que pour une lecture, la preuve après arrêt reste lisible.
+        if os.path.exists(os.path.join(state, "active_state_unreadable")):
+            os.remove(os.path.join(state, "active_state_unreadable"))
+            sys.exit(1)
         print(etat()[0])
     elif prop == "MainPID":
         operation("show MainPID")
@@ -72,12 +77,19 @@ elif args[0] == "stop":
         fh.write("stop active=%s pid=%s\n" % tuple(vivante))
     if scenario() == "pid-linger":
         final = ["inactive", "1234"]
-    elif scenario() == "failed":
+    elif scenario() == "failed" or vivante[0] == "failed":
         final = ["failed", "0"]   # stop non abouti (délai -> SIGKILL, sortie en erreur)
     else:
         final = ["inactive", "0"]
     with open(os.path.join(state, "unit"), "w") as fh:
         fh.write(" ".join(final) + "\n")
+elif args[0] == "reset-failed":
+    operation("reset-failed")
+    if scenario() == "reset-fails":
+        sys.exit(1)
+    if scenario() != "reset-no-effect":
+        with open(os.path.join(state, "unit"), "w") as fh:
+            fh.write("inactive 0\n")
 elif args[0] == "start":
     operation("start")
     with open(os.path.join(state, "restarted"), "w") as fh:
@@ -157,6 +169,11 @@ case $last in
   *psql*) echo 1 ;;
   *"ActiveState"*)
     echo "show ActiveState $unite" >> "$FAKE_STATE/ops.log"
+    # #2288 : la première lecture peut échouer ; le marqueur ne vaut que pour
+    # une lecture, la preuve après arrêt reste lisible.
+    if [ -e "$FAKE_STATE/active_state_unreadable" ]; then
+      rm -f "$FAKE_STATE/active_state_unreadable"; exit 1
+    fi
     set -- $(etat); echo "$1" ;;
   *"MainPID"*)
     echo "show MainPID $unite" >> "$FAKE_STATE/ops.log"
@@ -175,8 +192,12 @@ case $last in
     case $(stop_mode) in
       pid-linger) echo "inactive 1234" > "$FAKE_STATE/unit" ;;
       failed) echo "failed 0" > "$FAKE_STATE/unit" ;;
-      *) echo "inactive 0" > "$FAKE_STATE/unit" ;;
+      *) if [ "$1" = failed ]; then echo "failed 0"; else echo "inactive 0"; fi > "$FAKE_STATE/unit" ;;
     esac ;;
+  *"systemctl reset-failed"*)
+    echo "reset-failed $unite" >> "$FAKE_STATE/ops.log"
+    [ "$(stop_mode)" = "reset-fails" ] && exit 1
+    if [ "$(stop_mode)" != "reset-no-effect" ]; then echo "inactive 0" > "$FAKE_STATE/unit"; fi ;;
   *"systemctl start"*)
     echo "start $unite" >> "$FAKE_STATE/ops.log"
     : > "$FAKE_STATE/restarted"
@@ -250,10 +271,12 @@ class RestartLeaseTest(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             return [tuple(ligne.split()) for ligne in fh.read().splitlines()]
 
-    def op_position(self, nom):
+    def op_position(self, nom, after=-1):
         """Rang de la première opération `nom` sur l'unité de dev9, None si
         elle n'a pas eu lieu."""
         for rang, ligne in enumerate(self.ops()):
+            if rang <= after:
+                continue
             if not any("dev9" in champ for champ in ligne):
                 continue
             etiquette = " ".join(ligne[:-1]) if ligne[0] == "show" else ligne[0]
@@ -276,7 +299,7 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dev9 : redémarré", proc.stdout)
         stop = self.op_position("stop")
-        actif = self.op_position("show ActiveState")
+        actif = self.op_position("show ActiveState", after=stop)
         pid = self.op_position("show MainPID")
         start = self.op_position("start")
         self.assertIsNotNone(stop, "l'unité est arrêtée avant tout démarrage")
@@ -306,11 +329,59 @@ class RestartLeaseTest(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0, proc.stdout)
                 self.assertIsNone(self.op_position("start"),
                                   "aucun démarrage sans point sûr prouvé")
+                self.assertIsNone(self.op_position("reset-failed"),
+                                  "a new stop failure must not be cleared")
                 self.assertFalse(os.path.exists(os.path.join(self.state, "restarted")))
                 self.assertNotIn("dev9 : redémarré", proc.stdout)
                 attendu = ("l'arrêt échoue" if mode == "stop-fails"
                            else "arrêt non prouvé")
                 self.assertIn(attendu, proc.stderr)
+
+    def test_preexisting_failed_unit_is_reset_before_proven_stop(self):
+        with open(os.path.join(self.state, "unit"), "w", encoding="utf-8") as fh:
+            fh.write("failed 0\n")
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        before = self.op_position("show ActiveState")
+        reset = self.op_position("reset-failed")
+        stop = self.op_position("stop")
+        self.assertIsNotNone(reset, "the old failure is explicitly cleared")
+        self.assertLess(before, reset)
+        self.assertLess(reset, stop, "a new stop failure must remain visible")
+        self.assertLess(stop, self.op_position("show ActiveState", after=stop))
+        start = self.op_position("start")
+        self.assertLess(self.op_position("show ActiveState", after=stop), start)
+        self.assertLess(self.op_position("show MainPID", after=stop), start)
+        self.assertIn("dev9 : redémarré", proc.stdout)
+
+    def test_active_unit_is_not_reset_failed(self):
+        """#2288 : reset-failed n'est appelé que pour une unité `failed` ; une
+        unité active (cas courant d'un redémarrage) n'est jamais réinitialisée,
+        sans quoi un échec survenu pendant le drainage serait effacé."""
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(self.op_position("reset-failed"),
+                          "une unité active ne passe pas par reset-failed")
+        self.assertIsNotNone(self.op_position("start"))
+
+    def test_preexisting_failure_does_not_bypass_stop_proof(self):
+        for mode in ("failed", "pid-linger", "stop-fails", "reset-fails", "reset-no-effect"):
+            with self.subTest(mode=mode):
+                self.clear_ops()
+                with open(os.path.join(self.state, "unit"), "w", encoding="utf-8") as fh:
+                    fh.write("failed 0\n")
+                with open(os.path.join(self.state, "stop_mode"), "w", encoding="utf-8") as fh:
+                    fh.write(mode + "\n")
+                proc = self.restart("lease")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                reset = self.op_position("reset-failed")
+                self.assertIsNotNone(reset)
+                self.assertIsNone(self.op_position("start"))
+                self.assertFalse(os.path.exists(os.path.join(self.state, "restarted")))
+                if mode == "reset-fails":
+                    self.assertIsNone(self.op_position("stop"))
+                else:
+                    self.assertLess(reset, self.op_position("stop"))
 
     def test_statut_running_a_chaque_lecture_ne_bloque_pas(self):
         """#1152/R1 (starvation de l'incident impl07) : un statut `running` à
@@ -325,7 +396,7 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertIn("dev9 : redémarré (était running)", proc.stdout)
         self.assertNotIn("toujours en tour", proc.stderr)
         stop = self.op_position("stop")
-        actif = self.op_position("show ActiveState")
+        actif = self.op_position("show ActiveState", after=stop)
         pid = self.op_position("show MainPID")
         start = self.op_position("start")
         for nom, rang in (("stop", stop), ("show ActiveState", actif),
@@ -357,6 +428,21 @@ class RestartLeaseTest(unittest.TestCase):
         self.execstart("-")
         proc = self.restart("lease")
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "restarted")))
+
+    def test_unreadable_active_state_is_named_and_stops_before_any_restart(self):
+        """#2288 : la lecture initiale d'ActiveState qui échoue est nommée (au
+        lieu d'un `return 1` silencieux) et n'arrête ni ne démarre rien."""
+        with open(os.path.join(self.state, "active_state_unreadable"), "w",
+                  encoding="utf-8"):
+            pass
+        proc = self.restart("lease")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("dev9", proc.stderr)
+        self.assertIn("ActiveState", proc.stderr)
+        self.assertIsNone(self.op_position("reset-failed"))
+        self.assertIsNone(self.op_position("stop"))
+        self.assertIsNone(self.op_position("start"))
         self.assertFalse(os.path.exists(os.path.join(self.state, "restarted")))
 
     def test_no_password_on_a_command_line(self):

@@ -8,7 +8,11 @@ window, human decision). The hold stops the stale reminders and the SLO
 breaches, like any other planned wait, until the lot changes state or the hold
 is explicitly lifted. Only a pilot's hold counts here (`pilot_holds`), and the
 write path authenticates that claim (`work.check_wait_note`); the runner wake
-keeps its own, older convention (`LotSessions.HOLD_PREFIX`)."""
+keeps its own, older convention (`LotSessions.HOLD_PREFIX`).
+
+#2378: a lot in `waiting_human` with an open decision request (`ameesh decide
+ask`) waits for its decider until the request's deadline; past the deadline,
+the ordinary alerts come back."""
 from __future__ import annotations
 
 import datetime
@@ -24,6 +28,17 @@ _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
 #: external hold: the commitment names the gate it waits for (`gate:<name>`,
 #: or `external:<name>`), and holds the lot until the end of its due day.
 _GATE = re.compile(r"^(?:gate|external):(\S+)$", re.I)
+
+#: #2335 : une PR de paquet est une branche `integration/**` ; son manifeste
+#: (corps du lot porteur) nomme les unités avec leur tête gelée — `#1234 @
+#: abcdef0`, `#1234 abcdef0`, `#1234@abcdef0`, la forme des manifestes réels
+#: (#1342, #2085, #2270, #2277, #2347). Un `#N` cité en prose (« #2203
+#: exclu », « garder #1024 », « admis mais exclu ») n'est **pas** une unité :
+#: le taire masquerait justement l'alerte d'un lot qui attend son auteur.
+#: Une référence collée à un mot ou à un chemin (`manaty/ameesh#1697`) est
+#: écartée de même.
+_PACKET_BRANCH = "integration/"
+_UNIT = re.compile(r"(?<![\w/])#([0-9]{1,18})\s*@?\s*([0-9a-fA-F]{7,40})\b")
 
 
 def hold_end(due_on):
@@ -154,8 +169,107 @@ def ancestors(package_id, packages):
         package_id = package.get("parent")
 
 
+def decision_waits(requests, *, now) -> dict[int, dict]:
+    """#2378 : les lots qui attendent une décision ouverte et non échue.
+
+    `requests` : les demandes en attente (`decisions.pending`). Le lot attend
+    son décideur jusqu'à l'échéance la plus proche de ses demandes ouvertes ;
+    une seule demande échue (ou sans échéance) rend le signal : l'humain est
+    en retard, ce n'est plus une attente prévue."""
+    by_lot: dict[int, list] = {}
+    for request in requests or ():
+        lot = request.get("lot")
+        if isinstance(lot, int) and not isinstance(lot, bool):
+            by_lot.setdefault(lot, []).append(request)
+    out = {}
+    for lot, pending in by_lot.items():
+        dues = [request.get("due_ts") for request in pending]
+        if any(due is None or now >= float(due) for due in dues):
+            continue
+        first = min(pending, key=lambda r: (float(r["due_ts"]), int(r["id"])))
+        out[lot] = {"what": "decision", "decision": int(first["id"]),
+                    "owner": first.get("owner"),
+                    "due_ts": round(float(first["due_ts"]), 3),
+                    "until": time.strftime("%Y-%m-%d %H:%M",
+                                           time.localtime(float(first["due_ts"])))}
+    return out
+
+
+def packet_carriers(rows):
+    """#2335 : les porteurs de paquet ouverts, indexés par lot.
+
+    Un porteur est un lot ouvert dont la branche est `integration/**` : c'est
+    la PR que le composeur pousse et que le pilote fusionne. Le porteur ne
+    porte pas de code ; son corps est le manifeste des unités qu'il transporte.
+    """
+    out = {}
+    for row in rows or ():
+        if row.get("state") in ("merged", "promoted", "closed"):
+            continue
+        branch = str(row.get("branch") or "").strip()
+        if not branch.startswith(_PACKET_BRANCH):
+            continue
+        try:
+            out[int(row["id"])] = row
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _packet_wait(carrier):
+    """L'attente d'un lot inclus dans un paquet ouvert (forme `planned_wait`)."""
+    out = {"what": "packet", "vehicle": int(carrier["id"])}
+    branch = str(carrier.get("branch") or "").strip()
+    if branch:
+        out["branch"] = branch
+    head = str(carrier.get("branch_head") or "").strip()
+    if head:
+        out["head"] = head
+    return out
+
+
+def packet_waits(rows, open_items=None):
+    """#2335 : `{lot: wait}` pour tout lot ouvert nommé par un paquet.
+
+    La seule preuve est le manifeste du porteur : une unité y est nommée avec
+    sa tête gelée (`#<lot> <hex>` / `#<lot> @ <hex>`), la forme des manifestes
+    réels. Un simple `#N` en prose est ignoré (B1 de la relecture dev7) : un
+    lot exclu du paquet doit continuer d'alerter, sinon son attente serait
+    tue par un porteur qui ne le transporte pas.
+
+    Un lot inclus attend la **fusion du paquet**, pas un exécuteur : cette
+    attente est planifiée et tait la stagnation comme le SLO (#2335/A1).
+    """
+    universe: dict[int, dict] = {}
+    for row in open_items or ():
+        universe[int(row["id"])] = row
+    for row in rows or ():
+        universe.setdefault(int(row["id"]), row)
+    carriers = packet_carriers(universe.values())
+    if not carriers:
+        return {}
+    open_ids = {int(r["id"]) for r in universe.values()
+                if r.get("state") not in ("merged", "promoted", "closed")}
+    declared: dict[int, dict] = {}
+    for cid, carrier in carriers.items():
+        text = "%s\n%s" % (carrier.get("title") or "", carrier.get("body") or "")
+        for match in _UNIT.finditer(text):
+            ident = int(match.group(1))
+            if ident in open_ids and ident != cid:
+                declared.setdefault(ident, carrier)
+    out: dict[int, dict] = {}
+    for row in rows or ():
+        ident = int(row["id"])
+        if row.get("state") in ("merged", "promoted", "closed"):
+            continue
+        carrier = declared.get(ident)
+        if carrier is not None:
+            out[ident] = _packet_wait(carrier)
+    return out
+
+
 def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=(),
-            holds=None):
+            landings=(), holds=None, decisions=(), packets=None):
     """Pure resolver. Only an open execution lot can block another lot.
 
     Commitments apply to their explicit work item or to their plan package
@@ -168,11 +282,30 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     commitment's due day: the gate is not a lot, so nothing else can release
     it, and the date is what makes the hold end by itself.
 
+    #1945: a declared landing (`landings`, rows of `work_landings` enriched
+    with the vehicle's state and last freeze) is an admission PINNED to one
+    freeze. It waits only while the vehicle is open, not `blocked`, its last
+    freeze is exactly `pinned_sha`, and the finite day `until_on` is not past
+    (its day counts in full, like a hold). A new freeze, a missing freeze or a
+    blocked vehicle gives the signal back until the pilot renews the
+    declaration explicitly. A scheduled start, a dependency or a gate stays
+    ahead: the more explicit wait wins. Nothing is inferred from prose or git.
+
     `holds` (#1664, `pilot_holds`) est un hold déclaré, prioritaire sur une
     dépendance : le lot est parqué, pas en attente d'un lot.
+
+    `decisions` (#2378) : les demandes de décision en attente
+    (`decisions.pending`). Un lot `waiting_human` dont les demandes ouvertes
+    ne sont pas échues attend son décideur (`decision_waits`), après un hold
+    du pilote et avant une dépendance ; échue, la demande ne tait plus rien.
+
+    `packets` (#2335, `packet_waits`) est l'appartenance à un paquet ouvert :
+    le lot attend la fusion du porteur, pas un exécuteur ; cette attente passe
+    avant une dépendance (le paquet est le véhicule réel).
     """
     open_ids = {int(r["id"]) for r in open_items
                 if r.get("state") not in ("merged", "promoted", "closed")}
+    landing_by_item = {int(l["work_item_id"]): l for l in landings}
     package_lots = {}
     for row in open_items:
         if int(row["id"]) not in open_ids:
@@ -220,6 +353,8 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     # #1664 : les holds du pilote (dict lot -> hold), distincts du `held` de
     # porte par lot utilisé plus bas (collision de noms à l'union avec main).
     pilot = holds or {}
+    asked = decision_waits(decisions, now=now)
+    packet = packets or {}
     for row in rows:
         ident = int(row["id"])
         if row.get("state") in ("merged", "promoted", "closed"):
@@ -241,6 +376,12 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         if ident in pilot:
             waits[ident] = dict(pilot[ident])
             continue
+        if row.get("state") == "waiting_human" and ident in asked:
+            waits[ident] = dict(asked[ident])
+            continue
+        if ident in packet:
+            waits[ident] = dict(packet[ident])
+            continue
         blockers = set(direct.get(ident, ()))
         for package_id in ancestors(row.get("package_id"), packages):
             blockers.update(by_package.get(package_id, ()))
@@ -256,17 +397,130 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
                     break
         if held:
             waits[ident] = dict(held, what="hold")
+            continue
+        # #1945 (revue B) : l'admission est épinglée au gel du véhicule. Elle
+        # n'éteint que si le véhicule est ouvert, non bloqué, et si son dernier
+        # gel est EXACTEMENT la tête épinglée ; l'échéance (journée finie,
+        # comptée en entier) doit être future. Nouveau gel, gel absent, véhicule
+        # bloqué, retrait ou échéance dépassée : le signal stale revient, et le
+        # pilote renouvelle explicitement la déclaration sur la nouvelle tête.
+        # #2171 N3 : le lot parké doit être EN REVUE (qa) — un atterrissage ne
+        # remplace que l'attente de fusion ; sorti de qa (build, blocked,
+        # waiting_human), le signal revient.
+        landing = landing_by_item.get(ident)
+        if (not landing or row.get("state") != "qa"
+                or landing.get("admitted") is False):
+            continue
+        vehicle = int(landing["vehicle_id"])
+        open_vehicle = landing.get("open")
+        if open_vehicle is None:
+            open_vehicle = vehicle in open_ids
+        etat = landing.get("vehicle_state")
+        pinned = (landing.get("pinned_sha") or "").strip()
+        tete = (landing.get("head") or "").strip()
+        end = hold_end(landing.get("until_on"))
+        if (vehicle == ident or not open_vehicle or etat == "blocked"
+                or not pinned or not tete or pinned != tete
+                or end is None or now >= end):
+            continue
+        wait = {"what": "landing", "vehicle": vehicle,
+                "until": str(landing.get("until_on"))[:10], "head": pinned}
+        if etat:
+            wait["step"] = etat
+        waits[ident] = wait
     return waits
 
 
+def latest_freeze(rows):
+    """Le dernier gel d'un lot : `(at, id)` maximal, jamais l'ordre de lecture.
+
+    #2171 N2 : `set_landing` épingle avec `ORDER BY at DESC, id DESC` ; tous les
+    lecteurs doivent départager un ex aequo de la même façon, sinon la tête
+    comparée à `pinned_sha` peut différer à tort (sens sûr : l'alerte revient).
+    Les jalons non `frozen` ou sans sha ne comptent pas."""
+    freezes = [r for r in rows if r.get("kind") == "frozen"
+               and (r.get("sha") or "").strip()]
+    if not freezes:
+        return None
+    return max(freezes, key=lambda r: (float(r.get("at_ts") or 0),
+                                       int(r.get("id") or 0)))
+
+
+def _admitted(st, rows, landings):
+    """#2171 N3 (revue) : l'admission se relit sur le LOT, pas seulement au geste.
+
+    Le chemin groupé ne doit pas parquer un lot qui a perdu son gel ou son
+    verdict acquis depuis la déclaration (nouveau gel sans verdict, retour en
+    `qa` après un build) : même vérité que `progress._jalons_de_lot`, donc le
+    signal stale revient comme dans `progress`. Trois lectures groupées, pour
+    les seuls lots déclarés."""
+    if not landings:
+        return []
+    from . import progress
+    ids = sorted({int(l["work_item_id"]) for l in landings})
+    by_id = {int(r["id"]): r for r in rows}
+    transitions, actions, declared = {}, {}, {}
+    for row in st.progress.lot_transitions(ids):
+        transitions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_actions(ids):
+        actions.setdefault(int(row["work_item_id"]), []).append(row)
+    for row in st.progress.lot_milestones(ids):
+        declared.setdefault(int(row["work_item_id"]), []).append(row)
+    out = []
+    for landing in landings:
+        ident = int(landing["work_item_id"])
+        item = by_id.get(ident)
+        if item is None:
+            out.append(landing)
+            continue
+        jalons = progress._jalons_de_lot(
+            item, transitions.get(ident, []), actions.get(ident, []),
+            declared.get(ident, []))
+        admitted = (jalons.get("last_frozen") is not None
+                    and jalons.get("verdict_kind") == "ok"
+                    and bool(jalons.get("verdict_current")))
+        out.append(dict(landing, admitted=admitted))
+    return out
+
+
+def _with_heads(st, landings):
+    """#1945 : la tête exacte du véhicule est son dernier gel, lu en base.
+
+    Une lecture groupée pour tous les véhicules déclarés, comparée à chaque
+    passe à la tête épinglée dans `work_landings` (`pinned_sha`) : un nouveau
+    gel ne prolonge donc rien sans renouvellement explicite. Le départage à
+    égalité d'instant est celui de `latest_freeze` (#2171 N2)."""
+    rows = list(landings)
+    vehicles = sorted({int(l["vehicle_id"]) for l in rows})
+    by_vehicle: dict[int, list] = {}
+    if vehicles:
+        for mark in st.progress.lot_milestones(vehicles):
+            by_vehicle.setdefault(int(mark["work_item_id"]), []).append(mark)
+    heads = {vid: latest_freeze(marks) for vid, marks in by_vehicle.items()}
+    out = []
+    for landing in rows:
+        head = heads.get(int(landing["vehicle_id"]))
+        out.append(dict(landing, head=head["sha"].strip()) if head else landing)
+    return out
+
+
 def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=None,
-         holds=None):
+         holds=None, decisions=None, packets=None):
     """Grouped, unbounded truth reads; no query per candidate or dependency.
+
+    `decisions` (#2378) : les demandes en attente, lues ici en une lecture
+    groupée seulement quand un lot est en `waiting_human` ; `()` les ignore.
 
     `holds` peut être fourni par un appelant qui a déjà lu le flux ciblé
     (`pilot_holds`) : sinon il est lu ici, en une lecture groupée (#1664) qui
     ne transfère que les transitions et les notes hold/levée — jamais le
-    journal entier ni le texte des notes ordinaires."""
+    journal entier ni le texte des notes ordinaires.
+
+    `packets` (#2335) : marquer les unités d'un porteur `integration/**`
+    ouvert comme attente de paquet. `None` (défaut) réutilise le census déjà
+    fourni (`open_items`) ou déjà lu pour les engagements ; `True` le force ;
+    `False` l'interdit. Un appelant qui n'a pas le census ne paie donc pas une
+    lecture `open_lots_activity(None)` en plus (N1 de la relecture dev7)."""
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
@@ -280,8 +534,23 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     commitments = st.roadmap.commitments(statuses=["open"])
     packages = (packages if packages is not None else
                 {p["id"]: p for p in st.packages.all(include_absent=True)})
+    supplied = open_items is not None
     if open_items is None:
-        open_items = st.operations.open_lots_activity(None) if any(
-            c.get("depends_on") for c in commitments) else []
+        if packets is True or any(c.get("depends_on") for c in commitments):
+            open_items = st.operations.open_lots_activity(None)
+        else:
+            open_items = []
+    elif packets is True and not open_items:
+        open_items = st.operations.open_lots_activity(None)
+    want_packets = bool(packets) if packets is not None else (supplied or bool(open_items))
+    packet = packet_waits(rows, open_items) if want_packets else {}
+    landings = _with_heads(st, _admitted(
+        st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
+    if decisions is None:
+        decisions = ()
+        if any(r.get("state") == "waiting_human" for r in rows):
+            from . import decisions as decisions_mod  # import tardif : decisions importe work
+            decisions = decisions_mod.pending(db, now)
     return resolve(rows, dates, commitments, packages, open_items, now=now,
-                   dependencies=dependencies, holds=holds)
+                   dependencies=dependencies, landings=landings, holds=holds,
+                   decisions=decisions, packets=packet)

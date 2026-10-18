@@ -179,18 +179,33 @@ RECENT_FAILURE_DAYS = 7
 #: partagent un hôte, la part unique pesait 21,7-26,6 min au repos (médiane
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
-#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète passe à neuf parts (#1692) : sur le run
+#: ralentissement mesuré de 2,5-3x. psycopg : quatre parts pour une demande de
+#: lot (L1211), six pour la suite complète depuis #2292. Mesure sur les cinq
+#: derniers paquets (h-0500 à h-1900) : à quatre parts, 14,3-30,5 min sous
+#: saturation, et les parts 4/4 de h-1800 puis 1/4 de h-1900 ont été coupées au
+#: plafond de 30 min sans test en échec ; six parts visent ~15-20 min, sous le
+#: plafond relevé à 45 min (aligné sur « autre système de fichiers »).
+#: La suite psql complète passe à neuf parts (#1692) : sur le run
 #: 38736559499 attempt 2, les six parts ont pesé 26-45,5 min sous saturation
 #: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
 #: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
 #: mesuré, huit en laisseraient ~34.
+#:
+#: #1476 (18/10) : la cible est 15 min bout en bout. Mesure du run de paquet
+#: 39085758208 (h-2300, 6 psycopg / 9 psql, pool de 24 runners, 457 modules) :
+#: 51,7 min, parts psql de 15,8 à 36,5 min, psycopg de 11,4 à 20,5 min ; le
+#: travail mesuré est 201 min psql + 90 min psycopg. À 16 + 8 parts, les 24
+#: jobs occupent les 24 runners et la part la plus lente vise ~13-15 min, d'où
+#: PARTS : psycopg de 6 à 8 (part la plus lente 21,1 min à 6), psql de 9 à 16
+#: (36,5 min à 9). Le découpage suit les durées mesurées du run (flux), pas une
+#: hypothèse : tests/parts/durees.json est rafraîchi par ces mesures et la
+#: carte complète ses trous (weights()).
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 9)}
+PARTS = {"psycopg": (4, 8), "psql": (3, 16)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
-#: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
+#: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).
 PR_TARGET_PART_S = 300
 #: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
@@ -1082,7 +1097,8 @@ def _migration(card: dict, impact: Impact, status: str, path: str, head: str,
         impact.hit(card.get("tables", {}).get(table, ()), f"{path} (table {table})")
 
 
-def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path) -> None:
+def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path,
+          *, own: bool = True) -> None:
     readers = set(card.get("donnees", {}).get(path, ()))
     impact.hit(readers, path)
     listers: set[str] = set()
@@ -1091,7 +1107,15 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
     # a removal outside documentation is already a doubt, raised by `judge`:
     # only a removed document stays quiet here (the docs lane)
-    if not readers and not listers and not is_doc(path) and status != "D":
+    #
+    # #1314/#1476 : une donnée non Python que la branche ne change pas
+    # (`own=False`) vient de la cible, qui l'a déjà passée en suite complète :
+    # elle ne force plus le repli de la branche. C'est le cas mesuré d'un
+    # fichier sans lecteur mesuré (par exemple un `.cjs` ou un `.json` que la
+    # carte ne connaît pas encore) changé sur main entre la carte et la tête
+    # testée : le 15/10, deux lots sans rapport ont ainsi basculé en suite
+    # complète. Une donnée que la branche change elle-même reste un doute.
+    if not readers and not listers and not is_doc(path) and status != "D" and own:
         impact.doubt(f"{path}: read by no measured test", path)
 
 
@@ -1103,12 +1127,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
     `own` is the set of paths the branch itself changes — `own_base` (the base
     it merges, `HEAD^1` of a pull request's merge commit) to `head` — and
     `None` when that range cannot be read or is not trustworthy. A file of the
-    CI foundation (`is_foundation`) that the target already changed since the
-    map commit, and that this branch does not change, raises no doubt: the
-    target's own full suite validated it, and a late map must not send every
-    lot branch back to the full suite (#1314). The version-only exemption of
-    `pyproject.toml` (L157) is judged on that same own range, so a target
-    change to the file no longer breaks it.
+    CI foundation (`is_foundation`), or a data file read by no measured test
+    (`_data`), that the target already changed since the map commit, and that
+    this branch does not change, raises no doubt: the target's own full suite
+    validated it, and a late map must not send every lot branch back to the
+    full suite (#1314, #1476). The version-only exemption of `pyproject.toml`
+    (L157) is judged on that same own range, so a target change to the file no
+    longer breaks it.
     """
     impact = Impact()
     known_modules = set(card.get("modules", {}))
@@ -1159,7 +1184,10 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         elif path.startswith(MIGRATIONS_DIR) and path.endswith(".sql"):
             _migration(card, impact, status, path, head, repo)
         else:
-            _data(card, impact, status, path, repo)
+            # #1476 : `own` inconnu (range illisible) reste conservateur : la
+            # donnée est jugée comme changée par la branche, donc le doute tient.
+            _data(card, impact, status, path, repo,
+                  own=own is None or path in own)
     #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
     #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
     #: exécuté au niveau module (relecture Codex, B2 résiduel).
@@ -1341,6 +1369,26 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     return out
 
 
+def _overhead(card: dict | None, driver: str) -> float:
+    """#2397 : rapport carte / table statique pour un pilote (`measure.surcout`).
+
+    La carte mesure la suite sous couverture, la table statique la mesure sans
+    couverture : leurs durées ne sont pas comparables. `scripts/map.py` relève
+    le rapport des deux sur les modules que la carte connaît ; appliqué à la
+    table quand elle comble un trou, il ramène les deux sources à la même
+    échelle. Sans relevé (carte antérieure à `measure`), 1.0.
+    """
+    if not card:
+        return 1.0
+    mesure = card.get("measure") or card.get("mesure") or {}
+    surcout = mesure.get("surcout") if isinstance(mesure, dict) else None
+    try:
+        facteur = float((surcout or {}).get(driver))
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+    return facteur if facteur > 0 else 1.0
+
+
 def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, float]:
     table = None
     if card:
@@ -1354,6 +1402,27 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
                 table.setdefault(d, {})[module] = s
         if not table.get(driver):
             table = None
+    # #1476 : pour le découpage de la CI, la table statique (mesurée sur la
+    # suite complète, tous les modules) comble les trous de la carte ; quand la
+    # carte connaît une durée, c'est son dernier relevé qui fait foi (L148
+    # stage 6, `test_plan_weights_read_the_english_key`). L'ordre inverse
+    # (statique prioritaire) écrasait la mesure de la carte par un chiffre plus
+    # ancien et cassait ce contrat.
+    # #2397 : la table ne comble ces trous qu'à l'échelle de la carte (sous
+    # couverture) : son `surcout` la convertit, au lieu de mélanger une durée
+    # pleine suite et une durée sous couverture dans le même découpage.
+    if table is not None and parts.TABLE.exists():
+        mesurees = json.loads(parts.TABLE.read_text(encoding="utf-8"))
+        complete = {}
+        for d, valeurs in mesurees.items():
+            if not isinstance(valeurs, dict):
+                continue  # `_source` et autres métadonnées de la table
+            facteur = _overhead(card, d)
+            complete[d] = {m: (float(v) * facteur if isinstance(v, (int, float)) else v)
+                           for m, v in valeurs.items()}
+        for d, valeurs in table.items():
+            complete.setdefault(d, {}).update(valeurs)
+        table = complete
     weighed, _ = parts.weight(modules, driver, table)
     return weighed
 

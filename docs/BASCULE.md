@@ -1018,9 +1018,12 @@ The `installer` step follows the same practice.
 
 1. `poste.sh verifier`: target databases (without password), runners, SSH
    access to the server. Nothing is modified.
-2. `poste.sh sauvegarder`: `pg_dump -Fc` of the mesh database (the
-   server's) from the workstation, server backup (`ameesh-sauvegarde`), and
-   `pg_dump` of the old database, into `~/backups/ameesh/`.
+2. `poste.sh sauvegarder`: the server backup (`ameesh-sauvegarde`) dumps the
+   mesh database on the VM into its guarded local copy, then `poste.sh`
+   retrieves that dump compressed over SSH into `~/backups/ameesh/`, checking
+   its size and SHA-256 before publishing it. `pg_dump` of the old database
+   follows. The retrieval is bounded and reports a timeout with the bytes
+   already written: a slow WireGuard link no longer fails silently.
 3. `poste.sh installer [REF]`: snapshot of commit REF, installed with its
    dependencies (psycopg). The previous version is recorded for rollback.
    Running runners keep the old code in memory: continue without
@@ -1245,9 +1248,14 @@ code would have to check for the presence of each new column on every
 query, in every future lot: a single omission is enough to bring the outage back,
 and these guards would never be removed. The repository's migrations, for
 their part, are almost always additive (nullable columns or with a default, new
-tables, replaced constraints): the previous code runs without error on a
-migrated database, which every update since L60 already verifies. So we migrate
-**first**, then install, then restart.
+tables, replaced constraints). Compatibility must also hold on long-lived
+connections: adding a column changes the result type of `SELECT *`. Psycopg's
+automatically prepared statements can then fail with SQLSTATE `0A000`
+(`cached plan must not change result type`), even though the same old query
+works on a fresh connection. Automatic preparation is disabled in `db.py`
+(#2339); parameters remain bound normally. See the
+[Psycopg prepared statement documentation](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html).
+We migrate **first**, then install, then restart.
 
 **Order of steps, workstation side** (the previous sections remain valid
 for the content of each version):
@@ -1261,8 +1269,34 @@ for the content of each version):
    once, then the old database. `migrate --dry-run` first displays each
    missing migration, "additive" or "NON additive" (NOT additive) with the reason.
    Both preview and execution retain `--additive-only` even if REF is installed.
+   After each database migration and the target code's `doctor --probe`,
+   `auto-take-probe.py` runs with the **installed** interpreter in isolated mode
+   (`python -I`), using the installed auto-take code in dry-run mode and a
+   database connection forced read-only. It also reads review proposals even
+   when other work is available. This fresh-connection probe cannot inspect
+   prepared plans held by existing runners; the connection policy above and the
+   warm-connection migration regression test cover that case.
+   A failure means the old code cannot serve the migrated schema. It must not
+   leave that code in place: the target commit has already passed
+   `doctor --probe`, so `poste.sh migrer` finishes the other database's
+   migration, then **installs the target commit and restarts this host's
+   runners immediately** (#2357), instead of stopping the update. The restart
+   is thrown into a transient `systemd-run --user` unit when the user manager
+   accepts it, as any restart started from a runner (see
+   [AUDITEUR](AUDITEUR.md)); a plain shell without it falls back to a direct
+   restart. If that immediate installation or restart fails, stop and prepare a
+   compatible fix at once: the database stays migrated, so do not undo it and
+   do not let the old code keep serving it. The mesh database is migrated once
+   for the whole mesh: install and restart the other hosts without delay
+   (`vm.sh installer`, `vm.sh redemarrer`, or the staging sequence), rather than
+   waiting for an ordinary rollout. The **staging sequence** (`staging.sh`) sets
+   `MIGRER_SANS_REDEMARRAGE=1` for this step: it is not stopped by the failed
+   probe, and installs/restarts the hosts itself in the canonical order (agents
+   VMs first, poste last, canon §14).
 3. `poste.sh installer [REF]`: refuses as long as `doctor --probe` of the new
    code reports a missing migration, on the mesh database or the old one.
+   After the automatic fallback above it is already done (and idempotent);
+   `poste.sh role` in the next step still applies.
 4. `poste.sh role`, `poste.sh redemarrer`, then `vm.sh installer [REF]` and
    `vm.sh redemarrer`. **`vm.sh installer` also refuses** as long as the mesh
    database does not have all of REF's migrations (read from the server's clone,

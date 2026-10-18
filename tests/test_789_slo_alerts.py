@@ -9,14 +9,15 @@ retard : il est tu.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import time
 import unittest
 from unittest import mock
 
-from ameesh import (alert_briefs, exploitation, notify, registry, storage, work,
-                    work_dependencies)
+from ameesh import (alert_briefs, decisions, exploitation, notify, planned_waits,
+                    registry, stagnation, storage, work, work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -71,6 +72,36 @@ class _Base(PgTestCase):
             " VALUES (%s, 'verdict', now() - make_interval(secs => %s), 'rel', 'ok')",
             (self.lot["id"], float(verdict_s)))
         self.now = time.time()
+
+    def qa_at(self, verdict_ts, *, created_s=7200.0, lot=None):
+        """qa avec un verdict `ok` à l'instant absolu `verdict_ts` (#2335).
+
+        Les autres étapes restent tenues : création `created_s` avant le
+        verdict, build 30 min après la création (cible 1 h)."""
+        lot = self.lot if lot is None else lot
+        work.move(self.db, lot["id"], "build")
+        work.move(self.db, lot["id"], "qa")
+        created = float(verdict_ts) - float(created_s)
+        self.db.execute("UPDATE work_items SET created_at = to_timestamp(%s)"
+                        " WHERE id = %s", (created, lot["id"]))
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = to_timestamp(%s)"
+            " WHERE work_item_id = %s AND state = 'build'",
+            (created + 1800.0, lot["id"]))
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, actor, verdict)"
+            " VALUES (%s, 'verdict', to_timestamp(%s), 'rel', 'ok')",
+            (lot["id"], float(verdict_ts)))
+        self.now = float(verdict_ts)
+
+    def packet(self, body="", *, branch="integration/paquet-test", head=None):
+        """Un porteur de paquet ouvert (#2335) : branche `integration/**`."""
+        carrier = work.add(self.db, title="porteur de paquet test", body=body,
+                           branch=branch, actor="test")
+        if head:
+            self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                            (head, carrier["id"]))
+        return carrier
 
     def briefs(self, alert):
         listing = [{"name": n, "team": ""} for n in ("dev1", "orch", "bureau", "auditeur")]
@@ -151,6 +182,88 @@ class AlerteTest(_Base):
             " VALUES (%s, 'verdict', now() - interval '5 minutes', 'rel', 'ok')",
             (self.lot["id"],))
         self.assertEqual(self.slo(), [])
+
+
+class PaquetTest(_Base):
+    """#2335 : un paquet en cours est une attente planifiée, et l'horloge
+    GO → fusion ne part qu'au premier créneau de paquet après le GO."""
+
+    GO = datetime.datetime(2026, 10, 17, 23, 5, tzinfo=datetime.timezone.utc).timestamp()
+
+    def test_lot_dans_un_paquet_ouvert_est_une_attente_planifiee(self):
+        self.qa_at(self.GO)
+        self.packet(body="unités : #%d @ abcdef0 #999999 @ cafebabe" % self.lot["id"])
+        self.now = self.GO + 75 * 60
+        self.assertEqual(self.slo(), [])
+        rows = storage.of(self.db).operations.open_lots_activity(None)
+        described = stagnation.describe(self.db, rows, now=self.now, open_items=rows)
+        info = described[self.lot["id"]]
+        self.assertEqual((info["planned_wait"] or {}).get("what"), "packet")
+        self.assertEqual((info["waiting"] or {}).get("what"), "packet")
+        self.assertIn("packet merge", info["waiting"]["label"])
+        self.assertIn("packet merge", work_dependencies.wait_label(info["planned_wait"]))
+        self.assertIsNone(info["stale"])
+
+    def test_lot_exclu_en_prose_reste_signale(self):
+        # B1 (relecture dev7) : un lot seulement cité (« exclu », « garder »)
+        # n'est pas transporté ; son alerte ne doit pas être tue par le
+        # porteur. Seule une unité nommée avec sa tête l'est.
+        self.qa_at(self.GO)
+        exclu = work.add(self.db, title="exclu du paquet", assignee="dev1")
+        self.qa_at(self.GO, lot=exclu)
+        self.packet(body="unités : #%d @ abcdef0 ; #%d exclu (verdict manquant)"
+                    % (self.lot["id"], exclu["id"]))
+        self.now = self.GO + 125 * 60         # 01:10, après le créneau 00:00
+        alerts = self.slo()
+        self.assertEqual([a["lot"] for a in alerts], [exclu["id"]], alerts)
+        self.assertEqual(alerts[0]["step"], "verdict_merge")
+        self.assertIn("pilot", alerts[0]["targets"])
+
+    def test_non_inclus_avant_le_creneau_ne_signale_rien(self):
+        # GO 23:05, premier créneau 00:00 : à 00:20, 20 min < cible 30 min.
+        self.qa_at(self.GO)
+        self.packet(body="unités : #999999 @ cafebabe")
+        self.now = self.GO + 75 * 60          # 00:20
+        self.assertEqual(self.slo(), [])
+
+    def test_non_inclus_creneau_manque_signale_au_niveau_1(self):
+        # 01:10 : le créneau 00:00 est passé et la cible de 30 min est
+        # dépassée ; c'est le pilote qui porte la fusion dans le paquet.
+        self.qa_at(self.GO)
+        self.packet(body="unités : #999999 @ cafebabe")
+        self.now = self.GO + 125 * 60         # 01:10
+        alerts = self.slo()
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertEqual(alerts[0]["step"], "verdict_merge")
+        self.assertGreaterEqual(alerts[0]["level"], 1)
+        self.assertIn("pilot", alerts[0]["targets"])
+
+    def test_les_mentions_en_prose_ne_sont_pas_des_unites(self):
+        # Les quatre faux positifs réels de la relecture dev7 : un lot cité
+        # dans une phrase (« exclu », « garder ») n'est pas transporté.
+        rows = [{"id": i, "state": "qa"} for i in (2203, 1976, 2062, 1024)]
+        carrier = {"id": 9001, "state": "qa", "branch": "integration/paquet-test",
+                   "body": "Paquet ; #2203 exclu ; #1976 admis mais exclu du paquet ; "
+                           "Périmètre enregistré au lot #2062 ; garder #1024."}
+        self.assertEqual(planned_waits.packet_waits(rows, rows + [carrier]), {})
+
+    def test_cadence_du_canon_sans_porteur_observe(self):
+        # B2 (relecture dev7) : entre deux paquets (porteur précédent fusionné,
+        # suivant pas encore ouvert), la cadence déclarée au canon s'applique
+        # quand même ; l'horloge ne repart pas du GO.
+        class Cadence:
+            @staticmethod
+            def next_packet(at):
+                return float(at) + 3600.0
+        with mock.patch.object(exploitation, "_packet_calendar", return_value=Cadence()):
+            self.assertEqual(exploitation._packet_slot(
+                None, self.GO, "ameesh", observed=False), self.GO + 3600.0)
+
+    def test_creneau_horaire_utc_seulement_si_paquet_observe(self):
+        self.assertEqual(exploitation._packet_slot(
+            None, self.GO, "ameesh", observed=True), self.GO + 55 * 60)
+        self.assertIsNone(exploitation._packet_slot(
+            None, self.GO, "ameesh", observed=False))
 
 
 class BriefsTest(_Base):
@@ -259,6 +372,90 @@ class AttentePorteurTest(_Base):
         text = alert_briefs._slo_breach(alert)
         self.assertIn("assignee: act on it", text)
         self.assertNotIn("do not reassign its holder", text)
+
+
+class AttenteDecisionTest(_Base):
+    """#2378 : un lot `waiting_human` à demande de décision ouverte attend son
+    décideur. Non échue, c'est une attente prévue (aucune alerte) ; échue,
+    l'alerte vise le pilote et prescrit de vérifier l'échéance avec le
+    demandeur, jamais de réassigner le porteur ni de relancer l'owner (canon
+    §9). Sans demande, rien ne change."""
+
+    def ask(self, due_in_s=2 * HEURE):
+        view = decisions.ask(self.cfg, self.db, requester="dev1",
+                             question="Quel critère pour la porte des avis ?",
+                             options=["a=union", "b=par auteur"],
+                             lot=str(self.lot["id"]), due_ts=time.time() + due_in_s)
+        self.now = time.time()
+        return view
+
+    def expire(self, view, ago_s=10 * 60):
+        """La demande est échue depuis `ago_s` (l'échéance passe en base)."""
+        self.db.execute(
+            "UPDATE agent_mailbox SET payload = jsonb_set(payload, '{decision,due_ts}',"
+            " to_jsonb(%s::float8)) WHERE id = %s",
+            (time.time() - ago_s, view["id"]))
+        self.now = time.time()
+
+    def test_demande_ouverte_non_echue_tait_l_alerte(self):
+        self.qa(verdict_s=100 * 60)
+        self.assertEqual([a["level"] for a in self.slo()], [3])
+        view = self.ask()
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "waiting_human")
+        self.assertEqual(self.slo(), [])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=self.now,
+                                                          **_seuils(stale_lot_s=60))
+                          if a["type"] == "stale_lot" and a.get("lot") == self.lot["id"]],
+                         [])
+        wait = stagnation_wait(self.db, self.lot, self.now)
+        self.assertEqual((wait["what"], wait["decision"]), ("decision", view["id"]))
+        self.assertIn("decision #%d" % view["id"], work_dependencies.wait_label(wait))
+
+    def test_demande_echue_vise_le_pilote_sans_reassignation(self):
+        self.qa(verdict_s=100 * 60)
+        view = self.ask()
+        self.expire(view)
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 3, ["pilot", "bureau", "auditeur"])])
+        waiting = alerts[0]["waiting"]
+        self.assertEqual((waiting["what"], waiting["decision"]), ("decision", view["id"]))
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
+        for text in out.values():
+            self.assertIn("decision #%d" % view["id"], text)
+            self.assertIn("check the deadline with the requester", text)
+            self.assertNotIn("remind the decider", text)
+            self.assertIn("deadline", text)
+            self.assertNotIn("reassign it now", text)
+            self.assertNotIn("ameesh work assign", text)
+
+    def test_demande_echue_niveau_1_vise_le_pilote(self):
+        self.qa(verdict_s=50 * 60)
+        self.expire(self.ask())
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts], [(1, ["pilot"])])
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["orch"])
+        self.assertIn("pilot: the lot is `waiting_human` on decision", out["orch"])
+        self.assertIn("do not reassign its holder", out["orch"])
+
+    def test_waiting_human_sans_demande_inchange(self):
+        # ligne antérieure à L233 : `work.move` refuserait la transition
+        self.qa(verdict_s=50 * 60)
+        self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id = %s",
+                        (self.lot["id"],))
+        self.now = time.time()
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts], [(1, ["assignee"])])
+        self.assertNotIn("decision", alerts[0]["waiting"])
+        self.assertIn("assignee: act on it", self.briefs(alerts[0])["dev1"])
+
+
+def stagnation_wait(db, lot, now):
+    from ameesh import stagnation
+    row = work.get(db, lot["id"])
+    return stagnation.describe(db, [row], now=now)[int(lot["id"])]["planned_wait"]
 
 
 class NotifyLivreTest(_Base):
