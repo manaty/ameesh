@@ -173,6 +173,24 @@ class RuleTest(unittest.TestCase):
         self.assertIn("dispense", body)
         self.assertIn("route ci-dessus", body)
         self.assertIn("deux familles distinctes", body)
+        self.assertIn("livrés les verdicts ? saisir le pilote", body)
+        self.assertNotIn("clore cette mission** : `ameesh work close <id> --done`", body)
+
+    def test_auteur_humain_sans_harnais_ne_promet_pas_un_refus(self):
+        body = review_lot.body_of(
+            self.item, LOT, klass={"class": "sensitive", "critical": True},
+            author={"name": "human:smichea", "harness": ""})
+        self.assertNotIn("Famille de l'auteur non tracée", body)
+        self.assertNotIn("sera refusé", body)
+        self.assertIn("clore cette mission** : `ameesh work close <id> --done`", body)
+
+    def test_tiers_qui_regele_ne_donne_pas_sa_famille_a_lauteur(self):
+        body = review_lot.body_of(
+            self.item, LOT, klass={"class": "sensitive", "critical": True},
+            author={"name": "a1", "harness": "", "refroze": "claude1"})
+        self.assertIn("Famille de l'auteur non tracée", body)
+        self.assertIn("codex et claude", body)
+        self.assertNotIn("codex et deepseek", body)
 
     def test_un_light_hors_porte_de_fusion_reste_un_avis(self):
         """Le correctif ne transforme pas toute fusion light en relecture

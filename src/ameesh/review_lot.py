@@ -467,7 +467,8 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     why = " ".join(str((klass or {}).get("why") or "").split())
     critical = bool((klass or {}).get("critical"))
     families = review_families(author.get("harness")) if critical else ()
-    untraced = critical and not author_family
+    author_human = who.lower().startswith(work.HUMAN_PREFIX)
+    untraced = critical and not author_family and not author_human
     lines = [
         ("Relecture après fusion (canon `processus/lots.md` §2, **porte de fusion** : "
          "deux avis indépendants)." if critical
@@ -522,9 +523,11 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
             "- livrer le verdict (`ameesh work milestone %d verdict ok|blocked --sha %s`) ;"
             % (int(lot), merged_sha or "<sha>"))
     lines.extend([
-        "- **livré le verdict ? clore cette mission** : `ameesh work close <id> --done` — "
-        "elle n'a ni branche ni fusion, et le verdict du parent relu en est la preuve "
-        "(#1280) ;",
+        ("- **livrés les verdicts ? saisir le pilote** pour clore cette mission "
+         "selon la route ci-dessus ;" if untraced else
+         "- **livré le verdict ? clore cette mission** : `ameesh work close <id> --done` — "
+         "elle n'a ni branche ni fusion, et le verdict du parent relu en est la preuve "
+         "(#1280) ;"),
         "- si un défaut **non bloquant** se corrige en moins de 5 minutes, le corriger "
         "et pousser la correction sur la cible : le relecteur corrige lui-même dès le "
         "premier tour (canon §2, home#81) ; les autres défauts non bloquants vont au "
