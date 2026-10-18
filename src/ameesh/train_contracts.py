@@ -5,25 +5,45 @@ The source blobs describe the execution semantics behind the required jobs.
 A new workflow/planner needs a new audit; an unchanged display name does not
 transfer full-suite proof. No Nexlink contract is supplied while its backend
 and website dispatch can still select impacted tests on integration/train-*.
+
+#2446: ``paquet.yml`` is the caller run of the packet gate. A push to
+``integration/**`` creates that run; when no open PR covers the pushed head,
+its ``suite`` job calls ``tests.yml`` and the API exposes the called jobs in
+the same caller run (prefixed by the caller job). There is **no** separate
+``tests.yml?event=workflow_call`` run. The contract therefore pins the caller
+workflow, the called suite and the planning blobs, and requires the called
+jobs (prefixed by the caller job) — the full 8 psycopg + 16 psql matrix, the
+macOS platform job and the aggregate ``tests`` check.
 """
 from .train_ci import Workflow
 
 
 def ameesh() -> tuple[Workflow, ...]:
-    """Full push suite at e4e4c85c: both PostgreSQL drivers, macOS and gates.
+    """Full packet suite on ``integration/**`` (caller gate + called suite).
 
-    integration/** push always uses the full 4 psycopg + 6 psql parts,
-    including for documentation-only content. Doc-only and version jobs are
-    conditional lanes outside this contract; the aggregate cannot replace
-    the executable parts. No second dispatch is added to this push.
+    ``paquet.yml`` triggers on ``push integration/**`` and calls ``tests.yml``
+    as a reusable workflow when no open PR covers the pushed head. The train
+    pushes an immutable ``integration/train-*`` branch without opening a PR,
+    so this caller run carries the packet proof: its API jobs are the called
+    jobs prefixed by the caller job (e.g. ``suite complète du paquet / plan``).
+    A covered push (open PR) leaves ``suite`` skipped, so the called jobs are
+    absent and supply no packet CI: the train refuses it.
+    The full matrix is 8 psycopg parts, 16 psql parts, the macOS platform job
+    and the aggregate ``tests`` check; doc-only and version lanes are
+    conditional outside this contract.
     """
     return (Workflow(
-        path=".github/workflows/tests.yml",
-        jobs=("plan", *("psycopg %d/4" % n for n in range(1, 5)),
-              *("psql %d/6" % n for n in range(1, 7)), "plateforme macOS", "tests"),
-        sources=((".github/workflows/tests.yml", "d38a9e6f99ed39bed9b7192bc49cfbb1758968dd"),
-                 ("scripts/test-plan.py", "502141ea8fe28d8bcae132ea1b3fa74147f6d283"),
-                 ("scripts/test-parts.py", "5379a497802315a53d45bfaf6f6172cd43efe7ca"),
-                 ("scripts/ci-flow.py", "c3c8ce59a13fb7f652b3f7b32e533c72a2969d95"),
-                 ("scripts/map.py", "12207bd07fb0a38d66ade2e9b6e0cd903979b463")),
+        path=".github/workflows/paquet.yml",
+        jobs=("plan",
+              *("psycopg %d/8" % n for n in range(1, 9)),
+              *("psql %d/16" % n for n in range(1, 17)),
+              "plateforme macOS", "tests"),
+        event="push",
+        called=".github/workflows/tests.yml",
+        sources=((".github/workflows/paquet.yml", "0d4e4c9cae703575b33aa393d6a1c95a81e5c896"),
+                 (".github/workflows/tests.yml", "8403f902b5b87e52a99f86549822feb92e784035"),
+                 ("scripts/test-plan.py", "8f192023e6f5d1ca799068dd4a44c820170f2182"),
+                 ("scripts/test-parts.py", "2265308c9fed248852bfd9ec41ba8f79266f0647"),
+                 ("scripts/ci-flow.py", "ac574bd1f38eb788c70800095efde70bd2b8b751"),
+                 ("scripts/map.py", "7a7516683643ff7cd66abf3d50147b25446a03bb")),
     ),)

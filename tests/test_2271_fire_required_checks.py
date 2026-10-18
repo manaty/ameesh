@@ -120,6 +120,21 @@ class FakeGh:
                                      stderr="unexpected gh %s" % " ".join(argv))
 
 
+class FailingGh(FakeGh):
+    """Une lecture de la protection qui échoue avec le détail donné (vide
+    possible : `gh` sort en erreur sans rien écrire)."""
+
+    def __init__(self, detail):
+        super().__init__()
+        self.detail = detail
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:1] == ["api"] and len(argv) > 1 and argv[1].endswith("/protection"):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr=self.detail)
+        return super().__call__(argv, **kwargs)
+
+
 def _project(**extra):
     return radar.Project("ameesh", "/r", github="manaty/ameesh", **extra)
 
@@ -180,6 +195,29 @@ class ProtectionTest(unittest.TestCase):
         gh = FakeGh(error="gh: Resource not accessible by integration (HTTP 403)")
         project = _project(required_checks=("coverage",))
         self.assertEqual(self._required(gh, project=project), (("coverage", None),))
+
+    def test_only_a_proven_403_lets_the_declaration_cover_the_protection(self):
+        # #2344 N1 : un 404, un GOAWAY, un DNS ou une sortie vide ne prouvent
+        # pas un refus de droits ; la déclaration ne remplace pas la source.
+        project = _project(required_checks=("coverage",))
+        with self.assertRaises(land.LandError) as raised:
+            fire.required_checks("manaty/ameesh", "main", project,
+                                 gh=FakeGh(error="gh: Not Found (HTTP 404)"))
+        self.assertNotIsInstance(raised.exception, land.TransientLandError)
+        for detail in (
+                "dial tcp: lookup api.github.com on 127.0.0.53:53: server misbehaving",
+                "http2: server sent GOAWAY and closed the connection",
+                ""):
+            with self.subTest(detail=detail), self.assertRaises(land.TransientLandError):
+                fire.required_checks("manaty/ameesh", "main", project,
+                                     gh=FailingGh(detail))
+
+    def test_a_malformed_protection_is_not_covered_by_the_declaration(self):
+        project = _project(required_checks=("coverage",))
+        with self.assertRaises(land.LandError):
+            fire.required_checks(
+                "manaty/ameesh", "main", project,
+                gh=FakeGh(protection={"required_status_checks": {"contexts": "tests"}}))
 
     def test_the_declaration_completes_the_forge_never_weakens_it(self):
         project = _project(required_checks=("coverage",))
@@ -707,6 +745,29 @@ class ApiPagesTest(unittest.TestCase):
 
         with self.assertRaises(TRANSIENT):
             fire._head_check_runs("manaty/ameesh", SHA, gh=NoSlurpThenDown([]))
+
+
+class ReadClassificationTest(unittest.TestCase):
+    """#2344 : seul un 403 prouvé ouvre le repli sur la déclaration."""
+
+    def test_only_a_proven_403_is_forbidden(self):
+        for detail in ("gh: Resource not accessible by integration (HTTP 403)",
+                       "HTTP 403: Forbidden (https://api.github.com/repos/o/r)"):
+            self.assertTrue(fire._forbidden_read(detail), detail)
+        for detail in ("gh: Not Found (HTTP 404)", "",
+                       "http2: server sent GOAWAY and closed the connection"):
+            self.assertFalse(fire._forbidden_read(detail), detail)
+
+    def test_dns_goaway_and_empty_output_are_transient(self):
+        for detail in (
+                "dial tcp: lookup api.github.com on 127.0.0.53:53: server misbehaving",
+                "http2: server sent GOAWAY and closed the connection",
+                "", "   "):
+            self.assertTrue(fire._transient_read(detail), detail)
+
+    def test_a_404_is_not_transient(self):
+        self.assertFalse(fire._transient_read("gh: Not Found (HTTP 404)"))
+        self.assertFalse(fire._transient_read("gh: Branch not protected (HTTP 404)"))
 
 
 if __name__ == "__main__":

@@ -26,8 +26,10 @@ travail mais l'arbre **construit** du SHA candidat plus le plan relu, figé par
 son identité et passé à l'offload (`--snapshot`) : ni fichier non suivi, ni
 flag `assume-unchanged`/`skip-worktree`, ni modification locale ne peut s'y
 glisser. Le plan est un chemin relatif, refusé hors de l'arbre ou ignoré par
-git. La tête est relue après le run, en local et, si `--published-ref` est
-nommée, au distant : un mouvement pendant la validation invalide le rapport.
+git, ou s'il ne peut pas entrer dans l'arbre du SHA (conflit fichier/répertoire,
+`plan-path-conflict`). La tête est relue après le run, en local et, si
+`--published-ref` est nommée, au distant : un mouvement pendant la validation
+invalide le rapport.
 Le rapport porte lot, SHA complet, base, commit de carte, identité de l'arbre
 envoyé, modules exécutés, hôte, résultat et durée ; il n'est pas un verdict et
 ne remplace aucune relecture (#1617, #1756).
@@ -58,15 +60,21 @@ REPORT_SCHEMA = "ameesh-prevalidation/1"
 #: du plan L161f, chemin dépôt, contrat CLI `run --plan --part --driver --flow`.
 #: Un projet qui a son propre outil le déclare (`parts_script` du bloc, #1770).
 DEFAULT_PARTS_SCRIPT = "scripts/test-parts.py"
+#: lectures d'objets au SHA candidat sans `refs/replace` (#1819) : un
+#: remplacement local réécrit le contenu lu sans changer le SHA, la preuve
+#: divergerait de la référence publiée
+NO_REPLACE = offload.NO_REPLACE
 
 #: causes de refus d'une prévalidation ; le gel n'est pas écrit, la cause est dite
 CAUSES = (
     "card-missing",       # carte absente, illisible ou sans commit
     "card-stale",         # carte trop vieille ou sans ancêtre commun avec la tête
     "selection-unsafe",   # le plan n'est pas sûr (fondation, bloc inconnu, retrait…)
+    "plan-path-conflict",   # un parent du plan est un fichier au SHA (conflit D/F, #1820)
     "selection-full",     # le plan retombe sur la suite complète : refus, jamais de repli
     "head-moved",         # le plan ne porte pas la tête candidate exacte
-    "no-vm",              # VM absente, injoignable, job refusé ou arrêté (offload 75)
+    "no-vm",              # VM absente, injoignable, job refusé (offload 75)
+    "gate-preempted",     # le run a été arrêté par la porte de l'hôte (drain), pas une VM
     "run-red",            # la sélection est rouge
     "run-incomplete",     # timeout, annulation, part sans fin : inexploitable (124/130/70)
     "transport-lost",     # connexion perdue, résultat non authentifié
@@ -112,6 +120,9 @@ SECONDS_MARK = "ameesh-prevalidation-seconds="
 PART_MARK = "ameesh-prevalidation-part="
 _SECONDS_RE = re.compile(r"^%s(\d+)\s*$" % re.escape(SECONDS_MARK), re.M)
 _PART_RE = re.compile(r"^%s([A-Za-z0-9_.:-]+)\s*$" % re.escape(PART_MARK), re.M)
+#: note du client offload quand la porte de l'hôte arrête un run (drain)
+_GATE_STOP_RE = re.compile(r"^ameesh offload: stopped on .*: host (?:stopped|draining)\b",
+                           re.M)
 
 
 def _same_commit(a: str | None, b: str | None) -> bool:
@@ -455,12 +466,42 @@ def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
     photographie plus : il **construit** l'arbre voulu (arbre du SHA candidat
     plus le plan tel qu'il vient d'être lu), le fige par son identité et la
     passe à l'offload (`--snapshot`) : le contenu exécuté ne dépend plus de
-    l'état local, et le rapport peut nommer l'identité envoyée."""
+    l'état local, et le rapport peut nommer l'identité envoyée.
+
+    Un échec de construction est un refus `selection-unsafe` : `head-moved`
+    reste réservé à la tête qui a réellement bougé (`head_state`)."""
     try:
         return offload.snapshot_with(root, head, {plan_rel: plan})
     except offload.OffloadError as exc:
-        raise PrevalidationError("head-moved",
+        raise PrevalidationError("selection-unsafe",
                                  "arbre du SHA + plan non constructible: %s" % exc) from None
+
+
+def _tree_entries(root: str, head: str, paths: Sequence[str], *,
+                  runner=subprocess.run) -> list[tuple[str, str, str]]:
+    """Les entrées `(mode, type, chemin)` de `paths` dans l'arbre `head`.
+
+    `ls-tree -z` rend les chemins bruts, sans guillemets ; une lecture
+    impossible ou une sortie inattendue refuse (`selection-unsafe`) plutôt que
+    de supposer un chemin sûr."""
+    if not paths:
+        return []
+    proc = runner(["git", "-C", root, *NO_REPLACE, "--literal-pathspecs", "ls-tree", "-z",
+                   head, "--", *paths], capture_output=True, text=True)
+    if getattr(proc, "returncode", 1):
+        raise PrevalidationError("selection-unsafe",
+                                 "chemin du plan invérifiable au SHA candidat")
+    entries: list[tuple[str, str, str]] = []
+    for raw in (getattr(proc, "stdout", "") or "").split("\0"):
+        if not raw:
+            continue
+        meta, sep, path = raw.partition("\t")
+        fields = meta.split()
+        if not sep or len(fields) != 3:
+            raise PrevalidationError("selection-unsafe",
+                                     "sortie ls-tree illisible pour le chemin du plan")
+        entries.append((fields[0], fields[1], path))
+    return entries
 
 
 def remote_plan_path(plan_path: str, root: str, *, head: str = "",
@@ -468,8 +509,11 @@ def remote_plan_path(plan_path: str, root: str, *, head: str = "",
     """Le chemin du plan tel qu'il existe dans l'arbre envoyé à la VM.
 
     Le plan est un artefact relatif au dépôt, hors des chemins du SHA candidat :
-    il ne doit remplacer aucun fichier de ce SHA. Les chemins hors du dépôt ou
-    ignorés refusent aussi (`selection-unsafe`)."""
+    il ne doit remplacer aucun fichier de ce SHA, ni tomber sous un parent qui
+    y est un fichier — ce second cas est le conflit D/F que `update-index`
+    refuserait plus tard, nommé ici (`plan-path-conflict`) avant toute
+    construction. Les chemins hors du dépôt ou ignorés refusent aussi
+    (`selection-unsafe`)."""
     absolute = os.path.abspath(plan_path)
     relative = os.path.relpath(absolute, os.path.abspath(root))
     if relative == os.pardir or relative.startswith(os.pardir + os.sep):
@@ -477,13 +521,21 @@ def remote_plan_path(plan_path: str, root: str, *, head: str = "",
                                  "plan hors de l'arbre envoyé à la VM: %s" % plan_path)
     remote = relative.replace(os.sep, "/")
     if head:
-        proc = runner(["git", "-C", root, "--literal-pathspecs", "ls-tree", head,
-                       "--", remote], capture_output=True, text=True)
-        if getattr(proc, "returncode", 1):
-            raise PrevalidationError("selection-unsafe", "chemin du plan invérifiable au SHA candidat")
-        if (getattr(proc, "stdout", "") or "").strip():
+        if _tree_entries(root, head, [remote], runner=runner):
             raise PrevalidationError("selection-unsafe",
                                      "le plan remplacerait un chemin du SHA candidat: %s" % remote)
+        parts = remote.split("/")
+        parents = ["/".join(parts[:cut]) for cut in range(1, len(parts))]
+        for _mode, kind, path in _tree_entries(root, head, parents, runner=runner):
+            # Plusieurs pathspecs peuvent faire développer un arbre par Git :
+            # ses autres enfants ne sont pas des parents du plan.
+            if path in parents and kind != "tree":
+                qualifie = {"blob": "un fichier",
+                            "commit": "un sous-module"}.get(kind, "un objet " + kind)
+                raise PrevalidationError(
+                    "plan-path-conflict",
+                    "le plan %s tombe sous %s, %s au SHA candidat"
+                    " (conflit fichier/répertoire)" % (remote, path, qualifie))
     proc = runner(["git", "-C", root, "check-ignore", "-q", "--", remote],
                   capture_output=True, text=True)
     if getattr(proc, "returncode", 1) == 0:
@@ -520,10 +572,16 @@ def classify(exit_code: int, output: str = "") -> str:
     """Le sort du run depuis le code de sortie de l'offload (contrat L159b).
 
     Le code 75 couvre l'absence d'hôte, le refus/arrêt du job **et** la
-    connexion perdue : les notes de l'offload les distinguent."""
+    connexion perdue : les notes de l'offload les distinguent. Un run arrêté
+    par la porte de l'hôte (drain, `stopped on … host stopped|draining`) est
+    une `gate-preempted`, jamais un `no-vm` : la VM existe, c'est l'hôte qui a
+    préempté le run (#2298)."""
     code = int(exit_code)
-    if code == 75 and "lost the connection" in (output or ""):
+    output = output or ""
+    if code == 75 and "lost the connection" in output:
         return "transport-lost"
+    if code == 75 and _GATE_STOP_RE.search(output):
+        return "gate-preempted"
     return RUN_OUTCOMES.get(code, "run-incomplete")
 
 
@@ -592,7 +650,9 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
                         profile=profile, executable=executable)
     started = time.time()
     proc = runner(argv, cwd=cwd, env=env, capture_output=True, text=True)
-    output = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
+    # Les flux ont des lignes indépendantes, même sans saut final sur stdout.
+    output = "\n".join((getattr(proc, "stdout", "") or "",
+                        getattr(proc, "stderr", "") or ""))
     result = {"outcome": classify(proc.returncode, output), "exit": int(proc.returncode),
               "host": host, "flow": parse_flow(output)}
     result["seconds"] = parse_seconds(output)
@@ -620,7 +680,8 @@ def contract_modules(paths, repo: str = "", *, head: str = "",
         if head:
             # `cat-file blob` : contenu brut d'un fichier, un répertoire refuse
             # (`show` listerait l'arbre et en ferait des modules)
-            proc = runner(["git", "-C", repo or ".", "cat-file", "blob", "%s:%s" % (head, path)],
+            proc = runner(["git", "-C", repo or ".", *NO_REPLACE, "cat-file", "blob",
+                           "%s:%s" % (head, path)],
                           capture_output=True, text=True)
             if getattr(proc, "returncode", 1):
                 return (), "contrat déclaré illisible au SHA candidat: %s" % path
