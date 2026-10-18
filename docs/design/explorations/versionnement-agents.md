@@ -52,6 +52,21 @@ exerce, mais elle ne relie pas cette mesure à la composition des lots.
 - **Composition horaire sans revert.** Un paquet horaire deviendrait une
   sélection de changements qui commutent, dont le retrait serait exact et
   n'obligerait ni revert de fusion ni rejeu complet.
+- **La base comme source de vérité des atterrissages.** Aujourd'hui, la
+  livraison d'un lot est redéduite de git à chaque lecture :
+  `plan_git.probe` essaie l'ascendance, puis cherche un revert dans au plus
+  200 commits (`MAX_REVERT_SCAN`, message « This reverts commit »), puis
+  compare les `patch-id` ; `scripts/paquet-inclusion.py` vérifie ligne par
+  ligne le contenu à la tête d'un paquet. La base enregistre déjà la fusion
+  (jalon `merged` et son commit, `merge_queue` à `landed`, retraits de
+  train), mais pas le revert ni le retrait d'un lot composé. Si chaque
+  transition (composé dans un paquet, atterri, retiré ou annulé) était
+  écrite par celui qui la fait, au moment où il la fait, « ce lot est-il
+  livré ? » deviendrait une lecture, et git un contre-contrôle : un écart
+  entre la base et l'arbre serait une alerte, jamais une correction
+  silencieuse. Anthropic décrit le même principe : demander à l'outil de
+  revue quand un changement a atterri plutôt que relire l'historique (voir
+  Contexte).
 
 ## Questions ouvertes
 
@@ -69,10 +84,23 @@ exerce, mais elle ne relie pas cette mesure à la composition des lots.
   plus le commit ?
 - Que garde-t-on de git — revue, PR, historique — et qu'est-ce qui change
   de nature ?
+- Combien de reverts échappent à la détection actuelle (au-delà de la
+  fenêtre de 200 commits, ou faits sans le message standard), et combien
+  de lots ont été fermés à tort, puis rouverts ?
+- Combien de lots admis ont été omis à la composition d'un paquet sans que
+  rien ne le consigne, avant le contrôle d'inclusion ?
+- Un revert fait hors ameesh (un humain, un `git revert` direct) : le radar
+  doit-il l'enregistrer de lui-même, ou seulement alerter quand il ne sait
+  pas à quel lot le rattacher ?
+- Un lot annulé repasse-t-il en `build` pour son agent, ou reste-t-il
+  `blocked` en attendant une décision humaine ?
 
 Contexte : [Étude tests par impact](../etudes/l161-tests-par-impact.md)
 (carte test → code), [Radar de conflits](../etudes/l160-radar-de-conflits.md),
 [Pilote Mergiraf](../etudes/l160g-mergiraf-pilot.md), et le
 [processus de lot](https://github.com/manaty/home/blob/main/processus/lots.md)
-(paquets horaires). Ces références éclairent la question ; elles ne
+(paquets horaires), et
+[Redesigning source control at Anthropic](https://www.anthropic.com/engineering/redesigning-source-control)
+(Scion : changesets, requêtes côté serveur, tests après fusion). Ces
+références éclairent la question ; elles ne
 promeuvent pas cette fiche en étude ou en travail décidé.
