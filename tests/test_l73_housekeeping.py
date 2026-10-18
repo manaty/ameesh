@@ -597,6 +597,57 @@ class MenageDbTest(PgTestCase):
         menage.Turn.begin(self.cfgl, pol, "a1", main, new_session=False, base_env={})
         self.assertTrue(os.path.exists(os.path.join(mine, "garde-pour-la-session")))
 
+    def test_worktree_a_la_racine_du_tmp_d_un_autre_mesh_n_est_jamais_supprime(self):
+        """#2326 : un worktree créé par un agent à la racine partagée du tmp
+        (nom inconnu de CE registre, sans fichier de propriétaire à nous) n'est
+        jamais supprimé, même très ancien : un registre vide, partiel ou ancien
+        ne doit rien détruire."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "nexlink-dev1-0123abcd-review")
+        os.makedirs(root)
+        _write(os.path.join(root, ".git"), 10)
+        _write(os.path.join(root, "notes.txt"), 10)
+        loin = time.time() + 30 * 24 * 3600
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
+        self.assertTrue(os.path.isdir(root), rapport["skipped"])
+        self.assertIn("tmp %s kept: not owned by this mesh" % root, rapport["skipped"])
+        self.assertNotIn(root, [p["path"] for p in rapport["plan"]
+                                if p.get("action") == "suppression"])
+
+    def test_dossier_tmp_d_un_agent_absent_mais_a_nous_est_encore_supprime(self):
+        """#2326 : le nettoyage légitime reste — un dossier créé par ce mesh
+        pour un agent qui n'est plus au registre part après l'inactivité."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "ancien-agent")
+        os.makedirs(root)
+        menage._write_owner(troot, "ancien-agent", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        _write(os.path.join(root, "reste.txt"), 10)
+        loin = time.time() + 30 * 24 * 3600
+        menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(root))
+
+    def test_dossier_de_repli_avec_une_copie_git_n_est_pas_supprime(self):
+        """#2326 : même à nous, un dossier de repli qui porte une copie git
+        (worktree créé dans le dossier temporaire) est gardé et dit."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "a1+abcd1234")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd1234", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        _write(os.path.join(root, ".git"), 10)
+        loin = time.time() + 30 * 24 * 3600
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
+        self.assertTrue(os.path.isdir(root), rapport["skipped"])
+        self.assertIn("tmp %s kept: contains a Git worktree or clone" % root,
+                      rapport["skipped"])
+
     def _suivi(self, main: str, nom: str, lot: int | None) -> str:
         wt = os.path.join(self.tmp, nom)
         _git("worktree", "add", "-q", wt, "-b", nom, cwd=main)
