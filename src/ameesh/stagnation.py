@@ -397,6 +397,9 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     agents = st.progress.agents(None)
     states, externals = availability_of(agents)
     agent_projects = {r["name"]: projects.agent_project(r) for r in agents}
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur (voir progress._same_actor).
+    agent_names = {r["name"] for r in agents if r.get("name")}
     events, milestones, actions, messages, last_events, hold_events = _grouped(st, ids)
     from . import planned_waits
     from . import work_dependencies
@@ -416,7 +419,8 @@ def describe(db, rows: list[dict], *, now: float | None = None,
         package = packages.get(row.get("package_id")) or {}
         try:
             jalons = progress._jalons_de_lot(row, events.get(rid, []), acts,
-                                             milestones.get(rid))
+                                             milestones.get(rid),
+                                             agents=agent_names)
             detail = waiting(row, jalons, acts,
                              responsible=package.get("responsible"))
             # #1822 : la classe n'est lue que pour un lot qui attendrait un

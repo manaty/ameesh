@@ -10,6 +10,7 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import random
@@ -110,6 +111,37 @@ def has_reviewers(db) -> bool:
         except Exception:
             pass
     return found
+
+#: #2346 : le réglage lu par le trigger d'audit des relecteurs (migration 0462)
+_AUDIT_SETTING = "ameesh.reviewer_audit"
+
+
+@contextlib.contextmanager
+def python_reviewer_audit(db):
+    """#2346 : le drapeau qui tait le trigger d'audit ne couvre QUE l'UPDATE
+    dont le code Python journalise lui-même le retrait.
+
+    `SET LOCAL` vaut pour toute la transaction : un retrait SQL direct, plus
+    loin dans la même transaction (même après un `work.assign` imbriqué dans
+    la transaction d'un appelant), perdait sa ligne `db:reviewers_sync`. Le
+    drapeau est posé juste avant l'UPDATE et la valeur précédente rendue juste
+    après — sauvegarde/restauration, pas un effacement : un appel imbriqué
+    garde l'état de son appelant. Sans la migration 0456, rien à faire."""
+    if not has_reviewers(db):
+        yield
+        return
+    previous = db.query(
+        "SELECT current_setting(%s, true) AS value", (_AUDIT_SETTING,))
+    previous = (previous[0].get("value") if previous else None) or ""
+    db.execute("SELECT set_config(%s, 'python', true)", (_AUDIT_SETTING,))
+    try:
+        yield
+    finally:
+        try:
+            db.execute("SELECT set_config(%s, %s, true)",
+                       (_AUDIT_SETTING, previous))
+        except Exception:  # noqa: BLE001 - transaction déjà en échec, rien à rendre
+            pass
 
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
@@ -765,10 +797,6 @@ class WorkItems(interface.WorkItems):
         previous_reviewers: list[str] = []
         reviewer_set = ""
         params: list = [assignee]
-        if has_reviewers(self.db):
-            # #2204/N1 : le journal Python ci-dessous nomme le retrait avec
-            # l'acteur ; le trigger d'audit ne doit pas doubler la ligne.
-            self.db.execute("SET LOCAL ameesh.reviewer_audit = 'python'")
         if has_reviewer(self.db):
             # #813 : NO KEY UPDATE suffit à sérialiser deux réassignations, et
             # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
@@ -788,15 +816,19 @@ class WorkItems(interface.WorkItems):
                             " ELSE reviewer END")
             params.append(assignee)
         params += [int(item_id), current, state, state]
-        rows = self.db.query(
-            ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
-             "       updated_at = now(),"
-             "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-             " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
-             "   AND state NOT IN ('merged', 'promoted', 'closed')"
-             "   AND (%s::text IS NULL OR state = %s)"
-             " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
-            tuple(params))
+        # #2204/N1, #2346 : le journal Python ci-dessous nomme le retrait avec
+        # l'acteur ; le trigger d'audit ne doit pas doubler la ligne. Le
+        # drapeau ne couvre que cet UPDATE (voir python_reviewer_audit).
+        with python_reviewer_audit(self.db):
+            rows = self.db.query(
+                ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                 "       updated_at = now(),"
+                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                 " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
+                 "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                 "   AND (%s::text IS NULL OR state = %s)"
+                 " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
+                tuple(params))
         if not rows:
             return None
         self.db.query(
@@ -847,8 +879,6 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             with_reviewer = has_reviewer(self.db)
             with_reviewers = has_reviewers(self.db)
-            if with_reviewers:
-                tx.execute("SET LOCAL ameesh.reviewer_audit = 'python'")
             seen = tx.query(
                 "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
@@ -878,13 +908,16 @@ class WorkItems(interface.WorkItems):
                                 " ELSE reviewer END")
                 params = [delegate, delegate, delegated_by, float(within_s),
                           int(item_id)]
-            rows = tx.query(
-                ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
-                 "       delegated_by = %s, delegated_at = now(),"
-                 "       due_at = now() + make_interval(secs => %s), updated_at = now()"
-                 " WHERE id = %s RETURNING __COLUMNS__"
-                 ).replace("__COLUMNS__", item_columns(self.db)),
-                tuple(params))
+            # #2204/N1, #2346 : le journal Python ci-dessous nomme le retrait
+            # avec l'acteur ; le drapeau d'audit ne couvre que cet UPDATE.
+            with python_reviewer_audit(tx):
+                rows = tx.query(
+                    ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                     "       delegated_by = %s, delegated_at = now(),"
+                     "       due_at = now() + make_interval(secs => %s), updated_at = now()"
+                     " WHERE id = %s RETURNING __COLUMNS__"
+                     ).replace("__COLUMNS__", item_columns(self.db)),
+                    tuple(params))
             item = rows[0]
             delegation = tx.query(
                 "INSERT INTO work_item_delegations AS d"
@@ -999,19 +1032,20 @@ class WorkItems(interface.WorkItems):
                 # la désignation tombe dans la même écriture.
                 reviewer_set = ""
                 params: list = [row["delegated_by"]]
-                if with_reviewers:
-                    tx.execute("SET LOCAL ameesh.reviewer_audit = 'python'")
                 if with_reviewer:
                     reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
                                     " ELSE reviewer END")
                     params.append(row["delegated_by"])
-                item = tx.query(
-                    ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
-                     "       delegated_by = NULL, delegated_at = NULL, due_at = NULL,"
-                     "       updated_at = now()"
-                     " WHERE id = %s RETURNING __COLUMNS__"
-                     ).replace("__COLUMNS__", item_columns(self.db)),
-                    tuple(params + [item_id]))
+                # #2204/N1, #2346 : le journal Python ci-dessous nomme le
+                # retrait ; le drapeau ne couvre que cet UPDATE.
+                with python_reviewer_audit(tx):
+                    item = tx.query(
+                        ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                         "       delegated_by = NULL, delegated_at = NULL, due_at = NULL,"
+                         "       updated_at = now()"
+                         " WHERE id = %s RETURNING __COLUMNS__"
+                         ).replace("__COLUMNS__", item_columns(self.db)),
+                        tuple(params + [item_id]))
             elif outcome == "annulee":
                 # L46 : lot fermé OU réassigné hors `work assign` — la
                 # délégation annulée ne laisse ni délégant ni date

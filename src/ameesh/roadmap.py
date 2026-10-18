@@ -53,6 +53,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from typing import Iterable
 
 from . import config as config_mod
 from . import db as db_mod
@@ -384,13 +385,15 @@ def _source_view(kind: str | None, ref: str | None, label: str | None = None) ->
 
 
 def real_milestones(item: dict, events: list[dict], actions: list[dict],
-                    declared: list[dict] | None) -> dict:
+                    declared: list[dict] | None, *,
+                    agents: Iterable[str] | None = None) -> dict:
     """Les jalons RÉELS génériques d'une tâche, depuis ce qu'ameesh mesure
     déjà (journal, table des jalons, actions) : `{demandee, debut, soumise,
-    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint)."""
+    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint).
+    `agents` : le registre, pour la correspondance `seb` / `human:seb` (#2346)."""
     from . import progress  # import tardif : progress importe ce module
 
-    jalons = progress._jalons_de_lot(item, events, actions, declared)
+    jalons = progress._jalons_de_lot(item, events, actions, declared, agents=agents)
     started = next((e.get("created_ts") for e in events if dev.en_cours(e.get("state"))), None)
     out = {key: jalons.get(dev.jalon(key)) for key in ("demandee", "soumise", "verdict",
                                                        "livree")}
@@ -511,6 +514,9 @@ def build(db, *, now: float | None = None, project: str | None = None,
     now = time.time() if now is None else float(now)
     base = today(now)
     st = storage.of(db)
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur, pour que `lot_state` ne diverge pas de progress.
+    agents = {r["name"] for r in st.progress.agents(None) if r.get("name")}
     done_states = (dev.CORRESPONDANCES["etats_livres"]
                    + dev.CORRESPONDANCES["etats_abandonnes"])
     filters = {"project": project} if project else {}
@@ -552,8 +558,9 @@ def build(db, *, now: float | None = None, project: str | None = None,
     for item in rows:
         iid = int(item["id"])
         evs, acts = events.get(iid, []), actions.get(iid, [])
-        real = real_milestones(item, evs, acts, declared.get(iid))
-        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid))
+        real = real_milestones(item, evs, acts, declared.get(iid), agents=agents)
+        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid),
+                                         agents=agents)
         shown = progress.lot_state(item.get("state") or "", jalons)
         tasks.append(build_task(item, real, base=base,
                                 epic=plan_mod.epic_of(item.get("package_id"), by_pkg),
