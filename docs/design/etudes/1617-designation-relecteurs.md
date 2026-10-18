@@ -190,6 +190,25 @@ only machine sources:
   recipient**; the pilot is not a reviewer candidate, so the two roles never
   collapse into one mail.
 
+The **audited commit** is `canon_state.last_good_commit` whenever a state is
+recorded, even if the current pass is `invalid`: a failed pass must not fall
+back to the non-audited configured ref (B2 of the Codex review cx2). Only a
+host with no recorded state (bench, first start) reads the configured exact
+commit.
+
+The designation is also written into `work_items.reviewers`, the column read
+by the merge gate, `progress` and the stale-reviewer alert (`B1`): a new freeze
+first removes the names of the previous automatic marks, then appends the new
+ones, so the previous head stops being designated; a manual name (never in a
+mark) is preserved, and a manual waiver (`-none`) is never overridden.
+
+The selection and its reviewer sync run inside a **savepoint**: an exception
+while the second mail, the mark or the column is being written rolls the whole
+attempt back (and drops its deferred thread writes) before the waiting note is
+written. No first mail survives without its mark, and a replay mails no
+reviewer twice (B3 of the Codex review cx2). A failure to write the waiting
+note itself propagates: the milestone and its designation remain one fact.
+
 A manual reviewer already designated makes the automatic path an explicit,
 journaled no-op: the manual exception stays available. An expected input
 problem (no repository, no policy, unreadable evidence) keeps the freeze and
@@ -230,6 +249,15 @@ cancels the milestone, the mark and the mails; a nested freeze publishes no
 trace before the external commit (and nothing survives its rollback); after the
 external commit, the caller flushes the list; the callback is rejected outside
 a `frozen`.
+
+`tests/test_2447_review_designation_activation.py` — 15 tests on a real
+database, both drivers: the freeze designates two independent families and
+writes them into `work_items.reviewers`; a new freeze clears only the previous
+automatic names; the last good canon commit wins when the current state is
+invalid; a manual reviewer stays the journaled exception; no reviewer free is a
+wait plus a pilot alert; an exception during the selection is rolled back by a
+savepoint (no first mail without its mark, no duplicate on replay); the CLI
+freeze and the recovery command.
 
 ## Remaining after activation (#2447)
 

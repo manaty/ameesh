@@ -12,11 +12,13 @@ from __future__ import annotations
 import dataclasses
 import os
 import subprocess
+from unittest import mock
 
-from ameesh import registry, review_designation as rd
+from ameesh import mail, registry, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import storage, work
+from ameesh.work_reviewers import designated
 
 from .support import PgTestCase
 
@@ -226,11 +228,82 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertIn(self.frozen, self.mailbox()[0]["body"])
         self.assertEqual(len(self.marks()), 1)
         self.assertEqual(pg.designation_of(self.marks()[0])["state"], rd.DESIGNATED)
+        # B1 of the Codex review cx2: the gate and progress read the column,
+        # not the journal mark, so the designated reviewers must be there too
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
         # the CLI reads the same thing through the recovery view
         shown = act.reviewers(self.cfg, self.db, self.lot)
         self.assertEqual(shown["designation"]["state"], rd.DESIGNATED)
         self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
                          ["r1", "r2"])
+
+    def test_a_new_freeze_clears_the_previous_automatic_designation(self):
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        # a new head, no independent reviewer left: the old names must go
+        self.repo.write("src/ameesh/db.py", "another lot\n")
+        self.frozen = self.repo.commit("another lot")
+        self.receipts()
+        for name in ("r1", "r2"):
+            registry.upsert(self.db, name, harness="deepseek")
+        _, again = self.freeze()
+        self.assertEqual(again["state"], rd.WAITING, again)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+        self.assertTrue([n for n in self.notes() if "designation of freeze" in n
+                         and "cleared" in n])
+
+    def test_the_last_good_commit_wins_when_the_state_is_invalid(self):
+        # B2 of the Codex review cx2: a failed current pass (status invalid)
+        # must not fall back to the non-audited ref. The policy was two
+        # reviews at the audited commit, one at HEAD.
+        audited = self.canon.commit
+        fresh = self.canon.update(
+            "federation.yaml",
+            FEDERATION.replace("            reviews: 2", "            reviews: 1"))
+        storage.of(self.db).canon.record_state(
+            self.cfg.host, "ok", root=self.canon.root,
+            source="home @ %s" % audited[:12], commit=audited, good=True,
+            diagnostic="", canon="")
+        storage.of(self.db).canon.record_state(
+            self.cfg.host, "invalid", root=self.canon.root,
+            source="home @ %s" % fresh[:12], commit=fresh, good=False,
+            diagnostic="probe: current pass invalid", canon="")
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["required"], 2)
+        self.assertEqual(len(out["reviewers"]), 2)
+
+    def test_an_exception_during_the_selection_leaves_no_partial_mail(self):
+        # B3 of the Codex review cx2: the first mail must not survive without
+        # its mark. A savepoint rolls the attempt back; only the waiting note
+        # and the pilot alert remain, and a replay mails each reviewer once.
+        real = mail.send
+        calls = []
+
+        def failing(db, sender, recipient, body, *args, **kwargs):
+            calls.append(recipient)
+            if len(calls) == 2:
+                raise RuntimeError("injected failure before the second mail")
+            return real(db, sender, recipient, body, *args, **kwargs)
+
+        frozen = self.frozen
+        with mock.patch.object(mail, "send", side_effect=failing):
+            row, out = self.freeze()
+        self.assertEqual(row["kind"], "frozen")
+        self.assertEqual(out["state"], "unavailable", out)
+        self.assertIn("internal designation error", out["why"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        self.assertEqual(self.marks(), [])
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+        self.assertEqual(frozen, self.frozen)
+        # a replay designates the same head, without a duplicate r1 mail
+        again = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(again["state"], rd.DESIGNATED, again)
+        self.assertEqual([m["recipient"] for m in self.mailbox()],
+                         ["pilot", "r1", "r2"])
+        self.assertEqual(len(self.marks()), 1)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
 
     def test_the_policy_is_read_at_the_audited_commit_not_the_configured_ref(self):
         # HEAD says one review; the audited commit says two. The activation

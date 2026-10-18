@@ -41,6 +41,7 @@ capacity or canon problem fixed later can still designate the same head.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
@@ -125,13 +126,21 @@ def _audited_commit(db, cfg, canon, source) -> str:
     try:
         key = canon_sync.state_key(db, canon, getattr(cfg, "host", ""))
         state = storage.of(db).canon.state(getattr(cfg, "host", ""), key)
-    except Exception:  # noqa: BLE001 - unreadable state: the exact ref remains
+    except Exception:  # noqa: BLE001 - unreadable state: no audited commit known
         state = None
-    if state and state.get("status") == "ok":
+    if state is not None:
+        # A recorded state is authoritative even when the CURRENT pass is
+        # invalid: `last_good_commit` is the last audited commit, while the
+        # configured ref may already point at an un-audited head (B2 of the
+        # Codex review cx2). Without a last good commit there is no audited
+        # policy to read: never fall back to the ref on a known host.
         commit = str(state.get("last_good_commit") or "").strip().lower()
         root = str(state.get("root") or "")
         if commit and (not root or root == str(getattr(canon, "root", "") or "")):
             return commit
+        return ""
+    # No state at all (bench, first start): the exact configured ref is the
+    # only commit known, and `mechanics.load` still refuses a non-commit.
     return str(source.commit or "").strip().lower()
 
 
@@ -368,13 +377,27 @@ def _notify(cfg, db, project: str, listing: Sequence[Mapping]) -> str:
     return ""
 
 
-def _manual(item: Mapping) -> list:
+def _manual(db, item: Mapping) -> list:
+    """The reviewer names that were designated by hand, not by a past freeze.
+
+    `work_items.reviewers` holds both. The automatic names are exactly the ones
+    a `review-designation:` mark already carries; subtracting them keeps the
+    manual exception visible on a replays and lets a new freeze clear only the
+    names it wrote itself.
+    """
     from .work_reviewers import designated
 
     try:
-        return list(designated(dict(item or {})))
+        names = list(designated(dict(item or {})))
     except Exception:  # noqa: BLE001 - unreadable list: no manual exception
         return []
+    if not names:
+        return []
+    try:
+        automatic = set(_previous_reviewers(db, int(item.get("id") or 0), 0))
+    except Exception:  # noqa: BLE001 - unreadable marks: treat all as manual
+        return names
+    return [name for name in names if name not in automatic]
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +461,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | 
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
-                  manual=_manual(item))
+                  manual=_manual(db, item))
 
 
 # --------------------------------------------------------------------------
@@ -490,6 +513,123 @@ def _note_unavailable(db, item: Mapping, freeze: Mapping, why: str,
               after_commit=threads)
 
 
+def _previous_reviewers(db, lot: int, freeze_id: int) -> list:
+    """The reviewers of the lot's PREVIOUS automatic designations.
+
+    Only the journal marks are read: a name that never appeared in a mark is a
+    manual designation and must survive a new freeze. The current freeze is
+    excluded (its mark may already be written when this runs on a replay).
+    """
+    try:
+        rows = storage.of(db).work.events_noted(
+            "%s%d:" % (pg.MARK_PREFIX, int(lot)), 0, ids=[int(lot)])
+    except Exception:  # noqa: BLE001 - unreadable journal: keep the manual list
+        return []
+    names: list[str] = []
+    for row in rows or ():
+        try:
+            noted = pg.designation_of(row.get("note"))
+        except rd.DesignationError:
+            continue
+        if not noted or noted.get("state") != rd.DESIGNATED:
+            continue
+        try:
+            noted_freeze = int((noted.get("freeze") or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if noted_freeze == int(freeze_id):
+            continue
+        for reviewer in noted.get("reviewers") or ():
+            name = str((reviewer or {}).get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _sync_reviewers(db, item: Mapping, freeze: Mapping, names) -> None:
+    """Makes the automatic designation visible to the gate and to progress.
+
+    The journal mark is the authoritative record, but the reviewers read by
+    the merge gate, `progress` and the stale-reviewer alert are the
+    `work_items.reviewers` column (`work_reviewers.designated`). A new freeze
+    invalidates the previous automatic designation: the names of the previous
+    marks are removed first, then the new names appended; a name that never
+    appeared in a mark is a manual designation and is preserved. A manual
+    waiver (`-none`) is never overridden.
+    """
+    from .storage.postgres.work import has_reviewers
+
+    if not has_reviewers(db):
+        return
+    lot = int((item or {}).get("id") or 0)
+    freeze_id = int((freeze or {}).get("id") or 0)
+    rows = db.query(
+        "SELECT reviewers FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+        (lot,))
+    if not rows:
+        return
+    current = [str(name) for name in (rows[0].get("reviewers") or []) if name]
+    if "-none" in current:
+        return
+    previous = _previous_reviewers(db, lot, freeze_id)
+    keep = [name for name in current if name not in previous]
+    for name in names or ():
+        name = str(name or "").strip()
+        if name and name not in keep:
+            keep.append(name)
+    if keep == current:
+        return
+    db.query(
+        "UPDATE work_items SET reviewers ="
+        " ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) WHERE id = %s"
+        " RETURNING reviewers",
+        (json.dumps(keep), lot))
+    if names:
+        text = "reviewers designated automatically at freeze #%d: %s" % (
+            freeze_id, ", ".join(str(name) for name in names))
+    elif previous:
+        text = ("automatic reviewer designation of freeze #%d cleared"
+                " (previous head): %s" % (freeze_id, ", ".join(previous)))
+    else:
+        return
+    storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
+
+
+_SAVEPOINT = "ameesh_review_designation"
+
+
+def _savepoint(tx) -> None:
+    tx.execute("SAVEPOINT " + _SAVEPOINT)
+
+
+def _release(tx) -> None:
+    tx.execute("RELEASE SAVEPOINT " + _SAVEPOINT)
+
+
+def _rollback(tx) -> None:
+    tx.execute("ROLLBACK TO SAVEPOINT " + _SAVEPOINT)
+    tx.execute("RELEASE SAVEPOINT " + _SAVEPOINT)
+
+
+def _internal_failure(cfg, tx, item: Mapping, freeze: Mapping, threads: list,
+                      exc: BaseException) -> dict:
+    """Journal/notify an unexpected selection failure and return the wait.
+
+    Called only AFTER a savepoint rollback (or before any write): no partial
+    mail, mark or reviewer column can survive from the failed attempt. A
+    failure to write this note propagates, which rolls the freeze back: the
+    milestone and its designation are one fact, never a half-mailed freeze.
+    """
+    why = "internal designation error: %s: %s" % (type(exc).__name__,
+                                                  str(exc)[:240])
+    notify = _notify(cfg, tx, str((item or {}).get("app") or ""),
+                     registry.overview(tx))
+    _note_unavailable(tx, item, freeze, why, threads, notify)
+    _sync_reviewers(tx, item, freeze, [])
+    return {"state": "unavailable", "reviewers": [], "freeze": dict(freeze or {}),
+            "why": why}
+
+
 def _selection(inputs: Inputs, port) -> dict:
     """The `apply` call, shared by the hook and the recovery path."""
     return rd.apply(
@@ -509,52 +649,77 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     no-op (the manual exception is journaled by its own command). Every
     expected data problem is journaled and notified, never raised: a freeze is
     a fact of the lot's timeline and must not be lost to a designation input.
-    An unexpected selection error is recorded the same way; only a database
-    failure (the note itself cannot be written) rolls the milestone back.
+
+    The selection writes inside a **savepoint**: an exception while the mails,
+    the mark or the reviewer column are being written rolls the attempt back
+    (and truncates its deferred thread writes) before the explicit waiting
+    note is written. No first mail survives without its mark, and a replay
+    cannot mail the same reviewer twice (B3 of the Codex review cx2). A
+    failure to write the waiting note itself propagates: the milestone and
+    its designation are one fact.
     """
     item = work.get(tx, int(lot)) or {"id": int(lot), "state": "", "title": "", "app": ""}
     freeze = dict(milestone or {})
     freeze.setdefault("id", 0)
     freeze.setdefault("sha", "")
+    manual = _manual(tx, item)
+    if manual:
+        storage.of(tx).work.note(
+            int(lot), str(item.get("state") or ""),
+            "automatic reviewer designation skipped at freeze %s: manual"
+            " reviewer(s) already designated (%s); the manual designation"
+            " remains the journaled exception"
+            % (_freeze_label(freeze), ", ".join(manual)), SENDER)
+        return {"state": "manual", "reviewers": [], "freeze": freeze,
+                "why": "manual reviewer designation"}
     try:
-        if _manual(item):
-            storage.of(tx).work.note(
-                int(lot), str(item.get("state") or ""),
-                "automatic reviewer designation skipped at freeze %s: manual"
-                " reviewer(s) already designated (%s); the manual designation"
-                " remains the journaled exception"
-                % (_freeze_label(freeze), ", ".join(_manual(item))), SENDER)
-            return {"state": "manual", "reviewers": [], "freeze": freeze,
-                    "why": "manual reviewer designation"}
         inputs = prepare(cfg, tx, int(lot), freeze=freeze)
-        if isinstance(inputs, Unavailable):
-            if not inputs.silent:
-                notify = _notify(cfg, tx, str(item.get("app") or ""),
-                                 registry.overview(tx))
-                _note_unavailable(tx, item, freeze, inputs.why, threads, notify)
-            return {"state": "unavailable", "reviewers": [], "freeze": freeze,
-                    "why": inputs.why}
-        if not inputs.paths:
-            return {"state": rd.NONE, "required": 0, "reviewers": [],
-                    "freeze": freeze, "why": "no changed path: no review due"}
-        if inputs.policy.required == 0:
-            return {"state": rd.NONE, "required": 0, "reviewers": [],
-                    "freeze": freeze, "why": "light lot: no review before merge"}
-        return _selection(inputs, pg.PgPort(tx, after_commit=threads))
+    except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
+        return _internal_failure(cfg, tx, item, freeze, threads, exc)
+    if isinstance(inputs, Unavailable):
+        if not inputs.silent:
+            notify = _notify(cfg, tx, str(item.get("app") or ""),
+                             registry.overview(tx))
+            _note_unavailable(tx, item, freeze, inputs.why, threads, notify)
+            _sync_reviewers(tx, item, freeze, [])
+        return {"state": "unavailable", "reviewers": [], "freeze": freeze,
+                "why": inputs.why}
+    checkpoint = len(threads)
+    _savepoint(tx)
+    try:
+        if not inputs.paths or inputs.policy.required == 0:
+            out = {"state": rd.NONE, "required": 0, "reviewers": [],
+                   "freeze": freeze,
+                   "why": ("light lot: no review before merge" if inputs.paths
+                           else "no changed path: no review due")}
+            _sync_reviewers(tx, item, freeze, [])
+        else:
+            out = _selection(inputs, pg.PgPort(tx, after_commit=threads))
+            if out.get("state") == rd.DESIGNATED:
+                _sync_reviewers(tx, item, freeze,
+                                [r.get("name") for r in out.get("reviewers") or ()])
+            else:
+                _sync_reviewers(tx, item, freeze, [])
+        _release(tx)
+        return out
     except (rd.DesignationError, rd.StaleFreeze) as exc:
+        try:
+            _rollback(tx)
+        except Exception:  # noqa: BLE001 - no rollback: the freeze must roll back
+            raise exc
+        del threads[checkpoint:]
         notify = _notify(cfg, tx, str(item.get("app") or ""), registry.overview(tx))
         _note_unavailable(tx, item, freeze, str(exc), threads, notify)
+        _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": str(exc)}
-    except Exception as exc:  # noqa: BLE001 - a designation bug never loses a freeze
-        why = "internal designation error: %s: %s" % (type(exc).__name__,
-                                                      str(exc)[:240])
+    except Exception as exc:  # noqa: BLE001 - recorded after the savepoint rollback
         try:
-            notify = _notify(cfg, tx, str(item.get("app") or ""), registry.overview(tx))
-            _note_unavailable(tx, item, freeze, why, threads, notify)
-        except Exception:  # noqa: BLE001 - no note: the freeze must still be kept
-            pass
-        return {"state": "unavailable", "reviewers": [], "freeze": freeze, "why": why}
+            _rollback(tx)
+        except Exception:  # noqa: BLE001 - no rollback: the freeze must roll back
+            raise exc
+        del threads[checkpoint:]
+        return _internal_failure(cfg, tx, item, freeze, threads, exc)
 
 
 def hook(cfg, outcome: Optional[dict] = None):
@@ -604,7 +769,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> dict:
         freeze = {"id": int(row["id"]), "sha": str(row.get("sha") or "").strip(),
                   "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
     freeze = dict(freeze)
-    manual = _manual(item)
+    manual = _manual(db, item)
     if manual:
         return {"state": "manual", "reviewers": [], "freeze": freeze,
                 "why": "manual reviewer(s) designated: %s" % ", ".join(manual)}
@@ -617,20 +782,29 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> dict:
                                  registry.overview(db))
                 with db.transaction() as tx:
                     _note_unavailable(tx, item, freeze, inputs.why, threads, notify)
+                    _sync_reviewers(tx, item, freeze, [])
                 _drain(db, threads)
             return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                     "why": inputs.why}
         if not inputs.paths or inputs.policy.required == 0:
+            with db.transaction() as tx:
+                _sync_reviewers(tx, item, freeze, [])
             return {"state": rd.NONE, "required": 0, "reviewers": [],
                     "freeze": freeze,
                     "why": "light lot: no review before merge" if inputs.paths
                     else "no changed path: no review due"}
-        return _selection(inputs, pg.PgPort(db))
+        out = _selection(inputs, pg.PgPort(db))
+        names = ([r.get("name") for r in out.get("reviewers") or ()]
+                 if out.get("state") == rd.DESIGNATED else [])
+        with db.transaction() as tx:
+            _sync_reviewers(tx, item, freeze, names)
+        return out
     except (rd.DesignationError, rd.StaleFreeze) as exc:
         with db.transaction() as tx:
             _note_unavailable(tx, item, freeze, str(exc), threads,
                               _notify(cfg, db, str(item.get("app") or ""),
                                       registry.overview(db)))
+            _sync_reviewers(tx, item, freeze, [])
         _drain(db, threads)
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": str(exc)}
@@ -644,7 +818,7 @@ def reviewers(cfg, db, lot: int, *, apply: bool = False) -> dict:
     rows = storage.of(db).work.milestones(int(lot), pg.MILESTONES)
     row = plan_git.latest_freeze(rows)
     out = {"lot": int(lot), "freeze": None, "designation": None,
-           "manual": _manual(item), "applied": None}
+           "manual": _manual(db, item), "applied": None}
     if row is None:
         return out
     freeze = {"id": int(row["id"]), "sha": str(row.get("sha") or "").strip(),
