@@ -161,6 +161,11 @@ class _Base(unittest.TestCase):
         kw.setdefault("repo", self.repo)
         kw.setdefault("db", None)
         kw.setdefault("cfg", None)
+        # #2333 : ces bancs simulent la fusion d'un paquet ; une exception
+        # incident est la déclaration qui autorise un lot hors paquet. Les
+        # témoins de la garde elle-même passent exception="" explicitement.
+        kw.setdefault("exception", "incident")
+        kw.setdefault("reason", "test: lot merge fixture outside the packet")
         return merge_pr.direct_merge(slug or self.slug, 7, self.head, gh=gh, **kw)
 
     def move_main(self):
@@ -174,6 +179,52 @@ class _Base(unittest.TestCase):
         _git(mover, "commit", "-q", "-m", "moved")
         _git(mover, "push", "-q", "origin", "main")
         return _git(self.origin, "rev-parse", "main").lower()
+
+
+class PacketGuardTest(_Base):
+    """#2333/canon §11 bis : une tête `lot/**` ne se fusionne pas hors paquet ;
+    `integration/**` passe ; l'exception est déclarée et journalisée."""
+
+    def test_a_lot_branch_is_refused_outside_the_packet(self):
+        gh = self.gh()
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(gh, exception="", reason="")
+        message = str(caught.exception)
+        self.assertIn("§11 bis", message)
+        self.assertIn("integration/**", message)
+        self.assertEqual(len(gh.calls), 1, "le refus précède toute autre lecture")
+        self.assertEqual(self.tip(), self.base, "rien n'a été écrit")
+
+    def test_an_integration_packet_passes_without_exception(self):
+        from ameesh import packet_guard
+        out = packet_guard.check_merge(None, self.lot, "integration/paquet-2333", "main",
+                                       self.head, exception="", reason="")
+        self.assertTrue(out["allowed"])
+        self.assertEqual(out["exception"], "")
+
+    def test_the_exception_is_written_to_the_lot_journal(self):
+        from ameesh import packet_guard
+        head = self.head.lower()
+        db = mock.Mock()
+
+        def note(_db, lot, text, **kw):
+            declared["note"] = (int(lot), text, kw.get("actor"))
+            return True
+
+        declared = {}
+        events = []
+        with mock.patch.object(work, "note", side_effect=note), \
+                mock.patch.object(work, "events", return_value=events):
+            out = packet_guard.check_merge(db, self.lot, "lot/7-work", "main", head,
+                                           exception="incident",
+                                           reason="cible rouge 18/10",
+                                           actor="human:pilote")
+        self.assertTrue(out["allowed"])
+        self.assertTrue(out["journaled"])
+        self.assertEqual(declared["note"][0], self.lot)
+        self.assertIn("packet-exception incident sha=%s" % head, declared["note"][1])
+        self.assertIn("cible rouge 18/10", declared["note"][1])
+        self.assertEqual(declared["note"][2], "human:pilote")
 
 
 class GuardTest(_Base):
@@ -607,7 +658,7 @@ class RunTest(unittest.TestCase):
         import argparse
         data = dict(repo="o/r", fetch_url="", push_url="git@github.com:o/r.git",
                     target=None, pr=7, head="a" * 40, dry_run=False, lot=1003, json=True,
-                    actor="impl-03")
+                    exception="", reason="", actor="impl-03")
         data.update(over)
         return argparse.Namespace(**data)
 

@@ -13,6 +13,11 @@ verdicts requis et la composition de la PR, puis pose sur elle l'étiquette
 (`pull_request` `types: [labeled]`) sur la tête gelée ; `ci cancel` annule les
 runs périmés d'un lot.
 
+#2333 (canon §11 bis, décision owner 18/10/2026 « tout passe par paquet ») :
+`ci run` en mode lot (`ci-lot-<sha>`) est refusé entre deux paquets, sauf
+`--full` (la suite du paquet) ou exception `incident|unblock` motivée et
+journalisée dans la note du lot (`packet_guard`).
+
 Étude L161 (docs/design/etudes/l161-tests-par-impact.md, section 3), voie A :
 pendant les tests, chaque part de la CI publie un check run « tests (flux) »
 (`scripts/ci-flow.py publish`) dont la sortie porte, en JSON lignes, chaque
@@ -108,7 +113,7 @@ import secrets
 import time
 from datetime import datetime
 
-from . import storage
+from . import packet_guard, storage
 
 #: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
 #: workflow des tests L161 : comportement historique, compatible ameesh.
@@ -2903,14 +2908,37 @@ def _render_gel(decision: dict) -> list[str]:
 
 
 def cmd_ci_run(cfg, args) -> int:
-    """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois."""
-    from . import plan_github
+    """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois.
+
+    #2333 (canon §11 bis) : aucune étiquette `ci-lot-<sha>` entre deux paquets.
+    La garde passe avant le plan — un `--dry-run` la montre aussi — et ne
+    laisse partir que `--full` ou une exception `incident|unblock` motivée,
+    journalisée dans la note du lot à la tête réellement testée."""
+    from . import plan_github, work
     from .db import open_db
     db = open_db(cfg)
     gh = plan_github.Gh()
 
     def api(path: str):
         return plan_github._json(gh, ["api", path])
+
+    item = work.get(db, args.id) if args.id else None
+    if item is not None:
+        freeze = frozen_of(db, args.id)
+        declared_sha = ((args.sha or "") or ((freeze or {}).get("sha") or "")).strip().lower()
+        try:
+            packet_guard.check_ci(db, args.id, item.get("branch") or "",
+                                  mode="full" if args.full else "lot",
+                                  sha=declared_sha,
+                                  exception=args.exception or "", reason=args.reason or "")
+        except packet_guard.PacketGuardError as exc:
+            if getattr(args, "json", False):
+                print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                                  "action": "refuse", "why": str(exc)},
+                                 ensure_ascii=False, indent=1))
+            else:
+                print("ameesh ci run: %s" % exc)
+            return 1
 
     try:
         decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
@@ -2934,6 +2962,11 @@ def cmd_ci_run(cfg, args) -> int:
         return 0
     # canon §3 : un run de la branche hors de la composition courante (autre
     # SHA, autre base) est périmé ; jamais celui de la composition demandée.
+    # #2333 : l'exception est journalisée à la tête que le plan a retenue
+    # (celle que la demande va tester), avant la pose de l'étiquette.
+    if decision.get("exception"):
+        packet_guard.declare(db, args.id, decision["exception"], decision["reason"],
+                             decision["sha"], actor=getattr(args, "actor", "") or "")
     stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "",
                         number=decision["pr"], base=decision["base"])["runs"]
     if stale:

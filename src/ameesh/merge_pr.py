@@ -103,8 +103,8 @@ import shutil
 import tempfile
 import time
 
-from . import (fire, land, merge_queue, migrations, packet_reservation, plan_git, radar,
-               resolutions, work)
+from . import (fire, land, merge_queue, migrations, packet_guard, packet_reservation, plan_git,
+               radar, resolutions, work)
 from .canon import FETCH_TIMEOUT, GitError
 
 #: the path that makes the API refuse the merge
@@ -546,7 +546,8 @@ def _already(slug: str, pr: int, head: str, view: dict, *, target: str,
 def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None, cfg=None,
                  project=None, target: str | None = None,
                  fetch_url: str | None = None, push_url: str | None = None,
-                 gh=land._gh, dry_run: bool = False,
+                 gh=land._gh, dry_run: bool = False, exception: str = "", reason: str = "",
+                 actor: str = "",
                  attempts: int | None = None, poll_s: float | None = None,
                  sleep=time.sleep, work_dir: str | None = None) -> dict:
     """Merge PR `pr` (head `head`, lot `lot`) onto `target` by a local commit
@@ -555,8 +556,19 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
     any write and a second time just before the push. Nothing is written
     before the fresh guard; `dry_run` stops before the push. Returns the
     report (`state`: merged | already | already-unverified | dry-run |
-    pushed-unverified)."""
+    pushed-unverified).
+
+    #2333 (canon §11 bis): a lot branch (`lot/**`, `agent/**`, `review/**`)
+    is not merged directly on the integration target; only an `integration/**`
+    packet passes, or an exception `incident|unblock` declared in the lot's
+    note (journaled here) — `packet_guard.check_merge` refuses before any
+    write, the `MERGED` declaration path included."""
     head = check_head(head)
+    if exception:
+        try:
+            packet_guard.marker(exception, head, reason)
+        except packet_guard.PacketGuardError as exc:
+            raise MergePrError(str(exc)) from exc
     if lot is None:
         raise MergePrError("--lot is required: the frozen lot carries the freeze and the "
                            "review verdict this gesture replays, and the merge is declared "
@@ -584,6 +596,13 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError(str(exc)) from exc
     if branch and _branch_name(branch) != _branch_name(target):
         raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
+    # #2333 (canon §11 bis): the packet rule is checked before any scratch
+    # clone, GitHub mutation or write — the `already MERGED` declaration too.
+    try:
+        packet_guard.check_merge(db, lot, view.get("headRefName") or "", target, head,
+                                 exception=exception, reason=reason, actor=actor)
+    except packet_guard.PacketGuardError as exc:
+        raise MergePrError(str(exc)) from exc
 
     owner = work_dir or _scratch()
     reservation = None
@@ -809,6 +828,13 @@ def add_parser(work_sub, func) -> None:
     parser.add_argument("--lot", type=int, required=True,
                         help="the frozen lot that authorizes the gesture (freeze, review "
                              "verdict, admission); the merge is declared on it")
+    parser.add_argument("--exception", choices=packet_guard.EXCEPTIONS, default="",
+                        help="#2333/canon §11 bis: incident|unblock, for a lot branch merged "
+                             "outside the packet; declared and journaled in the lot's note; "
+                             "requires --reason")
+    parser.add_argument("--reason", default="",
+                        help="why the packet exception is taken (incident: target red; "
+                             "unblock: CI stuck); written to the lot's journal")
     parser.add_argument("--dry-run", action="store_true",
                         help="run every guard and build the merge commit; push nothing")
     parser.add_argument("--json", action="store_true")
@@ -866,7 +892,8 @@ def run(cfg, db, args) -> int:
         push_url = check_push_url(args.push_url or ("git@github.com:%s.git" % slug))
         out = direct_merge(slug, args.pr, args.head, lot=args.lot, repo=cwd, db=db, cfg=cfg,
                            target=args.target, fetch_url=fetch_url, push_url=push_url,
-                           dry_run=args.dry_run)
+                           dry_run=args.dry_run, exception=args.exception or "",
+                           reason=args.reason or "", actor=args.actor or "")
         # N1 (#1003): `--dry-run` never declares anything, including on an
         # already-MERGED PR (the `already` finding is not a write).
         if out.get("state") in ("merged", "already") and not args.dry_run:
