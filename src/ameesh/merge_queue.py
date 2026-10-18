@@ -95,7 +95,8 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 #: et prod** en demandent deux, indépendants (canon §2, décision 18855a). Ces
 #: trois domaines se lisent sur les chemins du diff classé (`klass["files"]`).
 #: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
-#: Les motifs de domaine restent larges pour ne pas omettre un chemin critique.
+#: `critical: true` au canon fait foi ; ces motifs restent un minimum lorsque
+#: le canon ne connaît pas encore un chemin critique ou omet sa déclaration.
 CRITICAL_SCOPE = (
     # SQL, migrations, stockage
     re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
@@ -109,8 +110,16 @@ CRITICAL_SCOPE = (
     re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
                r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
                r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
-               r"relocation|placement|merge_queue|land|fire)\.py$"),
+               r"relocation|placement|merge_queue|land|fire)\.py$|"
+               # la classe du lot, son classement et la fusion hors API (#2249)
+               r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               # preuve de famille indépendante des avis (#2265)
+               r"^src/ameesh/(review_lot|registry)\.py$"),
 )
+#: la documentation Markdown que le canon classe léger ou normal : les motifs
+#: de secours, larges, y verraient un domaine (`docs/design/decisions/`). Seul
+#: `critical: true` au canon la rend critique.
+_PROSE = re.compile(r"\.(md|markdown)$", re.IGNORECASE)
 #: le nombre d'avis d'un lot sensible hors de ces domaines
 SENSITIVE_REVIEWS = 1
 #: le nombre d'avis d'un lot sensible qui touche SQL, la sécurité ou la prod
@@ -120,6 +129,9 @@ CRITICAL_REVIEWS = 2
 def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
+    Le canon peut le déclarer explicitement sur chaque chemin classé. Les
+    motifs de secours s'appliquent aussi aux chemins classés légers, sauf à la
+    documentation Markdown classée légère ou normale.
     Un doute de classe (politique ou diff illisible, `files` vide) ne se
     suppose jamais rassurant : `required_verdicts` le compte alors comme un
     domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
@@ -127,17 +139,21 @@ def critical_scope(klass) -> bool:
     if not files:
         return True
     for entry in files:
-        if str(entry.get("class") or "") == "light":
-            continue
         path = str(entry.get("path") or "")
-        if not path or any(rx.search(path) for rx in CRITICAL_SCOPE):
+        if entry.get("critical") is True or not path:
+            return True
+        if (str(entry.get("class") or "") in ("light", "normal")
+                and _PROSE.search(path)):
+            continue
+        if any(rx.search(path) for rx in CRITICAL_SCOPE):
             return True
     return False
 
 
 def required_verdicts(klass) -> int:
-    """Le nombre d'avis indépendants que la classe exige : 0 pour un lot léger,
-    1 pour normal, 1 pour sensible (2 s'il touche SQL, la sécurité ou la prod).
+    """Le nombre d'avis indépendants : deux pour un chemin critique, même si
+    le canon l'a omis ou classé léger ; sinon 0 pour léger, 1 pour normal et
+    1 pour sensible hors SQL, sécurité et prod.
     Un doute de classe (politique ou diff illisible, `files` vide) ne se
     suppose jamais rassurant : il garde l'exigence des domaines critiques
     (deux avis), faute de pouvoir exclure SQL, la sécurité ou la prod.
@@ -147,10 +163,12 @@ def required_verdicts(klass) -> int:
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
-    if cls == lot_class.LIGHT:
-        return 0
     if klass.get("doubt"):
         return CRITICAL_REVIEWS
+    if klass.get("files") and critical_scope(klass):
+        return CRITICAL_REVIEWS
+    if cls == lot_class.LIGHT:
+        return 0
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
         return 1
     return CRITICAL_REVIEWS if critical_scope(klass) else SENSITIVE_REVIEWS

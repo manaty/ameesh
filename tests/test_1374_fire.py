@@ -222,6 +222,22 @@ class ReviewGateTest(unittest.TestCase):
                                 klass=klass)
             self.assertFalse(unknown["ok"], "une famille inconnue ne prouve pas l'indépendance")
 
+    def test_class_and_off_api_merge_need_two_families(self):
+        # #2249 : la classe du lot, son classement et la fusion hors API sont
+        # la porte de fusion, comme merge_queue et land.
+        for path in ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                     "src/ameesh/review.py"):
+            with self.subTest(path=path):
+                klass = {"class": "sensitive", "files": [
+                    {"path": path, "class": "sensitive", "rule": [path]}]}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+        near = {"class": "sensitive", "files": [
+            {"path": "src/ameesh/preview.py", "class": "sensitive",
+             "rule": ["src/ameesh/preview.py"]}]}
+        self.assertEqual(merge_queue.required_verdicts(near), 1, "motif ancré au nom")
+
     #: le canon synthétique du témoin de bout en bout (#2264) : les trois
     #: chemins que la porte de fusion doit voir (#1629), puis fire.py, qui
     #: tombe dans la portée critique « prod » (deux avis).
@@ -242,7 +258,7 @@ class ReviewGateTest(unittest.TestCase):
         le canon ne classait plus ces chemins. Ici la classe est lue par
         `lot_class.class_of_paths` sur un canon synthétique, puis la porte en
         déduit les avis ; le contrôle négatif (même canon sans règle) retombe
-        à `light` et zéro avis, donc le témoin dépend bien du canon."""
+        à `light`, tout en gardant la ceinture critique de #2265."""
         canon = self.canon(self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
         for path in self.GATE_CANON_PATHS:
             klass = lot_class.class_of_paths([canon], "ameesh", [path])
@@ -260,13 +276,13 @@ class ReviewGateTest(unittest.TestCase):
         self.assertTrue(two["ok"], two["why"])
         one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=together)
         self.assertFalse(one["ok"], "la classe lue exige bien deux avis")
-        # Contrôle négatif : sans règle, ces mêmes chemins ne sont plus
-        # sensibles et la porte n'exige plus d'avis.
+        # Sans règle, la classe devient légère ; #2265 garde deux avis sur
+        # les chemins critiques oubliés du canon, indépendamment de la classe.
         bare = self.canon()
         light = lot_class.class_of_paths(
             [bare], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
         self.assertEqual(light["class"], "light", light)
-        self.assertEqual(merge_queue.required_verdicts(light), 0, light)
+        self.assertEqual(merge_queue.required_verdicts(light), 2, light)
 
     def test_author_family_never_counts(self):
         klass = {"class": "sensitive", "files": [self.SQL]}
