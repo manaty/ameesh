@@ -1769,13 +1769,14 @@ class WorkItems(Domain):
         (la prise automatique, `backlog.auto_take`) : même contrôle sous le
         même verrou, mais le lot reste où il est et `PendingLot` est levée.
         `ready_only` (L165) exige un lot intake sans assigné dont toutes les
-        dépendances sont satisfaites ; vérifié sous verrou dans la même
-        transaction que l'attribution. `current` doit alors être NULL : toute
-        autre valeur est une erreur d'appel (`ValueError` immédiate, avant le
-        verrou) et non un None silencieux (#1696). La réservation manuelle
-        garde son comportement par défaut. #705 : si le nouvel assigné est le
-        relecteur désigné, la désignation tombe dans la même écriture (le
-        journal la nomme) — un relecteur ne relit pas son propre travail."""
+        dépendances sont FUSIONNÉES (`merged`/`promoted`/`closed`, #2252) ;
+        vérifié sous verrou dans la même transaction que l'attribution.
+        `current` doit alors être NULL : toute autre valeur est une erreur
+        d'appel (`ValueError` immédiate, avant le verrou) et non un None
+        silencieux (#1696). La réservation manuelle garde son comportement par
+        défaut. #705 : si le nouvel assigné est le relecteur désigné, la
+        désignation tombe dans la même écriture (le journal la nomme) — un
+        relecteur ne relit pas son propre travail."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str | None, *, current: str, state: str,
@@ -1961,14 +1962,19 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def unassigned_lots(self, limit: int) -> list[dict]:
         """L165 : les lots du projet encore à confier (`intake`, sans assigné,
-        hors file d'amélioration, sans dépendance ouverte), dans l'ordre de
-        prise : priorité, puis dates prévues (début, fin, livraison ; sans date en dernier), puis
-        ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
-        fiche ou de la fiche parente, sinon son application),
-        `pending_decision` (une demande de décision attend sur le lot) et
-        `decision_milestone` (un jalon de décision ouvert y est rattaché).
+        hors file d'amélioration, sans dépendance non fusionnée), dans l'ordre
+        de prise : priorité, puis dates prévues (début, fin, livraison ; sans
+        date en dernier), puis ancienneté. Chaque ligne ajoute `lot_team`
+        (équipe du lot, sinon de sa fiche ou de la fiche parente, sinon son
+        application), `pending_decision` (une demande de décision attend sur
+        le lot) et `decision_milestone` (un jalon de décision ouvert y est
+        rattaché).
         #1193: a lot whose explicit prerequisite is not finished is excluded —
-        the ready intake never offers a lot that cannot be started."""
+        the ready intake never offers a lot that cannot be started.
+        #2252 : « finished » veut dire fusionné (`merged`/`promoted`/`closed`) :
+        un bloqueur en `qa`, même à verdict favorable, garde une tête qui peut
+        encore changer ; la règle est celle de `work show` et de
+        « planned: waiting on lots »."""
 
     @abc.abstractmethod
     def review_proposals(self, limit: int, *, proposal_prefix: str,
@@ -2071,8 +2077,11 @@ class WorkPackages(Domain):
         toute écriture de `canon` (`canon.rebase_default`). À appeler dans une
         transaction ouverte : il tient jusqu'au COMMIT, comme
         `authenticators.lock_registry`. L'attente du verrou ne compte pas dans
-        le délai de requête de la session (un premier sync long ne fait pas
-        échouer les suivants)."""
+        le `statement_timeout` de la session (un premier sync long ne fait pas
+        échouer les suivants), mais elle reste BORNÉE (#1747) : par le
+        `lock_timeout` que le pilote Postgres pose le temps de la prise, et,
+        sous psql, par le délai client de chaque instruction
+        (`statement_timeout` + 5 s) — la plus courte des deux s'applique."""
 
 
 # --------------------------------------------------------------------------
@@ -2738,6 +2747,20 @@ class Progress(Domain):
         plus large de `since_ts` et des 24 dernières heures (horloge de la
         base) : `usd_window`, `usd_1h`, `usd_24h`, tours et jetons de la
         fenêtre. `agents` restreint aux agents nommés (None = tous)."""
+
+    @abc.abstractmethod
+    def ci_suite(self, *, since_ts: float, limit: int) -> list[dict]:
+        """Exécutions CONCLUES de la suite complète des tests depuis
+        `since_ts` (#1476), de la plus récente à la plus ancienne, au plus
+        `limit` **par dépôt**, dans les contextes qui la garantissent :
+        poussée ou pull request `release/**`|`integration/**` (source ou
+        cible), ou exécution manuelle (`workflow_dispatch`) ; une poussée sur
+        `main` est écartée (la voie documentation seule L161a y saute les
+        parts, et `ci_runs` ne garde pas le mode du plan). Chaque ligne :
+        repo, run_id, branch, base, event, `duration_s` (premier relevé du
+        veilleur → conclusion, l'unité de la vue) et `concluded_ts`. Les
+        exécutions annulées ou remplacées ne comptent pas (pas de durée de
+        suite)."""
 
 
 # --------------------------------------------------------------------------

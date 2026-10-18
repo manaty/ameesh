@@ -322,6 +322,8 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "stop_battery_percent": resources.DEFAULT_STOP_BATTERY_PERCENT,
             # L159d: CPU pressure not watched, no lending offer
             "max_cpu_pressure": None,
+            # #2296: memory pressure, a prudent default nobody declares here
+            "max_mem_pressure": resources.DEFAULT_MAX_MEM_PRESSURE,
             "lend": None,
             # #246: btrfs floors, nobody declares them
             "min_btrfs_unallocated": resources.DEFAULT_MIN_BTRFS_UNALLOCATED,
@@ -339,6 +341,7 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "min_battery_percent": resources.DEFAULT_ORIGIN,
             "stop_battery_percent": resources.DEFAULT_ORIGIN,
             "max_cpu_pressure": resources.DEFAULT_ORIGIN,
+            "max_mem_pressure": resources.DEFAULT_ORIGIN,
             "min_btrfs_unallocated": resources.DEFAULT_ORIGIN,
             "min_btrfs_metadata_headroom": resources.DEFAULT_ORIGIN,
             "warn_disk_used": resources.DEFAULT_ORIGIN,
