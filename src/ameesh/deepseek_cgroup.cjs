@@ -14,8 +14,9 @@ const threads = require('node:worker_threads');
 const PROVIDER = '@deepseek-ai/dsh-subprocess-local';
 const VERSION = '0.2.0-rc.2';
 const INDEX_HASH = 'e40106ed35a1e1744c016e77f2cf59b07f87969bb7c4b424d26fb08da75e3922';
-// Include every provider module the entry imports, not only its declared main:
-// runner-launch-B2zsQ1Dz.js, runner.js and output.js (#2275).
+// Include every provider module the entry imports (runner-launch-B2zsQ1Dz.js
+// and output.js), plus its separate ./runner export (runner.js); pinning the
+// latter is harmless although the entry does not import it (#2275, #2280).
 const HASHES = new Set([INDEX_HASH,
   '6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153',
   '4e21528dfdb3e92bdce2340945dc4dcb202e4a4af0bbeb8b97585f67735d30c1',

@@ -439,6 +439,12 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                 # (executor not designated) » était faux et l'escalade sans
                 # objet.
                 detail = _waiting("packet", "#%s" % wait.get("vehicle"))
+            elif (wait and wait.get("what") == "landing"
+                  and detail and detail.get("what") == "merge"):
+                # #1945 : un atterrissage déclaré est plus précis que le libellé
+                # générique « merge (executor not designated) » ; le registre
+                # nomme le véhicule, son étape, sa tête et l'échéance.
+                detail = dict(detail, who=None, label=work_dependencies.wait_label(wait))
             last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                                  messages.get(rid), events_ts=last_events.get(rid))
             project = projects.lot_project(row, agent_projects,

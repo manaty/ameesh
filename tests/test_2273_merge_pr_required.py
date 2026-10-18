@@ -20,6 +20,8 @@ protection ou une source illisible sans déclaration refuse.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -83,6 +85,12 @@ class FakeGh:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr=self.error)
             return types.SimpleNamespace(returncode=0,
                                          stdout=json.dumps(self.protection), stderr="")
+        path = next((arg for arg in argv if "/rules/branches/" in arg), "")
+        if path:
+            # #2285 : les rulesets sont lus en plus de la protection ; ce banc
+            # n'en déclare aucun.
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps([[]]),
+                                         stderr="")
         path = next((arg for arg in argv if "/check-runs" in arg), "")
         if path:
             if self.check_error:
@@ -204,8 +212,32 @@ class RequiredChecksRefusalTest(unittest.TestCase):
 
     def test_a_local_transport_has_no_forge_protection_to_read(self):
         gh = FakeGh()
-        self.assertEqual(self.refusal(gh, INCIDENT, slug="/tmp/repo"), "")
+        with tempfile.TemporaryDirectory() as repo:
+            self.assertEqual(self.refusal(gh, INCIDENT, slug=repo), "")
+            self.assertEqual(self.refusal(gh, INCIDENT, slug="file://" + repo), "")
         self.assertEqual(gh.calls, [])
+
+    def test_a_malformed_slug_refuses_instead_of_passing_as_local(self):
+        """#2289 : seul un transport local déclaré (chemin réel existant)
+        dispense des checks requis ; un slug vide, malformé ou un chemin
+        absent refuse, sans dépendre de `_bind_repo_identity`."""
+        gh = FakeGh(check_runs=[_run("tests")])
+        rollup = [_check("tests")]
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "absent")
+            for slug in ("", "  ", "manaty", "manaty/ameesh/extra", "manaty /ameesh",
+                         "https://example.org/x", missing):
+                with self.subTest(slug=slug):
+                    reason = self.refusal(gh, rollup, slug=slug)
+                    self.assertIn("cannot be proven", reason)
+                    self.assertIn("neither owner/repo nor a local transport", reason)
+        self.assertEqual(gh.calls, [])
+
+    def test_a_padded_github_key_is_read_as_that_key(self):
+        gh = FakeGh(check_runs=[_run("tests")])
+        self.assertEqual(self.refusal(gh, [_check("tests")], slug=" manaty/ameesh "), "")
+        self.assertTrue(any("repos/manaty/ameesh/" in arg
+                            for call in gh.calls for arg in call), gh.calls)
 
 
 class AdmissionTest(unittest.TestCase):
