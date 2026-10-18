@@ -130,14 +130,16 @@ DUE_SUITE_TOLERATED = {
 }
 
 
+def _plumbing_job(name, context):
+    """An identified plumbing job of the suite publishing `context`."""
+    return name in DUE_PLUMBING or name in (
+        "lot-pending / Lot status (%s)" % context,
+        "lot-status / Lot status (%s)" % context)
+
+
 def _tolerated_job(name, path, context):
     """An identified plumbing job, or a skip-by-design job of *this* suite."""
-    if name in DUE_PLUMBING:
-        return True
-    if name in ("lot-pending / Lot status (%s)" % context,
-                "lot-status / Lot status (%s)" % context):
-        return True
-    return name in DUE_SUITE_TOLERATED.get(path, ())
+    return _plumbing_job(name, context) or name in DUE_SUITE_TOLERATED.get(path, ())
 
 
 @dataclass(frozen=True)
@@ -431,7 +433,11 @@ class GitHub:
                 # A tolerated job is tolerated when *skipped by design*; if it
                 # actually ran and failed, the run is red and this suite is the
                 # faulty one (N2): a generic conclusion mismatch would hide it.
-                failed = any(job.get("conclusion") == "failure" for job in jobs)
+                # A failed plumbing job (status publisher, plan guard) is no
+                # test outcome: it names no lot and is left to the mismatch
+                # check below (#2550).
+                failed = any(job.get("conclusion") == "failure" for job in jobs
+                             if not _plumbing_job(job["name"], workflow.context))
             else:
                 failed = False
                 for required in workflow.jobs:
