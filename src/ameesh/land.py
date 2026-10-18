@@ -77,22 +77,46 @@ def _passive(db, to, lot: int, text: str, data: dict) -> None:
         pass
 
 
-def _fire_guard(landing) -> dict | None:
+def _fire_guard(landing, *, gh=None) -> dict | None:
     """#1374, P1-2 : le feu et les blocages sont revalidés au dernier geste.
 
     Le retrait ou l'invalidation d'un feu retire la ligne de file au passage
     suivant ; entre les deux, `land` pourrait encore pousser ou fusionner. Sous
     son bail, juste avant le geste, il redemande l'autorisation : un lot qui a
     porté un feu ne part que sous un feu actif couvrant le gel de sa file et
-    sans verdict bloqué non levé. Rend l'éjection, ou None si la voie est
-    libre."""
-    from . import fire
+    sans verdict bloqué non levé.
+
+    #2286 : sur un atterrissage local, la garde exige aussi les checks requis
+    déclarés du projet sur le gel : la voie file ne contourne pas la porte des
+    checks requis.
+
+    #2333 (canon §11 bis) : la file d'équipe ne contourne pas la règle du
+    paquet. La tête de la ligne (`lot/**`, `agent/**`, `review/**`) ne se
+    fusionne sur la cible d'intégration que portée par un paquet
+    (`integration/**`) ou sous une exception déclarée au journal du lot, pour
+    cette tête exacte — et cela **sans dépendre d'un feu** : une ligne déjà en
+    file ou `work queue add` (qui ne passe ni par `give` ni par `_act`) est
+    arrêtée ici, sur les voies `local` et `pr`. Rend l'éjection, ou None si la
+    voie est libre."""
+    from . import fire, packet_guard
+    row = landing.row or {}
+    try:
+        packet_guard.check_merge(landing.db, landing.lot, row.get("branch") or "",
+                                 row.get("target") or "", row.get("frozen_sha") or "")
+    except packet_guard.PacketGuardError as exc:
+        return landing.eject(str(exc), "This queue entry is not a packet (canon §11 bis): "
+                                       "take the lot out of the queue (`ameesh work queue "
+                                       "remove %d`) and let the packet carry it, or declare "
+                                       "the incident/unblock exception in the lot's note."
+                              % landing.lot)
     ok, why = fire.land_guard(landing.db, landing.lot, landing.row.get("frozen_sha") or "",
-                              repo=landing.project.repo)
+                              repo=landing.project.repo, project=landing.project,
+                              target=landing.row.get("target") or "", gh=gh)
     if ok:
         return None
-    return landing.eject(why, "The fire no longer authorizes this landing: ask the pilot for a "
-                              "fire on the current freeze, or take the lot out of the queue "
+    return landing.eject(why, "The fire or the required checks no longer authorize this "
+                              "landing: restore them on the freeze (or ask the pilot for a "
+                              "fire on the current freeze), or take the lot out of the queue "
                               "(`ameesh work queue remove %d`)." % landing.lot)
 
 
@@ -777,7 +801,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if project.land == "local":
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
-        stopped = _fire_guard(landing)
+        stopped = _fire_guard(landing, gh=gh)
         if stopped is not None:
             return stopped
         # #194 r6: one atomic push, two compare-and-swaps that the server
@@ -817,7 +841,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             "ameesh work queue add %d." % lot)
     if not landing.held():
         return landing.busy("lease on %s lost before pushing" % landing.key)
-    stopped = _fire_guard(landing)
+    stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
     # #194 r4: compare and swap on the freeze (see `local`)
@@ -959,7 +983,7 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return refused
     if not landing.held():
         return landing.busy("lease lost before merging PR #%s" % status["number"])
-    stopped = _fire_guard(landing)
+    stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
