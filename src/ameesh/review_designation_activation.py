@@ -451,7 +451,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | 
     notify = _notify(cfg, db, project, listing)
     candidates = rd.candidates_from_registry(
         listing, loads=_loads(db), project=project,
-        families=policy.families or rd.KNOWN_FAMILIES)
+        families=policy.families)
     if notify:
         # the pilot receives the capacity alert; the review stays with the
         # project's agents, so the two roles never collapse into one mail
@@ -675,7 +675,7 @@ def _selection(inputs: Inputs, port) -> dict:
         authors=inputs.authors, candidates=inputs.candidates,
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
-        families=inputs.policy.families or rd.KNOWN_FAMILIES)
+        families=inputs.policy.families)
 
 
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],

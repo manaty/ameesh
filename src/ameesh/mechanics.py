@@ -246,7 +246,7 @@ class Mechanics:
         return tuple(out)
 
     def cutoff(self, now: float) -> float:
-        """Dernière coupure locale à `now` ou avant (même contrat que `train.cutoff`)."""
+        """Dernière coupure locale à `now` ou avant."""
         local = datetime.fromtimestamp(now, self.zone())
         for offset in (0, -1):
             before = [stamp for stamp, _ in self.cutoffs_on(local.date() + timedelta(days=offset))
@@ -717,6 +717,37 @@ def load_global(repo: str, commit: str) -> Document:
     """Le document global (`processus/mecanique.yaml`) au commit exact."""
     commit = _exact_commit(repo, commit)
     return compile_document(_regular_blob(repo, commit, PATH), source=PATH)
+
+
+#: documents globaux déjà compilés, par `(dépôt, commit exact)` : un commit
+#: ne change pas, la passe d'un exécuteur ne relit donc pas le blob par lot
+_CONFIGURED: dict = {}
+
+
+def configured(cfg) -> Document:
+    """Le document global du canon appliqué (#2451), sans repli.
+
+    Même source que le constat de `ameesh canon sync` (`sync_mechanics`) : la
+    première source du canon par défaut, Git et épinglée, à la racine du dépôt.
+    Aucun canon lisible, une source non Git, un canon en sous-répertoire ou un
+    document absent refusent par `MechanicsError` (`MechanicsAbsent` pour le
+    document manquant) : un consommateur historique — plafond d'en-cours,
+    familles de relecture — ne se rabat jamais sur une valeur locale.
+    """
+    canons = canon.load_configured(cfg) if cfg is not None else []
+    if not canons or not canons[0].sources:
+        raise MechanicsError("no readable canon: compiled mechanics unavailable")
+    source = canons[0].sources[0]
+    if source.mode != "git" or not source.repo or not source.commit:
+        raise MechanicsError("no exact canon commit applied: "
+                             "compiled mechanics unavailable")
+    if source.prefix:
+        raise MechanicsError("canon under a sub-directory (%s): the mechanics are "
+                             "read at the Git root only" % source.prefix)
+    key = (source.repo, source.commit)
+    if key not in _CONFIGURED:
+        _CONFIGURED[key] = load_global(source.repo, source.commit)
+    return _CONFIGURED[key]
 
 
 def _federation(repo: str, commit: str) -> dict:

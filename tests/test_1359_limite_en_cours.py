@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1359 : limite d'en-cours (§4 du canon, owner 14/10/2026) — au plus
-`work.BUILD_LIMIT` lots en `build` par agent, surplus rendu à la file d'équipe.
+`build.max_in_build` lots en `build` par agent (canon compilé, #2451),
+surplus rendu à la file d'équipe. Le plafond est ici une valeur de fixture
+explicite (`CAP`) ; sa lecture au canon est couverte par
+test_2451_canon_consommateurs.
 
 Couvre : la prise atomique sous plafond (`assign_capped`), le refus du
 troisième lot dans la prise automatique, la restitution CAS (`work return`),
@@ -21,7 +24,17 @@ from .support import PgTestCase
 HEURE = 3600.0
 
 
+#: plafond §4 de fixture, posé à la place du canon compilé (#2451)
+CAP = 2
+
+
 class _Base(PgTestCase):
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(work, "build_limit", return_value=CAP)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def agent(self, name, harness="deepseek", *, status="idle", team="ameesh",
               since_s=2 * HEURE):
         registry.upsert(self.db, name, harness=harness, host=self.cfg.host)
@@ -79,7 +92,7 @@ class _Base(PgTestCase):
         """Une restitution de surplus directe (les gardes du balayage)."""
         kw.setdefault("marker", work.WIP_EXCEPTION_MARK)
         kw.setdefault("prefixes", work.ASSIGN_NOTES)
-        kw.setdefault("max_build", work.BUILD_LIMIT)
+        kw.setdefault("max_build", CAP)
         kw.setdefault("note", "restitution")
         kw.setdefault("actor", "ameesh")
         return storage.of(self.db).work.unassign_surplus(item_id, current=current, **kw)
@@ -95,20 +108,20 @@ class PriseSousPlafondTest(_Base):
         libre1 = self.lot("libre 1")
         self.assertIsNone(st.assign_capped(libre1["id"], "dev1", current=None,
                                            note="prise", actor="ameesh",
-                                           max_build=work.BUILD_LIMIT))
+                                           max_build=CAP))
         self.assertEqual(self.builds_of("dev1"), 2)
         self.assertIsNone(work.get(self.db, libre1["id"])["assignee"])
         # sous le plafond, la prise passe
         libre2 = self.lot("libre 2")
         self.assertIsNotNone(st.assign_capped(libre2["id"], "dev2", current=None,
                                               note="prise", actor="ameesh",
-                                              max_build=work.BUILD_LIMIT))
+                                              max_build=CAP))
         self.assertEqual(work.get(self.db, libre2["id"])["assignee"], "dev2")
         # CAS : un lot qui a bougé sous nos pieds n'est pas assigné
         libre3 = self.lot("libre 3")
         self.assertIsNone(st.assign_capped(libre3["id"], "dev2", current="quelqu_un",
                                            note="prise", actor="ameesh",
-                                           max_build=work.BUILD_LIMIT))
+                                           max_build=CAP))
         self.assertIsNone(work.get(self.db, libre3["id"])["assignee"])
 
     def test_la_prise_automatique_ignore_l_agent_au_plafond(self):
@@ -515,7 +528,7 @@ class NotesAttributionTest(_Base):
                                            work.ASSIGN_NOTES), [lot["id"]])
         done = st.assign_capped(lot["id"], "dev2", current=None,
                                 note="%s par dev2, au repos" % backlog.LOT_TAKE_NOTE,
-                                actor="ameesh", max_build=work.BUILD_LIMIT)
+                                actor="ameesh", max_build=CAP)
         self.assertIsNotNone(done)
         # la prise est une attribution : l'exception de la précédente est morte
         self.assertEqual(st.wip_exceptions([lot["id"]], work.WIP_EXCEPTION_MARK,

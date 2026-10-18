@@ -96,10 +96,6 @@ WAITING = {"blocked", "waiting_human"}
 CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
-#: §4 canon (owner 14/10/2026) : au plus 2 lots en développement (`build`) par
-#: agent ; les lots en surplus retournent à la file d'équipe. Règle générique,
-#: pour tous les projets et tous les agents.
-BUILD_LIMIT = 2
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
 #: portée par la note de la dernière attribution du lot (jamais une exemption
 #: silencieuse de qui a assigné le lot).
@@ -1501,6 +1497,19 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
                 "it has no team: it waits for the orchestrator (%s)" % later))
 
 
+def build_limit(cfg) -> int:
+    """§4 canon : le plafond de lots en développement (`build`) par agent.
+
+    Lu au canon compilé (`build.max_in_build`, #2451), jamais une constante
+    locale ; les lots en surplus retournent à la file d'équipe. Règle
+    générique du document global, pour tous les projets et tous les agents.
+    Sans document lisible, `mechanics.MechanicsError` : l'appelant refuse
+    d'agir plutôt que de supposer un plafond.
+    """
+    from . import mechanics
+    return mechanics.configured(cfg).max_in_build
+
+
 def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
                     reason: str = "") -> dict:
     """§4 : rend un lot à la file d'équipe — l'assignation est retirée (CAS sur
@@ -1527,8 +1536,8 @@ def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
     if who != current and not who.startswith(HUMAN_PREFIX) and not is_pilot(cfg, db, who):
         raise WorkError("return refused: %s is neither the assignee (%s), a human, nor "
                         "an orchestrator/design agent" % (who or "nobody", current))
-    note = "%s by %s (§4: at most %d lots in build per agent)" % (
-        RETURN_NOTE, who or UNKNOWN_ACTOR, BUILD_LIMIT)
+    note = "%s by %s (§4: lots in build per agent, capped by the canon)" % (
+        RETURN_NOTE, who or UNKNOWN_ACTOR)
     if reason.strip():
         note += ": %s" % " ".join(str(reason).split())
     row = storage.of(db).work.unassign(item_id, current=current, note=note,

@@ -18,7 +18,6 @@ from itertools import combinations
 from .train import TrainError
 
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
-FAMILIES = {"claude", "codex", "deepseek"}
 MARK_FIELDS = ("id", "actor", "at_ts", "sha", "verdict")
 
 
@@ -33,7 +32,7 @@ class Receipt:
     record: str                  # exact provenance record, never free-form note
     milestone: dict | None = None
 
-    def known(self, families=FAMILIES):
+    def known(self, families):
         return (all(isinstance(value, str) and value.strip() for value in (
             self.subject, self.commit, self.actor, self.session, self.turn, self.record))
                 and SHA.fullmatch(self.commit) is not None and self.harness in families)
@@ -54,8 +53,8 @@ def _order(mark):
 
 
 def qualify_recorded(db, head: str, commits: list[str], marks: list[dict], *,
-                     required: int, provider, families=FAMILIES,
-                     exclude_author_family=True, distinct_families=True) -> dict:
+                     required: int, provider, families,
+                     exclude_author_family, distinct_families) -> dict:
     """Read exact #1465 receipts through an explicitly trusted provider.
 
     The caller still supplies the complete Git range, complete milestone
@@ -95,8 +94,8 @@ def qualify_recorded(db, head: str, commits: list[str], marks: list[dict], *,
 
 
 def qualify(head: str, commits: list[str], marks: list[dict],
-            history: dict[str, Receipt | None], *, required: int, families=FAMILIES,
-            exclude_author_family=True, distinct_families=True) -> dict:
+            history: dict[str, Receipt | None], *, required: int, families,
+            exclude_author_family, distinct_families) -> dict:
     """Cover every content commit with independent final-head verdicts.
 
     The caller supplies the complete Git range and unbounded milestone read,

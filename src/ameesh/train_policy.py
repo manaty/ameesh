@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from . import canon, lot_class, merge_queue, resolutions, review
+from . import canon, lot_class, mechanics, merge_queue, resolutions, review
 from .train import TrainError
 from .train_admissions import Requirement
 from .train_review import SHA
@@ -135,7 +135,7 @@ class Compiled(Versioned):
     """
 
     def __init__(self, rules):
-        if rules.schema != "ameesh-mechanics/1" or not SHA.fullmatch(rules.commit):
+        if rules.schema != mechanics.SCHEMA or not SHA.fullmatch(rules.commit):
             raise TrainError("exact compiled canon mechanics required")
         self.mechanics = rules
         self.commit, self.project = rules.commit, rules.project
