@@ -57,6 +57,11 @@ pouvait le prendre (#2340). `required_family` relit la même preuve au moment
 de la prise et `may_take` n'ouvre le lot qu'à la famille opposée ; l'auteur
 inconnu ne se devine pas, et le lot attend alors une attribution explicite.
 
+#2552 : la référence d'un lot de relecture se lit aussi sur sa `source`. Des
+lots historiques la portent là avec un `issue_ref` GitHub (ou aucun) et
+échappaient à la garde de famille de #2377 ; la prise les écarte désormais de
+la famille de l'auteur de #N comme les lots courants.
+
 #2374 : une fusion classée `light` dont le diff touche pourtant la porte de
 fusion (`merge_queue.CRITICAL_SCOPE`) ouvre une relecture **sensible** à deux
 avis de familles distinctes. L'ouverture écrit en outre, au journal du lot
@@ -399,22 +404,38 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     return out
 
 
+def review_ref(item: dict) -> str:
+    """La référence `review-after-merge:#<lot>` que porte le lot (#2552).
+
+    `issue_ref` d'abord — c'est la marque écrite par l'ouverture —, puis
+    `source` : des lots de relecture plus anciens portent la référence en
+    `source` seulement, avec un `issue_ref` GitHub ou vide (#1218, #1231,
+    #1269). Rend "" hors lot de relecture ; la chaîne brute (minuscule) sinon,
+    que `required_family` valide."""
+    item = item or {}
+    for field in ("issue_ref", "source"):
+        ref = str(item.get(field) or "").strip().lower()
+        if ref.startswith(PREFIX):
+            return ref
+    return ""
+
+
 def required_family(db, item: dict) -> Optional[str]:
     """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
 
-    `None` quand ce n'est pas un lot de relecture (`issue_ref` hors du préfixe
-    `review-after-merge:`) : aucune garde. Une chaîne vide quand la famille de
-    l'auteur au gel est inconnue, ou quand sa trace est illisible : le lot
-    n'est alors **pris par personne** au repos (doute -> non pris, canon §8) et
-    attend une attribution explicite. Sinon la famille opposée à celle de
-    l'auteur au gel (`reviewer_family`), celle que le canon §2 demande au
-    relecteur.
+    `None` quand ce n'est pas un lot de relecture (ni `issue_ref` ni `source`
+    sous le préfixe `review-after-merge:`, #2552) : aucune garde. Une chaîne
+    vide quand la famille de l'auteur au gel est inconnue, ou quand sa trace
+    est illisible : le lot n'est alors **pris par personne** au repos (doute ->
+    non pris, canon §8) et attend une attribution explicite. Sinon la famille
+    opposée à celle de l'auteur au gel (`reviewer_family`), celle que le canon
+    §2 demande au relecteur.
 
     La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
     qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
     courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
-    ref = str((item or {}).get("issue_ref") or "").strip().lower()
-    if not ref.startswith(PREFIX):
+    ref = review_ref(item)
+    if not ref:
         return None
     try:
         lot = int(ref[len(PREFIX):].strip().lstrip("#"))
