@@ -744,7 +744,7 @@ class Cache:
 
 def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
          migrations: str = "", cache: Cache | None = None,
-         verify=None, reservations=None) -> dict:
+         verify=None, reservations=None, reservation_holder=None) -> dict:
     """Le radar sur un dépôt. `lots` : `{id, branch, branch_target?, title?,
     assignee?}`. Rend le rapport (sans horodatage ni durée).
 
@@ -761,7 +761,13 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
 
     `reservations` : `branches -> liste`, appelé sur les cibles certifiées
     quand les entrées portent encore `added` (les migrations ajoutées par un lot) ; seul son résultat
-    entre au rapport, `added` ne sort jamais dans le journal (#1335)."""
+    entre au rapport, `added` ne sort jamais dans le journal (#1335).
+
+    `reservation_holder` (facultatif) : `numéro -> id du lot détenteur | None`,
+    lu sur le registre des réservations. #2396 : quand plusieurs copies d'une
+    migration héritée divergent, le détenteur de la réservation est préféré
+    comme survivant, pour que la sonde des réservations ne signale pas la copie
+    d'un autre détenteur comme « unreserved ». Sans lui, le rang par date décide."""
     cache = cache if cache is not None else Cache()
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
@@ -917,8 +923,9 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if not one.get("target_certified", True):
             uncertified.setdefault((one["target"], one["target_ref"]),
                                    one.get("target_reason") or "")
-    migration_branches = (_native_migration_additions(repo, branches, migrations)
-                          if migrations else branches)
+    migration_branches = (_native_migration_additions(
+        repo, branches, migrations, reservation_holder=reservation_holder)
+        if migrations else branches)
     report = {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
                                          for b in branches],
               "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
@@ -935,7 +942,8 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     return report
 
 
-def _native_migration_additions(repo: str, branches: list[dict], directory: str) -> list[dict]:
+def _native_migration_additions(repo: str, branches: list[dict], directory: str,
+                                *, reservation_holder=None) -> list[dict]:
     """#2279/#2388: attribute unchanged inherited migrations to their base.
 
     Inheritance is proved by history, never by a branch name: either a strict
@@ -944,11 +952,14 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
     same path and blob (#2388: a lot stacked on a package whose tip has moved
     since the fork). One survivor is kept for the whole diverged group, not
     pair by pair: a pairwise choice can cycle between ancestry and date and
-    hide every copy. The survivor (the tip that advanced last) keeps the
-    attribution, so a third holder, the duplicate probe and the reservation
-    probe still see the number. Equal tips, independent additions, modified
-    SQL and unreadable evidence keep their warnings. Both probes use this
-    view; branch diffs in the report keep their full scope.
+    hide every copy. The survivor keeps the attribution, so a third holder,
+    the duplicate probe and the reservation probe still see the number. The
+    reservation holder is preferred when it is in the group (#2396): the
+    surviving copy is then the one the registry names, so the reservation
+    probe does not report another holder's copy as unreserved. Otherwise the
+    tip that advanced last wins, then the oldest lot. Equal tips, independent
+    additions, modified SQL and unreadable evidence keep their warnings. Both
+    probes use this view; branch diffs in the report keep their full scope.
     """
     groups: dict = {}
     for one in branches:
@@ -1022,13 +1033,15 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
                 tip_dates[tip] = 0
         return tip_dates[tip]
 
-    def rank(one: dict):
-        """Pick the survivor of a diverged group: the tip that advanced last,
-        then the oldest work item. Git cannot tell which of several diverged
-        branches was the base (they carry the same file at their merge-base);
-        the ranking only keeps one attribution, so a third holder and the
+    def rank(one: dict, holder=None):
+        """Pick the survivor of a diverged group: the reservation holder when
+        it is in the group (#2396), else the tip that advanced last, then the
+        oldest work item. Git cannot tell which of several diverged branches
+        was the base (they carry the same file at their merge-base); the
+        ranking only keeps one attribution, so a third holder and the
         reservation probe still see the number (#2388 review)."""
-        return (tip_date(one["tip"]), -int(one["work_item"]), one["branch"])
+        return (1 if holder is not None and int(one["work_item"]) == holder else 0,
+                tip_date(one["tip"]), -int(one["work_item"]), one["branch"])
 
     for (_, _, path), holders in groups.items():
         if len(holders) < 2:
@@ -1088,10 +1101,20 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
         groups_by_root: dict = {}
         for index in list(roots):
             groups_by_root.setdefault(find(index), []).append(index)
+        holder = None
+        if (reservation_holder is not None
+                and any(len(members) > 1 for members in groups_by_root.values())):
+            number = int(MIGRATION_RE.fullmatch(os.path.basename(path)).group(1))
+            try:
+                found = reservation_holder(number)
+            except Exception as exc:
+                raise GitError(
+                    "migration reservation registry unreadable: %s" % exc) from exc
+            holder = int(found) if found is not None else None
         for members in groups_by_root.values():
             if len(members) < 2:
                 continue
-            keep = max(members, key=lambda index: rank(holders[index]))
+            keep = max(members, key=lambda index: rank(holders[index], holder))
             inherited_indices.update(index for index in members if index != keep)
         for index in inherited_indices:
             inherited.setdefault(holders[index]["work_item"], set()).add(path)
@@ -1215,13 +1238,34 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
         started = now()
         try:
             from .migration_reservations import probe
-            missing_repo = bool(project.migrations) and not github_slug(project)
+            from .migrations import repo_key
+            github = github_slug(project)
+            missing_repo = bool(project.migrations) and not github
+            slug = repo_key(github) if project.migrations and github else ""
+            holders: dict = {}
+
+            def reservation_holder(number):
+                """#2396: prefer the registry's holder as the survivor of a
+                diverged inherited group, so the reservation probe does not
+                report another holder's copy as unreserved."""
+                if not slug:
+                    return None
+                if number not in holders:
+                    try:
+                        row = storage.of(db).work.migration_holder(number, slug)
+                    except Exception as exc:
+                        raise GitError(
+                            "migration reservation registry unreadable: %s" % exc) from exc
+                    holders[number] = int(row["id"]) if row else None
+                return holders[number]
+
             report = scan(
                 project.repo, lots, default_target=project.target or None,
                 migrations=project.migrations, cache=cache,
                 verify=published_tip if project.migrations else None,
                 reservations=None if missing_repo
-                else (lambda raw: probe(db, project, raw)))
+                else (lambda raw: probe(db, project, raw)),
+                reservation_holder=reservation_holder if slug else None)
             if missing_repo:
                 report["reservation_error"] = (
                     "migration reservations need a GitHub repository identity")
