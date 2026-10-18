@@ -771,7 +771,21 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire
-   (`tests/test_l122_numeros_de_migration.py`, sans base).
+   (`tests/test_l122_numeros_de_migration.py`, sans base). À la composition
+   d'un paquet par le train (#2400), une migration ajoutée par un lot est
+   renumérotée au maximum de la cible + 1, jamais une migration historique :
+   le lot qui en modifie une est écarté avec un motif. Les fichiers compagnons
+   du même préfixe (rollback, test, banc) sont renommés avec elle, les
+   références par nom de fichier et les numéros en commentaire suivent ; les
+   littéraux de code ne changent pas. Un transport qualifié qui porterait une
+   migration ajoutée ou modifiée est refusé et le lot écarté : sa qualification
+   fige l'arbre et le delta, la renumérotation doit donc précéder la
+   qualification. La réservation L122 est déplacée avant
+   la publication (journal « before: … »), le plan porte la correspondance
+   (`reserved`/`landed`) et le commit final la ligne
+   `ameesh-migration: <lot> <ancien> <nouveau>`. Après promotion confirmée,
+   le numéro atterri est enregistré (`migration_landed`) et la réservation
+   libérée. Le train reste inactif : ce raccord ne l'active pas.
 6. **Geler le périmètre d'une release à son ouverture** (L750/L756, #561/#566).
    Quand le lot de release est ouvert, son périmètre se fige à un commit
    **nommé** de sa cible : `ameesh release open <lot> --base <commit>`. Les
