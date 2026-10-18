@@ -42,7 +42,7 @@ def ameesh() -> tuple[Workflow, ...]:
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "0d4e4c9cae703575b33aa393d6a1c95a81e5c896"),
                  (".github/workflows/tests.yml", "8403f902b5b87e52a99f86549822feb92e784035"),
-                 ("scripts/test-plan.py", "d37c0a3dfcbb5516550d4015bb073538afbfc815"),
+                 ("scripts/test-plan.py", "8f192023e6f5d1ca799068dd4a44c820170f2182"),
                  ("scripts/test-parts.py", "2265308c9fed248852bfd9ec41ba8f79266f0647"),
                  ("scripts/ci-flow.py", "ac574bd1f38eb788c70800095efde70bd2b8b751"),
                  ("scripts/map.py", "7a7516683643ff7cd66abf3d50147b25446a03bb")),
