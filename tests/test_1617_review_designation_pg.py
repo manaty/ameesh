@@ -149,6 +149,40 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual([(r["recipient"], r["id"] == manual) for r in requests],
                          [("r1", True), ("r2", False)])
 
+    def test_a_review_request_is_read_on_the_indexed_column(self):
+        """#2563 : le lot est filtré sur `work_item_id`, sans fonction.
+
+        `btrim(coalesce(work_item_id, ''))` ne peut pas servir l'index partiel
+        0413 (une fonction sur la colonne) : la lecture parcourait tout le
+        courrier du relecteur. Tous les écrivains de `request` posent
+        `str(int(lot))` : l'égalité simple reste exacte."""
+        from ameesh import mail
+        manual = mail.send(self.db, "chef", "r1", "Review request: lot", kind="request",
+                           work_item_id=str(self.lot),
+                           payload={"review_request": {"lot": self.lot, "reviewer": "r1",
+                                                       "manual": True}})
+        seen = []
+
+        class Trace:
+            """La connexion réelle, avec le SQL de la lecture du lot noté."""
+            def __init__(self, db):
+                self.db = db
+
+            def query(self, sql, params=()):
+                seen.append(" ".join(sql.split()))
+                return self.db.query(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+        found = mail.review_requests(Trace(self.db), "r1", self.lot)
+        self.assertEqual([r["id"] for r in found], [manual])
+        queries = [sql for sql in seen if "FROM agent_mailbox" in sql]
+        self.assertEqual(len(queries), 1)
+        predicate = queries[0].split("WHERE", 1)[1]
+        self.assertIn("work_item_id = %s", predicate)
+        self.assertNotIn("btrim", predicate)
+
     def test_designated_records_and_mails_once(self):
         freeze = self.freeze()
         out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
