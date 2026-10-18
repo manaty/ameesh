@@ -33,13 +33,14 @@ from . import platform, storage
 from .db import Db
 
 #: valeurs par défaut prudentes des seuils (0028), quand la fiche Host n'en
-#: déclare pas : 1 Gio de mémoire disponible, 8 Gio de swap, 2×CPU de charge,
-#: 2 Gio de disque libre. Le plancher de mémoire est le signal de saturation ;
-#: le plafond de swap est haut parce qu'un poste de développement peut garder
-#: plusieurs Gio de swap ANCIEN sans pression réelle (l'incident de 0028 était
-#: à ~12 Go) ; l'hôte qui veut plus strict le déclare dans `policy.resources`.
+#: déclare pas : 1 Gio de mémoire disponible, 2×CPU de charge, 2 Gio de disque
+#: libre. Le plancher de mémoire est le signal de saturation. #2296 : pas de
+#: plafond de swap par défaut — un stock de swap n'est pas une pression, et le
+#: défaut de 0028 (8 Gio) faisait un faux « critical pressure » au démarrage,
+#: avant que la fiche Host ne soit lue (pc-smichea, auditeur 18/10) ; seul un
+#: hôte qui le déclare dans `policy.resources` a un plafond de swap.
 DEFAULT_MIN_MEM_AVAILABLE = 1024 ** 3
-DEFAULT_MAX_SWAP_USED = 8 * 1024 ** 3
+DEFAULT_MAX_SWAP_USED = None
 DEFAULT_MAX_LOAD_FACTOR = 2.0
 DEFAULT_MIN_DISK_FREE = 2 * 1024 ** 3
 #: #246: btrfs floors. On 2026-10-11 the host's btrfs was fully allocated
@@ -1138,7 +1139,10 @@ def thresholds(policy=None) -> dict:
     valeur par défaut : une politique incomplète n'ouvre pas la porte à une
     absence de garde. #2296 : c'est vrai aussi du plafond de pression mémoire
     (`max_mem_pressure`, 10 % par défaut) — un hôte qui ne le déclare pas
-    garde le critère d'admission.
+    garde le critère d'admission. Seule exception : `max_swap_used` n'a PAS
+    de défaut (None) — un stock de swap n'est pas une pression ; seul un hôte
+    qui déclare un plafond en a un, et ce plafond ne compte que corroboré par
+    la pression mémoire (`swap_ceiling_applies`).
     """
     raw = None
     if policy is not None:
@@ -1290,15 +1294,21 @@ def host_limits(canons, host: str) -> dict:
 def swap_ceiling_applies(reading: dict, limits: dict) -> bool:
     """#2296 : le plafond de swap utilisé compte-t-il pour ce relevé ?
 
-    Seulement avec une pression mémoire mesurée au-dessus de
-    `SWAP_PRESSURE_SHARE` de son propre plafond : le swap utilisé est un
-    STOCK, pas une pression (les pages y restent tant qu'on ne les touche
-    pas), donc un relevé où il dépasse le plafond après le retour au calme
-    ne doit plus retenir les tours. Sans PSI (hôte qui ne sait pas le
-    mesurer), le plafond garde son sens d'avant : pas de signal de pression
-    réelle, la porte ne s'ouvre pas sur le seul stock. Sans plafond mémoire
-    (appelant qui n'a pas calculé `thresholds`), même repli prudent.
+    Seulement pour un hôte qui a DÉCLARÉ un plafond (`max_swap_used`), et
+    avec une pression mémoire mesurée au-dessus de `SWAP_PRESSURE_SHARE` de
+    son propre plafond : le swap utilisé est un STOCK, pas une pression (les
+    pages y restent tant qu'on ne les touche pas), donc un relevé où il
+    dépasse le plafond après le retour au calme ne doit plus retenir les
+    tours. Sans plafond déclaré, il n'y a rien à corroborer : le stock ne
+    plafonne pas (le défaut de 0028 à 8 Gio faisait un faux « critical
+    pressure » au démarrage, avant la lecture de la fiche Host). Sans PSI
+    (hôte qui ne sait pas le mesurer), un plafond déclaré garde son sens
+    d'avant : pas de signal de pression réelle, la porte ne s'ouvre pas sur
+    le seul stock. Sans plafond mémoire (appelant qui n'a pas calculé
+    `thresholds`), même repli prudent.
     """
+    if limits.get("max_swap_used") is None:
+        return False
     psi = reading.get("psi_mem_some")
     limit = limits.get("max_mem_pressure")
     if psi is None or limit is None:
@@ -1347,7 +1357,9 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             out[-1]["path"] = path
 
     def ceiling(key, label, value, limit, critical_factor):
-        if value is None:
+        # #2296 : un plafond absent (None) ne plafonne rien — le stock de swap
+        # n'a pas de défaut ; les autres plafonds en ont un.
+        if value is None or limit is None:
             return
         if value > limit:
             out.append({"key": key, "label": label, "value": value, "limit": limit,

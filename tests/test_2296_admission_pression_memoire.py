@@ -72,14 +72,34 @@ class SwapStockTest(unittest.TestCase):
                                    limits(max_swap_used="16GiB"))
         self.assertEqual([b["key"] for b in found], ["max_swap_used"])
 
-    def test_un_seuil_absent_garde_le_defaut_prudent(self):
-        # le défaut de swap (8 GiB) s'applique quand la fiche se tait, et une
-        # pression réelle le fait compter : l'absence de seuil n'ouvre pas
+    def test_un_seuil_absent_ne_plafonne_pas_le_stock(self):
+        # #2296 (auditeur 18/10) : sans plafond déclaré, pas de plafond de
+        # swap — le défaut de 0028 (8 Gio) faisait un faux « critical
+        # pressure » au démarrage, avant la lecture de la fiche Host. La
+        # garde qui reste est la pression mémoire réelle (défaut 10 %).
         found = resources.breaches(
-            {"swap_used_bytes": resources.DEFAULT_MAX_SWAP_USED + 1,
-             "psi_mem_some": 20.0},
+            {"swap_used_bytes": int(22 * GIB), "psi_mem_some": 20.0},
             resources.thresholds(None))
-        self.assertIn("max_swap_used", [b["key"] for b in found])
+        keys = [b["key"] for b in found]
+        self.assertNotIn("max_swap_used", keys)
+        self.assertEqual(keys, ["max_mem_pressure"])
+
+    def test_le_demarrage_ne_critique_pas_le_swap_avant_la_fiche(self):
+        # témoin du constat auditeur : avant la lecture de la fiche Host, le
+        # relevé de pc-smichea du 17/10 23:50Z (swap 22 Gio, PSI 5.87 %,
+        # mémoire disponible 6.2 Gio) ne doit produire AUCUNE pression. Avec
+        # le défaut de 8 Gio, 5.87 % > 5 % corroborait le stock et le rendait
+        # critique (22 > 2 × 8).
+        verdict = resources.pressure({
+            "mem_available_bytes": int(6.2 * GIB),
+            "swap_used_bytes": int(22.0 * GIB),
+            "psi_mem_some": 5.87,
+            "load1": 8.0,
+            "disk_free_bytes": 100 * GIB,
+        }, resources.thresholds(None))
+        self.assertFalse(verdict["blocked"])
+        self.assertFalse(verdict["critical"])
+        self.assertEqual(verdict["breaches"], [])
 
     def test_le_plafond_de_swap_reste_critique_au_double(self):
         found = resources.breaches(
