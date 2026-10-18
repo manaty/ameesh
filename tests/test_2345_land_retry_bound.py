@@ -15,6 +15,9 @@ inopérante.
 from __future__ import annotations
 
 import dataclasses
+import os
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -76,6 +79,52 @@ class RetryBoundTest(_Land):
         self.assertEqual(out["result"], "retry", out)
         self.assertIn("retry 2/2", self.fake.queue_rows[4]["reason"])
         self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+
+    def test_a_new_admission_resets_the_counter(self):
+        """#2371 N2 : une note de réessai de l'admission précédente ne compte
+        pas ; le faux journal honore `since_ts` comme le vrai."""
+        self.queued(4)
+        old = dict(self.fake.queue_rows[4])
+        with mock.patch.object(land, "TRANSIENT_RETRY_LIMIT", 2):
+            first = self.land(4, gh=self._transient())
+            self.assertEqual(first["result"], "retry", first)
+            self.assertIn("retry 1/2", self.fake.queue_rows[4]["reason"])
+            self.fake.queue_remove(4, note="removed", actor="orch")
+            self.fake.queue_add(4, target=old["target"], frozen_sha=old["frozen_sha"],
+                                frozen_id=old["frozen_id"], source=old["source"],
+                                note="reentered", actor="orch")
+            self.assertGreater(self.fake.queue_rows[4]["queued_ts"], old["queued_ts"])
+            again = self.land(4, gh=self._transient())
+        self.assertEqual(again["result"], "retry", again)
+        self.assertIn("retry 1/2", self.fake.queue_rows[4]["reason"],
+                      "la nouvelle admission n'a pas remis le compteur à zéro")
+
+
+class RetryLimitImportTest(unittest.TestCase):
+    """#2371 N1 : une valeur d'environnement invalide ne casse plus l'import."""
+
+    def test_invalid_value_falls_back_with_a_warning(self):
+        with self.assertWarns(RuntimeWarning):
+            self.assertEqual(land._retry_limit(
+                {"AMEESH_LAND_TRANSIENT_RETRIES": "not-a-number"}),
+                land.DEFAULT_TRANSIENT_RETRY_LIMIT)
+
+    def test_absent_blank_and_negative_values(self):
+        self.assertEqual(land._retry_limit({}), land.DEFAULT_TRANSIENT_RETRY_LIMIT)
+        self.assertEqual(land._retry_limit(
+            {"AMEESH_LAND_TRANSIENT_RETRIES": "  "}), land.DEFAULT_TRANSIENT_RETRY_LIMIT)
+        self.assertEqual(land._retry_limit({"AMEESH_LAND_TRANSIENT_RETRIES": "3"}), 3)
+        self.assertEqual(land._retry_limit({"AMEESH_LAND_TRANSIENT_RETRIES": "-2"}), 0)
+
+    def test_the_module_imports_with_an_invalid_value(self):
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+        env = dict(os.environ,
+                   PYTHONPATH=src + os.pathsep + (os.environ.get("PYTHONPATH") or ""),
+                   AMEESH_LAND_TRANSIENT_RETRIES="not-a-number")
+        proc = subprocess.run([sys.executable, "-c", "import ameesh.land"],
+                              capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("AMEESH_LAND_TRANSIENT_RETRIES", proc.stderr)
 
 
 if __name__ == "__main__":
