@@ -129,6 +129,21 @@ def check_run(ident: int = 900, *, name: str = "tests", statut: str = "completed
             "details_url": "https://github.com/%s/runs/%d" % (DEPOT, ident)}
 
 
+def unreadable_run(ident: int = 12, *, sha: str = GEL, mode: str = "lot",
+                   statut: str = "completed", conclusion: str | None = "failure",
+                   number: int = PR, branche: str = BRANCHE) -> dict:
+    """Un run #2364 : le titre porte l'étiquette mais pas la base (un SHA).
+
+    C'est le run-name d'un ancien workflow, qui y mettait la description de
+    l'étiquette (« CI #1343 full sur <sha court> ») : `pr_run` le refuse, mais
+    sa tête et son libellé restent corrélables.
+    """
+    return label_run(ident, sha=sha, mode=mode, statut=statut,
+                     conclusion=conclusion, number=number, branche=branche,
+                     titre="tests [PR #%d ci-%s-%s base CI #1343 %s sur %s]"
+                           % (number, mode, sha, mode, sha[:12]))
+
+
 def marque(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
            token: str = "0" * 16, pr: int = PR, label: str | None = None,
            ident: int = 1, ts: float | None = None, texte: str = "",
@@ -1356,6 +1371,110 @@ class RequestTest(GelTestCase):
         self.assertEqual(gh.poses(), [])
         self.assertTrue(any("already holds" in n for n in notes), notes)
 
+    def test_un_run_illisible_materialise_la_reservation_et_force_reprend(self):
+        # #2364 (run 39092741517) : la marque `applied` n'était jamais
+        # matérialisée par le run, faute de base lisible dans son titre ;
+        # `--force` répondait « already reserved ». La tête et le libellé
+        # suffisent à libérer la clé, sans verdir la composition.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", mode="full", token="4" * 16,
+                                  ts=t + 0.125, seen=0))
+        api = Github(runs=[unreadable_run(12, mode="full")])
+        self.assertIsNone(ci.pr_run(unreadable_run(12, mode="full")))
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+                **{**vars(self.args), "full": True, "reason": "paquet h-0500",
+                   "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL_FULL])
+        applied = self.marques("applied")
+        self.assertEqual(len(applied), 1, notes)
+        self.assertIn("seen=12", applied[0], "le run illisible entre dans le `seen`")
+
+    def test_un_run_illisible_sans_force_demande_la_reprise(self):
+        # la reprise reste un geste explicite : le run illisible ne vaut ni
+        # vert ni rouge applicable, il ne repose pas tout seul.
+        self.gele()
+        self.events.append(marque("applied", token="5" * 16, seen=0))
+        api = Github(runs=[unreadable_run(12)])
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api)
+        self.assertIn("run-name is unreadable", str(caught.exception))
+        self.assertIn("--force", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune lecture du workflow")
+        gh = Gh()
+        code, _notes = self.run_cmd(api, gh)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+
+    def test_un_run_illisible_en_vol_ne_repose_pas(self):
+        # un run illisible encore vivant se surveille, même avec --force.
+        self.gele()
+        api = Github(runs=[unreadable_run(12, statut="in_progress", conclusion=None)])
+        decision = self.gel(api, force=True)
+        self.assertEqual(decision["action"], "running")
+        self.assertIn("run-name is unreadable", decision["why"])
+        gh = Gh()
+        code, _notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [])
+        self.assertEqual(gh.annulations(), [])
+
+    def test_une_marque_posterieure_au_run_illisible_tient_la_cle(self):
+        # P2-3 conservé : une marque posée après le run (seen=12) n'est pas
+        # matérialisée par lui, même si ce run porte la tête et le libellé.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", token="6" * 16, ts=t + 0.125, seen=12))
+        api = Github(runs=[unreadable_run(12)])
+        # la réservation fraîche est dite avant toute suggestion de reprise :
+        # `--force` ne la lèverait pas non plus.
+        decision = self.gel(api)
+        self.assertEqual(decision["action"], "running")
+        self.assertIn("reserved", decision["why"])
+        decision = self.gel(api, force=True)
+        self.assertEqual(decision["action"], "running")
+        self.assertIn("reserved", decision["why"])
+        gh = Gh()
+        code, _notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [])
+
+    def test_un_run_illisible_full_libere_une_marque_lot(self):
+        # la couverture des modes reste celle de `_covers` : un run `full`
+        # illisible matérialise une marque `full`, qui couvre une demande lot.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", mode="full", token="7" * 16,
+                                  ts=t + 0.125, seen=0))
+        api = Github(runs=[unreadable_run(12, mode="full")])
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, _notes = self.run_cmd(api, gh, args=argparse.Namespace(
+                **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL])
+
+    def test_un_run_illisible_de_lot_ne_libere_pas_une_marque_full(self):
+        # P2-3 (cx2) conservé : le mode se lit dans le libellé ; un run de lot
+        # illisible ne matérialise pas une demande full encore invisible.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", mode="full", token="8" * 16,
+                                  ts=t + 0.125, seen=0))
+        api = Github(runs=[unreadable_run(12, mode="lot")])
+        full = argparse.Namespace(**{**vars(self.args), "full": True,
+                                     "reason": "paquet §12", "force": True})
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, _notes = self.run_cmd(api, gh, args=full)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [], "un run de lot ne libère pas le full")
+
     def test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas(self):
         # P2-3, garde de bout en bout : le premier `--force` repose sur le run
         # rouge 12 et sa marque enregistre `seen=12` ; tant que le nouveau run
@@ -1466,6 +1585,31 @@ class ParsingTest(unittest.TestCase):
         info = ci.pr_run(label_run(6, mode="full", base=AUTRE))
         self.assertEqual((info["number"], info["mode"], info["sha"], info["base"]),
                          (PR, "full", GEL, AUTRE))
+
+    def test_carried_request_lit_un_titre_dont_la_base_est_illisible(self):
+        # #2364 : l'ancien run-name met la description de l'étiquette à la
+        # place de la base ; la composition reste illisible, mais la tête et
+        # le libellé restent corrélables.
+        row = unreadable_run(12, mode="full")
+        self.assertIsNone(ci.pr_run(row), "la base illisible ne prouve rien")
+        self.assertEqual(ci.carried_request(row, PR, GEL), "full")
+
+    def test_carried_request_exige_la_tete_et_le_libelle_de_la_demande(self):
+        for row in (unreadable_run(1, sha=TETE),
+                    unreadable_run(2, number=PR + 1),
+                    label_run(3, titre="tests [PR #%d base CI]" % PR),
+                    label_run(4, event="push",
+                              titre="tests [PR #%d ci-lot-%s]" % (PR, GEL))):
+            with self.subTest(row["id"]):
+                self.assertEqual(ci.carried_request(row, PR, GEL), "")
+
+    def test_carried_request_accepte_la_tete_du_payload_de_pr(self):
+        # même repli que `pr_run` : `head_sha` peut manquer, le payload de la
+        # PR liste alors la tête du libellé.
+        row = unreadable_run(5)
+        row["head_sha"] = TETE
+        row["pull_requests"] = [{"number": PR, "head": {"sha": GEL}}]
+        self.assertEqual(ci.carried_request(row, PR, GEL), "lot")
 
     def test_release_refs(self):
         self.assertTrue(ci.release_refs("release/1.10.0", "main"))
