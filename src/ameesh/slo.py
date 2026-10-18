@@ -247,7 +247,7 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra
 
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
-              now: float | None = None) -> list:
+              now: float | None = None, packet_slot: float | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -255,6 +255,12 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     étape terminée est rendue avec `done_ts` et `level` 0 ; une étape en cours
     court jusqu'à `now`. Une étape non mesurable n'est pas inventée : elle est
     absente (la table la déclare, `STEPS`).
+
+    #2335/A2 : `packet_slot` (premier créneau de paquet après le GO) décale le
+    départ de `verdict_merge` en cours de route. Le canon §11 bis ne permet pas
+    de fusionner un lot hors paquet : les 30 premières minutes après le GO ne
+    sont pas un retard. La ligne porte `packet_slot` pour que l'alerte dise
+    d'où part la mesure ; une fusion déjà faite garde sa durée réelle.
 
     #2217 : quand le lot vient d'être pris en charge (dernière ligne
     `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
@@ -311,7 +317,14 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             done_ts=round(float(merged), 3),
                             elapsed_s=int(max(0.0, float(merged) - float(verdict)))))
         elif state not in ("merged", "promoted", "closed"):
-            out.append(_row(step, verdict, now=now, critical=critical))
+            start = float(verdict)
+            extra = {}
+            if packet_slot is not None and float(packet_slot) > start:
+                # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
+                # l'horloge GO → fusion part de ce créneau, pas du GO.
+                start = float(packet_slot)
+                extra["packet_slot"] = round(start, 3)
+            out.append(_row(step, start, now=now, critical=critical, **extra))
 
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):

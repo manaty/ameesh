@@ -41,11 +41,13 @@ Un détenteur périmé s'arrête (`busy`) au lieu d'agir sur un instantané
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import socket
 from urllib.parse import quote
 
-from . import land, lot_class, merge_queue, plan_git, storage, work
+from . import land, lot_class, merge_queue, packet_guard, plan_git, storage, work
 
 FIRE = "fire"
 UNFIRE = "unfire"
@@ -142,12 +144,19 @@ def state(db, lot: int) -> dict:
     }
 
 
-def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None = None) -> dict:
+def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None = None,
+         exception: str = "", reason: str = "") -> dict:
     """Donne le feu du pilote sur la tête gelée `sha` du lot (jalon `fire`).
 
     Refuse un lot terminé, un lot non gelé, un `sha` qui n'est pas un commit,
     ou un `sha` qui n'est pas le gel courant : le feu se donne sur la tête
     exacte, jamais sur un lot (« si la tête change, le feu est à redonner »).
+
+    #2333 (canon §11 bis) : un feu sur une branche de travail (`lot/**`,
+    `agent/**`, `review/**`) vers la cible d'intégration est refusé hors
+    paquet, sauf exception `incident|unblock` motivée ; la déclaration est
+    écrite au journal du lot sur cette tête (`packet_guard`) et le passage
+    d'auto-fusion la relit.
 
     Le geste prend le bail du feu (`fire:<lot>`), celui du passage : un
     passage en cours d'armement ou de fusion ne peut pas ignorer un feu qui
@@ -157,13 +166,15 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
-        return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo)
+        return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo,
+                            exception=exception, reason=reason)
     finally:
         _unlock(handle)
 
 
 def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
-                 repo: str | None = None) -> dict:
+                 repo: str | None = None, exception: str = "",
+                 reason: str = "") -> dict:
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -185,6 +196,22 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
         raise FireError("the fire names %s, not the current freeze %s of lot #%d: the fire is "
                         "given on the exact head (freeze it again, then give the fire)"
                         % (wanted[:12], frozen[:12], lot))
+    if exception:
+        try:
+            packet_guard.marker(exception, frozen, reason)
+        except packet_guard.PacketGuardError as exc:
+            raise FireError(str(exc)) from exc
+    target = str(item.get("branch_target") or "").strip()
+    if not target and repo:
+        try:
+            target = plan_git.default_target(repo) or ""
+        except plan_git.MergeProbeError:
+            target = ""
+    try:
+        packet_guard.check_merge(db, lot, item.get("branch") or "", target, frozen,
+                                 exception=exception, reason=reason, actor=actor)
+    except packet_guard.PacketGuardError as exc:
+        raise FireError(str(exc)) from exc
     full = merge_queue.pinned(repo, wanted) if repo else None
     return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
                           note=(note or "").strip())
@@ -597,13 +624,88 @@ def _required_gap(required, rollup, provenance=None) -> list:
     return gaps
 
 
+#: #2306 : les codes HTTP qui disent « réessaie » plutôt que « c'est prouvé ».
+_TRANSIENT_CODE = re.compile(r"(?i)(?:\bhttp[ /]?|\(\s*)(?:408|429|5\d\d)\b")
+_TRANSIENT_TEXT = (
+    "timed out", "timeout", "deadline exceeded", "connection reset",
+    "connection refused", "connection aborted", "broken pipe",
+    "network is unreachable", "temporary failure in name resolution",
+    "no such host", "tls handshake", "unexpected eof", "server error",
+    "bad gateway", "service unavailable", "gateway timeout",
+    "rate limit", "too many requests", "abuse detection",
+)
+
+
+def _transient_read(detail: str) -> bool:
+    """#2306 : la lecture de la forge a-t-elle échoué pour une raison
+    passagère ? Seuls ces échecs (HTTP 408/429/5xx, délai, coupure réseau)
+    gardent la ligne en file ; un 4xx, un refus de droits ou une réponse
+    malformée restent des échecs prouvés, qui éjectent."""
+    low = str(detail or "").lower()
+    return bool(_TRANSIENT_CODE.search(low) or re.search(r"(?:^|:\s*)eof\s*$", low)
+                or any(word in low for word in _TRANSIENT_TEXT))
+
+
+def _json_pages(stdout: str, what: str) -> list:
+    """Les pages d'une sortie `gh api --paginate` concaténée (`[…][…]`).
+
+    `--slurp` (gh récent) rend une liste de pages ; le gh 2.45 de l'hôte ne
+    le connaît pas (#2285) : sans lui, `--paginate` écrit les pages à la
+    suite, sans séparateur, et chacune doit être décodée à son tour."""
+    text = (stdout or "").strip()
+    decoder = json.JSONDecoder()
+    pages, index = [], 0
+    while index < len(text):
+        try:
+            page, end = decoder.raw_decode(text, index)
+        except ValueError as exc:
+            raise land.LandError("%s: unreadable output (%s)" % (what, exc)) from exc
+        pages.append(page)
+        index = end
+        while index < len(text) and text[index].isspace():
+            index += 1
+    return pages
+
+
+def _api_pages(gh, path: str, what: str) -> list:
+    """Les pages d'une lecture `gh api --paginate`, quel que soit le gh.
+
+    `--slurp` est tenté d'abord (liste de pages, gh récent). Le gh 2.45 de
+    l'hôte répond « unknown flag: --slurp » (#2285) : la lecture est alors
+    rejouée sans lui et les pages concaténées sont décodées une à une. Un
+    échec passager de la forge lève `land.TransientLandError` (#2306, la file
+    réessaiera) ; toute autre lecture impossible lève `land.LandError` :
+    l'absence de garde ne se suppose jamais."""
+    proc = gh(["api", "--paginate", "--slurp", path])
+    detail = (proc.stderr or proc.stdout or "").strip()[:300]
+    if proc.returncode == 0:
+        try:
+            pages = json.loads(proc.stdout or "[]")
+        except ValueError as exc:
+            raise land.LandError("%s: unreadable output (%s)" % (what, exc)) from exc
+        if not isinstance(pages, list):
+            raise land.LandError("%s: unexpected output %s"
+                                 % (what, (proc.stdout or "")[:100]))
+        return pages
+    if "unknown flag: --slurp" not in detail:
+        error = land.TransientLandError if _transient_read(detail) else land.LandError
+        raise error("%s: %s" % (what, detail or "exit %d" % proc.returncode))
+    proc = gh(["api", "--paginate", path])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        error = land.TransientLandError if _transient_read(detail) else land.LandError
+        raise error("%s: %s" % (what, detail or "exit %d" % proc.returncode))
+    return _json_pages(proc.stdout, what)
+
+
 def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
     """Les check runs de la tête **exacte** `sha`, avec l'application qui les a
     produits. `statusCheckRollup` ne porte pas cette source : elle se lit sur
     le commit (`commits/<sha>/check-runs`). Les noms sont rendus exactement,
     espaces significatifs compris : `tests ` n'est pas le contexte `tests`.
     Une lecture impossible ou malformée lève `land.LandError` : une source
-    absente ne prouve rien."""
+    absente ne prouve rien. #2306 : un échec passager lève
+    `land.TransientLandError`, que la file sait réessayer sans éjecter."""
     if not slug:
         raise land.LandError("no GitHub repository known: the source of the checks "
                              "of %s cannot be read" % (sha or "the head"))
@@ -614,12 +716,7 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
         raise land.LandError("no frozen head: the source of the required checks "
                              "cannot be read")
     path = "repos/%s/commits/%s/check-runs" % (slug, quote(sha, safe=""))
-    proc = gh(["api", "--paginate", "--slurp", path + "?per_page=100"])
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise land.LandError("gh api %s: %s"
-                             % (path, detail or "exit %d" % proc.returncode))
-    pages = land._json(proc, "gh api %s" % path, list)
+    pages = _api_pages(gh, path + "?per_page=100", "gh api %s" % path)
     runs = []
     for page in pages:
         if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
@@ -644,14 +741,29 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
     return runs
 
 
+def _app_id(value, path: str) -> int | None:
+    """L'application GitHub imposée par une exigence, ou `None` pour « toute
+    application ».
+
+    `-1` est la valeur de l'API de protection pour « any app » (#2285) : la
+    traiter comme une réponse malformée fermerait la porte au lieu de
+    l'ouvrir à toute source. Un booléen, un non-entier, `0` ou un négatif
+    autre que `-1` restent refusés."""
+    if value is None or value == -1:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise land.LandError("gh api %s: invalid required check app_id" % path)
+    return value
+
+
 def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
     """Les checks requis par la protection classique de `target`, lus à la
     forge, sous la forme `(contexte, app_id)` : `app_id` est l'application
     GitHub que la protection impose (`checks[].app_id`), `None` quand elle
-    n'impose aucun fournisseur (ancienne liste `contexts`). Perdre `app_id`
-    accepterait un check homonyme produit par n'importe qui. Le contexte est
-    rendu exactement, espaces significatifs compris : `tests ` n'est pas
-    `tests`.
+    n'impose aucun fournisseur (ancienne liste `contexts`, ou `app_id` à
+    `-1`, « toute application »). Perdre `app_id` accepterait un check
+    homonyme produit par n'importe qui. Le contexte est rendu exactement,
+    espaces significatifs compris : `tests ` n'est pas `tests`.
 
     Un 404 « Branch not protected » est une réponse (aucun check requis) ;
     toute autre lecture — droits, branche absente, réponse malformée — lève
@@ -668,8 +780,8 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
         if "Branch not protected" in detail:
             return ()
-        raise land.LandError("gh api %s: %s"
-                             % (path, detail or "exit %d" % proc.returncode))
+        error = land.TransientLandError if _transient_read(detail) else land.LandError
+        raise error("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
     data = land._json(proc, "gh api %s" % path, dict)
     required = data.get("required_status_checks")
     if required is None:
@@ -686,10 +798,7 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
         if not isinstance(check, dict) or not isinstance(check.get("context"), str) \
                 or not check["context"].strip():
             raise land.LandError("gh api %s: invalid required check" % path)
-        app_id = check.get("app_id")
-        if app_id is not None and (isinstance(app_id, bool)
-                                   or not isinstance(app_id, int) or app_id <= 0):
-            raise land.LandError("gh api %s: invalid required check app_id" % path)
+        app_id = _app_id(check.get("app_id"), path)
         context = check["context"]
         pairs.append((context, app_id))
         scoped.add(context)
@@ -703,16 +812,63 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
     return tuple(dict.fromkeys(pairs))
 
 
+def _ruleset_required(slug: str | None, target: str, *, gh) -> tuple:
+    """Les checks requis par les rulesets de branche appliqués à `target`,
+    sous la forme `(contexte, app_id)`.
+
+    `GET repos/<slug>/rules/branches/<target>` rend les règles actives qui
+    s'appliquent à la branche, y compris celles d'une organisation ; une
+    règle `required_status_checks` porte ses contextes et, quand elle en
+    impose une, l'application (`integration_id`, `-1` valant « toute
+    application »). Les autres règles ne concernent pas les checks. Un dépôt
+    sans ruleset rend une liste vide ; une lecture impossible ou malformée
+    lève `land.LandError` : l'absence de règle ne se suppose jamais (#2285)."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the rulesets of %s "
+                             "cannot be read" % (target or "the target"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the rulesets of %s cannot be read"
+                             % target)
+    path = "repos/%s/rules/branches/%s" % (slug, quote(target, safe=""))
+    what = "gh api %s" % path
+    pages = _api_pages(gh, path + "?per_page=100", what)
+    pairs = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise land.LandError("%s: malformed response" % what)
+        for rule in page:
+            if not isinstance(rule, dict):
+                raise land.LandError("%s: malformed rule" % what)
+            if rule.get("type") != "required_status_checks":
+                continue
+            parameters = rule.get("parameters")
+            if not isinstance(parameters, dict):
+                raise land.LandError("%s: malformed required_status_checks rule" % what)
+            checks = parameters.get("required_status_checks")
+            if not isinstance(checks, list):
+                raise land.LandError("%s: malformed required_status_checks rule" % what)
+            for check in checks:
+                if not isinstance(check, dict) or not isinstance(check.get("context"), str) \
+                        or not check["context"].strip():
+                    raise land.LandError("%s: invalid required check" % what)
+                pairs.append((check["context"],
+                              _app_id(check.get("integration_id"), what)))
+    return tuple(dict.fromkeys(pairs))
+
+
 def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     """Les checks requis de la branche cible, sous la forme `(contexte,
-    app_id)` : la protection lue à la forge, complétée par la déclaration
-    `radar.projects.<p>.required_checks` (des noms, sans application imposée).
+    app_id)` : la protection classique et les rulesets lus à la forge,
+    complétés par la déclaration `radar.projects.<p>.required_checks` (des
+    noms, sans application imposée).
 
-    Quand la protection ne peut pas être lue (jeton sans droits, forge
-    muette), la déclaration du projet la remplace ; sans déclaration, la
-    lecture refuse. La déclaration ne peut jamais retirer un check que la
-    forge exige : elle s'ajoute. Les noms sont exacts de bout en bout :
-    la déclaration `tests ` ne vaut pas le contexte `tests`."""
+    Quand une lecture de la forge échoue durablement (jeton sans droits, forge
+    muette), la déclaration du projet la remplace **sans retirer l'autre
+    lecture** ; sans déclaration, la lecture refuse. Un échec passager, lui,
+    lève `land.TransientLandError` : la lecture sera réessayée, la déclaration
+    ne tient pas lieu de preuve (#2306). La déclaration ne peut jamais retirer
+    un check que la forge exige : elle s'ajoute. Les noms sont exacts de bout
+    en bout : la déclaration `tests ` ne vaut pas le contexte `tests`."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
                      if str(name).strip())
@@ -720,13 +876,99 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
         if declared:
             return declared
         raise land.LandError("no target branch known: its required checks cannot be read")
-    try:
-        forged = _protection_required(slug, target, gh=gh)
-    except land.LandError:
-        if declared:
-            return declared
-        raise
-    return tuple(dict.fromkeys(forged + declared))
+    forged = []
+    for read in (lambda: _protection_required(slug, target, gh=gh),
+                 lambda: _ruleset_required(slug, target, gh=gh)):
+        try:
+            forged.extend(read())
+        except land.TransientLandError:
+            # #2306 : un échec passager n'est pas une source absente ; la
+            # file réessaiera au passage suivant, jamais un atterrissage avec
+            # la seule déclaration.
+            raise
+        except land.LandError:
+            # Une source illisible n'efface pas l'autre : la déclaration
+            # remplace la seule lecture manquante (#2285).
+            if not declared:
+                raise
+    return tuple(dict.fromkeys(tuple(forged) + declared))
+
+
+def _head_statuses(slug: str | None, sha: str, *, gh) -> list:
+    """Les statuts de commit de la tête **exacte** `sha`, sous la forme d'une
+    entrée de `statusCheckRollup` (`context`, `state`).
+
+    L'endpoint `status` rend le dernier statut de chaque contexte ; un nom
+    exact traverse tel quel. Une lecture impossible ou malformée lève
+    `land.LandError` : une source absente ne prouve rien. #2306 : les pages
+    sont lues jusqu'au `total_count` annoncé — un total de 100 n'est plus pris
+    pour une troncature — et un échec passager lève `land.TransientLandError`."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the statuses of %s "
+                             "cannot be read" % (sha or "the head"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the statuses of %s cannot be read"
+                             % (sha or "the head"))
+    if not sha:
+        raise land.LandError("no frozen head: the statuses of the required checks "
+                             "cannot be read")
+    path = "repos/%s/commits/%s/status" % (slug, quote(sha, safe=""))
+    pages = _api_pages(gh, path + "?per_page=100", "gh api %s" % path)
+    total = None
+    statuses = []
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(page.get("statuses"), list):
+            raise land.LandError("gh api %s: malformed response" % path)
+        announced = page.get("total_count")
+        if type(announced) is not int or announced < 0 \
+                or (total is not None and announced != total):
+            raise land.LandError("gh api %s: malformed or truncated statuses" % path)
+        total = announced
+        statuses.extend(page["statuses"])
+    if total is None or len(statuses) != total:
+        raise land.LandError("gh api %s: malformed or truncated statuses" % path)
+    out = []
+    for status in statuses:
+        if not isinstance(status, dict) or not isinstance(status.get("context"), str) \
+                or not status["context"].strip() \
+                or status.get("state") not in ("success", "pending", "failure", "error"):
+            raise land.LandError("gh api %s: invalid commit status" % path)
+        out.append({"__typename": "StatusContext", "context": status["context"],
+                    "state": status["state"]})
+    return out
+
+
+def required_on_head(project, target: str, sha: str, *, gh) -> list:
+    """#2286 : les checks requis de la cible que la tête **exacte** `sha` ne
+    prouve pas, pour la voie file de fusion (`land`).
+
+    La source est la déclaration `radar.projects.<p>.required_checks` du
+    projet, complétée par la protection de la forge quand elle se lit (mêmes
+    règles que `required_checks`) : un projet qui ne déclare aucun check n'a
+    rien à prouver ici, et la protection seule reste portée par la forge au
+    moment de la fusion d'une PR. Sans déclaration, cette garde ne retire
+    jamais rien au comportement existant ; avec une déclaration, elle
+    s'applique à **tout** atterrissage de la file, `ci_required` ou non —
+    c'est le trou de la voie file (Nexlink n'a pas de protection de branche).
+
+    Rend la liste des manques (`tests (absent)`, `coverage (FAILURE)`…) ;
+    lève `land.LandError` quand les checks ou leur source ne peuvent pas être
+    lus : un vert ne se suppose jamais. #2306 : une lecture passagère lève
+    `land.TransientLandError` (la file réessaiera) ; une réponse malformée ou
+    un manque prouvé restent des `LandError`."""
+    from . import radar
+    declared = tuple(getattr(project, "required_checks", ()) or ())
+    if not declared:
+        return []
+    slug = radar.github_slug(project)
+    required = required_checks(slug, target, project, gh=gh)
+    if not required:
+        return []
+    runs = _head_check_runs(slug, sha, gh=gh)
+    statuses = _head_statuses(slug, sha, gh=gh)
+    rollup = ([{"__typename": "CheckRun", "name": run["name"], "status": run["status"],
+                "conclusion": run["conclusion"]} for run in runs] + statuses)
+    return _required_gap(required, rollup, runs)
 
 
 def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
@@ -1130,6 +1372,16 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     target = _target(row, project, work_repo, info)
     queue_mode = project is not None and getattr(project, "land", "off") != "off"
 
+    # #2333 (canon §11 bis) : aucune fusion de lot directe hors paquet, même
+    # pour un feu donné avant la garde ou avec une auto-fusion déjà armée. La
+    # déclaration d'exception est relue au journal du lot ; un refus désarme
+    # une auto-fusion résiduelle (`_not_ready`) avant toute PR ou file.
+    try:
+        packet_guard.check_merge(db, lot, branch, target, _norm(fire.get("sha")))
+    except packet_guard.PacketGuardError as exc:
+        return _not_ready(db, row, status, out, str(exc), gh=gh, slug=slug,
+                          dry_run=dry_run, handle=handle)
+
     # 4. LA PORTE DES VERDICTS, AVANT TOUTE PR, TOUTE FILE ET TOUTE CI (#1374,
     #    B et P1-1). Le feu peut être enregistré au gel ; rien ne part avant
     #    les avis requis, indépendants et sans blocage non levé.
@@ -1332,7 +1584,13 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
            cfg, dry_run: bool, out: dict) -> dict:
     """Le repli file de fusion : le lot entre dans la file de sa cible ; c'est
     l'exécutant qui l'atterrit (`land`). Un lot déjà en file ou en atterrissage
-    n'est pas ré-entré (une ré-entrée remettrait `landing` à `queued`)."""
+    n'est pas ré-entré (une ré-entrée remettrait `landing` à `queued`).
+
+    La porte `ready_pr` n'est pas lue ici : la file est le mode des dépôts
+    dont la protection de branche GitHub n'est pas exploitable (Nexlink, plan
+    gratuit : la lecture répond 403). Le contrôle de la cible y est celui de
+    `merge_queue.enter` — la CI du commit gelé quand le projet déclare
+    `ci_required` (#2285 N3, hors périmètre de ce lot)."""
     lot = int(row["id"])
     if not repo:
         out.update(result="no-repository", detail="no repository path known for this lot")
@@ -1375,16 +1633,32 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
 # le dernier geste de l'atterrissage
 # --------------------------------------------------------------------------
 
-def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None) -> tuple:
+def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None,
+               project=None, target: str = "", gh=None) -> tuple:
     """Le dernier contrôle avant le geste d'atterrissage (#1374, P1-2) : un lot
     qui a porté un feu ne s'atterrit que sous un feu actif couvrant la tête
     gelée de sa file, et jamais sous un blocage non levé.
+
+    #2286 : pour un atterrissage **local** (`project.land == "local"`, la voie
+    file de Nexlink), les checks requis **déclarés** du projet
+    (`radar.projects.<p>.required_checks`) sont aussi exigés sur le gel : la
+    poussée directe ne passe par aucune protection de branche, et cette
+    déclaration est la seule source de la cible (Nexlink n'en a pas). La garde
+    vaut pour tout atterrissage, `ci_required` ou non ; un projet qui ne
+    déclare aucun check garde le comportement d'avant, et la voie `pr` reste
+    tenue par la forge (et par `ready_pr` au feu) : ses checks de PR vivent
+    sur la ref de fusion, pas sur le commit gelé.
 
     Rend `(ok, raison)`. La garde est appelée par `land` juste avant la poussée
     ou la fusion de la PR, sous son propre bail : la ligne de file peut avoir
     été retirée par le passage du feu, mais la course entre les deux reste
     fermée ici. Sans aucun jalon de feu, la file d'équipe garde son cours : la
-    garde ne concerne que les lots que le feu a autorisés.
+    garde du feu ne concerne que les lots que le feu a autorisés (les checks
+    requis, eux, valent pour tout atterrissage local).
+
+    #2306 : une cible vide est refusée (elle sautait la garde) ; une lecture
+    passagère des checks lève `land.TransientLandError`, que `land` traduit en
+    nouvelle tentative au passage suivant, sans éjection.
     """
     lot = int(lot)
     try:
@@ -1392,21 +1666,41 @@ def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None) -> tup
     except Exception as exc:  # noqa: BLE001 - lecteur illisible : on refuse
         return False, ("cannot read the fire of lot #%d (%s: %s): landing refused"
                        % (lot, type(exc).__name__, str(exc)[:120]))
-    if not markers(marks):
-        return True, ""
-    fire = active(marks)
-    if fire is None:
-        return False, ("the fire of lot #%d was withdrawn or invalidated: no automatic landing"
-                       % lot)
-    if not same_commit(fire.get("sha"), frozen_sha, repo):
-        return False, ("the fire of lot #%d covers %s, not the queued freeze %s: freeze and "
-                       "fire again" % (lot, _norm(fire.get("sha"))[:12],
-                                       str(frozen_sha or "")[:12] or "—"))
-    blocked = merge_queue.blocked_verdicts(marks, frozen_sha, repo=repo)
-    if blocked:
-        return False, ("blocked verdict(s) on the freeze %s not lifted: %s: no automatic landing"
-                       % (str(frozen_sha or "")[:12],
-                          ", ".join(sorted(str(m.get("actor") or "?") for m in blocked))))
+    if markers(marks):
+        fire = active(marks)
+        if fire is None:
+            return False, ("the fire of lot #%d was withdrawn or invalidated: no automatic "
+                           "landing" % lot)
+        if not same_commit(fire.get("sha"), frozen_sha, repo):
+            return False, ("the fire of lot #%d covers %s, not the queued freeze %s: freeze and "
+                           "fire again" % (lot, _norm(fire.get("sha"))[:12],
+                                           str(frozen_sha or "")[:12] or "—"))
+        blocked = merge_queue.blocked_verdicts(marks, frozen_sha, repo=repo)
+        if blocked:
+            return False, ("blocked verdict(s) on the freeze %s not lifted: %s: no automatic "
+                           "landing" % (str(frozen_sha or "")[:12],
+                                        ", ".join(sorted(str(m.get("actor") or "?")
+                                                         for m in blocked))))
+    if project is not None and getattr(project, "land", "") == "local":
+        sha = _norm(frozen_sha)
+        if not target:
+            # #2306 : sans cible, la garde des checks requis était sautée
+            # (fail-open). Un atterrissage local sans cible est impossible
+            # (`fresh_target` la réclame) ; on refuse au lieu de laisser passer.
+            return False, ("no target branch known: the required checks cannot be proven: "
+                           "landing refused")
+        try:
+            gaps = required_on_head(project, target, sha, gh=gh)
+        except land.TransientLandError:
+            # #2306 : lecture passagère — l'appelant garde la ligne en file et
+            # réessaie au passage suivant ; le refus (fail-closed) tient.
+            raise
+        except land.LandError as exc:
+            return False, ("the required checks of %s on %s cannot be proven: %s: landing "
+                           "refused" % (target, sha[:12] or "—", exc))
+        if gaps:
+            return False, ("the required checks of %s are not proven on %s: %s: landing "
+                           "refused" % (target, sha[:12] or "—", ", ".join(gaps)))
     return True, ""
 
 
@@ -1425,6 +1719,13 @@ def add_parser(work_sub, func) -> None:
                         help="withdraw the fire: the automatic merge is disarmed")
     parser.add_argument("--repo", default=None,
                         help="the lot's repository (default: the current git repository)")
+    parser.add_argument("--exception", choices=packet_guard.EXCEPTIONS, default="",
+                        help="#2333/canon §11 bis: incident|unblock, for a lot branch merged "
+                             "outside the packet (the declaration is journaled in the lot's "
+                             "note); requires --sha and --reason")
+    parser.add_argument("--reason", default="",
+                        help="why the packet exception is taken (incident: target red; "
+                             "unblock: CI stuck); written to the lot's journal")
     parser.add_argument("--note", default="")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--actor", default="",
@@ -1444,6 +1745,9 @@ def run(cfg, db, args) -> int:
     if args.sha and args.withdraw:
         print("--sha and --withdraw are exclusive", file=sys.stderr)
         return 2
+    if args.exception and not args.sha:
+        print("--exception applies when the fire is given: pass --sha", file=sys.stderr)
+        return 2
     try:
         repo = resolutions.repo_root(args.repo) if args.repo else None
     except (resolutions.ResolveError, OSError) as exc:
@@ -1461,7 +1765,8 @@ def run(cfg, db, args) -> int:
                       "agent with a declared role): %s" % exc, file=sys.stderr)
                 return 1
         if args.sha:
-            row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo)
+            row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo,
+                       exception=args.exception or "", reason=args.reason or "")
             print("fire given to lot #%d on %s (by %s)" % (args.id, row["sha"][:12], actor))
             results = run_pass(cfg, db, only_lot=args.id, repo=repo)
         elif args.withdraw:

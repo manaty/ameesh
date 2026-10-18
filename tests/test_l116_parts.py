@@ -47,6 +47,19 @@ class RepartitionTest(unittest.TestCase):
         self.assertEqual(repli, ["test_neuf"])
         self.assertEqual(pesees, {"test_mesure": 4.0, "test_neuf": 12.0})  # 6 tests × 2 s
 
+    def test_modules_a_duree_nulle_repartis(self):
+        # #1476 : un module mesuré à 0,0 s n'atterrit plus toujours dans la
+        # même part ; le plancher les répartit.
+        with tempfile.TemporaryDirectory() as d:
+            table = {"psql": {"test_lourd": 100.0, **{f"test_nul_{i}": 0.0 for i in range(8)}}}
+            mods = sorted(table["psql"])
+            for m in mods:
+                (pathlib.Path(d) / f"{m}.py").write_text("def test_a(): pass\n")
+            pesees, _ = parts.weight(mods, "psql", table, pathlib.Path(d))
+        decoupe = parts.split(pesees, 4)
+        nuls = [sum(1 for m in p if m.startswith("test_nul_")) for p in decoupe]
+        self.assertEqual(sorted(nuls), [0, 2, 3, 3])
+
     def test_liste_pilote_connue(self):
         mods = parts.modules()
         liste = parts.read_list(REPO / "tests" / "parts" / "pilote-psql.txt", mods)

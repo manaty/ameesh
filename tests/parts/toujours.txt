@@ -20,6 +20,7 @@
 # same line, alphabetical order, no duplicate (scripts/test-parts.py refuses
 # an unsorted list).
 
+test_2340_auditeur_role  # #2340: auditeur login role, read-only, two supervisory contracts, refusals
 test_339_orphan_settle  # #749: orphan turn groups settled without a reboot, outside the measured blocks
 test_cluster  # roles created on the cluster (supervisor, approve), grants checked against every column
 test_events_attach  # LISTEN/NOTIFY channels, global to the cluster

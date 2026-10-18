@@ -20,7 +20,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import fire, land, merge_queue, storage, work
+from ameesh import fire, land, lot_class, merge_queue, packet_guard, review, storage, work
 
 from .support import PgTestCase
 
@@ -166,6 +166,46 @@ class ReviewGateTest(unittest.TestCase):
         same = self.gate(_marks(_mark("frozen", A), _verdict("other")))
         self.assertFalse(same["ok"], "la famille de l'auteur ne compte pas")
 
+    def test_grouped_rule_does_not_add_unchanged_critical_files(self):
+        # #2218 : le canon regroupe runner et porte de fusion dans une règle.
+        policy, problems = review.parse({"default": "light", "rules": [{
+            "paths": ["src/ameesh/runner.py", "src/ameesh/merge_queue.py",
+                      "src/ameesh/land.py"], "class": "sensitive"}]})
+        self.assertEqual(problems, [])
+        klass = review.classify(policy, ["src/ameesh/runner.py", "tests/test_runner.py"])
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+        self.assertEqual(one["required"], 1)
+        self.assertTrue(one["ok"], one["why"])
+        for actor in ("author", "other", "ghost"):
+            with self.subTest(actor=actor):
+                self.assertFalse(self.gate(
+                    _marks(_mark("frozen", A), _verdict(actor)), klass=klass)["ok"])
+
+    def test_changed_critical_file_keeps_two_reviews_in_a_grouped_rule(self):
+        for path in ("src/ameesh/merge_queue.py", "src/ameesh/land.py",
+                     "src/ameesh/migrations/0460_overview_runner_seen.sql",
+                     "src/ameesh/authority.py", "src/ameesh/approve_check.py",
+                     "src/ameesh/approve_client.py", "src/ameesh/config.py",
+                     "deploy/mise-a-jour/poste.sh"):
+            with self.subTest(path=path):
+                policy, _ = review.parse({"default": "light", "rules": [{
+                    "paths": ["src/ameesh/runner.py", path], "class": "sensitive"}]})
+                klass = review.classify(policy, ["src/ameesh/runner.py", path])
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+                two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"),
+                                       _verdict("rev2")), klass=klass)
+                self.assertTrue(two["ok"], two["why"])
+
+    def test_sensitive_without_changed_paths_keeps_two_reviews(self):
+        for files in ([], [{"class": "sensitive", "rule": ["src/ameesh/runner.py"]}]):
+            with self.subTest(files=files):
+                klass = {"class": "sensitive", "doubt": False, "files": files}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+
     def test_sql_and_merge_gate_need_two_distinct_families(self):
         for entry in (self.SQL, self.GATE):
             klass = {"class": "sensitive", "files": [entry]}
@@ -181,6 +221,68 @@ class ReviewGateTest(unittest.TestCase):
             unknown = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("ghost")),
                                 klass=klass)
             self.assertFalse(unknown["ok"], "une famille inconnue ne prouve pas l'indépendance")
+
+    def test_class_and_off_api_merge_need_two_families(self):
+        # #2249 : la classe du lot, son classement et la fusion hors API sont
+        # la porte de fusion, comme merge_queue et land.
+        for path in ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                     "src/ameesh/review.py"):
+            with self.subTest(path=path):
+                klass = {"class": "sensitive", "files": [
+                    {"path": path, "class": "sensitive", "rule": [path]}]}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+        near = {"class": "sensitive", "files": [
+            {"path": "src/ameesh/preview.py", "class": "sensitive",
+             "rule": ["src/ameesh/preview.py"]}]}
+        self.assertEqual(merge_queue.required_verdicts(near), 1, "motif ancré au nom")
+
+    #: le canon synthétique du témoin de bout en bout (#2264) : les trois
+    #: chemins que la porte de fusion doit voir (#1629), puis fire.py, qui
+    #: tombe dans la portée critique « prod » (deux avis).
+    GATE_CANON_PATHS = ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                        "src/ameesh/review.py")
+    CRITICAL_CANON_PATH = "src/ameesh/fire.py"
+
+    def canon(self, paths=(), default="light", root="canon"):
+        """Un canon minimal, de la même forme que celui de `test_review`."""
+        rules = [{"paths": [path], "class": "sensitive"} for path in paths]
+        return types.SimpleNamespace(
+            root=root, sources=[],
+            federation={"review_policies": {"risk_classes": {
+                "projects": {"ameesh": {"default": default, "rules": rules}}}}})
+
+    def test_the_canon_chain_drives_the_required_verdicts(self):
+        """#2264 : le témoin de #2249 forçait `klass` — il serait resté vert si
+        le canon ne classait plus ces chemins. Ici la classe est lue par
+        `lot_class.class_of_paths` sur un canon synthétique, puis la porte en
+        déduit les avis ; le contrôle négatif (même canon sans règle) retombe
+        à `light`, tout en gardant la ceinture critique de #2265."""
+        canon = self.canon(self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        for path in self.GATE_CANON_PATHS:
+            klass = lot_class.class_of_paths([canon], "ameesh", [path])
+            self.assertEqual(klass["class"], "sensitive", (path, klass))
+            self.assertFalse(klass["doubt"], (path, klass))
+        critical = lot_class.class_of_paths(
+            [canon], "ameesh", [self.CRITICAL_CANON_PATH])
+        self.assertEqual(critical["class"], "sensitive", critical)
+        self.assertEqual(merge_queue.required_verdicts(critical), 2, critical)
+        together = lot_class.class_of_paths(
+            [canon], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        self.assertEqual(merge_queue.required_verdicts(together), 2, together)
+        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=together)
+        self.assertTrue(two["ok"], two["why"])
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=together)
+        self.assertFalse(one["ok"], "la classe lue exige bien deux avis")
+        # Sans règle, la classe devient légère ; #2265 garde deux avis sur
+        # les chemins critiques oubliés du canon, indépendamment de la classe.
+        bare = self.canon()
+        light = lot_class.class_of_paths(
+            [bare], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        self.assertEqual(light["class"], "light", light)
+        self.assertEqual(merge_queue.required_verdicts(light), 2, light)
 
     def test_author_family_never_counts(self):
         klass = {"class": "sensitive", "files": [self.SQL]}
@@ -271,6 +373,62 @@ class ReviewGateTest(unittest.TestCase):
         self.assertIn("class: release", out["why"])
         ok = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass="release")
         self.assertTrue(ok["ok"], ok["why"])
+
+    def test_pilot_waiver_lifts_the_verdicts_but_never_a_block(self):
+        # #2281 : `work reviewer --no-verdict` (#1979) marque la dispense de
+        # re-verdict (`reviewer = -none`) ; la porte partagée la respecte,
+        # sans changer la classe ni lever un verdict bloquant courant.
+        for item in ({"assignee": "author", "reviewer": work.REVIEWER_NONE},
+                     {"assignee": "author", "reviewers": [work.REVIEWER_NONE]}):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]}, item=item)
+            self.assertTrue(out["ok"], out["why"])
+            self.assertTrue(out["waived"])
+            self.assertEqual(out["required"], 2, "la dispense ne change pas la classe")
+        named = self.gate(_marks(_mark("frozen", A)),
+                          klass={"class": "sensitive", "files": [self.SQL]},
+                          item={"assignee": "author", "reviewer": work.REVIEWER_NONE,
+                                "events": [{"note": "verdict not required: no re-verdict "
+                                                    "due (#1979)", "actor": "pilote-x"}]})
+        self.assertEqual(named["waived_by"], "pilote-x")
+        blocked = self.gate(_marks(_mark("frozen", A),
+                                   _verdict("rev1", verdict="blocked")),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"assignee": "author", "reviewer": work.REVIEWER_NONE})
+        self.assertFalse(blocked["ok"], "une dispense ne lève jamais une correction due")
+        self.assertIn("blocked verdict", blocked["why"])
+
+    def test_a_stale_waiver_row_does_not_cover_a_new_freeze(self):
+        # #2281/B1 cx1 : la ligne passée à la porte peut être antérieure au
+        # gel ; le stockage a périmé la dispense en base mais la copie la
+        # porte encore. La porte relit la marque après les jalons : un gel B
+        # sans avis reste refusé, même avec une ligne A en main.
+        stale = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        fresh = {"id": 9, "assignee": "author", "reviewer": "", "reviewers": []}
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh):
+            out = self.gate(_marks(_mark("frozen", B)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            frozen=B, item=stale)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["waived"])
+        self.assertIn("no review verdict ok", out["why"])
+
+    def test_the_waiver_actor_comes_from_the_lot_journal(self):
+        # #2281/N1 cx1 : `work.get` ne rend pas les événements ; en usage réel
+        # la note de file doit citer le pilote, lu dans la table du journal.
+        fresh = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        ops = mock.Mock()
+        ops.work.events_noted.return_value = [
+            {"note": "verdict not required: no re-verdict due (#1979)",
+             "actor": "pilote-x"}]
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh), \
+                mock.patch.object(merge_queue.storage, "of", return_value=ops):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"id": 9, "assignee": "author",
+                                  "reviewer": work.REVIEWER_NONE})
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["waived_by"], "pilote-x")
 
 
 class ReadyTest(unittest.TestCase):
@@ -377,12 +535,20 @@ class ActTest(unittest.TestCase):
 
     def _act(self, marks, status, *, gate=(True, "", {"class": "light"}), pr_gate=(True, ""),
              info=None, project=None, dry_run=False, opened=None, fresh=None, renew=True,
-             statuses=None, merge=(True, "PR merged"), target_blocked=False):
+             statuses=None, merge=(True, "PR merged"), target_blocked=False,
+             packet_refusal=None):
         names = ("_repo_of", "_slug", "_project", "_pr_status", "_repo_info", "_target",
                  "ready_verdicts", "ready_pr", "_merge_pr", "_disarm_auto", "_reconcile",
                  "_invalidate", "_disarm", "_open_pr", "_queue", "_passive", "_wake",
                  "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock")
-        with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched:
+        packet_patch = (
+            mock.patch.object(fire.packet_guard, "check_merge",
+                              side_effect=packet_guard.PacketGuardError(packet_refusal))
+            if packet_refusal else
+            mock.patch.object(fire.packet_guard, "check_merge",
+                              return_value={"allowed": True}))
+        with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched, \
+                packet_patch:
             patched["_repo_of"].return_value = None
             patched["_slug"].return_value = "manaty/ameesh"
             patched["_project"].return_value = project
@@ -447,6 +613,17 @@ class ActTest(unittest.TestCase):
         self.assertEqual(out["result"], "invalidated")
         calls["_invalidate"].assert_called_once()
         self.assertIn("the PR head moved", calls["_invalidate"].call_args.args[4])
+        calls["_merge_pr"].assert_not_called()
+
+    def test_packet_guard_refuses_before_any_pr_or_queue(self):
+        """#2333 : un feu de lot hors paquet est refusé avant la PR et la file."""
+        out, calls = self._act(
+            _marks(_mark("frozen", A), _mark("fire", A)), _status(),
+            packet_refusal="direct merge of lot/42-x into main refused: canon §11 bis")
+        self.assertEqual(out["result"], "not-ready")
+        self.assertIn("§11 bis", out["detail"])
+        calls["_open_pr"].assert_not_called()
+        calls["_queue"].assert_not_called()
         calls["_merge_pr"].assert_not_called()
 
     def test_verdicts_gate_before_opening_the_pr(self):
@@ -587,7 +764,8 @@ class LandGuardCallTest(unittest.TestCase):
             ejected.update(reason=reason, todo=todo)
             return {"lot": 7, "result": "ejected"}
 
-        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A},
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
                                         project=types.SimpleNamespace(repo="/r"), eject=eject)
         with mock.patch.object(fire, "land_guard", return_value=(False, "fire withdrawn")):
             out = land._fire_guard(landing)
@@ -596,7 +774,8 @@ class LandGuardCallTest(unittest.TestCase):
         self.assertIn("queue remove", ejected["todo"])
 
     def test_land_continues_without_fire_markers(self):
-        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A},
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
                                         project=types.SimpleNamespace(repo="/r"),
                                         eject=lambda *a, **k: {"result": "ejected"})
         with mock.patch.object(fire, "land_guard", return_value=(True, "")):
@@ -609,7 +788,98 @@ class FireDbTest(PgTestCase):
     def _frozen_lot(self, sha=A):
         lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
         work.milestone(self.db, lot, "frozen", sha=sha, actor="pilote")
+        # #2333 : ces témoins-ci portent sur le mécanisme du feu ; l'exception
+        # incident déclarée au journal les autorise hors paquet. Les refus de
+        # la garde ont leurs propres témoins ci-dessous.
+        packet_guard.declare(self.db, lot, "incident", "test: fire fixture", sha,
+                             actor="pilote")
         return lot
+
+    def _bare_frozen_lot(self, sha=A, branch="lot/1-un-lot"):
+        """Un gel sans exception : la garde du paquet doit refuser le feu."""
+        lot = work.add(self.db, title="un lot", branch=branch)["id"]
+        work.milestone(self.db, lot, "frozen", sha=sha, actor="pilote")
+        return lot
+
+    def test_packet_guard_refuses_a_direct_fire_on_the_target(self):
+        """#2333 : hors paquet, le feu d'une branche de lot est refusé, sans jalon."""
+        lot = self._bare_frozen_lot()
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertIn("§11 bis", str(caught.exception))
+        self.assertFalse(fire.state(self.db, lot)["active"])
+        self.assertEqual([e for e in work.events(self.db, lot)
+                          if (e.get("note") or "").startswith("packet-exception")], [])
+
+    def test_packet_guard_exception_is_journaled_on_the_fire(self):
+        """#2333 : l'exception motivée passe et laisse sa marque au journal."""
+        lot = self._bare_frozen_lot()
+        row = fire.give(self.db, lot, sha=A, actor="pilote",
+                        exception="incident", reason="cible rouge 18/10")
+        self.assertEqual(row["kind"], "fire")
+        notes = [e["note"] for e in work.events(self.db, lot)
+                 if (e.get("note") or "").startswith("packet-exception")]
+        self.assertEqual(notes, ["packet-exception incident sha=%s reason=cible rouge 18/10"
+                                 % A])
+
+    def test_packet_guard_exception_requires_a_reason(self):
+        """#2333 : une exception sans motif n'est pas une déclaration."""
+        lot = self._bare_frozen_lot()
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote", exception="incident")
+        self.assertIn("requires a reason", str(caught.exception))
+        self.assertFalse(fire.state(self.db, lot)["active"])
+
+    def test_packet_head_passes_without_an_exception(self):
+        """#2333 : la tête d'un paquet (`integration/**`) a le droit de fusionner."""
+        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
+        row = fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertEqual(row["kind"], "fire")
+
+    def _landing(self, lot, *, branch="lot/1-un-lot", target="main", sha=A):
+        """Le dernier geste de `land` : une ligne de file et son éjection."""
+        ejected: dict = {}
+
+        def eject(reason, todo, **extra):
+            ejected.update(reason=reason, todo=todo)
+            return {"lot": lot, "result": "ejected", "reason": reason, "todo": todo}
+
+        landing = types.SimpleNamespace(
+            db=self.db, lot=lot,
+            row={"branch": branch, "target": target, "frozen_sha": sha},
+            project=types.SimpleNamespace(repo=".", name="ameesh"), eject=eject)
+        return landing, ejected
+
+    def test_land_guard_refuses_a_queued_lot_head_without_a_packet(self):
+        """#2333 : une ligne de file déjà posée ne contourne pas le paquet, sans feu."""
+        lot = self._bare_frozen_lot()
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+        self.assertIn("queue remove", ejected["todo"])
+
+    def test_land_guard_passes_a_declared_exception_on_that_head(self):
+        """#2333 : l'exception déclarée au journal vaut au dernier geste de land."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "cible rouge 18/10", A)
+        landing, _ejected = self._landing(lot)
+        self.assertIsNone(land._fire_guard(landing))
+
+    def test_land_guard_refuses_a_declaration_on_another_head(self):
+        """#2333 : une déclaration d'une autre tête ne couvre pas ce gel."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "ancienne tête", B)
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+
+    def test_land_guard_passes_an_integration_packet(self):
+        """#2333 : une ligne de file dont la tête est integration/** passe."""
+        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
+        landing, _ejected = self._landing(lot, branch="integration/paquet-2333")
+        self.assertIsNone(land._fire_guard(landing))
 
     def test_give_refuses_without_a_freeze(self):
         lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
