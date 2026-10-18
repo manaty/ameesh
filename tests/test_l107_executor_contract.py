@@ -104,9 +104,10 @@ class TableTest(unittest.TestCase):
         ops = self.c.operations.values()
         # contrat 1.2 : expiration médiée des fils (#499, threads.recount) ;
         # #508 ajoute agents.runner_seen ; contrat 1.3 : #423 ajoute
-        # agents.resolve_name (septième ligne servie par session/op)
-        self.assertEqual(len(self.c.operations), 66)
-        self.assertEqual(sum(o.write for o in ops), 40)
+        # agents.resolve_name (septième ligne servie par session/op),
+        # #1349 ajoute operations.publish_peek.
+        self.assertEqual(len(self.c.operations), 67)
+        self.assertEqual(sum(o.write for o in ops), 41)
         self.assertEqual(sum(not o.write for o in ops), 26)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op

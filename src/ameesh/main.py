@@ -11,6 +11,7 @@
         [--cwd D] [--brief FILE|-] [--force]
         an existing (closed) interactive session moves under the runner (L39);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
+  ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh approvals            list signed approvals;
   ameesh approve              sign an approval;
@@ -275,6 +276,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "attach":
         from . import runner
         return runner.attach_main(rest)
+    if command == "agent" and rest and rest[0] == "peek":
+        from . import agent_peek
+        return agent_peek.main(rest[1:])
     if command == "activity":
         from . import activity
         return activity.main(rest)
