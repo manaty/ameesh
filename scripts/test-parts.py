@@ -103,6 +103,11 @@ TESTS = REPO / "tests"
 TABLE = TESTS / "parts" / "durees.json"
 #: durée par test quand la table n'a rien pour le pilote (repli du repli)
 DEFAULT_PER_TEST = 0.5
+#: #1476 : poids plancher d'un module mesuré. La table arrondit au dixième et
+#: ne compte ni l'import ni setUpClass : 73 modules psql et 67 psycopg y pèsent
+#: 0,0 s. À poids nul, `split` les donnait tous à la même part (la première à
+#: égalité), qui portait alors seule leur coût réel de démarrage.
+MIN_WEIGHT = 1.0
 #: schéma des lignes du flux (docs/design/etudes/l161-tests-par-impact.md)
 FLOW_SCHEMA = "ameesh-test-event/1"
 #: modules « pilote » psql (découpage de la mesure, #1341 R1)
@@ -193,7 +198,7 @@ def weight(mods: list[str], pilote: str, table: dict | None = None,
     resultat, repli = {}, []
     for m in mods:
         if m in mesures:
-            resultat[m] = float(mesures[m])
+            resultat[m] = max(float(mesures[m]), MIN_WEIGHT)
         else:
             resultat[m] = test_count(m, tests) * par_test
             repli.append(m)
