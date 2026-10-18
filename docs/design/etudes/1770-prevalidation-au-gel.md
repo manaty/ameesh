@@ -120,7 +120,9 @@ ou un flux sans test donnent `run-incomplete` ; une part rouge donne `run-red`.
 Seul `fin.statut = succes` est vert : `echec` est rouge, tout autre statut
 (`interrompu`, `unknown`, vide) est incomplet, et le `detail` nomme le statut
 observé. Un `fin=succes` isolé, sans événement de test, n'est jamais un vert et
-ne remplit jamais `modules` avec le plan.
+ne remplit jamais `modules` avec le plan. Un run arrêté par la porte de l'hôte
+(drain : note `stopped on … host stopped|draining`) donne `gate-preempted`,
+jamais `no-vm` : la VM existe, c'est l'hôte qui a préempté le run (#2298).
 
 `tree` recopie ce qui a été vérifié et ce qui est parti : `head` observé,
 `snapshot` (l'identité exacte du commit envoyé, vérifiable localement par
