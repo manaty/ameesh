@@ -2588,28 +2588,6 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                           base[:12],
                           ", ".join(sorted({r["conclusion"] or r["status"] or "?"
                                             for r in applicable}))))
-    if not applicable and carried:
-        #: #2364 : un run dont le run-name est illisible (ancien workflow/CLI)
-        #: porte la tête et le libellé de la demande, jamais sa base. Vivant, il
-        #: se surveille ; terminé, il ne vaut ni vert ni rouge applicable :
-        #: seule une reprise explicite le remplace (`--force`).
-        live_carried = [r for r in carried if r["status"] in OPEN_STATUSES]
-        if live_carried:
-            return {**decision, "action": "running",
-                    "why": "a request of this composition (PR #%d, %s) is visible but "
-                           "its run-name is unreadable (run %s, mode %s): its state "
-                           "cannot be checked; nothing posed"
-                           % (pr["number"], frozen_sha[:12], live_carried[0]["id"],
-                              live_carried[0]["mode"]),
-                    "run": _short_run(live_carried[0]["row"])}
-        if not force:
-            raise GelError("lot #%s: a request already ran on PR #%d for %s (run %s, "
-                           "mode %s), but its run-name is unreadable (base is not a "
-                           "SHA: old workflow/CLI), so its composition cannot be "
-                           "checked: --force to request the CI again (explicit "
-                           "resumption)"
-                           % (item_id, pr["number"], frozen_sha[:12], carried[0]["id"],
-                              carried[0]["mode"]))
     if not applicable:
         #: P2 R1 : GitHub ne montre pas un run aussitôt ; une étiquette déjà
         #: posée par un autre processus est dite, jamais reposée. Un run
@@ -2621,6 +2599,28 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
             return {**decision, "action": "running",
                     "why": "a request of this composition was already reserved (token %s): "
                            "nothing posed" % held["token"]}
+        if carried:
+            #: #2364 : un run dont le run-name est illisible (ancien
+            #: workflow/CLI) porte la tête et le libellé de la demande, jamais
+            #: sa base. Vivant, il se surveille ; terminé, il ne vaut ni vert
+            #: ni rouge applicable : seule une reprise explicite le remplace.
+            live_carried = [r for r in carried if r["status"] in OPEN_STATUSES]
+            if live_carried:
+                return {**decision, "action": "running",
+                        "why": "a request of this composition (PR #%d, %s) is visible "
+                               "but its run-name is unreadable (run %s, mode %s): its "
+                               "state cannot be checked; nothing posed"
+                               % (pr["number"], frozen_sha[:12], live_carried[0]["id"],
+                                  live_carried[0]["mode"]),
+                        "run": _short_run(live_carried[0]["row"])}
+            if not force:
+                raise GelError("lot #%s: a request already ran on PR #%d for %s (run %s, "
+                               "mode %s), but its run-name is unreadable (base is not a "
+                               "SHA: old workflow/CLI), so its composition cannot be "
+                               "checked: --force to request the CI again (explicit "
+                               "resumption)"
+                               % (item_id, pr["number"], frozen_sha[:12],
+                                  carried[0]["id"], carried[0]["mode"]))
     if not _carries_freeze_request(api, name, frozen_sha):
         raise GelError("the workflow at %s does not carry the freeze request trigger "
                        "(#1343, ci-lot/ci-full label): rebase the lot on main before "
@@ -2902,6 +2902,22 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
             return {"requested": False, "action": "refuse",
                     "why": "a %s request of this composition already ran, none green: "
                            "--force to request the CI again" % runs[-1]["mode"]}
+        #: P2 R1/P2-3 : une marque que matérialise une exécution visible (run
+        #: rouge court) ne tient plus la clé ; seule une demande encore
+        #: invisible tient, et la corrélation est le couple (identifiant, mode)
+        #: du run, pas l'horloge — un run de lot ne matérialise pas un `full`.
+        #: Un run au run-name illisible matérialise la marque de sa composition
+        #: (#2364), avec le mode lu dans son libellé.
+        held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
+                                  now=time.time(),
+                                  runs=tuple([(_run_id(r["row"]), r["mode"]) for r in runs]
+                                             + [(r["id"], r["mode"]) for r in carried]))
+        if held:
+            note("released", "another request (token %s) already holds this composition"
+                 % held["token"])
+            return {"requested": False, "action": "running",
+                    "why": "a request of this composition was already reserved (token %s): "
+                           "nothing posed" % held["token"]}
         #: #2364 : le run illisible porte la tête et le libellé, pas la base ;
         #: vivant, il se surveille ; terminé sans `--force`, il demande la
         #: reprise explicite au lieu de laisser la marque tenue pour toujours.
@@ -2919,22 +2935,6 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                            "so its composition cannot be checked: --force to request the "
                            "CI again (explicit resumption)"
                            % (number, carried[0]["id"], carried[0]["mode"])}
-        #: P2 R1/P2-3 : une marque que matérialise une exécution visible (run
-        #: rouge court) ne tient plus la clé ; seule une demande encore
-        #: invisible tient, et la corrélation est le couple (identifiant, mode)
-        #: du run, pas l'horloge — un run de lot ne matérialise pas un `full`.
-        #: Un run au run-name illisible matérialise la marque de sa composition
-        #: (#2364), avec le mode lu dans son libellé.
-        held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
-                                  now=time.time(),
-                                  runs=tuple([(_run_id(r["row"]), r["mode"]) for r in runs]
-                                             + [(r["id"], r["mode"]) for r in carried]))
-        if held:
-            note("released", "another request (token %s) already holds this composition"
-                 % held["token"])
-            return {"requested": False, "action": "running",
-                    "why": "a request of this composition was already reserved (token %s): "
-                           "nothing posed" % held["token"]}
         try:
             _revalidate(tx, int(item_id), decision)
         except GelError as exc:

@@ -1379,6 +1379,11 @@ class RequestTest(GelTestCase):
         t = time.time()
         self.events.append(marque("applied", token="6" * 16, ts=t + 0.125, seen=12))
         api = Github(runs=[unreadable_run(12)])
+        # la réservation fraîche est dite avant toute suggestion de reprise :
+        # `--force` ne la lèverait pas non plus.
+        decision = self.gel(api)
+        self.assertEqual(decision["action"], "running")
+        self.assertIn("reserved", decision["why"])
         decision = self.gel(api, force=True)
         self.assertEqual(decision["action"], "running")
         self.assertIn("reserved", decision["why"])
