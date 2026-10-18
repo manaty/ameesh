@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -288,6 +289,42 @@ class InventoryTest(unittest.TestCase):
         self.assertIn("freeze-not-head", text)
         self.assertIn("ERREURS", text)
         self.assertIn("#99 : lecture impossible", text)
+
+
+class ReadyOutTest(unittest.TestCase):
+    """Relecture cx2 B3 : un inventaire incomplet ne laisse jamais d'export."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-2404-ready-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = pathlib.Path(self.tmp) / "prets.txt"
+
+    def test_ready_out_removed_when_inventory_has_errors(self):
+        self.path.write_text("#100\n", encoding="utf-8")
+        candidates_script.write_ready_out(self.path, {
+            "target": "main", "base": "a" * 40, "ready": [100],
+            "errors": ["#500 : lecture impossible"],
+        })
+        self.assertFalse(self.path.exists())
+
+    def test_ready_out_written_when_inventory_is_complete(self):
+        candidates_script.write_ready_out(self.path, {
+            "target": "main", "base": "a" * 40, "ready": [100, 200],
+            "errors": [],
+        })
+        content = self.path.read_text(encoding="utf-8")
+        self.assertIn("#100", content)
+        self.assertIn("#200", content)
+
+    def test_previous_export_is_cleared_before_a_failed_run(self):
+        self.path.write_text("#100\n", encoding="utf-8")
+        with mock.patch.object(candidates_script.config, "load",
+                               side_effect=RuntimeError("boom")):
+            code = candidates_script.main(
+                ["--repo", self.tmp, "--ready-out", str(self.path)]
+            )
+        self.assertEqual(code, 2)
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":

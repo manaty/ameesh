@@ -436,6 +436,75 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertEqual([item["lot"] for item in payload["ready_omissions"]], [500])
         self.assertIn("mention faible", payload["ready_omissions"][0]["reason"])
 
+    def test_ecarte_reference_in_reason_stays_weak(self) -> None:
+        # Relecture cx2 B1 : « - #500 dépend de #600. » sous « Écartés » ne
+        # fait pas de #600 un lot écarté ; seul #500 est le sujet de la ligne.
+        manifest = pathlib.Path(self.tmp.name) / "manifeste-ecartes-ref.md"
+        manifest.write_text(
+            self.manifest_simple(100, self.src100, self.c100).read_text(encoding="utf-8")
+            + "\n## Écartés (ce véhicule)\n\n- #500 dépend de #600.\n",
+            encoding="utf-8",
+        )
+        code, payload = inclusion.run(
+            self.namespace(expected=[100], ready=[600], manifest=manifest,
+                           no_ready=False)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual([item["lot"] for item in payload["ready_omissions"]], [600])
+        self.assertNotIn("600", payload["explained"])
+        self.assertEqual(payload["ecartes"].get("500"), "dépend de #600.")
+        self.assertIn("600", payload["weak"])
+
+    def test_retrait_reference_in_reason_stays_weak(self) -> None:
+        # Même règle dans la branche EXPLAIN_RE (retrait/revert/report).
+        manifest = pathlib.Path(self.tmp.name) / "manifeste-retraits-ref.md"
+        manifest.write_text(
+            self.manifest_simple(100, self.src100, self.c100).read_text(encoding="utf-8")
+            + "\n## Retraits\n\n- #500 retiré, dépend de #600.\n",
+            encoding="utf-8",
+        )
+        code, payload = inclusion.run(
+            self.namespace(expected=[100, 500], ready=[500, 600],
+                           manifest=manifest, no_ready=False)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual([item["lot"] for item in payload["ready_omissions"]], [600])
+        self.assertIn("500", payload["explained"])
+        self.assertNotIn("600", payload["explained"])
+        self.assertIn("600", payload["weak"])
+
+    def test_empty_ready_file_is_a_valid_source(self) -> None:
+        # Relecture cx2 B2 : une source fournie mais vide dit « aucun lot
+        # prêt » ; elle ne doit pas être confondue avec l'absence de source.
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        ready_file = pathlib.Path(self.tmp.name) / "prets-vide.txt"
+        ready_file.write_text("# aucun lot prêt\n", encoding="utf-8")
+        code = inclusion.main([
+            "--manifest", str(manifest), "--head", self.head,
+            "--repo", str(self.repo), "--expected", "100",
+            "--ready-file", str(ready_file),
+        ])
+        self.assertEqual(code, 0)
+        _code, payload = inclusion.run(
+            self.namespace(expected=[100], ready_file=[str(ready_file)],
+                           manifest=manifest, no_ready=False)
+        )
+        self.assertEqual(payload["ready"], [])
+        self.assertEqual(payload["ready_source"], "options")
+        self.assertEqual(payload["ready_omissions"], [])
+
+    def test_missing_ready_file_is_invalid_input(self) -> None:
+        # Relecture cx2 B3 : un export retiré (inventaire incomplet) n'est pas
+        # une liste vide ; l'inclusion doit s'arrêter en entrée invalide.
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        missing = pathlib.Path(self.tmp.name) / "prets-absent.txt"
+        with self.assertRaises(inclusion.InputError) as caught:
+            inclusion.run(
+                self.namespace(expected=[100], ready_file=[str(missing)],
+                               manifest=manifest, no_ready=False)
+            )
+        self.assertIn("illisible", str(caught.exception))
+
     def test_commit_sans_delta_est_vide(self) -> None:
         # Remise fraîche sans delta : le paquet 11h réel en produit quatre.
         self.git("switch", "-q", "-c", "lot/700", "main")

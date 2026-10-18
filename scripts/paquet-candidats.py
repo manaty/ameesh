@@ -26,7 +26,9 @@ dans le format de `scripts/paquet-inclusion.py --ready-file` :
 
 Codes de retour : 0 si la liste est complète (même sans lot prêt), 1 si une
 lecture a échoué (la liste est incomplète : ne pas composer dessus), 2 si
-l'entrée est invalide (dépôt, projet, base).
+l'entrée est invalide (dépôt, projet, base). En cas d'échec, `--ready-out` est
+retiré — y compris un export d'une exécution précédente — pour qu'aucune liste
+partielle ne serve de base au contrôle d'inclusion.
 
 Lecture seule : la base n'est pas modifiée ; les branches sont lues dans le
 clone privé du radar ou dans un clone jetable, jamais dans le dépôt des agents.
@@ -102,6 +104,34 @@ def render(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def clear_ready_out(path: Path) -> None:
+    """Retire un export précédent : une liste périmée ne doit jamais servir."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_ready_out(path: Path, payload: dict) -> None:
+    """Écrit les lots prêts, ou retire l'export si l'inventaire est incomplet.
+
+    Un fichier d'une exécution précédente est retiré même quand la présente
+    exécution échoue : `paquet-inclusion.py` doit voir une entrée absente
+    (code 2) plutôt qu'une liste partielle trompeuse (#2404, relecture cx2 B3).
+    """
+    if payload.get("errors"):
+        clear_ready_out(path)
+        return
+    content = "# paquet-candidats %s %s\n%s\n" % (
+        payload["target"],
+        payload["base"][:12],
+        "\n".join("#%d" % lot for lot in payload["ready"]),
+    )
+    temporary = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    temporary.write_text(content, encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Liste calculée des lots prêts pour le paquet horaire (#2404).")
@@ -120,6 +150,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ready-out", default=None, metavar="FILE",
                         help="écrit les ids prêts, un par ligne, pour --ready-file")
     args = parser.parse_args(argv)
+
+    ready_out = Path(args.ready_out) if args.ready_out else None
+    if ready_out is not None:
+        try:
+            clear_ready_out(ready_out)
+        except OSError as exc:
+            print("paquet-candidats: cannot clear %s: %s" % (ready_out, exc),
+                  file=sys.stderr)
+            return 2
 
     repo = os.path.realpath(args.repo)
     try:
@@ -145,13 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = packet_candidates.inventory(
             conn, project, repo=repo, clone=clone, target=target, app=app,
             base=args.base, cfg=cfg)
-        if args.ready_out:
-            path = Path(args.ready_out)
-            path.write_text(
-                "# paquet-candidats %s %s\n%s\n"
-                % (payload["target"], payload["base"][:12],
-                   "\n".join("#%d" % lot for lot in payload["ready"])),
-                encoding="utf-8")
+        if ready_out is not None:
+            write_ready_out(ready_out, payload)
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str)
               if args.json else render(payload))
         return 1 if payload["errors"] else 0

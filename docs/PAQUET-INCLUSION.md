@@ -59,14 +59,18 @@ scripts/paquet-inclusion.py --manifest reviews/integration-paquet-h-…md \
     --expected-file "$TMPDIR/admissions-0800.txt"
 ```
 
-Sans `--ready-file`, le contrôle s'arrête en `2` ; `--no-ready` est le seul
-moyen d'assumer un contrôle sans liste calculée (audit hors base, par
-exemple).
+Sans source `--ready`/`--ready-file`, le contrôle s'arrête en `2` ; une source
+fournie mais vide (« aucun lot prêt ») est un calcul valide, pas une absence.
+`--no-ready` est le seul moyen d'assumer un contrôle sans liste calculée (audit
+hors base, par exemple).
 
 `paquet-candidats.py` ne compose rien et n'écrit dans aucun dépôt : il lit la
 base, les jalons et Git (clone privé du radar, ou clone jetable),
 et son code de retour est `1` si une lecture a échoué — une liste incomplète
-ne doit pas servir de base à un paquet. `--json` rend le schéma
+ne doit pas servir de base à un paquet. Dans ce cas `--ready-out` est retiré,
+y compris un export d'une exécution précédente : `paquet-inclusion.py`
+s'arrête alors sur un fichier absent (code `2`) au lieu de lire une liste
+partielle. `--json` rend le schéma
 `ameesh-packet-candidates/1` avec, par lot, la tête publiée, le gel effectif,
 la classe, la porte des avis, l'essai de fusion et les **codes** de refus
 (`freeze-not-head`, `verdicts-missing`, `conflict`, `already-in-target`, …).
@@ -105,11 +109,12 @@ scripts/paquet-inclusion.py … --no-expected
 - `--ready` / `--ready-file` : la liste **calculée** des lots prêts (#2404),
   telle que la produit `scripts/paquet-candidats.py --ready-out` (un id par
   ligne). Tout lot prêt doit être composé ou écarté avec un motif ; c'est la
-  liste de départ de la composition, pas une seconde liste d'admissions.
+  liste de départ de la composition, pas une seconde liste d'admissions. Un
+  fichier fourni mais vide est un calcul valide (« aucun lot prêt »).
 - `--no-ready` : assume explicitement un contrôle sans liste calculée des lots
   prêts ; le rapport dit alors « prêts × manifeste NON effectué ». Sans cette
-  option, l'absence de liste prête arrête le contrôle en `2` : la composition
-  part de la liste calculée (#2404), elle ne la suppose pas vide.
+  option, l'absence de source prête arrête le contrôle en `2` : la composition
+  part de la liste calculée (#2404), elle ne suppose pas qu'elle est vide.
 - `--no-expected` : assume explicitement un contrôle sans liste d'admissions ;
   le rapport dit alors « admissions × manifeste NON effectué ». Si une liste
   de lots prêts est fournie, le contrôle « prêts × manifeste » reste rendu.
@@ -187,7 +192,9 @@ restent la preuve de ses lots.
    du lot le sujet de la ligne (pas de mot-clé de retrait, ou lot cité au
    passage) est une **explication faible** : elle ne lève jamais une inclusion
    manquante ; elle n'explique qu'un contenu partiel ou absent d'un lot
-   composé, affiché « à confirmer ».
+   composé, affiché « à confirmer ». Seul le lot **en tête de ligne** est le
+   sujet d'une exclusion : un id cité dans le motif (« `#500` dépend de
+   `#600` ») reste une référence faible et ne lève pas l'omission de `#600`.
 2. **Manifeste × arbre.** Pour chaque entrée de composition, le delta du commit
    (`commit^..commit`, premier parent) doit encore être présent à la tête,
    vérifié **ligne par ligne**, pas par ascendance : toutes les lignes ajoutées
@@ -206,8 +213,9 @@ Sortie : un rapport lisible ou `--json` (schéma `ameesh-paquet-inclusion/1`).
 Codes de retour : `0` aucun défaut ; `1` une inclusion manquante, un lot prêt
 ni composé ni écarté avec un motif, un contenu absent non expliqué ou un commit
 introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
-expliqué ; `2` entrée invalide (manifeste ou tête introuvable, aucune liste
-prête sans `--no-ready`, ou aucune liste attendue sans `--no-expected`).
+expliqué ; `2` entrée invalide (manifeste ou tête introuvable, fichier de lots
+absent ou illisible, aucune source de liste prête sans `--no-ready`, ou aucune
+source de liste attendue sans `--no-expected`).
 
 ## Ce qu'il ne prouve pas
 

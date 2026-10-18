@@ -41,16 +41,21 @@ donne un avertissement.
 Un lot **prêt** (liste calculée) absent de la composition n'est pas une
 omission s'il figure dans une table « Écartés » avec un motif : c'est la forme
 que le composeur doit écrire, et le contrôle la lit comme une explication
-forte. Une ligne « écartée » sans motif ne lève pas l'omission (#2404).
+forte. Seul le lot en tête de ligne est le sujet d'une exclusion ; un id cité
+dans le motif reste une référence faible. Une ligne « écartée » sans motif ne
+lève pas l'omission (#2404).
 
 Sortie : un rapport lisible, ou `--json` (schéma `ameesh-paquet-inclusion/1`).
-La liste des lots prêts est demandée : sans `--ready`/`--ready-file`, le
-contrôle s'arrête en 2, sauf `--no-ready` qui assume un contrôle partiel.
+La liste des lots prêts est demandée : sans source `--ready`/`--ready-file`, le
+contrôle s'arrête en 2, sauf `--no-ready` qui assume un contrôle partiel ; un
+fichier fourni mais vide (« aucun lot prêt ») est valide, un fichier absent ou
+illisible est une entrée invalide.
 Codes de retour : 0 si aucun défaut ; 1 si une inclusion manquante, un lot
 prêt ni composé ni écarté avec un motif, un contenu absent non expliqué ou un
 commit introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
-expliqué ; 2 si l'entrée est invalide (manifeste ou tête introuvable, aucune
-liste prête sans `--no-ready`, ou aucune liste attendue sans `--no-expected`).
+expliqué ; 2 si l'entrée est invalide (manifeste ou tête introuvable, fichier
+de lots absent ou illisible, aucune source de liste prête sans `--no-ready`, ou
+aucune source de liste attendue sans `--no-expected`).
 Le script est en lecture seule : aucun réseau, aucune écriture dans le dépôt.
 """
 
@@ -181,6 +186,22 @@ class Manifest:
 
 def split_row(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def split_exclusion_line(line: str) -> tuple[list[int], list[int], str]:
+    """Ids sujets en tête de ligne, ids cités dans le motif, motif restant.
+
+    Sous « Écartés »/« Retraits », seul le lot en tête de ligne est le sujet de
+    l'exclusion. Un id cité dans le motif (« #500 dépend de #600 ») est une
+    référence : elle reste une explication faible (#2404, relecture cx2 B1).
+    """
+    match = re.match(r"^[\s>*\-]*((?:#\d+[\s/,]*)+)", line)
+    if not match:
+        return [], [int(found) for found in ID_RE.findall(line)], line.strip()
+    subjects = [int(found) for found in ID_RE.findall(match.group(1))]
+    rest = line[match.end():].strip(" :—-\t")
+    references = [int(found) for found in ID_RE.findall(rest)]
+    return subjects, references, rest
 
 
 def sha_in(cell: str) -> str | None:
@@ -330,34 +351,39 @@ def parse_manifest(path: Path) -> Manifest:
             continue
         if EXPLAIN_RE.search(line):
             reason = f"mention ligne {line_no} : {line.strip()[:160]}"
-            # Une mention en prose ne vaut explication forte que si le lot est
-            # le sujet de la ligne (id en tête, après marqueurs de liste) :
-            # « #987 × #1468 ... et retire celui de #1256 » ne retire pas #987.
-            leading = bool(re.match(r"^[\s>*\-]*#\d+", line))
-            weak = not (leading and EXCLUSION_HEADING_RE.search(heading))
-            for lot in (int(found) for found in ID_RE.findall(line)):
-                if weak:
-                    manifest.weak.setdefault(lot, reason)
-                else:
+            # Une mention en prose ne vaut explication forte que pour les lots
+            # sujets (ids en tête, après marqueurs de liste) ; un id cité dans
+            # le motif reste une référence faible : « #500 dépend de #600 » ne
+            # retire pas #600 (#2404, relecture cx2 B1).
+            subjects, references, _rest = split_exclusion_line(line)
+            strong = bool(subjects and EXCLUSION_HEADING_RE.search(heading))
+            for lot in subjects:
+                if strong:
                     manifest.explained.setdefault(lot, reason)
+                else:
+                    manifest.weak.setdefault(lot, reason)
+            for lot in references:
+                manifest.weak.setdefault(lot, reason)
         elif EXCLUSION_HEADING_RE.search(heading):
             # Sous « Écartés »/« Retraits », le lot doit être le sujet de la
             # ligne (id en tête) pour être écarté ; une phrase qui le cite au
             # passage reste une mention faible. Un id seul n'est pas un motif
             # et ne lève pas l'omission d'un lot prêt (#2404).
-            leading = bool(re.match(r"^[\s>*\-]*#?\d+", line))
-            rest = re.sub(r"^[\s>*\-]*(?:#\d+[\s/,]*)+", "", line).strip(" :—-\t")
-            reason = f"sous « {heading} », ligne {line_no}"
-            if leading and rest:
-                reason = f"écarté sous « {heading} », ligne {line_no} : {rest[:160]}"
-            for lot in (int(found) for found in ID_RE.findall(line)):
-                if leading and rest:
+            subjects, references, rest = split_exclusion_line(line)
+            strong = bool(subjects and rest)
+            for lot in subjects:
+                if strong:
                     manifest.ecartes.setdefault(lot, rest)
-                    manifest.explained.setdefault(lot, reason)
-                elif leading:
-                    manifest.ecartes.setdefault(lot, "")
+                    manifest.explained.setdefault(
+                        lot,
+                        f"écarté sous « {heading} », ligne {line_no} : {rest[:160]}",
+                    )
                 else:
-                    manifest.weak.setdefault(lot, reason)
+                    manifest.ecartes.setdefault(lot, "")
+            for lot in references:
+                manifest.weak.setdefault(
+                    lot, f"sous « {heading} », ligne {line_no}"
+                )
     if admissions:
         # dédoublonner en gardant l'ordre
         manifest.admissions = list(dict.fromkeys(admissions))
@@ -629,7 +655,13 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         expected = list(manifest.admissions)
     ready = collect_ids(getattr(args, "ready", []), getattr(args, "ready_file", []))
     no_ready = bool(getattr(args, "no_ready", False))
-    if not ready and not no_ready:
+    # Une source fournie mais vide est un calcul valide (« aucun lot prêt ») :
+    # seule l'absence de source exige --no-ready (#2404, relecture cx2 B2).
+    ready_source = bool(
+        getattr(args, "ready", None) or getattr(args, "ready_file", None)
+    )
+    expected_source = bool(args.expected or args.expected_file or manifest.admissions)
+    if not ready_source and not no_ready:
         # La composition part de la liste calculée (#2404) : sans elle, le
         # contrôle ne peut pas dire qu'un lot prêt a été oublié. L'assumer
         # explicitly (--no-ready) est un contrôle partiel, jamais un défaut.
@@ -638,7 +670,7 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
             "(sortie de scripts/paquet-candidats.py --ready-out), ou assumer "
             "le contrôle partiel avec --no-ready"
         )
-    if not expected and not ready and not args.no_expected:
+    if not expected_source and not ready_source and not args.no_expected:
         # Sans liste attendue ni liste calculée, le contrôle ne peut pas
         # conclure : une sortie 0 laisserait croire qu'il a eu lieu
         # (#1655 N1, #2404). --no-expected l'assume explicitement.
@@ -799,8 +831,7 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         "expected": expected,
         "ready": ready,
         "ready_source": (
-            "options" if (getattr(args, "ready", None) or getattr(args, "ready_file", None))
-            else None
+            "options" if ready_source else None
         ),
         "no_ready": no_ready,
         "ecartes": {str(lot): reason for lot, reason in sorted(manifest.ecartes.items())},
@@ -951,8 +982,14 @@ def parse_id_list(value: str) -> list[int]:
 
 
 def read_id_file(path: Path) -> list[int]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        # Un export absent (ou retiré parce que l'inventaire était incomplet)
+        # n'est pas une liste vide : c'est une entrée invalide (#2404, cx2 B3).
+        raise InputError(f"fichier de lots illisible : {path} ({error})") from error
     ids: list[int] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = re.sub(r"\s+#.*$", "", line)
         ids.extend(parse_id_list(line))
     return ids
