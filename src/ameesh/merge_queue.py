@@ -97,6 +97,10 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 #: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
 #: `critical: true` au canon fait foi ; ces motifs restent un minimum lorsque
 #: le canon ne connaît pas encore un chemin critique ou omet sa déclaration.
+#: Un doute de classe (politique ou diff illisible, `files` vide) n'ajoute
+#: aucun de ces domaines : il reste sensible, un avis (canon §2, owner 15/10 :
+#: deux familles seulement pour droits SQL, secrets, paiement, prod réelle ;
+#: #2394).
 CRITICAL_SCOPE = (
     # SQL, migrations, stockage
     re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
@@ -132,16 +136,19 @@ def critical_scope(klass) -> bool:
     Le canon peut le déclarer explicitement sur chaque chemin classé. Les
     motifs de secours s'appliquent aussi aux chemins classés légers, sauf à la
     documentation Markdown classée légère ou normale.
-    Un doute de classe (politique ou diff illisible, `files` vide) ne se
-    suppose jamais rassurant : `required_verdicts` le compte alors comme un
-    domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
+    Seuls les **chemins changés** prouvent un domaine critique : une liste
+    `files` vide, ou une entrée sans chemin, n'en désigne aucun. Le doute de
+    classe n'est pas critique pour autant : `required_verdicts` le garde
+    sensible, à un avis (canon §2, owner 15/10 ; #2394). Une déclaration
+    `critical: true` du canon reste lue même portée par une entrée sans
+    chemin."""
     files = (klass or {}).get("files") or ()
-    if not files:
-        return True
     for entry in files:
-        path = str(entry.get("path") or "")
-        if entry.get("critical") is True or not path:
+        if entry.get("critical") is True:
             return True
+        path = str(entry.get("path") or "")
+        if not path:
+            continue
         if (str(entry.get("class") or "") in ("light", "normal")
                 and _PROSE.search(path)):
             continue
@@ -154,9 +161,12 @@ def required_verdicts(klass) -> int:
     """Le nombre d'avis indépendants : deux pour un chemin critique, même si
     le canon l'a omis ou classé léger ; sinon 0 pour léger, 1 pour normal et
     1 pour sensible hors SQL, sécurité et prod.
-    Un doute de classe (politique ou diff illisible, `files` vide) ne se
-    suppose jamais rassurant : il garde l'exigence des domaines critiques
-    (deux avis), faute de pouvoir exclure SQL, la sécurité ou la prod.
+    Un doute de classe (politique ou diff illisible, `files` vide) est
+    sensible : un avis d'une autre famille (canon §2, owner 15/10 : deux
+    familles seulement pour droits SQL, secrets, paiement, prod réelle ;
+    #2394). La porte garde l'exigence d'indépendance d'une classe sensible :
+    un doute ne se suppose jamais rassurant, mais il n'invente pas un second
+    avis que le canon ne demande pas.
     Un lot release n'est jamais léger : il garde un avis (la procédure de
     release et la protection de cible restent au pilote ; le feu, lui, refuse
     la classe release avant tout compte)."""
@@ -164,14 +174,16 @@ def required_verdicts(klass) -> int:
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     if klass.get("doubt"):
-        return CRITICAL_REVIEWS
+        # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
+        # jamais critique par le seul doute (#2394).
+        cls = lot_class.SENSITIVE
     if klass.get("files") and critical_scope(klass):
         return CRITICAL_REVIEWS
     if cls == lot_class.LIGHT:
         return 0
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
         return 1
-    return CRITICAL_REVIEWS if critical_scope(klass) else SENSITIVE_REVIEWS
+    return SENSITIVE_REVIEWS
 
 
 def _mark_order(mark: dict) -> tuple:
@@ -286,8 +298,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     vigueur refuse la porte, quelle que soit la classe.
 
     Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
-    normal et pour un lot sensible hors SQL/sécurité/prod, 2 pour un lot
-    sensible qui touche ces domaines ou dont la classe reste un doute. Les avis
+    normal et pour un lot sensible hors SQL/sécurité/prod — un doute de classe
+    reste sensible —, 2 pour un lot sensible qui touche ces domaines. Les avis
     comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
     classe sensible, une famille de modèle connue et autre que celle de
     l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se

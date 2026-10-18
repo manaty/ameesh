@@ -198,13 +198,17 @@ class ReviewGateTest(unittest.TestCase):
                                        _verdict("rev2")), klass=klass)
                 self.assertTrue(two["ok"], two["why"])
 
-    def test_sensitive_without_changed_paths_keeps_two_reviews(self):
+    def test_sensitive_without_changed_paths_keeps_one_review(self):
+        # #2394 : le canon réserve les deux avis aux catégories critiques
+        # (SQL, secrets, paiement, prod réelle, porte de fusion) ; une liste de
+        # chemins vide ne prouve aucune de ces catégories. La classe reste
+        # sensible : un avis d'une autre famille, et rien de plus.
         for files in ([], [{"class": "sensitive", "rule": ["src/ameesh/runner.py"]}]):
             with self.subTest(files=files):
                 klass = {"class": "sensitive", "doubt": False, "files": files}
                 one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
-                self.assertEqual(one["required"], 2)
-                self.assertFalse(one["ok"])
+                self.assertEqual(one["required"], 1)
+                self.assertTrue(one["ok"], one["why"])
 
     def test_sql_and_merge_gate_need_two_distinct_families(self):
         for entry in (self.SQL, self.GATE):
@@ -291,22 +295,20 @@ class ReviewGateTest(unittest.TestCase):
         self.assertFalse(out["ok"], "l'avis de la famille de l'auteur ne compte pas")
         self.assertEqual([a["actor"] for a in out["accepted"]], ["rev1"])
 
-    def test_a_doubt_never_supposes_a_family_and_needs_two(self):
-        # B/P1 cx1 (57812f9b..979f2e2b) : un doute (politique ou diff illisible)
-        # peut cacher SQL/la sécurité/la prod ; il garde donc les deux avis des
-        # domaines critiques et l'indépendance ne s'y suppose jamais.
+    def test_a_doubt_never_supposes_a_family_and_needs_one(self):
+        # #2394 : le doute de classe reste sensible (canon §8) : un avis d'une
+        # autre famille suffit (owner 15/10), mais l'indépendance ne s'y
+        # suppose jamais — famille du relecteur connue et autre que l'auteur.
         klass = {"class": "sensitive", "doubt": True, "files": []}
         out = self.gate(_marks(_mark("frozen", A)), klass=klass)
         self.assertFalse(out["ok"])
-        self.assertEqual(out["required"], 2)
+        self.assertEqual(out["required"], 1)
         one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
-        self.assertFalse(one["ok"], "un avis ne suffit pas sur un doute")
-        ghost = self.gate(_marks(_mark("frozen", A), _verdict("ghost"), _verdict("rev1")),
-                          klass=klass)
+        self.assertTrue(one["ok"], one["why"])
+        ghost = self.gate(_marks(_mark("frozen", A), _verdict("ghost")), klass=klass)
         self.assertFalse(ghost["ok"], "une famille inconnue ne prouve pas l'indépendance")
-        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
-                        klass=klass)
-        self.assertTrue(two["ok"], two["why"])
+        same = self.gate(_marks(_mark("frozen", A), _verdict("other")), klass=klass)
+        self.assertFalse(same["ok"], "la famille de l'auteur ne compte pas")
         out = self.gate(_marks(_mark("frozen", A), _verdict("author")), klass=klass)
         self.assertFalse(out["ok"], "l'auteur ne relit pas son propre travail")
 
