@@ -768,8 +768,33 @@ def _internal_failure(cfg, tx, item: Mapping, freeze: Mapping, threads: list,
             "why": why}
 
 
-def _selection(inputs: Inputs, port) -> dict:
+class _ForcedPort:
+    """Vue du port qui ignore la sélection déjà écrite du gel (#2487).
+
+    `force` rejoue une désignation **réelle** après un report qui a refusé : la
+    sélection supplantée du même gel ne doit pas être renvoyée telle quelle par
+    `recorded` (`rd.apply`), et le port doit écrire une marque plus récente que
+    le report, pas rejouer l'ancienne (`PgPort.commit(force=True)`). Le verrou
+    et le contrôle du gel courant restent ceux du port réel.
+    """
+
+    def __init__(self, port) -> None:
+        self.port = port
+
+    def latest_freeze(self, lot: int):
+        return self.port.latest_freeze(lot)
+
+    def recorded(self, lot: int, freeze_id: int):
+        return None
+
+    def commit(self, lot: int, **kwargs) -> dict:
+        return self.port.commit(lot, force=True, **kwargs)
+
+
+def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
     """The `apply` call, shared by the hook and the recovery path."""
+    if force:
+        port = _ForcedPort(port)
     return rd.apply(
         inputs.item, policy=inputs.policy.rules, paths=list(inputs.paths),
         port=port, freeze_sha=str(inputs.freeze.get("sha") or ""),
@@ -1077,7 +1102,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     else "no changed path: no review due"}
         with db.transaction() as tx:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
-                                                at_freeze=False))
+                                                at_freeze=False), force=force)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") == rd.DESIGNATED else [])
             _sync_reviewers(tx, item, freeze, names)

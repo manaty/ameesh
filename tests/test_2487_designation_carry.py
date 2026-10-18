@@ -120,6 +120,12 @@ class _Repo:
         _git(self.root, "merge", "-q", "--no-edit", "main")
         return _git(self.root, "rev-parse", "HEAD")
 
+    def replay_reviewed(self) -> str:
+        """R' = la tête relue rejouée sur la cible : un autre réalignement de F."""
+        _git(self.root, "switch", "-q", "-c", "lot/9-x-replay", self.tip)
+        _git(self.root, "cherry-pick", self.reviewed)
+        return _git(self.root, "rev-parse", "HEAD")
+
     def author_commit(self, text: str = "lot, corrigé\n") -> str:
         """Une vraie tête d'auteur : ce n'est pas un réalignement."""
         _git(self.root, "switch", "-q", "lot/9-x")
@@ -445,11 +451,12 @@ class NotCarriedTest(_Fixture):
 class LateCarryTest(_Fixture):
     """Marques du même gel : la dernière du journal fait foi (#2487)."""
 
-    def _old_reviewers(self):
+    def _old_reviewers(self, second=True):
         _, outcome = self.freeze(self.repo.reviewed)
         self.assertEqual(outcome["state"], "designated", outcome)
         self.verdict("rev1", self.repo.reviewed)
-        self.verdict("rev2", self.repo.reviewed)
+        if second:
+            self.verdict("rev2", self.repo.reviewed)
         self.db.execute("DELETE FROM agent_mailbox")
 
     def test_a_late_carry_after_a_selection_replaces_its_reviewers(self):
@@ -518,6 +525,90 @@ class LateCarryTest(_Fixture):
                          ["rev1", "rev2"])
 
 
+    def test_a_force_designation_after_a_late_carry_supersedes_it(self):
+        # B/P1 de cx1 : un report tardif a remplacé la sélection du gel ; le
+        # repli `force` doit écrire une marque PLUS RÉCENTE que le report, et
+        # non rejouer l'ancienne sélection (colonne à quatre noms).
+        self._old_reviewers()
+        self.alternate_reviewers()
+        frozen = self.repo.merge_target()
+        with mock.patch.object(act, "carried_plan", return_value=None):
+            _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.db.execute("DELETE FROM agent_mailbox")
+        applied = act.designate(self.cfg, self.db, self.lot, force=True)
+        self.assertEqual(applied["state"], "designated", applied)
+        self.assertEqual([r["name"] for r in applied["reviewers"]],
+                         ["rev3", "rev4"])
+        self.assertFalse(applied.get("replayed"))
+        self.assertEqual(self.designated(), ["rev3", "rev4"])
+        self.assertEqual([m["recipient"] for m in self.review_mail()],
+                         ["rev3", "rev4"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "designated")
+        self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
+                         ["rev3", "rev4"])
+
+    def test_a_late_carry_keeps_the_previous_pending_seat(self):
+        # B/P1 de cx1 (B2) : le report ne reporte que des verdicts ; le siège
+        # du gel précédent sans verdict (rev2) reste désigné après un report
+        # tardif qui a remplacé la sélection du nouveau gel.
+        self._old_reviewers(second=False)
+        self.alternate_reviewers()
+        frozen = self.repo.merge_target()
+        with mock.patch.object(act, "carried_plan", return_value=None):
+            _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.assertEqual([r["name"] for r in outcome["reviewers"]],
+                         ["rev3", "rev4"])
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(sorted(self.designated()), ["rev1", "rev2"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "carried")
+        self.assertEqual(sorted(r["name"] for r in
+                                shown["designation"]["reviewers"]),
+                         ["rev1", "rev2"])
+        # rev2 n'a pas voté : la porte reste fermée sur les deux avis dus.
+        self.assertFalse(self.gate(frozen)["ok"])
+
+    def test_selection_carry_force_carry_follow_the_journal_order(self):
+        # Cas demandé : sélection → report → force → report. Chaque marque
+        # plus récente décide de la colonne et de la lecture.
+        self._old_reviewers(second=False)
+        self.alternate_reviewers()
+        frozen = self.repo.merge_target()
+        with mock.patch.object(act, "carried_plan", return_value=None):
+            _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        first = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                    repo=self.repo.root)
+        self.assertEqual(first["result"], "carried", first)
+        self.assertEqual(sorted(self.designated()), ["rev1", "rev2"])
+        applied = act.designate(self.cfg, self.db, self.lot, force=True)
+        self.assertEqual(applied["state"], "designated", applied)
+        self.assertEqual(sorted(self.designated()), ["rev3", "rev4"])
+        # un verdict tardif du siège resté en attente, sur un autre
+        # réalignement de la même tête, redonne un report après le `force`
+        replayed = self.repo.replay_reviewed()
+        self.verdict("rev2", replayed)
+        second = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                     repo=self.repo.root)
+        self.assertEqual(second["result"], "carried", second)
+        self.assertEqual(sorted(self.designated()), ["rev1", "rev2"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "carried")
+        self.assertEqual(sorted(r["name"] for r in
+                                shown["designation"]["reviewers"]),
+                         ["rev1", "rev2"])
+        self.assertNotIn("rev3", self.designated())
+
+
 class LatePendingSeatTest(_Fixture):
     """Report tardif : les sièges du gel précédent sans verdict restent (#2487)."""
 
@@ -559,6 +650,7 @@ class LatePendingSeatTest(_Fixture):
                                       repo=self.repo.root)
         self.assertEqual([e["actor"] for e in carried["carried"]], ["rev1"])
         self.assertEqual(self.designated(), ["rev1", "rev2"])
+
 
 
 if __name__ == "__main__":

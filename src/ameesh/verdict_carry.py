@@ -729,10 +729,18 @@ def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict
     (#2487) ; ce chemin couvre le report tardif (relevé de l'exécuteur, ou gel
     fait par un autre appelant) : sans lui, une désignation du nouveau gel
     resterait dans la colonne et `progress` attendrait un verdict qui n'a pas
-    lieu d'être. Une marque `review-designation-carried` est écrite quand la
-    dernière marque du gel n'en est pas déjà une (report après une désignation
-    `force`) : elle devient l'effective et la colonne la suit. La marque rend
-    la reprise et la lecture (`ameesh work reviewers`) idempotentes."""
+    lieu d'être.
+
+    La marque porte aussi les **sièges du gel précédent sans verdict** (B/P1 de
+    dev1) : le report ne reporte que des verdicts, pas une attente. Le hook les
+    filtre sur la colonne d'avant le gel ; ici, la sélection du nouveau gel a
+    déjà pu retirer ces noms, donc on les reprend de la marque effective du gel
+    précédent (un siège retiré à la main n'est pas distinguable — la marque est
+    la source automatique). Une marque `review-designation-carried` est écrite
+    quand la dernière marque du gel n'est pas un report qui porte déjà ces noms
+    (report après une désignation `force`, ou report tardif qui complète des
+    sièges) : elle devient l'effective et la colonne la suit. La marque rend la
+    reprise et la lecture (`ameesh work reviewers`) idempotentes."""
     from . import review_designation_activation as activation
     freeze_id = int(freeze.get("id") or 0)
     names = []
@@ -743,23 +751,31 @@ def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict
     if not names:
         return
     payload = {"state": "carried", "carried": out.get("carried") or []}
+    extra = activation._previous_designees(tx, int(lot), freeze_id)
+    note = carried_mark_note(int(lot), freeze, payload, extra_reviewers=extra)
+    wanted = carried_mark_of(note) or {}
+    wanted_names = [str((reviewer or {}).get("name") or "").strip()
+                    for reviewer in wanted.get("reviewers") or ()]
+    wanted_names = [name for name in wanted_names if name]
     effective = activation._effective_mark(
         tx, int(lot), freeze_id, since_ts=float(freeze.get("at_ts") or 0.0))
-    if effective is None or effective[1] != "carried":
+    current_names = []
+    if effective is not None and effective[1] == "carried":
+        current_names = [str((reviewer or {}).get("name") or "").strip()
+                         for reviewer in (effective[2].get("reviewers") or ())]
+        current_names = [name for name in current_names if name]
+    if effective is None or effective[1] != "carried" or current_names != wanted_names:
         # #2487 : un report tardif qui aboutit après une vraie désignation
         # (repli `force`) écrit une marque plus récente ; la colonne et la
         # lecture suivent alors le report, pas la sélection supplantée. Les
         # sièges du gel précédent sans verdict restent désignés, comme au gel ;
         # la colonne a déjà suivi la sélection, elle ne filtre donc pas.
-        note = carried_mark_note(
-            int(lot), freeze, payload,
-            extra_reviewers=activation._previous_designees(tx, int(lot), freeze_id))
         storage.of(tx).work.note(int(lot), str(row.get("state") or ""), note,
                                  work.SYSTEM_SENDER)
     activation._sync_reviewers(
-        tx, dict(row), freeze, names,
+        tx, dict(row), freeze, wanted_names,
         text="reviewers kept from carried verdicts at freeze #%d: %s (#2442/#2487)"
-             % (freeze_id, ", ".join(names)))
+             % (freeze_id, ", ".join(wanted_names)))
 
 
 def describe(result: dict) -> str:

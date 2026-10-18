@@ -286,15 +286,21 @@ mails, and `progress` waiting for a verdict that is not due.
 clean trial merge on the fresh target, mechanical history, same lot delta; no
 write, no lease). When the plan carries every pending verdict, the default hook
 receives it: it writes the `review-designation-carried:<lot>:<freeze>` mark,
-keeps the carried reviewers in `work_items.reviewers` and mails nobody. The
-carry then copies the verdicts and finds the same mark; a late carry (executor
-sweep) also resynchronises the column, so the gate and `progress` agree on any
-path. A plan that does not cover the head, or a proof that fails, keeps the
-normal designation.
+keeps the carried reviewers (and the previous freeze's seats still waiting for
+a verdict) in `work_items.reviewers` and mails nobody. The carry then copies
+the verdicts; a late carry (executor sweep) also writes a newer carried mark
+and resynchronises the column, so the gate and `progress` agree on any path. A
+plan that does not cover the head, or a proof that fails, keeps the normal
+designation.
 
-The CLI replays a real designation (`designate(force=True)`) when the carry
-refuses right after the freeze, and the executor does the same once when a
-freeze carries the mark but its carry keeps failing. Carried marks are
+Within one freeze, the **last** automatic mark in journal order (selection or
+carry) is the effective one: `reviewers()`, the recovery and the column all
+follow it. A late carry after a selection therefore retires the selection it
+supersedes, and restores the previous freeze's pending seats that the selection
+had removed. A forced replay (`designate(force=True)`) when the carry refuses
+goes through the port with `force`: the old selection is not replayed and a
+newer selection mark is written, so it supersedes the carried mark; a carry
+that succeeds afterwards writes a newer carried mark again. Carried marks are
 automatic designations for the column: a later real freeze removes their names
 before writing the new selection. `ameesh work reviewers` shows the carried
 state, not "no designation".
