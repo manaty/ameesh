@@ -84,3 +84,22 @@ class CompatibilityTest(PgTestCase):
                 probe.probe(self.cfg)
         self.assertEqual(raised.exception.sqlstate, '25006')
         self.assertEqual(self.db.query('SELECT id FROM work_items'), [])
+
+    def test_probe_runs_the_installed_constructor(self):
+        # #2359: take_pass may read any attribute its constructor sets; the
+        # probe mirrors none of them (`suite_cap` stands for a new one).
+        original = runner.Runner.take_pass
+        seen = []
+
+        def reads_constructor_state(state):
+            seen.append((state.suite_cap is not None, bool(state.workers)))
+            return original(state)
+        with mock.patch.object(runner.Runner, 'take_pass', reads_constructor_state):
+            probe.probe(self.cfg)
+        self.assertEqual(seen, [(True, True)])
+
+    def test_setup_failure_is_not_reported_as_incompatible(self):
+        with mock.patch.object(runner, 'Runner', side_effect=TypeError('take')):
+            with self.assertRaises(probe.ProbeUnusable) as raised:
+                probe.probe(self.cfg)
+        self.assertIn('TypeError: take', str(raised.exception))

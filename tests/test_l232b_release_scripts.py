@@ -134,6 +134,13 @@ class MigrationPinningTest(unittest.TestCase):
         self.assertIn("ancien code incompatible", done.stderr)
         self.assertEqual(self.calls()[-1]["release"], "installed")
 
+    def test_unusable_probe_stops_migration_step_with_its_own_message(self):
+        # #2359: exit 2 = probe unusable, not proven incompatible.
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="2")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("sonde inutilisable", done.stderr)
+        self.assertNotIn("ancien code incompatible", done.stderr)
+
     def test_missing_ref_takes_clone_head(self):
         # #1245 : sans REF, « migrer » migre le HEAD du dépôt de déploiement,
         # comme « installer » ; le contrôleur L232b migre, lui, son commit épinglé.
