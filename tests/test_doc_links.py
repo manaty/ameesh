@@ -109,6 +109,13 @@ class BrokenLinksTest(unittest.TestCase):
         self.assertEqual(self.reasons('<a id="custom"></a>\n\n[lien](#custom)\n'), [])
         self.assertEqual(self.reasons('<a name="legacy"></a>\n\n[lien](#legacy)\n'), [])
 
+    def test_html_anchor_requires_a_real_attribute(self):
+        for text in ('<a data-id="ghost"></a>', '<a title="id=\'ghost\'"></a>',
+                     '<!-- <a id="ghost"></a> -->', '`<a id="ghost"></a>`'):
+            with self.subTest(text=text):
+                self.assertEqual(self.reasons(text + '\n\n[link](#ghost)\n'),
+                                 ["missing anchor"])
+
     def test_footnote_is_not_a_reference(self):
         self.assertEqual(self.reasons("[^1]: Voir.\n"), [])
         self.assertEqual(self.reasons("[^1]: Voir.\n\n[ok](target.md)\n"), [])
