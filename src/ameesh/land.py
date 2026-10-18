@@ -726,7 +726,12 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             return landing.eject("%s is a protected target (%s)" % (row["target"], glob),
                                  "Merging into %s is the orchestrator's gesture: ask it."
                                  % row["target"])
-        return _land(landing, replayer, slug, gh)
+        # #2428: the merge, the gates and the push read and write the radar
+        # clone's worktree. Another pass, a stacked trial or a turn's command
+        # may share that clone: the lock keeps one tree per operation. A busy
+        # clone surfaces as CloneBusy (a GitError), and the line is retried.
+        with replayer.locked():
+            return _land(landing, replayer, slug, gh)
     except (GitError, LandError, OSError, ValueError) as exc:
         error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
         if row["state"] == "landing" and project.land == "pr":
