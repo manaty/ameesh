@@ -2586,7 +2586,29 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     return row
 
 
-def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False) -> bool:
+def _wake_moment(ts: float) -> str:
+    """Un instant de réveil, fuseau du poste (lisible dans le journal)."""
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(ts)))
+
+
+#: #2466 : une échéance dans le texte d'une note (`wake_at=2026-…+02:00`),
+#: ISO 8601 avec fuseau obligatoire — le même contrat que `--wake-at`.
+_WAKE_AT_TOKEN = re.compile(r"(?:^|\s)wake_at=(\S+)", re.IGNORECASE)
+
+
+def _note_wake_at(text: str) -> float | None:
+    match = _WAKE_AT_TOKEN.search(text or "")
+    if not match:
+        return None
+    from . import watch
+    try:
+        return watch.parse_wake_deadline(None, match.group(1))
+    except watch.WatchError as exc:
+        raise WorkError("wake_at= in the note: %s" % exc) from exc
+
+
+def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False,
+         wake_ts: float | None = None) -> bool:
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -2594,9 +2616,56 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
         raise WorkError("empty note")
     text = text.strip()
     actor = check_wait_note(getattr(db, "cfg", None), db, actor, text)
-    options = {"once": True} if once else {}
-    storage.of(db).work.note(item_id, item["state"], text, actor, **options)
+    token_ts = _note_wake_at(text)
+    if wake_ts is not None and token_ts is not None:
+        raise WorkError("give the wake deadline once: --wake-at/--wake-in or "
+                        "wake_at= in the note")
+    if token_ts is not None:
+        wake_ts = token_ts
+    if wake_ts is not None:
+        if once:
+            raise WorkError("a scheduled wake goes with a regular note, not `once`")
+        if item["state"] in ("merged", "promoted", "closed"):
+            raise WorkError("lot %s is %s: no wake to schedule" % (item_id, item["state"]))
+        # #2466 : la note porte elle-même son échéance de reprise (témoin
+        # lisible dans le journal) ; la colonne `wake_at` la rend exécutoire.
+        text = "%s [réveil programmé: %s]" % (text, _wake_moment(float(wake_ts)))
+        storage.of(db).work.note_with_wake(item_id, item["state"], text, actor,
+                                           float(wake_ts))
+    else:
+        options = {"once": True} if once else {}
+        storage.of(db).work.note(item_id, item["state"], text, actor, **options)
     return True
+
+
+def schedule_wake(db: Db, item_id: int, wake_ts: float | None, *,
+                  text: str = "", actor: str = "") -> dict:
+    """#2466 : pose ou efface le réveil programmé d'un lot ouvert.
+
+    Le geste est journalisé (`wake: …`) et ne change pas la retenue d'un lot
+    sous `hold:` : le réveil est un rendez-vous explicite, porté par la base
+    et consommé par l'exécuteur. `wake_ts=None` annule, en nommant l'échéance
+    retirée quand il y en avait une."""
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if item["state"] in ("merged", "promoted", "closed"):
+        raise WorkError("lot %s is %s: no wake to schedule" % (item_id, item["state"]))
+    why = (text or "").strip()
+    previous = item.get("wake_ts")
+    if wake_ts is None:
+        label = "wake: cancelled"
+        if previous:
+            label += " (was due %s)" % _wake_moment(float(previous))
+        if why:
+            label += " — " + why
+    else:
+        label = "wake: " + (why or "scheduled wake")
+        label += " (due %s)" % _wake_moment(float(wake_ts))
+    row = storage.of(db).work.schedule_wake(item_id, wake_ts, text=label, actor=actor)
+    if row is None:
+        raise WorkError("lot %s changed or closed in the meantime: retry" % item_id)
+    return row
 
 
 def events(db: Db, item_id: int, limit: int | None = 100) -> list[dict]:
