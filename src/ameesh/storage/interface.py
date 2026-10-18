@@ -247,7 +247,8 @@ class Agents(Domain):
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
                        actor: str, principal: str,
-                       expect_reason: str | None = None) -> dict | None:
+                       expect_reason: str | None = None,
+                       not_after: float | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
@@ -258,6 +259,11 @@ class Agents(Domain):
         instruction, sous le verrou de ligne : une pause étrangère posée entre
         la lecture et la reprise n'est jamais levée. Refusé pour POSER une
         pause (`paused=True`).
+
+        `not_after` (#2184/R3) : échéance absolue (epoch) pour une POSE ; la
+        base la compare à son horloge sous le verrou de ligne et refuse la
+        pose au-delà (`changed=false`, `refusal='not_after'`). Une pose
+        distante retardée ne peut donc pas committer après le nettoyage.
         """
 
     @abc.abstractmethod
@@ -360,7 +366,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
-        """Détenteur, epoch, statut et vie du bail (`live`), ou None."""
+        """Nom primaire résolu, détenteur, epoch, statut et vie du bail
+        (`live`), ou None."""
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
@@ -1095,6 +1102,15 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def history(self, recipient: str, limit: int) -> list[dict]:
         """Derniers messages du destinataire, du plus récent au plus ancien."""
+
+    @abc.abstractmethod
+    def review_requests(self, recipient: str, lot: str) -> list[dict]:
+        """#2504 : les demandes de relecture (`kind = 'request'`) du
+        destinataire liées à ce lot, du plus récent au plus ancien.
+
+        Le filtre (destinataire, nature, lot) est fait DANS la requête : un
+        `history` borne avant de filtrer, donc une demande ancienne du même lot
+        sortait de la fenêtre et une re-désignation renvoyait un doublon."""
 
     @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
@@ -2023,10 +2039,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
-                     landed: tuple[int, str] | None = None) -> dict | None:
+                     landed: tuple[int, str] | None = None,
+                     unfrozen: bool = False) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
-        dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
+        dernier gel du lot — `unfrozen` (#2444) : si le lot n'a toujours aucun
+        gel (sinon None, rien d'écrit) ; journal et jalon
         `merged` (commit, auteur de la fusion) dans la même transaction.
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la même transaction."""
@@ -3112,6 +3130,14 @@ class Operations(Domain):
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
                         "turn_grace_seconds")
+
+    @abc.abstractmethod
+    def publish_peek(self, name: str, owner: str, epoch: int, payload: dict) -> bool:
+        """Replace a sanitised observation under the live agent lease; false if fenced."""
+
+    @abc.abstractmethod
+    def read_peek(self, name: str, human: str) -> dict | None:
+        """Responsible human only; no snapshot data selected on a refused read."""
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:

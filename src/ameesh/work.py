@@ -1088,6 +1088,62 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
     return row
 
 
+def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
+    """The request mail that wakes a manually designated reviewer (#2478).
+
+    A designation writes the reviewer column and the journal; without a mail
+    linked to the lot, the reviewer's runner had nothing to open a turn on and
+    the review waited for a later `stale_lot` alert. The mail is a `request`
+    (`kind`) carrying `work_item_id` (the `--lot` of `agent-mail`), so it is
+    active mail for the runner's unread selection.
+
+    The designation is already written when this runs: a delivery failure is
+    returned as a warning (same pattern as `delegate`), never raised, so the
+    caller can surface it without losing the designation. A human reviewer has
+    no runner to wake and gets no mailbox request. An earlier request that
+    already covers this reviewer and head is reused, not sent again (#2495).
+    """
+    from . import mail, plan_git
+    from .review_designation import (REQUEST_KIND, covering_request,
+                                     manual_reviewer_message)
+
+    name = (reviewer or "").strip()
+    if not name or name.startswith(HUMAN_PREFIX) or name == REVIEWER_NONE:
+        return {}
+    try:
+        latest = plan_git.latest_freeze(milestones(db, int(item["id"]), limit=None))
+    except Exception:  # noqa: BLE001 - unreadable milestones: no head named
+        latest = None
+    freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
+              if latest is not None else None)
+    # #2495/#2504 : one request per (lot, reviewer, head). A re-designation, or
+    # a designation after the freeze already woke this reviewer, sends nothing.
+    # The requests are selected per lot in storage: an old one cannot fall out
+    # of a history window under a heavy mailbox.
+    try:
+        prior = covering_request(mail.review_requests(db, name, int(item["id"])),
+                                 lot=int(item["id"]), reviewer=name,
+                                 sha=freeze["sha"] if freeze else "")
+    except Exception:  # noqa: BLE001 - unreadable requests: send, as before #2495
+        prior = None
+    if prior is not None:
+        return {"reviewer_request_message_id": int(prior["id"]),
+                "reviewer_request_reused": True}
+    payload = {"review_request": {"lot": int(item["id"]), "reviewer": name,
+                                  "manual": True}}
+    if freeze:
+        payload["review_request"]["freeze"] = freeze
+    body = manual_reviewer_message(item, freeze=freeze, actor=who)
+    try:
+        message_id = mail.send(
+            db, who or SYSTEM_SENDER, name, body, kind=REQUEST_KIND,
+            work_item_id=str(int(item["id"])), payload=payload)
+    except Exception as exc:  # noqa: BLE001 - la désignation est écrite ; le dire
+        return {"reviewer_request_warning":
+                "review request not delivered to %s (%s): notify them" % (name, exc)}
+    return {"reviewer_request_message_id": message_id}
+
+
 def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
                        actor: str | None = None, remove: bool = False) -> dict:
     """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
@@ -1097,7 +1153,10 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
     `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`.
     Même harnais déclaré que l'auteur : avertissement indicatif (#800), posé
-    sur la ligne rendue (`reviewer_warning`), la désignation est conservée."""
+    sur la ligne rendue (`reviewer_warning`), la désignation est conservée.
+    La désignation dépose aussi un `request` lié au lot (#2478) : le relecteur
+    est réveillé, son runner ouvre un tour ; une remise en échec est un
+    avertissement (`reviewer_request_warning`), la désignation reste écrite."""
     who, item = _review_item(cfg, db, item_id, actor)
     # A former reviewer can still be withdrawn after leaving the registry.
     name = (reviewer or "").strip() if remove else check_reviewer_choice(
@@ -1109,6 +1168,8 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
         name, "removed" if remove else "designated"), remove=remove)
     if warning:
         row["reviewer_warning"] = warning
+    if not remove:
+        row.update(_reviewer_request(db, item, name, who))
     return row
 
 
@@ -1808,7 +1869,7 @@ def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
-                 landed: tuple[int, str] | None = None) -> dict:
+                 landed: tuple[int, str] | None = None, unfrozen: bool = False) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
@@ -1818,7 +1879,9 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
     `frozen_id` (preuve par le contenu) : le jalon `frozen` examiné ; si ce
     n'est plus le dernier gel du lot au moment d'écrire, rien n'est fermé
-    (`refrozen`) — le nouveau gel n'a pas été examiné.
+    (`refrozen`) — le nouveau gel n'a pas été examiné. `unfrozen` (#2444,
+    gel d'origine verdict) : aucun gel n'a été examiné ; un gel déclaré
+    depuis rend aussi `refrozen`.
 
     `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri, écrit
     dans la transaction de la fusion ; l'appelant l'a validé et réservé.
@@ -1886,7 +1949,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 work_dependencies.lock(tx)
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
-                    frozen_id=frozen_id, landed=landed)
+                    frozen_id=frozen_id, landed=landed, unfrozen=unfrozen)
                 if row is not None:
                     _notify_released(tx, item_id, blocker_state="merged",
                                      after_commit=threads)
@@ -1912,9 +1975,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": detail, "review_lot": review}
-        if frozen_id is not None:
+        if frozen_id is not None or unfrozen:
             freezes = [m for m in milestones(db, item_id) if m["kind"] == "frozen"]
-            if not freezes or int(freezes[0]["id"]) != int(frozen_id):
+            if (bool(freezes) if frozen_id is None
+                    else not freezes or int(freezes[0]["id"]) != int(frozen_id)):
                 return {"id": int(item_id), "result": "refrozen", "item": get(db, item_id),
                         "detail": "new freeze declared in the meantime: not closed, review again"}
     raise WorkError("lot %s moved in the meantime: retry" % item_id)
@@ -2461,7 +2525,9 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     désignation est journalisée ; `waiting()`, la vue de progrès et l'alerte
     `stale_lot` le nomment avant tout verdict. Un relecteur du **même harnais
     déclaré** que l'auteur rend un avertissement indicatif (#800), jamais un
-    refus : il est posé sur la ligne rendue (`reviewer_warning`)."""
+    refus : il est posé sur la ligne rendue (`reviewer_warning`). La
+    désignation dépose un `request` lié au lot (#2478) qui réveille le
+    relecteur ; une remise en échec est un `reviewer_request_warning`."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
@@ -2580,6 +2646,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         row["reviewers"] = designated.get("reviewers")
         if reviewer_warning:
             row["reviewer_warning"] = reviewer_warning
+        row.update(_reviewer_request(db, item, reviewer, actor))
     return row
 
 
@@ -2703,6 +2770,14 @@ def milestones(db: Db, item_id: int, limit: int = 100) -> list[dict]:
     return storage.of(db).work.milestones(item_id, limit)
 
 
+def _in_transaction(db: Db) -> bool:
+    """True on an open transaction object (psql) or inside a psycopg block."""
+    depth = getattr(db, "_depth", None)
+    if depth is not None:
+        return bool(depth)
+    return int(getattr(db, "_tx_depth", 0) or 0) > 0
+
+
 def milestone(
     db: Db,
     item_id: int,
@@ -2730,9 +2805,15 @@ def milestone(
     (`mail.send(..., after_commit=…)`) ; c'est **l'appelant** qui vide la liste
     après le COMMIT qu'il tient (celui du `with` interne sur une connexion
     racine, celui de sa propre transaction si l'appel est imbriqué : un `with`
-    imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
-    le raccord de la désignation des relecteurs se branche à l'activation du
-    lot #1617, pas ici.
+    imbriqué ne commite pas).
+
+    Absent (le défaut), le gel **active la désignation automatique des
+    relecteurs** (#2447) quand l'hôte lit un canon et que l'appel tient sa
+    transaction : le hook de `review_designation_activation` est installé, et
+    la liste `after_commit` créée ici est vidée après le COMMIT interne. Sur
+    une transaction déjà ouverte, l'appelant garde la main : il fournit son
+    hook et sa liste, comme le contrat #1617 l'exige. Un callback explicite
+    l'emporte toujours (témoins, reprise hors hook).
 
     Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
     porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
@@ -2753,6 +2834,15 @@ def milestone(
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     if get(db, item_id) is None:
         raise WorkError("lot %s not found" % item_id)
+    drain: list | None = None
+    if kind == "frozen" and on_frozen is None:
+        from . import review_designation_activation as activation
+        cfg = getattr(db, "cfg", None)
+        if activation.enabled(cfg) and not _in_transaction(db):
+            on_frozen = activation.hook(cfg)
+            if after_commit is None:
+                after_commit = []
+                drain = after_commit
     # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
     # preuve exacte de son origine (acteur, session, tour, harnais, sha
     # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
@@ -2761,9 +2851,14 @@ def milestone(
     proof = review_provenance.proof_for_current_turn(db, actor=actor, sha=sha)
     if proof and not actor:
         actor = proof["actor"]
-    return storage.of(db).work.add_milestone(
+    row = storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
         on_frozen=on_frozen, after_commit=after_commit, proof=proof)
+    if drain is not None:
+        # the internal `with` has committed: the readable thread can leave now
+        for record in drain:
+            record(db.cfg, db)
+    return row
 
 
 def delays(db: Db, limit: int = 200, *, ids: Sequence[int] | None = None) -> list[dict]:

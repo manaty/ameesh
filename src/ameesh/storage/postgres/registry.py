@@ -234,7 +234,7 @@ def name_lock_key(name: str) -> str:
 class Agents(interface.Agents):
 
     def operator_pause(self, name, *, paused, reason, actor, principal,
-                       expect_reason=None) -> dict | None:
+                       expect_reason=None, not_after=None) -> dict | None:
         # #2152 : reprise conditionnelle (une seule instruction SQL, verrou de
         # ligne) ; `expect_reason` n'a de sens que pour LEVER une pause.
         if expect_reason is not None:
@@ -243,6 +243,16 @@ class Agents(interface.Agents):
             rows = self.db.query(
                 "SELECT * FROM ameesh_operator_resume_if(%s, %s, %s, %s, %s)",
                 (name, reason, actor, principal, expect_reason))
+            return rows[0] if rows else None
+        if not_after is not None:
+            if not paused:
+                raise ValueError("not_after only applies to an operator pause")
+            # #2184/R3 : la base compare l'échéance à SA clock_timestamp(),
+            # sous le verrou de ligne ; l'epoch client peut dériver.
+            rows = self.db.query(
+                "SELECT * FROM ameesh_operator_pause_before("
+                "%s, %s, %s, %s, %s, to_timestamp(%s))",
+                (name, paused, reason, actor, principal, not_after))
             return rows[0] if rows else None
         rows = self.db.query(
             "SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",

@@ -18,7 +18,9 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, db as db_mod, exploitation, notify, plan, progress, storage, work
+from ameesh import (alert_briefs, db as db_mod, exploitation, mail, notify, plan,
+                    progress, registry, storage, work)
+from ameesh.runner import AgentWorker, Runner
 
 from .support import REPO, PgTestCase
 
@@ -165,7 +167,11 @@ class ReviewerDesignationTest(PgTestCase):
                          env=self._env())
 
     def _stale(self, lot):
-        """Vieillit la ligne, les transitions et les jalons du lot (7 h)."""
+        """Vieillit la ligne, les transitions, les jalons et le courrier (7 h).
+
+        #2478 : la désignation dépose un courrier lié au lot, qui compte comme
+        activité ; vieillir le courrier aussi garde le témoin `stale_lot`.
+        """
         for sql in ("UPDATE work_items SET created_at = now() - interval '8 hours',"
                     " updated_at = now() - interval '7 hours' WHERE id = %s",
                     "UPDATE work_item_events SET created_at = now() - interval '7 hours'"
@@ -173,6 +179,8 @@ class ReviewerDesignationTest(PgTestCase):
                     "UPDATE work_item_milestones SET at = now() - interval '7 hours'"
                     " WHERE work_item_id = %s"):
             self.db.execute(sql, (lot,))
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '7 hours'"
+                        " WHERE work_item_id = %s", (str(lot),))
 
     def _stale_alert(self, lot):
         alertes = exploitation.alerts(self.cfg, self.db,
@@ -331,8 +339,9 @@ class ReviewerDesignationTest(PgTestCase):
         ncfg = notify.parse_config({"default": []})
         notifier = notify.Notifier(self.cfg, ncfg, sender=object(), log=lambda t: None)
         notifier.run_pass(self.db, current=[alert])
-        rows = self.db.query("SELECT body, payload FROM agent_mailbox WHERE recipient = %s",
-                             ("relecteur",))
+        rows = self.db.query(
+            "SELECT body, payload FROM agent_mailbox WHERE recipient = %s"
+            " AND payload->>'alert' = 'stale_lot'", ("relecteur",))
         self.assertEqual(len(rows), 1, rows)
         self.assertIn("designated reviewer", rows[0]["body"])
         self.assertIn("ameesh work milestone %d verdict" % lot["id"], rows[0]["body"])
@@ -387,6 +396,128 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertEqual(alert["waiting"]["who"], "premier, second")
         briefs = self._briefs(alert)
         self.assertIn("ameesh work milestone %d verdict" % lot["id"], briefs["second"])
+
+    def test_la_designation_reveille_le_relecteur(self):
+        """#2478 : la désignation dépose un `request` lié au lot ; le runner du
+        relecteur le voit comme courrier actif, donc un tour s'ouvre."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        rows = self.db.query(
+            "SELECT id, kind, work_item_id, body FROM agent_mailbox"
+            " WHERE recipient = %s AND payload ? 'review_request' ORDER BY id",
+            ("relecteur",))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["kind"], "request")
+        self.assertEqual(rows[0]["work_item_id"], str(lot["id"]))
+        self.assertIn("lot #%d" % lot["id"], rows[0]["body"])
+        self.assertIn("ameesh work milestone %d verdict" % lot["id"],
+                      rows[0]["body"])
+        self.assertEqual([m["id"] for m in mail.unread_active(self.db, "relecteur")],
+                         [rows[0]["id"]])
+
+    def test_work_reviewer_reveille_le_nouveau_relecteur(self):
+        """#2478 : la désignation d'un lot déjà en `qa` pousse le même `request`;
+        un retrait n'en pousse pas."""
+        self.register("premier", "codex", cwd=self.tmp)
+        self.register("second", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "premier")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sha = "a" * 40
+        work.milestone(self.db, lot["id"], "frozen", sha=sha, actor="auteur")
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "second",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = self.db.query(
+            "SELECT id, kind, work_item_id, body FROM agent_mailbox"
+            " WHERE recipient = %s AND payload ? 'review_request' ORDER BY id",
+            ("second",))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual((rows[0]["kind"], rows[0]["work_item_id"]),
+                         ("request", str(lot["id"])))
+        self.assertIn(sha, rows[0]["body"])
+        self.assertEqual(len(mail.unread_active(self.db, "second")), 1)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "second", "--remove",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = self.db.query(
+            "SELECT id FROM agent_mailbox"
+            " WHERE recipient = %s AND payload ? 'review_request'", ("second",))
+        self.assertEqual(len(rows), 1)
+
+    def test_redesignation_ne_renvoie_pas_de_request(self):
+        """#2495 : re-désigner le même relecteur pour la même tête ne dépose pas
+        un second `request` ; une nouvelle tête gelée, une fois le premier lu, si."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        self.assertEqual(self._qa(lot, "--reviewer", "relecteur").returncode, 0)
+
+        def requests():
+            return self.db.query(
+                "SELECT id FROM agent_mailbox WHERE recipient = %s"
+                " AND payload ? 'review_request' ORDER BY id", ("relecteur",))
+
+        def redesignate():
+            proc = self.mesh("work", "reviewer", str(lot["id"]), "relecteur",
+                             "--actor", "chef", env=self._env())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        redesignate()
+        self.assertEqual(len(requests()), 1)
+        mail.mark_delivered(self.db, [r["id"] for r in requests()])
+        work.milestone(self.db, lot["id"], "frozen", sha="a" * 40, actor="auteur")
+        redesignate()
+        self.assertEqual(len(requests()), 2)
+        redesignate()
+        self.assertEqual(len(requests()), 2)
+
+    def test_redesignation_retrouve_le_request_hors_fenetre(self):
+        """#2504 : une re-désignation retrouve le request du lot même derrière
+        plus de 200 courriers plus récents ; le filtre est fait en base par lot
+        et nature, pas dans une fenêtre d'historique."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        self.assertEqual(self._qa(lot, "--reviewer", "relecteur").returncode, 0)
+        first = self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s"
+            " AND payload ? 'review_request' ORDER BY id", ("relecteur",))
+        self.assertEqual(len(first), 1)
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, work_item_id)"
+            " SELECT 'chef', 'relecteur', 'other lot mail', 'notify', '9999'"
+            " FROM generate_series(1, 250)")
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "relecteur",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s"
+            " AND payload ? 'review_request' ORDER BY id", ("relecteur",))
+        self.assertEqual([r["id"] for r in rows], [r["id"] for r in first])
+
+    def test_le_runner_du_relecteur_prend_un_tour(self):
+        """#2478 témoin : la désignation dépose un courrier actif ; le runner du
+        relecteur le choisit comme prochain tour, sur le lot du message."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        runner = Runner(self.cfg, self.db, once=True)
+        runner.mail_batch = 0.0
+        lease = registry.claim(self.db, "relecteur", runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        worker = AgentWorker(runner, registry.get(self.db, "relecteur"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        spec = worker.pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail")
+        self.assertIn("Review request", spec["prompt"])
+        self.assertEqual(spec.get("lot"), str(lot["id"]))
 
     def test_work_reviewer_refuse_hors_qa(self):
         """#705 : la commande ne désigne que dans une revue en cours."""

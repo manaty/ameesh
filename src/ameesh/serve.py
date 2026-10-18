@@ -242,6 +242,18 @@ def _agent(ctx: Context, db, params, query) -> dict:
     return {"schema": "ameesh-agent-detail/1", "agent": row}
 
 
+def _agent_peek(ctx: Context, db, params, query) -> dict:
+    from . import agent_peek
+    try:
+        limit = _one(query, "limit")
+        return agent_peek.snapshot(db, params["agent"], human=ctx.human,
+                                   limit=int(limit) if limit is not None else 10)
+    except PermissionError as exc:
+        raise ApiError(403, "forbidden", "agent peek requires its responsible human") from exc
+    except ValueError as exc:
+        raise ApiError(400, "bad_query", "limit must be between 1 and 50") from exc
+
+
 def _chat(ctx: Context, db, params, query) -> dict:
     """An agent's shared conversation, ascending from `after` (L83): the same
     `ameesh-conversation/1` history `ameesh chat` reads. No relation filter
@@ -360,6 +372,10 @@ ROUTES = (
     Route(API + "/agents", "ameesh-agents/1", "Agents (`ameesh list --json`)", _agents),
     Route(API + "/agents/{agent}", "ameesh-agent-detail/1", "One agent (`ameesh show --json`)",
           _agent),
+    Route(API + "/agents/{agent}/peek", "ameesh-agent-peek/1",
+          "Responsible human's agent summary (`ameesh agent peek`)", _agent_peek,
+          query=(("limit", {"type": "integer", "minimum": 1, "maximum": 50},
+                  "latest public messages and tool summaries (default 10)"),)),
     Route(API + "/agents/{agent}/chat", "ameesh-conversation/1",
           "An agent's shared conversation (`ameesh chat <agent>`, L78/L83)", _chat,
           query=(("after", {"type": "integer", "minimum": 0},
@@ -460,6 +476,10 @@ _HOST = _obj("ameesh-host/1", ["host", "limits", "pressure", "history"],
 #: the response schemas: the keys every response carries (the objects they
 #: hold are the CLI's, documented in docs/EXPLOITATION.md and docs/PROGRESS.md)
 SCHEMAS = {
+    "ameesh-agent-peek/1": _obj("ameesh-agent-peek/1",
+        ["agent", "host", "lot", "captured_ts", "stale", "workspace", "events"],
+        agent=_STR, host=_STR, lot=_OBJ, captured_ts={"type": ["number", "null"]},
+        stale={"type": "boolean"}, workspace=_OBJ, events=_LIST),
     "ameesh-me/1": _obj("ameesh-me/1", ["human", "organisation", "mode", "roles",
                                         "deputyships", "language"],
                         human=_STR, organisation=_STR_NULL, mode={"enum": ["local"]},
@@ -554,6 +574,8 @@ def openapi() -> dict:
                      "400": _response("bad request", "ameesh-error/1"),
                      "401": _response("token missing or refused", "ameesh-error/1"),
                      "503": _response("database unavailable", "ameesh-error/1")}
+        if route.schema == "ameesh-agent-peek/1":
+            responses["403"] = _response("responsible human required", "ameesh-error/1")
         if "{" in route.path:
             responses["404"] = _response("not found", "ameesh-error/1")
         if route.stream:

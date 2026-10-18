@@ -10,6 +10,9 @@
                            d'intégration develop/main/master/release/*)
   ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118 : branche
                             ou commit de fusion qui désigne le lot)
+  ameesh work sync-packets --git-dir D [--target T] [--dry-run] [--json]
+                          (unités des manifestes `reviews/**paquet**.md` de la
+                           cible : le gel de chaque unité, #2426)
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
   ameesh work project-github --app P [--repo R] [--dry-run] [--json]   (L126)
@@ -27,10 +30,11 @@ import argparse
 import json
 import sys
 
-from . import plan_git, plan_github, work
+from . import packet_close, plan_git, plan_github, work
 from .deprecated import DeprecatedAlias
 
-COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-github", "project-github",
+COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-packets", "sync-github",
+            "project-github",
             "plan", "estimates", "schedule", "measure")
 
 
@@ -92,6 +96,18 @@ def add_parsers(work_sub, func) -> None:
     p_branches.add_argument("--actor", default="")
     p_branches.add_argument("--json", action="store_true")
     p_branches.set_defaults(func=func)
+
+    p_packages = work_sub.add_parser(
+        "sync-packets", help="close the unit work items of merged packages from their "
+                              "git manifest (reviews/**paquet**.md, #2426)")
+    p_packages.add_argument("--git-dir", default=".", help="local clone (read-only)")
+    p_packages.add_argument("--target", default=None,
+                            help="target branch carrying the merged manifests (default: "
+                                 "`git config ameesh.target`, else the default branch)")
+    p_packages.add_argument("--dry-run", action="store_true", help="report without closing")
+    p_packages.add_argument("--actor", default="")
+    p_packages.add_argument("--json", action="store_true")
+    p_packages.set_defaults(func=func)
 
     p_sync = work_sub.add_parser(
         "sync-github", help="close the work items whose PR is merged (GitHub read-only)")
@@ -259,6 +275,8 @@ def run(db, args: argparse.Namespace) -> int:
         return _sync_merges(db, args)
     if command == "sync-branches":
         return _sync_branches(db, args)
+    if command == "sync-packets":
+        return _sync_packages(db, args)
     try:
         return _github(db, args)
     except plan_github.GithubError as exc:
@@ -370,6 +388,27 @@ def _sync_branches(db, args: argparse.Namespace) -> int:
             entry["work_item"], entry["branch"] or "(no branch)",
             _BRANCH_RESULTS.get(entry["result"], entry["result"]), entry["detail"]))
     print("%d work item(s) closed%s" % (report["merged"], " (dry run)" if args.dry_run else ""))
+    return 0
+
+
+def _sync_packages(db, args: argparse.Namespace) -> int:
+    """#2426 : les unités des manifestes de paquet, ciblées par leur gel."""
+    try:
+        report = packet_close.sync(db, args.git_dir, target=args.target,
+                                    dry_run=args.dry_run, actor=args.actor)
+    except packet_close.PacketError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    print("%s%s (%s): %d manifest(s), %d unit(s), %d work item(s) closed" % (
+        "[dry run] " if args.dry_run else "", report["git_dir"], report["target"],
+        report["manifests"], report["units"], report["merged"]))
+    for row in report["results"]:
+        print("  work item #%-5s %-11s %-9s %s" % (
+            row["work_item"], row["result"], row.get("how") or "—",
+            row.get("detail") or ""))
     return 0
 
 

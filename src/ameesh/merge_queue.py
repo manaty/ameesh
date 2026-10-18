@@ -120,6 +120,8 @@ CRITICAL_SCOPE = (
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
                r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               # le report des verdicts acquis sur une tête réalignée (#2442)
+               r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
                r"^src/ameesh/(review_lot|registry)\.py$"),
 )
@@ -787,7 +789,10 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
 
     La classe se lit entre la cible **fraîche** et la tête gelée. Seul `base`
     est une cible fraîche : le commit que l'appelant vient de récupérer
-    (`readiness`), ou `target` quand il nomme déjà un commit. Sinon, la borne
+    (`readiness`), ou `target` quand il nomme déjà un commit. Ce commit est
+    aussi la révision exacte du diff (`base_sha`, #2318), jamais une ref que le
+    fetch concurrent du radar peut déplacer entre la lecture et la classe.
+    Sinon, la borne
     est la cible que le radar a laissée sous `QUEUE_REF` dans son clone, à défaut
     `origin/<cible>` du dépôt des agents, puis sa cible locale : c'est la
     cible du **dernier** fetch connu, que rien ne prouve fraîche — un fetch
@@ -830,7 +835,7 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
             # `readiness` n'écrit que dans le clone).
             if fresh and plan_git._commit(path, fresh) and plan_git._commit(path, tip):
                 paths.append((path, _class_ref(path, target, fresh,
-                                               queue=cloned and path == source)))
+                                               queue=cloned and path == source), fresh))
         if not paths:
             # aucune cible fraîche lisible : repli explicite sur les refs de
             # cible disponibles. Ce repli ne prouve pas la fraîcheur : un
@@ -839,15 +844,15 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
             # et `of_lot` peut alors rendre une classe calculée, `light`
             # comprise, au lieu d'un doute. L'admission doit refuser une cible
             # absente (#2278) ; ce repli ne le garantit pas (#2284).
-            paths.append((source, _class_base(source, target, queue=cloned) or target))
+            paths.append((source, _class_base(source, target, queue=cloned) or target, None))
             if cloned:
-                paths.append((repo, _class_base(repo, target) or target))
+                paths.append((repo, _class_base(repo, target) or target, None))
     else:
-        paths.append((repo, target))
+        paths.append((repo, target, None))
     best = None
-    for path, base_ref in paths:
+    for path, base_ref, base_sha in paths:
         current = lot_class.of_lot(db, lot, cfg=cfg, item=item, repo=path, base=base_ref,
-                                   head=tip)
+                                   head=tip, base_sha=base_sha)
         if best is None or _class_worse(current, best):
             best = current
     if (target and base is None and best is not None

@@ -4,9 +4,13 @@
 `review_designation` does the **selection** without any I/O; this module is the
 real `Port`: it reads the lot's milestones, re-reads the idempotent mark of the
 freeze and writes the designation in **one** transaction (lock of the lot row,
-mark in the journal, mails in the mailbox). The readable thread is written only
-after the commit (`mail.send(..., after_commit=…)`, pattern #315 of
-`deep_analysis`): a cancelled send leaves no trace in the external thread.
+mark in the journal, mails in the mailbox). A reviewer mail is a `request`
+linked to the lot (#2478): the reviewer's runner opens a turn on it, once
+per head (#2495: a reviewer already holding a request for this head, or an
+unread one naming none, gets no second mail); the capacity notification to the
+pilot stays a `notify`. The readable thread is
+written only after the commit (`mail.send(..., after_commit=…)`, pattern #315
+of `deep_analysis`): a cancelled send leaves no trace in the external thread.
 
 Two uses, depending on who holds the transaction:
 
@@ -31,7 +35,8 @@ import json
 from typing import Mapping, Optional, Sequence
 
 from . import mail, plan_git, registry, storage
-from .review_designation import DESIGNATED, WAITING, DesignationError, StaleFreeze
+from .review_designation import (DESIGNATED, REQUEST_KIND, WAITING,
+                                 DesignationError, StaleFreeze, covering_request)
 
 #: prefix of the journal marks: `<prefix><lot>:<milestone>: <json>`
 MARK_PREFIX = "review-designation:"
@@ -132,12 +137,22 @@ class PgPort:
     (no nesting in the `frozen` milestone's one). Built without `after_commit`
     on an open transaction, the port refuses to write (`DesignationError`,
     nothing written): a nested `with` does not commit, so draining the thread
-    there would publish it before the caller's commit (#1775, N2)."""
+    there would publish it before the caller's commit (#1775, N2).
 
-    def __init__(self, db, *, sender: str = SENDER, after_commit: Optional[list] = None):
+    `at_freeze` says whether the write happens inside the `frozen` milestone:
+    an unknown recipient is then a waiting designation instead of a refusal
+    (#1634), because raising would cancel the acquired freeze. It defaults to
+    True when `after_commit` is given (the hook's transaction), False when the
+    port owns the transaction (a recovery outside the hook keeps the refusal).
+    """
+
+    def __init__(self, db, *, sender: str = SENDER, after_commit: Optional[list] = None,
+                 at_freeze: Optional[bool] = None):
         self.db = db
         self.sender = sender or SENDER
         self.after_commit = after_commit
+        self.at_freeze = ((after_commit is not None) if at_freeze is None
+                          else bool(at_freeze))
 
     # -- reads ------------------------------------------------------------
     def latest_freeze(self, lot: int) -> Optional[dict]:
@@ -207,7 +222,8 @@ class PgPort:
             return self._write(self.db, lot, freeze=freeze, required=required,
                                state=state, reviewers=reviewers, missing=missing,
                                why=why, authors=authors, policy_ref=policy_ref,
-                               notify=notify, messages=messages, hook=True)
+                               notify=notify, messages=messages,
+                               hook=self.at_freeze)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads)
         with self.db.transaction() as tx:
@@ -306,7 +322,16 @@ class PgPort:
         threads = self.after_commit if self.after_commit is not None else []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
+            if (str(row.get("kind") or "") == REQUEST_KIND
+                    and covering_request(mail.review_requests(db, recipient, lot),
+                                         lot=lot, reviewer=recipient, sha=sha)):
+                # #2495/#2504 : this reviewer already holds a request for this
+                # head (or an unread one naming none): the designation is
+                # written, no second mail. The requests are selected per lot in
+                # storage, so an old one cannot fall out of a history window.
+                continue
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
+                      kind=str(row.get("kind") or "notify"),
                       work_item_id=str(lot),
                       payload={"review_designation": {
                           "lot": lot, "freeze": freeze_id, "sha": sha,

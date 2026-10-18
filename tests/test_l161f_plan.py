@@ -851,7 +851,9 @@ class MapTest(unittest.TestCase):
 
     def test_always_list_sorted_and_known(self):
         always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
-        self.assertEqual(always, ["test_2340_auditeur_role", "test_339_orphan_settle",
+        self.assertEqual(always, ["test_2340_auditeur_role",
+                                  "test_2449_garde_mecanique",
+                                  "test_339_orphan_settle",
                                   "test_cluster", "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",
                                   "test_l72_panne_de_base", "test_migrations"])

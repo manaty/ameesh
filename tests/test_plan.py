@@ -631,6 +631,133 @@ class GithubTest(_PlanDb):
         self.assertIn("PR ouverte %s#83" % REPO, report["results"][0]["detail"])
         self.assertEqual(work.get(self.db, n)["state"], "intake")
 
+    # --- #1693 : suites de la relecture Claude de #759 ----------------------
+
+    def test_1693_la_meme_pr_ne_referme_pas_un_lot_corrige(self):
+        # #1693 (N1) : après une correction `merged → build`, la PR qui a fermé
+        # le lot ne le referme pas au relevé suivant — un transport nouveau est
+        # attendu ; c'est lui qui devient la PR de référence du lot.
+        a = work.add(self.db, title="corrigé")
+        n = a["id"]
+        work.set_branch(self.db, n, "lot/%d-etape" % n, actor="orch", source="test")
+        self.merged_pr(91, "lot/%d-etape" % n, body="Étape.\n\nameesh-work: %d" % n)
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#91" % REPO)
+        work.move(self.db, n, "build", actor="orch",
+                  correct="PR d'étape fusionnée trop tôt (#759)")
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        by_item = {r["work_item"]: r for r in report["results"]}
+        self.assertEqual(by_item[n]["result"], "stage-merged")
+        self.assertIn("déjà fermé", by_item[n]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "build")
+        # un transport nouveau (autre PR sur la branche déclarée) ferme le lot
+        self.merged_pr(92, "lot/%d-etape" % n, body="Fin.\n\nameesh-work: %d" % n)
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#92" % REPO)
+
+    def test_1693_stage_reason_annule_toute_fusion_anterieure_a_la_correction(self):
+        # #1693 (N1, vue cx2) : le critère est l'instant de la fusion, pas le
+        # seul `pr_ref` — après deux corrections, une PR plus ancienne que la
+        # dernière correction ne referme pas le lot, même si `pr_ref` porte
+        # désormais une autre PR.
+        item = {"id": 7, "pr_ref": "%s#92" % REPO, "branch": "lot/7-etape"}
+        pr = {"number": 91, "headRefName": "lot/7-etape", "body": ""}
+        detail = plan_github._stage_reason(item, pr, None, "%s#91" % REPO,
+                                           annulled_ts=200.0, merged_ts=100.0)
+        self.assertIn("antérieure à la dernière correction", detail)
+        # une fusion POSTÉRIEURE à la correction ferme (None)
+        self.assertIsNone(plan_github._stage_reason(item, pr, None, "%s#91" % REPO,
+                                                    annulled_ts=100.0, merged_ts=200.0))
+
+    def test_1693_deux_corrections_aucune_ancienne_fusion_ne_referme(self):
+        # #1693 (N1, vue cx2) : intégration — après deux fusions annulées, le
+        # relevé revoit les deux PR ; la première (`pr_ref` porte la seconde)
+        # doit être retenue par le critère d'instant. Les instants des
+        # corrections sont posés pour que chaque fusion tombe entre deux.
+        # La création précède ces instants fixes, quelle que soit l'horloge.
+        a = work.add(self.db, title="deux corrections")
+        n = a["id"]
+        self.db.execute("UPDATE work_items SET created_at = to_timestamp(1000000000)"
+                        " WHERE id = %s", (n,))
+        work.set_branch(self.db, n, "lot/%d-etape" % n, actor="orch", source="test")
+        self.merged_pr(91, "lot/%d-etape" % n, body="Étape.\n\nameesh-work: %d" % n,
+                       merged_at="2030-01-01T00:00:00Z")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        work.move(self.db, n, "build", actor="orch", correct="trop tôt (1)")
+        self.db.execute("UPDATE work_item_events SET created_at = to_timestamp(2000000000)"
+                        " WHERE work_item_id = %s AND state = 'build'", (n,))
+        self.merged_pr(92, "lot/%d-etape" % n, body="Fin.\n\nameesh-work: %d" % n,
+                       merged_at="2035-01-01T00:00:00Z")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#92" % REPO)
+        work.move(self.db, n, "build", actor="orch", correct="trop tôt (2)")
+        self.db.execute("UPDATE work_item_events SET created_at = to_timestamp(2100000000)"
+                        " WHERE work_item_id = %s AND state = 'build'", (n,))
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        by_pr = {r["pr"]: r for r in report["results"]}
+        self.assertIn("antérieure à la dernière correction", by_pr["%s#91" % REPO]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "build")
+        # seul un transport fusionné APRÈS la dernière correction ferme le lot
+        self.merged_pr(93, "lot/%d-etape" % n, body="Vraie fin.\n\nameesh-work: %d" % n,
+                       merged_at="2040-01-01T00:00:00Z")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#93" % REPO)
+
+    def test_1693_le_constat_stage_merged_ne_se_repete_pas_apres_une_note(self):
+        # #1693 (N3) : la dédup du constat lit le journal récent, pas seulement
+        # sa dernière ligne — une note intercalée ne le fait pas réécrire.
+        a = work.add(self.db, title="retenu", package="cat-export")
+        self.merged_pr(93, "fix/export", body="ameesh-lot: cat-export")
+        self.gh.state["prs"]["%s#94" % REPO] = {
+            "state": "OPEN", "headRefName": "lot/cat-export"}
+        plan_github.sync_github(self.db, self.gh, REPO)
+        work.note(self.db, a["id"], "relance du pilote", actor="orch")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        notes = [e["note"] for e in work.events(self.db, a["id"])
+                 if (e["note"] or "").startswith("stage merged")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("PR ouverte %s#94" % REPO, notes[0])
+
+    def test_1693_une_pr_de_fiche_retient_puis_ferme_tous_ses_lots(self):
+        # #1693 (N2) : la rétention par PR ouverte inclut les fiches — une PR
+        # de fiche ouverte retient TOUS ses lots, et sa fusion les ferme tous.
+        # Comportement voulu de la livraison par fiche (#759) : verrouillé ici.
+        a = work.add(self.db, title="un", package="cat-export")
+        b = work.add(self.db, title="deux", package="cat-export")
+        self.gh.state["prs"]["%s#95" % REPO] = {
+            "state": "OPEN", "headRefName": "lot/cat-export"}
+        self.merged_pr(96, "fix/export", body="ameesh-lot: cat-export")
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {a["id"]: "stage-merged", b["id"]: "stage-merged"})
+        # la fusion de la PR de fiche ferme tous ses lots
+        self.merged_pr(95, "lot/cat-export")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, a["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, b["id"])["state"], "merged")
+
+    def test_1693_une_pr_de_fiche_ouverte_retient_tous_ses_lots(self):
+        # #1693 (N2) : la PR de fiche nomme explicitement un de ses lots ; sa
+        # rétention couvre pourtant TOUTE la fiche — le lot non nommé ne se
+        # ferme pas sous elle (une ligne `ameesh-work:` ne réduit pas la fiche).
+        a = work.add(self.db, title="un", package="cat-export")
+        b = work.add(self.db, title="deux", package="cat-export")
+        self.gh.state["prs"]["%s#97" % REPO] = {
+            "state": "OPEN", "headRefName": "lot/cat-export",
+            "body": "Étape.\n\nameesh-work: %d" % a["id"]}
+        self.merged_pr(98, "fix/export", body="ameesh-lot: cat-export")
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        by_item = {r["work_item"]: r for r in report["results"]}
+        self.assertEqual(by_item[a["id"]]["result"], "stage-merged")
+        self.assertEqual(by_item[b["id"]]["result"], "stage-merged")
+        self.assertIn("PR ouverte %s#97" % REPO, by_item[b["id"]]["detail"])
+        self.assertEqual(work.get(self.db, b["id"])["state"], "intake")
+
     def issue(self, prefix: str) -> dict:
         found = self.gh.issue(REPO, prefix)
         self.assertIsNotNone(found, prefix)
@@ -1135,6 +1262,50 @@ class ContentMergeTest(_PlanDb):
         result = self.run_sync()[item["id"]]
         self.assertEqual(result["result"], "no-commit")
         self.assertIsNone(result["freeze_origin"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def _verdict_lot(self, branch):
+        git(self.repo, "checkout", "-q", "-b", branch)
+        reviewed = self.commit("src/%s.py" % branch.split("/")[-1], "x = 1\n", "relu")
+        item = work.add(self.db, title=branch, branch=branch)
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=reviewed,
+                       actor="relecteur")
+        return item, reviewed
+
+    def test_2444_la_tete_publiee_prime_sur_la_locale(self):
+        """#2444 : la tête confrontée à l'avis est `origin/<branche>` d'abord ;
+        une locale restée sur le commit relu ne masque pas une forge avancée."""
+        item, reviewed = self._verdict_lot("agent/lot-publie")
+        ahead = self.commit("src/lot-publie.py", "x = 2\n", "poussé après l'avis")
+        git(self.repo, "update-ref", "refs/remotes/origin/agent/lot-publie", ahead)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "branch", "-f", "--no-track", "agent/lot-publie", reviewed)
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", reviewed)
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["freeze_origin"]), ("no-commit", None))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2444_une_branche_disparue_ne_vaut_pas_controle_de_la_tete(self):
+        """#2444 : sans tête lisible, le gel d'origine verdict n'est pas retenu."""
+        item, reviewed = self._verdict_lot("agent/lot-disparu")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "agent/lot-disparu")
+        git(self.repo, "branch", "-q", "-D", "agent/lot-disparu")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["freeze_origin"]), ("no-commit", None))
+        self.assertIn("branch head not found", result["detail"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2444_un_gel_apparu_sans_gel_examine_refuse(self):
+        """#2444 : fermeture par gel d'origine verdict (`unfrozen`) — un gel
+        déclaré entre la lecture et l'écriture rend `refrozen`."""
+        item, reviewed = self._verdict_lot("agent/lot-regel")
+        work.milestone(self.db, item["id"], "frozen", sha=reviewed, actor="auteur")
+        done = work.close_merged(self.db, item["id"], sha=reviewed, actor="git:main",
+                                 source="content (ancestor)", unfrozen=True)
+        self.assertEqual(done["result"], "refrozen")
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
 
     # -- revue codex1 (750c221), sondes reprises telles quelles -----------------
