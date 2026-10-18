@@ -259,7 +259,7 @@ trace before the external commit (and nothing survives its rollback); after the
 external commit, the caller flushes the list; the callback is rejected outside
 a `frozen`.
 
-`tests/test_2447_review_designation_activation.py` — 20 tests on a real
+`tests/test_2447_review_designation_activation.py` — 27 tests on a real
 database, both drivers: the freeze designates two independent families and
 writes them into `work_items.reviewers`; a new freeze clears only the previous
 automatic names; the last good canon commit wins when the current state is
@@ -270,7 +270,11 @@ recovery — selection, light or unavailable — leaves the newer freeze's colum
 notes and mails untouched; the selection and the column commit together (a
 failure of the column write leaves neither a designated mark nor a reviewer
 mail); a recovery still refuses an undeliverable waiting designation while the
-hook turns it into a waiting mark; the CLI freeze and the recovery command.
+hook turns it into a waiting mark; a light lot journals its no-pre-merge-review
+outcome once; a freeze run outside the lot worktree finds it beside the agent's
+session directory, and a sibling of another project is refused; a policy that
+arrives later is retried on the same freeze (the runner call included); the CLI
+freeze (light explanation included) and the recovery command.
 
 ## Verdict carry and the freeze designation (#2442 × #2487)
 
@@ -350,3 +354,57 @@ carried state, not "no designation".
   every column write;
 - two independent reviews outside the author for this gate (security of the
   admission chain), then package at the cut-off.
+
+## 18 October, the first real freezes (#2561)
+
+The first freezes after activation (21:51Z) produced no automatic reviewer for
+#2510, #2517, #2522 and #1854; the pilot designated three of them by hand. The
+diagnosis separates four facts:
+
+- **canon published after activation**: `processus/mecanique.yaml` entered canon
+  main with home#111 (`91abace7980f`, merged 21:56:15Z); the audited commit at
+  freeze was still `b7263126`, which has no mechanics file. The hook recorded
+  `review-designation-unavailable:<lot>:<freeze>:` and mailed the pilot — the
+  explicit wait the design asks for, not a guessed policy. The host synced at
+  21:57:46 and the audited policy now resolves;
+- **frozen head not found** (#2510): the freeze command ran from the agent's
+  session directory (`~/work/nexlink-deepseek2`), not from the lot's worktree.
+  `_repository` knew only the registry `cwd`, the host's radar repository and
+  the process `cwd`; none held the ameesh commit, although the pushed head
+  existed in the agent's other checkout. The fallback now reads the worktrees
+  attributed by housekeeping (`managed_worktrees`) and the siblings of the known
+  paths whose name cites the lot or its assignee; the exact SHA and the issue's
+  repository origin decide. A false neighbour can never contribute content:
+  the commit id is exact and the origin must match;
+- **light lots have no pre-merge reviewer**: canon §2 (full table) gives a light
+  lot tests and CI before merge and the other-family review *after* merge; only
+  a normal/sensitive path asks for a reviewer at the freeze. The hook already
+  returned `none`; it now journals
+  `review-designation-none:<lot>:<freeze>: automatic reviewer designation:
+  none — light lot…` once per freeze, and the CLI prints that reason. "No
+  reviewer at the freeze" is therefore an explained outcome, not a failed
+  designation (#2517 had no error at all; #2510/#2522/#1854 are light too);
+- **recovery command version**: `ameesh work reviewers` ships from 1.12.0; the
+  pilot's installation was 1.11.7 and only had the manual `work reviewer`. The
+  unavailable mail now names the required version and keeps the manual path
+  usable on every installation. The runner also replays the unavailable freezes
+  after a successful canon sync (`retry_pending`, bounded to 20 lots, same
+  frozen head; a waiting mark is retried, a designated/light outcome is skipped),
+  so the recovery command is optional.
+
+A remaining limit, not on the light path: the `pre-commit`/`post-commit`
+provenance hooks are installed at session open in the session's `cwd` repository
+only. A commit made in another clone (or in a worktree of another clone) has no
+`commit:` receipt; a **sensitive** lot then waits (the designation never guesses
+an author family). Light lots are not affected (no pre-merge designation). A
+follow-up lot should install the hooks in every clone/worktree the agent commits
+from.
+
+Verification: the seven new witnesses in
+`tests/test_2447_review_designation_activation.py` (light note and CLI
+explanation once; repository found beside the agent's cwd from a different
+repository; sibling of another project refused; a head only on origin fetched;
+retry on the same freeze after the canon policy arrives; the runner call) plus
+the existing 20 tests, on both drivers. The real proof remains a freeze after the next release:
+`ameesh work milestone <lot> frozen` must write a designation (sensitive) or a
+`review-designation-none` note (light) without any agent.

@@ -8086,6 +8086,7 @@ class Runner:
         """
         if getattr(self, "mediated", False):
             return True  # L109 : le canon est synchronisé par le serveur
+        self._designation_retry_ready = False
         entries = canon_mod.configured(self.cfg)
         # L159f : aucun canon, aucune fiche Host prêteuse : la porte est fixée
         self._canon_complete = not entries
@@ -8197,6 +8198,9 @@ class Runner:
             # L159f : la porte d'hôte n'est fixée que sur TOUS les canons
             # configurés (un hôte prêteur l'est par sa fiche Host, `policy.lend`)
             self._canon_complete = bool(entries) and len(synced) == len(entries)
+            # #2561: only a pass that actually synced a canon may replay the
+            # pending designations (a mocked/test `canon_sync_once` must not).
+            self._designation_retry_ready = bool(synced)
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced, complete=self._canon_complete)
@@ -8228,9 +8232,41 @@ class Runner:
                       % GATE_SETTLE_RETRY_S)
         return False
 
+    def retry_review_designations(self) -> None:
+        """#2561: retry the freezes whose automatic designation was journaled
+        unavailable. A canon publication/sync (or a worktree that became
+        readable) can lift the cause after the freeze; the freeze is kept, so
+        the same head is replayed, never a newer one. Bounded and never fatal:
+        the canon sync must not fail because a designation retry did."""
+        if getattr(self, "mediated", False):
+            return
+        if not getattr(self, "_designation_retry_ready", False):
+            return  # only after a pass that really synced a canon
+        try:
+            from . import review_designation_activation as activation
+            if not activation.enabled(self.cfg):
+                return
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
+            try:
+                report = activation.retry_pending(self.cfg, db)
+            finally:
+                db.close()
+            if report.get("attempted") or report.get("errors"):
+                detail = "" if not report.get("errors") else (
+                    " (%d error(s): %s)" % (len(report["errors"]), report["errors"][0]))
+                log_async("review designation retry: %s%s"
+                          % (report.get("summary") or "", detail))
+        except Exception as exc:  # noqa: BLE001 - never fatal for the canon sync
+            log_async("review designation retry failed: %s"
+                      % " ".join(str(exc).split())[:200])
+
     def _canon_sync_loop(self) -> None:
         while not self.stop.is_set():
-            self.canon_sync_once()
+            if self.canon_sync_once():
+                # #2561: a designation that waited on the canon policy or on a
+                # worktree now readable is retried on the same freeze.
+                self.retry_review_designations()
             settled = self._settle_gate_after_sync()
             # avant la première porte fixée, on réessaie vite
             wait = (self.canon_sync_interval if settled or self.canon_sync_interval <= 0
@@ -8258,12 +8294,14 @@ class Runner:
             self._gate_settled.set()
             return
         if self.once:
-            self.canon_sync_once()
+            if self.canon_sync_once():
+                self.retry_review_designations()
             return
         if self.canon_thread is not None:
             return
         if self.canon_sync_interval <= 0:
-            self.canon_sync_once()  # seulement au démarrage…
+            if self.canon_sync_once():  # seulement au démarrage…
+                self.retry_review_designations()
             if self._settle_gate_after_sync():
                 return
             # … ou jusqu'à la première porte d'hôte fixée (fil ci-dessous)

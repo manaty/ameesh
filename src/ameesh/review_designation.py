@@ -663,7 +663,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             "review count unknown for a non-light lot (#%d, class %s)" % (lot, risk))
     if required == 0:
         return {"state": NONE, "required": 0, "reviewers": [], "missing": 0,
-                "why": "light lot: no review before merge", "freeze": freeze}
+                "why": ("light lot: no pre-merge reviewer is due (the other-family"
+                        " review happens after merge)"), "freeze": freeze}
     existing = port.recorded(lot, freeze["id"])
     if existing and existing.get("state") == DESIGNATED:
         out = dict(existing)

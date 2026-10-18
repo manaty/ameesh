@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import shutil
 import subprocess
+import types
 from unittest import mock
 
 from ameesh import mail, registry, review_designation as rd
@@ -524,10 +526,168 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertIn("policy unavailable", out["why"])
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
         self.assertEqual(len(self.notes(act.UNAVAILABLE_PREFIX)), 1)
+        # #2561: the recovery command is versioned, and the manual path stays
+        # usable on an older installation (the incident's host ran 1.11.7).
+        body = self.mailbox()[0]["body"]
+        self.assertIn("ameesh >= 1.12.0", body)
+        self.assertIn("ameesh work reviewer %d" % self.lot, body)
         # a replay of the same freeze does not add a second note or mail
         act.designate(cfg, self.db, self.lot)
         self.assertEqual(len(self.notes(act.UNAVAILABLE_PREFIX)), 1)
         self.assertEqual(len(self.mailbox()), 1)
+
+    def test_a_light_lot_journals_no_pre_merge_reviewer(self):
+        # #2561: a light lot has no pre-merge reviewer (canon §2, full table:
+        # the other family reviews after merge). The freeze must say so once,
+        # instead of leaving "no reviewer" to be read as a failed designation.
+        # a fresh light-only branch: resetting to the base removes the
+        # sensitive src/ameesh change of the fixture's first head
+        self.repo.git("reset", "-q", "--hard", self.base)
+        self.repo.write("docs/README.md", "doc\n")
+        self.frozen = self.repo.commit("light doc")
+        self.receipts()
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.NONE, out)
+        self.assertIn("no pre-merge reviewer", out["why"])
+        self.assertEqual(self.mailbox(), [])
+        notes = self.notes(act.NONE_PREFIX)
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("light lot", notes[0])
+        # the read/recovery view explains it too, without a designation mark
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], rd.NONE)
+        self.assertIn("no pre-merge reviewer", shown["designation"]["why"])
+        # a replay of the same freeze adds no second note
+        act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(len(self.notes(act.NONE_PREFIX)), 1)
+
+    def test_a_freeze_run_outside_the_lot_worktree_finds_it_beside_the_agent(self):
+        # #2561 (#2510): the freeze command ran from the agent's session
+        # directory, so none of the historical hints held the ameesh commit.
+        # The lot's worktree is the agent's sibling; the exact commit and the
+        # issue's repository decide.
+        work_root = os.path.join(self.tmp, "work")
+        session = os.path.join(work_root, "session")
+        os.makedirs(session)
+        sibling = os.path.join(work_root, "author-%d" % self.lot)
+        shutil.copytree(self.repo.root, sibling)
+        subprocess.run(["git", "-C", sibling, "remote", "add", "origin",
+                        "https://github.com/manaty/ameesh.git"], check=True,
+                       capture_output=True)
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("manaty/ameesh#1932", self.lot))
+        self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = 'author'",
+                        (session,))
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(session)
+        item = work.get(self.db, self.lot)
+        cfg = dataclasses.replace(self.cfg, radar={})
+        found = act._repository(self.db, cfg, item, self.frozen)
+        self.assertEqual(os.path.realpath(found), os.path.realpath(sibling))
+
+    def test_a_discovered_sibling_of_another_project_is_refused(self):
+        # The exact commit is not a permission: a sibling clone whose origin is
+        # another project must not provide the target refs. Without the issue
+        # reference there is no identity at all, so the fallback keeps the old
+        # hints only.
+        work_root = os.path.join(self.tmp, "work-autre")
+        session = os.path.join(work_root, "session")
+        os.makedirs(session)
+        sibling = os.path.join(work_root, "author-%d" % self.lot)
+        shutil.copytree(self.repo.root, sibling)
+        subprocess.run(["git", "-C", sibling, "remote", "add", "origin",
+                        "https://github.com/manaty/nexlink.git"], check=True,
+                       capture_output=True)
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("manaty/ameesh#1932", self.lot))
+        self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = 'author'",
+                        (session,))
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(session)
+        item = work.get(self.db, self.lot)
+        cfg = dataclasses.replace(self.cfg, radar={})
+        self.assertEqual(act._repository(self.db, cfg, item, self.frozen), "")
+
+    def test_a_frozen_head_only_on_origin_is_fetched(self):
+        # #2561 (#2517): the head was pushed but no local clone held it. A clone
+        # of the lot's repository (validated by the issue's origin) fetches the
+        # exact head from the origin, bounded; the freeze then reads its diff.
+        origin = os.path.join(self.tmp, "origin-fetch.git")
+        subprocess.run(["git", "init", "--bare", "-q", origin], check=True,
+                       capture_output=True)
+        self.repo.git("push", "-q", origin,
+                      "%s:refs/heads/lot/2561" % self.frozen)
+        work_root = os.path.join(self.tmp, "work-fetch")
+        session = os.path.join(work_root, "session")
+        os.makedirs(session)
+        local = _Repo(os.path.join(work_root, "author-%d" % self.lot))
+        local.write("base.txt", "base\n")
+        local.commit("base")
+        local.git("remote", "add", "origin",
+                  "https://github.com/manaty/ameesh.git")
+        local.git("config", "url.%s.insteadOf" % origin,
+                  "https://github.com/manaty/ameesh.git")
+        self.db.execute("UPDATE work_items SET issue_ref = %s, branch = %s"
+                        " WHERE id = %s",
+                        ("manaty/ameesh#1932", "lot/2561", self.lot))
+        self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = 'author'",
+                        (session,))
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(session)
+        item = work.get(self.db, self.lot)
+        cfg = dataclasses.replace(self.cfg, radar={})
+        found = act._repository(self.db, cfg, item, self.frozen)
+        self.assertEqual(os.path.realpath(found), os.path.realpath(local.root))
+        self.assertEqual(local.git("cat-file", "-t", self.frozen), "commit")
+
+    def test_a_canon_policy_arriving_later_is_retried_on_the_same_freeze(self):
+        # #2561 (#2522/#1854): the canon publication arrived after the freeze.
+        # The unavailable note is the retry marker; the same frozen head is
+        # designated once the audited policy exists.
+        bad = _Canon(os.path.join(self.tmp, "canon-tardif"), mechanics=None)
+        cfg = dataclasses.replace(self.cfg, canon=bad.root, canon_ref="HEAD")
+        self.freeze(cfg=cfg)
+        self.assertEqual(self.marks(), [])
+        self.assertEqual(len(self.notes(act.UNAVAILABLE_PREFIX)), 1)
+        bad.repo.write("processus/mecanique.yaml", MECHANICS)
+        bad.commit = bad.repo.commit("mechanics published")
+        storage.of(self.db).canon.record_state(
+            self.cfg.host, "ok", root=bad.root,
+            source="home @ %s" % bad.commit[:12], commit=bad.commit, good=True,
+            diagnostic="", canon="")
+        report = act.retry_pending(cfg, self.db)
+        self.assertEqual(report["attempted"], 1, report)
+        self.assertEqual(report["designated"], 1, report)
+        shown = act.reviewers(cfg, self.db, self.lot)
+        self.assertEqual(shown["freeze"]["sha"], self.frozen)
+        self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
+                         ["r1", "r2"])
+        before = len(self.mailbox())
+        again = act.retry_pending(cfg, self.db)
+        self.assertEqual(again["attempted"], 0, again)
+        self.assertEqual(len(self.mailbox()), before)
+
+    def test_the_runner_retries_after_a_successful_canon_sync(self):
+        # The runner's periodic pass calls the bounded retry; a failure there
+        # never fails the canon sync.
+        from ameesh import runner as runner_mod
+
+        fake = types.SimpleNamespace(cfg=self.cfg, mediated=False,
+                                     _designation_retry_ready=True)
+        fake_db = mock.MagicMock()
+        report = {"attempted": 1, "designated": 1,
+                  "summary": "1 attempted: 1 designated"}
+        with mock.patch("ameesh.scoped_db.ScopedDb", return_value=fake_db), \
+                mock.patch.object(act, "retry_pending", return_value=report) as retry, \
+                mock.patch.object(runner_mod, "log_async") as log:
+            runner_mod.Runner.retry_review_designations(fake)
+        retry.assert_called_once_with(self.cfg, fake_db)
+        fake_db.close.assert_called_once()
+        self.assertTrue(any("review designation retry" in str(call)
+                            for call in log.call_args_list))
 
 
 class ActivationCliTest(_ActivationFixture, PgTestCase):
@@ -542,6 +702,27 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         self.assertIn("reviewers: r1 (claude), r2 (codex)", proc.stdout)
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
         self.assertEqual(len(self.marks()), 1)
+
+    def test_the_cli_explains_a_light_lot(self):
+        # #2561: the freeze must not print nothing for a light lot; the
+        # no-pre-merge-review note is the visible outcome.
+        self.repo.git("reset", "-q", "--hard", self.base)
+        self.repo.write("docs/README.md", "doc\n")
+        self.frozen = self.repo.commit("light doc")
+        self.receipts()
+        proc = self.mesh(
+            "work", "milestone", str(self.lot), "frozen", "--sha", self.frozen,
+            "--actor", "author",
+            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("review: none", proc.stdout)
+        self.assertIn("no pre-merge reviewer", proc.stdout)
+        self.assertEqual(self.mailbox(), [])
+        shown = self.mesh("work", "reviewers", str(self.lot),
+                          env=self.env(AMEESH_CANON=self.canon.root,
+                                       AMEESH_CANON_REF="HEAD"))
+        self.assertIn("designation: none", shown.stdout)
+        self.assertIn("no pre-merge reviewer", shown.stdout)
 
     def test_the_cli_recovery_retries_the_same_freeze(self):
         self.freeze()  # first freeze: designated
