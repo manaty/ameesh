@@ -453,10 +453,14 @@ rang 1.
 
 ## Intégration par paquets §12 : contrôle d'inclusion avant le feu
 
-Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
-lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
-et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
-à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+**Chaque heure**, le pilote compose un petit paquet avec les lots prêts, sans
+conflit et aux verdicts complets, sur la tête de la cible (canon
+`processus/lots.md` §§11 bis et 12) ; un nouveau paquet attend le précédent.
+Aux coupures de 11:00 et 23:00, la release prend la tête de la cible (ou le
+dernier commit vert), taguée et déployée en staging : elle ne compose plus de
+paquet. Avant la CI complète et le feu, le contrôle d'inclusion confronte la
+liste des lots admis ou routés au paquet aux lignes du manifeste **et** au
+contenu réel de l'arbre :
 
 ```sh
 scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
