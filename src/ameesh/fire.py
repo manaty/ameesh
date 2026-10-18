@@ -42,6 +42,7 @@ Un détenteur périmé s'arrête (`busy`) au lieu d'agir sur un instantané
 from __future__ import annotations
 
 import os
+import re
 import socket
 from urllib.parse import quote
 
@@ -597,13 +598,36 @@ def _required_gap(required, rollup, provenance=None) -> list:
     return gaps
 
 
+#: #2306 : les codes HTTP qui disent « réessaie » plutôt que « c'est prouvé ».
+_TRANSIENT_CODE = re.compile(r"(?i)(?:\bhttp[ /]?|\(\s*)(?:408|429|5\d\d)\b")
+_TRANSIENT_TEXT = (
+    "timed out", "timeout", "deadline exceeded", "connection reset",
+    "connection refused", "connection aborted", "broken pipe",
+    "network is unreachable", "temporary failure in name resolution",
+    "no such host", "tls handshake", "unexpected eof", "server error",
+    "bad gateway", "service unavailable", "gateway timeout",
+    "rate limit", "too many requests", "abuse detection",
+)
+
+
+def _transient_read(detail: str) -> bool:
+    """#2306 : la lecture de la forge a-t-elle échoué pour une raison
+    passagère ? Seuls ces échecs (HTTP 408/429/5xx, délai, coupure réseau)
+    gardent la ligne en file ; un 4xx, un refus de droits ou une réponse
+    malformée restent des échecs prouvés, qui éjectent."""
+    low = str(detail or "").lower()
+    return bool(_TRANSIENT_CODE.search(low) or re.search(r"(?:^|:\s*)eof\s*$", low)
+                or any(word in low for word in _TRANSIENT_TEXT))
+
+
 def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
     """Les check runs de la tête **exacte** `sha`, avec l'application qui les a
     produits. `statusCheckRollup` ne porte pas cette source : elle se lit sur
     le commit (`commits/<sha>/check-runs`). Les noms sont rendus exactement,
     espaces significatifs compris : `tests ` n'est pas le contexte `tests`.
     Une lecture impossible ou malformée lève `land.LandError` : une source
-    absente ne prouve rien."""
+    absente ne prouve rien. #2306 : un échec passager lève
+    `land.TransientLandError`, que la file sait réessayer sans éjecter."""
     if not slug:
         raise land.LandError("no GitHub repository known: the source of the checks "
                              "of %s cannot be read" % (sha or "the head"))
@@ -617,8 +641,8 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
     proc = gh(["api", "--paginate", "--slurp", path + "?per_page=100"])
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise land.LandError("gh api %s: %s"
-                             % (path, detail or "exit %d" % proc.returncode))
+        error = land.TransientLandError if _transient_read(detail) else land.LandError
+        raise error("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
     pages = land._json(proc, "gh api %s" % path, list)
     runs = []
     for page in pages:
@@ -668,8 +692,8 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
         if "Branch not protected" in detail:
             return ()
-        raise land.LandError("gh api %s: %s"
-                             % (path, detail or "exit %d" % proc.returncode))
+        error = land.TransientLandError if _transient_read(detail) else land.LandError
+        raise error("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
     data = land._json(proc, "gh api %s" % path, dict)
     required = data.get("required_status_checks")
     if required is None:
@@ -708,10 +732,12 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     app_id)` : la protection lue à la forge, complétée par la déclaration
     `radar.projects.<p>.required_checks` (des noms, sans application imposée).
 
-    Quand la protection ne peut pas être lue (jeton sans droits, forge
-    muette), la déclaration du projet la remplace ; sans déclaration, la
-    lecture refuse. La déclaration ne peut jamais retirer un check que la
-    forge exige : elle s'ajoute. Les noms sont exacts de bout en bout :
+    Quand la protection ne peut durablement pas être lue (jeton sans droits),
+    la déclaration du projet la remplace ; sans déclaration, la lecture refuse.
+    Un échec passager lève `land.TransientLandError` : la lecture sera réessayée,
+    sans affaiblir la protection sur la seule déclaration. La déclaration ne
+    peut jamais retirer un check que la forge exige : elle s'ajoute.
+    Les noms sont exacts de bout en bout :
     la déclaration `tests ` ne vaut pas le contexte `tests`."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
@@ -722,6 +748,8 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
         raise land.LandError("no target branch known: its required checks cannot be read")
     try:
         forged = _protection_required(slug, target, gh=gh)
+    except land.TransientLandError:
+        raise
     except land.LandError:
         if declared:
             return declared
@@ -734,8 +762,10 @@ def _head_statuses(slug: str | None, sha: str, *, gh) -> list:
     entrée de `statusCheckRollup` (`context`, `state`).
 
     L'endpoint `status` rend le dernier statut de chaque contexte ; un nom
-    exact traverse tel quel. Une lecture impossible, malformée ou tronquée
-    lève `land.LandError` : une source absente ne prouve rien."""
+    exact traverse tel quel. Une lecture impossible ou malformée lève
+    `land.LandError` : une source absente ne prouve rien. #2306 : les pages
+    sont lues jusqu'au `total_count` annoncé — un total de 100 n'est plus pris
+    pour une troncature — et un échec passager lève `land.TransientLandError`."""
     if not slug:
         raise land.LandError("no GitHub repository known: the statuses of %s "
                              "cannot be read" % (sha or "the head"))
@@ -746,15 +776,24 @@ def _head_statuses(slug: str | None, sha: str, *, gh) -> list:
         raise land.LandError("no frozen head: the statuses of the required checks "
                              "cannot be read")
     path = "repos/%s/commits/%s/status" % (slug, quote(sha, safe=""))
-    proc = gh(["api", path + "?per_page=100"])
+    proc = gh(["api", "--paginate", "--slurp", path + "?per_page=100"])
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise land.LandError("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
-    data = land._json(proc, "gh api %s" % path, dict)
-    statuses = data.get("statuses")
-    total = data.get("total_count")
-    if not isinstance(statuses, list) or type(total) is not int \
-            or total != len(statuses) or total >= 100:
+        error = land.TransientLandError if _transient_read(detail) else land.LandError
+        raise error("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
+    pages = land._json(proc, "gh api %s" % path, list)
+    total = None
+    statuses = []
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(page.get("statuses"), list):
+            raise land.LandError("gh api %s: malformed response" % path)
+        announced = page.get("total_count")
+        if type(announced) is not int or announced < 0 \
+                or (total is not None and announced != total):
+            raise land.LandError("gh api %s: malformed or truncated statuses" % path)
+        total = announced
+        statuses.extend(page["statuses"])
+    if total is None or len(statuses) != total:
         raise land.LandError("gh api %s: malformed or truncated statuses" % path)
     out = []
     for status in statuses:
@@ -782,7 +821,9 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
 
     Rend la liste des manques (`tests (absent)`, `coverage (FAILURE)`…) ;
     lève `land.LandError` quand les checks ou leur source ne peuvent pas être
-    lus : un vert ne se suppose jamais."""
+    lus : un vert ne se suppose jamais. #2306 : une lecture passagère lève
+    `land.TransientLandError` (la file réessaiera) ; une réponse malformée ou
+    un manque prouvé restent des `LandError`."""
     from . import radar
     declared = tuple(getattr(project, "required_checks", ()) or ())
     if not declared:
@@ -1466,6 +1507,10 @@ def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None,
     fermée ici. Sans aucun jalon de feu, la file d'équipe garde son cours : la
     garde du feu ne concerne que les lots que le feu a autorisés (les checks
     requis, eux, valent pour tout atterrissage local).
+
+    #2306 : une cible vide est refusée (elle sautait la garde) ; une lecture
+    passagère des checks lève `land.TransientLandError`, que `land` traduit en
+    nouvelle tentative au passage suivant, sans éjection.
     """
     lot = int(lot)
     try:
@@ -1488,10 +1533,20 @@ def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None,
                            "landing" % (str(frozen_sha or "")[:12],
                                         ", ".join(sorted(str(m.get("actor") or "?")
                                                          for m in blocked))))
-    if project is not None and target and getattr(project, "land", "") == "local":
+    if project is not None and getattr(project, "land", "") == "local":
         sha = _norm(frozen_sha)
+        if not target:
+            # #2306 : sans cible, la garde des checks requis était sautée
+            # (fail-open). Un atterrissage local sans cible est impossible
+            # (`fresh_target` la réclame) ; on refuse au lieu de laisser passer.
+            return False, ("no target branch known: the required checks cannot be proven: "
+                           "landing refused")
         try:
             gaps = required_on_head(project, target, sha, gh=gh)
+        except land.TransientLandError:
+            # #2306 : lecture passagère — l'appelant garde la ligne en file et
+            # réessaie au passage suivant ; le refus (fail-closed) tient.
+            raise
         except land.LandError as exc:
             return False, ("the required checks of %s on %s cannot be proven: %s: landing "
                            "refused" % (target, sha[:12] or "—", exc))
