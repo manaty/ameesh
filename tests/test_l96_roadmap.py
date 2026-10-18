@@ -508,6 +508,20 @@ class RoadmapPgTest(PgTestCase):
                                                          now=ts("2026-10-14"))
                           if a["type"] == "engagement_overdue"])
 
+    def test_items_carry_the_designated_reviewers(self):
+        # #2204/N5 : la frise lit les relecteurs comme progress/list, pour que
+        # lot_state ne diverge pas entre les deux projections.
+        lot = self._lot()
+        work.move(self.db, lot["id"], "build")
+        work.move(self.db, lot["id"], "qa")
+        self.db.execute("UPDATE work_items SET reviewer = 'first' WHERE id = %s",
+                        (lot["id"],))
+        rows = storage.of(self.db).roadmap.items(
+            since_ts=0, limit=50, done_states=[], project="ameesh")
+        row = next(r for r in rows if int(r["id"]) == lot["id"])
+        self.assertEqual(row["reviewer"], "first")
+        self.assertEqual(row["reviewers"], ["first"])
+
     def test_engagement_overdue_ignore_dates_calculees_et_lots_en_attente(self):
         """#2342 : une date p80 est re-datée à la passe suivante, pas alertée ;
         un lot en attente (bloqué, relu, dépendance) ne l'est pas non plus."""
