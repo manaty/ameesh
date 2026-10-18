@@ -272,6 +272,22 @@ class IdleCapacityTest(_Base):
         self.assertEqual(sous_utilisation.idle_capacity(
             self.db, self.listing(), self.now, [], paid=()), [])
 
+    def test_lot_d_un_autre_projet_ne_leve_pas(self):
+        """#2337 B4 : cinq agents Nexlink au repos ne sont pas une capacité
+        pour un lot ameesh ; l'alerte ne se lève que sur un couple possible
+        (projet du lot dans ceux d'un agent au repos)."""
+        self.agent("claude1")
+        self.db.execute("UPDATE agent_registry SET team = 'nexlink' WHERE name = 'claude1'")
+        lot = work.add(self.db, title="lot ameesh", app="ameesh")
+        self.assertEqual(sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=()), [])
+        # contre-épreuve : un agent du projet du lot rend le couple possible
+        self.agent("claude2")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'claude2'")
+        alerte = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=())[0]
+        self.assertEqual(alerte["startable_lots"], [lot["id"]])
+
     def test_cle_stable_quand_forfait_bascule(self):
         """#2337 B2 : `aggravating` bascule à chaque début/fin de tour d'un
         agent payé ; la raison ne change pas la clé — un seul courrier."""

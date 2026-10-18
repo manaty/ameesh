@@ -985,6 +985,23 @@ def split_startable(waiting_lots: list, waits: dict) -> tuple:
     return startable, blocked
 
 
+def lots_for_idle(lots: list, idle: list) -> list:
+    """#2337 B4 : ne garder que les lots qu'un agent au repos peut prendre —
+    le projet du lot (`app`, `workstream` ; `projects.lot_project`) doit
+    figurer dans ceux d'au moins un agent. Un lot sans projet connu reste (on
+    ne devine pas) et un repos sans projet déclaré ne filtre rien (cas hub).
+    Sans ce croisement, cinq agents Nexlink au repos et un lot ameesh
+    démarrable levaient encore l'alerte."""
+    from . import projects as projects_mod
+    wanted = {project for row in idle
+              for project in projects_mod.agent_projects(row)}
+    if not wanted:
+        return list(lots)
+    return [lot for lot in lots
+            if not projects_mod.lot_project(lot)
+            or projects_mod.lot_project(lot) in wanted]
+
+
 def waiting_text(blocked: dict, limit: int = 6) -> str:
     """« #12 waits on #3, #4; #15 is scheduled for 2026-10-16 » (L368)."""
     parts = []
@@ -1039,6 +1056,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
     waiting_lots = waiting_project_lots(lots)
+    # #2337 B4 : un lot démarrable d'un autre projet n'est pas une capacité
+    # pour ces agents (cinq agents Nexlink au repos + un lot ameesh levait
+    # encore l'alerte) ; on croise avec les projets des agents au repos.
+    waiting_lots = lots_for_idle(waiting_lots, idle)
     waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
     startable_lots, blocked_lots = split_startable(waiting_lots, waits)
     backlog = [row for row in listing
@@ -1132,8 +1153,9 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     et (L165b) aux agents de conception.
 
     Rend `{orchestrateur: texte}` : à chacun, les agents au repos sans lot de
-    SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (un lot
-    ne dit pas son équipe : tous). Un orchestrateur sans agent à occuper ne
+    SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (filtrés
+    en amont sur les projets des agents au repos, #2337 B4 ; un lot sans
+    projet connu reste). Un orchestrateur sans agent à occuper ne
     reçoit rien ; il n'est jamais cité dans sa propre liste.
 
     #1608 : seuls les lots sans attente planifiée sont proposés (L368) ; les
