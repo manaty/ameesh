@@ -23,9 +23,11 @@ relisent par `ameesh work show` et par les relecteurs.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import re
 import sys
+import time
 
 from . import lot_class, plan_git, work
 
@@ -216,16 +218,156 @@ def render(report: dict) -> list[str]:
     ]
 
 
+def _project_names(cfg, args) -> list[str]:
+    from . import release_cutoff
+    declared = release_cutoff.projects(cfg)
+    if not declared:
+        return []
+    wanted = getattr(args, "project", None)
+    if wanted:
+        if wanted not in declared:
+            raise release_cutoff.ReleaseError(
+                "project %r is not declared under release.projects" % wanted)
+        return [wanted]
+    return sorted(declared)
+
+
+def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
+    from . import release_cutoff
+    plan = release_cutoff.build_plan(cfg, project, now=now, version=version)
+    report = {
+        "schema": release_cutoff.SCHEMA, "mode": "dry-run",
+        "project": project.name, "repo": project.repo, "target": project.target,
+        "canon_commit": plan.canon_commit, "cutoff_at": plan.cutoff_at,
+        "cutoff_label": plan.cutoff_label, "head": plan.head,
+        "green": plan.green, "last_green": plan.last_green, "base": plan.base,
+        "current_version": plan.current_version,
+        "previous": plan.previous, "version": plan.version,
+        "floor": plan.floor, "floor_reason": plan.floor_reason,
+        "packets": [{"pr": packet.pr, "package": packet.package,
+                     "units": packet.units, "manifest": packet.manifest,
+                     "excluded": packet.excluded} for packet in plan.packets],
+        "direct": plan.direct, "included": plan.included,
+        "excluded": plan.excluded, "migrations": plan.migrations,
+        "notes": plan.notes,
+    }
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    else:
+        print("release %s — coupure %s — cible %s @ %s"
+              % (plan.version, plan.cutoff_label, project.target, plan.head[:12]))
+        print("CI verte: %s%s" % ("oui" if plan.green else "non",
+                                  "" if plan.green else
+                                  " ; dernier vert " + (plan.last_green or "?")[:12]))
+        print("paquets: %s" % (", ".join(
+            "%s%s" % (packet.package, " (#%d)" % packet.pr if packet.pr else "")
+            for packet in plan.packets) or "aucun"))
+        print("lots inclus: %s" % (", ".join("#%d" % lot for lot in plan.included) or "aucun"))
+        print("lots écartés: %s" % (", ".join("#%d" % lot for lot, _reason in plan.excluded)
+                                    or "aucun"))
+        print("migrations: %s" % (", ".join(plan.migrations) or "aucune"))
+        print("notes:\n%s" % plan.notes)
+    return 0
+
+
+def _report_error(cfg, db, project, exc, now: float) -> None:
+    """Mail a definitive error once; transient errors go to the journal only."""
+    from . import mail, release_cutoff
+    if isinstance(exc, release_cutoff.TransientReleaseError):
+        return
+    try:
+        state = release_cutoff.load_state(cfg)
+        slot = release_cutoff.project_state(state, project.name)
+        text = str(exc)
+        if slot.get("last_error") == text:
+            return
+        slot["last_error"] = text
+        slot["last_error_at"] = now
+        release_cutoff.save_state(cfg, state)
+        if db is not None:
+            mail.send(db, work.SYSTEM_SENDER, project.report,
+                      "Release %s NON faite : %s\n\nAucun tag, aucun déploiement. "
+                      "Corrige la cause ; le prochain tick réessaiera tant que la "
+                      "coupure est dans sa fenêtre." % (project.name, text),
+                      kind="event", payload={"release_error": text, "urgent": True})
+    except Exception:  # a report never masks the original error
+        pass
+
+
 def run(cfg, args) -> int:
-    """`ameesh release open|check|reason` : la porte de release (L750/L756)."""
+    """`ameesh release open|check|reason|cutoff|tick|calendar`."""
+    from . import release_cutoff
+    command = args.release_command
+    if command == "calendar":
+        declared = release_cutoff.projects(cfg)
+        if not declared:
+            print("release: off (no release block for this host)")
+            return 0
+        now = time.time() if args.now is None else float(args.now)
+        for name, project in sorted(declared.items()):
+            try:
+                rules, source = release_cutoff.compiled_rules(cfg, name)
+                at, label = release_cutoff.cutoff_slot(rules, now)
+                nxt = rules.next_cutoff(now)
+                print("%s: canon %s, coupures %s, dernière %s, prochaine %s, cible %s"
+                      % (name, source.commit[:12], ", ".join(rules.cutoffs), label,
+                         _dt.datetime.fromtimestamp(nxt, rules.zone()).strftime("%d/%m %H:%M"),
+                         project.target))
+            except Exception as exc:
+                print("%s: calendrier illisible (%s)" % (name, exc))
+        return 0
+    if command in ("cutoff", "tick"):
+        declared = release_cutoff.projects(cfg)
+        if not declared:
+            print("release: off (no release block for this host)")
+            return 0
+        names = _project_names(cfg, args)
+        now = time.time() if args.now is None else float(args.now)
+        if getattr(args, "dry_run", False):
+            for name in names:
+                _dry_run(cfg, declared[name], now=now,
+                         version=getattr(args, "version", None), as_json=args.json)
+            return 0
+        from .db import open_db
+        db = open_db(cfg)
+        try:
+            status = 0
+            for name in names:
+                project = declared[name]
+                try:
+                    report = release_cutoff.execute(
+                        cfg, db, project, now=now, force=getattr(args, "force", False),
+                        no_staging=getattr(args, "no_staging", False),
+                        version=getattr(args, "version", None))
+                except release_cutoff.TransientReleaseError as exc:
+                    print("%s: %s" % (name, exc), file=sys.stderr)
+                    status = 1
+                    continue
+                except release_cutoff.ReleaseError as exc:
+                    print("%s: %s" % (name, exc), file=sys.stderr)
+                    _report_error(cfg, db, project, exc, now)
+                    status = 1
+                    continue
+                if args.json:
+                    print(json.dumps(report, ensure_ascii=False, default=str))
+                else:
+                    print("%s: %s%s" % (name, report.get("result"),
+                                        " (%s)" % report.get("version")
+                                        if report.get("version") else ""))
+                if report.get("result") not in ("released", "reconciled",
+                                                "already-recorded", "not-due", "missed"):
+                    status = 1
+            return status
+        finally:
+            db.close()
     from .db import open_db
     db = open_db(cfg)
     try:
-        if args.release_command == "open":
+        if command == "open":
             base = record_perimeter(db, args.id, args.base, actor=args.actor)
             print("lot #%d: release perimeter frozen at %s" % (args.id, base[:12]))
             return 0
-        if args.release_command == "reason":
+        if command == "reason":
             text = record_reason(db, args.id, args.text, actor=args.actor)
             print("lot #%d: reason recorded (%s)" % (args.id, text))
             return 0
@@ -259,6 +401,34 @@ def add_parser(sub, func) -> None:
                                                       "declared radar.projects repository)")
     check_p.add_argument("--json", action="store_true", help="`ameesh-release/1` report")
     check_p.set_defaults(func=func)
+    cutoff_p = rel.add_parser(
+        "cutoff", help="release at a compiled canon cutoff: tag the green head, generate "
+                       "notes, deploy staging, report to the owner (#2448)")
+    cutoff_p.add_argument("--project", default=None)
+    cutoff_p.add_argument("--now", type=float, default=None,
+                          help="epoch seconds (default: now)")
+    cutoff_p.add_argument("--force", action="store_true",
+                          help="ignore the recorded cutoff and the recent-tag guard")
+    cutoff_p.add_argument("--dry-run", action="store_true",
+                          help="read and print the plan; no tag, no push, no staging")
+    cutoff_p.add_argument("--no-staging", action="store_true")
+    cutoff_p.add_argument("--version", default=None,
+                          help="override the next patch version")
+    cutoff_p.add_argument("--json", action="store_true")
+    cutoff_p.set_defaults(func=func)
+    tick_p = rel.add_parser(
+        "tick", help="run the release when a compiled cutoff is due (systemd timer)")
+    tick_p.add_argument("--project", default=None)
+    tick_p.add_argument("--now", type=float, default=None)
+    tick_p.add_argument("--force", action="store_true")
+    tick_p.add_argument("--no-staging", action="store_true")
+    tick_p.add_argument("--version", default=None)
+    tick_p.add_argument("--json", action="store_true")
+    tick_p.set_defaults(func=func)
+    calendar_p = rel.add_parser(
+        "calendar", help="show the compiled cutoffs and the next one")
+    calendar_p.add_argument("--now", type=float, default=None)
+    calendar_p.set_defaults(func=func)
     reason_p = rel.add_parser(
         "reason", help="record why the release branch's base moved after the freeze")
     reason_p.add_argument("id", type=int)

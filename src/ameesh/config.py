@@ -449,6 +449,10 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: #2448 : release aux coupures du canon compilé (clé `release` du fichier
+    #: de l'hôte opérateur : `host` et `projects` — dépôt, cible, staging,
+    #: rapport). Validée par `ameesh.release_cutoff` ; absente = aucune.
+    release: dict = field(default_factory=dict)
     #: #2212 : fichier de configuration lu par `load` ("" sans fichier), pour
     #: relire `radar` à chaque passage du feu (`fresh_radar`) ; calculé, jamais
     #: lu tel quel
