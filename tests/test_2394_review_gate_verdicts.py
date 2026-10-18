@@ -111,6 +111,23 @@ class ClassReaderTest(unittest.TestCase):
         self.assertEqual(invalid["class"], "sensitive")
         self.assertEqual(merge_queue.required_verdicts(invalid), 1)
 
+    def test_an_unreadable_policy_keeps_the_critical_paths_it_was_given(self):
+        # Revue #2394 (dev2) : le doute vient de la politique, pas du diff ; les
+        # motifs de secours voient encore SQL et la porte de fusion (2 avis).
+        bad = [{"paths": ["x"], "class": "bogus"}]
+        for paths, required in ((["src/ameesh/migrations/0460_x.sql"], 2),
+                                ([".github/workflows/tests.yml"], 2),
+                                (["src/ameesh/work.py"], 1)):
+            with self.subTest(paths=paths):
+                klass = self.classify(paths, bad)
+                self.assertTrue(klass["doubt"])
+                self.assertEqual(klass["class"], "sensitive")
+                self.assertEqual([f["path"] for f in klass["files"]], paths)
+                self.assertEqual(merge_queue.required_verdicts(klass), required)
+        undeclared = lot_class.class_of_paths([], "ameesh", ["src/ameesh/db.py"])
+        self.assertTrue(undeclared["doubt"])
+        self.assertEqual(merge_queue.required_verdicts(undeclared), 2)
+
 
 class GateTest(unittest.TestCase):
     """La porte applique ce barème : un avis hors doute, deux hors critique."""
