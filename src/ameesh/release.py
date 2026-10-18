@@ -249,10 +249,14 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
                      "excluded": packet.excluded} for packet in plan.packets],
         "direct": plan.direct, "included": plan.included,
         "excluded": plan.excluded, "migrations": plan.migrations,
-        "notes": plan.notes,
+        "notes": plan.notes, "empty": plan.empty,
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    elif plan.empty:
+        print("rien de nouveau — coupure %s — cible %s @ %s : base %s = %s, aucun tag"
+              % (plan.cutoff_label, project.target, plan.head[:12], plan.base[:12],
+                 plan.previous["tag"]))
     else:
         print("release %s — coupure %s — cible %s @ %s"
               % (plan.version, plan.cutoff_label, project.target, plan.head[:12]))
@@ -362,7 +366,7 @@ def run(cfg, args) -> int:
                     print("%s: %s%s" % (name, report.get("result"),
                                         " (%s)" % report.get("version")
                                         if report.get("version") else ""))
-                if report.get("result") not in ("released", "reconciled",
+                if report.get("result") not in ("released", "reconciled", "nothing-new",
                                                 "already-recorded", "not-due", "missed"):
                     status = 1
             return status
