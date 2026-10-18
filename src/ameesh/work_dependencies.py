@@ -198,6 +198,13 @@ def wait_label(wait):
             label += " since %s" % time.strftime("%Y-%m-%d %H:%M",
                                                  time.localtime(float(wait["since"])))
         return label
+    if wait["what"] == "packet":
+        # #2335 : le lot n'attend pas un exécuteur de lot mais la fusion du
+        # porteur `integration/**` (le composeur/pilote la porte).
+        label = "waiting for packet merge #%s" % wait.get("vehicle")
+        if wait.get("branch"):
+            label += " (%s)" % wait["branch"]
+        return label
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 
