@@ -83,6 +83,12 @@ class FakeGh:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr=self.error)
             return types.SimpleNamespace(returncode=0,
                                          stdout=json.dumps(self.protection), stderr="")
+        path = next((arg for arg in argv if "/rules/branches/" in arg), "")
+        if path:
+            # #2285 : les rulesets sont lus en plus de la protection ; ce banc
+            # n'en déclare aucun.
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps([[]]),
+                                         stderr="")
         path = next((arg for arg in argv if "/check-runs" in arg), "")
         if path:
             if self.check_error:
