@@ -628,14 +628,17 @@ class _Landing:
     def review_after_merge(self, *, merged_sha: str = "", pr=None) -> dict:
         """L539 : ouvre le lot de relecture d'un lot **léger** (canon §2), une
         seule fois, après que la fusion est un fait enregistré. La classe est
-        relue sur le diff gelé (`merge_queue._class_of`, canon §8) ; un doute
-        ou une classe supérieure n'ouvre rien. Ne lève jamais."""
-        from . import merge_queue, review_lot
+        relue sur le diff que la fusion a fait entrer (`class_at_merge`) —
+        jamais `cible..gel`, vide une fois le gel devenu ancêtre de la cible ;
+        un `light` qui touche la porte de fusion ouvre deux avis (#2374). Ne
+        lève jamais."""
+        from . import review_lot
         try:
             item = work.get(self.db, self.lot)
-            klass = merge_queue._class_of(
-                self.db, self.lot, item, self.project.repo, self.clone,
-                self.row.get("target"), self.row.get("frozen_sha") or "", cfg=self.cfg)
+            klass = review_lot.class_at_merge(
+                self.db, self.lot, item=item,
+                repo=self.clone or self.project.repo,
+                target=self.row.get("target") or "", sha=merged_sha)
             return review_lot.open_after_merge(
                 self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
                 pr=pr, target=self.row.get("target") or "")
