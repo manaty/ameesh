@@ -67,9 +67,18 @@ Le faux `fake_readiness` d'`AdmissionTest` a une signature stricte ; l'unité
 #2333 ajoute `packet_exception` à `merge_queue.readiness` et
 `merge_pr._admission` le transmet désormais. Le faux accepte le paramètre
 (ignoré : ce test porte sur l'admission d'une tête verte, pas sur l'exception
-de paquet) ; aucun code de production n'est modifié et aucun avis n'est requis
-(§11 bis, même régime que les adaptations `01435d13a4` et `a57f8c5e3` de
-h-0500).
+de paquet).
+
+La même suite a aussi rougi (`psql 5/9`, `psycopg 5/6`) sur
+`tests.test_l118_assignments.IdleCapacityToOrchestratorTest.test_briefs_et_envoi` :
+l'unité #2337 (B3) remplace le brief « without a lot in progress for more than
+30 min » (périmé depuis #1677) par « without an actionable lot » ; le témoin
+L118 gardait l'ancienne formule. L'attente est alignée sur le nouveau brief,
+comme l'ont été `test_l94_underuse` et `test_l119_backlog` dans l'unité.
+
+Ces deux adaptations sont des tests seuls : aucun code de production n'est
+modifié et aucun avis n'est requis (§11 bis, même régime que les adaptations
+`01435d13a4` et `a57f8c5e3` de h-0500).
 
 La composition des 11 unités, leurs têtes et leurs verdicts ne changent pas ;
-la tête de la branche après ce commit est celle de l'unique suite complète.
+la tête de la branche après ces commits est celle de l'unique suite complète.
