@@ -232,8 +232,8 @@ table : aucun écart n'est toléré d'un côté seulement.
   `load1`, `cpu_count`, `disk_free_bytes`, `disk_path`,
   `turns_in_progress`), identifiant d'exécuteur sur 16 caractères
   hexadécimaux, code d'enrôlement de 24 caractères Crockford.
-- **`leases.state`** rend `{lease_owner, lease_epoch, status, live}`, les
-  clés que lit `registry.lease_matches`.
+- **`leases.state`** rend `{name, lease_owner, lease_epoch, status, live}`
+  (`name` = nom primaire résolu), les clés que lit `registry.lease_matches`.
 - **NOTIFY `agent_lease`.** Sur le fil, le payload est `{name, owner,
   epoch, status}`. Le déclencheur de 0001 écrit `agent` ; le serveur le
   renomme `name` à la réception (`stream.wire_payload`) et filtre sur `name`.
