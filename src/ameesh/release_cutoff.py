@@ -126,15 +126,15 @@ def next_version(current: str, *, bump: str = "level",
     it needs the owner's go (CONTRIBUTING.md, "Numérotation des versions").
     """
     triple = version_tuple(current)
+    if floor == "major":
+        raise ReleaseError("a major version needs the owner's go (content is major)")
+    if floor == "unknown":
+        raise ReleaseError("the content's version level is unknown "
+                           "(scripts/version-level.py): no release")
     if bump == "patch":
         return version_text(bump_patch(triple))
     if bump != "level":
         raise ReleaseError("version_bump: level | patch expected, got %r" % bump)
-    if floor == "unknown":
-        raise ReleaseError("the content's version level is unknown "
-                           "(scripts/version-level.py): no release")
-    if floor == "major":
-        raise ReleaseError("a major version needs the owner's go (content is major)")
     if floor == "minor":
         return version_text(bump_minor(triple))
     return version_text(bump_patch(triple))
@@ -166,19 +166,17 @@ def validate_version(previous: dict | None, version: str, floor: str,
         if triple <= version_tuple(previous["version"]):
             raise ReleaseError("version %s is not greater than the previous tag %s"
                                % (version, previous["tag"]))
-    if bump != "level":
-        # Explicit `version_bump=patch` is an operator override; it never
-        # authorises a major release, which is the owner's decision.
-        if floor == "major":
-            raise ReleaseError("a major version needs the owner's go (content is major)")
-        return
     if floor == "unknown":
         raise ReleaseError("the content's version level is unknown "
                            "(scripts/version-level.py): no release")
-    if floor == "major":
-        raise ReleaseError("a major version needs the owner's go (content is major)")
     if previous is not None and version_level(previous["version"], version) == "major":
         raise ReleaseError("a major version needs the owner's go")
+    if floor == "major":
+        raise ReleaseError("a major version needs the owner's go (content is major)")
+    if bump != "level":
+        # Explicit `version_bump=patch` is an operator override; a major
+        # version is refused above, and unknown is never guessed.
+        return
     if previous is not None and _RANK[version_level(previous["version"], version)] \
             < _RANK[floor]:
         raise ReleaseError("version %s is below the content's %s floor"
@@ -430,46 +428,80 @@ def _release_commit(repo: str, sha: str) -> bool:
                                        or message.lstrip().startswith("release:"))
 
 
+def _landing_release(repo: str, sha: str) -> bool:
+    """A release landing merge M = merge(main, V), with two parents."""
+    message = _git(repo, "log", "-1", "--format=%B", sha).stdout or ""
+    if "ameesh-release:" not in message or not message.lstrip().startswith("release:"):
+        return False
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", sha).stdout.split()
+    return len(parents) == 3
+
+
 def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
-                    depth: int = 4, reading: dict | None = None) -> bool:
-    """The exact commit is green; a release commit inherits its parent."""
-    reading = ci_reading(project, sha) if reading is None else reading
-    if reading.get("green"):
-        return True
-    if depth > 0 and _release_commit(repo, sha):
-        parent = _git(repo, "rev-parse", "--verify", "%s^1" % sha)
-        if parent.returncode == 0:
-            return commit_is_green(repo, project, (parent.stdout or "").strip(), depth - 1)
+                    reading: dict | None = None) -> bool:
+    """The exact commit is green; a release commit inherits its chain.
+
+    The chain is followed iteratively through `[skip ci]` release commits, with
+    no fixed depth: a long series of red-landing releases must stay green as a
+    chain (B1). A landing merge is not green: its first parent is the red main.
+    """
+    seen = set()
+    current = sha
+    first = True
+    while current and current not in seen:
+        seen.add(current)
+        if _landing_release(repo, current):
+            return False
+        current_reading = reading if first else None
+        first = False
+        current_reading = (ci_reading(project, current)
+                           if current_reading is None else current_reading)
+        if current_reading.get("green"):
+            return True
+        if not _release_commit(repo, current):
+            return False
+        parent = _git(repo, "rev-parse", "--verify", "%s^1" % current)
+        if parent.returncode:
+            return False
+        current = (parent.stdout or "").strip()
     return False
 
 
-def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 20) -> str | None:
-    """The green content of the first-parent chain, or the latest release tag.
+def _latest_green_tag(repo: str, head: str, project: "ProjectRelease") -> str | None:
+    """The highest reachable release tag whose first parent is green."""
+    latest = latest_tag(repo, head)
+    if not latest or not _release_commit(repo, latest["commit"]):
+        return None
+    if not is_ancestor(repo, latest["commit"], head):
+        return None
+    parent = _git(repo, "rev-parse", "--verify", "%s^1" % latest["commit"])
+    if parent.returncode:
+        return None
+    if commit_is_green(repo, project, (parent.stdout or "").strip()):
+        return latest["commit"]
+    return None
 
-    A red landing merge `M = merge(main, V)` carries the published release V as
-    its second parent; the first-parent walk reaches the older green B, but V
-    is the green content that was actually released and must be the next base
-    (B1). A tag V is preferred only when it descends from that first-parent
-    green commit, so a genuinely newer green commit still wins.
+
+def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100) -> str | None:
+    """The green content of the history, without a release-chain cap.
+
+    A red landing merge `M = merge(main, V)` names the published green content
+    as its second parent; the latest release tag is then the base (B1). A
+    landing merge is recognised directly, so any number of successive red
+    cutoffs works. Without a landing merge, only a truly green first-parent
+    commit is accepted; if none is found the caller refuses (N5).
     """
     cursor = head
-    first = None
     for _ in range(limit):
+        if _landing_release(repo, cursor):
+            return _latest_green_tag(repo, head, project)
         if commit_is_green(repo, project, cursor):
-            first = cursor
-            break
+            return cursor
         parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
         if parent.returncode:
             break
         cursor = (parent.stdout or "").strip()
-    latest = latest_tag(repo, head)
-    if latest and latest["commit"] != first and _release_commit(repo, latest["commit"]):
-        parent = _git(repo, "rev-parse", "--verify", "%s^1" % latest["commit"])
-        if parent.returncode == 0 and commit_is_green(
-                repo, project, (parent.stdout or "").strip()) \
-                and (first is None or is_ancestor(repo, first, latest["commit"])):
-            return latest["commit"]
-    return first
+    return None
 
 
 def version_floor(repo: str, since: str, target: str) -> tuple[str, str]:

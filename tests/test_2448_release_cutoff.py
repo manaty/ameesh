@@ -7,6 +7,7 @@ temporary HOME. No network, no host, no database.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -345,6 +346,36 @@ class ReleaseFixture(unittest.TestCase):
         self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"),
                          second["landing_sha"])
 
+    def test_seven_red_cutoffs_keep_the_release_chain_green(self):
+        """B1: the green chain is durable across >=7 successive red cutoffs."""
+        green = self.head
+        self.write("red.txt", "red\n")
+        self.commit("red change")
+        self.git(self.seed, "push", "-q", "origin", "main")
+
+        def reading(project, sha):
+            return {"green": sha == green}
+
+        slots = [_paris(11, day=18), _paris(23, day=18),
+                 _paris(11, day=19), _paris(23, day=19),
+                 _paris(11, day=20), _paris(23, day=20),
+                 _paris(11, day=21)]
+        versions = []
+        with mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
+            for slot in slots:
+                report = release_cutoff.execute(self.cfg, None, self.project, now=slot)
+                self.assertEqual(report["result"], "released", report)
+                versions.append(report["version"])
+        self.assertEqual(versions, ["1.11.8", "1.11.9", "1.11.10", "1.11.11",
+                                    "1.11.12", "1.11.13", "1.11.14"])
+
+    def test_last_green_returns_none_without_any_green(self):
+        """N5: no green in the walk means refuse, never fall back silently."""
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               return_value={"green": False}):
+            self.assertIsNone(release_cutoff.last_green(
+                self.clone, self.head, self.project))
+
     def test_red_head_without_green_refuses(self):
         with mock.patch.object(release_cutoff, "ci_reading",
                                return_value={"green": False}), \
@@ -386,6 +417,30 @@ class ReleaseFixture(unittest.TestCase):
             with self.assertRaises(release_cutoff.ReleaseError):
                 release_cutoff.build_plan(self.cfg, self.project, now=_paris(11, 5),
                                           version="2.0.0")
+
+    def test_patch_override_still_refuses_major_and_unknown(self):
+        """B4: the override never authorises a major or an unknown floor."""
+        project = dataclasses.replace(self.project, version_bump="patch")
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               return_value={"green": True}):
+            with self.assertRaises(release_cutoff.ReleaseError):
+                release_cutoff.build_plan(self.cfg, project, now=_paris(11, 5),
+                                          version="2.0.0")
+        with self.assertRaises(release_cutoff.ReleaseError):
+            release_cutoff.next_version("1.11.7", bump="patch", floor="major")
+        with self.assertRaises(release_cutoff.ReleaseError):
+            release_cutoff.next_version("1.11.7", bump="patch", floor="unknown")
+
+    def test_patch_override_refuses_an_untagged_major_bump(self):
+        """B4: an untagged major bump is refused even under a patch override."""
+        project = dataclasses.replace(self.project, version_bump="patch")
+        self.write("pyproject.toml", '[project]\nname = "x"\nversion = "2.0.0"\n')
+        self.commit("major bump")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               return_value={"green": True}):
+            with self.assertRaises(release_cutoff.ReleaseError):
+                release_cutoff.build_plan(self.cfg, project, now=_paris(11, 5))
 
     def test_manifest_parser_keeps_composition_and_drops_non_exclusions(self):
         parsed = release_cutoff.parse_manifest(MANIFEST)
