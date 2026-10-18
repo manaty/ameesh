@@ -1076,6 +1076,11 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
         raise RepriseError("invalid agent name: %r" % (name,))
+    # L243b (B1) : résoudre à l'entrée, puis écrire sous le primaire — la
+    # lecture (`registry.get`) résout déjà, les écritures non : garder l'alias
+    # ferait chercher une ligne inexistante et refuser un agent connu.
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="reprise.adopt")
     if harness not in HARNESSES:
         raise RepriseError("harness %r: adopt can resume %s" % (harness, ", ".join(HARNESSES)))
     if not SESSION_RE.match(session_id or ""):
@@ -1362,6 +1367,10 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
         raise RepriseError("invalid agent name: %r" % (name,))
+    # L243b (B1) : même résolution que la lecture, à l'entrée : tout ce qui
+    # suit (bail, NOTIFY, oubli local, fil) écrit sous le nom primaire.
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="reprise.resume")
     row = registry.get(db, name)
     if row is None:
         raise RepriseError("unknown agent: %s" % name)
@@ -1526,7 +1535,9 @@ def cmd_resume(cfg: Config, args) -> int:
                   file=sys.stderr)
             return 1
         return agent_pause.cmd_cli(cfg, args, paused=False)
-    if getattr(args, "expect_reason", None):
+    # #2184/N7 : un motif vide explicite n'est pas « absent » ; la présence
+    # du drapeau suffit à exiger --operator (même règle qu'agent_pause.py).
+    if getattr(args, "expect_reason", None) is not None:
         print("ameesh resume: --expect-reason requires --operator", file=sys.stderr)
         return 1
     try:
@@ -1564,6 +1575,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pause.add_argument("agent")
     p_pause.add_argument("--reason", required=True)
     p_pause.add_argument("--human", default=None, help="local human (same as ameesh serve)")
+    p_pause.add_argument("--not-after", type=float, default=None, metavar="EPOCH",
+                         help="deadline (epoch) after which the database refuses "
+                              "the pause; set by the drain before a remote call")
     p_pause.add_argument("--json", action="store_true")
     from . import agent_pause
     p_pause.set_defaults(func=lambda cfg, args: agent_pause.cmd_cli(cfg, args, paused=True))

@@ -201,6 +201,8 @@ def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
             print(json.dumps({"operation": row,
                               "events": storage.of(db).handoffs.events(args.operation)}, ensure_ascii=False))
             return 0
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="handoff.agent")
         binding = identity.resolve_binding(cfg, db)
         if not binding.ok or binding.name != args.agent:
             work.corrector(cfg, db)
@@ -1922,6 +1924,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # est indicatif (canon §2).
             if item.get("reviewer_warning"):
                 print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
+            # #2478 : la désignation est écrite ; un courrier non remis est dit.
+            if item.get("reviewer_request_warning"):
+                print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
@@ -1974,6 +1979,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # famille est indicatif (canon §2).
                 if item.get("reviewer_warning"):
                     print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
+                # #2478 : la désignation est écrite ; un courrier non remis est dit.
+                if item.get("reviewer_request_warning"):
+                    print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
             def _declare_constat(constat: dict) -> None:
@@ -2024,13 +2032,108 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d: %s — %s" % (row["id"], row["status"],
                                            row.get("project") or row.get("reason", "changed concurrently")))
             return 0
+        if args.work_command == "reviewers":
+            from . import review_designation_activation as activation
+            out = activation.reviewers(cfg, db, args.id, apply=args.apply)
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+            else:
+                freeze = out.get("freeze")
+                if not freeze:
+                    print("lot #%d is not frozen: no automatic designation" % args.id)
+                else:
+                    print("lot #%d: freeze #%s %s" % (
+                        args.id, freeze["id"], str(freeze.get("sha") or "")[:12]))
+                    designation = out.get("designation")
+                    if not designation:
+                        print("designation: none recorded")
+                    elif designation.get("state") == "designated":
+                        names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                          for r in designation.get("reviewers") or ())
+                        print("designation: %s" % names)
+                        if designation.get("policy_ref"):
+                            print("policy     : %s" % designation["policy_ref"])
+                    elif designation.get("state") == "carried":
+                        print("designation: kept from carried verdicts (%s)"
+                              % ", ".join(str(r.get("name"))
+                                          for r in designation.get("reviewers") or ()))
+                    else:
+                        print("designation: %s — %s" % (
+                            designation.get("state"), designation.get("why") or ""))
+                    if out.get("manual"):
+                        print("manual     : %s" % ", ".join(out["manual"]))
+                    if out.get("error"):
+                        print("mark       : %s" % out["error"])
+            applied = out.get("applied")
+            if applied is not None and not args.json:
+                state = applied.get("state")
+                if state == "designated":
+                    names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                      for r in applied.get("reviewers") or ())
+                    print("designated: %s" % names)
+                elif state == "waiting":
+                    print("waiting    : %s" % (applied.get("why") or ""))
+                elif state == "manual":
+                    print("manual     : %s" % (applied.get("why") or ""))
+                elif state == "carried":
+                    print("kept       : %s" % ", ".join(
+                        str(r.get("name")) for r in applied.get("reviewers") or ()))
+                elif state in ("unavailable", "none", "unfrozen"):
+                    print("%-11s: %s" % (state, applied.get("why") or ""))
+                else:
+                    print("designation: %s" % state)
+            return 0
         if args.work_command == "milestone":
+            from . import review_designation_activation as activation
+            outcome: dict = {}
+            note = args.note or ""
+            if args.kind == "frozen":
+                # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
+                from . import freeze_checks
+                note = freeze_checks.before_freeze(
+                    cfg, db, args.id, args.sha or "", repo=args.repo,
+                    skip=args.no_static_checks, note=note)
+            elif args.repo is not None or args.no_static_checks is not None:
+                raise work.WorkError("--repo and --no-static-checks only apply to a freeze")
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=args.note or "")
+                verdict=args.verdict, note=note, outcome=outcome)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            if args.kind == "frozen":
+                # #2442 : un réalignement mécanique sur la cible garde les
+                # verdicts de la tête relue ; sinon l'exécuteur retente.
+                from . import verdict_carry
+                carried = verdict_carry.carry(cfg, db, args.id)
+                if carried["result"] != "idle":
+                    print(verdict_carry.describe(carried))
+                # #2487 : la désignation s'est abstenue sur le plan du report.
+                # Si le report refuse finalement, les sièges manquants sont
+                # désignés maintenant, hors du gel, sans attendre un passage.
+                # `busy`/`moved` ne sont pas des refus : un autre hôte porte le
+                # report ou le gel a bougé, la désignation attend.
+                if outcome.get("state") == "carried" \
+                        and carried.get("result") in ("not-carried", "no-repository",
+                                                      "error", "idle"):
+                    outcome = activation.designate(cfg, db, args.id, force=True)
+                    print("review designation after the carry refused: %s"
+                          % (outcome.get("state") or "?"))
+            state = str(outcome.get("state") or "")
+            if state == "designated":
+                print("reviewers: %s" % ", ".join(
+                    "%s (%s)" % (r.get("name"), r.get("family"))
+                    for r in outcome.get("reviewers") or ()))
+            elif state == "carried":
+                print("reviewers: kept from carried verdicts (%s)" % ", ".join(
+                    str(r.get("name")) for r in outcome.get("reviewers") or ()))
+            elif state == "waiting":
+                print("review pending: %s" % (outcome.get("why") or ""))
+            elif state == "manual":
+                print("reviewers: manual designation kept (%s)"
+                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
+            elif state == "unavailable":
+                print("review designation unavailable: %s" % (outcome.get("why") or ""))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
@@ -2291,6 +2394,8 @@ def cmd_set(cfg: Config, args) -> int:
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db, defer=True)
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="settings.permission_mode")
         agent = registry.get(db, args.agent)
         if agent is None:
             print("unknown agent: %s" % args.agent, file=sys.stderr)
@@ -2953,6 +3058,17 @@ def build_parser() -> argparse.ArgumentParser:
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
     pw_reviewer.set_defaults(func=cmd_work)
+    pw_reviewers = work_sub.add_parser(
+        "reviewers",
+        help="#2447: read the automatic reviewer designation of the latest freeze, "
+             "or retry it outside the freeze hook (recovery)")
+    pw_reviewers.add_argument("id", type=int)
+    pw_reviewers.add_argument("--apply", action="store_true",
+                              help="retry the designation of the latest freeze (same head); "
+                                   "a waiting state yields to the designation when capacity "
+                                   "or the canon policy comes back")
+    pw_reviewers.add_argument("--json", action="store_true")
+    pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
                        "on the target): any open state → merged, merged milestone with the commit")
@@ -3073,6 +3189,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="for the verdict milestone: ok or blocked")
     pw_ms.add_argument("--note", default="")
     pw_ms.add_argument("--actor", default="")
+    # #2542 : les contrôles statiques du projet passent avant le gel
+    pw_ms.add_argument("--repo", default=None,
+                       help="frozen: the repository holding --sha (default: the current "
+                            "directory, then the lot's project repository)")
+    pw_ms.add_argument("--no-static-checks", dest="no_static_checks", default=None,
+                       metavar="REASON",
+                       help="frozen: freeze without the project's static checks "
+                            "(scripts/freeze-checks.py); the reason goes in the note")
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)

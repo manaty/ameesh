@@ -15,7 +15,12 @@ l'humain. Cinq familles, cinq règles :
   fin de chaque tour) et supprimé quand l'agent n'existe plus au registre —
   L219 : seulement s'il appartient à CE mesh (fichier `.<agent>.owner`),
   sans tour en cours (verrou `.<agent>.lock`, bail vivant) ni activité depuis
-  `orphan_idle` ; un homonyme d'un autre mesh a son propre dossier.
+  `orphan_idle` ; un homonyme d'un autre mesh a son propre dossier. Un
+  dossier sans fichier de propriétaire de ce mesh n'est jamais supprimé
+  (#2326) : il reste suivi par un constat `tmp_unowned` dédupliqué, avec la
+  commande d'inspection (#2493). Un dossier à nous qui porte une copie Git
+  n'est retiré qu'après la preuve qu'aucun travail n'y est à garder : les
+  worktrees passent par `git worktree remove`, jamais `--force` (#2493).
 * **Caches partagés de l'hôte** (réutilisables) : `npm_config_cache`, store
   pnpm (`npm_config_store_dir`/`pnpm_config_store_dir`), `YARN_CACHE_FOLDER`
   — et, sur demande de la politique, `XDG_CACHE_HOME` — pointent vers
@@ -101,6 +106,7 @@ import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
+from urllib.parse import unquote, urlsplit
 
 from . import build_artifacts
 from . import platform
@@ -143,6 +149,10 @@ ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
 #: periodic pass once its last line is this old, so that it stays in the 24 h
 #: window of the alerts for as long as it exists
 UNATTRIBUTED_REFRESH_S = 12 * 3600.0
+#: #2493 : a temporary directory WITHOUT owner file of this mesh is never
+#: deleted; it is re-signaled at most this often (one `tmp_unowned` alert per
+#: path follows it), so the pass no longer repeats it in `skipped` every time
+UNOWNED_REFRESH_S = 12 * 3600.0
 #: L162 : nombre de plus grosses entrées de /tmp dites quand le tmpfs se remplit
 TMP_TOP = 5
 #: #1547 (N3) : conteneurs hors tour détaillés dans le relevé de ménage — le
@@ -1822,6 +1832,136 @@ def unsaved_git_work(path: str) -> str:
     return ""
 
 
+def tmp_recovery_command(path: str) -> str:
+    """#2493 : the commands that inspect a temporary directory before a human
+    moves or removes it (never a blind `rm -rf`). Git copies get the
+    saved-work checks; a plain directory just its listing."""
+    copies = _git_copies(path)
+    if not copies:
+        return "ls -la -- %s" % shlex.quote(path)
+    commands = []
+    for copy in copies:
+        commands.append("git -C %s status --short" % shlex.quote(copy))
+        commands.append("git -C %s log --branches --not --remotes" % shlex.quote(copy))
+    return " ; ".join(commands)
+
+
+def _clone_remote_inside(path: str, entry: str) -> str:
+    """#2493 : why the remotes of this CLONE do not prove it saved: one lives
+    inside the temporary directory `entry` that is about to be removed, so
+    the commits its remote-tracking refs vouch for go with it. Empty when
+    every remote is outside (or is not a local path)."""
+    remotes = _git(["remote"], path)
+    if remotes is None or remotes.returncode != 0:
+        return "remote URLs unreadable"
+    urls = []
+    for remote in remotes.stdout.splitlines():
+        # get-url applies Git's insteadOf rewrites, unlike raw config URLs.
+        resolved = _git(["remote", "get-url", "--all", remote], path)
+        if resolved is None or resolved.returncode != 0:
+            return "remote URLs unreadable"
+        urls.extend(resolved.stdout.splitlines())
+    root = _real(entry)
+    for value in urls:
+        if value.startswith("file:"):
+            try:
+                parsed = urlsplit(value)
+            except ValueError:
+                return "local remote URL unreadable"
+            if parsed.netloc not in ("", "localhost"):
+                return "local remote URL authority unknown"
+            value = unquote(parsed.path)
+        elif ":" in value and not os.path.isabs(value):
+            # Network URL or scp-style host:path; all other Git URLs are
+            # local paths, including relative names without a leading dot.
+            continue
+        local = _real(os.path.join(path, os.path.expanduser(value)))
+        if _under(local, root):
+            return "remote %s lives inside the temporary directory" % value
+    return ""
+
+
+def tmp_git_work(path: str, rules=()) -> str:
+    """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
+    empty when every copy is safe to recover: unlocked, readable, clean (no
+    modified or untracked file, no ignored file outside the build output
+    `rules`, like the worktree pass), pushed or integrated, for a clone also
+    no unpushed local branch, stash, other linked worktree nor remote inside
+    the directory, without submodules and with no process inside. A
+    directory is never deleted merely because its agent left the registry;
+    this check is the second condition."""
+    for copy in _git_copies(path):
+        st = worktree_state(copy)
+        if not st["exists"]:
+            return "%s: %s" % (copy, st["reason"] or "directory gone")
+        if st["locked"]:
+            return "%s locked (git worktree lock)" % copy
+        if not st["gitdir"]:
+            return "%s: git metadata unreadable" % copy
+        if os.path.isfile(os.path.join(copy, ".git")) and _under(
+                _real(common_dir(copy)), _real(path)):
+            return "%s: common repository lives inside the temporary directory" % copy
+        if st["submodules"]:
+            return "%s has submodules" % copy
+        if not st["clean"]:
+            return "%s: %s" % (copy, st["reason"] or "uncommitted changes")
+        if not (st["pushed"] or st["integrated"]):
+            return "%s: HEAD %s on no remote branch" % (copy, st["head"][:12] or "?")
+        # an ignored `.env` or dataset would go with the directory (relecture
+        # cx1 sur ab2a2c8c) ; only regenerable build output is exempt
+        leftovers = ignored_leftovers(copy, rules)
+        if leftovers is None:
+            return "%s: ignored files unreadable (git status --ignored)" % copy
+        if leftovers:
+            return "%s: %d ignored file(s) outside build artifacts (%s)" % (
+                copy, len(leftovers), leftovers[0])
+        if os.path.isdir(os.path.join(copy, ".git")):
+            linked = _git(["worktree", "list", "--porcelain"], copy)
+            if linked is None or linked.returncode != 0:
+                return "%s: linked worktrees unreadable" % copy
+            if sum(line.startswith("worktree ") for line in linked.stdout.splitlines()) > 1:
+                return "%s: the clone has other linked worktrees" % copy
+            # A clone takes its local branches and its stash with it (a linked
+            # worktree leaves them in its common repository): HEAD alone does
+            # not prove they are saved. Unreadable: a doubt, the copy stays.
+            local = _git(["log", "--branches", "--not", "--remotes", "--format=%H",
+                          "-1"], copy)
+            if local is None or local.returncode != 0:
+                return "%s: local branches unreadable" % copy
+            if local.stdout.strip():
+                return "%s: local branch commit %s on no remote branch" % (
+                    copy, local.stdout.strip()[:12])
+            stash = _git(["rev-parse", "-q", "--verify", "refs/stash"], copy)
+            if stash is None or stash.returncode not in (0, 1):
+                return "%s: stash unreadable" % copy
+            if stash.returncode == 0:
+                return "%s: has a stash" % copy
+            remote = _clone_remote_inside(copy, path)
+            if remote:
+                return "%s: %s" % (copy, remote)
+        if worktree_in_use(copy):
+            return "%s: a process is working in it" % copy
+    return ""
+
+
+def recover_tmp_git_copies(path: str) -> tuple[bool, str, list[str]]:
+    """#2493 (N2) : remove the linked worktrees of `path` with `git worktree
+    remove` (never `--force`, its own checks still apply), after `tmp_git_work`
+    proved them saved. Clones stay for `_safe_rmtree`; their content was
+    checked the same way. (ok, error, common repositories to prune)."""
+    repos: list[str] = []
+    for copy in _git_copies(path):
+        if not os.path.isfile(os.path.join(copy, ".git")):
+            continue                     # a clone: clean and pushed, deleted with the dir
+        repo = common_dir(copy)
+        ok, error = remove_worktree(copy, repo)
+        if not ok:
+            return False, "%s: %s" % (copy, error), repos
+        if repo:
+            repos.append(repo)
+    return True, "", repos
+
+
 def tmp_holder(path: str, allow=()) -> str:
     """Le processus qui tient `path` (fichier ouvert dedans, dossier courant,
     chemin sur sa ligne de commande), en clair ; vide si aucun. Si l'OS ne
@@ -3371,7 +3511,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         # pass from an empty one, without touching the lock itself.
         return {"host": host, "dry_run": dry_run, "status": "skipped",
                 "entries": [], "plan": [], "skipped": [reason], "orphans": [],
-                "measure": None}
+                "unowned": [], "measure": None}
 
     lock = session_lock.try_lock(os.path.join(cfg.state_dir, MANAGED_DIR), "host-pass")
     if lock is None:
@@ -3443,9 +3583,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     entries: list[dict] = []
     plan: list[dict] = []
     skipped: list[str] = []
+    unowned: list[dict] = []
     if disabled():
         return {"host": host, "dry_run": dry_run, "disabled": True, "entries": [],
-                "plan": [], "skipped": ["AMEESH_HOUSEKEEPING=off"], "measure": None}
+                "plan": [], "skipped": ["AMEESH_HOUSEKEEPING=off"], "unowned": [],
+                "measure": None}
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     registered: set[str] = set()
     protected: set[str] = set()
@@ -3465,6 +3607,16 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         registered = None  # type: ignore[assignment]
     # 1. dossiers temporaires des agents
     key = mesh_key(cfg)
+    # #2493 : dernier signalement d'un dossier sans propriétaire, pour ne pas
+    # le répéter dans `skipped` à chaque passe (un constat persistant suffit).
+    last_unowned: dict[str, dict] = {}
+    try:
+        for row in storage.of(db).housekeeping.latest_by_path(host, "tmp"):
+            if row.get("action") == "unowned":
+                last_unowned[row["path"]] = row
+    except Exception:  # journal illisible : on signale, sans doublon garanti
+        last_unowned = {}
+    seen_unowned: set[str] = set()
     if os.path.isdir(troot) and _managed(troot):
         for name in sorted(os.listdir(troot)):
             full = os.path.join(troot, name)
@@ -3489,6 +3641,46 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             # idle, like the directory of an agent absent from the registry
             orphan = FALLBACK_SEP in name or (registered is not None
                                               and agent not in registered)
+            # #2326 : la suppression ne vise que ce qui est À NOUS. Un dossier
+            # sans fichier de propriétaire de ce mesh (worktree créé par un
+            # agent à la racine partagée, dossier d'un autre mesh d'avant L219,
+            # nom inconnu) n'est jamais supprimé, même ancien : un registre
+            # vide, partiel ou ancien ne doit rien détruire.
+            if orphan and owner != key:
+                # #2493 (N1) : ce dossier n'est jamais supprimé (#2326) ; on
+                # ne le répète plus dans `skipped` à chaque passe. Un constat
+                # unique le suit, re-signalé seulement s'il change ou après
+                # UNOWNED_REFRESH_S, et l'alerte `tmp_unowned` le reprend.
+                seen_unowned.add(full)
+                previous = last_unowned.get(full)
+                data = (previous or {}).get("data") or {}
+                try:
+                    st = os.stat(full)
+                    ino, dev, mtime = st.st_ino, st.st_dev, st.st_mtime
+                except OSError:
+                    ino = dev = mtime = None
+                changed = (previous is None or data.get("ino") != ino
+                           or data.get("dev") != dev or data.get("mtime") != mtime)
+                # #2493 : ne pas parcourir un dossier inchangé à chaque passe ;
+                # sa taille journalisée suffit tant que rien ne le modifie.
+                size = (size_of(full) if changed or previous.get("bytes") is None
+                        else int(previous["bytes"]))
+                first_seen = data.get("first_seen") or now
+                if changed or now - float((previous or {}).get("at_ts") or 0) \
+                        >= UNOWNED_REFRESH_S:
+                    command = tmp_recovery_command(full)
+                    entries.append({
+                        "kind": "tmp", "action": "unowned", "path": full,
+                        "bytes": size, "agent": agent,
+                        "detail": "no owner file of this mesh: never deleted; "
+                                  "inspect with the command, then move it or "
+                                  "remove it manually once its work is saved",
+                        "data": {"ino": ino, "dev": dev, "mtime": mtime,
+                                 "first_seen": first_seen, "command": command}})
+                unowned.append({"path": full, "bytes": size, "agent": agent,
+                                "first_seen": first_seen,
+                                "command": tmp_recovery_command(full)})
+                continue
             why = tmp_problem(full, owner, key, registered=not orphan,
                               idle_after=policy.orphan_idle, now=now)
             if why:
@@ -3508,20 +3700,45 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
-                    size = size_of(full)
+                    size = size_of(full)          # avant tout retrait : total libéré
+                    # #2493 (N2) : un dossier qui porte une copie git n'est
+                    # supprimé qu'après la preuve qu'aucun travail n'y est à
+                    # garder (propre, poussé ou intégré, sans verrou, sans
+                    # sous-module, sans processus dedans) ; les worktrees sont
+                    # retirés par `git worktree remove`, jamais `--force`.
+                    # Sinon il reste, avec la raison et la commande à lancer.
+                    git_repos: list[str] = []
+                    if _git_copies(full):
+                        work = tmp_git_work(
+                            full, build_artifacts.rules_of(policy.artifacts))
+                        if work:
+                            command = tmp_recovery_command(full)
+                            skipped.append("tmp %s kept: git work — %s ; inspect "
+                                           "with: %s" % (full, work, command))
+                            continue
+                        if not dry_run:
+                            ok, error, git_repos = recover_tmp_git_copies(full)
+                            if not ok:
+                                skipped.append("tmp %s kept: git worktree removal "
+                                               "refused — %s" % (full, error))
+                                continue
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "suppression", "bytes": size,
                                  "detail": "agent not in the registry"})
                     if not dry_run:
-                        freed = _safe_rmtree(full, troot)
+                        _safe_rmtree(full, troot)
+                        for repo in git_repos:
+                            prune_worktrees(repo)
                         for leftover in (owner_file(troot, name), lock_file(troot, name)):
                             try:
                                 os.unlink(leftover)
                             except OSError:
                                 pass
                         entries.append({"kind": "tmp", "action": "deleted", "path": full,
-                                        "bytes": freed, "agent": agent,
-                                        "detail": "agent not in the registry"})
+                                        "bytes": size, "agent": agent,
+                                        "detail": "agent not in the registry"
+                                        + ("; git worktrees recovered"
+                                           if git_repos else "")})
                     continue
                 result = evict_lru([full], troot, policy.tmp_quota, now=now,
                                    dry_run=dry_run)
@@ -3555,6 +3772,14 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             finally:
                 if lock is not None:
                     lock.close()
+        # #2493 : un constat sans propriétaire dont le dossier a disparu est
+        # clos (l'alerte `tmp_unowned` s'arrête), comme une entrée de /tmp.
+        if not dry_run:
+            for path in last_unowned:
+                if path in seen_unowned or os.path.lexists(path):
+                    continue
+                entries.append({"kind": "tmp", "action": "gone", "path": path,
+                                "detail": "unowned temporary directory gone"})
     # 2. caches partagés
     directories = [os.path.join(croot, name) for name, _v in cache_names(policy)]
     if busy:
@@ -3694,7 +3919,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                      orphan_bytes=sum(o["bytes"] for o in orphans))})
         storage.of(db).housekeeping.log(host, entries, actor=actor)
     return {"host": host, "dry_run": dry_run, "entries": entries, "plan": plan,
-            "skipped": skipped, "orphans": orphans, "measure": report_measure,
+            "skipped": skipped, "orphans": orphans, "unowned": unowned,
+            "measure": report_measure,
             "containers": report_measure["containers"],
             "volumes": report_measure["volumes"],
             "policy": policy.as_dict()}
@@ -3759,8 +3985,10 @@ def print_report(report: dict) -> None:
                 " — ALERT: above %d %%" % round(m["tmpfs_alert"] * 100)
                 if (m.get("system_tmp_fraction") or 0) >= m["tmpfs_alert"] else ""))
     # en essai, les entrées de /tmp ont leur propre section (avec la commande)
-    rows = [p for p in report["plan"] if p.get("kind") != "orphan"] if report["dry_run"] \
-        else [e for e in report["entries"] if e["kind"] != "mesure"]
+    rows = [p for p in report["plan"] if p.get("kind") != "orphan"
+            and p.get("action") != "unowned"] if report["dry_run"] \
+        else [e for e in report["entries"] if e["kind"] != "mesure"
+              and e.get("action") != "unowned"]
     if not rows and not skipped_pass:
         print("  nothing to do")
     for row in rows:
@@ -3768,6 +3996,15 @@ def print_report(report: dict) -> None:
             row.get("kind", ""), action_label(row.get("action", "")),
             _fmt(row["bytes"]) if row.get("bytes") is not None else "",
             row.get("path", ""), " — %s" % row["detail"] if row.get("detail") else ""))
+    # #2493 : les dossiers sans propriétaire ne sont ni supprimés ni répétés
+    # dans `skipped` ; une section stable dit quoi inspecter.
+    unowned = report.get("unowned") or ()
+    if unowned:
+        print("  unowned   temporary dirs without owner file (never deleted; "
+              "inspect before any manual move):")
+        for row in unowned:
+            print("            %-10s %s — %s" % (
+                _fmt(row.get("bytes")), row.get("path"), row.get("command")))
     if not skipped_pass:  # #2173: the reason is already in the banner, once
         for note in report.get("skipped") or ():
             print("  skipped   %s" % note)

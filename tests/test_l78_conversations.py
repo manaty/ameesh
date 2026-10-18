@@ -8,10 +8,9 @@ import os
 import threading
 import time
 import unittest
-import uuid
 from unittest import mock
 
-from ameesh import adapters, conversation as C, db as db_mod, fil, progress, storage
+from ameesh import adapters, conversation as C, db as db_mod, fil, progress
 from tests.support import PgTestCase
 
 
@@ -224,24 +223,10 @@ class StoreTest(PgTestCase):
         if listener is None:
             self.skipTest("driver has no LISTEN")
         self.addCleanup(listener.close)
-        # psql starts LISTEN asynchronously. Observe a unique probe before
-        # testing transaction delivery; startup latency is not a lost event.
-        probe = json.dumps({"probe": uuid.uuid4().hex})
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            storage.of(self.db).wakeups.notify(C.CHANNEL, probe)
-            message = listener.wait(0.5)
-            if message is not None and message.get("payload") == probe:
-                for _ in range(32):
-                    message = listener.wait(0.1)
-                    if message is None:
-                        break
-                    self.assertNotEqual(message.get("event"), "down", message)
-                else:
-                    self.fail("conversation listener probe queue did not drain")
-                break
-        else:
-            self.fail("conversation listener never became ready")
+        # #2514 : l'abonnement attend déjà ses LISTEN (sonde de #681,
+        # pg_listening_channels) ; la sonde de ce test réémettait le même
+        # payload et son vidage de 0,1 s laissait une notification en vol que
+        # la lecture suivante prenait pour celle du journal sous charge CI.
         with self.db.transaction() as tx:
             log = C.Log(tx, self.cfg, agent="worker", project="acme")
             row = log.append("text", "sensitive " * 2000, event_id="1")

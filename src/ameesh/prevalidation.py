@@ -60,6 +60,10 @@ REPORT_SCHEMA = "ameesh-prevalidation/1"
 #: du plan L161f, chemin dépôt, contrat CLI `run --plan --part --driver --flow`.
 #: Un projet qui a son propre outil le déclare (`parts_script` du bloc, #1770).
 DEFAULT_PARTS_SCRIPT = "scripts/test-parts.py"
+#: lectures d'objets au SHA candidat sans `refs/replace` (#1819) : un
+#: remplacement local réécrit le contenu lu sans changer le SHA, la preuve
+#: divergerait de la référence publiée
+NO_REPLACE = offload.NO_REPLACE
 
 #: causes de refus d'une prévalidation ; le gel n'est pas écrit, la cause est dite
 CAUSES = (
@@ -69,7 +73,8 @@ CAUSES = (
     "plan-path-conflict",   # un parent du plan est un fichier au SHA (conflit D/F, #1820)
     "selection-full",     # le plan retombe sur la suite complète : refus, jamais de repli
     "head-moved",         # le plan ne porte pas la tête candidate exacte
-    "no-vm",              # VM absente, injoignable, job refusé ou arrêté (offload 75)
+    "no-vm",              # VM absente, injoignable, job refusé (offload 75)
+    "gate-preempted",     # le run a été arrêté par la porte de l'hôte (drain), pas une VM
     "run-red",            # la sélection est rouge
     "run-incomplete",     # timeout, annulation, part sans fin : inexploitable (124/130/70)
     "transport-lost",     # connexion perdue, résultat non authentifié
@@ -115,6 +120,9 @@ SECONDS_MARK = "ameesh-prevalidation-seconds="
 PART_MARK = "ameesh-prevalidation-part="
 _SECONDS_RE = re.compile(r"^%s(\d+)\s*$" % re.escape(SECONDS_MARK), re.M)
 _PART_RE = re.compile(r"^%s([A-Za-z0-9_.:-]+)\s*$" % re.escape(PART_MARK), re.M)
+#: note du client offload quand la porte de l'hôte arrête un run (drain)
+_GATE_STOP_RE = re.compile(r"^ameesh offload: stopped on .*: host (?:stopped|draining)\b",
+                           re.M)
 
 
 def _same_commit(a: str | None, b: str | None) -> bool:
@@ -478,7 +486,7 @@ def _tree_entries(root: str, head: str, paths: Sequence[str], *,
     de supposer un chemin sûr."""
     if not paths:
         return []
-    proc = runner(["git", "-C", root, "--literal-pathspecs", "ls-tree", "-z",
+    proc = runner(["git", "-C", root, *NO_REPLACE, "--literal-pathspecs", "ls-tree", "-z",
                    head, "--", *paths], capture_output=True, text=True)
     if getattr(proc, "returncode", 1):
         raise PrevalidationError("selection-unsafe",
@@ -564,10 +572,16 @@ def classify(exit_code: int, output: str = "") -> str:
     """Le sort du run depuis le code de sortie de l'offload (contrat L159b).
 
     Le code 75 couvre l'absence d'hôte, le refus/arrêt du job **et** la
-    connexion perdue : les notes de l'offload les distinguent."""
+    connexion perdue : les notes de l'offload les distinguent. Un run arrêté
+    par la porte de l'hôte (drain, `stopped on … host stopped|draining`) est
+    une `gate-preempted`, jamais un `no-vm` : la VM existe, c'est l'hôte qui a
+    préempté le run (#2298)."""
     code = int(exit_code)
-    if code == 75 and "lost the connection" in (output or ""):
+    output = output or ""
+    if code == 75 and "lost the connection" in output:
         return "transport-lost"
+    if code == 75 and _GATE_STOP_RE.search(output):
+        return "gate-preempted"
     return RUN_OUTCOMES.get(code, "run-incomplete")
 
 
@@ -636,7 +650,9 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
                         profile=profile, executable=executable)
     started = time.time()
     proc = runner(argv, cwd=cwd, env=env, capture_output=True, text=True)
-    output = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
+    # Les flux ont des lignes indépendantes, même sans saut final sur stdout.
+    output = "\n".join((getattr(proc, "stdout", "") or "",
+                        getattr(proc, "stderr", "") or ""))
     result = {"outcome": classify(proc.returncode, output), "exit": int(proc.returncode),
               "host": host, "flow": parse_flow(output)}
     result["seconds"] = parse_seconds(output)
@@ -664,7 +680,8 @@ def contract_modules(paths, repo: str = "", *, head: str = "",
         if head:
             # `cat-file blob` : contenu brut d'un fichier, un répertoire refuse
             # (`show` listerait l'arbre et en ferait des modules)
-            proc = runner(["git", "-C", repo or ".", "cat-file", "blob", "%s:%s" % (head, path)],
+            proc = runner(["git", "-C", repo or ".", *NO_REPLACE, "cat-file", "blob",
+                           "%s:%s" % (head, path)],
                           capture_output=True, text=True)
             if getattr(proc, "returncode", 1):
                 return (), "contrat déclaré illisible au SHA candidat: %s" % path

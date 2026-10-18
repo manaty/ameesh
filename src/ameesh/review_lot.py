@@ -455,6 +455,10 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     """Le corps du lot de relecture : quoi relire, par qui, avant quand."""
     author = author or {}
     who = author.get("name") or "inconnu"
+    # #2384 : la famille se lit sur le harnais du gel, jamais sur le texte
+    # affiché (le nom d'un tiers qui a reposé le gel peut contenir un mot de
+    # famille) ; le corps doit annoncer exactement ce que la garde relira.
+    author_family = family_of(author.get("harness"))
     harness = author.get("harness") or UNTRACED
     if author.get("refroze"):
         # #1859 : un tiers a reposé le gel ; il n'est pas l'auteur
@@ -462,7 +466,9 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     where = "PR #%s" % pr if pr else (merged_sha[:12] if merged_sha else "?")
     why = " ".join(str((klass or {}).get("why") or "").split())
     critical = bool((klass or {}).get("critical"))
-    families = review_families(harness) if critical else ()
+    families = review_families(author.get("harness")) if critical else ()
+    author_human = who.lower().startswith(work.HUMAN_PREFIX)
+    untraced = critical and not author_family and not author_human
     lines = [
         ("Relecture après fusion (canon `processus/lots.md` §2, **porte de fusion** : "
          "deux avis indépendants)." if critical
@@ -476,6 +482,19 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
                                      target or item.get("branch_target") or "sa cible"),
         "- Auteur : %s (harnais %s)." % (who, harness),
     ]
+    if untraced:
+        # #2384 : sans famille d'auteur tracée, les deux avis ne peuvent pas
+        # prouver leur indépendance et la garde de livraison refuse `--done`.
+        # Le corps le dit avant les verdicts, avec la route de sortie.
+        lines.extend([
+            "- **Famille de l'auteur non tracée** : l'indépendance des deux avis "
+            "ne peut pas être prouvée ; `ameesh work close <id> --done` sera refusé "
+            "même après deux verdicts `ok` (garde de livraison, #2374).",
+            "- Route : livrer les verdicts sur le lot source, puis saisir le pilote ; "
+            "il tranche l'abandon de la mission (`ameesh work close <id> --abandoned`), "
+            "son remplacement (`--superseded-by <id>`) ou une dispense, consignée dans "
+            "la note de clôture. Ne pas clore `--done` : la garde le refuse.",
+        ])
     if critical:
         lines.extend([
             "- Relecteurs : **deux familles distinctes**, hors de celle de l'auteur — "
@@ -504,9 +523,11 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
             "- livrer le verdict (`ameesh work milestone %d verdict ok|blocked --sha %s`) ;"
             % (int(lot), merged_sha or "<sha>"))
     lines.extend([
-        "- **livré le verdict ? clore cette mission** : `ameesh work close <id> --done` — "
-        "elle n'a ni branche ni fusion, et le verdict du parent relu en est la preuve "
-        "(#1280) ;",
+        ("- **livrés les verdicts ? saisir le pilote** pour clore cette mission "
+         "selon la route ci-dessus ;" if untraced else
+         "- **livré le verdict ? clore cette mission** : `ameesh work close <id> --done` — "
+         "elle n'a ni branche ni fusion, et le verdict du parent relu en est la preuve "
+         "(#1280) ;"),
         "- si un défaut **non bloquant** se corrige en moins de 5 minutes, le corriger "
         "et pousser la correction sur la cible : le relecteur corrige lui-même dès le "
         "premier tour (canon §2, home#81) ; les autres défauts non bloquants vont au "
@@ -525,7 +546,9 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
         "",
         ("Ce lot n'est assigné à personne : le premier relecteur disponible de la bonne "
          "famille le prend ; une seconde famille doit rendre le second avis avant la "
-         "clôture." if critical else
+         "clôture." + (" La clôture `--done` reste soumise à la route ci-dessus tant "
+                       "que la famille de l'auteur n'est pas tracée." if untraced else "")
+         if critical else
          "Ce lot n'est assigné à personne : il est dans la file de l'équipe, le premier "
          "relecteur disponible de la bonne famille le prend."),
     ])
@@ -747,7 +770,9 @@ def guard_delivery(db, item: dict) -> dict:
     if required >= 2 and not author_family and not author_human:
         raise work.WorkError(
             "lot #%s: famille de l'auteur inconnue ; indépendance des deux "
-            "avis non prouvée, clôture refusée" % item["id"])
+            "avis non prouvée, clôture refusée — route : le pilote tranche "
+            "(abandon/remplacement de la mission, ou dispense consignée dans "
+            "la note de clôture)" % item["id"])
     created = float(item.get("created_ts") or 0.0)
     repo = (_repo_of_agent(db, str(source.get("assignee") or ""))
             or lot_class.repository(getattr(db, "cfg", None), source) or "")
@@ -782,7 +807,10 @@ def guard_delivery(db, item: dict) -> dict:
             continue
         if author and actor and actor.lower() == author.lower():
             continue                  # on ne relit pas son propre travail
-        family = merge_queue.actor_family(db, actor)
+        try:
+            family = merge_queue.actor_family(db, actor)
+        except merge_queue.RegistryReadError:
+            family = ""              # #2521 : lecture impossible, famille non prouvée
         if family and author_family and family == author_family:
             continue                  # la famille de l'auteur ne compte pas
         if required >= 2:
@@ -972,9 +1000,11 @@ CATCH_UP_LIMIT = 20
 
 
 def merged_sha(db, lot: int) -> str:
-    """Le commit du dernier jalon `merged` du lot, ou "" (best effort)."""
+    """Le commit du dernier jalon `merged` EFFECTIF du lot, ou "" (best effort).
+    Un jalon annulé par une correction `merged → build` est ignoré (#2317/N5)."""
     try:
-        rows = [m for m in work.milestones(db, int(lot)) if m.get("kind") == "merged"]
+        rows = [m for m in work.milestones(db, int(lot))
+                if m.get("kind") == "merged" and not m.get("annulled")]
     except Exception:  # noqa: BLE001 - pas de jalon lisible : pas de commit
         return ""
     if not rows:

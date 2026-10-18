@@ -406,6 +406,32 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertNotIn(entree, {a.get("path") for a in exploitation.alerts(self.cfg, self.db)
                                   if a["type"] == "tmp_orphan"})
 
+    def test_dossier_tmp_sans_proprietaire_alerte_une_fois(self):
+        """#2493 N1 : un dossier de la racine gérée sans fichier de
+        propriétaire n'est jamais supprimé ; il n'est plus répété dans
+        `skipped` et fait l'objet d'un seul constat persistant, avec sa
+        commande d'inspection (l'alerte ne se re-annonce pas)."""
+        troot = menage.tmp_root(self.cfgl, self.pol)
+        menage._ensure_root(troot)
+        legacy = os.path.join(troot, "ancien-hors-registre")
+        _write(os.path.join(legacy, "f"), 5000)
+        rapport = self._passage(0.0)
+        self.assertTrue(os.path.isdir(legacy))
+        self.assertEqual([note for note in rapport["skipped"]
+                          if "not owned by this mesh" in note], [])
+        self.assertIn(legacy, [row["path"] for row in rapport["unowned"]])
+        alertes = [a for a in exploitation.alerts(self.cfgl, self.db)
+                   if a["type"] == "tmp_unowned" and a.get("path") == legacy]
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual(alertes[0]["value"], menage.size_of(legacy))
+        self.assertIn("ls -la", alertes[0]["detail"])
+        since = alertes[0]["since"]
+        self._passage(menage.UNOWNED_REFRESH_S + 60)
+        alertes = [a for a in exploitation.alerts(self.cfgl, self.db)
+                   if a["type"] == "tmp_unowned" and a.get("path") == legacy]
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual(alertes[0]["since"], since)
+
     def test_suivi_sans_borne_au_dela_de_500_et_200_entrees(self):
         """#222 (relecture) : le passage lisait 500 lignes, les alertes 200 ;
         chaque entrée non attribuée est suivie et alertée, quel qu'en soit le

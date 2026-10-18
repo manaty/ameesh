@@ -455,6 +455,37 @@ class BranchMergeTest(_Base):
         self.assertEqual(self.sync()["results"][0]["result"], "open")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
 
+    def test_branche_nee_d_un_paquet_deja_fusionne_n_est_pas_livree(self):
+        """#2543 : une pointe entrée dans la cible par la fusion d'un AUTRE lot
+        (un paquet) n'est pas une preuve de livraison. Tant que l'auteur n'a pas
+        de commit propre, le lot reste ouvert ; après son commit puis sa fusion,
+        le relevé le ferme."""
+        # le paquet : son commit entre dans develop par un commit de fusion,
+        # donc hors de la chaîne première-parente de la cible.
+        self.branch("paquet/78", "paquet")
+        paquet = _git(self.repo, "rev-parse", "paquet/78")
+        self.commit("apres-paquet")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge paquet/78", "paquet/78")
+        # la branche du lot naît sur ce commit, sans travail propre
+        _git(self.repo, "branch", "agent/dev1-paquet", paquet)
+        lot = self.lot("agent/dev1-paquet")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("no work of its own", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        # le premier commit de l'auteur, vu en avance, puis sa fusion : livré
+        _git(self.repo, "checkout", "-q", "agent/dev1-paquet")
+        self.commit("propre")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "merge agent/dev1-paquet",
+             "agent/dev1-paquet")
+        report = self.sync()
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(report["results"][0]["how"], "ancestor")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
     def test_avance_rapide_apres_un_releve(self):
         self.branch("agent/dev1-ff", "f1")
         lot = self.lot("agent/dev1-ff")
@@ -523,6 +554,10 @@ class BranchMergeTest(_Base):
         proc = self.mesh("work", "assign", str(other["id"]), "dev1", "--branch", "agent/y")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, other["id"])["branch"], "agent/y")
+        # #2543 : une pointe jamais vue en avance ne prouve rien (même forme
+        # qu'une branche née sur un commit déjà fusionné) ; le relevé la voit
+        # d'abord en avance, puis sa fusion la ferme.
+        self.sync()
         _git(self.repo, "merge", "-q", "--no-ff", "-m", "m", "agent/dev1-cli")
         proc = self.mesh("work", "sync-branches")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -582,9 +617,8 @@ class CloneRefreshTest(_Base):
             fh.write(text)
 
     def lot_in_another_clone(self, branch):
-        """La branche du lot naît dans un AUTRE clone, puis est fusionnée dans
-        `main` distante : le clone de l'assigné ne voit ni l'une ni l'autre
-        sans fetch."""
+        """La branche du lot naît dans un AUTRE clone, avec son commit, puis
+        est poussée : le clone de l'assigné ne la voit pas sans fetch."""
         other = os.path.join(self.tmp, "other-" + branch.replace("/", "-"))
         _git(self.tmp, "clone", "-q", self.origin, other)
         _git(other, "checkout", "-q", "-b", branch, "origin/main")
@@ -592,19 +626,29 @@ class CloneRefreshTest(_Base):
         _git(other, "add", "-A")
         _git(other, "commit", "-qm", branch)
         _git(other, "push", "-q", "origin", branch)
+        return other
+
+    def merge_in_another_clone(self, other, branch):
+        """La branche déjà vue en avance (#2543) est fusionnée dans `main`
+        distante, que le clone de l'assigné ne voit pas non plus sans fetch."""
         _git(other, "checkout", "-q", "main")
         _git(other, "merge", "-q", "--no-ff", "-m", "merge %s" % branch, branch)
         _git(other, "push", "-q", "origin", "main")
-        return other
 
     def test_a_stale_clone_is_fetched_before_the_probe(self):
         branch = "lot/2302-stale"
         stale = _git(self.repo, "rev-parse", "origin/main")
         merged = self.lot_in_another_clone(branch)
-        self.assertNotEqual(stale, _git(merged, "rev-parse", "main"))
         self.agent("dev1", cwd=self.repo)
         lot = work.add(self.db, title="clone en retard", assignee="dev1",
                        branch=branch, branch_target="main")
+        # #2543 : la pointe est d'abord vue en avance (le premier relevé
+        # rafraîchit le clone), puis sa fusion est constatée.
+        first = plan_git.sync_branches(self.db, host=self.cfg.host)["results"][0]
+        self.assertEqual(first["result"], "open", first)
+        self.assertIsNotNone(work.get(self.db, lot["id"])["branch_head"])
+        self.merge_in_another_clone(merged, branch)
+        self.assertNotEqual(stale, _git(merged, "rev-parse", "main"))
         report = plan_git.sync_branches(self.db, host=self.cfg.host)
         entry = report["results"][0]
         self.assertEqual(entry["result"], "merged", entry)
@@ -622,12 +666,16 @@ class CloneRefreshTest(_Base):
         _git(wrong, "commit", "-qm", "base")
         _git(wrong, "push", "-q", "-u", "origin", "main")
         branch = "lot/2302-wrong-repo"
-        self.lot_in_another_clone(branch)
+        other = self.lot_in_another_clone(branch)
         self.agent("dev1", cwd=wrong)
         self.agent("dev2", cwd=self.repo)
         lot = work.add(self.db, title="dépôt du projet", assignee="dev1",
                        branch=branch, branch_target="main",
                        issue_ref="manaty/ameesh#1692")
+        # #2543 : même lecture en deux temps que ci-dessus.
+        first = plan_git.sync_branches(self.db, host=self.cfg.host)["results"][0]
+        self.assertEqual((first["result"], first["repo"]), ("open", self.repo), first)
+        self.merge_in_another_clone(other, branch)
         report = plan_git.sync_branches(self.db, host=self.cfg.host)
         entry = report["results"][0]
         self.assertEqual(entry["result"], "merged", entry)

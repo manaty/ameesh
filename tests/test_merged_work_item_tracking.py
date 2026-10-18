@@ -25,8 +25,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (assignments, exploitation, mail, plan_git, projects, registry,
-                    sous_utilisation, storage, work)
+from ameesh import (assignments, exploitation, land, mail, plan_git, process_verifiers,
+                    projects, registry, review_lot, storage, sous_utilisation, work)
 
 from .support import PgTestCase, hold_for_owner
 
@@ -268,11 +268,182 @@ class CorrectionTest(_Base):
         self.assertEqual(item["state"], "build")
         self.assertEqual(work.events(self.db, lot["id"])[0]["note"],
                          "correction: merged → build — PR d'étape fusionnée trop tôt (#759)")
-        # le jalon de fusion reste : la fusion a bien eu lieu
+        # le jalon de fusion reste : la fusion a bien eu lieu (l'historique
+        # n'est pas réécrit)…
         self.assertEqual(sum(1 for m in work.milestones(self.db, lot["id"])
                              if m["kind"] == "merged"), 1)
+        # … mais la correction l'annule à la lecture : il ne date plus le lot
+        # tant qu'aucune fusion postérieure n'a écrit son propre jalon.
+        self.assertIsNone(work.timeline(self.db, lot["id"])["merged_ts"])
         # et le lot repart dans la machine à états
         self.assertEqual(work.move(self.db, lot["id"], "qa")["state"], "qa")
+        # la vraie fusion écrit SON jalon, daté par elle
+        self.assertEqual(work.move(self.db, lot["id"], "merged")["state"], "merged")
+        jalons = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertEqual(len(jalons), 2)
+        vrai = max(jalons, key=lambda m: m["at_ts"])
+        self.assertEqual(work.timeline(self.db, lot["id"])["merged_ts"],
+                         vrai["at_ts"])
+
+    def test_1693_jalon_annule_reste_mais_toutes_les_lectures_l_ecartent(self):
+        # #1693 (N4), variante sans reprise destructive : le jalon de la
+        # fusion annulée reste dans `work_item_milestones` (l'historique est
+        # préservé) ; ce sont les lectures qui calculent le jalon effectif
+        # depuis le journal — affichage, délais, en-tête d'issue et mesures.
+        lot = work.add(self.db, title="fusion annulée", actor="orch")
+        work.set_branch(self.db, lot["id"], "lot/%d-etape" % lot["id"], actor="orch",
+                        source="test")
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("acme/web#9", lot["id"]))
+        work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
+        self.assertIsNotNone(work.timeline(self.db, lot["id"])["merged_ts"])
+        work.move(self.db, lot["id"], "build", actor="orch",
+                  correct="PR d'étape fusionnée trop tôt (#759)")
+        # l'historique est intact : un seul jalon, celui de la fusion annulée
+        jalons = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertEqual(len(jalons), 1)
+        # aucune lecture ne le retient comme fusion effective
+        self.assertIsNone(work.timeline(self.db, lot["id"])["merged_ts"])
+        self.assertIsNone(work.delays(self.db, ids=[lot["id"]])[0]["merged_ts"])
+        feed = next(r for r in storage.of(self.db).work.issue_feed(200)
+                    if int(r["id"]) == int(lot["id"]))
+        self.assertIsNone(feed["merged_ts"])
+        self.assertFalse(any(int(r["id"]) == int(lot["id"])
+                             for r in storage.of(self.db).work.estimate_history(
+                                 app=None, limit=200)))
+        self.assertFalse(any(int(r["id"]) == int(lot["id"])
+                             for r in storage.of(self.db).work.measure_candidates(
+                                 ids=[int(lot["id"])], retry_diff_s=3600, since_s=None,
+                                 limit=10)))
+        # le jalon effectif revient à la vraie fusion, postérieure à la
+        # correction ; l'ancien reste dans la table, la lecture prend le dernier
+        work.move(self.db, lot["id"], "qa", actor="orch")
+        work.move(self.db, lot["id"], "merged", actor="orch")
+        jalons = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertEqual(len(jalons), 2)
+        vrai = max(jalons, key=lambda m: m["at_ts"])
+        self.assertEqual(work.timeline(self.db, lot["id"])["merged_ts"],
+                         vrai["at_ts"])
+        self.assertEqual(work.delays(self.db, ids=[lot["id"]])[0]["merged_ts"],
+                         vrai["at_ts"])
+        feed = next(r for r in storage.of(self.db).work.issue_feed(200)
+                    if int(r["id"]) == int(lot["id"]))
+        self.assertEqual(feed["merged_ts"], vrai["at_ts"])
+        self.assertTrue(any(int(r["id"]) == int(lot["id"])
+                            for r in storage.of(self.db).work.estimate_history(
+                                app=None, limit=200)))
+
+    def test_1693_retour_de_blocked_ne_redate_pas_la_fusion(self):
+        # R1 dev2 (B1) : `merged → blocked → merged` n'est pas une nouvelle
+        # fusion ; sans index unique, le déclencheur ne doit pas écrire un
+        # second jalon qui redaterait le lot et perdrait le SHA.
+        lot = work.add(self.db, title="aller-retour", actor="orch")
+        work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
+        avant = work.timeline(self.db, lot["id"])["merged_ts"]
+        work.move(self.db, lot["id"], "blocked", actor="orch")
+        work.move(self.db, lot["id"], "merged", actor="orch")
+        jalons = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertEqual(len(jalons), 1)
+        self.assertEqual(jalons[0]["sha"], SHA)
+        self.assertEqual(work.timeline(self.db, lot["id"])["merged_ts"], avant)
+
+    def test_2317_une_note_libre_du_meme_prefixe_n_annule_pas_la_fusion(self):
+        # #2317 (N2) : la correction se reconnaît à la TRANSITION du journal,
+        # pas au texte de sa note. Une note libre qui commence par le même
+        # préfixe ne doit donc pas annuler la fusion.
+        lot = work.add(self.db, title="note libre", actor="orch")
+        work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
+        work.note(self.db, lot["id"], "correction: merged → build — note libre",
+                  actor="orch")
+        jalons = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertEqual(len(jalons), 1)
+        self.assertFalse(jalons[0]["annulled"])
+        self.assertIsNotNone(work.timeline(self.db, lot["id"])["merged_ts"])
+        # une VRAIE correction, elle, annule le jalon (transition merged→build)
+        work.move(self.db, lot["id"], "build", actor="orch", correct="vraie correction")
+        jalons = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertTrue(jalons[0]["annulled"])
+
+    def test_2317_le_jalon_est_date_a_l_insertion_pas_au_debut_de_transaction(self):
+        # #2317 (N1) : now() = début de transaction ; un close_merged retenu
+        # par le verrou consultatif datait sa fusion avant une correction
+        # concurrente. Le jalon est daté par clock_timestamp().
+        lot = work.add(self.db, title="horloge", actor="orch")
+        with self.db.transaction() as tx:
+            debut = tx.query("SELECT extract(epoch from now())::float8 AS ts")[0]["ts"]
+            time.sleep(0.05)
+            work.close_merged(tx, lot["id"], sha=SHA, actor="orch")
+            row = tx.query(
+                "SELECT extract(epoch from at)::float8 AS ts FROM work_item_milestones"
+                " WHERE work_item_id = %s AND kind = 'merged'", (lot["id"],))[0]
+            self.assertGreater(row["ts"], debut)
+
+    def test_2317_correction_apres_fusion_dans_transaction_englobante(self):
+        # Both operations may share an outer transaction. Its start precedes
+        # the merge milestone; the later correction must still annul it.
+        lot = work.add(self.db, title="correction transactionnelle", actor="orch")
+        with self.db.transaction() as tx:
+            work.close_merged(tx, lot["id"], sha=SHA, actor="orch")
+            work.move(tx, lot["id"], "build", actor="orch", correct="trop tôt")
+            merged = [m for m in work.milestones(tx, lot["id"])
+                      if m["kind"] == "merged"]
+            self.assertTrue(merged[0]["annulled"])
+            self.assertIsNone(work.timeline(tx, lot["id"])["merged_ts"])
+            work.close_merged(tx, lot["id"], sha="f" * 40, actor="orch")
+            self.assertEqual(review_lot.merged_sha(tx, lot["id"]), "f" * 40)
+
+    def test_2317_les_lecteurs_de_fusion_ignorent_le_jalon_annule(self):
+        # #2317 (N5) : land, review_lot et le registre Process ne retiennent
+        # pas le sha d'une fusion annulée.
+        lot = work.add(self.db, title="lecteurs", actor="orch")
+        work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
+        self.assertEqual(land._merged_sha(self.db, lot["id"]), SHA)
+        self.assertEqual(review_lot.merged_sha(self.db, lot["id"]), SHA)
+        work.move(self.db, lot["id"], "build", actor="orch", correct="trop tôt")
+        self.assertEqual(land._merged_sha(self.db, lot["id"]), "")
+        self.assertEqual(review_lot.merged_sha(self.db, lot["id"]), "")
+        rows = storage.of(self.db).work.milestones(lot["id"], None)
+        self.assertEqual(process_verifiers.merged_of(rows), "")
+        # la vraie fusion, elle, redonne son sha
+        work.move(self.db, lot["id"], "qa", actor="orch")
+        work.close_merged(self.db, lot["id"], sha="f" * 40, actor="orch")
+        self.assertEqual(land._merged_sha(self.db, lot["id"]), "f" * 40)
+        self.assertEqual(review_lot.merged_sha(self.db, lot["id"]), "f" * 40)
+
+    def test_2317_estimate_history_garde_la_premiere_fin(self):
+        # #2317 (N6) : la fin d'un lot reste la PREMIÈRE livraison (fusion,
+        # sinon livraison hors cible). Un jalon `delivered` postérieur ne doit
+        # pas faire glisser la mesure (le max de #1693 le faisait).
+        lot = work.add(self.db, title="mesure", actor="orch")
+        work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
+        fusion = work.timeline(self.db, lot["id"])["merged_ts"]
+        time.sleep(0.02)
+        storage.of(self.db).work.add_milestone(
+            lot["id"], "delivered", sha=SHA, actor="orch", verdict=None,
+            note="delivered")
+        row = next(r for r in storage.of(self.db).work.estimate_history(
+            app=None, limit=500) if int(r["id"]) == int(lot["id"]))
+        self.assertAlmostEqual(row["merged_ts"], fusion, places=3)
+
+    def test_2317_corrections_bornees_aux_lots_candidats(self):
+        # #2317 (N4) : la lecture des corrections est bornée aux lots
+        # candidats, pas un LIKE sur tout le journal.
+        a = work.add(self.db, title="un", actor="orch")
+        b = work.add(self.db, title="deux", actor="orch")
+        for lot in (a, b):
+            work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
+            work.move(self.db, lot["id"], "build", actor="orch", correct="trop tôt")
+        st = storage.of(self.db).work
+        self.assertEqual(set(st.corrections([a["id"]])), {int(a["id"])})
+        self.assertEqual(set(st.corrections([a["id"], b["id"]])),
+                         {int(a["id"]), int(b["id"])})
+        self.assertEqual(st.corrections([]), {})
 
     def test_role_de_conception_au_canon(self):
         class Fiche:

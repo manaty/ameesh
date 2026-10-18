@@ -99,6 +99,30 @@ class MarkersTest(unittest.TestCase):
         self.assertFalse(fire.same_commit(A, B))
         self.assertFalse(fire.same_commit("", A))
 
+    def test_same_commit_by_common_prefix(self):
+        # #2349 : gel `c4d85ac37`, tête de PR `c4d85ac37dce` — le même commit
+        # sur deux longueurs ne doit pas invalider le feu.
+        full = "c4d85ac37dcedb8f11bbdfed89201ee38547ae4a"
+        self.assertTrue(fire.same_commit(full, full[:9]))
+        self.assertTrue(fire.same_commit(full[:12], full[:9]))
+        self.assertTrue(fire.same_commit(full[:9], full[:12]))
+        self.assertFalse(fire.same_commit(full[:9], "d4d85ac37"))
+        self.assertTrue(fire.same_commit(full, full))
+
+    def test_a_resolved_side_is_compared_by_its_full_id(self):
+        # relecture #2349 : le dépôt connaît l'abréviation du feu ; une tête
+        # inconnue qui partage seulement ce préfixe n'est pas le même commit.
+        known = "c4d85ac37dcedb8f11bbdfed89201ee38547ae4a"
+        other = "c4d85ac37000000000000000000000000000000f"
+        pins = {known[:9]: known, known: known}
+        with mock.patch.object(merge_queue, "pinned",
+                               side_effect=lambda _repo, sha: pins.get(sha)):
+            self.assertFalse(fire.same_commit(known[:9], other, "/repo"))
+            self.assertFalse(fire.same_commit(other, known[:9], "/repo"))
+            self.assertTrue(fire.same_commit(known[:9], known, "/repo"))
+            # rien de résolu : le préfixe commun reste la règle (#1756)
+            self.assertTrue(fire.same_commit("c4d85ac37", other))
+
     def test_state_covered_and_withdrawn(self):
         item = {"id": 3, "title": "t", "state": "build", "branch": "lot/3-x"}
         covered = _marks(_mark("frozen", A), _mark("fire", A))

@@ -263,6 +263,22 @@ class EchecsRapidesTest(PgTestCase):
         self.assertFalse((row["status_text"] or "").startswith("session lock held"),
                          row["status_text"])
 
+    def test_motif_de_la_nouvelle_serie_survit_a_la_remise_a_zero(self):
+        """#2206 : au changement de motif, `_deferral_over` remet
+        `deferred_reason` à vide ; le motif de la série qui commence est
+        rétabli, pour que la lecture qui suit (grâce d'un verrou tenu) porte
+        sur ce motif et non sur une chaîne vide."""
+        worker = self._worker(max_fast_failures=2)
+        worker.deferred_lock_grace = lambda: 2.0
+        worker.monotonic = Horloge().maintenant
+        worker.deferred_reason = "attach requested"
+        self.assertEqual(worker._deferred_turn(), worker.DEFERRED_RETRY)
+        self.assertEqual(worker.deferred_reason, "attach requested")
+        worker.deferred_reason = worker.DEFERRED_STATUS
+        self.assertEqual(worker._deferred_turn(), worker.DEFERRED_RETRY)
+        self.assertEqual(worker.deferred_reason, worker.DEFERRED_STATUS)
+        self.assertEqual(worker.deferred_series_reason, worker.DEFERRED_STATUS)
+
     def test_verrou_ne_recouvre_pas_un_autre_blocage(self):
         """#1914 : un agent déjà bloqué pour une autre raison (budget, auth,
         hôte…) garde son motif : le verrou tenu est journalisé et les reprises

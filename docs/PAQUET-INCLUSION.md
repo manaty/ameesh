@@ -32,6 +32,21 @@ La correction a deux jambes, toutes deux dans ce dépôt :
    cette tête, essai de fusion propre contre la cible). C'est la liste de
    départ de la composition ; un courrier peut ajouter une admission, jamais
    retirer un lot prêt du calcul.
+
+   #2496 : un lot dont le seul motif est `conflict` est prêt **comme unité**
+   quand une remise poussée sous `refs/ameesh/resolutions/<lot>/<cible>-…`
+   (ou `union-<cible>-…`) a pour parents le gel relu et un commit de la
+   cible, fusionne proprement dans la base, et qu'un verdict la couvre (sur
+   le SHA de la remise, avec la classe la plus stricte du gel et du contenu
+   composé — la remise contre la base —, au moins un avis indépendant même
+   pour un lot léger, et jamais la dispense `-none` du gel) ou que c'est une
+   union mécanique (ajouts purs des deux côtés, arbre égal à la fusion
+   `merge=union` ; §2, aucun avis). La remise est alors la **source** à
+   composer (`source`, et « remise … » dans le rapport). Un verdict sur la
+   remise ne périme pas le gel de la branche ; il n'est mis de côté que pour
+   une fusion à deux parents, jamais pour la tête publiée ni un SHA gelé : un
+   blocage du gel reste. Un blocage sur la remise la refuse toujours. Sinon le
+   motif `conflict` dit pourquoi chaque remise est refusée.
 2. `scripts/paquet-inclusion.py --ready-file` confronte cette liste au
    manifeste : tout lot prêt doit être **composé**, ou figurer dans la table
    « Écartés (ce véhicule) » avec un **motif**. Une ligne sans motif ne compte
