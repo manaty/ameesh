@@ -520,8 +520,8 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
             body=body_of(item, lot, klass=klass, merged_sha=merged_sha, pr=pr,
                          target=target, author=author, family=family),
             issue_ref=ref, actor=actor, mark_item_id=lot,
-            mark_note="%s lot #%d ouvert (classe %s, %d avis, relecture due %s)"
-                      % (ref, lot, review_class, reviews, deadline()))
+            mark_note="%s lot #{lot} ouvert (classe %s, %d avis, relecture due %s)"
+                      % (ref, review_class, reviews, deadline()))
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
         # revue #544 r2 : un appel concurrent a pu créer le lot pendant
         # l'attente du verrou ; on rend l'identifiant du gagnant, pas un échec
