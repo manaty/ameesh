@@ -224,10 +224,12 @@ class ApiTest(ServerMixin, unittest.TestCase):
                 peek.read_api(url, str(token_path), "worker", 3)
 
 
-from tests.test_l108_executor_server import ServeurExecTest, OWNER
+from tests import test_l108_executor_server as _exec_server
+
+OWNER = _exec_server.OWNER
 
 
-class ExecutorTest(ServeurExecTest):
+class ExecutorTest(_exec_server.ServeurExecTest):
     FENCE = ("inge-front", OWNER, 42)
 
     def test_peek_publication_is_scoped_fenced_sanitised_and_not_readable_to_executor(self):
