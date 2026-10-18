@@ -247,7 +247,8 @@ class Agents(Domain):
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
                        actor: str, principal: str,
-                       expect_reason: str | None = None) -> dict | None:
+                       expect_reason: str | None = None,
+                       not_after: float | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
@@ -258,6 +259,11 @@ class Agents(Domain):
         instruction, sous le verrou de ligne : une pause étrangère posée entre
         la lecture et la reprise n'est jamais levée. Refusé pour POSER une
         pause (`paused=True`).
+
+        `not_after` (#2184/R3) : échéance absolue (epoch) pour une POSE ; la
+        base la compare à son horloge sous le verrou de ligne et refuse la
+        pose au-delà (`changed=false`, `refusal='not_after'`). Une pose
+        distante retardée ne peut donc pas committer après le nettoyage.
         """
 
     @abc.abstractmethod
@@ -3100,6 +3106,14 @@ class Operations(Domain):
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
                         "turn_grace_seconds")
+
+    @abc.abstractmethod
+    def publish_peek(self, name: str, owner: str, epoch: int, payload: dict) -> bool:
+        """Replace a sanitised observation under the live agent lease; false if fenced."""
+
+    @abc.abstractmethod
+    def read_peek(self, name: str, human: str) -> dict | None:
+        """Responsible human only; no snapshot data selected on a refused read."""
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
