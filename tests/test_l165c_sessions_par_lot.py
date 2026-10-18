@@ -1193,6 +1193,24 @@ class ReveilProgrammeCliTest(_Base):
         self.assertIn("timezone", proc.stderr)
 
 
+class WakeDeadlineCliTest(unittest.TestCase):
+    """The absolute CLI deadline reaches the shared deadline validator."""
+
+    def test_absolute_deadline_is_parsed(self):
+        from ameesh.mesh_cli import build_parser, _wake_deadline
+        args = build_parser().parse_args([
+            "work", "wake", "1", "--at", "2999-01-01T00:00:00Z"])
+        self.assertIsNotNone(_wake_deadline(args))
+
+    def test_absolute_and_relative_deadlines_are_rejected(self):
+        from ameesh.mesh_cli import build_parser, _wake_deadline
+        args = build_parser().parse_args([
+            "work", "wake", "1", "--at", "2999-01-01T00:00:00Z",
+            "--in", "15m"])
+        with self.assertRaisesRegex(work.WorkError, "exactly one"):
+            _wake_deadline(args)
+
+
 class WakeGrantTest(unittest.TestCase):
     """#2466 : le GRANT du superviseur porte la colonne lue par `item_columns`."""
 

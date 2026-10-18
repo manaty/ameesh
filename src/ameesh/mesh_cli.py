@@ -3089,7 +3089,7 @@ def build_parser() -> argparse.ArgumentParser:
                      "wakes its assignee at the deadline, even under a hold or in "
                      "waiting_human/blocked)")
     pw_wake.add_argument("id", type=int)
-    pw_wake.add_argument("--at", default=None, metavar="TIME",
+    pw_wake.add_argument("--at", dest="wake_at", default=None, metavar="TIME",
                          help="absolute deadline, ISO 8601 with timezone "
                               "(the wake time is not read twice: a timezone is required)")
     pw_wake.add_argument("--in", dest="wake_in", default=None, metavar="DURATION",
