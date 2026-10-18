@@ -15,8 +15,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (alert_briefs, exploitation, notify, registry, storage, work,
-                    work_dependencies)
+from ameesh import (alert_briefs, decisions, exploitation, notify, registry, storage,
+                    work, work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -259,6 +259,88 @@ class AttentePorteurTest(_Base):
         text = alert_briefs._slo_breach(alert)
         self.assertIn("assignee: act on it", text)
         self.assertNotIn("do not reassign its holder", text)
+
+
+class AttenteDecisionTest(_Base):
+    """#2378 : un lot `waiting_human` à demande de décision ouverte attend son
+    décideur. Non échue, c'est une attente prévue (aucune alerte) ; échue,
+    l'alerte vise le pilote et prescrit de relancer le décideur, jamais de
+    réassigner le porteur. Sans demande, rien ne change."""
+
+    def ask(self, due_in_s=2 * HEURE):
+        view = decisions.ask(self.cfg, self.db, requester="dev1",
+                             question="Quel critère pour la porte des avis ?",
+                             options=["a=union", "b=par auteur"],
+                             lot=str(self.lot["id"]), due_ts=time.time() + due_in_s)
+        self.now = time.time()
+        return view
+
+    def expire(self, view, ago_s=10 * 60):
+        """La demande est échue depuis `ago_s` (l'échéance passe en base)."""
+        self.db.execute(
+            "UPDATE agent_mailbox SET payload = jsonb_set(payload, '{decision,due_ts}',"
+            " to_jsonb(%s::float8)) WHERE id = %s",
+            (time.time() - ago_s, view["id"]))
+        self.now = time.time()
+
+    def test_demande_ouverte_non_echue_tait_l_alerte(self):
+        self.qa(verdict_s=100 * 60)
+        self.assertEqual([a["level"] for a in self.slo()], [3])
+        view = self.ask()
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "waiting_human")
+        self.assertEqual(self.slo(), [])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=self.now,
+                                                          **_seuils(stale_lot_s=60))
+                          if a["type"] == "stale_lot" and a.get("lot") == self.lot["id"]],
+                         [])
+        wait = stagnation_wait(self.db, self.lot, self.now)
+        self.assertEqual((wait["what"], wait["decision"]), ("decision", view["id"]))
+        self.assertIn("decision #%d" % view["id"], work_dependencies.wait_label(wait))
+
+    def test_demande_echue_vise_le_pilote_sans_reassignation(self):
+        self.qa(verdict_s=100 * 60)
+        view = self.ask()
+        self.expire(view)
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 3, ["pilot", "bureau", "auditeur"])])
+        waiting = alerts[0]["waiting"]
+        self.assertEqual((waiting["what"], waiting["decision"]), ("decision", view["id"]))
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
+        for text in out.values():
+            self.assertIn("decision #%d" % view["id"], text)
+            self.assertIn("remind the decider", text)
+            self.assertIn("deadline", text)
+            self.assertNotIn("reassign it now", text)
+            self.assertNotIn("ameesh work assign", text)
+
+    def test_demande_echue_niveau_1_vise_le_pilote(self):
+        self.qa(verdict_s=50 * 60)
+        self.expire(self.ask())
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts], [(1, ["pilot"])])
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["orch"])
+        self.assertIn("pilot: the lot is `waiting_human` on decision", out["orch"])
+        self.assertIn("do not reassign its holder", out["orch"])
+
+    def test_waiting_human_sans_demande_inchange(self):
+        # ligne antérieure à L233 : `work.move` refuserait la transition
+        self.qa(verdict_s=50 * 60)
+        self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id = %s",
+                        (self.lot["id"],))
+        self.now = time.time()
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts], [(1, ["assignee"])])
+        self.assertNotIn("decision", alerts[0]["waiting"])
+        self.assertIn("assignee: act on it", self.briefs(alerts[0])["dev1"])
+
+
+def stagnation_wait(db, lot, now):
+    from ameesh import stagnation
+    row = work.get(db, lot["id"])
+    return stagnation.describe(db, [row], now=now)[int(lot["id"])]["planned_wait"]
 
 
 class NotifyLivreTest(_Base):
