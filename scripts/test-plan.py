@@ -190,10 +190,20 @@ RECENT_FAILURE_DAYS = 7
 #: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
 #: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
 #: mesuré, huit en laisseraient ~34.
+#:
+#: #1476 (18/10) : la cible est 15 min bout en bout. Mesure du run de paquet
+#: 39085758208 (h-2300, 6 psycopg / 9 psql, pool de 24 runners, 457 modules) :
+#: 51,7 min, parts psql de 15,8 à 36,5 min, psycopg de 11,4 à 20,5 min ; le
+#: travail mesuré est 201 min psql + 90 min psycopg. À 16 + 8 parts, les 24
+#: jobs occupent les 24 runners et la part la plus lente vise ~13-15 min, d'où
+#: PARTS : psycopg de 6 à 8 (part la plus lente 21,1 min à 6), psql de 9 à 16
+#: (36,5 min à 9). Le découpage suit les durées mesurées du run (flux), pas une
+#: hypothèse : tests/parts/durees.json est rafraîchi par ces mesures et la
+#: carte complète ses trous (weights()).
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 6), "psql": (3, 9)}
+PARTS = {"psycopg": (4, 8), "psql": (3, 16)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).
@@ -1087,7 +1097,8 @@ def _migration(card: dict, impact: Impact, status: str, path: str, head: str,
         impact.hit(card.get("tables", {}).get(table, ()), f"{path} (table {table})")
 
 
-def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path) -> None:
+def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path,
+          *, own: bool = True) -> None:
     readers = set(card.get("donnees", {}).get(path, ()))
     impact.hit(readers, path)
     listers: set[str] = set()
@@ -1096,7 +1107,15 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
     # a removal outside documentation is already a doubt, raised by `judge`:
     # only a removed document stays quiet here (the docs lane)
-    if not readers and not listers and not is_doc(path) and status != "D":
+    #
+    # #1314/#1476 : une donnée non Python que la branche ne change pas
+    # (`own=False`) vient de la cible, qui l'a déjà passée en suite complète :
+    # elle ne force plus le repli de la branche. C'est le cas mesuré d'un
+    # fichier sans lecteur mesuré (par exemple un `.cjs` ou un `.json` que la
+    # carte ne connaît pas encore) changé sur main entre la carte et la tête
+    # testée : le 15/10, deux lots sans rapport ont ainsi basculé en suite
+    # complète. Une donnée que la branche change elle-même reste un doute.
+    if not readers and not listers and not is_doc(path) and status != "D" and own:
         impact.doubt(f"{path}: read by no measured test", path)
 
 
@@ -1108,12 +1127,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
     `own` is the set of paths the branch itself changes — `own_base` (the base
     it merges, `HEAD^1` of a pull request's merge commit) to `head` — and
     `None` when that range cannot be read or is not trustworthy. A file of the
-    CI foundation (`is_foundation`) that the target already changed since the
-    map commit, and that this branch does not change, raises no doubt: the
-    target's own full suite validated it, and a late map must not send every
-    lot branch back to the full suite (#1314). The version-only exemption of
-    `pyproject.toml` (L157) is judged on that same own range, so a target
-    change to the file no longer breaks it.
+    CI foundation (`is_foundation`), or a data file read by no measured test
+    (`_data`), that the target already changed since the map commit, and that
+    this branch does not change, raises no doubt: the target's own full suite
+    validated it, and a late map must not send every lot branch back to the
+    full suite (#1314, #1476). The version-only exemption of `pyproject.toml`
+    (L157) is judged on that same own range, so a target change to the file no
+    longer breaks it.
     """
     impact = Impact()
     known_modules = set(card.get("modules", {}))
@@ -1164,7 +1184,10 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         elif path.startswith(MIGRATIONS_DIR) and path.endswith(".sql"):
             _migration(card, impact, status, path, head, repo)
         else:
-            _data(card, impact, status, path, repo)
+            # #1476 : `own` inconnu (range illisible) reste conservateur : la
+            # donnée est jugée comme changée par la branche, donc le doute tient.
+            _data(card, impact, status, path, repo,
+                  own=own is None or path in own)
     #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
     #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
     #: exécuté au niveau module (relecture Codex, B2 résiduel).
@@ -1359,6 +1382,19 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
                 table.setdefault(d, {})[module] = s
         if not table.get(driver):
             table = None
+    # #1476 : pour le découpage de la CI, la table statique (mesurée sur la
+    # suite complète, tous les modules) est la référence ; la carte ne fait que
+    # compléter les modules qu'elle connaît en plus. L'ordre inverse reste
+    # celui de la mesure (test-parts.py --map), où la carte est le dernier
+    # relevé sous couverture.
+    if table is not None and parts.TABLE.exists():
+        mesurees = json.loads(parts.TABLE.read_text(encoding="utf-8"))
+        complete = {d: dict(v) for d, v in table.items()}
+        for d, valeurs in mesurees.items():
+            if not isinstance(valeurs, dict):
+                continue  # `_source` et autres métadonnées de la table
+            complete.setdefault(d, {}).update(valeurs)
+        table = complete
     weighed, _ = parts.weight(modules, driver, table)
     return weighed
 
