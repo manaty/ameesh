@@ -264,6 +264,13 @@ migrer_base() {
   fi
   [ "$code" = 0 ] || exit "$code"
   ameesh_de "$cible" doctor --probe
+  # #2339: run the INSTALLED code, not the migration snapshot, read-only.
+  # A failed compatibility check stops before installation on every host.
+  etape "auto-prise du code installé sur la base migrée (lecture seule)"
+  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || {
+    echo "ancien code incompatible : arrêter la mise à jour ; préparer un correctif compatible avant de poursuivre (base déjà migrée)." >&2
+    return 1
+  }
 }
 
 # The remote administrator switches to the actual migration owner so future

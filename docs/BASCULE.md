@@ -1245,9 +1245,14 @@ code would have to check for the presence of each new column on every
 query, in every future lot: a single omission is enough to bring the outage back,
 and these guards would never be removed. The repository's migrations, for
 their part, are almost always additive (nullable columns or with a default, new
-tables, replaced constraints): the previous code runs without error on a
-migrated database, which every update since L60 already verifies. So we migrate
-**first**, then install, then restart.
+tables, replaced constraints). Compatibility must also hold on long-lived
+connections: adding a column changes the result type of `SELECT *`. Psycopg's
+automatically prepared statements can then fail with SQLSTATE `0A000`
+(`cached plan must not change result type`), even though the same old query
+works on a fresh connection. Automatic preparation is disabled in `db.py`
+(#2339); parameters remain bound normally. See the
+[Psycopg prepared statement documentation](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html).
+We migrate **first**, then install, then restart.
 
 **Order of steps, workstation side** (the previous sections remain valid
 for the content of each version):
@@ -1261,6 +1266,16 @@ for the content of each version):
    once, then the old database. `migrate --dry-run` first displays each
    missing migration, "additive" or "NON additive" (NOT additive) with the reason.
    Both preview and execution retain `--additive-only` even if REF is installed.
+   After each database migration and the target code's `doctor --probe`,
+   `auto-take-probe.py` runs with the **installed** interpreter in isolated mode
+   (`python -I`), using the installed auto-take code in dry-run mode and a
+   database connection forced read-only. It also reads review proposals even
+   when other work is available. A failure stops the update before any host
+   installation: the database is already migrated, so prepare a compatible
+   fix before continuing; do not undo migrations or wait for ordinary rollout.
+   This fresh-connection probe cannot inspect prepared plans held by existing
+   runners. The connection policy above and the warm-connection migration
+   regression test cover that case. Proceed promptly to installation and restart.
 3. `poste.sh installer [REF]`: refuses as long as `doctor --probe` of the new
    code reports a missing migration, on the mesh database or the old one.
 4. `poste.sh role`, `poste.sh redemarrer`, then `vm.sh installer [REF]` and

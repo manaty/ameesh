@@ -85,7 +85,14 @@ class MigrationPinningTest(unittest.TestCase):
         self.share = Path(self.env["HOME"]) / ".local/share/ameesh"
         venv = self.share / "venv/bin"
         venv.mkdir(parents=True)
-        (venv / "python").write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        # The probe is run by the installed interpreter, outside PYTHONPATH.
+        # Fake that installed entry here; the real probe has PostgreSQL tests.
+        (venv / "python").write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = -I ] && [ "${2##*/}" = auto-take-probe.py ]; then\n'
+            "  printf '%s\\n' '{\"release\":\"installed\",\"args\":[\"auto-take-probe\"]}' >> \"$RELEASE_CALLS\"\n"
+            '  exit "${AUTO_TAKE_PROBE_STATUS:-0}"\n'
+            'fi\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
         (venv / "python").chmod(0o755)
         config = Path(self.env["HOME"]) / ".config/ameesh/config.json"
         config.parent.mkdir(parents=True)
@@ -116,10 +123,16 @@ class MigrationPinningTest(unittest.TestCase):
         done = self.run_script("migrer", self.a)
         self.assertEqual(done.returncode, 0, done.stderr)
         calls = self.calls()
-        self.assertEqual([call["release"] for call in calls], ["A", "A", "A"])
+        self.assertEqual([call["release"] for call in calls], ["A", "A", "A", "installed"])
         self.assertEqual(calls[0]["args"], ["migrate", "--dry-run", "--additive-only"])
         self.assertEqual(calls[1]["args"], ["migrate", "--additive-only"])
         self.assertEqual(calls[2]["args"], ["doctor", "--probe"])
+
+    def test_incompatible_installed_auto_take_stops_migration_step(self):
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("ancien code incompatible", done.stderr)
+        self.assertEqual(self.calls()[-1]["release"], "installed")
 
     def test_missing_ref_takes_clone_head(self):
         # #1245 : sans REF, « migrer » migre le HEAD du dépôt de déploiement,
@@ -127,7 +140,7 @@ class MigrationPinningTest(unittest.TestCase):
         done = self.run_script("migrer")
         self.assertEqual(done.returncode, 0, done.stderr)
         calls = self.calls()
-        self.assertEqual([call["release"] for call in calls], ["B", "B", "B"])
+        self.assertEqual([call["release"] for call in calls], ["B", "B", "B", "installed"])
         self.assertEqual(calls[0]["args"], ["migrate", "--dry-run", "--additive-only"])
         self.assertEqual(calls[1]["args"], ["migrate", "--additive-only"])
 

@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Additive migration compatibility for a warmed runner connection."""
+import importlib.util
+from pathlib import Path
+import threading
+import unittest
+from unittest import mock
+
+from ameesh import db as db_mod, runner, storage
+from .support import PgTestCase
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    'auto_take_probe', ROOT / 'deploy/mise-a-jour/auto-take-probe.py')
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+
+
+class LogTest(unittest.TestCase):
+    def test_failed_take_keeps_bounded_sql_message_and_continues_sweep(self):
+        state = mock.Mock()
+        state.workers = {}
+        state.lock = threading.Lock()
+        state.power_hold.is_set.return_value = False
+        state.draining.is_set.return_value = False
+        state.restart_for_stale = False
+        state.host_gate = None
+        state.take_interval = 1
+        state._take_next = 0
+        state.take_pass.side_effect = db_mod.DbError(
+            'column x does not exist\nDETAIL: ' + 'x' * 500)
+        with mock.patch.object(runner, 'log_async') as log, \
+                mock.patch.object(runner.registry, 'reap', return_value=[]), \
+                mock.patch.object(runner.registry, 'claimable', return_value=[]) as claim:
+            runner.Runner.sweep(state)
+        message = log.call_args.args[0]
+        self.assertIn('DbError', message)
+        self.assertIn('column x does not exist DETAIL:', message)
+        self.assertTrue(message.endswith('; runner continues'))
+        self.assertNotIn('\n', message)
+        self.assertLess(len(message), 380)
+        claim.assert_called_once()
+
+
+class CompatibilityTest(PgTestCase):
+    def migrate_after_warmup(self, *, prepare=False):
+        # Every test has its own schema. Removing the additive objects models
+        # 1.11.5; another connection then applies the actual 1.11.6 migrations.
+        old = self.connect()
+        self.addCleanup(old.close)
+        if prepare:
+            if not hasattr(old, 'conn'):
+                self.skipTest('named prepared plans are specific to psycopg')
+            old.conn.prepare_threshold = 5  # pre-fix psycopg default
+        self.db.execute('ALTER TABLE work_items DROP COLUMN reviewers CASCADE')
+        self.db.execute('DROP TABLE review_catch_up')
+        work = storage.of(old).work
+        for _ in range(8):
+            work.review_proposals(1, proposal_prefix='probe')
+            work.unassigned_lots(200)
+        for name in ('0438_review_catch_up.sql', '0456_work_item_reviewers.sql'):
+            self.db.script((ROOT / 'src/ameesh/migrations' / name).read_text())
+        return work
+
+    def test_warmed_connection_survives_additive_migrations(self):
+        work = self.migrate_after_warmup()
+        self.assertEqual(work.review_proposals(1, proposal_prefix='probe'), [])
+        self.assertEqual(work.unassigned_lots(200), [])
+        probe.probe(self.cfg)
+
+    def test_pre_fix_preparation_reproduces_0456_error(self):
+        work = self.migrate_after_warmup(prepare=True)
+        with self.assertRaises(db_mod.DbError) as raised:
+            work.review_proposals(1, proposal_prefix='probe')
+        self.assertEqual(raised.exception.sqlstate, '0A000')
+        self.assertIn('cached plan must not change result type', str(raised.exception))
+
+    def test_probe_connection_cannot_write(self):
+        def attempt_write(state):
+            self.assertTrue(state.dry_run)
+            state.db.execute("INSERT INTO work_items(title) VALUES ('forbidden')")
+        with mock.patch.object(runner.Runner, 'take_pass', attempt_write):
+            with self.assertRaises(db_mod.DbError) as raised:
+                probe.probe(self.cfg)
+        self.assertEqual(raised.exception.sqlstate, '25006')
+        self.assertEqual(self.db.query('SELECT id FROM work_items'), [])
