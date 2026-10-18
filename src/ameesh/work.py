@@ -1088,6 +1088,47 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
     return row
 
 
+def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
+    """The request mail that wakes a manually designated reviewer (#2478).
+
+    A designation writes the reviewer column and the journal; without a mail
+    linked to the lot, the reviewer's runner had nothing to open a turn on and
+    the review waited for a later `stale_lot` alert. The mail is a `request`
+    (`kind`) carrying `work_item_id` (the `--lot` of `agent-mail`), so it is
+    active mail for the runner's unread selection.
+
+    The designation is already written when this runs: a delivery failure is
+    returned as a warning (same pattern as `delegate`), never raised, so the
+    caller can surface it without losing the designation. A human reviewer has
+    no runner to wake and gets no mailbox request.
+    """
+    from . import mail, plan_git
+    from .review_designation import REQUEST_KIND, manual_reviewer_message
+
+    name = (reviewer or "").strip()
+    if not name or name.startswith(HUMAN_PREFIX) or name == REVIEWER_NONE:
+        return {}
+    try:
+        latest = plan_git.latest_freeze(milestones(db, int(item["id"]), limit=None))
+    except Exception:  # noqa: BLE001 - unreadable milestones: no head named
+        latest = None
+    freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
+              if latest is not None else None)
+    payload = {"review_request": {"lot": int(item["id"]), "reviewer": name,
+                                  "manual": True}}
+    if freeze:
+        payload["review_request"]["freeze"] = freeze
+    body = manual_reviewer_message(item, freeze=freeze, actor=who)
+    try:
+        message_id = mail.send(
+            db, who or SYSTEM_SENDER, name, body, kind=REQUEST_KIND,
+            work_item_id=str(int(item["id"])), payload=payload)
+    except Exception as exc:  # noqa: BLE001 - la désignation est écrite ; le dire
+        return {"reviewer_request_warning":
+                "review request not delivered to %s (%s): notify them" % (name, exc)}
+    return {"reviewer_request_message_id": message_id}
+
+
 def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
                        actor: str | None = None, remove: bool = False) -> dict:
     """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
@@ -1097,7 +1138,10 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
     `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`.
     Même harnais déclaré que l'auteur : avertissement indicatif (#800), posé
-    sur la ligne rendue (`reviewer_warning`), la désignation est conservée."""
+    sur la ligne rendue (`reviewer_warning`), la désignation est conservée.
+    La désignation dépose aussi un `request` lié au lot (#2478) : le relecteur
+    est réveillé, son runner ouvre un tour ; une remise en échec est un
+    avertissement (`reviewer_request_warning`), la désignation reste écrite."""
     who, item = _review_item(cfg, db, item_id, actor)
     # A former reviewer can still be withdrawn after leaving the registry.
     name = (reviewer or "").strip() if remove else check_reviewer_choice(
@@ -1109,6 +1153,8 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
         name, "removed" if remove else "designated"), remove=remove)
     if warning:
         row["reviewer_warning"] = warning
+    if not remove:
+        row.update(_reviewer_request(db, item, name, who))
     return row
 
 
@@ -2464,7 +2510,9 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     désignation est journalisée ; `waiting()`, la vue de progrès et l'alerte
     `stale_lot` le nomment avant tout verdict. Un relecteur du **même harnais
     déclaré** que l'auteur rend un avertissement indicatif (#800), jamais un
-    refus : il est posé sur la ligne rendue (`reviewer_warning`)."""
+    refus : il est posé sur la ligne rendue (`reviewer_warning`). La
+    désignation dépose un `request` lié au lot (#2478) qui réveille le
+    relecteur ; une remise en échec est un `reviewer_request_warning`."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
@@ -2583,6 +2631,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         row["reviewers"] = designated.get("reviewers")
         if reviewer_warning:
             row["reviewer_warning"] = reviewer_warning
+        row.update(_reviewer_request(db, item, reviewer, actor))
     return row
 
 

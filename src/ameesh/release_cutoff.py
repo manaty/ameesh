@@ -912,6 +912,16 @@ class Plan:
     included: list[int]
     excluded: list[tuple[int, str]]
     notes: str
+    # N4: the base carries the previous tag's exact tree, nothing to release.
+    empty: bool = False
+
+
+def same_tree(repo: str, left: str, right: str) -> bool:
+    """Both commits carry the same tree (no content between them)."""
+    trees = [_git(repo, "rev-parse", "--verify", "%s^{tree}" % ref) for ref in (left, right)]
+    if any(tree.returncode for tree in trees):
+        return False
+    return trees[0].stdout.strip() == trees[1].stdout.strip()
 
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
@@ -932,6 +942,17 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
     if previous and version_tuple(current) < version_tuple(previous["version"]):
         raise ReleaseError("the target %s is behind its tag %s: refusing to release"
                            % (base[:12], previous["tag"]))
+    if previous and same_tree(project.repo, previous["commit"], base):
+        # N4: a red main whose last green is already tagged (or a main with
+        # nothing merged since the tag) is a no-op, never an empty release.
+        return Plan(project=project, rules=rules, canon_commit=source.commit,
+                    cutoff_at=cutoff_at, cutoff_label=cutoff_label, head=head, ci=reading,
+                    green=green, last_green=green_commit, base=base,
+                    current_version=current, previous=previous,
+                    version=previous["version"], floor="patch",
+                    floor_reason="nothing new since %s" % previous["tag"],
+                    packets=[], direct=[], migrations=[], included=[], excluded=[],
+                    notes="", empty=True)
     floor, floor_reason = ("patch", "no previous tag")
     if previous:
         floor, floor_reason = version_floor(project.repo, previous["tag"], base)
@@ -1533,6 +1554,32 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                         % (plan.version, project.target, label, plan.head[:12],
                            "verte" if plan.ci.get("green") else "non verte"),
                         report, urgent=True)
+        return report
+
+    if plan.empty:
+        state_slot["last_cutoff"] = at
+        state_slot["last_result"] = "nothing-new"
+        state_slot["last_label"] = label
+        state_slot.pop("last_error", None)
+        report = {"schema": SCHEMA, "result": "nothing-new", "project": project.name,
+                  "version": plan.version, "tag": plan.previous["tag"],
+                  "release_sha": plan.previous["commit"], "target_head": plan.head,
+                  "base": plan.base, "cutoff_at": at, "label": label, "ci": plan.ci,
+                  "started_at": started,
+                  "deviations": ["nothing new since %s: no tag, no staging"
+                                 % plan.previous["tag"]],
+                  "canon_commit": plan.canon_commit}
+        report["completed_at"] = time.time()
+        report["duration_s"] = round(report["completed_at"] - started, 1)
+        report["report_path"] = write_report(cfg, project, report)
+        save_state(cfg, state)
+        if db is not None:
+            send_report(cfg, db, project,
+                        "Release non faite à la coupure %s : rien de nouveau depuis %s "
+                        "(base %s, tête %s, CI %s). Aucun tag, aucun déploiement."
+                        % (label, plan.previous["tag"], plan.base[:12], plan.head[:12],
+                           "verte" if plan.ci.get("green") else "non verte"),
+                        report)
         return report
 
     deviations = []

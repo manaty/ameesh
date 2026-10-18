@@ -390,6 +390,33 @@ class EntryTest(_Base):
         self.ready(1, sha=tip.upper())
         self.assertEqual(self.enter(1)["frozen_sha"], tip)
 
+    def test_admission_fetches_the_branch_and_the_target_once(self):
+        # #2318 (1) : l'admission lit la branche et la cible en **un** ls-remote
+        # et **un** fetch, pas un aller-retour réseau par nom.
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        self.ready(1)
+        calls = []
+        real = resolutions._run
+
+        def counting(path, *args, **kwargs):
+            calls.append(args)
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(resolutions, "_run", side_effect=counting):
+            row = merge_queue.enter(None, 1, repo=agents, actor="orch",
+                                    ci=self.green(1), clone=clone)
+        self.assertEqual(row["state"], "queued")
+        listings = [args for args in calls if args and args[0] == "ls-remote"]
+        fetches = [args for args in calls if args and args[0] == "fetch"]
+        self.assertEqual(len(listings), 1)
+        self.assertEqual(len(fetches), 1)
+        for name in ("lot/1-a", "main"):
+            self.assertIn("refs/heads/" + name, listings[0])
+            self.assertIn("+refs/heads/%s:%s%s" % (name, merge_queue.QUEUE_REF, name),
+                          fetches[0])
+
     def test_a_failed_fetch_refuses_the_lot(self):
         agents = os.path.join(self.tmp, "agents")
         _git(self.tmp, "clone", "-q", self.repo, agents)
@@ -406,7 +433,8 @@ class EntryTest(_Base):
             with self.subTest(url):
                 _git(agents, "remote", "set-url", "origin", url)
                 self.fake.queue_rows.clear()
-                with self.assertRaisesRegex(merge_queue.QueueError, "cannot fetch branch lot/1-a"):
+                with self.assertRaisesRegex(merge_queue.QueueError,
+                                            "cannot fetch branch(es)? lot/1-a"):
                     merge_queue.enter(None, 1, repo=agents, actor="orch",
                                       ci=lambda branch: status, clone=clone)
                 self.assertEqual(self.fake.queue_rows, {})
@@ -442,6 +470,48 @@ class EntryTest(_Base):
         with self.assertRaisesRegex(merge_queue.QueueError,
                                     "target main not found on the repository"):
             self.enter(1)
+
+    def test_a_concurrent_queue_fetch_does_not_move_the_class_target(self):
+        # #2318 (2) : le fetch de la ref queue par le radar peut courir avec la
+        # lecture de la cible. La classe se calcule sur la tête que l'admission
+        # a validée, jamais sur la ref `QUEUE_REF` déplacée après coup.
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        self.ready(1)
+        validated = _git(self.repo, "rev-parse", "main")
+        real = merge_queue.fetch_fresh
+        raced = {"done": False}
+
+        def concurrent(repo, names, clone=None):
+            tips, where = real(repo, names, clone)
+            if not raced["done"] and where != repo \
+                    and any(merge_queue._remote_branch(n) == "main" for n in names):
+                raced["done"] = True
+                _commit_on(self.repo, "main", "other.py", "moved\n", "target moved concurrently")
+                _git(where, "fetch", "-q", self.repo,
+                     "+refs/heads/main:%smain" % merge_queue.QUEUE_REF)
+            return tips, where
+
+        seen = []
+
+        def fake_of_lot(db, lot, **kw):
+            seen.append((kw.get("repo"), kw.get("base"), kw.get("base_sha")))
+            return {"class": "light", "doubt": False, "why": "policy"}
+
+        with mock.patch.object(merge_queue, "fetch_fresh", side_effect=concurrent), \
+                mock.patch.object(lot_class, "of_lot", side_effect=fake_of_lot):
+            row = merge_queue.enter(None, 1, repo=agents, actor="orch",
+                                    ci=self.green(1), clone=clone)
+        self.assertTrue(raced["done"])
+        self.assertEqual(row["state"], "queued")
+        # toutes les lectures partent du commit validé par l'admission, jamais
+        # de la ref `QUEUE_REF` déplacée par le fetch concurrent
+        self.assertEqual({sha for _, _, sha in seen}, {validated})
+        self.assertNotIn(merge_queue.QUEUE_REF + "main", [base for _, base, _ in seen])
+        # la ref a bien bougé après l'admission : c'est le commit validé qui a classé
+        self.assertNotEqual(_git(clone.path, "rev-parse", merge_queue.QUEUE_REF + "main"),
+                            validated)
 
     def test_no_target_is_refused(self):
         with self.assertRaisesRegex(merge_queue.QueueError, "no target branch known"):
@@ -685,6 +755,21 @@ class ClassOfSourcesTest(unittest.TestCase):
         self.assertEqual(out["class"], "sensitive")
         self.assertEqual(out["why"], "clone")
         self.assertEqual(calls, [merge_queue.QUEUE_REF + "main", "origin/main"])
+
+    def test_la_lecture_du_clone_part_de_la_tete_d_admission(self):
+        # #2318 : quand l'admission a lu la cible, la lecture du clone part de
+        # ce commit exact (`base_sha`), pas de la ref `QUEUE_REF` qu'un fetch
+        # concurrent peut déplacer.
+        calls = []
+
+        def fake(db, lot, **kw):
+            calls.append((kw.get("base"), kw.get("base_sha")))
+            return {"class": "light", "doubt": False, "why": "policy"}
+        with mock.patch.object(plan_git, "_commit", return_value="c" * 40), \
+                mock.patch.object(lot_class, "of_lot", side_effect=fake):
+            merge_queue._class_of(None, 1, {"app": "ameesh"}, "depot", "clone",
+                                  "main", "f" * 40, base="a" * 40)
+        self.assertEqual([sha for _, sha in calls], ["a" * 40, "a" * 40])
 
     def test_un_doute_ne_se_lit_pas_comme_une_classe_sensible(self):
         # deux lectures sensibles : la calculée explique mieux que le doute
