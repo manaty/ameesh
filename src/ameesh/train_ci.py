@@ -43,6 +43,20 @@ def _json_pages(proc) -> list:
         pages.append(page)
 
 
+def _same_branch(run, workflow, plan):
+    """The run belongs to the pushed packet.
+
+    #2446: a reusable workflow's run (``workflow_call``) reports the ref of
+    its *caller*; GitHub has documented that ref differently across caller
+    types. The exact ``head_sha``, the audited ``path`` and the event already
+    bind the run to the immutable packet head, so the branch label is not a
+    second proof there. A push or dispatch run keeps the exact branch check.
+    """
+    if run.get("head_branch") == plan["branch"]:
+        return True
+    return workflow.event == "workflow_call" and isinstance(run.get("head_branch"), str)
+
+
 @dataclass(frozen=True)
 class Workflow:
     path: str
@@ -55,8 +69,8 @@ class Workflow:
     sources: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self):
-        if self.event not in ("push", "workflow_dispatch"):
-            raise ValueError("train CI event: push | workflow_dispatch")
+        if self.event not in ("push", "workflow_dispatch", "workflow_call"):
+            raise ValueError("train CI event: push | workflow_dispatch | workflow_call")
         if not self.path.startswith(".github/workflows/") or not self.path.endswith((".yml", ".yaml")):
             raise ValueError("explicit workflow path expected")
         if not self.jobs or len(set(self.jobs)) != len(self.jobs):
@@ -155,7 +169,8 @@ class GitHub:
             path = ("actions/workflows/%s/runs?head_sha=%s&event=%s&per_page=100"
                     % (name, plan["head"], workflow.event))
             runs = [r for page in self._api(path) for r in page.get("workflow_runs", ())
-                    if r.get("head_sha") == plan["head"] and r.get("head_branch") == plan["branch"]
+                    if r.get("head_sha") == plan["head"]
+                    and _same_branch(r, workflow, plan)
                     and r.get("path") == workflow.path and r.get("event") == workflow.event]
             if not runs:
                 absent = True

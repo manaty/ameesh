@@ -91,6 +91,17 @@ class TrainCiTest(unittest.TestCase):
                 self.runs = [dict(self.run, **{key: value})]
                 self.assertEqual(self.ci().read(self.plan)["status"], "absent")
 
+    def test_workflow_call_binds_the_exact_head_not_the_callers_branch_label(self):
+        # #2446: the packet suite is the reusable-workflow run of tests.yml.
+        # Its head SHA, path and event are the exact packet identity; GitHub
+        # may label the caller ref differently, so the branch label is not a
+        # second proof for workflow_call (a push still requires it).
+        self.runs = [dict(self.run, event="workflow_call", head_branch="main")]
+        self.assertEqual(self.ci("workflow_call").read(self.plan)["status"], "green")
+        self.runs = [dict(self.run, event="workflow_call", head_branch="main",
+                           head_sha="c" * 40)]
+        self.assertEqual(self.ci("workflow_call").read(self.plan)["status"], "absent")
+
     def test_skipped_required_job_is_not_full_ci(self):
         self.jobs = [dict(self.job, conclusion="skipped")]
         with self.assertRaisesRegex(train.TrainError, "skipped"):
@@ -145,6 +156,7 @@ class TrainCiTest(unittest.TestCase):
     def test_ameesh_aggregate_cannot_cover_missing_matrix_part_or_platform(self):
         contract, = train_contracts.ameesh()
         sources = dict(contract.sources)
+        self.runs = [dict(self.run, event=contract.event)]
         def gh(args):
             path = args[-1]
             if "/contents/" in path:
@@ -159,7 +171,10 @@ class TrainCiTest(unittest.TestCase):
         every = [dict(self.job, id=i, name=name) for i, name in enumerate(contract.jobs)]
         self.jobs = every
         self.assertEqual(ci.read(self.plan)["status"], "green")
-        for missing in ("psycopg 4/4", "psql 6/6", "plateforme macOS"):
+        # #2446 : the packet suite is the compiled 8 psycopg + 16 psql matrix;
+        # a missing aggregate, part or platform job can never be replaced by
+        # the workflow's green conclusion.
+        for missing in ("tests", "psycopg 4/8", "psql 6/16", "plateforme macOS"):
             with self.subTest(missing=missing):
                 self.jobs = [j for j in every if j["name"] != missing]
                 with self.assertRaisesRegex(train.TrainError, "required full-suite job missing"):
