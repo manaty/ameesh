@@ -44,6 +44,12 @@ que la fusion a fait entrer (`class_at_merge`, `lot_measures.diff_range`) —
 jamais `cible..gel`, vide dès que le gel est un ancêtre de la cible — avec les
 indices de l'appelant ; seule `light` ouvre, un doute n'ouvre rien, et
 l'idempotence reste celle de `open_after_merge`.
+
+#2377 : la famille écrite au corps n'était qu'une consigne — la prise au repos
+(L165) ouvrait le lot à toute l'équipe, et un agent de la famille de l'auteur
+pouvait le prendre (#2340). `required_family` relit la même preuve au moment
+de la prise et `may_take` n'ouvre le lot qu'à la famille opposée ; l'auteur
+inconnu ne se devine pas, et le lot attend alors une attribution explicite.
 """
 from __future__ import annotations
 
@@ -324,6 +330,51 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     except Exception:  # noqa: BLE001 - toute trace illisible : famille inconnue
         pass
     return out
+
+
+def required_family(db, item: dict) -> Optional[str]:
+    """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
+
+    `None` quand ce n'est pas un lot de relecture (`issue_ref` hors du préfixe
+    `review-after-merge:`) : aucune garde. Une chaîne vide quand la famille de
+    l'auteur au gel est inconnue, ou quand sa trace est illisible : le lot
+    n'est alors **pris par personne** au repos (doute -> non pris, canon §8) et
+    attend une attribution explicite. Sinon la famille opposée à celle de
+    l'auteur au gel (`reviewer_family`), celle que le canon §2 demande au
+    relecteur.
+
+    La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
+    qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
+    courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
+    ref = str((item or {}).get("issue_ref") or "").strip().lower()
+    if not ref.startswith(PREFIX):
+        return None
+    try:
+        lot = int(ref[len(PREFIX):].strip().lstrip("#"))
+        source = work.get(db, lot)
+        if source is None:
+            return ""
+        family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"))
+    except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
+        return ""
+    return "" if family == UNKNOWN_FAMILY else family
+
+
+def may_take(db, item: dict, agent: dict) -> bool:
+    """Un agent au repos peut-il prendre ce lot ? (#2377)
+
+    Hors lot de relecture, oui, sans autre condition. Pour un lot de
+    relecture, seule la famille opposée à celle de l'auteur au gel le prend ;
+    la session vivante du preneur fait foi (`registry.live_harness`, #1037),
+    et un harnais hors des familles connues (`family_of`) ne compte pas.
+    Famille de l'auteur inconnue ou famille du preneur inconnue : non — la
+    prise ne devine jamais une indépendance d'avis (#1374)."""
+    family = required_family(db, item)
+    if family is None:
+        return True
+    from . import registry
+    mine = family_of(registry.live_harness(agent or {}))
+    return bool(family) and family == mine
 
 
 def title_of(item: dict, lot: int) -> str:
