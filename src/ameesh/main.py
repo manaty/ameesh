@@ -10,8 +10,8 @@
   ameesh adopt <agent> --session ID --harness claude|codex|deepseek [--account C]
         [--cwd D] [--brief FILE|-] [--force]
         an existing (closed) interactive session moves under the runner (L39);
-  ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
+  ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh approvals            list signed approvals;
   ameesh approve              sign an approval;
