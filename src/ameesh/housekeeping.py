@@ -106,6 +106,7 @@ import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
+from urllib.parse import unquote, urlsplit
 
 from . import build_artifacts
 from . import platform
@@ -1850,16 +1851,29 @@ def _clone_remote_inside(path: str, entry: str) -> str:
     inside the temporary directory `entry` that is about to be removed, so
     the commits its remote-tracking refs vouch for go with it. Empty when
     every remote is outside (or is not a local path)."""
-    urls = _git(["config", "--get-regexp", r"^remote\..*\.url$"], path)
-    if urls is None or urls.returncode not in (0, 1):
+    remotes = _git(["remote"], path)
+    if remotes is None or remotes.returncode != 0:
         return "remote URLs unreadable"
+    urls = []
+    for remote in remotes.stdout.splitlines():
+        # get-url applies Git's insteadOf rewrites, unlike raw config URLs.
+        resolved = _git(["remote", "get-url", "--all", remote], path)
+        if resolved is None or resolved.returncode != 0:
+            return "remote URLs unreadable"
+        urls.extend(resolved.stdout.splitlines())
     root = _real(entry)
-    for line in urls.stdout.splitlines():
-        _key, _sep, value = line.partition(" ")
-        value = value.strip()
-        if value.startswith("file://"):
-            value = value[len("file://"):]
-        if not (os.path.isabs(value) or value.startswith(".") or value.startswith("~")):
+    for value in urls:
+        if value.startswith("file:"):
+            try:
+                parsed = urlsplit(value)
+            except ValueError:
+                return "local remote URL unreadable"
+            if parsed.netloc not in ("", "localhost"):
+                return "local remote URL authority unknown"
+            value = unquote(parsed.path)
+        elif ":" in value and not os.path.isabs(value):
+            # Network URL or scp-style host:path; all other Git URLs are
+            # local paths, including relative names without a leading dot.
             continue
         local = _real(os.path.join(path, os.path.expanduser(value)))
         if _under(local, root):
@@ -1884,6 +1898,9 @@ def tmp_git_work(path: str, rules=()) -> str:
             return "%s locked (git worktree lock)" % copy
         if not st["gitdir"]:
             return "%s: git metadata unreadable" % copy
+        if os.path.isfile(os.path.join(copy, ".git")) and _under(
+                _real(common_dir(copy)), _real(path)):
+            return "%s: common repository lives inside the temporary directory" % copy
         if st["submodules"]:
             return "%s has submodules" % copy
         if not st["clean"]:

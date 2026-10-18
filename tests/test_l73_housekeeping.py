@@ -818,6 +818,20 @@ class MenageDbTest(PgTestCase):
                     if note.startswith("tmp %s kept: git work —" % root)]
             self.assertEqual(len(kept), 1, rapport["skipped"])
 
+    def test_worktree_dont_le_depot_commun_est_dans_le_tmp_est_garde(self):
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        root = os.path.join(self.tmp, "tmp-recovery")
+        os.makedirs(root)
+        bare = os.path.join(root, "bare.git")
+        subprocess.run(["git", "clone", "-q", "--bare", main, bare],
+                       check=True, capture_output=True)
+        _git("fetch", "-q", "origin", "main:refs/remotes/origin/main", cwd=bare)
+        # A bare common repository is not itself one of _git_copies.
+        wt = os.path.join(root, "wt")
+        _git("worktree", "add", "-q", wt, "main", cwd=bare)
+        self.assertIn("common repository lives inside", menage.tmp_git_work(root))
+
     def test_clone_dont_le_remote_est_dans_le_dossier_tmp_est_garde(self):
         """#2493 (relecture) : les refs de suivi ne prouvent rien si le remote
         vit dans le dossier temporaire supprimé : le clone et son origin
@@ -841,6 +855,18 @@ class MenageDbTest(PgTestCase):
         clone = os.path.join(root, "clone")
         subprocess.run(["git", "clone", "-q", origin, clone], check=True,
                        capture_output=True)
+        # All these usable local URLs point to the same sole backup.
+        os.mkdir(os.path.join(clone, "sub"))
+        for url in (origin, "file://localhost" + origin,
+                    "file://" + origin.replace("origin.git", "%6frigin.git"),
+                    "sub/../../origin.git"):
+            with self.subTest(url=url):
+                _git("remote", "set-url", "origin", url, cwd=clone)
+                self.assertTrue(_git("ls-remote", "origin", cwd=clone))
+                self.assertIn("inside the temporary directory", menage.tmp_git_work(root))
+        _git("config", "url.%s.insteadOf" % origin, "review-backup:", cwd=clone)
+        _git("remote", "set-url", "origin", "review-backup:", cwd=clone)
+        self.assertTrue(_git("ls-remote", "origin", cwd=clone))
         _age_tree(root, 3 * 3600)
         self.assertIn("inside the temporary directory", menage.tmp_git_work(root))
         rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
