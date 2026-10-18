@@ -37,6 +37,34 @@ A lot is stale when it is open and inactive beyond the configured threshold
   the lot at once; renewing it means cancelling and adding a new dated
   commitment (a later due day pushes the hold). A hold whose date cannot be
   read does not suppress the alert: a hold always ends.
+- A **declared landing**, `ameesh work landing <id> --vehicle <lot> --until <day>`
+  (#1945), parks a lot whose
+  work is done on a package vehicle: an open lot that carries the composition.
+  The declaration is an admission **pinned to the vehicle's freeze**: the
+  vehicle must carry a `frozen` head (refused otherwise, and refused while it
+  is `blocked`), and the pin is read in the same transaction as the write.
+  While the vehicle is open, not `blocked`, its last freeze is exactly that
+  pinned head **and** the day is not past (its day counts in full, like a
+  hold), the lot is not stale. A new freeze, a vehicle left without a freeze,
+  a vehicle moved to `blocked`, `ameesh work landing <id> --clear`, a closed
+  or merged vehicle, or a past deadline all give the signal back: the pilot
+  renews the declaration explicitly on the new head. A
+  self, unknown or finished vehicle does not suppress the alert; nor does
+  prose, a bare admission to a packet or an old transport chain.
+
+  ```sh
+  ameesh work landing 1427 --vehicle 1675 --until 2026-10-18   # pin the current freeze
+  ameesh work landing 1427 --clear
+  ```
+
+  The step is read at each pass from `work_items.state`, but the displayed
+  head is the pinned one (the admission), never a later freeze. The gesture is
+  journalled (`Landing declared: vehicle #1675 until … (frozen …)`) and counts
+  as activity, like a prerequisite edit. A planned start, a declared
+  prerequisite or a gate stays ahead in the displayed wait: the more explicit
+  wait wins. When a landing is active on a frozen lot whose verdict is
+  acquired, the registry label names the vehicle, its step, its pinned head
+  and the deadline instead of `merge (executor not designated)`.
 
 - An explicit **hold**: a journal note whose text begins with `hold:` (for
   example `ameesh work note <id> "hold: operator window"`), written by a
@@ -96,6 +124,12 @@ or, for a dated external hold:
 {"what": "hold", "gate": "liquichain-window", "until": "2026-10-15", "commitment": 42}
 ```
 
+or, for a declared landing on a vehicle:
+
+```json
+{"what": "landing", "vehicle": 1675, "step": "qa", "head": "04965e6ca1b2…", "until": "2026-10-18"}
+```
+
 or, for an explicit pilot hold:
 
 ```json
@@ -111,6 +145,7 @@ blockers outside the current project or progress window.
 
 Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
-by a planned date, commitment/plan dependency, direct prerequisite link, a
-dated external hold or an explicit `hold:` note. This preserves alerts for
+by a planned date, commitment/plan dependency, direct prerequisite link,
+dated external hold, declared landing or an explicit `hold:` note. This
+preserves alerts for
 unexplained waits.
