@@ -291,12 +291,16 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     out["frozen_sha"] = head
     # La cible résolue à l'atterrissage (celle du projet, ou `origin/HEAD`) peut
     # être `release/*` sans que la ligne du lot le dise : l'axe release se lit
-    # sur elle aussi, normalisée (revue #544 r1).
-    landing = default_base(cfg, row, repo)
+    # sur elle aussi, normalisée (revue #544 r1). Mais quand l'appelant nomme
+    # déjà la base (commit de cible frais, cible du paquet), elle seule fait
+    # foi : relire `origin/HEAD` d'un clone pour la surclasser rendait
+    # « release » un lot visant `main` (#2464, clone radar figé sur une release
+    # périmée).
+    landing = None if base else default_base(cfg, row, repo)
     if not base:
         base = landing
     out["target"] = base or ""
-    reason = release_reason(row, landing, base)
+    reason = release_reason(row, base)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
         return out

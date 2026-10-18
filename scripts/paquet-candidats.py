@@ -11,7 +11,11 @@ soit comme unité du paquet, soit comme ligne « écarté » motivée du manifes
 Le calcul est celui de `ameesh.packet_candidates` : état `qa` (sans filtre
 d'assigné), gel effectif égal à la **tête publiée** de la branche (lecture
 fraîche d'`origin`), verdicts requis acquis sur cette tête par la porte de
-fusion, essai de fusion propre contre la cible.
+fusion, essai de fusion propre contre la cible. La cible est `--target`, sinon
+celle du projet, sinon `origin/HEAD` ; un `origin/HEAD` qui nomme `release/*`
+sans cible déclarée est une erreur de lecture (rc 1), jamais une classe : un
+clone radar figé sur une release périmée écartait en silence tous les lots sans
+`branch_target` (#2464).
 
 Sortie lisible par défaut : les lots prêts d'abord, puis les lots en attente
 avec leur motif (`freeze-not-head`, `verdicts-missing`, `conflict`, …), puis
@@ -44,7 +48,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ameesh import config, db, merge_queue, packet_candidates, plan_git  # noqa: E402
+from ameesh import config, db, merge_queue, packet_candidates  # noqa: E402
 
 
 def resolve_project(cfg, repo: str, name: str | None):
@@ -72,8 +76,10 @@ def resolve_project(cfg, repo: str, name: str | None):
 
 def render(payload: dict) -> str:
     lines = [
-        "paquet-candidats : projet %s, cible %s, base %s (%s)"
-        % (payload["project"] or "?", payload["target"], payload["base"][:12],
+        "paquet-candidats : projet %s, cible %s (%s), base %s (%s)"
+        % (payload["project"] or "?", payload["target"],
+           payload.get("target_source") or "?",
+           payload["base"][:12],
            "tête de la cible lue de origin" if payload["base_source"] == "target"
            else "commit imposé par --base"),
         "%d lot(s) prêt(s), %d en attente, %d erreur(s)"
@@ -174,10 +180,6 @@ def main(argv: list[str] | None = None) -> int:
     except packet_candidates.CandidateError as exc:
         print("paquet-candidats: %s" % exc, file=sys.stderr)
         return 2
-    target = args.target or getattr(project, "target", "") or plan_git.default_target(repo)
-    if not target:
-        print("paquet-candidats: no target branch: pass --target", file=sys.stderr)
-        return 2
     app = args.app or getattr(project, "name", "") or packet_candidates.default_app(repo)
     conn = None
     scratch = None
@@ -185,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         conn = db.connect(cfg)
         clone, scratch = merge_queue.working_clone(cfg, repo, project if declared else None)
         payload = packet_candidates.inventory(
-            conn, project, repo=repo, clone=clone, target=target, app=app,
+            conn, project, repo=repo, clone=clone, target=args.target, app=app,
             base=args.base, cfg=cfg)
         if ready_out is not None:
             write_ready_out(ready_out, payload)

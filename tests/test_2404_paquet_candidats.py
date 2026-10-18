@@ -187,10 +187,12 @@ class InventoryTest(unittest.TestCase):
             3: [{"path": "migrations/0009_x.sql", "class": "sensitive", "rule": None}],
         }
         self.families = {"author": "deepseek", "reviewer": "claude"}
+        self.class_calls = []
         self.head_classes: dict[str, tuple] = {}
 
     def inventory(self, *, family=None, **kwargs):
         def fake_class(db, lot, **rest):
+            self.class_calls.append((lot, rest))
             # #2496 : la classe du contenu composé d'une remise, par SHA
             if rest.get("head") in self.head_classes:
                 cls, files = self.head_classes[rest["head"]]
@@ -292,6 +294,28 @@ class InventoryTest(unittest.TestCase):
     def test_other_project_is_out_of_the_list(self):
         payload = self.inventory()
         self.assertNotIn(10, [entry["work_item"] for entry in payload["candidates"]])
+
+    def test_class_reads_the_package_target_not_origin_head(self):
+        # #2464 : avec un origin/HEAD resté sur une release, la classe doit
+        # recevoir la cible du paquet (main), pas relire ce HEAD.
+        base = _git(self.repo, "rev-parse", self.tips[1] + "^")
+        _git(self.repo, "update-ref", "refs/remotes/origin/release/1.11.0", base)
+        _git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/release/1.11.0")
+        payload = self.inventory()
+        call = next(rest for lot, rest in self.class_calls if lot == 1)
+        self.assertEqual(call["item"]["branch_target"], "main")
+        self.assertEqual(call["base"], payload["base"])
+
+    def test_origin_head_release_without_target_is_a_read_error(self):
+        base = _git(self.repo, "rev-parse", self.tips[1] + "^")
+        _git(self.repo, "update-ref", "refs/remotes/origin/release/1.11.0", base)
+        _git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/release/1.11.0")
+        with self.assertRaises(packet_candidates.CandidateError):
+            packet_candidates.inventory(
+                object(), SimpleNamespace(name="ameesh", target=""),
+                repo=self.repo, clone=self.clone, target=None, cfg=None)
 
     def test_base_option_reproduces_a_manifest(self):
         base = _git(self.repo, "rev-parse", "main^")

@@ -501,9 +501,10 @@ scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
 Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
 ni « écarté » motivé), ou si le contenu d'un lot composé a disparu de la tête
 (revert non consigné) — l'ascendance d'une tête ne suffit pas après un revert
-(#1638). Sans source de liste attendue ni de liste prête, il sort `2`, sauf
-`--no-expected` qui assume le contrôle partiel ; un fichier de lots prêts
-fourni mais vide est valide. Un contenu *partiel* ou *vide* est listé « à
+(#1638). Sans liste prête, il sort `2` (`--no-ready` est refusé) ; sans liste
+attendue, il sort `2` sauf `--no-expected` explicite. Un fichier de lots prêts
+fourni mais vide est valide. Sur une recomposition, la liste est recalculée sur
+la cible de la recomposition. Un contenu *partiel* ou *vide* est listé « à
 lire » (union, adaptation, remise fraîche) ; `--strict` le rend bloquant.
 Détail, format de la liste attendue et validation sur le paquet 11h :
 `docs/PAQUET-INCLUSION.md`.
