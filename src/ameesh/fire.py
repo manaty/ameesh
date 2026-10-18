@@ -45,7 +45,7 @@ import os
 import socket
 from urllib.parse import quote
 
-from . import land, lot_class, merge_queue, plan_git, storage, work
+from . import land, lot_class, merge_queue, packet_guard, plan_git, storage, work
 
 FIRE = "fire"
 UNFIRE = "unfire"
@@ -148,12 +148,19 @@ def state(db, lot: int) -> dict:
     }
 
 
-def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None = None) -> dict:
+def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None = None,
+         exception: str = "", reason: str = "") -> dict:
     """Donne le feu du pilote sur la tête gelée `sha` du lot (jalon `fire`).
 
     Refuse un lot terminé, un lot non gelé, un `sha` qui n'est pas un commit,
     ou un `sha` qui n'est pas le gel courant : le feu se donne sur la tête
     exacte, jamais sur un lot (« si la tête change, le feu est à redonner »).
+
+    #2333 (canon §11 bis) : un feu sur une branche de travail (`lot/**`,
+    `agent/**`, `review/**`) vers la cible d'intégration est refusé hors
+    paquet, sauf exception `incident|unblock` motivée ; la déclaration est
+    écrite au journal du lot sur cette tête (`packet_guard`) et le passage
+    d'auto-fusion la relit.
 
     Le geste prend le bail du feu (`fire:<lot>`), celui du passage : un
     passage en cours d'armement ou de fusion ne peut pas ignorer un feu qui
@@ -163,13 +170,15 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
-        return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo)
+        return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo,
+                            exception=exception, reason=reason)
     finally:
         _unlock(handle)
 
 
 def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
-                 repo: str | None = None) -> dict:
+                 repo: str | None = None, exception: str = "",
+                 reason: str = "") -> dict:
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -195,6 +204,22 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
         raise FireError("the fire names %s, not the current freeze %s of lot #%d: the fire is "
                         "given on the exact head (freeze it again, then give the fire)"
                         % (wanted[:12], frozen[:12], lot))
+    if exception:
+        try:
+            packet_guard.marker(exception, frozen, reason)
+        except packet_guard.PacketGuardError as exc:
+            raise FireError(str(exc)) from exc
+    target = str(item.get("branch_target") or "").strip()
+    if not target and repo:
+        try:
+            target = plan_git.default_target(repo) or ""
+        except plan_git.MergeProbeError:
+            target = ""
+    try:
+        packet_guard.check_merge(db, lot, item.get("branch") or "", target, frozen,
+                                 exception=exception, reason=reason, actor=actor)
+    except packet_guard.PacketGuardError as exc:
+        raise FireError(str(exc)) from exc
     full = merge_queue.pinned(repo, wanted) if repo else None
     return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
                           note=(note or "").strip())
@@ -1209,6 +1234,16 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     target = _target(row, project, work_repo, info)
     queue_mode = project is not None and getattr(project, "land", "off") != "off"
 
+    # #2333 (canon §11 bis) : aucune fusion de lot directe hors paquet, même
+    # pour un feu donné avant la garde ou avec une auto-fusion déjà armée. La
+    # déclaration d'exception est relue au journal du lot ; un refus désarme
+    # une auto-fusion résiduelle (`_not_ready`) avant toute PR ou file.
+    try:
+        packet_guard.check_merge(db, lot, branch, target, _norm(fire.get("sha")))
+    except packet_guard.PacketGuardError as exc:
+        return _not_ready(db, row, status, out, str(exc), gh=gh, slug=slug,
+                          dry_run=dry_run, handle=handle)
+
     # 4. LA PORTE DES VERDICTS, AVANT TOUTE PR, TOUTE FILE ET TOUTE CI (#1374,
     #    B et P1-1). Le feu peut être enregistré au gel ; rien ne part avant
     #    les avis requis, indépendants et sans blocage non levé.
@@ -1527,6 +1562,13 @@ def add_parser(work_sub, func) -> None:
     parser.add_argument("--repo", default=None,
                         help="the lot's repository: a checkout path, or the current "
                              "checkout's owner/name (default: the current git repository)")
+    parser.add_argument("--exception", choices=packet_guard.EXCEPTIONS, default="",
+                        help="#2333/canon §11 bis: incident|unblock, for a lot branch merged "
+                             "outside the packet (the declaration is journaled in the lot's "
+                             "note); requires --sha and --reason")
+    parser.add_argument("--reason", default="",
+                        help="why the packet exception is taken (incident: target red; "
+                             "unblock: CI stuck); written to the lot's journal")
     parser.add_argument("--note", default="")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--actor", default="",
@@ -1546,6 +1588,9 @@ def run(cfg, db, args) -> int:
     if args.sha and args.withdraw:
         print("--sha and --withdraw are exclusive", file=sys.stderr)
         return 2
+    if args.exception and not args.sha:
+        print("--exception applies when the fire is given: pass --sha", file=sys.stderr)
+        return 2
     try:
         repo = resolutions.repo_root(args.repo) if args.repo else None
     except (resolutions.ResolveError, OSError) as exc:
@@ -1563,7 +1608,8 @@ def run(cfg, db, args) -> int:
                       "agent with a declared role): %s" % exc, file=sys.stderr)
                 return 1
         if args.sha:
-            row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo)
+            row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo,
+                       exception=args.exception or "", reason=args.reason or "")
             print("fire given to lot #%d on %s (by %s)" % (args.id, row["sha"][:12], actor))
             results = run_pass(cfg, db, only_lot=args.id, repo=repo)
         elif args.withdraw:

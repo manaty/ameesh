@@ -20,7 +20,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import fire, land, lot_class, merge_queue, review, storage, work
+from ameesh import fire, land, lot_class, merge_queue, packet_guard, review, storage, work
 
 from .support import PgTestCase
 
@@ -529,12 +529,20 @@ class ActTest(unittest.TestCase):
 
     def _act(self, marks, status, *, gate=(True, "", {"class": "light"}), pr_gate=(True, ""),
              info=None, project=None, dry_run=False, opened=None, fresh=None, renew=True,
-             statuses=None, merge=(True, "PR merged"), target_blocked=False):
+             statuses=None, merge=(True, "PR merged"), target_blocked=False,
+             packet_refusal=None):
         names = ("_repo_of", "_slug", "_project", "_pr_status", "_repo_info", "_target",
                  "ready_verdicts", "ready_pr", "_merge_pr", "_disarm_auto", "_reconcile",
                  "_invalidate", "_disarm", "_open_pr", "_queue", "_passive", "_wake",
                  "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock")
-        with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched:
+        packet_patch = (
+            mock.patch.object(fire.packet_guard, "check_merge",
+                              side_effect=packet_guard.PacketGuardError(packet_refusal))
+            if packet_refusal else
+            mock.patch.object(fire.packet_guard, "check_merge",
+                              return_value={"allowed": True}))
+        with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched, \
+                packet_patch:
             patched["_repo_of"].return_value = None
             patched["_slug"].return_value = "manaty/ameesh"
             patched["_project"].return_value = project
@@ -599,6 +607,17 @@ class ActTest(unittest.TestCase):
         self.assertEqual(out["result"], "invalidated")
         calls["_invalidate"].assert_called_once()
         self.assertIn("the PR head moved", calls["_invalidate"].call_args.args[4])
+        calls["_merge_pr"].assert_not_called()
+
+    def test_packet_guard_refuses_before_any_pr_or_queue(self):
+        """#2333 : un feu de lot hors paquet est refusé avant la PR et la file."""
+        out, calls = self._act(
+            _marks(_mark("frozen", A), _mark("fire", A)), _status(),
+            packet_refusal="direct merge of lot/42-x into main refused: canon §11 bis")
+        self.assertEqual(out["result"], "not-ready")
+        self.assertIn("§11 bis", out["detail"])
+        calls["_open_pr"].assert_not_called()
+        calls["_queue"].assert_not_called()
         calls["_merge_pr"].assert_not_called()
 
     def test_verdicts_gate_before_opening_the_pr(self):
@@ -739,7 +758,8 @@ class LandGuardCallTest(unittest.TestCase):
             ejected.update(reason=reason, todo=todo)
             return {"lot": 7, "result": "ejected"}
 
-        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A},
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
                                         project=types.SimpleNamespace(repo="/r"), eject=eject)
         with mock.patch.object(fire, "land_guard", return_value=(False, "fire withdrawn")):
             out = land._fire_guard(landing)
@@ -748,7 +768,8 @@ class LandGuardCallTest(unittest.TestCase):
         self.assertIn("queue remove", ejected["todo"])
 
     def test_land_continues_without_fire_markers(self):
-        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A},
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
                                         project=types.SimpleNamespace(repo="/r"),
                                         eject=lambda *a, **k: {"result": "ejected"})
         with mock.patch.object(fire, "land_guard", return_value=(True, "")):
@@ -761,7 +782,98 @@ class FireDbTest(PgTestCase):
     def _frozen_lot(self, sha=A):
         lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
         work.milestone(self.db, lot, "frozen", sha=sha, actor="pilote")
+        # #2333 : ces témoins-ci portent sur le mécanisme du feu ; l'exception
+        # incident déclarée au journal les autorise hors paquet. Les refus de
+        # la garde ont leurs propres témoins ci-dessous.
+        packet_guard.declare(self.db, lot, "incident", "test: fire fixture", sha,
+                             actor="pilote")
         return lot
+
+    def _bare_frozen_lot(self, sha=A, branch="lot/1-un-lot"):
+        """Un gel sans exception : la garde du paquet doit refuser le feu."""
+        lot = work.add(self.db, title="un lot", branch=branch)["id"]
+        work.milestone(self.db, lot, "frozen", sha=sha, actor="pilote")
+        return lot
+
+    def test_packet_guard_refuses_a_direct_fire_on_the_target(self):
+        """#2333 : hors paquet, le feu d'une branche de lot est refusé, sans jalon."""
+        lot = self._bare_frozen_lot()
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertIn("§11 bis", str(caught.exception))
+        self.assertFalse(fire.state(self.db, lot)["active"])
+        self.assertEqual([e for e in work.events(self.db, lot)
+                          if (e.get("note") or "").startswith("packet-exception")], [])
+
+    def test_packet_guard_exception_is_journaled_on_the_fire(self):
+        """#2333 : l'exception motivée passe et laisse sa marque au journal."""
+        lot = self._bare_frozen_lot()
+        row = fire.give(self.db, lot, sha=A, actor="pilote",
+                        exception="incident", reason="cible rouge 18/10")
+        self.assertEqual(row["kind"], "fire")
+        notes = [e["note"] for e in work.events(self.db, lot)
+                 if (e.get("note") or "").startswith("packet-exception")]
+        self.assertEqual(notes, ["packet-exception incident sha=%s reason=cible rouge 18/10"
+                                 % A])
+
+    def test_packet_guard_exception_requires_a_reason(self):
+        """#2333 : une exception sans motif n'est pas une déclaration."""
+        lot = self._bare_frozen_lot()
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote", exception="incident")
+        self.assertIn("requires a reason", str(caught.exception))
+        self.assertFalse(fire.state(self.db, lot)["active"])
+
+    def test_packet_head_passes_without_an_exception(self):
+        """#2333 : la tête d'un paquet (`integration/**`) a le droit de fusionner."""
+        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
+        row = fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertEqual(row["kind"], "fire")
+
+    def _landing(self, lot, *, branch="lot/1-un-lot", target="main", sha=A):
+        """Le dernier geste de `land` : une ligne de file et son éjection."""
+        ejected: dict = {}
+
+        def eject(reason, todo, **extra):
+            ejected.update(reason=reason, todo=todo)
+            return {"lot": lot, "result": "ejected", "reason": reason, "todo": todo}
+
+        landing = types.SimpleNamespace(
+            db=self.db, lot=lot,
+            row={"branch": branch, "target": target, "frozen_sha": sha},
+            project=types.SimpleNamespace(repo=".", name="ameesh"), eject=eject)
+        return landing, ejected
+
+    def test_land_guard_refuses_a_queued_lot_head_without_a_packet(self):
+        """#2333 : une ligne de file déjà posée ne contourne pas le paquet, sans feu."""
+        lot = self._bare_frozen_lot()
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+        self.assertIn("queue remove", ejected["todo"])
+
+    def test_land_guard_passes_a_declared_exception_on_that_head(self):
+        """#2333 : l'exception déclarée au journal vaut au dernier geste de land."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "cible rouge 18/10", A)
+        landing, _ejected = self._landing(lot)
+        self.assertIsNone(land._fire_guard(landing))
+
+    def test_land_guard_refuses_a_declaration_on_another_head(self):
+        """#2333 : une déclaration d'une autre tête ne couvre pas ce gel."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "ancienne tête", B)
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+
+    def test_land_guard_passes_an_integration_packet(self):
+        """#2333 : une ligne de file dont la tête est integration/** passe."""
+        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
+        landing, _ejected = self._landing(lot, branch="integration/paquet-2333")
+        self.assertIsNone(land._fire_guard(landing))
 
     def test_give_refuses_without_a_freeze(self):
         lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]

@@ -88,8 +88,27 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
 
     #2286 : sur un atterrissage local, la garde exige aussi les checks requis
     déclarés du projet sur le gel : la voie file ne contourne pas la porte des
-    checks requis. Rend l'éjection, ou None si la voie est libre."""
-    from . import fire
+    checks requis.
+
+    #2333 (canon §11 bis) : la file d'équipe ne contourne pas la règle du
+    paquet. La tête de la ligne (`lot/**`, `agent/**`, `review/**`) ne se
+    fusionne sur la cible d'intégration que portée par un paquet
+    (`integration/**`) ou sous une exception déclarée au journal du lot, pour
+    cette tête exacte — et cela **sans dépendre d'un feu** : une ligne déjà en
+    file ou `work queue add` (qui ne passe ni par `give` ni par `_act`) est
+    arrêtée ici, sur les voies `local` et `pr`. Rend l'éjection, ou None si la
+    voie est libre."""
+    from . import fire, packet_guard
+    row = landing.row or {}
+    try:
+        packet_guard.check_merge(landing.db, landing.lot, row.get("branch") or "",
+                                 row.get("target") or "", row.get("frozen_sha") or "")
+    except packet_guard.PacketGuardError as exc:
+        return landing.eject(str(exc), "This queue entry is not a packet (canon §11 bis): "
+                                       "take the lot out of the queue (`ameesh work queue "
+                                       "remove %d`) and let the packet carry it, or declare "
+                                       "the incident/unblock exception in the lot's note."
+                              % landing.lot)
     ok, why = fire.land_guard(landing.db, landing.lot, landing.row.get("frozen_sha") or "",
                               repo=landing.project.repo, project=landing.project,
                               target=landing.row.get("target") or "", gh=gh)
