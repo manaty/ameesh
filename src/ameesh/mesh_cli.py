@@ -550,14 +550,32 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             def tag(key: str) -> str:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
-            print("  thresholds memory ≥ %s%s; swap ≤ %s%s; load ≤ %.2f%s; disk ≥ %s%s"
+            # #2354: no declared swap ceiling and no PSI to corroborate one —
+            # the host is under the 0028 conservative fallback, the stock is
+            # then the only memory signal; say it instead of a bare "—".
+            swap = limits["max_swap_used"]
+            if swap is None and latest.get("psi_mem_some") is None:
+                swap = res.DEFAULT_MAX_SWAP_USED_WITHOUT_PSI
+                swap_tag = " [fallback: no PSI]"
+                swap_note = "counts alone, no PSI"
+            else:
+                # #2296: the declared ceiling, or none at all — "— [défaut]"
+                # would claim a default value that does not exist
+                swap_tag = tag("max_swap_used") if swap is not None else " [no default]"
+                swap_note = "counts only under memory pressure"
+
+            print("  thresholds memory ≥ %s%s; swap ≤ %s%s (%s); load ≤ %.2f%s; disk ≥ %s%s"
                   "; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
-                     _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
+                     _fmt_bytes(swap), swap_tag, swap_note,
                      limits["max_load"], tag("max_load"),
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
                      tag("max_tmpfs_used")))
+            # #2296: the admission signal that follows the real pressure
+            print("  thresholds memory pressure ≤ %s%s"
+                  % (res.fmt_value("max_mem_pressure", limits["max_mem_pressure"]),
+                     tag("max_mem_pressure")))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -1529,6 +1547,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "dependencies":
             from . import work_dependencies
             return work_dependencies.run(db, args)
+        if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
+            from . import work_dependencies
+            return work_dependencies.run_landing(db, args)
         if args.work_command == "queue":   # merge queue per target (L160e)
             from . import merge_queue
             return merge_queue.run(cfg, db, args)
@@ -2841,6 +2862,7 @@ def build_parser() -> argparse.ArgumentParser:
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
+    work_dependencies.add_landing_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")

@@ -479,6 +479,9 @@ la remise du lot diffère du gel enregistré (#2157). `scripts/paquet-compose.py
 compose l'unité et écrit ce message, y compris sur conflit (`.git/MERGE_MSG`
 prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé n'est
 réécrit pour ce seul métadonné.
+Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
+ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
+un `#N` seul n'y déclare aucune unité (#2335).
 
 ## Le lot en cours
 
@@ -691,9 +694,9 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI and no CI per lot between cuts, sober proofs
-   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
-   reviewed commit.
+   hourly packages, review before CI and no CI per lot between packages, sober
+   proofs (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only
+   through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
    exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
    Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance

@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
+from ameesh import (lot_class, mail, merge_queue, packet_guard, plan_git, plan_github, radar,
                     resolutions, storage, work)
 
 from .support import PgTestCase
@@ -117,14 +117,21 @@ class _Base(unittest.TestCase):
         self.fake = FakeQueue(lots)
         self.marks: dict = {}
         store = mock.Mock(work=self.fake)
-        for patch in (mock.patch.object(storage, "of", return_value=store),
-                      mock.patch.object(work, "get",
-                                        side_effect=lambda db, n: self.fake.lots.get(n)),
-                      mock.patch.object(work, "milestones",
-                                        side_effect=lambda db, n, *a: self.marks.get(n, [])),
-                      mock.patch.object(merge_queue, "actor_family",
-                                        side_effect=lambda db, n: self.FAMILIES.get(
-                                            str(n or "").strip(), ""))):
+        patches = [mock.patch.object(storage, "of", return_value=store),
+                   mock.patch.object(work, "get",
+                                     side_effect=lambda db, n: self.fake.lots.get(n)),
+                   mock.patch.object(work, "milestones",
+                                     side_effect=lambda db, n, *a: self.marks.get(n, [])),
+                   mock.patch.object(merge_queue, "actor_family",
+                                     side_effect=lambda db, n: self.FAMILIES.get(
+                                         str(n or "").strip(), ""))]
+        if getattr(self, "PACKET_GUARD", True):
+            # #2333 : ces bancs sans base simulent la mécanique de file ; la
+            # garde du paquet y est simulée (les témoins de la garde elle-même
+            # sont dans PacketAdmissionTest et test_1374_fire).
+            patches.append(mock.patch.object(packet_guard, "check_merge",
+                                             return_value={"allowed": True}))
+        for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -385,6 +392,31 @@ class EntryTest(_Base):
         self.fake.lots[1]["state"] = "merged"
         with self.assertRaisesRegex(merge_queue.QueueError, "nothing to merge"):
             self.enter(1)
+
+
+class PacketAdmissionTest(_Base):
+    """#2333/canon §11 bis : la file refuse une tête de lot hors paquet, et
+    accepte le paquet (`integration/**`). La garde réelle est laissée active
+    (pas de simulation) ; la base est absente, donc aucune exception ne peut
+    être relue ici : les exceptions sont éprouvées sur Postgres dans
+    test_1374_fire (land._fire_guard) et test_l161g_ci_gel (ci run)."""
+
+    PACKET_GUARD = False
+
+    def test_queue_add_refuses_a_lot_head_outside_the_packet(self):
+        self.ready(1)
+        with self.assertRaisesRegex(merge_queue.QueueError, "§11 bis"):
+            self.enter(1)
+        self.assertEqual(self.fake.queue_rows, {}, "aucune ligne de file écrite")
+
+    def test_queue_add_accepts_an_integration_packet(self):
+        sha = self.tip(1)
+        _git(self.repo, "branch", "integration/paquet-2333", sha)
+        self.fake.lots[1]["branch"] = "integration/paquet-2333"
+        self.ready(1)
+        self.enter(1)
+        self.assertEqual(self.fake.queue_rows[1]["frozen_sha"], sha)
+        self.assertEqual(self.fake.queue_rows[1]["target"], "main")
 
 
 class LightClassTest(_Base):
@@ -1063,6 +1095,11 @@ class QueueWithoutRadarTest(PgTestCase):
         work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")
+        # #2333 : `queue add` refuse une tête de lot hors paquet ; ce banc
+        # éprouve le clone jetable et la tête fraîche, pas la garde : une
+        # exception déclarée sur cette tête exacte autorise l'admission.
+        packet_guard.declare(self.db, lot, "incident", "test: queue mechanics", fresh,
+                             actor="pilot")
         status = {"number": 7, "green": True, "head": fresh, "draft": False}
         made: list = []
         real = tempfile.mkdtemp

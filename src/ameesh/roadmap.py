@@ -53,6 +53,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from typing import Iterable
 
 from . import config as config_mod
 from . import db as db_mod
@@ -384,13 +385,15 @@ def _source_view(kind: str | None, ref: str | None, label: str | None = None) ->
 
 
 def real_milestones(item: dict, events: list[dict], actions: list[dict],
-                    declared: list[dict] | None) -> dict:
+                    declared: list[dict] | None, *,
+                    agents: Iterable[str] | None = None) -> dict:
     """Les jalons RÉELS génériques d'une tâche, depuis ce qu'ameesh mesure
     déjà (journal, table des jalons, actions) : `{demandee, debut, soumise,
-    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint)."""
+    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint).
+    `agents` : le registre, pour la correspondance `seb` / `human:seb` (#2346)."""
     from . import progress  # import tardif : progress importe ce module
 
-    jalons = progress._jalons_de_lot(item, events, actions, declared)
+    jalons = progress._jalons_de_lot(item, events, actions, declared, agents=agents)
     started = next((e.get("created_ts") for e in events if dev.en_cours(e.get("state"))), None)
     out = {key: jalons.get(dev.jalon(key)) for key in ("demandee", "soumise", "verdict",
                                                        "livree")}
@@ -511,6 +514,9 @@ def build(db, *, now: float | None = None, project: str | None = None,
     now = time.time() if now is None else float(now)
     base = today(now)
     st = storage.of(db)
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur, pour que `lot_state` ne diverge pas de progress.
+    agents = {r["name"] for r in st.progress.agents(None) if r.get("name")}
     done_states = (dev.CORRESPONDANCES["etats_livres"]
                    + dev.CORRESPONDANCES["etats_abandonnes"])
     filters = {"project": project} if project else {}
@@ -552,8 +558,9 @@ def build(db, *, now: float | None = None, project: str | None = None,
     for item in rows:
         iid = int(item["id"])
         evs, acts = events.get(iid, []), actions.get(iid, [])
-        real = real_milestones(item, evs, acts, declared.get(iid))
-        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid))
+        real = real_milestones(item, evs, acts, declared.get(iid), agents=agents)
+        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid),
+                                         agents=agents)
         shown = progress.lot_state(item.get("state") or "", jalons)
         tasks.append(build_task(item, real, base=base,
                                 epic=plan_mod.epic_of(item.get("package_id"), by_pkg),
@@ -646,6 +653,14 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
     ligne : `{reason, what, due, days, commitment, lot, package, owner,
     assignee, responsible}` — `reason` : `engagement` ou `date_prevue`.
 
+    Une date prévue ne lève que si une personne l'a posée et si le lot est
+    encore piloté par son porteur : les dates calculées par la table de
+    référence (`planned_source` « reference p80… ») sont re-datées à la passe
+    suivante de `work schedule --apply`, jamais alertées ; un lot en attente
+    (bloqué, en relecture, ou retenu par une attente planifiée) ne l'est pas
+    non plus. Un lot daté et engagé ne produit qu'une alerte : l'engagement
+    explicite l'emporte sur la date.
+
     Lecture légère (aucun journal) : l'alerte tourne à chaque passe."""
     now = time.time() if now is None else float(now)
     base = today(now)
@@ -673,11 +688,31 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
                     "days": (base - due).days, "commitment": row["id"], "lot": lot,
                     "package": row.get("package_id"), "owner": row.get("owner"),
                     "assignee": (item or {}).get("assignee"), "project": row.get("project")})
+    # #2342 : un lot daté et engagé est une seule alerte (l'engagement est la
+    # promesse explicite) ; sinon la date posée par une personne reste la sienne.
+    engaged = {r["lot"] for r in out if r["reason"] == "engagement" and r["lot"] is not None}
+    from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
+    dated = []
     for item in rows:
         key = "planned_delivery" if item.get("planned_delivery") else (
             "planned_end" if item.get("planned_end") else None)
         due = _date(item.get(key)) if key else None
-        if not due or base <= due:
+        if not due or base <= due or int(item["id"]) in engaged:
+            continue
+        # a date computed by the schedule is re-dated by its next pass; a lot
+        # waiting (held, under review, waiting for its package or a dependency)
+        # has no gesture on its date, so it is not a date-driven alert
+        if not dev.active(item.get("state")):
+            continue
+        if str(item.get("planned_source") or "").startswith(SOURCE):
+            continue
+        dated.append((item, key, due))
+    waits = {}
+    if dated:
+        from . import planned_waits
+        waits = planned_waits.read(db, [item for item, _, _ in dated], now=now)
+    for item, key, due in dated:
+        if int(item["id"]) in waits:
             continue
         out.append({"reason": "date_prevue", "what": "%s of task #%d \"%s\"" % (
             LABELS["delivery" if key == "planned_delivery" else "end"], int(item["id"]),

@@ -7,7 +7,8 @@
 #   deploy/mise-a-jour/poste.sh <étape> [REF]
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
-#   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
+#   sauvegarder  dump de la base du mesh sur la VM (copie gardée), rapatrié
+#                compressé, puis pg_dump de l'ancienne base
 #   migrer [--additif-seulement] [REF]
 #                migrations de REF (défaut HEAD, comme installer), lancées
 #                depuis son instantané AVANT de l'installer : base du mesh
@@ -81,6 +82,12 @@ ROLE=${ROLE_SUPERVISEUR:-ameesh_superviseur}
 EXECUTOR_ROLE=${ROLE_EXECUTOR:-ameesh_executor}
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 SAUVEGARDES="$HOME/backups/ameesh"
+#: dumps produits sur la VM par ameesh-sauvegarde.service (0700, 0600)
+SAUVEGARDES_VM=${SAUVEGARDES_VM:-/home/ameesh/sauvegardes}
+SAUVEGARDES_VM=${SAUVEGARDES_VM%/}
+#: borne du rapatriement du dump serveur (secondes) ; la progression et les
+#: octets déjà écrits sont journalisés par le récepteur en cas d'échec
+RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT:-3600}
 case "${1:-}" in
   publier|rattraper) ;;
   *) mkdir -p "$TRAVAIL" "$SAUVEGARDES"; chmod 700 "$TRAVAIL" ;;
@@ -88,6 +95,12 @@ esac
 
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
+#: même canal, borné par un délai : la récupération d'un dump ne peut pas
+#: retenir le staging indéfiniment si le lien WireGuard se bloque.
+ssh_vm_borne() {
+  local delai=$1; shift
+  timeout --foreground "$delai" ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"
+}
 dsn_de() { python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["dsn"])' "$1"; }
 # #518: a DSN's password never goes on a command line, which every process of
 # the host can read (ps, /proc/<pid>/cmdline), nor in a trace (bash -x) or a
@@ -148,22 +161,96 @@ verifier() {
   ("$AMEESH" doctor || true) | tail -3
 }
 
-sauvegarder() {
-  local jour dsn; jour=$(date +%F-%H%M)
-  etape "base du mesh, vidée depuis le poste"
-  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
-  # d'ouvrir le canal privé de sauvegarde, comme pour « migrer ».
-  dsn_part dsn "$CONFIG" dsn || return
-  "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG" \
-    --output "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
-  ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
-  etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
-  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
-  # Un échec de backup/upload doit arrêter cette étape avant les migrations.
-  ssh_vm 'set -e
+# Démarre la sauvegarde serveur (copie gardée sur la VM) et atteste le dump
+# qu'elle vient de produire : chemin, taille et SHA-256, sur trois lignes.
+# Le service publie son fichier par lien dur : un dump visible est complet.
+# Aucun DSN ni secret ne traverse cette commande distante.
+sauvegarde_serveur() {
+  printf '%s\n' "$SAUVEGARDES_VM" | ssh_vm 'set -eu
+    IFS= read -r d
+    test -d "$d"
+    before=$(mktemp "$d/.liste-avant.XXXXXX")
+    after=$(mktemp "$d/.liste-apres.XXXXXX")
+    trap "rm -f -- \"$before\" \"$after\"" EXIT HUP INT TERM
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$before"
     systemctl start ameesh-sauvegarde.service
     test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
-    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
+    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$after"
+    new=$(comm -13 "$before" "$after" | tail -1)
+    if [ -z "$new" ]; then
+      echo "ameesh-sauvegarde : aucun nouveau dump dans $d" >&2
+      exit 1
+    fi
+    f="$d/$new"
+    test -f "$f"
+    printf "%s\n" "$f"
+    stat -c %s -- "$f"
+    sha256sum -- "$f" | cut -d" " -f1
+  '
+}
+
+sauvegarder() {
+  local jour sortie meta statut distant taille sha statuts dsn
+  jour=$(date +%F-%H%M)
+  sortie="$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  case "$RECUPERATION_TIMEOUT" in
+    ''|*[!0-9]*|0) echo "RECUPERATION_TIMEOUT doit être un entier positif" >&2; return 2 ;;
+  esac
+  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
+  # toute sauvegarde, comme pour « migrer ».
+  dsn_part dsn "$CONFIG" dsn || return
+  [ -n "$dsn" ] || { echo "DSN de la base du mesh illisible" >&2; return 1; }
+  etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
+  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
+  # Un échec de backup/upload doit arrêter cette étape avant les migrations ;
+  # son code de sortie est propagé tel quel (banc : BACKUP_START_STATUS).
+  if meta=$(sauvegarde_serveur); then :; else
+    statut=$?
+    echo "sauvegarde serveur en échec (statut $statut) : rien n'a été modifié" >&2
+    return "$statut"
+  fi
+  distant=$(sed -n '1p' <<<"$meta")
+  taille=$(sed -n '2p' <<<"$meta")
+  sha=$(sed -n '3p' <<<"$meta")
+  case "$distant" in
+    "$SAUVEGARDES_VM"/ameesh-*.dump) ;;
+    *) echo "sauvegarde serveur : chemin de dump inattendu" >&2; return 1 ;;
+  esac
+  case "$taille" in ''|*[!0-9]*|0) echo "sauvegarde serveur : taille invalide" >&2; return 1 ;; esac
+  case "$sha" in
+    ''|*[!0-9a-f]*) echo "sauvegarde serveur : empreinte invalide" >&2; return 1 ;;
+  esac
+  [ "${#sha}" -eq 64 ] || { echo "sauvegarde serveur : empreinte invalide" >&2; return 1; }
+  etape "rapatriement compressé du dump serveur ($taille octets)"
+  # Le dump est déjà sur la VM ; on ne fait plus traverser WireGuard à pg_dump.
+  # gzip borne le débit utile ; le récepteur vérifie taille et SHA-256 avant
+  # de publier le fichier par lien dur, et journalise les octets écrits.
+  set +e
+  printf '%s\n' "$distant" | ssh_vm_borne "$RECUPERATION_TIMEOUT" \
+      'IFS= read -r f; gzip -1 -c -- "$f"' \
+    | "$VENV/bin/python" "$ICI/sauvegarder-prive.py" pull --output "$sortie" \
+        --sha256 "$sha" --bytes "$taille" --timeout "$RECUPERATION_TIMEOUT"
+  statuts=("${PIPESTATUS[@]}")
+  set -e
+  # trois maillons : l'écriture du chemin, la source ssh bornée, le récepteur.
+  if [ "${statuts[2]}" != 0 ]; then
+    echo "rapatriement en échec : récepteur ${statuts[2]}, source ${statuts[1]}" >&2
+    return 1
+  fi
+  if [ "${statuts[1]}" != 0 ]; then
+    if [ "${statuts[1]}" = 124 ]; then
+      echo "rapatriement en échec : délai de ${RECUPERATION_TIMEOUT} s dépassé" >&2
+    else
+      echo "rapatriement en échec : source ${statuts[1]}" >&2
+    fi
+    return 1
+  fi
+  if [ "${statuts[0]}" != 0 ]; then
+    echo "rapatriement en échec : écriture du chemin ${statuts[0]}" >&2
+    return 1
+  fi
+  ls -l "$sortie"
   if ancienne; then
     etape "ancienne base"
     dsn_part dsn "$CONFIG_RESTE" dsn || return
@@ -264,6 +351,13 @@ migrer_base() {
   fi
   [ "$code" = 0 ] || exit "$code"
   ameesh_de "$cible" doctor --probe
+  # #2339: run the INSTALLED code, not the migration snapshot, read-only.
+  # A failed compatibility check stops before installation on every host.
+  etape "auto-prise du code installé sur la base migrée (lecture seule)"
+  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || {
+    echo "ancien code incompatible : arrêter la mise à jour ; préparer un correctif compatible avant de poursuivre (base déjà migrée)." >&2
+    return 1
+  }
 }
 
 # The remote administrator switches to the actual migration owner so future

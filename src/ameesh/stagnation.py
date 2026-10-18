@@ -397,6 +397,9 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     agents = st.progress.agents(None)
     states, externals = availability_of(agents)
     agent_projects = {r["name"]: projects.agent_project(r) for r in agents}
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur (voir progress._same_actor).
+    agent_names = {r["name"] for r in agents if r.get("name")}
     events, milestones, actions, messages, last_events, hold_events = _grouped(st, ids)
     from . import planned_waits
     from . import work_dependencies
@@ -416,7 +419,8 @@ def describe(db, rows: list[dict], *, now: float | None = None,
         package = packages.get(row.get("package_id")) or {}
         try:
             jalons = progress._jalons_de_lot(row, events.get(rid, []), acts,
-                                             milestones.get(rid))
+                                             milestones.get(rid),
+                                             agents=agent_names)
             detail = waiting(row, jalons, acts,
                              responsible=package.get("responsible"))
             # #1822 : la classe n'est lue que pour un lot qui attendrait un
@@ -429,6 +433,12 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                                      responsible=package.get("responsible"),
                                      review_class=cls)
             detail = with_availability(detail, states, externals)
+            hold = waits.get(rid)
+            if hold and hold.get("what") == "landing" and detail and detail.get("what") == "merge":
+                # #1945 : un atterrissage déclaré est plus précis que le libellé
+                # générique « merge (executor not designated) » ; le registre
+                # nomme le véhicule, son étape, sa tête et l'échéance.
+                detail = dict(detail, who=None, label=work_dependencies.wait_label(hold))
             last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                                  messages.get(rid), events_ts=last_events.get(rid))
             project = projects.lot_project(row, agent_projects,
