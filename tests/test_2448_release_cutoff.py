@@ -286,6 +286,73 @@ class ReleaseFixture(unittest.TestCase):
         self.assertEqual(later["version"], "1.11.8")
         self.assertEqual(later["staging"]["exit"], 0)
 
+    def _red_cutoff(self, green):
+        """A green B, a red commit on main, then the 11:00 cutoff: V and M."""
+        self.write("red.txt", "red\n")
+        self.commit("red change")
+        self.git(self.seed, "push", "-q", "origin", "main")
+
+        def reading(project, sha):
+            return {"green": sha == green}
+
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "released", report)
+        self.assertNotEqual(report["landing_sha"], report["release_sha"])
+        return report
+
+    def test_green_landing_merge_is_green_content(self):
+        """B1: CI green on the landing M itself must be trusted, not skipped."""
+        green = self.head
+        first = self._red_cutoff(green)
+        landing = first["landing_sha"]
+        self.assertTrue(release_cutoff.commit_is_green(
+            self.clone, self.project, landing, reading={"green": True}))
+
+        def reading(project, sha):
+            return {"green": sha in (green, landing)}
+
+        with mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
+            plan = release_cutoff.build_plan(self.cfg, self.project, now=_paris(23, 5))
+        self.assertTrue(plan.ci["green"], plan.ci)
+        self.assertTrue(plan.green)
+        self.assertEqual(plan.base, landing)
+        self.assertEqual(plan.last_green, landing)
+        self.assertEqual(plan.version, "1.11.9")
+        self.assertEqual(self.git(self.clone, "show", "%s:red.txt" % plan.base), "red")
+        # The tagged content follows the validated landing: red.txt is in it.
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T23:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
+            second = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(23, 5))
+        self.assertEqual(second["result"], "released", second)
+        self.assertEqual(self.git(self.clone, "rev-parse", "%s^" % second["release_sha"]),
+                         landing)
+        self.assertEqual(self.git(self.clone, "show",
+                                  "%s:red.txt" % second["release_sha"]), "red")
+
+    def test_red_child_of_a_green_landing_keeps_the_landing_as_base(self):
+        """B1: a red child of a green landing M still finds M as last green."""
+        green = self.head
+        first = self._red_cutoff(green)
+        landing = first["landing_sha"]
+        self.git(self.seed, "pull", "-q", "--ff-only", "origin", "main")
+        self.write("later.txt", "later\n")
+        self.commit("later red change")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               side_effect=lambda project, sha:
+                               {"green": sha in (green, landing)}):
+            plan = release_cutoff.build_plan(self.cfg, self.project, now=_paris(23, 5))
+        self.assertFalse(plan.ci["green"], plan.ci)
+        self.assertFalse(plan.green)
+        self.assertEqual(plan.last_green, landing)
+        self.assertEqual(plan.base, landing)
+
     def test_red_head_releases_last_green_with_a_landing_merge(self):
         green = self.head
         self.write("red.txt", "red\n")

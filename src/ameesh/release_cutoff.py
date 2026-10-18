@@ -439,25 +439,29 @@ def _landing_release(repo: str, sha: str) -> bool:
 
 def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
                     reading: dict | None = None) -> bool:
-    """The exact commit is green; a release commit inherits its chain.
+    """The exact commit is green; a non-green release commit inherits its chain.
 
-    The chain is followed iteratively through `[skip ci]` release commits, with
-    no fixed depth: a long series of red-landing releases must stay green as a
-    chain (B1). A landing merge is not green: its first parent is the red main.
+    The exact CI reading always wins, including on a landing merge M: content
+    re-validated green on M is green (B1). Only a commit whose exact CI is not
+    green may inherit, and a landing merge never inherits: its first parent is
+    the red main, its published green content is found through the tag
+    (last_green). The chain is followed iteratively through `[skip ci]` release
+    commits, with no fixed depth: a long series of red-landing releases must
+    stay green as a chain.
     """
     seen = set()
     current = sha
     first = True
     while current and current not in seen:
         seen.add(current)
-        if _landing_release(repo, current):
-            return False
         current_reading = reading if first else None
         first = False
         current_reading = (ci_reading(project, current)
                            if current_reading is None else current_reading)
         if current_reading.get("green"):
             return True
+        if _landing_release(repo, current):
+            return False
         if not _release_commit(repo, current):
             return False
         parent = _git(repo, "rev-parse", "--verify", "%s^1" % current)
@@ -487,13 +491,18 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
 
     A red landing merge `M = merge(main, V)` names the published green content
     as its second parent; the latest release tag is then the base (B1). A
-    landing merge is recognised directly, so any number of successive red
-    cutoffs works. Without a landing merge, only a truly green first-parent
-    commit is accepted; if none is found the caller refuses (N5).
+    landing merge whose own CI is green is the green content itself, also for
+    a red child of it. A landing merge is recognised directly, so any number of
+    successive red cutoffs works. Without a landing merge, only a truly green
+    first-parent commit is accepted; if none is found the caller refuses (N5).
     """
     cursor = head
     for _ in range(limit):
         if _landing_release(repo, cursor):
+            # Exact CI first: a re-validated landing is green content, never
+            # an inheritance from its red first parent.
+            if commit_is_green(repo, project, cursor):
+                return cursor
             return _latest_green_tag(repo, head, project)
         if commit_is_green(repo, project, cursor):
             return cursor
