@@ -321,12 +321,20 @@ def run(cfg, args) -> int:
         if not declared:
             print("release: off (no release block for this host)")
             return 0
-        names = _project_names(cfg, args)
+        try:
+            names = _project_names(cfg, args)
+        except release_cutoff.ReleaseError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 1
         now = time.time() if args.now is None else float(args.now)
         if getattr(args, "dry_run", False):
             for name in names:
-                _dry_run(cfg, declared[name], now=now,
-                         version=getattr(args, "version", None), as_json=args.json)
+                try:
+                    _dry_run(cfg, declared[name], now=now,
+                             version=getattr(args, "version", None), as_json=args.json)
+                except release_cutoff.ReleaseError as exc:
+                    print("%s: %s" % (name, exc), file=sys.stderr)
+                    return 1
             return 0
         from .db import open_db
         db = open_db(cfg)

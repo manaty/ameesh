@@ -410,8 +410,11 @@ def version_floor(repo: str, since: str, target: str) -> tuple[str, str]:
     script = os.path.join(repo, "scripts", "version-level.py")
     if not os.path.isfile(script):
         return "unknown", "scripts/version-level.py absent"
-    proc = subprocess.run([sys.executable, script, "level", since, target],
-                          capture_output=True, text=True, cwd=repo, timeout=300.0)
+    try:
+        proc = subprocess.run([sys.executable, script, "level", since, target],
+                              capture_output=True, text=True, cwd=repo, timeout=300.0)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "unknown", "version-level.py: %s" % exc
     if proc.returncode != 0:
         return "unknown", " ".join((proc.stderr or proc.stdout or "").split())[-300:]
     text = (proc.stdout or "").strip()
@@ -1193,6 +1196,8 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         for row in staging.get("summary") or []:
             lines.append("  - %s: %s %s%s" % (row["host"], row["step"], row["verdict"],
                                              " (retour effectué)" if row["rollback"] else ""))
+        if staging.get("error"):
+            lines.append("  erreur: %s" % staging["error"])
         if staging.get("attestation"):
             lines.append("  attestation: %s" % attestation_path(release_sha))
     if deviations:
@@ -1304,18 +1309,20 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         notes = (_git(project.repo, "show", "%s:%s" % (release_sha, notes_path)).stdout
                  or "") if _git(project.repo, "cat-file", "-e",
                                 "%s:%s" % (release_sha, notes_path)).returncode == 0 else ""
+        since = previous["commit"] if previous else release_sha
+        packets, direct = packets_between(project.repo, since, release_sha)
+        migrations = migrations_between(project.repo, since, release_sha)
+        included = sorted({lot for packet in packets for lot in packet.units}
+                          | {lot for row in direct for lot in row["lots"]})
         if not notes:
-            since = previous["commit"] if previous else release_sha
-            packets, direct = packets_between(project.repo, since, release_sha)
-            migrations = migrations_between(project.repo, since, release_sha)
-            notes, _, _ = generate_notes(
+            notes, included, _ = generate_notes(
                 project=project, repo=project.repo, since=since, target=release_sha,
                 version=version_out, cutoff_label=label, cutoff_at=at, rules=rules,
                 previous=previous, floor="patch", floor_reason="reconciled release",
                 packets=packets, direct=direct, migrations=migrations)
         ensure_github_release(project, recent["tag"], version_out, notes)
         staging = (None if no_staging else
-                   maybe_staging(project, release_sha, [], cfg.state_dir))
+                   _staging_step(project, release_sha, included, cfg.state_dir))
         report = {"schema": SCHEMA, "result": "reconciled", "project": project.name,
                   "version": version_out, "tag": recent["tag"],
                   "release_sha": release_sha, "target_head": target_head,
@@ -1403,7 +1410,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
     # Staging deploys the tag's commit V (the green content), never the main
     # head; `origin/main` now contains the landing merge M when main was red.
     staging = (None if no_staging else
-               maybe_staging(project, version_sha, plan.included, cfg.state_dir))
+               _staging_step(project, version_sha, plan.included, cfg.state_dir))
     if plan.floor != "patch":
         deviations.append("version level %s: %s" % (plan.floor, plan.floor_reason[:300]))
     report = {"schema": SCHEMA, "result": "released", "project": project.name,
@@ -1419,6 +1426,23 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
               "deviations": deviations}
     return finish(cfg, db, project, report, state, state_slot, at, label, rules,
                   plan.previous, plan, staging, no_staging)
+
+
+def _staging_step(project: ProjectRelease, release_sha: str, included: list[int],
+                  state_dir: str) -> dict:
+    """Run staging; a lock conflict retries, a timeout is reported as a gap."""
+    try:
+        result = maybe_staging(project, release_sha, included, state_dir)
+    except ReleaseBusy:
+        raise
+    except TransientReleaseError as exc:
+        return {"exit": None, "duration_s": 0.0, "log": "", "summary": [],
+                "attestation": None, "error": str(exc)}
+    if result.get("exit") == 75:
+        # staging.sh's single-operator lock: another sequence is running. Not
+        # a release failure; the next tick reconciles the tag and retries.
+        raise ReleaseBusy("staging is running (code 75, single-operator lock)")
+    return result
 
 
 def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int],
