@@ -2086,9 +2086,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "milestone":
             from . import review_designation_activation as activation
             outcome: dict = {}
+            note = args.note or ""
+            if args.kind == "frozen":
+                # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
+                from . import freeze_checks
+                note = freeze_checks.before_freeze(
+                    cfg, db, args.id, args.sha or "", repo=args.repo,
+                    skip=args.no_static_checks, note=note)
+            elif args.repo is not None or args.no_static_checks is not None:
+                raise work.WorkError("--repo and --no-static-checks only apply to a freeze")
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=args.note or "", outcome=outcome)
+                verdict=args.verdict, note=note, outcome=outcome)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
@@ -3180,6 +3189,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="for the verdict milestone: ok or blocked")
     pw_ms.add_argument("--note", default="")
     pw_ms.add_argument("--actor", default="")
+    # #2542 : les contrôles statiques du projet passent avant le gel
+    pw_ms.add_argument("--repo", default=None,
+                       help="frozen: the repository holding --sha (default: the current "
+                            "directory, then the lot's project repository)")
+    pw_ms.add_argument("--no-static-checks", dest="no_static_checks", default=None,
+                       metavar="REASON",
+                       help="frozen: freeze without the project's static checks "
+                            "(scripts/freeze-checks.py); the reason goes in the note")
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
