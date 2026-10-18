@@ -1807,7 +1807,8 @@ def _bare_git_copy(path: str) -> bool:
     """Un dépôt nu : `HEAD`, `objects` et `refs`, sans `.git` (#2525).
     Signature seule, sans lancer git : un faux positif garde l'entrée, jamais
     l'inverse."""
-    return os.path.isfile(os.path.join(path, "HEAD")) \
+    return not os.path.lexists(os.path.join(path, ".git")) \
+        and os.path.isfile(os.path.join(path, "HEAD")) \
         and os.path.isdir(os.path.join(path, "objects")) \
         and os.path.isdir(os.path.join(path, "refs"))
 
@@ -1836,7 +1837,7 @@ def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], 
         walked += 1
         if walked > limit:
             return trees + bare, "more than %d directories: contents not verifiable" % limit
-        if _bare_git_copy(current) and not os.path.lexists(os.path.join(current, ".git")):
+        if _bare_git_copy(current):
             bare.append(current)
             continue          # le dedans d'un dépôt nu ne cache pas d'arbre de travail
         if os.path.lexists(os.path.join(current, ".git")):
