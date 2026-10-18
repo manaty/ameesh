@@ -102,10 +102,27 @@ class OrphanTmpTest(PgTestCase):
         _age(legacy, 23 * HOUR)
         report = self._pass()
         self.assertTrue(os.path.isdir(legacy))
-        self.assertIn("tmp %s kept: not owned by this mesh" % legacy,
-                      report["skipped"])
-        self._pass(later=25 * HOUR)
+        self.assertNotIn("tmp %s kept: not owned by this mesh" % legacy,
+                         report["skipped"])
+        self.assertIn(legacy, [row["path"] for row in report["unowned"]])
+        first = [e for e in report["entries"]
+                 if e.get("path") == legacy and e.get("action") == "unowned"]
+        self.assertEqual(len(first), 1)
+        self.assertTrue(first[0]["data"]["command"].startswith("ls -la"))
+        # #2493 : pas de nouveau constat dans la même fenêtre de 12 h...
+        again = self._pass(later=HOUR)
         self.assertTrue(os.path.exists(os.path.join(legacy, "f")))
+        self.assertEqual([e for e in again["entries"]
+                          if e.get("path") == legacy and e.get("action") == "unowned"],
+                         [])
+        self.assertIn(legacy, [row["path"] for row in again["unowned"]])
+        # ... puis un seul, à l'échéance, avec le même `first_seen` (alerte stable)
+        later = self._pass(later=menage.UNOWNED_REFRESH_S + 60)
+        repeated = [e for e in later["entries"]
+                    if e.get("path") == legacy and e.get("action") == "unowned"]
+        self.assertEqual(len(repeated), 1)
+        self.assertEqual(repeated[0]["data"]["first_seen"],
+                         first[0]["data"]["first_seen"])
         self.assertFalse(os.path.exists(menage.owner_file(
             menage.tmp_root(self.mine, self.pol), "ancien")))
 

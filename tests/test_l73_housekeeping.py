@@ -55,6 +55,14 @@ def _write(path: str, size: int, age_s: float = 0.0) -> None:
         os.utime(path, (moment, moment))
 
 
+def _age_tree(path: str, age_s: float) -> None:
+    at = time.time() - age_s
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in files + dirs:
+            os.utime(os.path.join(root, name), (at, at))
+    os.utime(path, (at, at))
+
+
 def _git(*args: str, cwd: str) -> str:
     out = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
                          check=True, env=dict(os.environ, GIT_AUTHOR_NAME="t",
@@ -672,8 +680,12 @@ class MenageDbTest(PgTestCase):
         _write(os.path.join(root, "notes.txt"), 10)
         loin = time.time() + 30 * 24 * 3600
         rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
-        self.assertTrue(os.path.isdir(root), rapport["skipped"])
-        self.assertIn("tmp %s kept: not owned by this mesh" % root, rapport["skipped"])
+        self.assertTrue(os.path.isdir(root))
+        self.assertNotIn("tmp %s kept: not owned by this mesh" % root,
+                         rapport["skipped"])
+        self.assertIn(root, [row["path"] for row in rapport["unowned"]])
+        self.assertEqual(len([e for e in rapport["entries"]
+                              if e.get("path") == root and e.get("action") == "unowned"]), 1)
         self.assertNotIn(root, [p["path"] for p in rapport["plan"]
                                 if p.get("action") == "suppression"])
 
@@ -705,9 +717,166 @@ class MenageDbTest(PgTestCase):
         _write(os.path.join(root, ".git"), 10)
         loin = time.time() + 30 * 24 * 3600
         rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
-        self.assertTrue(os.path.isdir(root), rapport["skipped"])
-        self.assertIn("tmp %s kept: contains a Git worktree or clone" % root,
-                      rapport["skipped"])
+        self.assertTrue(os.path.isdir(root))
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("git metadata unreadable", kept[0])
+
+    def test_worktree_propre_et_pousse_dans_un_orphelin_possede_est_recupere(self):
+        """#2493 N2 : une copie git propre et poussée dans un dossier tmp
+        possédé n'est plus gardée à jamais : elle est récupérée par
+        `git worktree remove` (sans --force), puis le dossier part ; la branche
+        reste."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        main = _repo(self.tmp)
+        root = os.path.join(troot, "a1+abcd9999")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9999", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        wt = os.path.join(root, "wt")
+        _git("worktree", "add", "-q", wt, "-b", "wt-recup", cwd=main)
+        _git("push", "-q", "origin", "wt-recup", cwd=main)
+        _age_tree(root, 3 * 3600)
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertFalse(os.path.isdir(root), rapport["skipped"])
+        deleted = [e for e in rapport["entries"]
+                   if e.get("path") == root and e.get("action") == "deleted"]
+        self.assertEqual(len(deleted), 1)
+        self.assertIn("git worktrees recovered", deleted[0]["detail"])
+        self.assertNotIn(wt, _git("worktree", "list", cwd=main))
+        self.assertIn("wt-recup", _git("branch", "--list", "wt-recup", cwd=main))
+
+    def test_worktree_sale_dans_un_orphelin_possede_est_garde(self):
+        """#2493 N2 : aucun travail non commité n'est détruit : un worktree
+        sale garde le dossier, avec la raison et la commande d'inspection."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        main = _repo(self.tmp)
+        root = os.path.join(troot, "a1+abcd9998")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9998", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        wt = os.path.join(root, "wt")
+        _git("worktree", "add", "-q", wt, "-b", "wt-sale", cwd=main)
+        _write(os.path.join(wt, "brouillon.txt"), 10)
+        _age_tree(root, 3 * 3600)
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertTrue(os.path.isdir(root))
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("git -C", kept[0])
+        self.assertNotIn(root, [p["path"] for p in rapport["plan"]
+                                if p.get("action") == "suppression"])
+
+    def test_clone_avec_branche_locale_non_poussee_est_garde(self):
+        """#2493 (relecture dev7, cx1) : un clone emporte ses branches
+        locales, son stash, ses fichiers ignorés et casse ses worktrees liés ;
+        HEAD propre et poussé ne suffit pas — chacun garde le dossier."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        _repo(self.tmp)
+        for nom, preparer in (
+                ("a1+abcd9997", lambda c: (
+                    _git("checkout", "-q", "-b", "travail", cwd=c),
+                    _git("commit", "-q", "--allow-empty", "-m", "jamais pousse", cwd=c),
+                    _git("checkout", "-q", "main", cwd=c))),
+                ("a1+abcd9996", lambda c: (
+                    _write(os.path.join(c, "brouillon.txt"), 10),
+                    _git("stash", "push", "-q", "-u", cwd=c))),
+                # relecture cx1 : un fichier ignoré (.env) partirait avec le clone
+                ("a1+abcd9995", lambda c: (
+                    _write(os.path.join(c, ".git", "info", "exclude"), 0),
+                    open(os.path.join(c, ".git", "info", "exclude"), "w").write("*.env\n"),
+                    _write(os.path.join(c, "private.env"), 10))),
+                # un clone qui porte un autre worktree lié ailleurs
+                ("a1+abcd9994", lambda c: _git(
+                    "worktree", "add", "-q", c + "-lie", "-b", "lie", cwd=c))):
+            root = os.path.join(troot, nom)
+            os.makedirs(root)
+            menage._write_owner(troot, nom, menage.mesh_key(self.cfgl),
+                                menage.ORIGIN_CREATED)
+            clone = os.path.join(root, "clone")
+            subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                            clone], check=True, capture_output=True)
+            preparer(clone)
+            _age_tree(root, 3 * 3600)
+            rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                      now=time.time() + 3 * 3600)
+            self.assertTrue(os.path.isdir(clone), nom)
+            kept = [note for note in rapport["skipped"]
+                    if note.startswith("tmp %s kept: git work —" % root)]
+            self.assertEqual(len(kept), 1, rapport["skipped"])
+
+    def test_worktree_dont_le_depot_commun_est_dans_le_tmp_est_garde(self):
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        root = os.path.join(self.tmp, "tmp-recovery")
+        os.makedirs(root)
+        bare = os.path.join(root, "bare.git")
+        subprocess.run(["git", "clone", "-q", "--bare", main, bare],
+                       check=True, capture_output=True)
+        _git("fetch", "-q", "origin", "main:refs/remotes/origin/main", cwd=bare)
+        # A bare common repository is not itself one of _git_copies.
+        wt = os.path.join(root, "wt")
+        _git("worktree", "add", "-q", wt, "main", cwd=bare)
+        self.assertIn("common repository lives inside", menage.tmp_git_work(root))
+
+    def test_clone_dont_le_remote_est_dans_le_dossier_tmp_est_garde(self):
+        """#2493 (relecture) : les refs de suivi ne prouvent rien si le remote
+        vit dans le dossier temporaire supprimé : le clone et son origin
+        partiraient ensemble. Le dossier reste, avec la raison."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "a1+abcd9993")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9993", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        origin = os.path.join(root, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin],
+                       check=True)
+        amont = os.path.join(self.tmp, "amont")
+        subprocess.run(["git", "clone", "-q", origin, amont], check=True,
+                       capture_output=True)
+        _git("commit", "-q", "--allow-empty", "-m", "racine", cwd=amont)
+        _git("push", "-q", "origin", "main", cwd=amont)
+        clone = os.path.join(root, "clone")
+        subprocess.run(["git", "clone", "-q", origin, clone], check=True,
+                       capture_output=True)
+        # All these usable local URLs point to the same sole backup.
+        os.mkdir(os.path.join(clone, "sub"))
+        for url in (origin, "file://localhost" + origin,
+                    "file://" + origin.replace("origin.git", "%6frigin.git"),
+                    "sub/../../origin.git"):
+            with self.subTest(url=url):
+                _git("remote", "set-url", "origin", url, cwd=clone)
+                self.assertTrue(_git("ls-remote", "origin", cwd=clone))
+                self.assertIn("inside the temporary directory", menage.tmp_git_work(root))
+        _git("config", "url.%s.insteadOf" % origin, "review-backup:", cwd=clone)
+        _git("remote", "set-url", "origin", "review-backup:", cwd=clone)
+        self.assertTrue(_git("ls-remote", "origin", cwd=clone))
+        _age_tree(root, 3 * 3600)
+        self.assertIn("inside the temporary directory", menage.tmp_git_work(root))
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertTrue(os.path.isdir(clone))
+        self.assertTrue(os.path.isdir(origin))
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1, rapport["skipped"])
+        self.assertIn("inside the temporary directory", kept[0])
 
     def _suivi(self, main: str, nom: str, lot: int | None) -> str:
         wt = os.path.join(self.tmp, nom)
