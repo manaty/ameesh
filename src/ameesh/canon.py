@@ -1439,6 +1439,12 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         return subprocess.run(cmd, cwd=repo, input=stdin, capture_output=True,
                               env=env, timeout=timeout, check=False)
     except FileNotFoundError as exc:
+        # Deux cas distincts portent le même FileNotFoundError : l'exécutable
+        # `git` absent, et le dossier de travail (`cwd=repo`) absent. Le
+        # second ne doit jamais se lire « git not found » (#2349).
+        if exc.filename and exc.filename != cmd[0]:
+            raise GitError("git %s: repository directory %r does not exist"
+                           % (args[0] if args else "?", repo)) from exc
         raise GitError("git not found") from exc
     except subprocess.TimeoutExpired as exc:
         raise GitError("git %s: timed out" % args[0]) from exc

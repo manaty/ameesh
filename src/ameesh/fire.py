@@ -105,9 +105,13 @@ def _norm(sha) -> str:
 
 
 def same_commit(a, b, repo=None) -> bool:
-    """Deux identifiants de commit qui nomment le même commit : égaux, ou
-    résolus dans `repo` (un gel et un feu peuvent citer des abréviations
-    différentes)."""
+    """Deux identifiants de commit qui nomment le même commit : égaux, résolus
+    dans `repo` quand il peut nommer les deux, sinon par préfixe commun.
+
+    Un gel, un feu et une tête de PR peuvent citer le même commit sur des
+    longueurs différentes (`c4d85ac37` au gel, `c4d85ac37dce` à la tête) :
+    l'égalité de chaînes seule invalidait un feu pourtant posé sur la même
+    tête (#2349)."""
     left, right = _norm(a), _norm(b)
     if not left or not right:
         return False
@@ -118,7 +122,9 @@ def same_commit(a, b, repo=None) -> bool:
         full_right = merge_queue.pinned(repo, right)
         if full_left and full_right:
             return full_left == full_right
-    return False
+    # Pas de dépôt (ou un commit qu'il ne peut pas résoudre) : deux
+    # abréviations du même commit sont préfixes l'une de l'autre (#1756).
+    return plan_git.same_commit(left, right)
 
 
 def state(db, lot: int) -> dict:
@@ -181,6 +187,10 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                         % (lot, frozen[:12]))
     if not merge_queue._HEX.fullmatch(wanted):
         raise FireError("--sha: a commit id (7 to 64 hex characters), not %r" % sha)
+    # Le dépôt de l'assigné (registre) sert à résoudre les abréviations et à
+    # enregistrer le SHA complet, comme le passage le fait déjà ; sans lui, la
+    # comparaison par préfixe commun reste possible (#2349).
+    repo = repo or _repo_of(db, item)
     if not same_commit(wanted, frozen, repo):
         raise FireError("the fire names %s, not the current freeze %s of lot #%d: the fire is "
                         "given on the exact head (freeze it again, then give the fire)"
@@ -1515,7 +1525,8 @@ def add_parser(work_sub, func) -> None:
     parser.add_argument("--withdraw", action="store_true",
                         help="withdraw the fire: the automatic merge is disarmed")
     parser.add_argument("--repo", default=None,
-                        help="the lot's repository (default: the current git repository)")
+                        help="the lot's repository: a checkout path, or the current "
+                             "checkout's owner/name (default: the current git repository)")
     parser.add_argument("--note", default="")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--actor", default="",

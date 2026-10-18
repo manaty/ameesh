@@ -85,6 +85,16 @@ class MarkersTest(unittest.TestCase):
         self.assertFalse(fire.same_commit(A, B))
         self.assertFalse(fire.same_commit("", A))
 
+    def test_same_commit_by_common_prefix(self):
+        # #2349 : gel `c4d85ac37`, tête de PR `c4d85ac37dce` — le même commit
+        # sur deux longueurs ne doit pas invalider le feu.
+        full = "c4d85ac37dcedb8f11bbdfed89201ee38547ae4a"
+        self.assertTrue(fire.same_commit(full, full[:9]))
+        self.assertTrue(fire.same_commit(full[:12], full[:9]))
+        self.assertTrue(fire.same_commit(full[:9], full[:12]))
+        self.assertFalse(fire.same_commit(full[:9], "d4d85ac37"))
+        self.assertTrue(fire.same_commit(full, full))
+
     def test_state_covered_and_withdrawn(self):
         item = {"id": 3, "title": "t", "state": "build", "branch": "lot/3-x"}
         covered = _marks(_mark("frozen", A), _mark("fire", A))
