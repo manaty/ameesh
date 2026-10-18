@@ -145,6 +145,40 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(row["level"], 1)
         self.assertEqual(row["targets"], ("assignee",))
 
+    def test_intake_reporte_part_du_jour_planifie(self):
+        from ameesh.plan import day_start_ts
+        planned = day_start_ts("2026-10-19")
+        item = _item(assignee="executant", planned_start="2026-10-19")
+        for offset, expected in ((-1, None), (0, 0), (180, 0),
+                                 (3599, 0), (3600, 1), (10800, 3)):
+            with self.subTest(offset=offset):
+                rows = slo.lot_steps(item, _jalons(item, []), [], now=planned + offset)
+                intake = [r for r in rows if r["step"] == "intake_started"]
+                if expected is None:
+                    self.assertEqual(intake, [])
+                else:
+                    self.assertEqual(intake[0]["started_ts"], planned)
+                    self.assertEqual(intake[0]["elapsed_s"], offset)
+                    self.assertEqual(intake[0]["level"], expected)
+
+    def test_intake_assignation_apres_date_planifiee(self):
+        from ameesh.plan import day_start_ts
+        planned = day_start_ts("2026-10-19")
+        item = _item(assignee="executant", planned_start="2026-10-19")
+        events = [_ev("intake", planned + 7200,
+                      "assigned to executant (before: nobody)")]
+        before = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                        now=planned + 10800), "intake_started")
+        self.assertEqual(before["started_ts"], planned + 7200)
+        self.assertEqual(before["elapsed_s"], 3600)
+        events.append(_ev("build", planned + 10800))
+        item["state"] = "build"
+        after = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                       now=planned + 14400), "intake_started")
+        self.assertEqual(after["started_ts"], before["started_ts"])
+        self.assertEqual(after["elapsed_s"], 3600)
+        self.assertEqual(after["level"], 0)
+
     def test_intake_garde_son_origine_au_demarrage(self):
         events = [_ev("intake", T0), _ev("intake", T0 + 7200,
                   "assigned to executant (before: nobody)")]

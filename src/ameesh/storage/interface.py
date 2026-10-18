@@ -3212,7 +3212,8 @@ class Operations(Domain):
         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
-        assignee, `package_id`, type et `priority` (le délai court du canon §9
+        assignee, `package_id`, type, `planned_start` (jour ISO ou None,
+        origine du délai intake #2562) et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
         son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
         celle de son paquet ou du parent, sinon son `app`), `workflow_ref`

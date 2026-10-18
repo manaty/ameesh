@@ -262,6 +262,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     sont pas un retard. La ligne porte `packet_slot` pour que l'alerte dise
     d'où part la mesure ; une fusion déjà faite garde sa durée réelle.
 
+    #2562 : le délai intake part au plus tôt du début planifié (minuit
+    local). Avant cette date, aucune ligne intake en cours ne court.
+
     #2217 : quand le lot vient d'être pris en charge (dernière ligne
     `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
     dépassements déjà courus ne sont pas imputés au nouveau porteur : leur
@@ -291,11 +294,16 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     if requested is not None and state not in ("merged", "promoted", "closed"):
         step = step_of("intake_started")
         ready = assigned if assigned is not None else requested
+        # #2562 : un report planifié ne constitue pas un retard intake.
+        from .plan import day_start_ts
+        planned = day_start_ts(item.get("planned_start"))
+        if planned is not None:
+            ready = max(float(ready), planned)
         if started is not None:
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))
-        elif state == "intake":
+        elif state == "intake" and now >= float(ready):
             # prêt, pas encore démarré : le délai court depuis que le lot est
             # prêt. Passé intake sans événement `build` (#1982), la phase est
             # franchie mais non mesurable : aucune ligne, donc aucun retard

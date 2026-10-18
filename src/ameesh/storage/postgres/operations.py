@@ -432,6 +432,7 @@ class Operations(interface.Operations):
                    -- pour un porteur : pas pour tous les lots ouverts (N2 de
                    -- la relecture dev7).
                    w.branch, w.branch_head,
+                   to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,
                    CASE WHEN left(btrim(w.branch), 12) = 'integration/' THEN w.body END AS body,
                    to_jsonb(w)->'reviewers' AS reviewers,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
