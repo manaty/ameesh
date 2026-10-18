@@ -9,6 +9,7 @@ from unittest import mock
 
 from ameesh import train, train_runner
 from ameesh.runner import Runner
+from .support import PgTestCase
 
 
 class Ops:
@@ -162,6 +163,40 @@ class ServiceLeaseTest(unittest.TestCase):
         self.assertIn(("acquire", 100), lease.calls)
         self.assertNotIn(("release", None), lease.calls)
         self.assertIsNone(lease.epoch)
+
+
+class HostLeaseSqlTest(PgTestCase):
+    """La sémantique réelle de `merge_locks` : même runner, incarnations distinctes."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE merge_locks RESTART IDENTITY CASCADE")
+
+    def test_two_incarnations_of_the_same_runner_cannot_both_hold(self):
+        cfg = types.SimpleNamespace(runner="runner-a@host-a", host="host-a")
+        first = train_runner.HostLease(cfg, ttl=900)
+        second = train_runner.HostLease(cfg, ttl=900)
+        self.assertNotEqual(first.owner, second.owner)
+        self.assertTrue(first.acquire(self.db, now=1000))
+        self.assertFalse(second.acquire(self.db, now=1000))
+        self.assertEqual(first.epoch, 1)
+        self.assertIsNone(second.epoch)
+        # Codex B2 repro: the same owner would have obtained epoch 2 here.
+        self.assertTrue(first.renew(self.db, now=1100))
+        self.assertTrue(first.release(self.db))
+        self.assertTrue(second.acquire(self.db, now=1200))
+
+    def test_a_live_lease_blocks_another_incarnation(self):
+        cfg = types.SimpleNamespace(runner="runner-a@host-a", host="host-a")
+        first = train_runner.HostLease(cfg, ttl=900)
+        second = train_runner.HostLease(cfg, ttl=900)
+        self.assertTrue(first.acquire(self.db, now=1000))
+        # The row is live even if the first process never renews again; the
+        # second incarnation must wait for expiry instead of bumping the epoch.
+        self.db.execute("UPDATE merge_locks SET expires_at = clock_timestamp()"
+                        " + interval '10 minutes' WHERE target = %s", ("train-service",))
+        self.assertFalse(second.acquire(self.db, now=1100))
+        self.assertTrue(first.renew(self.db, now=1100))
 
 
 class RunnerWiringTest(unittest.TestCase):

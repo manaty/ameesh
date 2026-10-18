@@ -37,6 +37,7 @@ test_1467_train_runner  # stockage : passage, clone privé, provenance et promot
 test_1467_train_runtime  # stockage : raccord train/feu SQL et gardes finales avant effet (#1467)
 test_1467_train_storage  # stockage : intentions CAS et bail cible partagé (#1467)
 test_2446_train_initial  # stockage : frontière d'activation et reçus de file réels (#2446)
+test_2446_train_service_lease  # stockage : bail de service, même runner/incarnations distinctes (#2446)
 test_2446_train_shadow  # stockage : plan ombre sur file, historique et préparation réels (#2446)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail

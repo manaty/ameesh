@@ -304,7 +304,7 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
         return train_shadow.Passage(
             cfg, project, policy_path=spec.canon, policy_commit=commit,
             workflows=workflows, provider=provider, mechanics=mechanics,
-            repository=repo, candidate=candidate, notify=report)
+            repository=repo, candidate=candidate, initial=initial, notify=report)
     passage = train_runner.Passage(
         cfg, project, owner=cfg.runner, policy=train.Policy(enabled=True),
         policy_path=spec.canon, policy_commit=commit, workflows=workflows,

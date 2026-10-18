@@ -181,7 +181,7 @@ class AssemblyTest(unittest.TestCase):
         self.assertEqual(passage.project.target, "main")
         self.assertTrue(passage.store.path.startswith(self.state))
         self.assertIsNotNone(result.lease)
-        self.assertEqual(result.lease.owner, "train-service:runner-a@host-a")
+        self.assertTrue(result.lease.owner.startswith("train-service:runner-a@host-a:"))
 
     def test_active_assembles_a_real_passage_and_the_configured_deadline(self):
         result = self.assemble(train=dict(self.config, mode="active"))

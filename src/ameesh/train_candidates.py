@@ -135,7 +135,15 @@ class Enrollment:
                 deferred.append(dict(work_item_id=candidate["work_item_id"], reason=str(exc)))
         return dict(admitted=admitted, deferred=deferred)
 
-    def enroll(self, candidate, base, *, actor, lease=None):
+    def decide(self, candidate, base):
+        """Read-only preparation and initial-history decision; no allocation.
+
+        The shadow mode uses the same decision as the active enrollment: a
+        candidate refused here (withdrawn freeze, unknown legacy history,
+        moved branch, incomplete reviews) can never be presented as a packet
+        member the train would enroll. ``enroll`` performs the write with the
+        returned prepared subject and decision.
+        """
         prepared = self.preparation.prepare(candidate, base)
         subject = prepared["subject"]
         # Historical queue_remove deleted its row without a typed receipt.
@@ -143,6 +151,21 @@ class Enrollment:
         # reader/unknown answer only permits replay of a recorded allocation.
         initial = (self.initial(self.preparation.history.db, subject=copy.deepcopy(subject))
                    if self.initial is not None else None)
+        if initial is not False:
+            # `queue_add` can only replay a row that matches a recorded packet
+            # allocation. Without that receipt, any existing row (e.g. an
+            # ejection) makes the active enrollment refuse; mirror that here so
+            # the shadow plan never presents it as a member.
+            current = {row["work_item_id"]: row
+                       for row in self.preparation.ops.queue(None)}
+            if subject["work_item_id"] in current:
+                initial = False
+        return dict(prepared=prepared, initial=initial)
+
+    def enroll(self, candidate, base, *, actor, lease=None):
+        decision = self.decide(candidate, base)
+        prepared, initial = decision["prepared"], decision["initial"]
+        subject = prepared["subject"]
         row = self.preparation.ops.queue_add(subject["work_item_id"], target=subject["target"],
             frozen_sha=subject["frozen_sha"], frozen_id=subject["frozen_id"], source=subject["source"],
             packet=prepared["item"], packet_initial=initial is True,

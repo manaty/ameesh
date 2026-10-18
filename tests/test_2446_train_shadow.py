@@ -19,7 +19,8 @@ from functools import partial
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from ameesh import (mechanics, plan_git, radar, storage, train_shadow, work)
+from ameesh import (mechanics, merge_queue, plan_git, radar, storage,
+                    train_initial, train_shadow, work)
 from .support import PgTestCase
 from .test_1467_train_review import author
 from .test_2446_train_assembly import MECHANICS, _Repo
@@ -172,6 +173,7 @@ class ShadowPassageTest(PgTestCase):
             self.project, policy_path=self.canon.root, policy_commit=self.commit,
             workflows=(), provider=provider, mechanics=mechanics,
             repository=self.project_repo.root, candidate=candidate,
+            initial=train_initial.Boundary(self.now - 60),
             notify=self.notices.append)
 
     def manual_packet(self, lots, stamp="20261018-1100"):
@@ -219,6 +221,41 @@ class ShadowPassageTest(PgTestCase):
         self.assertEqual(comparison["missing"], [999])
         self.assertEqual(comparison["extra"], [])
         self.assertIn("not a candidate", comparison["explanations"]["999"])
+
+    def test_withdrawal_receipt_is_the_same_refusal_as_active_enrollment(self):
+        self.db.execute(
+            "INSERT INTO integration_train_queue_receipts"
+            " (work_item_id, generation, frozen_id, kind) VALUES (%s, 1, %s, 'removed')",
+            (self.item["id"], self.mark["id"]))
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["plan"]["members"], [])
+        reasons = {row["work_item_id"]: row["reason"]
+                   for row in result["plan"]["deferred"]}
+        self.assertIn("active enrollment would refuse", reasons[self.item["id"]])
+        self.assertEqual(self.ops.queue(None), [])
+
+    def test_an_existing_queue_row_without_allocation_receipt_is_not_a_member(self):
+        source = merge_queue.source_of(self.project_repo.root)
+        self.ops.queue_add(self.item["id"], target="main", frozen_sha=self.head,
+                           frozen_id=self.mark["id"], source=source, actor="fixture",
+                           note="")
+        self.ops.queue_update(self.item["id"], state="ejected", actor="fixture",
+                              note="legacy ejection without packet receipt")
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["plan"]["members"], [])
+        self.assertTrue(any(row["work_item_id"] == self.item["id"]
+                            and "active enrollment would refuse" in row["reason"]
+                            for row in result["plan"]["deferred"]))
+
+    def test_freeze_before_the_activation_boundary_is_not_a_member(self):
+        self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                        " WHERE id = %s",
+                        (self.now - 7200, self.mark["id"]))
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["plan"]["members"], [])
+        self.assertTrue(any(row["work_item_id"] == self.item["id"]
+                            and "active enrollment would refuse" in row["reason"]
+                            for row in result["plan"]["deferred"]))
 
     def test_packets_merged_before_the_first_plan_are_not_compared(self):
         self.shadow.scheduled_step(self.db, self.now)

@@ -97,7 +97,8 @@ class Passage:
     reservation = None
 
     def __init__(self, cfg, project, *, policy_path, policy_commit, workflows,
-                 provider, mechanics, repository, candidate=None, notify=None):
+                 provider, mechanics, repository, candidate=None, initial=None,
+                 notify=None):
         if not isinstance(project.name, str) or not project.name:
             raise train.TrainError("explicit shadow project required")
         if not isinstance(policy_commit, str) or not re.fullmatch(
@@ -109,6 +110,8 @@ class Passage:
         self.workflows, self.provider, self.mechanics = workflows, provider, mechanics
         self.repository_source = repository
         self.candidate = candidate
+        #: the same qualified initial-history reader the active Enrollment uses
+        self.initial = initial
         self.notify = notify or (lambda message: None)
         self.maintenance_at = None
         target = merge_queue._remote_branch(project.target)
@@ -195,6 +198,8 @@ class Passage:
             preparation = train_candidates.Preparation(
                 db, self.project, repository=repository, history=history,
                 policy=requirement)
+            enrollment = train_candidates.Enrollment(preparation, admissions,
+                                                     initial=self.initial)
             for candidate in inventory["candidates"]:
                 lot = candidate["work_item_id"]
                 if lot in prepared_ids:
@@ -204,10 +209,20 @@ class Passage:
                                               "; ".join(candidate["causes"])))
                     continue
                 try:
-                    prepared = preparation.prepare(candidate, base)
+                    decision = enrollment.decide(candidate, base)
                 except train.TrainError as exc:
                     deferred.append(_deferred(lot, "candidate", str(exc)))
                     continue
+                # The shadow plan must not show a member that the active
+                # enrollment would refuse: a withdrawal receipt or an
+                # unqualified initial absence is the same refusal here.
+                if decision["initial"] is not True:
+                    deferred.append(_deferred(
+                        lot, "candidate",
+                        "no qualified initial queue history or a withdrawal: "
+                        "active enrollment would refuse"))
+                    continue
+                prepared = decision["prepared"]
                 members.append(_member(dict(prepared["subject"], priority=2,
                                             rank=len(members), queued_ts=0),
                                        origin="candidate", proof=prepared))

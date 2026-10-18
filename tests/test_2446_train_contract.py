@@ -19,7 +19,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 class ContractTest(unittest.TestCase):
     def test_packet_gate_and_suite_blobs_are_the_current_ones(self):
         contract, = train_contracts.ameesh()
-        self.assertEqual(contract.event, "workflow_call")
+        self.assertEqual(contract.path, ".github/workflows/paquet.yml")
+        self.assertEqual(contract.event, "push")
+        self.assertEqual(contract.called, ".github/workflows/tests.yml")
         paths = [path for path, _blob in contract.sources]
         self.assertIn(".github/workflows/paquet.yml", paths)
         self.assertIn(".github/workflows/tests.yml", paths)

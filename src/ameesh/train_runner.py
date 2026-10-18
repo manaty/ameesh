@@ -12,6 +12,7 @@ import os
 import math
 import threading
 import time
+import uuid
 from dataclasses import asdict, replace
 
 from . import (merge_queue, radar, resolutions, storage, train, train_admissions,
@@ -39,7 +40,12 @@ class HostLease:
                 or retry <= 0:
             raise train.TrainError("positive train service lease duration required")
         self.key = key
-        self.owner = "train-service:" + (cfg.runner or cfg.host or "unknown")
+        # #2446/Codex B2: `land_lock` lets the SAME owner take a new epoch
+        # immediately. One owner per service incarnation is therefore
+        # mandatory: two processes configured with the same runner id must
+        # contend instead of both considering themselves the holder.
+        self.owner = "train-service:%s:%s" % (
+            cfg.runner or cfg.host or "unknown", uuid.uuid4().hex)
         self.ttl, self.retry, self.clock = float(ttl), float(retry), clock
         self.epoch = None
         self.next_at = 0.0

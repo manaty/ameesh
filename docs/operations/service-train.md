@@ -55,6 +55,11 @@ hôtes lisent la configuration et n'assemblent rien (une ligne de journal le
 dit). Un seul hôte exécute le service grâce au bail `train-service` (table
 `merge_locks`, TTL 15 min, renouvelé, rendu à l'arrêt) : si deux agents ou deux
 hôtes le tentent, un seul obtient le bail ; les autres attendent et réessaient.
+Le propriétaire du bail porte un identifiant d'incarnation unique : deux
+processus configurés avec le même identifiant d'exécuteur ne peuvent pas
+reprendre le bail l'un de l'autre (le SQL autorise le même propriétaire à
+prendre un nouvel epoch). Après un arrêt brutal, le successeur attend donc
+l'expiration du TTL ; un arrêt propre le libère tout de suite.
 
 ## Modes
 
@@ -71,6 +76,11 @@ service :
 4. compare ce plan au manifeste du composeur humain quand le paquet de la même
    heure a atterri : lots manquants (avec le motif que le train avait), lots en
    trop, paquet et base qui ont servi.
+
+L'inventaire de l'ombre applique la **même décision d'inscription** que le mode
+actif (`Enrollment.decide` : préparation, avis, puis frontière initiale et
+reçus de retrait), sans écrire : un gel retiré, d'historique inconnu ou une ligne de file sans reçu d'allocation
+n'est jamais présenté comme un membre que le train inscrirait.
 
 Rien n'est réservé, poussé, dispatché ni fusionné : aucun `merge_locks` de
 cible, aucune branche `integration/**`, aucune CI. C'est le mode qui doit
@@ -91,7 +101,10 @@ paquet n'a pas encore atterri n'apparaît pas dans `comparisons`.
 
 Le passage réel du moteur #1467 : il compose la tête du paquet, publie la
 branche immuable `integration/train-*`, attend l'unique CI complète du paquet
-(`paquet.yml` → `workflow_call` de `tests.yml`) et fusionne au vert. Le
+(le run `push` de `paquet.yml`, dont le job `suite` appelle `tests.yml` ; ses
+jobs appelés apparaissent dans le même run, préfixés par le job appelant) et
+fusionne au vert. Un push couvert par une PR ouverte laisse `suite` sauté : ce
+n'est pas une preuve de paquet, le train refuse. Le
 composeur humain devient le repli : en cas de rouge, le train s'arrête, alerte
 et n'enchaîne pas ; un humain reprend la main.
 
@@ -115,13 +128,17 @@ agents) et journalise le premier refus :
 
 ## Contrat CI
 
-`train_contracts.ameesh()` épingle les blobs de `.github/workflows/paquet.yml`,
-`.github/workflows/tests.yml` et des planificateurs (`test-plan.py`,
-`test-parts.py`, `ci-flow.py`, `map.py`). La suite du paquet est la matrice
-complète 8 psycopg + 16 psql, le job `plateforme macOS` et l'agrégat `tests`,
-lus sur l'événement `workflow_call` de la tête poussée. Une modification d'un
-de ces fichiers exige un nouveau contrat audité : le témoin
-`tests/test_2446_train_contract.py` compare les blobs au commit.
+`train_contracts.ameesh()` épingle les blobs de `.github/workflows/paquet.yml`
+(le run appelant), `.github/workflows/tests.yml` (le workflow appelé) et des
+planificateurs (`test-plan.py`, `test-parts.py`, `ci-flow.py`, `map.py`). La
+preuve est le run `push` de `paquet.yml` à la tête exacte : il doit référencer
+`tests.yml` au même SHA et porter les jobs appelés, préfixés par le job
+appelant (`suite complète du paquet / plan`, `… / psycopg 4/8`, `… / tests`) :
+la matrice complète 8 psycopg + 16 psql, le job `plateforme macOS` et l'agrégat
+`tests`. Une PR ouverte laisse `suite` sauté : les jobs appelés sont absents et
+le train ne s'en sert jamais. Une modification d'un de ces fichiers exige un
+nouveau contrat audité : le témoin `tests/test_2446_train_contract.py` compare
+les blobs au commit.
 
 ## Retour arrière
 
