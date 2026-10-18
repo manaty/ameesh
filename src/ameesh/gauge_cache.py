@@ -13,9 +13,11 @@ class GaugeCache:
     directories therefore cannot cause unlimited retention. No transcript
     text, credentials, registry entries or budget decisions are retained.
 
-    Une observation est `(estampille, production, gauges)` (#1132) : la copie
-    garde le TYPE de la liste (son `overage` pour `Gauges`) sans recopier ses
-    éléments, qui sont gelés.
+    Une observation est `(estampille, production, gauges)` (#1132) : le cache
+    en garde une copie et `get` en rend une autre (#1702 N5) — un appelant ne
+    peut pas muter l'observation partagée par un autre CostBook, l'invariant
+    n'est plus porté par un commentaire. La copie garde le TYPE de la liste
+    (son `overage` pour `Gauges`) sans recopier ses éléments, qui sont gelés.
     """
 
     def __init__(self, max_entries=128, max_accounts=64):
@@ -27,9 +29,16 @@ class GaugeCache:
     def get(self, path):
         with self._lock:
             value = self._entries.get(path)
-            if value is not None:
-                self._entries.move_to_end(path)
-            return value
+            if value is None:
+                return None
+            self._entries.move_to_end(path)
+            signature, readings = value
+            # #1702 (N5) : copie défensive à la lecture. `copy` à l'insertion
+            # ne protégeait que la mutation du producteur ; `get` rendait la
+            # liste interne, et l'invariant « un appelant ne mute pas » n'était
+            # qu'un commentaire. La liste rendue est propre à l'appelant.
+            return signature, {account: (stamp, produced, copy(gauges))
+                               for account, (stamp, produced, gauges) in readings.items()}
 
     def __setitem__(self, path, value):
         signature, readings = value

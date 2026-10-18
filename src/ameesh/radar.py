@@ -20,6 +20,8 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
    déjà sous un autre nom. Seules les migrations du **delta propre** du lot
    comptent (celles que la cible ne porte pas déjà) : une migration de la
    cible ramenée par une fusion dans la branche n'est à personne (#1333).
+   Une copie identique héritée d'un autre lot suivi reste attribuée à ce
+   constituant, sans doublon ni réservation supplémentaire pour le paquet (#2279).
 
 Les fusions d'essai n'écrivent rien dans le dépôt des agents : leurs objets
 vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
@@ -67,7 +69,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import plan_git
-from .canon import GIT_TIMEOUT, GitError, _git, _git_env
+from .canon import GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
@@ -912,19 +914,64 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if not one.get("target_certified", True):
             uncertified.setdefault((one["target"], one["target_ref"]),
                                    one.get("target_reason") or "")
+    migration_branches = (_native_migration_additions(repo, branches, migrations)
+                          if migrations else branches)
     report = {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
                                          for b in branches],
               "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
               "against_target": against,
               "uncertified_targets": [{"target": target, "ref": ref, "reason": why}
                                       for (target, ref), why in sorted(uncertified.items())],
-              "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+              "migrations": migration_probe(repo, migration_branches, migrations)
+              if migrations else []}
     if migrations and shallow:
         report["migration_probe"] = "suspended: shallow repository (history is incomplete)"
     if reservations is not None:
         report["unreserved_migrations"] = reservations(
-            [b for b in branches if b.get("target_certified", True)])
+            [b for b in migration_branches if b.get("target_certified", True)])
     return report
+
+
+def _native_migration_additions(repo: str, branches: list[dict], directory: str) -> list[dict]:
+    """#2279: attribute an unchanged inherited migration to its constituent.
+
+    Only a strict ancestor with the same path, blob and certified target
+    proves inheritance. Equal tips, independent additions, modified SQL and
+    unreadable evidence keep their warnings. Both probes use this view;
+    branch diffs in the report keep their full scope.
+    """
+    groups: dict = {}
+    for one in branches:
+        if not one.get("target_certified", True):
+            continue
+        for path in one.get("added") or ():
+            if (os.path.dirname(path) == directory
+                    and MIGRATION_RE.fullmatch(os.path.basename(path))):
+                groups.setdefault((one["target"], one["target_head"], path), []).append(one)
+    inherited, ancestors, blobs = {}, {}, {}
+    for (_, _, path), holders in groups.items():
+        if len(holders) < 2:
+            continue
+        for one in holders:
+            for other in holders:
+                pair = (other["tip"], one["tip"])
+                if pair[0] == pair[1]:
+                    continue
+                if pair not in ancestors:
+                    ancestors[pair] = _git(repo, "merge-base", "--is-ancestor", *pair,
+                                            env_extra=NO_LAZY_FETCH).returncode == 0
+                if not ancestors[pair]:
+                    continue
+                for tip in pair:
+                    if (tip, path) not in blobs:
+                        proc = _git(repo, "rev-parse", "--verify", tip + ":" + path,
+                                    env_extra=NO_LAZY_FETCH)
+                        blobs[tip, path] = proc.stdout.strip() if proc.returncode == 0 else None
+                if blobs[pair[0], path] and blobs[pair[0], path] == blobs[pair[1], path]:
+                    inherited.setdefault(one["work_item"], set()).add(path)
+    return [dict(one, added=[path for path in one.get("added") or ()
+                            if path not in inherited.get(one["work_item"], ())])
+            for one in branches]
 
 
 def migration_probe(repo: str, branches: list[dict], directory: str) -> list[dict]:
