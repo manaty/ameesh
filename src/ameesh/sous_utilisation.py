@@ -1050,7 +1050,12 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                           and _state(row) == "working" and not _attached(row))
     plan_idle = [row for row in idle if paid is not None and row.get("harness") not in paid]
     aggravating = bool(paid_working and plan_idle)
-    if not (waiting_lots or backlog or aggravating):
+    # #2337 : la levée se lit sur les lots DÉMARRABLES — un lot qu'une
+    # dépendance ou une date retient n'est pas du travail à confier, et
+    # `waiting_lots` en compte 24 sans qu'un agent puisse rien prendre. Les
+    # bloqués restent dans le détail d'une alerte levée par autre chose (un
+    # courrier en souffrance, le forfait au repos).
+    if not (startable_lots or backlog or aggravating):
         return []
     names = sorted(row["name"] for row in idle)
     # #1677 (b) : le repos se lit sur les lots actionnables, plus sur le temps
@@ -1151,8 +1156,8 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             not mine or mine & set(projects_mod.agent_projects(by_name.get(n) or {})))]
         if not names:
             continue
-        parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "
-                 "than %s: %s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
+        parts = ["Idle capacity: %d wakeable agent(s) without an actionable lot: %s."
+                 % (len(names), ", ".join(names))]
         if startable:
             parts.append("Open lots without an agent: %s." % ", ".join(
                 "#%d%s" % (i, " \"%s\"" % titles[i] if titles.get(i) else "")
