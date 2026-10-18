@@ -639,6 +639,9 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         os.chdir(session)
         item = work.get(self.db, self.lot)
         cfg = dataclasses.replace(self.cfg, radar={})
+        # the freeze transaction never reaches the network: no fetch there
+        self.assertEqual(act._repository(self.db, cfg, item, self.frozen,
+                                         fetch=False), "")
         found = act._repository(self.db, cfg, item, self.frozen)
         self.assertEqual(os.path.realpath(found), os.path.realpath(local.root))
         self.assertEqual(local.git("cat-file", "-t", self.frozen), "commit")

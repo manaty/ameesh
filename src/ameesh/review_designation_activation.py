@@ -445,7 +445,8 @@ def _repo_holding(path: str, frozen_sha: str, seen: set) -> str:
         return ""
 
 
-def _repository(db, cfg, item: Mapping, frozen_sha: str) -> str:
+def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
+                fetch: bool = True) -> str:
     """The repository holding the frozen head (assignee's worktree first).
 
     #2561: a freeze command often runs from the agent's *session* directory
@@ -455,6 +456,10 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str) -> str:
     housekeeping (a trusted machine source) and the siblings of the known paths
     whose name cites the lot or its assignee; the exact commit id decides, and a
     discovered sibling must also carry the lot's own GitHub origin.
+
+    `fetch=False` (the freeze transaction) never reaches the network: the head
+    found only on origin is journaled unavailable, then fetched by the retry
+    that runs outside any transaction (`retry_pending`).
     """
     candidates = _candidate_paths(db, cfg, item)
     seen: set[str] = set()
@@ -488,6 +493,8 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str) -> str:
             return repo
     # The head may have been pushed but not fetched into any local clone
     # (#2517); fetch it from the lot's own origin, bounded, and verify the SHA.
+    if not fetch:
+        return ""
     return _fetch_from_local_clone(
         list(candidates) + list(hints) + list(neighbours), slug, frozen_sha,
         str((item or {}).get("branch") or "").strip(), set())
@@ -665,8 +672,12 @@ def _manual(db, item: Mapping) -> list:
 # the inputs of one freeze
 # --------------------------------------------------------------------------
 
-def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | Unavailable:
-    """Reads the machine inputs of a freeze; an expected refusal is `Unavailable`."""
+def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
+            fetch: bool = True) -> Inputs | Unavailable:
+    """Reads the machine inputs of a freeze; an expected refusal is `Unavailable`.
+
+    `fetch=False` keeps the read local (no `git fetch`), as the freeze
+    transaction requires."""
     item = work.get(db, int(lot))
     if item is None:
         return Unavailable("lot #%d not found" % int(lot))
@@ -682,7 +693,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | 
     frozen_sha = str(freeze.get("sha") or "").strip()
     if not frozen_sha:
         return Unavailable("freeze #%s names no commit" % (freeze.get("id"),))
-    repo = _repository(db, cfg, item, frozen_sha)
+    repo = _repository(db, cfg, item, frozen_sha, fetch=fetch)
     if not repo:
         return Unavailable("no repository holds the frozen head %s: cannot read the"
                            " frozen diff" % frozen_sha[:12])
@@ -1240,7 +1251,8 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     if carried:
         return _carried_in_transaction(tx, item, freeze, carried)
     try:
-        inputs = prepare(cfg, tx, int(lot), freeze=freeze)
+        # no network read inside the freeze transaction (see the docstring)
+        inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False)
     except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
     if isinstance(inputs, Unavailable):
