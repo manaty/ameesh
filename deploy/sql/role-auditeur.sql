@@ -19,11 +19,19 @@
 -- JAMAIS dans ce fichier : le propriétaire pose `\password <role>`, puis une
 -- ligne dans le `~/.pgpass` (0600) de l'hôte de l'auditeur.
 --
--- TRANSACTIONNEL ET IDEMPOTENT : une appartenance hors des deux contrats
--- ou des rôles de base absents font échouer le script et annulent tout. Le relancer après une mise à jour ne change
--- rien. Il remet à zéro les attributs (LOGIN INHERIT, aucun privilège de
--- rôle) et les droits directs du rôle sur le schéma ; il ne révoque jamais
--- une appartenance accordée par un autre : il refuse.
+-- TRANSACTIONNEL ET IDEMPOTENT : une appartenance hors des deux contrats ou
+-- des rôles de base absents font échouer le script et annulent tout. Le
+-- relancer après une mise à jour ne change rien. Il remet à zéro les
+-- attributs (LOGIN INHERIT, aucun privilège de rôle) et les droits directs du
+-- rôle sur le schéma ; il ne révoque jamais une appartenance accordée par un
+-- autre : il refuse.
+--
+-- Propriété refusée : le rôle ne doit RIEN posséder (schéma, table, séquence,
+-- fonction, type, base, privilèges par défaut), ni les contrats dont il hérite
+-- (atteignables par SET ROLE) : un propriétaire garde le pouvoir de se
+-- redonner les droits que le REVOKE lui retire. Refuse aussi un réglage
+-- `ALTER ROLE … IN DATABASE … SET default_transaction_read_only`, qui
+-- supplante le réglage du rôle.
 --
 -- Sans ce rôle (ou sans `AUDITEUR_DSN` dans le drop-in de l'exécuteur),
 -- l'analyse se contente des commandes `ameesh … --json` ; elle n'utilise
@@ -54,7 +62,10 @@ DECLARE
     e text := current_setting('ameesh.auditeur_etat');
     c text := current_setting('ameesh.auditeur_contenus');
     s text := current_schema();
+    r_oid oid;
     extra text;
+    possede text;
+    reglages text;
     admin boolean;
 BEGIN
     IF r = e OR r = c OR e = c THEN
@@ -73,6 +84,43 @@ BEGIN
     ELSE
         EXECUTE format('ALTER ROLE %I LOGIN INHERIT NOSUPERUSER NOCREATEDB '
                        'NOCREATEROLE NOREPLICATION NOBYPASSRLS', r);
+    END IF;
+
+    SELECT oid INTO r_oid FROM pg_roles WHERE rolname = r;
+
+    -- Propriété refusée : un propriétaire garde le pouvoir de se redonner les
+    -- droits que le REVOKE lui retire (GRANT à soi-même, ALTER OWNER, etc.).
+    -- pg_shdepend couvre les schémas, tables, séquences, fonctions, types,
+    -- bases et privilèges par défaut, dans toutes les bases ; les contrats
+    -- hérités sont atteignables par SET ROLE et sont donc contrôlés aussi.
+    SELECT string_agg(format('%s possède %s', u.rolname,
+                             coalesce(nullif(pg_describe_object(d.classid, d.objid, 0), ''),
+                                      d.classid::regclass::text || ' oid ' || d.objid)),
+                      ' ; ' ORDER BY 1)
+      INTO possede
+      FROM pg_shdepend d
+      JOIN pg_roles u ON u.oid = d.refobjid
+     WHERE u.rolname IN (r, e, c)
+       AND d.refclassid = 'pg_authid'::regclass
+       AND d.deptype = 'o';
+    IF possede IS NOT NULL THEN
+        RAISE EXCEPTION 'propriété interdite : % — transférez la propriété (ALTER ... OWNER TO ...), le REVOKE ne désarme pas un propriétaire ; transaction annulée',
+                        possede;
+    END IF;
+
+    -- Un réglage `ALTER ROLE … IN DATABASE … SET default_transaction_read_only`
+    -- supplante le réglage du rôle : la lecture seule ne serait plus le défaut.
+    SELECT string_agg(format('%s : %s', d.datname, reglage), ' ; ' ORDER BY 1)
+      INTO reglages
+      FROM pg_db_role_setting rs
+      JOIN pg_database d ON d.oid = rs.setdatabase
+      CROSS JOIN LATERAL unnest(rs.setconfig) AS reglage
+     WHERE rs.setrole = r_oid
+       AND rs.setdatabase <> 0
+       AND reglage LIKE 'default_transaction_read_only=%';
+    IF reglages IS NOT NULL THEN
+        RAISE EXCEPTION 'réglage par base interdit pour % : % — ALTER ROLE … IN DATABASE … RESET default_transaction_read_only ; transaction annulée',
+                        r, reglages;
     END IF;
 
     -- Droits directs remis à zéro : seuls les contrats hérités comptent.

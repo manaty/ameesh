@@ -946,7 +946,12 @@ Le script est transactionnel et idempotent : il crée le rôle de connexion
 `auditeur_lecture` s'il manque, le rend membre des deux contrats et pose
 `default_transaction_read_only = on` ; il retire ses droits directs sur le
 schéma (seuls les contrats hérités comptent) et refuse une appartenance hors
-des deux rôles. Il ne pose aucun mot de passe.
+des deux rôles. Il refuse aussi toute propriété d'objet — schéma, table,
+séquence, fonction, type, base, privilèges par défaut, y compris par un des
+contrats hérités — car un propriétaire se redonne les droits que le `REVOKE`
+lui retire, ainsi que tout réglage `ALTER ROLE … IN DATABASE … SET
+default_transaction_read_only`, qui supplante celui du rôle. Il ne pose aucun
+mot de passe.
 
 Vérifier depuis l'exécuteur de l'auditeur, une fois `AUDITEUR_DSN` posé :
 

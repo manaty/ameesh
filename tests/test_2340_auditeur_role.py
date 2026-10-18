@@ -8,7 +8,9 @@ l'auditeur n'aurait pu passer que par `AGENT_MESH_DSN`, non restreint.
 Ce module vérifie le script de mise en service (`deploy/sql/role-auditeur.sql`)
 sur un Postgres réel : rôle LOGIN, membre des deux contrats de supervision,
 lecture seule par défaut, aucun droit direct, refus d'une appartenance hors
-contrat et de rôles de base absents. L'application réelle reste un geste du
+contrat, de rôles de base absents, d'une propriété d'objet (B1 : le
+propriétaire se redonne les droits retirés) et d'un réglage par base qui
+supplanterait la lecture seule. L'application réelle reste un geste du
 propriétaire (c'est une permission) : le script est la procédure, pas le geste.
 """
 from __future__ import annotations
@@ -171,6 +173,61 @@ class AuditeurLoginRoleTest(PgTestCase):
         finally:
             self.db.execute("REVOKE %s FROM %s" % (q(self.autre), q(self.login)))
             self.db.execute("DROP ROLE %s" % q(self.autre))
+        self.apply_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                          contenus=self.contenus)
+
+    def test_un_role_proprietaire_de_table_fait_refuser(self):
+        """B1 (#2340) : le propriétaire se redonne les droits que le REVOKE retire."""
+        q = db_mod.quote_ident
+        table = "%s.probe_proprietaire" % q(self.schema)
+        self.db.execute("DROP TABLE IF EXISTS %s" % table)
+        self.db.execute("CREATE TABLE %s (id int, signature text)" % table)
+        self.db.execute("ALTER TABLE %s OWNER TO %s" % (table, q(self.login)))
+        try:
+            proc = self.run_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                                   contenus=self.contenus)
+            self.assertNotEqual(proc.returncode, 0, "propriété acceptée à tort")
+            self.assertIn("propriété interdite", proc.stderr)
+            self.assertIn("probe_proprietaire", proc.stderr)
+        finally:
+            self.db.execute("DROP TABLE IF EXISTS %s" % table)
+        self.apply_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                          contenus=self.contenus)
+
+    def test_une_propriete_d_un_contrat_fait_refuser(self):
+        """B1 (#2340) : le rôle peut SET ROLE vers un contrat, qui ne doit rien posséder."""
+        q = db_mod.quote_ident
+        table = "%s.probe_contrat" % q(self.schema)
+        self.db.execute("DROP TABLE IF EXISTS %s" % table)
+        self.db.execute("CREATE TABLE %s (id int)" % table)
+        self.db.execute("ALTER TABLE %s OWNER TO %s" % (table, q(self.etat)))
+        try:
+            proc = self.run_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                                   contenus=self.contenus)
+            self.assertNotEqual(proc.returncode, 0, "propriété d'un contrat acceptée à tort")
+            self.assertIn("propriété interdite", proc.stderr)
+            self.assertIn(self.etat, proc.stderr)
+        finally:
+            self.db.execute("DROP TABLE IF EXISTS %s" % table)
+        self.apply_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                          contenus=self.contenus)
+
+    def test_un_reglage_par_base_ne_supplante_pas_la_lecture_seule(self):
+        """B1 (#2340) : ALTER ROLE … IN DATABASE … SET l'emporte sur le rôle."""
+        q = db_mod.quote_ident
+        base = self.db.query("SELECT current_database() AS nom")[0]["nom"]
+        self.db.execute("ALTER ROLE %s IN DATABASE %s "
+                        "SET default_transaction_read_only = off"
+                        % (q(self.login), q(base)))
+        try:
+            proc = self.run_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                                   contenus=self.contenus)
+            self.assertNotEqual(proc.returncode, 0, "réglage par base accepté à tort")
+            self.assertIn("réglage par base interdit", proc.stderr)
+        finally:
+            self.db.execute("ALTER ROLE %s IN DATABASE %s "
+                            "RESET default_transaction_read_only"
+                            % (q(self.login), q(base)))
         self.apply_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
                           contenus=self.contenus)
 
