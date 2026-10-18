@@ -1103,6 +1103,23 @@ class ReveilTest(_Base):
                      if e["note"].startswith("wake: scheduled wake delivered")]
         self.assertEqual(len(delivered), 2, "chaque délivrance a son témoin")
 
+    def test_reveil_programme_non_consomme_si_le_tour_n_est_pas_lance(self):
+        """#2466 B1 (cx2, 2e tour) : tant que le harnais n'a pas démarré
+        (`_turn_launched` faux : refus READY, send résident en échec), la
+        consommation ne doit pas effacer l'échéance."""
+        worker = self._worker("r7c")
+        lot = work.add(self.db, title="séance owner", assignee="r7c",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7c",
+                  wake_ts=time.time() - 1)
+        spec = self.pick(worker)
+        worker._turn_launched = False
+        worker._consume_scheduled_wake(spec)
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "aucune consommation avant le lancement effectif")
+        self.assertFalse(any(e["note"].endswith("consumed")
+                             for e in work.events(self.db, lot)))
+
     def test_reveil_programme_resiste_a_lot_wake_off(self):
         worker = self._worker("r8", lot_wake=False)
         lot = work.add(self.db, title="séance owner", assignee="r8",

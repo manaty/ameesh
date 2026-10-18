@@ -5893,9 +5893,6 @@ class AgentWorker(threading.Thread):
                         adapter, key=cle_resident, session=session, cwd=cwd, env=env,
                         model=model, effort=effort, tier=tier, lot=lot_du_tour,
                         stderr_path=stderr_path)
-                    if rp is not None:
-                        self._turn_launched = True
-                        self._consume_scheduled_wake(spec)
                 if rp is None:
                     # L498 : le cgroup délégué ne concerne que le lancement d'un
                     # harnais par événement ; le processus résident (L76) sert
@@ -5936,8 +5933,6 @@ class AgentWorker(threading.Thread):
                                 start_new_session=True,  # son groupe : on peut le tuer en entier
                                 pass_fds=(ready_w,) if ready_w is not None else (),
                             )
-                            self._turn_launched = True
-                            self._consume_scheduled_wake(spec)
                             self.runner.harness_pids.add(proc.pid)
                     except RuntimeError as exc:
                         raise _LancementImpossible(str(exc)) from exc
@@ -5987,6 +5982,15 @@ class AgentWorker(threading.Thread):
                                  or proc.stdout.readline().strip() != audit_guard.READY):
                 raise _LancementImpossible("auditor scope not validated: memory cap "
                                            "missing or scope creation refused")
+            # #2466 : le trampoline et le scope auditeur ont validé le
+            # placement ; pour un harnais par événement il va être exec'é —
+            # l'échéance du réveil programmé peut être consommée. Un refus
+            # READY ci-dessus laisse le claim expirer et le réveil sera
+            # délivré de nouveau. Le résident, lui, n'est consommé qu'après
+            # un send accepté (plus bas).
+            if rp is None:
+                self._turn_launched = True
+                self._consume_scheduled_wake(spec)
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
@@ -6003,6 +6007,12 @@ class AgentWorker(threading.Thread):
                 rp.drain()  # rien d'un tour précédent
                 try:
                     tour_resident = rp.driver.send(resume + spec["prompt"])
+                    # #2466 : le tour résident a démarré (send accepté) —
+                    # seulement maintenant l'échéance est consommée. Un
+                    # ResidentError laisse le claim expirer et le réveil
+                    # sera délivré de nouveau.
+                    self._turn_launched = True
+                    self._consume_scheduled_wake(spec)
                     flux = (json.dumps(raw, ensure_ascii=False)
                             for raw, _parsed in rp.stream(tour_resident))
                 except resident_mod.ResidentError as exc:
