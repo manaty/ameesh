@@ -702,7 +702,8 @@ class MapTest(unittest.TestCase):
                     self.assertIn("release/**", p["selection"]["why"])
                     self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                                      _full_suite_parts("psycopg"))
-                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                                     _full_suite_parts("psql"))
                     self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                     self.assertEqual(
                         sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
@@ -730,7 +731,8 @@ class MapTest(unittest.TestCase):
         self.assertIn("release/**", release["selection"]["why"])
         self.assertNotEqual(release["parts"]["psycopg"], [])
         self.assertEqual(plan.outputs(release)["code"], "true")
-        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [9] * 9)
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]],
+                         _full_suite_parts("psql"))
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -1838,11 +1840,15 @@ class PlanTest(unittest.TestCase):
         mods = parts.modules()
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+        # #1476 : la suite complète passe à 16 psql et 8 psycopg
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _full_suite_parts("psycopg"))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
         out = plan.outputs(p)
         self.assertEqual(json.loads(out["psycopg"]),
                          list(range(1, plan.PARTS["psycopg"][1] + 1)))
-        self.assertEqual(out["psql_parts"], "9")
+        self.assertEqual(out["psql_parts"], str(plan.PARTS["psql"][1]))
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
@@ -1865,9 +1871,10 @@ class PlanTest(unittest.TestCase):
         # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
-        # #1692 : la suite complète passe de 6 à 9 parts ; le pilote d'une PR
-        # de lot reste à trois (n_pr), inchangé.
-        self.assertEqual(plan.PARTS["psql"][1], 9)
+        # #1476 : seize parts psql et huit psycopg (24 jobs = 24 runners),
+        # d'après les durées mesurées du run de paquet 39085758208.
+        self.assertEqual(plan.PARTS["psql"][1], 16)
+        self.assertEqual(plan.PARTS["psycopg"][1], 8)
 
     def test_full_suite_psycopg_is_split_for_the_cap(self):
         # #2292 : à quatre parts, 14,3-30,5 min sous saturation sur les cinq
@@ -1953,8 +1960,9 @@ class PlanTest(unittest.TestCase):
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
         # #749 : une fusion a main passe la suite complete sous les deux pilotes
-        # (psql en 9 parts depuis #1692), pas seulement la CI de release.
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+        # (psql en 16 parts depuis #1476), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -2010,7 +2018,7 @@ class PlanTest(unittest.TestCase):
 def _full_suite_parts(driver: str) -> list[int]:
     """`of` de chaque part de la suite complète, lu de `plan.PARTS`.
 
-    Le découpage appartient au plan (#1692 : 9 parts psql ; #1476 : 12 psql et
+    Le découpage appartient au plan (#1692 : 9 parts psql ; #1476 : 16 psql et
     8 psycopg), épinglé par
     `PlanTest.test_pull_request_psql_part_is_split_for_the_cap`. Un témoin de
     cette voie le lit au lieu de recopier le nombre : sinon chaque changement
@@ -2198,7 +2206,8 @@ class LotBranchTest(unittest.TestCase):
                                head_ref="release/1.10.0")
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]),
                          list(range(1, plan.PARTS["psycopg"][1] + 1)))
-        self.assertEqual(json.loads(plan.outputs(p)["psql"]), list(range(1, 10)))
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]),
+                         list(range(1, plan.PARTS["psql"][1] + 1)))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")

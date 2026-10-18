@@ -444,6 +444,174 @@ class RoleExecutorTest(PgTestCase):
             db.close()
             self.db.execute('DROP SCHEMA %s CASCADE' % q(schema))
 
+    def test_executor_reads_review_catch_up_without_writes(self):
+        """#1448 N1 : la borne d'activation du rattrapage après fusion (0438)
+        est lisible par l'exécuteur, mais aucun rôle exécuteur ne la déplace."""
+        for privilege in ('INSERT', 'UPDATE', 'DELETE'):
+            with self.subTest(privilege=privilege):
+                self.assertFalse(self.db.query(
+                    'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                    (self.login, 'review_catch_up', privilege))[0]['allowed'])
+        self.assertTrue(self.db.query(
+            'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+            (self.login, 'review_catch_up', 'SELECT'))[0]['allowed'])
+        self.assertEqual(self.as_host('SELECT bound_at FROM review_catch_up').returncode, 0)
+        refused = self.as_host('UPDATE review_catch_up SET bound_at = now()')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('permission denied', refused.stderr.lower(),
+                      attendu(refused.stderr.lower()))
+
+    def test_inherited_review_bound_writes_make_executor_audit_fail(self):
+        """#1448 N1 : un droit d'écriture hérité sur la borne (rôle parent ou
+        octroi direct) fait échouer le contrat de rôle, pas seulement le
+        rôle nommé."""
+        q = db_mod.quote_ident
+        parent = 't_bound_parent_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % q(parent))
+        try:
+            self.db.execute('GRANT UPDATE ON review_catch_up TO %s' % q(parent))
+            self.db.execute('GRANT %s TO %s' % (q(parent), q(self.role)))
+            result = self.run_script(self.role)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('forbidden UPDATE on review_catch_up', result.stderr,
+                          attendu(result.stderr))
+        finally:
+            self.db.execute('REVOKE %s FROM %s' % (q(parent), q(self.role)))
+            self.db.execute('DROP OWNED BY %s' % q(parent))
+            self.db.execute('DROP ROLE %s' % q(parent))
+
+    def test_column_level_review_bound_write_is_revoked_from_executor(self):
+        """#1448 B1 (R Codex cx2) : un GRANT UPDATE (bound_at) vit dans
+        pg_attribute.attacl, que REVOKE ... ON TABLE ne nettoie pas. Le script
+        révoque le droit de colonne : l'audit reste vert et l'UPDATE échoue."""
+        q = db_mod.quote_ident
+        self.db.execute('GRANT UPDATE (bound_at) ON review_catch_up TO %s' % q(self.role))
+        self.assertTrue(self.db.query(
+            'SELECT has_column_privilege(%s,%s,%s,%s) AS allowed',
+            (self.role, 'review_catch_up', 'bound_at', 'UPDATE'))[0]['allowed'])
+        result = self.run_script(self.role)
+        self.assertEqual(result.returncode, 0, attendu(result.stderr))
+        self.assertFalse(self.db.query(
+            'SELECT has_column_privilege(%s,%s,%s,%s) AS allowed',
+            (self.role, 'review_catch_up', 'bound_at', 'UPDATE'))[0]['allowed'])
+        refused = self.as_host('UPDATE review_catch_up SET bound_at = now()')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('permission denied', refused.stderr.lower(),
+                      attendu(refused.stderr.lower()))
+
+    def test_column_level_review_bound_write_through_parent_makes_audit_fail(self):
+        """#1448 B1 : un droit de colonne porté par un parent accessible par
+        SET ROLE (membre WITH INHERIT FALSE) doit faire échouer le contrat."""
+        q = db_mod.quote_ident
+        parent = 't_bound_col_parent_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % q(parent))
+        try:
+            self.db.execute('GRANT UPDATE (bound_at) ON review_catch_up TO %s' % q(parent))
+            self.db.execute('GRANT %s TO %s WITH INHERIT FALSE' % (q(parent), q(self.role)))
+            self.assertFalse(self.db.query(
+                'SELECT has_column_privilege(%s,%s,%s,%s) AS allowed',
+                (self.role, 'review_catch_up', 'bound_at', 'UPDATE'))[0]['allowed'])
+            result = self.run_script(self.role)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('forbidden UPDATE on a column of review_catch_up through %s' % parent,
+                          result.stderr, attendu(result.stderr))
+        finally:
+            self.db.execute('REVOKE %s FROM %s' % (q(parent), q(self.role)))
+            self.db.execute('DROP OWNED BY %s' % q(parent))
+            self.db.execute('DROP ROLE %s' % q(parent))
+
+    def test_set_role_parent_review_bound_write_makes_executor_audit_fail(self):
+        """#1448 B2 : un parent porteur d'UPDATE accessible par SET ROLE
+        (membre WITH INHERIT FALSE) échappe à has_table_privilege(r) ; le
+        contrat doit le refuser, car SET ROLE le rend effectif."""
+        q = db_mod.quote_ident
+        parent = 't_bound_setrole_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % q(parent))
+        try:
+            self.db.execute('GRANT UPDATE ON review_catch_up TO %s' % q(parent))
+            self.db.execute('GRANT %s TO %s WITH INHERIT FALSE' % (q(parent), q(self.role)))
+            self.assertFalse(self.db.query(
+                'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                (self.role, 'review_catch_up', 'UPDATE'))[0]['allowed'])
+            result = self.run_script(self.role)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('forbidden UPDATE on review_catch_up through %s' % parent,
+                          result.stderr, attendu(result.stderr))
+        finally:
+            self.db.execute('REVOKE %s FROM %s' % (q(parent), q(self.role)))
+            self.db.execute('DROP OWNED BY %s' % q(parent))
+            self.db.execute('DROP ROLE %s' % q(parent))
+
+    def test_review_catch_up_migration_revokes_creation_time_executor_defaults(self):
+        """#1448 N1 : les droits par défaut présents quand 0438 crée la table
+        (exécuteur, PUBLIC) ne survivent pas à la migration 0461 ; le
+        propriétaire, lui, peut toujours déplacer la borne."""
+        import shutil
+        import tempfile
+        from pathlib import Path
+        q = db_mod.quote_ident
+        schema = 't_bound_upgrade_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE SCHEMA %s' % q(schema))
+        db = db_mod.connect(dataclasses.replace(self.cfg, schema=schema))
+        try:
+            db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT,INSERT,UPDATE,DELETE,'
+                       'TRUNCATE,REFERENCES,TRIGGER ON TABLES TO %s'
+                       % (q(schema), q(self.role)))
+            with tempfile.TemporaryDirectory() as directory:
+                for name in ('0438_review_catch_up.sql', '0461_review_catch_up_acl.sql'):
+                    shutil.copy(Path(REPO, 'src/ameesh/migrations', name), directory)
+                migrations.migrate(db, directory)
+            for privilege in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'):
+                with self.subTest(privilege=privilege):
+                    self.assertFalse(db.query(
+                        'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                        (self.role, schema + '.review_catch_up', privilege))[0]['allowed'])
+            self.assertTrue(db.query(
+                'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                (self.role, schema + '.review_catch_up', 'SELECT'))[0]['allowed'])
+            db.execute('UPDATE review_catch_up SET bound_at = bound_at')
+            self.assertTrue(db.query('SELECT bound_at FROM review_catch_up')[0]['bound_at'])
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA %s CASCADE' % q(schema))
+
+    def test_review_catch_up_migration_revokes_column_acl(self):
+        """#1448 B1 : 0461 révoque aussi les droits de colonne laissés à
+        l'exécuteur ou à PUBLIC (pg_attribute.attacl), que
+        REVOKE ... ON TABLE ne touche pas."""
+        import shutil
+        import tempfile
+        from pathlib import Path
+        q = db_mod.quote_ident
+        schema = 't_bound_col_upgrade_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE SCHEMA %s' % q(schema))
+        db = db_mod.connect(dataclasses.replace(self.cfg, schema=schema))
+        try:
+            with tempfile.TemporaryDirectory() as first, \
+                    tempfile.TemporaryDirectory() as second:
+                shutil.copy(Path(REPO, 'src/ameesh/migrations', '0438_review_catch_up.sql'),
+                            first)
+                migrations.migrate(db, first)
+                db.execute('GRANT UPDATE (bound_at) ON %s.review_catch_up TO %s'
+                           % (q(schema), q(self.role)))
+                db.execute('GRANT UPDATE (bound_at) ON %s.review_catch_up TO PUBLIC'
+                           % q(schema))
+                self.assertTrue(db.query(
+                    'SELECT has_column_privilege(%s,%s,%s,%s) AS allowed',
+                    (self.role, schema + '.review_catch_up', 'bound_at',
+                     'UPDATE'))[0]['allowed'])
+                shutil.copy(Path(REPO, 'src/ameesh/migrations',
+                                 '0461_review_catch_up_acl.sql'), second)
+                migrations.migrate(db, second)
+            self.assertFalse(db.query(
+                'SELECT has_column_privilege(%s,%s,%s,%s) AS allowed',
+                (self.role, schema + '.review_catch_up', 'bound_at',
+                 'UPDATE'))[0]['allowed'])
+            db.execute('UPDATE %s.review_catch_up SET bound_at = bound_at' % q(schema))
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA %s CASCADE' % q(schema))
+
     def test_independent_release_role_writes_only_fences_and_locks_registry(self):
         from pathlib import Path
         q = db_mod.quote_ident

@@ -190,10 +190,20 @@ RECENT_FAILURE_DAYS = 7
 #: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
 #: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
 #: mesuré, huit en laisseraient ~34.
+#:
+#: #1476 (18/10) : la cible est 15 min bout en bout. Mesure du run de paquet
+#: 39085758208 (h-2300, 6 psycopg / 9 psql, pool de 24 runners, 457 modules) :
+#: 51,7 min, parts psql de 15,8 à 36,5 min, psycopg de 11,4 à 20,5 min ; le
+#: travail mesuré est 201 min psql + 90 min psycopg. À 16 + 8 parts, les 24
+#: jobs occupent les 24 runners et la part la plus lente vise ~13-15 min, d'où
+#: PARTS : psycopg de 6 à 8 (part la plus lente 21,1 min à 6), psql de 9 à 16
+#: (36,5 min à 9). Le découpage suit les durées mesurées du run (flux), pas une
+#: hypothèse : tests/parts/durees.json est rafraîchi par ces mesures et la
+#: carte complète ses trous (weights()).
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 6), "psql": (3, 9)}
+PARTS = {"psycopg": (4, 8), "psql": (3, 16)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).
