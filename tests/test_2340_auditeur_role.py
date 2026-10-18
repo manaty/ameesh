@@ -10,8 +10,10 @@ sur un Postgres réel : rôle LOGIN, membre des deux contrats de supervision,
 lecture seule par défaut, aucun droit direct, refus d'une appartenance hors
 contrat, de rôles de base absents, d'une propriété d'objet (B1 : le
 propriétaire se redonne les droits retirés) et d'un réglage par base qui
-supplanterait la lecture seule. L'application réelle reste un geste du
-propriétaire (c'est une permission) : le script est la procédure, pas le geste.
+supplanterait la lecture seule ; réparation d'une appartenance INHERIT FALSE
+posée alors que le rôle était NOINHERIT (B2). L'application réelle reste un
+geste du propriétaire (c'est une permission) : le script est la procédure, pas
+le geste.
 """
 from __future__ import annotations
 
@@ -99,14 +101,18 @@ class AuditeurLoginRoleTest(PgTestCase):
             raise AssertionError("%s en échec : %s" % (os.path.basename(path), proc.stderr))
         return proc
 
-    def as_auditeur(self, sql: str) -> subprocess.CompletedProcess:
+    def as_role(self, name: str, password: str,
+                sql: str) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env.pop("PGPASSWORD", None)
         env.pop("PGOPTIONS", None)
         return subprocess.run(
-            ["psql", _dsn_for(self.login, self.password), "-X", "-At",
+            ["psql", _dsn_for(name, password), "-X", "-At",
              "-v", "ON_ERROR_STOP=1", "-c", sql],
             capture_output=True, text=True, timeout=30, env=env)
+
+    def as_auditeur(self, sql: str) -> subprocess.CompletedProcess:
+        return self.as_role(self.login, self.password, sql)
 
     def memberships(self) -> dict[str, bool]:
         return {row["groupe"]: bool(row["admin"]) for row in self.db.query(
@@ -158,6 +164,40 @@ class AuditeurLoginRoleTest(PgTestCase):
         self.assertTrue(self.role()["rolinherit"])
         etat = self.as_auditeur("SELECT count(id) FROM agent_mailbox")
         self.assertEqual(etat.returncode, 0, etat.stderr)
+
+    def test_noinherit_avant_les_grants_est_repare(self):
+        """B2 (#2340) : des GRANT posés sous NOINHERIT gardent inherit_option=false."""
+        version = int(self.db.query("SHOW server_version_num")[0]["server_version_num"])
+        if version < 160000:
+            self.skipTest("options d'appartenance des rôles : PostgreSQL 16+")
+        q = db_mod.quote_ident
+        role = "t_aud_b2_%s" % uuid.uuid4().hex[:8]
+        password = secrets.token_hex(16)
+        self.db.execute("CREATE ROLE %s LOGIN NOINHERIT" % q(role))
+        try:
+            self.db.execute("GRANT %s TO %s" % (q(self.etat), q(role)))
+            self.db.execute("GRANT %s TO %s" % (q(self.contenus), q(role)))
+            avant = self.db.query(
+                "SELECT count(*) AS n FROM pg_auth_members "
+                "WHERE member = %s::regrole AND NOT inherit_option", (role,))[0]["n"]
+            self.assertEqual(avant, 2, "le cas B2 n'est pas reproduit")
+            self.apply_script(AUDITEUR_SQL, role=role, etat=self.etat,
+                              contenus=self.contenus)
+            self.assertTrue(self.role(role)["rolinherit"])
+            apres = self.db.query(
+                "SELECT count(*) AS n FROM pg_auth_members "
+                "WHERE member = %s::regrole AND inherit_option", (role,))[0]["n"]
+            self.assertEqual(apres, 2)
+            self.db.execute("ALTER ROLE %s PASSWORD '%s'" % (q(role), password))
+            self.db.execute("ALTER ROLE %s SET search_path = %s"
+                            % (q(role), q(self.schema)))
+            etat = self.as_role(role, password, "SELECT count(id) FROM agent_mailbox")
+            self.assertEqual(etat.returncode, 0, etat.stderr)
+            contenu = self.as_role(role, password, "SELECT count(body) FROM agent_mailbox")
+            self.assertEqual(contenu.returncode, 0, contenu.stderr)
+        finally:
+            self.db.execute("DROP OWNED BY %s" % q(role))
+            self.db.execute("DROP ROLE %s" % q(role))
 
     def test_une_appartenance_hors_contrat_fait_refuser(self):
         q = db_mod.quote_ident

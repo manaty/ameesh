@@ -33,6 +33,11 @@
 -- `ALTER ROLE … IN DATABASE … SET default_transaction_read_only`, qui
 -- supplante le réglage du rôle.
 --
+-- PG 16+ : une appartenance préexistante accordée alors que le rôle était
+-- NOINHERIT garde `inherit_option=false` ; le script force `INHERIT TRUE` sur
+-- les deux contrats et relit l'héritage, puis les droits effectifs (une
+-- colonne d'état et une de contenus).
+--
 -- Sans ce rôle (ou sans `AUDITEUR_DSN` dans le drop-in de l'exécuteur),
 -- l'analyse se contente des commandes `ameesh … --json` ; elle n'utilise
 -- jamais `AGENT_MESH_DSN`, qui n'est pas borné à la lecture.
@@ -76,6 +81,9 @@ BEGIN
        OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = c) THEN
         RAISE EXCEPTION 'rôles de base absents (% , %) : lancer deploy/sql/role-superviseur.sql et deploy/sql/role-superviseur-contenus.sql d''abord',
                         e, c;
+    END IF;
+    IF s IS NULL THEN
+        RAISE EXCEPTION 'search_path ne désigne aucun schéma existant : poser PGOPTIONS=''-c search_path=<schéma ameesh>'' ; transaction annulée';
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
@@ -131,8 +139,18 @@ BEGIN
         EXECUTE format('REVOKE ALL ON SCHEMA %I FROM %I', s, r);
     END IF;
 
-    EXECUTE format('GRANT %I TO %I', e, r);
-    EXECUTE format('GRANT %I TO %I', c, r);
+    -- PG 16+ : une appartenance accordée alors que le rôle était NOINHERIT
+    -- garde inherit_option=false, et un GRANT sans option ne la corrige pas
+    -- (notice « already granted ») : la lecture par les contrats exigerait
+    -- SET ROLE. On force l'héritage ; SET reste tel quel, il ne conditionne
+    -- pas la lecture.
+    IF current_setting('server_version_num')::int >= 160000 THEN
+        EXECUTE format('GRANT %I TO %I WITH INHERIT TRUE', e, r);
+        EXECUTE format('GRANT %I TO %I WITH INHERIT TRUE', c, r);
+    ELSE
+        EXECUTE format('GRANT %I TO %I', e, r);
+        EXECUTE format('GRANT %I TO %I', c, r);
+    END IF;
     EXECUTE format('ALTER ROLE %I SET default_transaction_read_only = on', r);
 
     -- Read-back : l'appartenance, les attributs et la lecture seule sont
@@ -154,6 +172,29 @@ BEGIN
      WHERE u.rolname = r AND g.rolname IN (e, c);
     IF coalesce(admin, false) THEN
         RAISE EXCEPTION 'appartenance avec ADMIN OPTION pour % ; transaction annulée', r;
+    END IF;
+
+    -- PG 16+ : relire l'héritage des deux appartenances, pas seulement le
+    -- GRANT. Une appartenance INHERIT FALSE passerait les contrôles ci-dessus
+    -- sans donner la lecture (B2, #2340).
+    IF current_setting('server_version_num')::int >= 160000 THEN
+        IF EXISTS (SELECT 1
+                     FROM pg_auth_members m
+                     JOIN pg_roles g ON g.oid = m.roleid
+                     JOIN pg_roles u ON u.oid = m.member
+                    WHERE u.rolname = r
+                      AND g.rolname IN (e, c)
+                      AND NOT m.inherit_option) THEN
+            RAISE EXCEPTION 'appartenance non héritée pour % (INHERIT FALSE) : la lecture par les contrats échouerait ; transaction annulée', r;
+        END IF;
+    END IF;
+
+    -- Droits EFFECTIFS : lire une colonne de chaque contrat prouve l'héritage
+    -- au-delà des catalogues d'appartenance (une colonne d'état, une de
+    -- contenus ; les droits directs ont été retirés plus haut).
+    IF NOT has_column_privilege(r, format('%I.%I', s, 'agent_mailbox'), 'id', 'SELECT')
+       OR NOT has_column_privilege(r, format('%I.%I', s, 'agent_mailbox'), 'body', 'SELECT') THEN
+        RAISE EXCEPTION 'droits effectifs absents pour % : lecture de l''état ou des contenus non héritée ; transaction annulée', r;
     END IF;
 
     IF EXISTS (SELECT 1 FROM pg_roles

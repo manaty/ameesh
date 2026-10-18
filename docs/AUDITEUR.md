@@ -950,8 +950,10 @@ des deux rôles. Il refuse aussi toute propriété d'objet — schéma, table,
 séquence, fonction, type, base, privilèges par défaut, y compris par un des
 contrats hérités — car un propriétaire se redonne les droits que le `REVOKE`
 lui retire, ainsi que tout réglage `ALTER ROLE … IN DATABASE … SET
-default_transaction_read_only`, qui supplante celui du rôle. Il ne pose aucun
-mot de passe.
+default_transaction_read_only`, qui supplante celui du rôle. Il force aussi
+`INHERIT TRUE` sur les deux appartenances (PG 16+), même accordées sous
+NOINHERIT, et relit la lecture effective d'une colonne d'état et d'une de
+contenus. Il ne pose aucun mot de passe.
 
 Vérifier depuis l'exécuteur de l'auditeur, une fois `AUDITEUR_DSN` posé :
 
