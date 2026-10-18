@@ -56,7 +56,9 @@ What the registry guarantees, in ONE transaction:
    `superseded_by` —, `delivered` — with the head `sha`), sets
    `close_reason`/`superseded_by` and the `closed`/`delivered` milestones: what
    `work.close` now refuses to a pinned lot (N8) is done here, in the
-   same transaction.
+   same transaction. A delivered review-after-merge lot counts its reviews
+   first, like `work.close --delivered` (`review_lot.guard_delivery`, #2374,
+   #2385): a missing review is `review-undelivered`.
 
 Protocol `WorkflowSpec` (structural, the slice A artifact satisfies it):
 
@@ -115,7 +117,7 @@ Stable refusal codes (`RegistryRefusal.code`): `command-invalid`,
 `stage-mismatch`, `stage-undeclared`, `edge-undeclared`, `terminal-reopened`,
 `held`, `hold-invalid`, `hold-redundant`, `hold-no-decision`, `decision-pending`,
 `hold-core-unproven`, `not-held`, `close-reason`, `superseded-unknown`,
-`delivered-sha`,
+`delivered-sha`, `review-undelivered`,
 `repair-exhausted`, `revision-regression`, `verifier-uninstalled`,
 `verifier-invalid`, `verifier-error`, `verifier-refused`, `verifier-name`.
 
@@ -751,6 +753,26 @@ def _close_facts(tx: Any, command: Command) -> tuple[str, int | None, str]:
     return reason, superseded_by, sha
 
 
+def _guard_review_delivery(tx: Any, command: Command) -> None:
+    """#2385: a delivered closure of a review-after-merge lot counts its
+    reviews, like `work.close --delivered` (#2374).
+
+    `review_lot.guard_delivery` reads the structured mark from the source
+    lot's journal and counts its `verdict` milestones at the merged sha; run
+    here, in the transaction and under the lot lock, a lot pinned on a
+    workflow is not closed without its reviews either. Any other lot passes
+    through unchanged. A missing review is a refusal: nothing written.
+    """
+    from . import review_lot, work
+    item = work.get(tx, command.work_item_id)
+    if item is None:
+        raise RegistryRefusal("lot-unknown", "lot %s not found" % command.work_item_id)
+    try:
+        review_lot.guard_delivery(tx, item)
+    except work.WorkError as exc:
+        raise RegistryRefusal("review-undelivered", str(exc)) from exc
+
+
 def _close_label(reason: str, superseded_by: int | None, sha: str) -> str:
     """The closure label of the journal and milestone note (legacy wording)."""
     if reason == "superseded":
@@ -800,6 +822,8 @@ def _plan_advance(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) 
     close_reason, superseded_by, delivered_sha = "", None, ""
     if core_to == "closed":
         close_reason, superseded_by, delivered_sha = _close_facts(tx, command)
+        if close_reason == "delivered":
+            _guard_review_delivery(tx, command)
         note = "%s — %s" % (note, _close_label(close_reason, superseded_by, delivered_sha))
     return _Plan(state=core_to, stage=command.to_stage, loops=loops, note=note,
                  close_reason=close_reason, superseded_by=superseded_by,

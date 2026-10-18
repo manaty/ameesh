@@ -272,7 +272,8 @@ unite_systemctl() {  # unité commande [arguments]
 # failure BEFORE stop (#1907), so a new failure during drainage stays visible.
 redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
   local u=$1 etat pid
-  etat=$(unite_systemctl "$u" show -p ActiveState --value) || return 1
+  etat=$(unite_systemctl "$u" show -p ActiveState --value) \
+    || { echo "$u : lecture d'ActiveState impossible — aucun démarrage" >&2; return 1; }
   if [ "$etat" = failed ]; then
     unite_systemctl "$u" reset-failed \
       || { echo "$u : reset-failed échoue — aucun démarrage" >&2; return 1; }

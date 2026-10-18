@@ -97,6 +97,10 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 #: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
 #: `critical: true` au canon fait foi ; ces motifs restent un minimum lorsque
 #: le canon ne connaît pas encore un chemin critique ou omet sa déclaration.
+#: Un doute de classe (politique ou diff illisible, `files` vide) n'ajoute
+#: aucun de ces domaines : il reste sensible, un avis (canon §2, owner 15/10 :
+#: deux familles seulement pour droits SQL, secrets, paiement, prod réelle ;
+#: #2394).
 CRITICAL_SCOPE = (
     # SQL, migrations, stockage
     re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
@@ -116,6 +120,8 @@ CRITICAL_SCOPE = (
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
                r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               # le report des verdicts acquis sur une tête réalignée (#2442)
+               r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
                r"^src/ameesh/(review_lot|registry)\.py$"),
 )
@@ -135,16 +141,19 @@ def critical_scope(klass) -> bool:
     Le canon peut le déclarer explicitement sur chaque chemin classé. Les
     motifs de secours s'appliquent aussi aux chemins classés légers, sauf à la
     documentation Markdown classée légère ou normale.
-    Un doute de classe (politique ou diff illisible, `files` vide) ne se
-    suppose jamais rassurant : `required_verdicts` le compte alors comme un
-    domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
+    Seuls les **chemins changés** prouvent un domaine critique : une liste
+    `files` vide, ou une entrée sans chemin, n'en désigne aucun. Le doute de
+    classe n'est pas critique pour autant : `required_verdicts` le garde
+    sensible, à un avis (canon §2, owner 15/10 ; #2394). Une déclaration
+    `critical: true` du canon reste lue même portée par une entrée sans
+    chemin."""
     files = (klass or {}).get("files") or ()
-    if not files:
-        return True
     for entry in files:
-        path = str(entry.get("path") or "")
-        if entry.get("critical") is True or not path:
+        if entry.get("critical") is True:
             return True
+        path = str(entry.get("path") or "")
+        if not path:
+            continue
         if (str(entry.get("class") or "") in ("light", "normal")
                 and _PROSE.search(path)):
             continue
@@ -157,9 +166,12 @@ def required_verdicts(klass) -> int:
     """Le nombre d'avis indépendants : deux pour un chemin critique, même si
     le canon l'a omis ou classé léger ; sinon 0 pour léger, 1 pour normal et
     1 pour sensible hors SQL, sécurité et prod.
-    Un doute de classe (politique ou diff illisible, `files` vide) ne se
-    suppose jamais rassurant : il garde l'exigence des domaines critiques
-    (deux avis), faute de pouvoir exclure SQL, la sécurité ou la prod.
+    Un doute de classe (politique ou diff illisible, `files` vide) est
+    sensible : un avis d'une autre famille (canon §2, owner 15/10 : deux
+    familles seulement pour droits SQL, secrets, paiement, prod réelle ;
+    #2394). La porte garde l'exigence d'indépendance d'une classe sensible :
+    un doute ne se suppose jamais rassurant, mais il n'invente pas un second
+    avis que le canon ne demande pas.
     Un lot release n'est jamais léger : il garde un avis (la procédure de
     release et la protection de cible restent au pilote ; le feu, lui, refuse
     la classe release avant tout compte)."""
@@ -167,14 +179,16 @@ def required_verdicts(klass) -> int:
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     if klass.get("doubt"):
-        return CRITICAL_REVIEWS
+        # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
+        # jamais critique par le seul doute (#2394).
+        cls = lot_class.SENSITIVE
     if klass.get("files") and critical_scope(klass):
         return CRITICAL_REVIEWS
     if cls == lot_class.LIGHT:
         return 0
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
         return 1
-    return CRITICAL_REVIEWS if critical_scope(klass) else SENSITIVE_REVIEWS
+    return SENSITIVE_REVIEWS
 
 
 def _mark_order(mark: dict) -> tuple:
@@ -289,8 +303,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     vigueur refuse la porte, quelle que soit la classe.
 
     Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
-    normal et pour un lot sensible hors SQL/sécurité/prod, 2 pour un lot
-    sensible qui touche ces domaines ou dont la classe reste un doute. Les avis
+    normal et pour un lot sensible hors SQL/sécurité/prod — un doute de classe
+    reste sensible —, 2 pour un lot sensible qui touche ces domaines. Les avis
     comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
     classe sensible, une famille de modèle connue et autre que celle de
     l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
@@ -312,6 +326,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     frozen = str(frozen or "").strip().lower()
+    if klass.get("doubt"):
+        cls = lot_class.SENSITIVE
     # #1979/#2281 : la dispense de re-verdict du pilote (`-none`) lève la
     # porte, comme elle lève l'attente dans `progress` ; elle ne survit pas à
     # un nouveau gel (stockage `_lapse_waiver`) et ne lève jamais un blocage.
@@ -758,7 +774,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     if needs_commit_ci:
         if parts is None and getattr(project, "ci_parts", None):
             parts = _parts_reader(project, repo, target, tip, clone, cfg=cfg)
-        _required_ci(project, tip, commit_ci, parts=parts)
+        _required_ci(project, tip, commit_ci, parts=parts, branch=row["branch"])
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),
@@ -771,12 +787,16 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
               tip: str, *, cfg=None, base: str | None = None) -> dict:
     """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
 
-    La classe se lit entre la cible **fraîche** et la tête gelée. La cible
-    fraîche vient de l'admission (`base`, le commit récupéré par `readiness`),
-    sinon de la cible que le radar a récupérée sous `QUEUE_REF` dans son clone ;
-    à défaut seulement, de `origin/<cible>` du dépôt des agents, puis de sa
-    cible locale. La copie `origin/<cible>` du clone `--shared` n'est jamais
-    une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
+    La classe se lit entre la cible **fraîche** et la tête gelée. Seul `base`
+    est une cible fraîche : le commit que l'appelant vient de récupérer
+    (`readiness`), ou `target` quand il nomme déjà un commit. Sinon, la borne
+    est la cible que le radar a laissée sous `QUEUE_REF` dans son clone, à défaut
+    `origin/<cible>` du dépôt des agents, puis sa cible locale : c'est la
+    cible du **dernier** fetch connu, que rien ne prouve fraîche — un fetch
+    antérieur, une cible supprimée depuis sur origin (le fetch ne nettoie pas)
+    ou déjà avancée par la fusion du lot. La lecture garde sa classe, mais son
+    `why` le dit (#2379). La copie `origin/<cible>` du clone `--shared` n'est
+    jamais une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
 
     Toutes les lectures comparées portent sur **la même** cible fraîche : une
     source qui ne la porte pas (référence périmée, objet absent) est écartée
@@ -832,6 +852,11 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
                                    head=tip)
         if best is None or _class_worse(current, best):
             best = current
+    if (target and base is None and best is not None
+            and not _HEX.fullmatch(target.strip().lower())):
+        best = dict(best, why="%s; borne %s non prouvée fraîche (dernier fetch connu, "
+                    "aucune cible récupérée par l'appelant)"
+                    % (best.get("why") or "?", best.get("target") or target))
     return best
 
 
@@ -890,7 +915,8 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
     return reader
 
 
-def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
+def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
+                 branch: str | None = None) -> None:
     """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
     `sha` itself; QueueError otherwise (no run, running, red, unreadable).
 
@@ -906,7 +932,7 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     one."""
     from . import plan_github, radar
     try:
-        runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
         raise QueueError("project %s requires CI on the frozen commit (ci_required), "
                          "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
@@ -919,6 +945,10 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     if runs["failed"]:
         raise QueueError("the CI on the frozen commit %s is red (%s)"
                          % (sha[:12], ", ".join(runs["failed"])))
+    if runs.get("missing"):
+        raise QueueError("the frozen commit %s carries no successful %s status: its "
+                         "required validation has not concluded (required_statuses)"
+                         % (sha[:12], " / ".join("%s*" % p for p in runs["missing"])))
     if not runs.get("green"):
         raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
     if parts is None:
@@ -1104,7 +1134,18 @@ def stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *, gen
     resolutions (`rows`) of this lot with the lots already stacked. A lot
     that leaves a conflict is skipped. Returns `{lot: {state: clean|
     replayed|conflict|generated, files}}`. Generated conflicts are excluded
-    before rerere; each trial tree is regenerated and checked."""
+    before rerere; each trial tree is regenerated and checked.
+
+    #2428: the whole trial holds the radar clone's worktree lock. A landing
+    running in another process owns the same worktree: the trial waits for
+    it, and on timeout raises `resolutions.CloneBusy` instead of checking
+    out the target under the merge's gates."""
+    with replayer.locked():
+        return _stack(replayer, target_head, lots, rows, generated=generated)
+
+
+def _stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *,
+           generated=()) -> dict:
     from . import land, resolutions
     paths = {g.path for g in generated}
     latest: dict = {}
@@ -1389,13 +1430,22 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits,
                    generated)
             if key not in stacks:
+                busy = None
                 try:
                     replayer.ensure()
                     stacks[key] = stack(replayer, key[0], stacked, resolution_rows,
                                         generated=generated)
+                except resolutions.CloneBusy as exc:
+                    # #2428: another operation owns the clone's worktree (a
+                    # landing and its gates, another pass). Nothing was read,
+                    # so no lot is ejected and nothing is cached: the next
+                    # pass retries the trial.
+                    busy = "%s: %s" % (type(exc).__name__, exc)
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
-            result = stacks[key]
+                result = {"error": busy} if busy is not None else stacks[key]
+            else:
+                result = stacks[key]
         listed = [{"lot": int(r["work_item_id"]), "rank": 1, "state": "landing",
                    "reason": r.get("reason") or "", "stack": None}
                   for r in landing.get(target) or ()]

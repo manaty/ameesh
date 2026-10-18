@@ -201,6 +201,8 @@ def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
             print(json.dumps({"operation": row,
                               "events": storage.of(db).handoffs.events(args.operation)}, ensure_ascii=False))
             return 0
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="handoff.agent")
         binding = identity.resolve_binding(cfg, db)
         if not binding.ok or binding.name != args.agent:
             work.corrector(cfg, db)
@@ -1543,10 +1545,12 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
 
 
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
-    from . import plan, plan_cli, stagnation  # plan de travail (L29)
+    from . import plan, plan_cli, prevalidation, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
         _work_actor(cfg, db, args)
+        if args.work_command in prevalidation.COMMANDS:   # #1770 prévalidation au gel
+            return prevalidation.run(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
@@ -1890,6 +1894,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     (event.get("actor") or "—")[:12], event["note"]))
             return 0
         if args.work_command == "migration":
+            from . import migration_reservations
+            if (args.slot or args.list or args.landed or args.target_branch
+                    or args.target_sha or args.reservation_id):
+                return migration_reservations.run(db, args, cfg)
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
                                           repo=args.repo, actor=args.actor, cfg=cfg,
@@ -2018,13 +2026,85 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d: %s — %s" % (row["id"], row["status"],
                                            row.get("project") or row.get("reason", "changed concurrently")))
             return 0
+        if args.work_command == "reviewers":
+            from . import review_designation_activation as activation
+            out = activation.reviewers(cfg, db, args.id, apply=args.apply)
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+            else:
+                freeze = out.get("freeze")
+                if not freeze:
+                    print("lot #%d is not frozen: no automatic designation" % args.id)
+                else:
+                    print("lot #%d: freeze #%s %s" % (
+                        args.id, freeze["id"], str(freeze.get("sha") or "")[:12]))
+                    designation = out.get("designation")
+                    if not designation:
+                        print("designation: none recorded")
+                    elif designation.get("state") == "designated":
+                        names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                          for r in designation.get("reviewers") or ())
+                        print("designation: %s" % names)
+                        if designation.get("policy_ref"):
+                            print("policy     : %s" % designation["policy_ref"])
+                    else:
+                        print("designation: %s — %s" % (
+                            designation.get("state"), designation.get("why") or ""))
+                    if out.get("manual"):
+                        print("manual     : %s" % ", ".join(out["manual"]))
+                    if out.get("error"):
+                        print("mark       : %s" % out["error"])
+            applied = out.get("applied")
+            if applied is not None and not args.json:
+                state = applied.get("state")
+                if state == "designated":
+                    names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                      for r in applied.get("reviewers") or ())
+                    print("designated: %s" % names)
+                elif state == "waiting":
+                    print("waiting    : %s" % (applied.get("why") or ""))
+                elif state == "manual":
+                    print("manual     : %s" % (applied.get("why") or ""))
+                elif state in ("unavailable", "none", "unfrozen"):
+                    print("%-11s: %s" % (state, applied.get("why") or ""))
+                else:
+                    print("designation: %s" % state)
+            return 0
         if args.work_command == "milestone":
+            from . import review_designation_activation as activation
+            threads: list = []
+            outcome: dict = {}
+            on_frozen = None
+            if args.kind == "frozen" and activation.enabled(cfg):
+                on_frozen = activation.hook(cfg, outcome)
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=args.note or "")
+                verdict=args.verdict, note=args.note or "",
+                on_frozen=on_frozen, after_commit=threads if on_frozen else None)
+            for record in threads:
+                record(db.cfg, db)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            state = str(outcome.get("state") or "")
+            if state == "designated":
+                print("reviewers: %s" % ", ".join(
+                    "%s (%s)" % (r.get("name"), r.get("family"))
+                    for r in outcome.get("reviewers") or ()))
+            elif state == "waiting":
+                print("review pending: %s" % (outcome.get("why") or ""))
+            elif state == "manual":
+                print("reviewers: manual designation kept (%s)"
+                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
+            elif state == "unavailable":
+                print("review designation unavailable: %s" % (outcome.get("why") or ""))
+            if args.kind == "frozen":
+                # #2442 : un réalignement mécanique sur la cible garde les
+                # verdicts de la tête relue ; sinon l'exécuteur retente.
+                from . import verdict_carry
+                carried = verdict_carry.carry(cfg, db, args.id)
+                if carried["result"] != "idle":
+                    print(verdict_carry.describe(carried))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
@@ -2285,6 +2365,8 @@ def cmd_set(cfg: Config, args) -> int:
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db, defer=True)
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="settings.permission_mode")
         agent = registry.get(db, args.agent)
         if agent is None:
             print("unknown agent: %s" % args.agent, file=sys.stderr)
@@ -2910,6 +2992,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
+    from . import migration_reservations
+    migration_reservations.add_options(pw_mig)
     pw_mig.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)
@@ -2945,6 +3029,17 @@ def build_parser() -> argparse.ArgumentParser:
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
     pw_reviewer.set_defaults(func=cmd_work)
+    pw_reviewers = work_sub.add_parser(
+        "reviewers",
+        help="#2447: read the automatic reviewer designation of the latest freeze, "
+             "or retry it outside the freeze hook (recovery)")
+    pw_reviewers.add_argument("id", type=int)
+    pw_reviewers.add_argument("--apply", action="store_true",
+                              help="retry the designation of the latest freeze (same head); "
+                                   "a waiting state yields to the designation when capacity "
+                                   "or the canon policy comes back")
+    pw_reviewers.add_argument("--json", action="store_true")
+    pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
                        "on the target): any open state → merged, merged milestone with the commit")
@@ -3068,6 +3163,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
+    from . import prevalidation
+    prevalidation.add_parsers(work_sub, cmd_work)  # #1770 prévalidation au gel
     from . import backlog
     backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
     from . import wip

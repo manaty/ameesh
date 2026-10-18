@@ -74,6 +74,8 @@ class MigrationPinningTest(unittest.TestCase):
             '  *) exit 97 ;; esac ;;\n'
             'start) [ "${BACKUP_START_STATUS:-0}" = 0 ] || exit "${BACKUP_START_STATUS}";\n'
             '  d=${SAUVEGARDES_VM:?}; mkdir -p "$d";\n'
+            '  if [ -n "${BACKUP_SAME_NAME:-}" ]; then\n'
+            '    printf "server dump rewritten\\n" > "$d/$BACKUP_SAME_NAME"; exit 0; fi;\n'
             '  n=$(find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" | wc -l);\n'
             '  printf "server dump %s\\n" "$n" > "$d/ameesh-simulation-20261017-1500$(printf "%02d" "$n").dump";\n'
             '  exit 0 ;;\n'
@@ -278,6 +280,17 @@ class MigrationPinningTest(unittest.TestCase):
         ])
         self.assertIn("--user restart ameesh-notify.service", self.systemctl_calls())
 
+    def test_unusable_probe_is_handled_like_a_failure_with_its_own_message(self):
+        # #2359: exit 2 = probe unusable, not proven incompatible; #2357: like
+        # a failure, it hands over to the install and restart (here deferred
+        # to the staging sequence).
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="2",
+                               MIGRER_SANS_REDEMARRAGE="1")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("sonde inutilisable", done.stderr)
+        self.assertNotIn("ancien code incompatible", done.stderr)
+        self.assertIn("la séquence staging poursuit sans s'arrêter", done.stderr)
+
     def test_missing_ref_takes_clone_head(self):
         # #1245 : sans REF, « migrer » migre le HEAD du dépôt de déploiement,
         # comme « installer » ; le contrôleur L232b migre, lui, son commit épinglé.
@@ -332,6 +345,23 @@ class MigrationPinningTest(unittest.TestCase):
         self.assertEqual(len(dumps), 1, dumps)
         self.assertEqual(dumps[0].read_bytes(), b"server dump 0\n")
         self.assertEqual(stat.S_IMODE(dumps[0].stat().st_mode), 0o600)
+
+    @unittest.skipUnless(HAVE_PSYCOPG,
+                         "psycopg absent (part psql) : sauvegarder-prive.py non exécutable")
+    def test_dump_rewritten_under_the_same_name_is_pulled(self):
+        # #2424 : le script serveur déployé réécrit le dump du jour sous le
+        # même nom ; il reste reconnu comme nouveau.
+        name = "ameesh-simulation-20261017.dump"
+        self.remote_dumps.mkdir(parents=True, exist_ok=True)
+        old = self.remote_dumps / name
+        old.write_bytes(b"old dump\n")
+        os.utime(old, (1_000_000_000, 1_000_000_000))
+        done = self.run_script("sauvegarder", BACKUP_SAME_NAME=name)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        dumps = list((Path(self.env["HOME"]) / "backups/ameesh").glob(
+            "mesh-*-avant-l60-l74.dump"))
+        self.assertEqual(len(dumps), 1, dumps)
+        self.assertEqual(dumps[0].read_bytes(), b"server dump rewritten\n")
 
     @unittest.skipUnless(HAVE_PSYCOPG,
                          "psycopg absent (part psql) : sauvegarder-prive.py non exécutable")

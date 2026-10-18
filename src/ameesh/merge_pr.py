@@ -200,7 +200,7 @@ def _branch_name(target: str) -> str:
     return merge_queue._remote_branch((target or "").strip())
 
 
-def _pr_guards(view: dict, pr: int, head: str, target: str) -> None:
+def _pr_guards(view: dict, pr: int, head: str, target: str, project=None) -> None:
     """The guards carried by the PR view, replayed before any write."""
     state = (view.get("state") or "").upper()
     if state != "OPEN":
@@ -220,7 +220,8 @@ def _pr_guards(view: dict, pr: int, head: str, target: str) -> None:
             "PR #%d is not mergeable now (mergeStateStatus %s): the direct path never "
             "weakens what the API checks — required checks, reviews or the base state "
             "must be settled first" % (pr, merge_state or "?"))
-    if not radar.ci_green(view.get("statusCheckRollup") or []):
+    required = radar.required_statuses(project, (view.get("headRefName") or "").strip() or None)
+    if not radar.ci_green(view.get("statusCheckRollup") or [], required):
         raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
                            % (pr, head[:12]))
 
@@ -313,7 +314,7 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
             return None
         return {"number": view.get("number"), "url": view.get("url") or "",
                 "head": head.lower(),
-                "green": radar.ci_green(rollup),
+                "green": radar.ci_green(rollup, radar.required_statuses(project, branch)),
                 "draft": bool(view.get("isDraft"))}
 
     clone = resolutions.Replayer(repo, owner)
@@ -639,7 +640,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                 raise MergePrError(
                     "PR #%d: auto-merge armed and not disarmed (%s): nothing written; disarm "
                     "it (gh pr merge --disable-auto %d) and retry" % (pr, error, pr))
-        _pr_guards(view, pr, head, target)
+        _pr_guards(view, pr, head, target, project)
         ready = _admission(db, cfg, lot, repo, project, owner, view,
                            slug=slug, target=target, head=head, gh=gh,
                            packet_exception=((exception, reason)
@@ -748,7 +749,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # admission and both remote refs are read again; any mutation since
         # the merge commit was built stops without writing.
         fresh = pr_view(slug, pr, gh=gh)
-        _pr_guards(fresh, pr, head, target)
+        _pr_guards(fresh, pr, head, target, project)
         ready = _admission(db, cfg, lot, repo, project, owner, fresh,
                            slug=slug, target=target, head=head, gh=gh,
                            packet_exception=((exception, reason)

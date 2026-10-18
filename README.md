@@ -350,6 +350,20 @@ inputs waiting more than ten minutes produce an alert without being consumed.
 process or modified in the last minute: close it and let its journal settle.
 The existing audited `adopt --force` override remains available.
 
+### Automatic packet train (#2446)
+
+The #1467 train engine is assembled from the host configuration's `train`
+key and started by the runner only on the designated host. Two explicit
+modes exist: `shadow` (the plan the train would compose at each compiled
+packet cutoff is published under `$AMEESH_STATE/trains/shadow/` and compared
+with the composer's landed manifest; nothing is reserved, pushed or merged)
+and `active` (compose, push `integration/train-*`, wait for the single packet
+CI and promote on green). A `train-service` lease in `merge_locks` ensures one
+host executes the service. Absent configuration means no service; a missing
+or unknown piece refuses by name, never by a fallback. Configuration, the
+named refusals, the proof and the rollback are described in
+[`docs/operations/service-train.md`](docs/operations/service-train.md).
+
 ## Language choice
 
 **Python 3 (stdlib) + `psycopg`, with the `psql` binary as a fallback.**
