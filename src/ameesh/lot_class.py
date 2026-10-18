@@ -257,6 +257,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     elif callable(canons):
         canons = canons()
     if not canons:
+        out["files"] = _doubtful_files(paths)
         out["why"] = "no readable canon: review policy unknown"
         return out
     result = class_of_paths(canons, row.get("app"), paths)

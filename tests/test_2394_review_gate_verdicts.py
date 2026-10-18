@@ -129,6 +129,21 @@ class ClassReaderTest(unittest.TestCase):
         self.assertEqual(merge_queue.required_verdicts(undeclared), 2)
 
 
+    def test_no_readable_canon_keeps_paths_from_the_lot_diff(self):
+        for path, required in (("src/ameesh/db.py", 2),
+                               ("src/ameesh/work.py", 1)):
+            with self.subTest(path=path), \
+                    mock.patch.object(lot_class, "default_base", return_value="main"), \
+                    mock.patch.object(lot_class.canon_mod, "git_range_paths",
+                                      return_value=[path]):
+                klass = lot_class.of_lot(None, 2394, item={"app": "ameesh"},
+                                        repo="fixture", base="main", head=HEAD,
+                                        canons=[])
+                self.assertTrue(klass["doubt"])
+                self.assertEqual([f["path"] for f in klass["files"]], [path])
+                self.assertEqual(merge_queue.required_verdicts(klass), required)
+
+
 class GateTest(unittest.TestCase):
     """La porte applique ce barème : un avis hors doute, deux hors critique."""
 
