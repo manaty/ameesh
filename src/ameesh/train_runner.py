@@ -13,7 +13,7 @@ import math
 import threading
 import time
 import uuid
-from dataclasses import asdict, replace
+from dataclasses import replace
 
 from . import (merge_queue, radar, resolutions, storage, train, train_admissions,
                train_candidates, train_ci, train_fire, train_git, train_history,
@@ -109,7 +109,7 @@ class Passage:
             raise train.TrainError("explicit qualified packet reservation required")
         return self.reservation.bind(db, self.project,
             merge_queue._remote_branch(self.project.target), self.owner,
-            train.digest([asdict(workflow) for workflow in self.workflows]))
+            train_ci.contract_digest(self.workflows))
 
     def maintain(self, db, now):
         self.maintenance_at = self.reservation_ledger(db).maintain(now)
@@ -169,10 +169,14 @@ class Passage:
             raise train.TrainError("explicit compiled packet merge policy required") from exc
         policy = replace(self.policy, schedule=rules)
         requirement = train_policy.Compiled(rules)
-        ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows)
+        # #2503: a dynamic contract resolves the due parts in the private
+        # clone, against the plan's base and head; a static contract ignores
+        # the path and the proof cache.
+        directory = self.repository_path()
+        ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows,
+                             repo=directory, cache=train_ci.parts_cache(self.cfg))
         # The radar, another target, and another runner may all replay merges
         # concurrently. They must never reset this passage's worktree.
-        directory = self.repository_path()
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         transports = (None if self.transports is None else
                       lambda **context: self.transports(db, **context))
