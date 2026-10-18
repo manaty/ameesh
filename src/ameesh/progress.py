@@ -153,7 +153,8 @@ def parse_since(text: str | None, now: float) -> float:
 # --------------------------------------------------------------------------
 
 def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
-                          declared: Iterable[dict] | None = None) -> dict:
+                          declared: Iterable[dict] | None = None, *,
+                          agents: Iterable[str] | None = None) -> dict:
     """Les jalons d'un lot : requested / frozen / verdict / merged / delivered.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
@@ -189,7 +190,13 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
+
+    `agents` : les noms d'agents du registre (#2346). `seb` et `human:seb` ne
+    nomment le même acteur que si `seb` n'est PAS un agent ; sans cette
+    classification (None), aucun alias n'est admis — le sens est restreint,
+    jamais deviné.
     """
+    agents = None if agents is None else set(agents)
     requested = item.get("created_ts")
     merged = None
     blocks = 0
@@ -275,6 +282,27 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
     reviewer = (last["actor"] if last else None) if verdict_current else designated
+    from .work_reviewers import designated as designated_reviewers
+    reviewers = designated_reviewers(item)
+    # Key by designation: aliases share one latest verdict, and withdrawn
+    # reviewers cannot supply the aggregate verdict after their removal.
+    current = {name: v for v in verdicts if _verdict_applies(v, last_frozen)
+               for name in reviewers if _same_actor(name, v["actor"], agents)}
+    pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
+               if item.get("reviewers") is not None else [])
+    # Every designated reviewer owes their own verdict on the frozen head.
+    # A later GO from another reviewer cannot erase a blocking verdict.
+    blocked = [v for v in current.values() if v["kind"] == "blocked"]
+    if item.get("reviewers") is not None and reviewers and blocked:
+        last = max(blocked, key=lambda v: v["at_ts"])
+        verdict_current = True
+    elif reviewers and pending:
+        verdict_current = False
+    elif item.get("reviewers") is not None and reviewers and current:
+        last = max(current.values(), key=lambda v: v["at_ts"])
+        verdict_current = True
+    if item.get("reviewers") is not None and reviewers:
+        reviewer = last["actor"] if verdict_current and last else designated
     # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
     # mécanique, canon §11 bis/#87) en marquant la colonne du relecteur
     # (`work.waive_review`) : l'attente passe alors à la fusion, sans faux
@@ -287,6 +315,8 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "verdict": last["at_ts"] if last else None,
         "verdict_kind": last["kind"] if last else None,
         "reviewer": reviewer,
+        "reviewers": reviewers,
+        "pending_reviewers": pending,
         "verdict_current": verdict_current,
         "verdict_required": verdict_required,
         "merged": merged,
@@ -302,6 +332,29 @@ def _same_commit(a: str | None, b: str | None) -> bool:
     Un identifiant vide n'est jamais « le même commit »."""
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
     return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _same_actor(left: str | None, right: str | None,
+                agents: set[str] | None = None) -> bool:
+    """#2204/N4, #2346 : `seb` et `human:seb` ne nomment le même acteur que si
+    `seb` n'est pas un agent du registre. Un agent nommé `seb` ne peut donc ni
+    valider l'approbation humaine `human:seb`, ni fournir le verdict attendu
+    d'un relecteur `human:seb`. `agents` None (classification inconnue) :
+    aucun alias — on restreint plutôt que de deviner."""
+    left, right = (left or "").strip(), (right or "").strip()
+    if left == right:
+        return True
+    if not left or not right:
+        return False
+    if left.startswith("human:"):
+        bare, other = left[len("human:"):], right
+    elif right.startswith("human:"):
+        bare, other = right[len("human:"):], left
+    else:
+        return False
+    if not bare or other != bare:
+        return False
+    return agents is not None and bare not in agents
 
 
 def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
@@ -379,8 +432,9 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               planned_wait: dict | None = None,
               dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
-              agent_externals: dict[str, str | None] | None = None) -> dict:
-    jalons = _work_item_milestones(item, events, actions, declared)
+              agent_externals: dict[str, str | None] | None = None,
+              agents: Iterable[str] | None = None) -> dict:
+    jalons = _work_item_milestones(item, events, actions, declared, agents=agents)
     packages = packages or {}
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
@@ -404,6 +458,8 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         # le dit ; le jeton de la colonne ne sort pas dans la vue.
         "reviewer": (None if jalons["reviewer"] == work_mod.REVIEWER_NONE
                      else jalons["reviewer"]),
+        "reviewers": jalons["reviewers"],
+        "pending_reviewers": jalons["pending_reviewers"],
         "milestones": {k: _round(jalons[k])
                        for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
@@ -483,6 +539,26 @@ def agent_state(row: dict) -> str:
     return "idle"                       # idle, queued
 
 
+def operator_pause_of(row: dict) -> dict | None:
+    """#2200 : la pause opérateur d'une ligne, projetée une seule fois.
+
+    `ameesh show`, `ameesh projects`/`progress` et les alertes lisent la même
+    pause (raison, auteur, principal, début) : une projection partagée évite
+    que l'un l'affiche et que l'autre la perde en route. `after_turn` dit que
+    le tour en cours finit avant que la pause ne prenne effet (`running`,
+    comme `ameesh list` : le statut suffit, la lecture `show` n'a pas de
+    `lease_live`)."""
+    if not row.get("operator_paused"):
+        return None
+    return {
+        "reason": row.get("operator_pause_reason"),
+        "by": row.get("operator_pause_by"),
+        "for": row.get("operator_pause_for"),
+        "since_ts": _round(row.get("operator_pause_ts")),
+        "after_turn": row.get("status") == "running",
+    }
+
+
 def paused_on_budget(row: dict) -> bool:
     """#1070 : is the agent in a BUDGET pause? Delegates to `handoff.paused`
     (L233b), the single definition, so no second rule is kept here."""
@@ -547,13 +623,7 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
-        "operator_pause": ({
-            "reason": row.get("operator_pause_reason"),
-            "by": row.get("operator_pause_by"),
-            "for": row.get("operator_pause_for"),
-            "since_ts": _round(row.get("operator_pause_ts")),
-            "after_turn": state == "working",
-        } if row.get("operator_paused") else None),
+        "operator_pause": operator_pause_of(row),
     }
 
 
@@ -837,20 +907,29 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     packages = {p["id"]: p for p in package_rows}
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
-    states, externals = stagnation.availability_of(st.agents(None))
+    all_agents = st.agents(None)
+    states, externals = stagnation.availability_of(all_agents)
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur. Cette table classe les homonymes pour `_same_actor`.
+    agent_names = {row["name"] for row in all_agents if row.get("name")}
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, items, now=now, packages=packages,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    # #1664 : le flux ciblé du stockage (transitions + notes hold/levée) ;
+    # jamais le journal entier ni le texte des notes ordinaires.
+    waits = planned_waits.read(
+        db, items, now=now, packages=packages,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(
+            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])),
                       events_ts=last_events.get(int(item["id"])), agent_states=states,
-                      planned_wait=holds.get(int(item["id"])),
+                      planned_wait=waits.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
-                      agent_externals=externals)
+                      agent_externals=externals, agents=agent_names)
             for item in items]
     # #1822 : un lot léger sans verdict courant attend la fusion, pas un
     # verdict ; la classe n'est lue — une fois par passage — que pour ces lots.
@@ -865,7 +944,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
             continue
         rid = int(item["id"])
         acts = by_item.get(rid, [])
-        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid))
+        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid),
+                                       agents=agent_names)
         lot["waiting_for"] = stagnation.with_availability(
             stagnation.waiting(item, jalons, acts,
                                responsible=(packages.get(item.get("package_id"))
@@ -1066,7 +1146,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
         extra = []
         if lot["assignee"]:
             extra.append("author %s" % lot["assignee"])
-        if lot["reviewer"]:
+        if lot.get("reviewers"):
+            extra.append("reviewers %s" % ", ".join(lot["reviewers"]))
+        elif lot["reviewer"]:
             extra.append("reviewer %s" % lot["reviewer"])
         if lot["blocked_verdicts"] or lot["blocks"]:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))

@@ -550,14 +550,32 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             def tag(key: str) -> str:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
-            print("  thresholds memory ≥ %s%s; swap ≤ %s%s; load ≤ %.2f%s; disk ≥ %s%s"
+            # #2354: no declared swap ceiling and no PSI to corroborate one —
+            # the host is under the 0028 conservative fallback, the stock is
+            # then the only memory signal; say it instead of a bare "—".
+            swap = limits["max_swap_used"]
+            if swap is None and latest.get("psi_mem_some") is None:
+                swap = res.DEFAULT_MAX_SWAP_USED_WITHOUT_PSI
+                swap_tag = " [fallback: no PSI]"
+                swap_note = "counts alone, no PSI"
+            else:
+                # #2296: the declared ceiling, or none at all — "— [défaut]"
+                # would claim a default value that does not exist
+                swap_tag = tag("max_swap_used") if swap is not None else " [no default]"
+                swap_note = "counts only under memory pressure"
+
+            print("  thresholds memory ≥ %s%s; swap ≤ %s%s (%s); load ≤ %.2f%s; disk ≥ %s%s"
                   "; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
-                     _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
+                     _fmt_bytes(swap), swap_tag, swap_note,
                      limits["max_load"], tag("max_load"),
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
                      tag("max_tmpfs_used")))
+            # #2296: the admission signal that follows the real pressure
+            print("  thresholds memory pressure ≤ %s%s"
+                  % (res.fmt_value("max_mem_pressure", limits["max_mem_pressure"]),
+                     tag("max_mem_pressure")))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -931,6 +949,7 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
 
 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
+    from . import progress
     db = _open(cfg)
     try:
         row = agent_detail(db, args.agent)
@@ -940,10 +959,17 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0
+        # #2200 : la pause opérateur se lit dans le résumé texte, pas seulement
+        # dans le JSON — un `idle` avec bail vivant ne dit pas « ne reprendra
+        # pas » et a fait router des lots vers un agent pausé.
+        pause = progress.operator_pause_of(row)
+        status = row.get("status")
+        if pause and status not in ("stopped", "dead", "blocked"):
+            status = "pause-next" if pause.get("after_turn") else "op-paused"
         print("agent    : %s" % row["name"])
         print("workspace: %s" % (row.get("chantier") or "—"))
         print("harness  : %-9s host: %-12s status: %s%s" % (
-            row.get("harness") or "?", row.get("host") or "—", row.get("status"),
+            row.get("harness") or "?", row.get("host") or "—", status,
             (" (%s)" % row["status_text"]) if row.get("status_text") else ""))
         # L242b/#1250 : le harnais DÉCLARÉ ne dit pas sous lequel la session
         # tourne (harnais emprunté) ; quand la session vivante en a un autre,
@@ -953,6 +979,18 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             print("session harness: %s" % live)
         if row.get("stop_reason"):
             print("stopped  : %s" % row["stop_reason"])
+        if pause:
+            who = pause.get("by") or "?"
+            if pause.get("for") and pause["for"] != who:
+                who += " for %s" % pause["for"]
+            print("paused   : operator pause since %s by %s — %s" % (
+                _fmt_moment(pause.get("since_ts")), who,
+                pause.get("reason") or "(no reason given)"))
+            if pause.get("after_turn"):
+                print("           this turn finishes, then no new turn starts")
+            else:
+                print("           no new turn starts until it is lifted "
+                      "(ameesh resume %s --operator --reason <reason>)" % row["name"])
         # L37 (0030) : mode explicite ; un agent externe exige un responsable
         if row.get("mode") == "externe":
             print("mode     : externe (human session, cannot be woken)%s" % (
@@ -1509,6 +1547,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "dependencies":
             from . import work_dependencies
             return work_dependencies.run(db, args)
+        if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
+            from . import work_dependencies
+            return work_dependencies.run_landing(db, args)
         if args.work_command == "queue":   # merge queue per target (L160e)
             from . import merge_queue
             return merge_queue.run(cfg, db, args)
@@ -1718,8 +1759,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
             if item.get("reviewer") == work.REVIEWER_NONE:
                 print("reviewer : — (verdict not required, #1979)")
-            elif item.get("reviewer"):
-                print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
+            else:
+                from .work_reviewers import designated
+                if designated(item):
+                    print("reviewer : %s (designated for the review, #2076)" %
+                          ", ".join(designated(item)))
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -1843,15 +1887,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "",
                 " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
+            # #800 : la désignation est conservée ; l'avertissement de famille
+            # est indicatif (canon §2).
+            if item.get("reviewer_warning"):
+                print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
-            # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
+            # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
             # sans aller-retour build/qa ; c'est la commande que l'alerte
             # `stale_lot` recommande à l'orchestrateur du projet.
             # #1979 : `--remove` retire la désignation, `--no-verdict` marque
             # « verdict non requis » (résolution de composition mécanique,
             # canon §11 bis/#87) : l'attente passe à la fusion, sans rappel.
-            if args.agent and (args.remove or args.no_verdict):
+            if args.no_verdict and (args.agent or args.remove):
                 print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
                       "mutually exclusive", file=sys.stderr)
                 return 2
@@ -1859,10 +1907,28 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
                       file=sys.stderr)
                 return 2
-            if args.remove:
+            if args.remove and args.agent:
+                item = work.designate_reviewer(cfg, db, args.id, args.agent,
+                                               actor=args.actor, remove=True)
+                if item.get("reviewer_changed") is False:
+                    # #2084/N2 : dire le non-effet, sans écrire un faux
+                    # « removed » au journal.
+                    print("lot #%d: reviewer %s was not designated: nothing removed "
+                          "(state %s, by %s)" % (
+                              item["id"], args.agent, item["state"],
+                              args.actor or "the bound identity"))
+                else:
+                    print("lot #%d: reviewer %s removed (state %s, by %s)" % (
+                        item["id"], args.agent, item["state"],
+                        args.actor or "the bound identity"))
+            elif args.remove:
                 item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
-                print("lot #%d: reviewer designation removed (state %s, by %s)" % (
-                    item["id"], item["state"], args.actor or "the bound identity"))
+                if item.get("reviewer_changed") is False:
+                    print("lot #%d: no reviewer designation to remove (state %s, by %s)" % (
+                        item["id"], item["state"], args.actor or "the bound identity"))
+                else:
+                    print("lot #%d: reviewer designation removed (state %s, by %s)" % (
+                        item["id"], item["state"], args.actor or "the bound identity"))
             elif args.no_verdict:
                 item = work.waive_review(cfg, db, args.id, actor=args.actor)
                 print("lot #%d: verdict not required (state %s, by %s)" % (
@@ -1873,11 +1939,24 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d: reviewer %s (state %s, designated by %s)" % (
                     item["id"], item["reviewer"], item["state"],
                     args.actor or "the bound identity"))
+                # #800 : la désignation est conservée ; l'avertissement de
+                # famille est indicatif (canon §2).
+                if item.get("reviewer_warning"):
+                    print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
+            def _declare_constat(constat: dict) -> None:
+                # #1400 : le constat (lot/app/titre + sujet du commit, et la
+                # forme de la preuve) est montré AVANT l'écriture ; l'état du
+                # lot ne change qu'après.
+                print("declaring merge: lot #%d (%s: %s)"
+                      % (constat["id"], constat["app"] or "?", constat["title"]))
+                print("commit %s (%s): %s"
+                      % (constat["sha"][:12], constat["how"], constat["subject"]))
+
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
                                actor=args.actor, repo=args.repo, migration_landed=args.migration_landed,
-                               cfg=cfg)
+                               cfg=cfg, announce=_declare_constat)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
             elif done["result"] == "landed":
@@ -2783,6 +2862,7 @@ def build_parser() -> argparse.ArgumentParser:
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
+    work_dependencies.add_landing_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")
@@ -2819,18 +2899,19 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.add_argument("--reviewer", default=None, metavar="AGENT",
                          help="#705: designate the reviewer of the review that starts, only "
                               "when moving to qa: waiting(), the progress view and the stale_lot "
-                              "alert name them before any verdict")
+                              "alert name them before any verdict; a reviewer of the author's "
+                              "declared harness warns (indicative, #800)")
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
-        help="#705: designate (or change) the reviewer of a lot already in qa, "
+        help="#2076: add a designated reviewer of a lot already in qa, "
              "without a build/qa round trip")
     pw_reviewer.add_argument("id", type=int)
     pw_reviewer.add_argument("agent", nargs="?", metavar="AGENT",
                              help="a registry agent, or human:<id>; never the lot's assignee")
     pw_reviewer.add_argument("--remove", action="store_true",
-                             help="#1979: remove the designation (the review goes back to "
-                                  "« verdict from a reviewer (none designated) »)")
+                             help="#2076: remove AGENT's designation; without AGENT, "
+                                  "remove all designations (#1979)")
     pw_reviewer.add_argument("--no-verdict", dest="no_verdict", action="store_true",
                              help="#1979: mark « verdict not required » (mechanical composition "
                                   "resolution, canon §11 bis/#87): the lot waits for its merge "
@@ -2911,7 +2992,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_expire.add_argument("--actor", default="")
     pw_expire.set_defaults(func=cmd_work)
 
-    pw_note = work_sub.add_parser("note")
+    pw_note = work_sub.add_parser(
+        "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text")
     pw_note.add_argument("--actor", default="")
@@ -3243,6 +3325,14 @@ def _cost_report_reads(cfg: Config, db) -> None:
     _real_spend_24h(db)
 
 
+def _config_origin(cfg: Config) -> dict:
+    """#1466 : provenance de la configuration lue — fichier, base héritée et
+    clés qu'un profil écrase (les comptes, notamment)."""
+    return {"path": cfg.config_path, "base": cfg.config_base,
+            "shadowed": list(cfg.config_shadowed or ()),
+            "source": cfg.config_source}
+
+
 def cmd_accounts(cfg: Config, args) -> int:
     """`ameesh accounts list|use <harnais> <compte>|auto [harnais]|healthy
     <harnais> [<compte>]` (L30, 0027 ; L226b).
@@ -3337,10 +3427,22 @@ def cmd_accounts(cfg: Config, args) -> int:
             except db_mod.DbError:
                 sante = []  # base sans la migration 0060
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
+                              "config": _config_origin(cfg),
                               "accounts": rows, "switches": bascules,
                               "credentials": sante, "proposal": prop.as_dict()},
                              ensure_ascii=False, indent=2, default=str))
             return 0
+        if cfg.config_base:
+            # #1466 : d'où viennent ces comptes — un profil peut diverger de
+            # la configuration de l'hôte sans que personne ne le voie
+            note = ("config     : %s (profile; host config %s)"
+                    % (cfg.config_path, cfg.config_base))
+            if cfg.config_shadowed:
+                note += "; overrides: %s" % ", ".join(cfg.config_shadowed)
+            if "accounts" in (cfg.config_shadowed or ()):
+                note += ("\n             WARNING: this profile's `accounts` override the "
+                         "host's; a stale profile diverges silently from other runners")
+            print(note)
         print(accounts_mod.format_rows(rows))
         print(prop.text())
         if bascules:

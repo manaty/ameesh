@@ -700,7 +700,8 @@ class MapTest(unittest.TestCase):
                     self.assertTrue(p["phase2_safe"], p["phase2_why"])
                     self.assertEqual(p["selection"]["mode"], "full")
                     self.assertIn("release/**", p["selection"]["why"])
-                    self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                                     _full_suite_parts("psycopg"))
                     self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                     self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                     self.assertEqual(
@@ -848,8 +849,8 @@ class MapTest(unittest.TestCase):
 
     def test_always_list_sorted_and_known(self):
         always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
-        self.assertEqual(always, ["test_339_orphan_settle", "test_cluster",
-                                  "test_events_attach", "test_l31_orphans",
+        self.assertEqual(always, ["test_2340_auditeur_role", "test_339_orphan_settle",
+                                  "test_cluster", "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",
                                   "test_l72_panne_de_base", "test_migrations"])
 
@@ -1839,7 +1840,8 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         out = plan.outputs(p)
-        self.assertEqual(json.loads(out["psycopg"]), [1, 2, 3, 4])
+        self.assertEqual(json.loads(out["psycopg"]),
+                         list(range(1, plan.PARTS["psycopg"][1] + 1)))
         self.assertEqual(out["psql_parts"], "9")
         self.assertEqual(out["code"], "true")
 
@@ -1866,6 +1868,15 @@ class PlanTest(unittest.TestCase):
         # #1692 : la suite complète passe de 6 à 9 parts ; le pilote d'une PR
         # de lot reste à trois (n_pr), inchangé.
         self.assertEqual(plan.PARTS["psql"][1], 9)
+
+    def test_full_suite_psycopg_is_split_for_the_cap(self):
+        # #2292 : à quatre parts, 14,3-30,5 min sous saturation sur les cinq
+        # derniers paquets ; les parts 4/4 de h-1800 et 1/4 de h-1900 ont été
+        # coupées au plafond de 30 min sans test en échec. La suite complète
+        # passe à six parts (~15-20 min visées) et le plafond du job à 45 min ;
+        # le pilote d'une PR de lot reste à quatre parts (n_pr).
+        self.assertGreaterEqual(plan.PARTS["psycopg"][1], 6)
+        self.assertEqual(plan.PARTS["psycopg"][0], 4)
 
     def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
         # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
@@ -1925,7 +1936,8 @@ class PlanTest(unittest.TestCase):
         f.write_text(json.dumps(p), encoding="utf-8")
         self.assertIsNone(parts.read_plan(f, "psql", 1))
         self.assertTrue(parts._driver_plan(str(f)))
-        self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
+        self.assertEqual(json.loads(plan.outputs(p)["psycopg"]),
+                         list(range(1, plan.PARTS["psycopg"][0] + 1)))
         # #947 : le plan de repli garde le découpage de la part psql d'une PR
         self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3])
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [3, 3, 3])
@@ -1991,7 +2003,8 @@ class PlanTest(unittest.TestCase):
         finally:
             sys.stdout = old
         self.assertEqual(code, 0)
-        self.assertIn("psycopg=[1, 2, 3, 4]", (d / "out").read_text(encoding="utf-8"))
+        self.assertIn(f"psycopg={list(range(1, plan.PARTS['psycopg'][1] + 1))}",
+                      (d / "out").read_text(encoding="utf-8"))
 
 
 def _full_suite_parts(driver: str) -> list[int]:
@@ -2183,7 +2196,8 @@ class LotBranchTest(unittest.TestCase):
         # reprend ni la liste pilote psql ni le découpage d'une PR de lot.
         p = plan.fallback_plan("pull_request", "boom", base_ref="main",
                                head_ref="release/1.10.0")
-        self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
+        self.assertEqual(json.loads(plan.outputs(p)["psycopg"]),
+                         list(range(1, plan.PARTS["psycopg"][1] + 1)))
         self.assertEqual(json.loads(plan.outputs(p)["psql"]), list(range(1, 10)))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
@@ -3047,10 +3061,10 @@ class WorkflowTest(unittest.TestCase):
 
     def test_plan_job_passes_the_pushed_range(self):
         # #833: a push is planned from github.event.before, not HEAD^1 alone ;
-        # #1343 : une demande de gel est planifiée depuis la base du payload
-        # (`pull_request.base.sha`), la composition même du merge-ref vérifié.
+        # #2328 : la pointe cible figée dans la description de l'étiquette
+        # nomme la composition, même si pull_request.base.sha est périmé.
         self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && "
-                      "github.event.pull_request.base.sha || (github.event_name == 'push' && "
+                      "github.event.label.description || (github.event_name == 'push' && "
                       "github.event.before || 'HEAD^1') }}", self.text)
         self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
@@ -3148,7 +3162,7 @@ class WorkflowTest(unittest.TestCase):
     def test_label_gate_exact_frozen_sha_and_composition(self):
         # #1343 : le job plan ne teste que la composition demandée — étiquette
         # exacte `ci-lot/ci-full-<40hex>`, SHA égal à `pull_request.head.sha`,
-        # checkout = merge-ref composé de la base du payload et de cette tête.
+        # checkout = merge-ref composé de la base de l'étiquette et de cette tête.
         # Un refus rougit le check requis sans exécuter de tests, jamais un vert
         # sur une autre tête.
         self.assertIn("^ci-(lot|full)-[0-9a-f]{40}$", self.text)
@@ -3186,6 +3200,9 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("run-name:", self.text)
         self.assertIn("format(' [PR #{0} {1} base {2}]'", self.text)
         self.assertIn("github.event.label.name", self.text)
+        run_name = next(line for line in self.text.splitlines() if line.startswith("run-name:"))
+        self.assertIn("github.event.label.description", run_name)
+        self.assertNotIn("github.event.pull_request.base.sha", run_name)
 
 
 class LotFreezePlanTest(unittest.TestCase):
@@ -3301,7 +3318,7 @@ class LotFreezePlanTest(unittest.TestCase):
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_cli_mode_lot_sans_base_refuse(self):
-        # sans la base du payload, la sélection porterait sur HEAD^1 et
+        # sans la base demandée, la sélection porterait sur HEAD^1 et
         # manquerait des modules du lot : la CLI refuse plutôt que de deviner.
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

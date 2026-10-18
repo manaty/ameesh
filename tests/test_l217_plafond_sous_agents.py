@@ -6,8 +6,9 @@ relus, alors que son fil principal était à ~4 M. Ses quatre sous-agents en
 avaient relu 11,7 M, et le tour a été clos sur un point sûr de sous-agent :
 analyses perdues, rotation inutile. Le flux `stream-json` de Claude Code
 publie les événements des sous-agents avec `parent_tool_use_id`. Leurs
-jetons sont comptés à part, pour information. Postgres réel ; faux harnais
-`claude` du banc.
+jetons sont comptés à part, pour information. #2336 : le plafond mesure le
+contexte du dernier appel du fil principal, pas la somme des relectures du
+tour. Postgres réel ; faux harnais `claude` du banc.
 """
 from __future__ import annotations
 
@@ -122,17 +123,19 @@ class PlafondDuFilPrincipalTest(PgTestCase):
         # le grand livre compte les sous-agents (au-delà du plafond de 1 000)…
         self.assertGreaterEqual(worker.last_turn_reread, 2400)
         self.assertEqual(worker.last_turn_subagent_reread, 2400)
-        # … la rotation, non : 50 jetons relus par le fil principal
-        # (l'appel 4, s'il est émis avant l'arrêt, compte aussi : 60 jetons)
+        # … la rotation, non : le contexte du dernier appel du fil principal
+        # (50 ; l'appel 4, s'il est émis avant l'arrêt, donne 10) reste sous
+        # le plafond de 1 000, quelle que soit la somme des relectures.
         self.assertIn(worker.last_turn_context_reread(), ((50, "claude-sess-1"),
-                                                          (60, "claude-sess-1")))
+                                                          (10, "claude-sess-1")))
         self.assertIsNone(worker.rotation_forcee)
         self.assertFalse(worker.context_rotation_due())
 
     def test_un_appel_principal_lu_apres_la_cloture_compte(self):
         """L217b (relecture codex) : clos par sa durée à 50 jetons, le tour lit
         encore un appel principal de 1 200 jetons, émis avant l'arrêt ; le
-        grand livre le compte, la rotation aussi (plafond 1 000)."""
+        grand livre le compte, la rotation aussi (plafond 1 000), sur le
+        contexte de ce dernier appel."""
         worker = self._worker("audit-tampon")
         storage.of(self.db).operations.set_settings("audit-tampon", {"turn_max_seconds": "1"})
         worker.agent = registry.get(self.db, "audit-tampon")
@@ -143,18 +146,31 @@ class PlafondDuFilPrincipalTest(PgTestCase):
         self.assertIn('"id": "msg-tampon"', self._flux(worker))
         # 50 + 1 200, et l'appel 2 (10) s'il est émis avant l'arrêt
         self.assertIn(worker.last_turn_main_reread, (1250, 1260))
+        # le plafond, lui, lit le contexte du dernier appel principal (1 200),
+        # pas la somme des relectures du tour
         self.assertEqual(worker.last_turn_context_reread(),
-                         (worker.last_turn_main_reread, "claude-sess-1"))
+                         (1200, "claude-sess-1"))
         self.assertGreaterEqual(worker.last_turn_reread, 1250)     # le grand livre aussi
         self.assertTrue(worker.context_rotation_due())
 
-    def test_rotation_due_quand_le_fil_principal_depasse(self):
+    def test_rotation_due_quand_un_appel_depasse(self):
         worker = self._worker("audit-rot2")
         self.assertTrue(self._tour(worker, [{"reread": 600, "tool": True},
-                                            {"reread": 600}]))
+                                            {"reread": 1200}]))
         self.assertIsNone(worker.last_turn_closed)  # aucun point sûr après le plafond
         self.assertEqual(worker.last_turn_context_reread(), (1200, "claude-sess-1"))
         self.assertTrue(worker.context_rotation_due())
+
+    def test_la_somme_des_appels_ne_tourne_pas(self):
+        """#2336 : 1 200 jetons relus en deux appels de 600 dans une session de
+        600 jetons ne dépassent pas un plafond de 1 000 — la somme du tour
+        n'est pas une taille de contexte."""
+        worker = self._worker("audit-somme")
+        self.assertTrue(self._tour(worker, [{"reread": 600, "tool": True},
+                                            {"reread": 600}]))
+        self.assertIsNone(worker.last_turn_closed)
+        self.assertEqual(worker.last_turn_context_reread(), (600, "claude-sess-1"))
+        self.assertFalse(worker.context_rotation_due())
 
 
 if __name__ == "__main__":

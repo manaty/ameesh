@@ -38,6 +38,10 @@ _ITEM_COLUMNS = ", ".join([
     "w.estimate_minutes", "w.estimate_source", "w.estimate_by",
     "extract(epoch from w.estimate_at)::float8 AS estimate_ts",
     "extract(epoch from w.started_at)::float8 AS started_ts",
+    # #2204/N5 : la frise porte les relecteurs comme progress/list (lot_state
+    # ne doit pas diverger entre les deux lectures).
+    "coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer",
+    "to_jsonb(w)->'reviewers' AS reviewers",
 ])
 
 _COMMITMENT_COLUMNS = ", ".join([
