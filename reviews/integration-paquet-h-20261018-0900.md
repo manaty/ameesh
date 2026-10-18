@@ -42,6 +42,10 @@ Chaque commit de composition a le lot en second parent, son sujet nomme le lot e
 
 - #1359 : les deux lignes de `docs/EXECUTEUR-MEDIEE.md` ajoutées par sa remise (compteurs 387 refusées / 452 opérations) sont réécrites par l'union de l'unité 11 (389 / 454) ; lot bien composé, non retiré.
 
+## Correctif de relecture du paquet
+
+- **ameesh-cx1**, verdict `blocked` sur #2402 (18/10 08:12Z, B1) : la clôture `work.close --done` d'une relecture après fusion contournait `guard_delivery` — un seul `ok` sur un autre sha, ou un `blocked` courant, fermait la mission en `done`. Correctif : la garde s'applique aussi à `done` (`src/ameesh/work.py`) ; la preuve du lecteur (`_parent_verdict`) reste due. Couverture : `tests/test_1104_review_lot_hors_file.py` (avis unique, verdict sur un sha étranger, blocage courant, relecture légère, mission manuelle bloquée inchangée). Tests : 48×2 sur ce fichier, 57×2 sur `test_1280_work_close_done` + `test_l539_review_lot` + `test_2377_revue_famille`.
+
 ## Preuves
 
 - `git diff --stat 8f413a8d259f..HEAD` : **76 fichiers, +6442/−378**, dont `src/ameesh/review_lot.py`, `src/ameesh/fire.py`, `src/ameesh/merge_queue.py`, `src/ameesh/radar.py`, `src/ameesh/wip.py`, `src/ameesh/accounts.py`, `scripts/paquet-compose.py`, `deploy/` le cas échéant.

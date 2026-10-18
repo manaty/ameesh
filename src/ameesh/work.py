@@ -2199,9 +2199,14 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
                             "nothing to close done" % (item_id, state))
     elif state in MERGED_STATES:
         raise WorkError("lot %s already %s: nothing to close" % (item_id, state))
-    if delivered:
+    if delivered or done:
         # #2374 : la clôture d'une relecture après fusion n'est pas un simple
         # constat — les avis dus sur la fusion sont comptés avant d'écrire.
+        # La garde vaut aussi pour `done` : le corps de la mission recommande
+        # `close --done`, et un avis unique, périmé ou bloqué ne prouve pas une
+        # relecture livrée (relecture ameesh-cx1 #2402 B1, 18/10 08:12Z).
+        # Hors `review-after-merge:#N`, `guard_delivery` ne rend rien : les
+        # missions manuelles `R1`/`R2` gardent la preuve `_parent_verdict`.
         from . import review_lot
         review_lot.guard_delivery(db, item)
     if abandoned:

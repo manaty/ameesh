@@ -909,6 +909,71 @@ class CloseGuardWitnessTest(_Witness):
         row = work.close(self.db, out["id"], delivered=True, sha=sha, actor="codex1")
         self.assertEqual(row["state"], "closed")
 
+    def test_done_avec_un_seul_avis_ne_clot_pas_une_relecture_critique(self):
+        """Relecture cx1 #2402 B1 : le corps recommande `close --done` ; cette
+        clôture applique la même garde que `--delivered`."""
+        sha = "7" * 40
+        lot, review = self.critical_review(sha)
+        work.assign(self.db, review, "codex1", actor="orch")
+        self.verdict(lot, sha, "codex1")
+        with self.assertRaisesRegex(work.WorkError, "2 avis"):
+            work.close(self.db, review, done=True, actor="codex1")
+        self.verdict(lot, sha, "claude2")
+        row = work.close(self.db, review, done=True, actor="claude2")
+        self.assertEqual(row["state"], "closed")
+
+    def test_done_ignore_un_verdict_rendu_sur_un_autre_sha(self):
+        sha = "6" * 40
+        lot, review = self.critical_review(sha)
+        work.assign(self.db, review, "codex1", actor="orch")
+        self.verdict(lot, "bad0000", "codex1")
+        self.verdict(lot, "bad0000", "claude2")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review, done=True, actor="codex1")
+        self.verdict(lot, sha, "codex1")
+        self.verdict(lot, sha, "claude2")
+        row = work.close(self.db, review, done=True, actor="claude2")
+        self.assertEqual(row["state"], "closed")
+
+    def test_done_refuse_un_blocage_courant(self):
+        sha = "5" * 40
+        lot, review = self.critical_review(sha)
+        work.assign(self.db, review, "codex1", actor="orch")
+        work.milestone(self.db, lot, "verdict", sha=sha, actor="codex1",
+                       verdict="blocked")
+        self.verdict(lot, sha, "claude2")
+        with self.assertRaisesRegex(work.WorkError, "bloquant"):
+            work.close(self.db, review, done=True, actor="claude2")
+        self.verdict(lot, sha, "codex1")
+        row = work.close(self.db, review, done=True, actor="codex1")
+        self.assertEqual(row["state"], "closed")
+
+    def test_done_d_une_relecture_legere_exige_l_avis_au_sha(self):
+        sha = "4" * 40
+        lot = self.merged_lot("docs done", sha=sha)
+        out = review_lot.open_after_merge(
+            self.db, lot=lot, klass={"class": "light", "why": "policy"},
+            merged_sha=sha)
+        work.assign(self.db, out["id"], "codex1", actor="orch")
+        self.verdict(lot, "bad0000", "codex1")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, out["id"], done=True, actor="codex1")
+        self.verdict(lot, sha, "codex1")
+        row = work.close(self.db, out["id"], done=True, actor="codex1")
+        self.assertEqual(row["state"], "closed")
+
+    def test_done_d_une_mission_manuelle_accepte_un_blocked(self):
+        """Hors `review-after-merge:#N`, un verdict bloqué reste une relecture
+        livrée : la garde structurée ne s'applique pas."""
+        parent = self.merged_lot("parent manuel", sha="3" * 40)
+        review = work.add(self.db, title="R1 Codex #%d : avis" % int(parent),
+                          source="mail", issue_ref="manaty/ameesh#941",
+                          app="ameesh", assignee="codex1")["id"]
+        work.milestone(self.db, parent, "verdict", verdict="blocked",
+                       sha="3" * 40, actor="codex1")
+        row = work.close(self.db, review, done=True, actor="codex1")
+        self.assertEqual(row["state"], "closed")
+
     def test_un_lot_ordinaire_se_clot_sans_avis(self):
         lot = self.lot("rapport ordinaire")
         row = work.close(self.db, lot, delivered=True, sha="e" * 40, actor="claude1")
