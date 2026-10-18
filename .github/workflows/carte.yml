@@ -125,7 +125,8 @@ jobs:
           [ -f "$CARTE" ] || CARTE=""
           python3 scripts/test-parts.py plan --out plan/plan.json \
             --parts "$PARTS_MESURE" --list-psql tests/parts/pilote-psql.txt \
-            ${CARTE:+--map "$CARTE"} --summary "$GITHUB_STEP_SUMMARY"
+            ${CARTE:+--map "$CARTE"} --summary "$GITHUB_STEP_SUMMARY" \
+            --plafond-min 60
           # la fusion réutilise la carte qui a servi au plan (historique des
           # échecs) : le plan et la carte publiée décrivent le même run.
           if [ -f "$CARTE" ]; then cp "$CARTE" plan/carte-source.json.gz; fi
@@ -140,9 +141,14 @@ jobs:
     needs: plan-mesure
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # 16/10 — arbitrage pilote sur le run 38845518821 (main fae0df2b3) :
-    # plafond 40 min conservé, répartition resserrée à 6 parts psycopg et
-    # 4 parts psql (psycopg 2/4, 3/4 et psql 1/2, 2/2 annulées à 40m30).
-    timeout-minutes: 40
+    # répartition resserrée à 6 parts psycopg et 4 parts psql (psycopg 2/4,
+    # 3/4 et psql 1/2, 2/2 annulées à 40m30).
+    # #2224 — run 39015105210 (main eadc7bdc) : psycopg 3/6 annulée à 40m46
+    # en progression, 9/10 parts vertes et aucune carte publiée ; estimée
+    # 1 588,7 s, 2 316 s de tests réels (test_503_agent_host ×2,4 sous charge).
+    # Plafond porté à 60 min, la borne de #755 ; le plan signale une part
+    # dont l'estimation × 1,5 dépasse ce plafond (`--plafond-min`, même valeur).
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -244,7 +250,7 @@ jobs:
     # #2175 : l'assemblage d'une carte complète (10 parts) coûte ~11 min à 100 % CPU
     # localement ; à 15 min il a été annulé à 15m20 au run 38985327391 alors que les
     # 10 parts étaient vertes, sans publier de carte. Plafond porté à 30 min,
-    # sous la borne de 60 de #755 ; matrice 6/4 et plafond 40 min des mesures inchangés.
+    # sous la borne de 60 de #755 ; matrice 6/4 inchangée (plafond des mesures : #2224).
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

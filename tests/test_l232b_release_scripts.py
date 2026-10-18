@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,7 +48,9 @@ class MigrationPinningTest(unittest.TestCase):
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         (bin_dir / "python3").symlink_to(sys.executable)
-        (bin_dir / "pg_dump").write_text('#!/bin/sh\nwhile [ "$1" != --file ]; do shift; done\nprintf archive > "$2"\n')
+        (bin_dir / "pg_dump").write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "${PG_DUMP_CALLS:?}"\n'
+            'while [ "$1" != --file ]; do shift; done\nprintf archive > "$2"\n')
         (bin_dir / "pg_dump").chmod(0o755)
         (bin_dir / "pg_restore").write_text("#!/bin/sh\nexit 0\n")
         (bin_dir / "pg_restore").chmod(0o755)
@@ -57,16 +60,30 @@ class MigrationPinningTest(unittest.TestCase):
         (bin_dir / "ssh").chmod(0o755)
         (bin_dir / "systemctl").write_text(
             '#!/bin/sh\ncase "$1" in\n'
-            'start) exit "${BACKUP_START_STATUS:-0}" ;;\n'
+            'start) [ "${BACKUP_START_STATUS:-0}" = 0 ] || exit "${BACKUP_START_STATUS}";\n'
+            '  d=${SAUVEGARDES_VM:?}; mkdir -p "$d";\n'
+            '  n=$(find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" | wc -l);\n'
+            '  printf "server dump %s\\n" "$n" > "$d/ameesh-simulation-20261017-1500$(printf "%02d" "$n").dump";\n'
+            '  exit 0 ;;\n'
             'show) case "$4" in\n'
             'Result) echo "${BACKUP_RESULT:-success}" ;;\n'
             'ExecMainStatus) echo "${BACKUP_EXIT_STATUS:-0}" ;;\n'
             '*) exit 97 ;; esac ;;\n'
             '*) exit 98 ;; esac\n')
         (bin_dir / "systemctl").chmod(0o755)
-        (bin_dir / "ls").write_text("#!/bin/sh\nexit 0\n")
-        (bin_dir / "ls").chmod(0o755)
+        (bin_dir / "sha256sum").write_text(
+            '#!/bin/sh\n'
+            'if [ "${FAKE_SHA256_BAD:-0}" = 1 ]; then\n'
+            '  printf "%064d  %s\\n" 0 "${2:-}"\n'
+            '  exit 0\n'
+            'fi\n'
+            'exec /usr/bin/sha256sum "$@"\n')
+        (bin_dir / "sha256sum").chmod(0o755)
         self.env["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
+        self.remote_dumps = self.root / "remote-dumps"
+        self.remote_dumps.mkdir()
+        self.env["SAUVEGARDES_VM"] = str(self.remote_dumps)
+        self.env["PG_DUMP_CALLS"] = str(self.root / "pg_dump-calls")
         self.git("init", "-q")
         self.script = self.repo / "deploy/mise-a-jour/poste.sh"
         self.script.parent.mkdir(parents=True)
@@ -85,7 +102,14 @@ class MigrationPinningTest(unittest.TestCase):
         self.share = Path(self.env["HOME"]) / ".local/share/ameesh"
         venv = self.share / "venv/bin"
         venv.mkdir(parents=True)
-        (venv / "python").write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        # The probe is run by the installed interpreter, outside PYTHONPATH.
+        # Fake that installed entry here; the real probe has PostgreSQL tests.
+        (venv / "python").write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = -I ] && [ "${2##*/}" = auto-take-probe.py ]; then\n'
+            "  printf '%s\\n' '{\"release\":\"installed\",\"args\":[\"auto-take-probe\"]}' >> \"$RELEASE_CALLS\"\n"
+            '  exit "${AUTO_TAKE_PROBE_STATUS:-0}"\n'
+            'fi\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
         (venv / "python").chmod(0o755)
         config = Path(self.env["HOME"]) / ".config/ameesh/config.json"
         config.parent.mkdir(parents=True)
@@ -116,10 +140,16 @@ class MigrationPinningTest(unittest.TestCase):
         done = self.run_script("migrer", self.a)
         self.assertEqual(done.returncode, 0, done.stderr)
         calls = self.calls()
-        self.assertEqual([call["release"] for call in calls], ["A", "A", "A"])
+        self.assertEqual([call["release"] for call in calls], ["A", "A", "A", "installed"])
         self.assertEqual(calls[0]["args"], ["migrate", "--dry-run", "--additive-only"])
         self.assertEqual(calls[1]["args"], ["migrate", "--additive-only"])
         self.assertEqual(calls[2]["args"], ["doctor", "--probe"])
+
+    def test_incompatible_installed_auto_take_stops_migration_step(self):
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("ancien code incompatible", done.stderr)
+        self.assertEqual(self.calls()[-1]["release"], "installed")
 
     def test_missing_ref_takes_clone_head(self):
         # #1245 : sans REF, « migrer » migre le HEAD du dépôt de déploiement,
@@ -127,7 +157,7 @@ class MigrationPinningTest(unittest.TestCase):
         done = self.run_script("migrer")
         self.assertEqual(done.returncode, 0, done.stderr)
         calls = self.calls()
-        self.assertEqual([call["release"] for call in calls], ["B", "B", "B"])
+        self.assertEqual([call["release"] for call in calls], ["B", "B", "B", "installed"])
         self.assertEqual(calls[0]["args"], ["migrate", "--dry-run", "--additive-only"])
         self.assertEqual(calls[1]["args"], ["migrate", "--additive-only"])
 
@@ -161,3 +191,28 @@ class MigrationPinningTest(unittest.TestCase):
     def test_successful_oneshot_does_not_require_active_state(self):
         done = self.run_script("sauvegarder")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    @unittest.skipUnless(HAVE_PSYCOPG,
+                         "psycopg absent (part psql) : sauvegarder-prive.py non exécutable")
+    def test_mesh_dump_is_pulled_from_the_server_not_dumped_from_the_poste(self):
+        done = self.run_script("sauvegarder")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        calls = self.root / "pg_dump-calls"
+        self.assertFalse(calls.exists() and calls.read_text().strip(),
+                         "pg_dump ran on the poste for the mesh database")
+        dumps = list((Path(self.env["HOME"]) / "backups/ameesh").glob(
+            "mesh-*-avant-l60-l74.dump"))
+        self.assertEqual(len(dumps), 1, dumps)
+        self.assertEqual(dumps[0].read_bytes(), b"server dump 0\n")
+        self.assertEqual(stat.S_IMODE(dumps[0].stat().st_mode), 0o600)
+
+    @unittest.skipUnless(HAVE_PSYCOPG,
+                         "psycopg absent (part psql) : sauvegarder-prive.py non exécutable")
+    def test_corrupt_retrieval_never_publishes_and_logs_bytes(self):
+        done = self.run_script("sauvegarder", FAKE_SHA256_BAD="1")
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("digest mismatch", done.stderr)
+        self.assertIn("bytes written", done.stderr)
+        self.assertIn("rapatriement en échec", done.stderr)
+        self.assertFalse(list((Path(self.env["HOME"]) / "backups/ameesh").glob(
+            "mesh-*-avant-l60-l74.dump")))

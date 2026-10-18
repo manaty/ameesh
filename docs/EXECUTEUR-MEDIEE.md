@@ -16,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 65 opérations et la liste des 377 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 65 opérations et la liste des 380 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -64,7 +64,7 @@ Comptes : 65 opérations, dont 25 lectures et 40 écritures. 55 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
 sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (442
+signature et les mêmes types. Il vérifie aussi que l'interface entière (445
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -257,8 +257,9 @@ table : aucun écart n'est toléré d'un côté seulement.
   `fil.member`) ; le nom nu reste admis.
 - **`HostInfo.limits`** (`GET /host`) : `{"max_agents": int|null,
   "resources": {"min_mem_available", "max_swap_used", "max_load",
-  "min_disk_free"}}`, tiré du canon (`resources.host_limits`). Un seuil
-  absent prend son défaut prudent côté exécuteur.
+  "min_disk_free", "max_mem_pressure"}}`, tiré du canon
+  (`resources.host_limits`). Un seuil absent prend son défaut prudent côté
+  exécuteur (`max_mem_pressure` : 10 %, #2296).
 - **Porte.** `GateAck.from_json` lève `ValueError` pour tout corps faux.
   Un état illisible vaut `stopped` pour un hôte médié. `max_concurrent`
   vaut 1 par défaut.

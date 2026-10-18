@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
+from ameesh import (lot_class, mail, merge_queue, packet_guard, plan_git, plan_github, radar,
                     resolutions, storage, work)
 
 from .support import PgTestCase
@@ -84,9 +84,10 @@ class FakeQueue(FakeWork):
     def note(self, item_id, state, text, actor):
         self.notes.append((item_id, text, actor))
 
-    def events_noted(self, prefix, since_ts):
+    def events_noted(self, prefix, since_ts, *, ids=None):
         return [{"work_item_id": i, "note": n, "actor": a, "created_ts": self.clock, "assignee": self.lots[i].get("assignee")}
-                for i, n, a in self.notes if n.startswith(prefix)]
+                for i, n, a in self.notes if n.startswith(prefix)
+                and (ids is None or i in ids)]
 
     def queue_remove(self, item_id, *, note, actor):
         self.notes.append((item_id, note, actor))
@@ -116,14 +117,21 @@ class _Base(unittest.TestCase):
         self.fake = FakeQueue(lots)
         self.marks: dict = {}
         store = mock.Mock(work=self.fake)
-        for patch in (mock.patch.object(storage, "of", return_value=store),
-                      mock.patch.object(work, "get",
-                                        side_effect=lambda db, n: self.fake.lots.get(n)),
-                      mock.patch.object(work, "milestones",
-                                        side_effect=lambda db, n, *a: self.marks.get(n, [])),
-                      mock.patch.object(merge_queue, "actor_family",
-                                        side_effect=lambda db, n: self.FAMILIES.get(
-                                            str(n or "").strip(), ""))):
+        patches = [mock.patch.object(storage, "of", return_value=store),
+                   mock.patch.object(work, "get",
+                                     side_effect=lambda db, n: self.fake.lots.get(n)),
+                   mock.patch.object(work, "milestones",
+                                     side_effect=lambda db, n, *a: self.marks.get(n, [])),
+                   mock.patch.object(merge_queue, "actor_family",
+                                     side_effect=lambda db, n: self.FAMILIES.get(
+                                         str(n or "").strip(), ""))]
+        if getattr(self, "PACKET_GUARD", True):
+            # #2333 : ces bancs sans base simulent la mécanique de file ; la
+            # garde du paquet y est simulée (les témoins de la garde elle-même
+            # sont dans PacketAdmissionTest et test_1374_fire).
+            patches.append(mock.patch.object(packet_guard, "check_merge",
+                                             return_value={"allowed": True}))
+        for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -188,6 +196,70 @@ class EntryTest(_Base):
         with self.assertRaisesRegex(merge_queue.QueueError, "no CI reader"):
             self.enter(2, ci=None)
         self.assertEqual(set(self.fake.queue_rows), {1})
+
+    def test_a_pilot_waiver_lifts_the_verdict_gate(self):
+        """#2281 : `work reviewer --no-verdict` (#1979) marque la dispense de
+        re-verdict sur la tête gelée (`reviewer = -none`) ; `queue add` la
+        respecte au lieu de redemander les avis de la classe. N1 : l'auteur du
+        geste se lit au journal du lot (`events_noted`), pas dans la ligne du
+        lot (`work.get` ne rend pas les événements)."""
+        tip = self.tip(1)
+        self.fake.lots[1]["reviewer"] = work.REVIEWER_NONE
+        self.assertFalse(self.fake.lots[1].get("events"),
+                         "le lot réel ne porte pas le journal : le témoin doit lire la table")
+        self.fake.note(1, "qa", "verdict not required: no re-verdict due (#1979)",
+                       "pilote-x")
+        self.marks[1] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        row = self.enter(1)
+        self.assertEqual(row["state"], "queued")
+        self.assertTrue(row["waived"])
+        self.assertIn("verdict waived by pilote-x", self.fake.notes[-1][1])
+
+    def test_a_stale_waiver_does_not_cover_a_new_freeze(self):
+        """#2281/B1 : la ligne lue avant les jalons peut encore porter la
+        dispense d'une tête A alors qu'un gel B l'a périmée en base
+        (`_lapse_waiver`). La porte relit la marque après les jalons : B sans
+        avis n'entre pas, même si l'appelant lui a passé A en main."""
+        tip = self.tip(1)
+        fresh = self.fake.lots[1]
+        fresh["reviewer"] = ""
+        fresh["reviewers"] = []
+        stale = dict(fresh, reviewer=work.REVIEWER_NONE,
+                     reviewers=[work.REVIEWER_NONE])
+        self.marks[1] = [{"id": 2, "kind": "frozen", "sha": tip, "at_ts": 2.0}]
+        reads = {"n": 0}
+
+        def read(db, n):
+            reads["n"] += 1
+            return stale if reads["n"] == 1 else fresh
+
+        with mock.patch.object(work, "get", side_effect=read):
+            with self.assertRaisesRegex(merge_queue.QueueError,
+                                        "no review verdict ok on the freeze"):
+                self.enter(1)
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_pilot_waiver_never_lifts_a_blocked_verdict(self):
+        """#2281 : la dispense ne survit pas à une correction due — un verdict
+        bloquant courant refuse la file, comme il refuse la dispense (#1979)."""
+        tip = self.tip(1)
+        self.fake.lots[1]["reviewer"] = work.REVIEWER_NONE
+        self.marks[1] = [{"id": 2, "kind": "verdict", "verdict": "blocked", "sha": tip,
+                          "at_ts": 2.0, "actor": "rev1"},
+                         {"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        with self.assertRaisesRegex(merge_queue.QueueError, "blocked verdict"):
+            self.enter(1)
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_waived_lot_still_refuses_a_draft_pr(self):
+        """#2281 : sans avis, la qualité de la PR reste une porte — une PR en
+        brouillon ne s'atterrit pas, même sous dispense."""
+        tip = self.tip(1)
+        self.fake.lots[1]["reviewer"] = work.REVIEWER_NONE
+        self.marks[1] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        with self.assertRaisesRegex(merge_queue.QueueError, "PR #7 is a draft"):
+            self.enter(1, ci=self.green(1, draft=True))
+        self.assertEqual(self.fake.queue_rows, {})
 
     def test_required_commit_ci_certifies_a_landing_without_a_pr(self):
         """Revue #544 r2 : sans PR (lecteur muet ou `None`), un projet
@@ -320,6 +392,31 @@ class EntryTest(_Base):
         self.fake.lots[1]["state"] = "merged"
         with self.assertRaisesRegex(merge_queue.QueueError, "nothing to merge"):
             self.enter(1)
+
+
+class PacketAdmissionTest(_Base):
+    """#2333/canon §11 bis : la file refuse une tête de lot hors paquet, et
+    accepte le paquet (`integration/**`). La garde réelle est laissée active
+    (pas de simulation) ; la base est absente, donc aucune exception ne peut
+    être relue ici : les exceptions sont éprouvées sur Postgres dans
+    test_1374_fire (land._fire_guard) et test_l161g_ci_gel (ci run)."""
+
+    PACKET_GUARD = False
+
+    def test_queue_add_refuses_a_lot_head_outside_the_packet(self):
+        self.ready(1)
+        with self.assertRaisesRegex(merge_queue.QueueError, "§11 bis"):
+            self.enter(1)
+        self.assertEqual(self.fake.queue_rows, {}, "aucune ligne de file écrite")
+
+    def test_queue_add_accepts_an_integration_packet(self):
+        sha = self.tip(1)
+        _git(self.repo, "branch", "integration/paquet-2333", sha)
+        self.fake.lots[1]["branch"] = "integration/paquet-2333"
+        self.ready(1)
+        self.enter(1)
+        self.assertEqual(self.fake.queue_rows[1]["frozen_sha"], sha)
+        self.assertEqual(self.fake.queue_rows[1]["target"], "main")
 
 
 class LightClassTest(_Base):
@@ -998,6 +1095,11 @@ class QueueWithoutRadarTest(PgTestCase):
         work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")
+        # #2333 : `queue add` refuse une tête de lot hors paquet ; ce banc
+        # éprouve le clone jetable et la tête fraîche, pas la garde : une
+        # exception déclarée sur cette tête exacte autorise l'admission.
+        packet_guard.declare(self.db, lot, "incident", "test: queue mechanics", fresh,
+                             actor="pilot")
         status = {"number": 7, "green": True, "head": fresh, "draft": False}
         made: list = []
         real = tempfile.mkdtemp

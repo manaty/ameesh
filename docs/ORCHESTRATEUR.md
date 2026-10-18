@@ -70,7 +70,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   désigne les orchestrateurs prévenus et sert au personnel et aux alertes. Un
   lot sans équipe connue attend l'orchestrateur.
 * Ordre : priorité, puis dates prévues (début, fin, livraison), puis
-  ancienneté. Un orchestrateur ne se sert pas lui-même.
+  ancienneté. Un orchestrateur ne se sert pas lui-même. Lors d'un appel
+  central (`agents` absent), ses candidats passent en dernier et, s'il prend
+  un lot faute d'autre preneur, la note d'attribution porte la trace du repli
+  (#1739) ; en prise locale (#804, `agents` fourni, même vide), aucun repli :
+  son orchestrateur reste exclu (L804).
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
@@ -400,8 +404,14 @@ La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
 Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
 de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
 Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
-pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
-n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+pas. Depuis #1400, la branche enregistrée du lot est reconnue dans un vrai
+commit de fusion (forme GitHub `Merge pull request #N from
+<propriétaire>/<branche>` comprise ; le propriétaire doit être celui du
+dépôt canonique, la branche homonyme d'un fork ne prouve rien), et le
+constat — lot, projet, titre et sujet du commit — est affiché avant toute
+écriture ; aucun `--force`. Un refus affiche le projet et le titre du lot ;
+aucun état ni jalon n'est écrit. Le SHA abrégé accepté est conservé sous sa
+forme complète.
 Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
 dossier courant. La lecture reste locale : récupérer la cible au préalable
 si nécessaire. Un commit sans rattachement ne ferme pas le lot.
@@ -480,6 +490,9 @@ la remise du lot diffère du gel enregistré (#2157). `scripts/paquet-compose.py
 compose l'unité et écrit ce message, y compris sur conflit (`.git/MERGE_MSG`
 prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé n'est
 réécrit pour ce seul métadonné.
+Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
+ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
+un `#N` seul n'y déclare aucune unité (#2335).
 
 ## Le lot en cours
 
@@ -692,9 +705,9 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI and no CI per lot between cuts, sober proofs
-   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
-   reviewed commit.
+   hourly packages, review before CI and no CI per lot between packages, sober
+   proofs (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only
+   through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
    exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
    Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance

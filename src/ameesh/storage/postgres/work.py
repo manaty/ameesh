@@ -10,6 +10,7 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import random
@@ -23,7 +24,6 @@ from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENC
 from .work_dependencies import current_verdict as _current_verdict
 from .work_dependencies import last_freeze_sha as _last_freeze_sha
 from .work_dependencies import not_blocking as _not_blocking
-from .work_dependencies import reviewed_head as _reviewed_head
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -91,7 +91,56 @@ def item_columns(db, ref: str | None = None) -> str:
         reviewer = "reviewer"
     else:
         reviewer = "''::text AS reviewer"
-    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer)
+    # to_jsonb keeps reads compatible with schemas predating 0456, without
+    # another catalogue round trip (including bounded progress/list reads).
+    reviewers = "to_jsonb(%s)->'reviewers' AS reviewers" % (ref or "work_items")
+    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer + ", " + reviewers)
+
+
+def has_reviewers(db) -> bool:
+    if getattr(db, "_has_reviewers", False):
+        return True
+    found = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        " AND column_name = 'reviewers'"))
+    if found:
+        try:
+            db._has_reviewers = True
+        except Exception:
+            pass
+    return found
+
+#: #2346 : le réglage lu par le trigger d'audit des relecteurs (migration 0462)
+_AUDIT_SETTING = "ameesh.reviewer_audit"
+
+
+@contextlib.contextmanager
+def python_reviewer_audit(db):
+    """#2346 : le drapeau qui tait le trigger d'audit ne couvre QUE l'UPDATE
+    dont le code Python journalise lui-même le retrait.
+
+    `SET LOCAL` vaut pour toute la transaction : un retrait SQL direct, plus
+    loin dans la même transaction (même après un `work.assign` imbriqué dans
+    la transaction d'un appelant), perdait sa ligne `db:reviewers_sync`. Le
+    drapeau est posé juste avant l'UPDATE et la valeur précédente rendue juste
+    après — sauvegarde/restauration, pas un effacement : un appel imbriqué
+    garde l'état de son appelant. Sans la migration 0456, rien à faire."""
+    if not has_reviewers(db):
+        yield
+        return
+    previous = db.query(
+        "SELECT current_setting(%s, true) AS value", (_AUDIT_SETTING,))
+    previous = (previous[0].get("value") if previous else None) or ""
+    db.execute("SELECT set_config(%s, 'python', true)", (_AUDIT_SETTING,))
+    try:
+        yield
+    finally:
+        try:
+            db.execute("SELECT set_config(%s, %s, true)",
+                       (_AUDIT_SETTING, previous))
+        except Exception:  # noqa: BLE001 - transaction déjà en échec, rien à rendre
+            pass
 
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
@@ -406,6 +455,131 @@ class WorkItems(interface.WorkItems):
         params.append(None if limit is None else int(limit))
         return self.db.query(sql, tuple(params))
 
+    def items_missing_ref(self, *, states, ref_prefix, limit,
+                          attempt_prefix="", retry_s=0, terminal_prefix="",
+                          max_attempts=0, since=None) -> list[dict]:
+        """L539 (#1104) : les lots dont `ref_prefix + id` n'existe pas encore.
+
+        L'anti-jointure est faite **avant** la borne : `limit` borne les
+        manquants rendus, pas un balayage de lots déjà pourvus (R2 #1104
+        P2-2 : vingt pourvus plus récents ne cachent plus un manquant ancien).
+        Les états forment un seul ensemble ordonné ; `id` départage deux
+        `updated_at` égaux, sans quoi la sélection ne serait pas stable.
+
+        `attempt_prefix`/`retry_s` (binôme mesh-design, 14/10) : une tentative
+        de rattrapage sans création journalise `attempt_prefix<id>` (voir
+        `log_review_attempt`) ; un lot dont la tentative est plus récente que
+        `retry_s` est exclu **avant** la borne, sinon les mêmes candidats
+        confirmés (non-light, doutes, erreurs) consommeraient chaque passage et
+        affameraient les plus anciens. Le délai passé, la tentative redevient
+        sélectionnable : le marqueur est un délai, pas une suppression.
+
+        `since` (arbitrage pilote du 15/10) : ne rend que les lots dont le
+        jalon `merged` est à `since` ou après — la borne d'activation, jamais
+        l'historique. `terminal_prefix`/`max_attempts` : une marque terminale
+        exclut toujours, et un candidat qui a déjà `max_attempts` tentatives
+        n'est plus sélectionné (traitement borné, jamais perpétuel).
+
+        Le filtre lui-même (`_missing_ref_gates`) est partagé avec
+        `missing_ref_eligible`, pour qu'un lot donné reçoive la même vérité que
+        le balayage (B1 de la R1 #1104)."""
+        wanted = [str(s) for s in (states or ())]
+        if not wanted:
+            return []
+        params: list = list(wanted)
+        sql = (
+            "SELECT __COLUMNS__ FROM work_items w"
+            " WHERE w.state IN (__STATES__)"
+            + self._missing_ref_gates(
+                params, ref_prefix=ref_prefix, attempt_prefix=attempt_prefix,
+                retry_s=retry_s, terminal_prefix=terminal_prefix,
+                max_attempts=max_attempts, since=since)
+            + " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
+        )
+        params.append(int(limit))
+        return self.db.query(
+            sql.replace("__COLUMNS__", item_columns(self.db, "w")).replace(
+                "__STATES__", ", ".join(["%s"] * len(wanted))),
+            tuple(params))
+
+    @staticmethod
+    def _missing_ref_gates(params: list, *, ref_prefix, attempt_prefix="",
+                           retry_s=0, terminal_prefix="", max_attempts=0,
+                           since=None) -> str:
+        """L539 (#1104) : les conditions « relecture encore due » d'un lot.
+
+        Rendues en SQL pour être ajoutées après `WHERE …, ` et complète
+        `params` dans l'ordre du texte produit — le même filtre sert au
+        balayage borné (`items_missing_ref`) et à un lot donné
+        (`missing_ref_eligible`)."""
+        sql = (
+            "   AND NOT EXISTS (SELECT 1 FROM work_items r"
+            "                    WHERE r.issue_ref = %s || w.id::text)"
+        )
+        params.append(str(ref_prefix))
+        if since is not None:
+            sql += (
+                "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
+                "                WHERE m.work_item_id = w.id AND m.kind = 'merged'"
+                "                  AND m.at >= %s)"
+            )
+            params.append(since)
+        if terminal_prefix:
+            sql += (
+                "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                "                    WHERE e.work_item_id = w.id"
+                "                      AND split_part(e.note, ' ', 1) = %s || w.id::text)"
+            )
+            params.append(str(terminal_prefix))
+        if attempt_prefix:
+            if int(max_attempts) > 0:
+                sql += (
+                    "   AND (SELECT count(*) FROM work_item_events e"
+                    "         WHERE e.work_item_id = w.id"
+                    "           AND split_part(e.note, ' ', 1) = %s || w.id::text) < %s"
+                )
+                params += [str(attempt_prefix), int(max_attempts)]
+            if float(retry_s) > 0:
+                sql += (
+                    "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                    "                    WHERE e.work_item_id = w.id"
+                    "                      AND split_part(e.note, ' ', 1) = %s || w.id::text"
+                    "                      AND e.created_at > now() - make_interval(secs => %s))"
+                )
+                params += [str(attempt_prefix), float(retry_s)]
+        return sql
+
+    def missing_ref_eligible(self, item_id, *, ref_prefix, attempt_prefix="",
+                             retry_s=0, terminal_prefix="", max_attempts=0,
+                             since=None) -> bool:
+        """L539 (#1104, B1 de la R1) : le lot `item_id` passerait-il la
+        sélection de `items_missing_ref` ?
+
+        Même filtre, une seule ligne : le chemin `already` de `close_merged`
+        ne relance l'ouverture que pour un lot que le rattrapage borné
+        sélectionnerait encore — jamais pour l'historique d'avant l'activation
+        (migration 0438) ni pour un lot terminal, que `sync-github` rappelle
+        pourtant à chaque passage."""
+        params: list = []
+        sql = ("SELECT 1 FROM work_items w WHERE w.id = %s"
+               + self._missing_ref_gates(
+                   params, ref_prefix=ref_prefix, attempt_prefix=attempt_prefix,
+                   retry_s=retry_s, terminal_prefix=terminal_prefix,
+                   max_attempts=max_attempts, since=since)
+               + " LIMIT 1")
+        return bool(self.db.query(sql, (int(item_id),) + tuple(params)))
+
+    def review_catch_up_bound(self):
+        """L539 (#1104) : la borne d'activation (ligne unique de la migration
+        0438), ou None si elle manque — le rattrapage reste alors fermé. Rend
+        une chaîne ISO-8601, identique pour les deux pilotes (`psql` rend le
+        texte, `psycopg` un `datetime`), utilisable telle quelle en paramètre."""
+        rows = self.db.query("SELECT bound_at FROM review_catch_up WHERE id")
+        if not rows:
+            return None
+        value = rows[0]["bound_at"]
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
@@ -455,35 +629,86 @@ class WorkItems(interface.WorkItems):
                                     why="état %s" % state, actor=actor)
             return rows[0]
 
-    def designate_reviewer(self, item_id, reviewer, *, actor, event=None) -> dict | None:
-        """#705 : pose (ou change) le relecteur désigné d'un lot en `qa`, et le
-        journalise ; None si le lot n'est plus en `qa` (rien d'écrit). La
-        colonne vient de la migration 0421 : sans elle, l'écriture est refusée
-        avec la marche à suivre (les lectures, elles, s'en passent).
-        #1979 : `reviewer` vide efface la désignation, et `event` remplace la
-        ligne de journal par défaut (retrait, « verdict non requis »)."""
+    def designate_reviewer(self, item_id, reviewer, *, actor, remove=False,
+                           event=None) -> dict | None:
+        """Ajoute ou retire un relecteur en `qa`, avec sa ligne de journal.
+
+        Les écritures exigent 0421 et 0456 ; les lectures restent possibles
+        avant ces migrations. La mise à jour conditionnelle et le trigger
+        sérialisent les désignations et les changements de responsable."""
         if not has_reviewer(self.db):
             raise DbError("work_items.reviewer is missing (migration 0421): "
                           "run \"ameesh migrate\", then designate the reviewer")
+        if not has_reviewers(self.db):
+            raise DbError("work_items.reviewers is missing (migration 0456): "
+                          "run \"ameesh migrate\", then designate the reviewers")
         with self.db.transaction() as tx:
-            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor, event)
+            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor,
+                                                     remove=remove, event=event)
 
-    def _designate_reviewer(self, item_id, reviewer, actor, event=None) -> dict | None:
+    def _journal_cleared_reviewers(self, item_id, state, previous, row, actor):
+        """#2084/N1 : le trigger 0456 retire de `reviewers` toute personne qui
+        devient assigné ou délégué. Ce retrait automatique a sa propre ligne de
+        journal, nommant chaque relecteur retiré — pas seulement le dernier de
+        la liste, que l'ancien champ `reviewer` portait."""
+        remaining = row.get("reviewers")
+        if remaining is None:
+            remaining = [row.get("reviewer")] if row.get("reviewer") else []
+        remaining = set(remaining)
+        for name in dict.fromkeys(previous or []):
+            if name and name != REVIEWER_NONE and name not in remaining:
+                self._event(int(item_id), state,
+                            "reviewer %s cleared (they now hold the lot)" % name,
+                            actor)
+
+    def _designate_reviewer(self, item_id, reviewer, actor, *, remove=False,
+                            event=None) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
-        avant, un `assign` a pu la changer entre-temps."""
+        avant, un `assign` a pu la changer entre-temps.
+
+        #2084/N2 : un retrait ne journalise que s'il retire quelque chose.
+        La liste est lue sous le verrou de la ligne, dans la même transaction,
+        puis comparée à l'écriture : `--remove` d'un nom non désigné, ou
+        `--remove` global sur une liste déjà vide, ne laisse aucun faux
+        « removed » au journal."""
+        if remove or not reviewer:
+            locked = self.db.query(
+                "SELECT " + item_columns(self.db) + " FROM work_items"
+                " WHERE id = %s AND state = 'qa' FOR NO KEY UPDATE",
+                (int(item_id),))
+            if not locked:
+                return None
+            previous = list(locked[0]["reviewers"] or [])
+            # Ne pas toucher `updated_at`, ni le trigger, quand le retrait ne
+            # retire rien : c'est un non-effet complet, pas seulement muet.
+            if not previous or (remove and reviewer not in previous):
+                row = locked[0]
+                row["reviewer_changed"] = False
+                return row
+        if remove:
+            expression, params = "array_remove(reviewers, %s)", [reviewer]
+        elif not reviewer:
+            expression, params = "'{}'::text[]", []
+        elif reviewer == REVIEWER_NONE:
+            expression, params = "ARRAY[%s]::text[]", [REVIEWER_NONE]
+        else:
+            expression = "array_append(array_remove(array_remove(reviewers, %s), %s), %s)"
+            params = [REVIEWER_NONE, reviewer, reviewer]
         rows = self.db.query(
-            "UPDATE work_items SET reviewer = %%s, updated_at = now()"
-            " WHERE id = %%s AND state = 'qa'"
-            "   AND assignee IS DISTINCT FROM %%s"
-            " RETURNING %s" % item_columns(self.db),
-            (reviewer, int(item_id), reviewer))
+            "UPDATE work_items SET reviewers = " + expression + ", updated_at = now()"
+            " WHERE id = %s AND state = 'qa'"
+            "   AND (assignee IS DISTINCT FROM %s OR %s)"
+            " RETURNING " + item_columns(self.db),
+            tuple(params + [int(item_id), reviewer, bool(remove)]))
         if not rows:
             return None
-        self._event(int(item_id), "qa",
-                    event or ("reviewer %s designated" % reviewer), actor)
-        return rows[0]
+        row = rows[0]
+        self._event(int(item_id), "qa", event or ("reviewer %s %s" % (
+            reviewer, "removed" if remove else "designated")), actor)
+        row["reviewer_changed"] = True
+        return row
 
     def assign(self, item_id, assignee, *, current, note, actor,
                queued_note=None, forced_note=None, take=False,
@@ -514,14 +739,15 @@ class WorkItems(interface.WorkItems):
                 if item is None or item["state"] != "intake" \
                         or item["assignee"] is not None:
                     return None
-                # #1677 : un bloqueur en `qa` à verdict COURANT favorable (et à
-                # tête relue) n'empêche plus la prise — il attend sa fusion, le
-                # lot pris s'empile sur cette tête. Le verdict est relu par une
-                # requête POSTÉRIEURE au verrou (N4) : en READ COMMITTED, la
-                # sous-requête d'un `SELECT … FOR UPDATE` lit l'instantané pris
-                # avant l'attente du verrou, donc un verdict `blocked` validé
-                # pendant cette attente y serait invisible. Le prédicat est le
-                # même que celui de `unassigned_lots` (une seule règle).
+                # #2252 : toutes les dépendances doivent être FUSIONNÉES
+                # (merged/promoted/closed) — un lot en `qa`, même à verdict
+                # favorable, garde une tête qui peut encore changer (cas #667 :
+                # un `blocked` est arrivé 10 s après la prise). Le contrôle est
+                # refait par une requête POSTÉRIEURE au verrou (N4) : en READ
+                # COMMITTED, un SELECT … FOR UPDATE lit l'instantané pris avant
+                # l'attente du verrou, donc une fusion ou une arête ajoutée
+                # pendant cette attente y serait invisible. Même prédicat que
+                # `unassigned_lots` (une seule règle).
                 if tx.query("SELECT 1 FROM work_item_dependencies d"
                             " JOIN work_items b ON b.id = d.blocker_id"
                             " WHERE d.work_item_id = %s AND NOT " + _not_blocking("b") +
@@ -568,7 +794,7 @@ class WorkItems(interface.WorkItems):
         aussi quand l'assignation arrive après la désignation — la désignation
         tombe alors dans la MÊME écriture (l'assignation et la désignation
         peuvent se croiser), et le journal le dit."""
-        previous_reviewer = ""
+        previous_reviewers: list[str] = []
         reviewer_set = ""
         params: list = [assignee]
         if has_reviewer(self.db):
@@ -576,34 +802,43 @@ class WorkItems(interface.WorkItems):
             # n'attend pas les contrôles de clé étrangère (FOR KEY SHARE) des
             # insertions au journal et aux jalons du lot, que FOR UPDATE
             # bloquait jusqu'au commit.
+            with_reviewers = has_reviewers(self.db)
             seen = self.db.query(
-                "SELECT reviewer FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                (int(item_id),))
-            previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
+                "SELECT reviewer%s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                % (", reviewers" if with_reviewers else ""), (int(item_id),))
+            if not seen:
+                return None
+            previous_reviewer = seen[0]["reviewer"] or ""
+            previous_reviewers = (list(seen[0].get("reviewers") or [])
+                                  if with_reviewers else
+                                  ([previous_reviewer] if previous_reviewer else []))
             reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
                             " ELSE reviewer END")
             params.append(assignee)
         params += [int(item_id), current, state, state]
-        rows = self.db.query(
-            ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
-             "       updated_at = now(),"
-             "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-             " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
-             "   AND state NOT IN ('merged', 'promoted', 'closed')"
-             "   AND (%s::text IS NULL OR state = %s)"
-             " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
-            tuple(params))
+        # #2204/N1, #2346 : le journal Python ci-dessous nomme le retrait avec
+        # l'acteur ; le trigger d'audit ne doit pas doubler la ligne. Le
+        # drapeau ne couvre que cet UPDATE (voir python_reviewer_audit).
+        with python_reviewer_audit(self.db):
+            rows = self.db.query(
+                ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                 "       updated_at = now(),"
+                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                 " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
+                 "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                 "   AND (%s::text IS NULL OR state = %s)"
+                 " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
+                tuple(params))
         if not rows:
             return None
-        if previous_reviewer and previous_reviewer == assignee:
-            note = "%s; reviewer %s cleared (they now hold the lot)" % (
-                note, previous_reviewer)
         self.db.query(
             "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
             "       resolved_by = %s"
             " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
             (actor or "", int(item_id)))
         self._event(int(item_id), rows[0]["state"], note, actor)
+        self._journal_cleared_reviewers(item_id, rows[0]["state"],
+                                        previous_reviewers, rows[0], actor)
         return rows[0]
 
     def handoff(self, item_id, assignee, *, current, state, paused_prefix, note_prefix,
@@ -643,17 +878,22 @@ class WorkItems(interface.WorkItems):
         Rend `{item, delegation, replaced}` ou None (lot modifié entre-temps)."""
         with self.db.transaction() as tx:
             with_reviewer = has_reviewer(self.db)
+            with_reviewers = has_reviewers(self.db)
             seen = tx.query(
                 "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
                 " FOR NO KEY UPDATE"
-                % (", reviewer" if with_reviewer else "", _CLOSED),
+                % (", reviewer, reviewers" if with_reviewers
+                   else (", reviewer" if with_reviewer else ""), _CLOSED),
                 (int(item_id), current))
             if not seen:
                 return None
             # #705 r2 (B1) : déléguer à son relecteur retire la désignation
             # (le relecteur relirait son propre travail), dans l'écriture même.
             previous_reviewer = (seen[0]["reviewer"] or "") if with_reviewer else ""
+            previous_reviewers = (list(seen[0].get("reviewers") or [])
+                                  if with_reviewers else
+                                  ([previous_reviewer] if previous_reviewer else []))
             replaced = tx.query(
                 "UPDATE work_item_delegations SET outcome = 'remplacee', resolved_at = now(),"
                 "       resolved_by = %s"
@@ -668,13 +908,16 @@ class WorkItems(interface.WorkItems):
                                 " ELSE reviewer END")
                 params = [delegate, delegate, delegated_by, float(within_s),
                           int(item_id)]
-            rows = tx.query(
-                ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
-                 "       delegated_by = %s, delegated_at = now(),"
-                 "       due_at = now() + make_interval(secs => %s), updated_at = now()"
-                 " WHERE id = %s RETURNING __COLUMNS__"
-                 ).replace("__COLUMNS__", item_columns(self.db)),
-                tuple(params))
+            # #2204/N1, #2346 : le journal Python ci-dessous nomme le retrait
+            # avec l'acteur ; le drapeau d'audit ne couvre que cet UPDATE.
+            with python_reviewer_audit(tx):
+                rows = tx.query(
+                    ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                     "       delegated_by = %s, delegated_at = now(),"
+                     "       due_at = now() + make_interval(secs => %s), updated_at = now()"
+                     " WHERE id = %s RETURNING __COLUMNS__"
+                     ).replace("__COLUMNS__", item_columns(self.db)),
+                    tuple(params))
             item = rows[0]
             delegation = tx.query(
                 "INSERT INTO work_item_delegations AS d"
@@ -682,10 +925,9 @@ class WorkItems(interface.WorkItems):
                 " SELECT id, %%s, %%s, delegated_at, due_at FROM work_items WHERE id = %%s"
                 " RETURNING %s" % _DELEGATION_COLUMNS,
                 (delegate, delegated_by, int(item_id)))[0]
-            if previous_reviewer and previous_reviewer == delegate:
-                note = "%s; reviewer %s cleared (they now hold the lot)" % (
-                    note, previous_reviewer)
             WorkItems(tx)._event(int(item_id), item["state"], note, actor)
+            WorkItems(tx)._journal_cleared_reviewers(
+                item_id, item["state"], previous_reviewers, item, actor)
             return {"item": item, "delegation": delegation,
                     "replaced": replaced[0] if replaced else None}
 
@@ -757,11 +999,14 @@ class WorkItems(interface.WorkItems):
             # relu APRÈS le verrou, dans une instruction suivante : en READ
             # COMMITTED elle voit l'issue posée par un exécuteur concurrent
             with_reviewer = has_reviewer(self.db)
+            with_reviewers = has_reviewers(self.db)
             rows = tx.query(
                 "SELECT %s, %s AS worked, w.title, w.state, w.assignee%s"
                 "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
                 " WHERE d.id = %%s AND d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
-                % (_DELEGATION_COLUMNS, _WORKED, ", w.reviewer" if with_reviewer else ""),
+                % (_DELEGATION_COLUMNS, _WORKED,
+                   ", w.reviewer, w.reviewers" if with_reviewers
+                   else (", w.reviewer" if with_reviewer else "")),
                 (int(delegation_id), float(now_ts)))
             if not rows:
                 return None
@@ -791,13 +1036,16 @@ class WorkItems(interface.WorkItems):
                     reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
                                     " ELSE reviewer END")
                     params.append(row["delegated_by"])
-                item = tx.query(
-                    ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
-                     "       delegated_by = NULL, delegated_at = NULL, due_at = NULL,"
-                     "       updated_at = now()"
-                     " WHERE id = %s RETURNING __COLUMNS__"
-                     ).replace("__COLUMNS__", item_columns(self.db)),
-                    tuple(params + [item_id]))
+                # #2204/N1, #2346 : le journal Python ci-dessous nomme le
+                # retrait ; le drapeau ne couvre que cet UPDATE.
+                with python_reviewer_audit(tx):
+                    item = tx.query(
+                        ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                         "       delegated_by = NULL, delegated_at = NULL, due_at = NULL,"
+                         "       updated_at = now()"
+                         " WHERE id = %s RETURNING __COLUMNS__"
+                         ).replace("__COLUMNS__", item_columns(self.db)),
+                        tuple(params + [item_id]))
             elif outcome == "annulee":
                 # L46 : lot fermé OU réassigné hors `work assign` — la
                 # délégation annulée ne laisse ni délégant ni date
@@ -810,12 +1058,14 @@ class WorkItems(interface.WorkItems):
                     "UPDATE work_items SET due_at = NULL WHERE id = %%s RETURNING %s"
                     % item_columns(self.db), (item_id,))
             text = describe(outcome, row) if describe else None
-            if outcome == "rendue" and row.get("reviewer") \
-                    and row["reviewer"] == row["delegated_by"]:
-                text = "%s; reviewer %s cleared (they now hold the lot)" % (
-                    text or "delegation expired", row["reviewer"])
             if text:
                 WorkItems(tx)._event(item_id, item[0]["state"], text, actor)
+            if outcome == "rendue":
+                previous_reviewers = (list(row.get("reviewers") or [])
+                                      if with_reviewers else
+                                      ([row["reviewer"]] if row.get("reviewer") else []))
+                WorkItems(tx)._journal_cleared_reviewers(
+                    item_id, item[0]["state"], previous_reviewers, item[0], actor)
             return dict(row, outcome=outcome, item=item[0])
 
     def overdue_delegations(self, now_ts) -> list[dict]:
@@ -855,6 +1105,14 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
+
+    def log_review_attempt(self, item_id, state, text, actor) -> None:
+        """L539 (#1104) : journalise une tentative de rattrapage sans création.
+
+        N'écrit que le journal (`work_item_events`) : `updated_at` n'est pas
+        touché — une tentative de fond ne doit ni réordonner la sélection ni
+        faire passer le lot pour actif."""
+        self._event(int(item_id), str(state or ""), str(text or ""), actor)
 
     def lock_deep_analysis(self, item_id) -> None:
         self.db.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
@@ -1702,7 +1960,7 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "SELECT %s FROM work_items w"
                 " WHERE w.assignee = %%s AND w.state = 'promoted'"
-                " ORDER BY w.id%s" % (item_columns(self.db), limit), (agent,))
+                " ORDER BY w.id%s" % (item_columns(self.db, "w"), limit), (agent,))
             for row in rows:
                 if dry_run:
                     out.append(dict(row, dry_run=True, assigned_to=measure_actor))
@@ -1896,21 +2154,10 @@ class WorkItems(interface.WorkItems):
         return int(rows[0]["n"]) if rows else 0
 
     def unassigned_lots(self, limit) -> list[dict]:
-        # #1677 : les lots dont tous les bloqueurs sont terminés **ou** en `qa`
-        # à verdict courant favorable sont prenables ; `stack_on` décrit ces
-        # bloqueurs (lot, branche, tête relue) pour le courrier de prise. La
-        # tête est celle que le verdict nomme, sinon celle du dernier gel (B2) :
-        # un bloqueur sans tête relue reste bloquant.
-        stack_on = (
-            "(SELECT string_agg('#' || b.id::text || ' ('"
-            "                    || coalesce(nullif(btrim(b.branch), ''), '—')"
-            "                    || ', gel ' || coalesce(" + _reviewed_head("b") + ", '—') || ')',"
-            "                  ', ' ORDER BY b.id)"
-            "   FROM work_item_dependencies d"
-            "   JOIN work_items b ON b.id = d.blocker_id"
-            "  WHERE d.work_item_id = work_items.id AND b.state = 'qa'"
-            "    AND " + _current_verdict("b") + " = 'ok'"
-            "    AND " + _reviewed_head("b") + " IS NOT NULL)")
+        # #2252 : seuls les lots dont TOUTES les dépendances sont fusionnées
+        # (`merged`/`promoted`/`closed`) sont prenables. La règle est celle de
+        # `work show` (`depends … blocking`) et de « planned: waiting on lots » :
+        # une dépendance en `qa`, même jugée, n'offre pas de base stable.
         return self.db.query(
             ("SELECT w.*,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
@@ -1925,8 +2172,7 @@ class WorkItems(interface.WorkItems):
             "  FROM (SELECT %s,"
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
-            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
-            "               " + stack_on + " AS stack_on"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
             "          FROM work_items"
             "         WHERE state = 'intake' AND assignee IS NULL"
             "           AND type <> 'improvement'"

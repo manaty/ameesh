@@ -67,7 +67,9 @@ class HostConfigWitnessTest(unittest.TestCase):
                  "_passive", "_wake", "_disarm", "_invalidate")
         with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched, \
                 mock.patch.object(fire.storage, "of",
-                                  return_value=mock.Mock(work=ops)):
+                                  return_value=mock.Mock(work=ops)), \
+                mock.patch.object(fire.packet_guard, "check_merge",
+                                  return_value={"allowed": True}):
             patched["_repo_of"].return_value = repo
             patched["_slug"].return_value = "manaty/nexlink"
             patched["_project"].return_value = project

@@ -222,6 +222,27 @@ class PartielInformateurTest(unittest.TestCase):
                                  evaluations, now)
         self.assertIn("tried (no current reading)", why)
 
+    def test_age_non_fini_ou_futur_refuse(self):
+        """La garde d'âge (`not isfinite(age) or age < 0`) : un `read_at`
+        futur, NaN ou infini ne prouve aucune fraîcheur — fraîcheur 2, jamais
+        0. Sans elle, un futur (ou un +inf) garderait le rang d'un courant."""
+        now = self.NOW
+        for stamp in (now + HOUR, float("inf"), float("nan"), float("-inf")):
+            with self.subTest(read_at=stamp):
+                melange = [
+                    cost.Gauge("claude", "seven_day", 0.30, now + 3 * DAY, WEEK,
+                               stamp),
+                    cost.Gauge("claude", "five_hour", 0.90, now - 60, 5 * HOUR,
+                               stamp),
+                ]
+                self.assertTrue(cost.stale_reading(melange, now))
+                self.assertFalse(accounts._informative_partial(
+                    melange, self._ev("x", melange), now))
+                items = [accounts.Profile("claude", "secondaire")]
+                evaluations = {"secondaire": self._ev("secondaire", melange)}
+                self.assertEqual(
+                    accounts._rank_key(items[0], evaluations, now)[0], 2)
+
     def test_plafond_effectif_et_non_held_cap(self):
         """La marge se lit sur `Evaluation.limits` (plafond fixe, court ou
         d'overage), pas sur le seul plafond de rythme : ici le rythme

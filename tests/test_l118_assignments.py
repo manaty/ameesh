@@ -538,6 +538,102 @@ class BranchMergeTest(_Base):
         self.assertEqual(plan_git.cited_branch("voir agent/a-b."), "agent/a-b")
 
 
+class CloneRefreshTest(_Base):
+    """#2302 : le relevé rafraîchit le clone de l'assigné et lit le dépôt du
+    projet, pas n'importe quel dépôt posé dans son dossier de travail."""
+
+    def setUp(self):
+        super().setUp()
+        self.origin = os.path.join(self.tmp, "manaty", "ameesh.git")
+        os.makedirs(os.path.dirname(self.origin))
+        _git(self.tmp, "init", "-q", "--bare", "--initial-branch=main", self.origin)
+        self.repo = os.path.join(self.tmp, "clone")
+        _git(self.tmp, "clone", "-q", self.origin, self.repo)
+        self.write(self.repo, "README.md", "base\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "base")
+        _git(self.repo, "push", "-q", "-u", "origin", "main")
+
+    def write(self, repo, name, text):
+        path = os.path.join(repo, name)
+        os.makedirs(os.path.dirname(path) or repo, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    def lot_in_another_clone(self, branch):
+        """La branche du lot naît dans un AUTRE clone, puis est fusionnée dans
+        `main` distante : le clone de l'assigné ne voit ni l'une ni l'autre
+        sans fetch."""
+        other = os.path.join(self.tmp, "other-" + branch.replace("/", "-"))
+        _git(self.tmp, "clone", "-q", self.origin, other)
+        _git(other, "checkout", "-q", "-b", branch, "origin/main")
+        self.write(other, "lot.txt", branch + "\n")
+        _git(other, "add", "-A")
+        _git(other, "commit", "-qm", branch)
+        _git(other, "push", "-q", "origin", branch)
+        _git(other, "checkout", "-q", "main")
+        _git(other, "merge", "-q", "--no-ff", "-m", "merge %s" % branch, branch)
+        _git(other, "push", "-q", "origin", "main")
+        return other
+
+    def test_a_stale_clone_is_fetched_before_the_probe(self):
+        branch = "lot/2302-stale"
+        stale = _git(self.repo, "rev-parse", "origin/main")
+        merged = self.lot_in_another_clone(branch)
+        self.assertNotEqual(stale, _git(merged, "rev-parse", "main"))
+        self.agent("dev1", cwd=self.repo)
+        lot = work.add(self.db, title="clone en retard", assignee="dev1",
+                       branch=branch, branch_target="main")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = report["results"][0]
+        self.assertEqual(entry["result"], "merged", entry)
+        self.assertEqual(entry["target"], "origin/main")     # ref publiée lue
+        self.assertEqual(entry["how"], "ancestor")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_the_project_repo_wins_over_the_assignee_wrong_repo(self):
+        wrong_origin = os.path.join(self.tmp, "manaty", "nexlink.git")
+        _git(self.tmp, "init", "-q", "--bare", "--initial-branch=main", wrong_origin)
+        wrong = os.path.join(self.tmp, "nexlink-clone")
+        _git(self.tmp, "clone", "-q", wrong_origin, wrong)
+        self.write(wrong, "README.md", "nexlink\n")
+        _git(wrong, "add", "-A")
+        _git(wrong, "commit", "-qm", "base")
+        _git(wrong, "push", "-q", "-u", "origin", "main")
+        branch = "lot/2302-wrong-repo"
+        self.lot_in_another_clone(branch)
+        self.agent("dev1", cwd=wrong)
+        self.agent("dev2", cwd=self.repo)
+        lot = work.add(self.db, title="dépôt du projet", assignee="dev1",
+                       branch=branch, branch_target="main",
+                       issue_ref="manaty/ameesh#1692")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = report["results"][0]
+        self.assertEqual(entry["result"], "merged", entry)
+        self.assertEqual(entry["repo"], self.repo)
+        self.assertIn("working directory", entry["repo_note"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_a_wrong_repo_without_a_local_clone_is_reported(self):
+        wrong_origin = os.path.join(self.tmp, "manaty", "nexlink.git")
+        _git(self.tmp, "init", "-q", "--bare", "--initial-branch=main", wrong_origin)
+        wrong = os.path.join(self.tmp, "nexlink-clone")
+        _git(self.tmp, "clone", "-q", wrong_origin, wrong)
+        self.write(wrong, "README.md", "nexlink\n")
+        _git(wrong, "add", "-A")
+        _git(wrong, "commit", "-qm", "base")
+        _git(wrong, "push", "-q", "-u", "origin", "main")
+        self.agent("dev1", cwd=wrong)
+        lot = work.add(self.db, title="mauvais dépôt", assignee="dev1",
+                       branch="lot/2302-absente", branch_target="main",
+                       issue_ref="manaty/ameesh#1692")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = report["results"][0]
+        self.assertEqual(entry["result"], "wrong-repo", entry)
+        self.assertIn("manaty/ameesh", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+
 class IdleCapacityToOrchestratorTest(_Base):
     """`idle_capacity` part aussi à l'orchestrateur, par courrier `event`."""
 

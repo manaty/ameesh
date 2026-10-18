@@ -8,7 +8,7 @@ fois, sur la tête gelée. Le déclencheur retenu est l'étiquette
 `types: [labeled]`) : un `workflow_dispatch` ne satisfait pas un check requis
 de PR. Ces témoins tiennent la décision seule (`ci.gel_plan`, `ci.cancel_plan`,
 la pose de `ci.cmd_ci_run`), sans réseau ni base : le faux `api` rend les cinq
-lectures GitHub (tête de branche, exécutions, PR, contenu du workflow, check
+lectures GitHub (têtes de branches, exécutions, PR, contenu du workflow, check
 requis), les jalons et le journal du lot sont posés à la main, et la
 transaction du faux `db` prend un verrou — deux `ci run` concurrents se
 sérialisent comme sur la ligne `work_items`.
@@ -30,8 +30,9 @@ le verrou de la ligne du lot sérialise deux `ci run`.
 
 L'avis delta R1 sur `3ce572f7b` est tenu aussi : le gel et les derniers
 verdicts sont relus sous le verrou (`ci._revalidate`) — un `blocked` ou un
-nouveau gel commité pendant l'attente fait reculer la pose, les exceptions
-explicites (`--exception`, `--full`) gardant leur cours ; la phase critique
+nouveau gel commité pendant l'attente fait reculer la pose, seule l'exception
+explicite (`--exception … --reason …`) gardant son cours (`--full` reste
+soumis aux avis, #2214) ; la phase critique
 refait la décision check/mode/`--force` du plan (le `--force` d'un check requis
 rouge part) ; la marque d'un run rouge visible ne tient plus la clé (`after`) ;
 une réservation `full` couvre une demande `lot`, jamais l'inverse ; le chemin
@@ -69,7 +70,7 @@ PR = 1047
 LABEL = "ci-lot-%s" % GEL
 LABEL_FULL = "ci-full-%s" % GEL
 WORKFLOW = ("name: tests\n# #1343\non:\n  pull_request:\n    types: [labeled]\n"
-            "# ci-(lot|full)-<sha>\n")
+            "# ci-(lot|full)-<sha>\n# github.event.label.description\n")
 
 
 def lot(**extra) -> dict:
@@ -128,18 +129,37 @@ def check_run(ident: int = 900, *, name: str = "tests", statut: str = "completed
             "details_url": "https://github.com/%s/runs/%d" % (DEPOT, ident)}
 
 
+def unreadable_run(ident: int = 12, *, sha: str = GEL, mode: str = "lot",
+                   statut: str = "completed", conclusion: str | None = "failure",
+                   number: int = PR, branche: str = BRANCHE) -> dict:
+    """Un run #2364 : le titre porte l'étiquette mais pas la base (un SHA).
+
+    C'est le run-name d'un ancien workflow, qui y mettait la description de
+    l'étiquette (« CI #1343 full sur <sha court> ») : `pr_run` le refuse, mais
+    sa tête et son libellé restent corrélables.
+    """
+    return label_run(ident, sha=sha, mode=mode, statut=statut,
+                     conclusion=conclusion, number=number, branche=branche,
+                     titre="tests [PR #%d ci-%s-%s base CI #1343 %s sur %s]"
+                           % (number, mode, sha, mode, sha[:12]))
+
+
 def marque(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
            token: str = "0" * 16, pr: int = PR, label: str | None = None,
            ident: int = 1, ts: float | None = None, texte: str = "",
-           seen: int | None = 0) -> dict:
+           avis: int | None = None, seen: int | None = 0) -> dict:
     """Un événement `ci-label` du journal du lot, comme `work.events` le rend.
 
-    `seen` est le plus grand identifiant d'exécution connu avant la pose
-    (P2-3) ; `None` écrit une marque d'avant #1343, sans corrélation.
+    `avis` (N2 #2240) garde le nombre d'avis déclaré, y compris 0 ; `None`
+    écrit une marque d'avant #2240, sans ce champ. `seen` est le plus grand
+    identifiant d'exécution connu avant la pose (P2-3) ; `None` écrit une
+    marque d'avant #1343, sans corrélation.
     """
     label = label or "ci-%s-%s" % (mode, sha)
     note = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
             % (state, pr, label, sha, base, mode, token))
+    if avis is not None:
+        note += " avis=%d" % avis
     if seen is not None:
         note += " seen=%d" % seen
     if texte:
@@ -149,11 +169,11 @@ def marque(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
 
 def porte(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
           token: str = "0" * 16, ident: int = 1, ts: float | None = None,
-          seen: int | None = 0) -> dict:
+          avis: int | None = None, seen: int | None = 0) -> dict:
     """Une marque déjà parsée, comme `ci.request_events` la rend."""
     return {"id": ident, "state": state, "pr": PR,
             "label": "ci-%s-%s" % (mode, sha), "sha": sha, "base": base,
-            "mode": mode, "token": token, "seen": seen,
+            "mode": mode, "token": token, "avis": avis, "seen": seen,
             "ts": time.time() if ts is None else ts}
 
 
@@ -187,13 +207,17 @@ class FakeDb:
 class Github:
     """Les lectures GitHub de `gel_plan`/`cancel_plan`/`cmd_ci_run`, sans réseau."""
 
-    def __init__(self, *, head: str = GEL, runs=(), workflow: str | None = WORKFLOW,
-                 pulls=None, checks=None):
+    def __init__(self, *, head: str = GEL, base=BASE, runs=(), workflow: str | None = WORKFLOW,
+                 pulls=None, checks=None, manifest: str | None = None,
+                 base_reviews=("integration-paquet-h-20261017-0500.md",)):
         self.head = head
+        self.base = base
         self.runs = list(runs)
         self.workflow = workflow
         self.pulls = [pull()] if pulls is None else pulls
         self.checks = {"check_runs": [check_run()]} if checks is None else checks
+        self.manifest = manifest
+        self.base_reviews = list(base_reviews)
         self.paths: list[str] = []
 
     def rows(self) -> list[dict]:
@@ -210,7 +234,9 @@ class Github:
     def __call__(self, path: str) -> dict:
         self.paths.append(path)
         if path.startswith("repos/%s/branches/" % DEPOT):
-            return {"commit": {"sha": self.head}}
+            if unquote(path.split("/branches/", 1)[1]) == BRANCHE:
+                return {"commit": {"sha": self.head}}
+            return {"commit": {"sha": self.base() if callable(self.base) else self.base}}
         if "/actions/workflows/tests.yml/runs?" in path:
             runs = self.rows()
             found = re.search(r"[?&]head_sha=([0-9a-f]{40})", path)
@@ -231,6 +257,16 @@ class Github:
             if self.workflow is None:
                 return {}
             return {"content": base64.b64encode(self.workflow.encode()).decode()}
+        if "/contents/reviews?" in path:
+            # N1 #2240 : le manifeste de composition du porteur, lu à la tête.
+            # Sans manifeste, GitHub rend un 404 que `_json` lève en
+            # `GithubError` ; le faux rend une liste vide, même verdict.
+            # La base porte déjà les manifestes des paquets fusionnés ; la tête
+            # en hérite, plus le sien (R1 ameesh-dev1).
+            noms = list(self.base_reviews)
+            if "ref=%s" % BASE not in path and self.manifest is not None:
+                noms.append(self.manifest)
+            return [{"name": n, "type": "file"} for n in noms]
         if "/check-runs?" in path:
             return self.checks
         raise AssertionError("chemin GitHub inattendu : %s" % path)
@@ -252,7 +288,9 @@ class Gh:
         self.actor = actor
         self.refuse = tuple(refuse)
         self.repo_labels: set[str] = set(repo_labels)
+        self.descriptions = {name: "old description" for name in repo_labels}
         self.posed: list[str] = []
+        self.posed_bases: list[str] = []
         self.removed: list[str] = []
 
     def run(self, argv: list[str], stdin: str | None = None) -> tuple[int, str, str]:
@@ -267,21 +305,27 @@ class Gh:
         if argv[:3] == ["api", "-X", "POST"] and "/issues/%d/labels" % PR in argv[3]:
             names = json.loads(stdin or "{}").get("labels") or []
             self.posed += names
+            self.posed_bases += [self.descriptions[name] for name in names]
             self.repo_labels.update(names)
             return 0, "", ""
         if argv[:3] == ["api", "-X", "DELETE"] and "/issues/%d/labels/" % PR in argv[3]:
             self.removed.append(argv[3].rsplit("/", 1)[-1])
             return 0, "", ""
         if argv[:3] == ["api", "-X", "POST"] and argv[3] == "repos/%s/labels" % DEPOT:
-            name = json.loads(stdin or "{}").get("name") or ""
+            data = json.loads(stdin or "{}")
+            name = data.get("name") or ""
             self.repo_labels.add(name)
+            self.descriptions[name] = data.get("description") or ""
+            return 0, "", ""
+        if argv[:3] == ["api", "-X", "PATCH"] and argv[3].startswith("repos/%s/labels/" % DEPOT):
+            self.descriptions[unquote(argv[3].rsplit("/", 1)[-1])] = json.loads(stdin)["description"]
             return 0, "", ""
         if argv[:3] == ["api", "-X", "DELETE"] and argv[3].startswith("repos/%s/labels/" % DEPOT):
             self.repo_labels.discard(argv[3].rsplit("/", 1)[-1])
             return 0, "", ""
-        if argv[:2] == ["api", "repos/%s/labels/" % DEPOT]:
+        if argv[0] == "api" and argv[1].startswith("repos/%s/labels/" % DEPOT):
             # lecture d'existence : 0 si l'étiquette du dépôt existe déjà
-            return (0 if argv[2].rsplit("/", 1)[-1] in self.repo_labels else 1), "", ""
+            return (0 if unquote(argv[1].rsplit("/", 1)[-1]) in self.repo_labels else 1), "", ""
         return 0, "", ""
 
     def annulations(self) -> list[list[str]]:
@@ -399,10 +443,24 @@ class GelPlanTest(GelTestCase):
 
     def test_une_base_illisible_est_refusee(self):
         self.gele()
-        api = Github(pulls=[pull(base="pas-un-sha")])
+        api = Github(base="pas-un-sha")
         with self.assertRaises(ci.GelError) as caught:
             self.gel(api)
-        self.assertIn("unusable base commit", str(caught.exception))
+        self.assertIn("branch main not found", str(caught.exception))
+        self.assertEqual(api.ecrit(), [])
+
+    def test_la_pointe_cible_remplace_le_payload_perime(self):
+        self.gele()
+        api = Github(base=AUTRE, runs=[label_run(base=BASE)])
+        decision = self.gel(api)
+        self.assertEqual((decision["action"], decision["base"]), ("request", AUTRE))
+        self.assertIn("repos/%s/branches/main" % DEPOT, api.paths)
+
+    def test_la_cible_absente_est_refusee_sans_repli_sur_base_sha(self):
+        self.gele()
+        api = Github(pulls=[pull(base_ref="")])
+        with self.assertRaisesRegex(ci.GelError, "missing target branch"):
+            self.gel(api)
         self.assertEqual(api.ecrit(), [])
 
     def test_une_source_release_refuse_le_lot_et_impose_full(self):
@@ -429,12 +487,111 @@ class GelPlanTest(GelTestCase):
 
     def test_un_full_sur_pr_ordinaire_est_une_demande_ci_full(self):
         # #1343 : le mode est porté par l'étiquette (`ci-lot` / `ci-full`) ; un
-        # `--full --reason` sur une PR ordinaire est représentable et sans
-        # ambiguïté, il ne peut pas verdir un run lot.
-        self.jalons.append(jalon("frozen", sha=GEL))
+        # `--full --reason` sur une PR ordinaire, ses avis acquis, est
+        # représentable et sans ambiguïté, il ne peut pas verdir un run lot.
+        self.gele()
         decision = self.gel(Github(), full=True, reason="paquet §12")
         self.assertEqual((decision["action"], decision["mode"], decision["label"]),
                          ("request", "full", LABEL_FULL))
+
+    def test_un_full_ne_dispense_pas_des_avis_requis(self):
+        # #2214 : `--full` est un mode d'exécution, pas une relecture ; sans
+        # avis sur la tête il ne part pas, même sur une PR ordinaire.
+        api = Github()
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, full=True, reason="paquet §12")
+        self.assertIn("0 independent verdict(s)", str(caught.exception))
+        self.assertIn("--exception incident|unblock", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune demande sans les avis")
+
+    def test_un_avis_zero_full_refuse_hors_porteur(self):
+        # N1 #2240 (b) : `--avis 0 --full` n'est permis qu'à une tête
+        # `integration/**` ; une branche de lot garde les avis requis (#2214).
+        self.gele()
+        api = Github()
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, avis=0, full=True,
+                     reason="porteur, unités relues au manifeste")
+        self.assertIn("integration/**", str(caught.exception))
+        self.assertIn("#%d" % PR, str(caught.exception))
+        self.assertEqual([p for p in api.paths if "contents/reviews" in p], [],
+                         "un refus nommé ne lit pas de manifeste")
+
+    def test_un_avis_zero_full_refuse_sans_manifeste(self):
+        # N1 #2240 (b) : le zéro avis du porteur tient à son manifeste de
+        # composition, publié à la tête gelée ; sans lui, refus nommé.
+        self.gele()
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")])
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, avis=0, full=True,
+                     reason="porteur, unités relues au manifeste")
+        self.assertIn("manifest", str(caught.exception))
+        self.assertIn(GEL[:12], str(caught.exception))
+
+    def test_un_avis_zero_full_refuse_un_manifeste_herite_ou_d_un_autre(self):
+        # R1 ameesh-dev1 : `main` porte les manifestes des paquets fusionnés ;
+        # un porteur qui n'en publie pas un à son nom, nouveau, est refusé.
+        for manifeste, base in (
+                ("integration-paquet-h-20261017-0500.md", ()),
+                ("integration-paquet-h-20261017-0600.md",
+                 ("integration-paquet-h-20261017-0600.md",))):
+            with self.subTest(manifeste=manifeste, base=base):
+                self.gele()
+                api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                             manifest=manifeste, base_reviews=base)
+                with self.assertRaises(ci.GelError) as caught:
+                    self.gel(api, avis=0, full=True,
+                             reason="porteur, unités relues au manifeste")
+                self.assertIn("integration-paquet-h-20261017-0600.md",
+                              str(caught.exception))
+
+    def test_un_avis_zero_full_refuse_un_repertoire_nomme_comme_le_manifeste(self):
+        manifest = "integration-paquet-h-20261017-0600.md"
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                     manifest=manifest)
+
+        def directory_api(path):
+            rows = api(path)
+            if "/contents/reviews?" in path:
+                return [{**row, "type": "dir"} if row["name"] == manifest else row
+                        for row in rows]
+            return rows
+
+        with self.assertRaises(ci.GelError):
+            self.gel(directory_api, avis=0, full=True, reason="porteur sans fichier manifeste")
+        self.assertFalse(any("/contents/.github/workflows/" in path for path in api.paths),
+                         "aucune CI sans fichier manifeste")
+
+    def test_un_avis_zero_full_passe_sur_porteur_et_son_manifeste(self):
+        # N1 #2240 (b) : le porteur `integration/**` qui publie son manifeste
+        # à la tête demande la suite complète sans avis sur la tête composée.
+        self.gele()
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                     manifest="integration-paquet-h-20261017-0600.md")
+        decision = self.gel(api, avis=0, full=True,
+                            reason="porteur, unités relues au manifeste")
+        self.assertEqual((decision["action"], decision["mode"], decision["avis"]),
+                         ("request", "full", 0))
+        self.assertIn("contents/reviews?ref=%s" % GEL, " ".join(api.paths))
+        self.assertIn("contents/reviews?ref=%s" % BASE, " ".join(api.paths))
+
+    def test_un_full_ne_consomme_pas_un_avis_manquant(self):
+        # #2214, constat #2209 : `--avis 2 --full` avec un seul `ok` doit
+        # refuser, y compris sur une branche de paquet (integration/**).
+        self.gele()
+        api = Github(pulls=[pull(base_ref="integration/paquet")])
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, avis=2, full=True, reason="paquet §12")
+        self.assertIn("1 independent verdict(s)", str(caught.exception))
+
+    def test_un_full_sans_avis_passe_par_l_exception_marquee(self):
+        # Canon §3 : seul `--exception incident|unblock --reason …` suspend les
+        # avis, et le motif reste dans la trace.
+        self.jalons.append(jalon("frozen", sha=GEL))
+        decision = self.gel(Github(), full=True, reason="paquet §12",
+                            exception="unblock")
+        self.assertEqual((decision["action"], decision["exception"], decision["mode"]),
+                         ("request", "unblock", "full"))
 
     def test_un_vert_de_la_composition_ne_repose_pas(self):
         self.gele()
@@ -471,8 +628,8 @@ class GelPlanTest(GelTestCase):
 
     def test_un_vert_de_mode_lot_ne_fait_pas_un_full_deja_vert(self):
         # P1-3 : un run `lot` vert ne prouve pas la suite complète qu'un
-        # `--full` demande ; la demande part.
-        self.jalons.append(jalon("frozen", sha=GEL))
+        # `--full` demande ; la demande part (avis acquis, #2214).
+        self.gele()
         api = Github(runs=[label_run(7, mode="lot")])
         decision = self.gel(api, full=True, reason="paquet §12")
         self.assertEqual((decision["action"], decision["mode"]), ("request", "full"))
@@ -607,6 +764,13 @@ class GelPlanTest(GelTestCase):
             self.gel(api)
         self.assertIn("does not carry the freeze request trigger", str(caught.exception))
 
+    def test_un_workflow_qui_lit_encore_la_base_perimee_est_refuse(self):
+        self.gele()
+        api = Github(workflow=WORKFLOW.replace("github.event.label.description",
+                                             "github.event.pull_request.base.sha"))
+        with self.assertRaisesRegex(ci.GelError, "pinned target base"):
+            self.gel(api)
+
     def test_une_exception_sans_gel_ni_avis_mais_marquee(self):
         api = Github(head=TETE, pulls=[pull(head=TETE)])
         decision = self.gel(api, exception="incident", reason="CI cassée sur main")
@@ -621,9 +785,14 @@ class GelPlanTest(GelTestCase):
         with self.assertRaises(ci.GelError):
             self.gel(Github(), exception="autre", reason="x")
 
-    def test_full_sans_avis_en_mode_full(self):
-        self.jalons.append(jalon("frozen", sha=GEL))
-        decision = self.gel(Github(), full=True, reason="paquet §12")
+    def test_full_sans_avis_refuse_meme_sans_gel(self):
+        # #2214 : le gel est facultatif en `--full` (la tête nommée), les avis
+        # non ; le refus porte sur les avis, pas sur le gel.
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(Github(), full=True, reason="paquet §12")
+        self.assertIn("0 independent verdict(s)", str(caught.exception))
+        decision = self.gel(Github(), full=True, reason="paquet §12",
+                            exception="unblock")
         self.assertEqual((decision["action"], decision["mode"]), ("request", "full"))
 
     def test_avis_hors_bornes_refuse(self):
@@ -704,7 +873,10 @@ class GelPlanTest(GelTestCase):
 
     def test_un_lot_leger_demande_sans_avis(self):
         self.jalons.append(jalon("frozen", sha=GEL))
-        self.assertEqual(self.gel(Github(), avis=0)["action"], "request")
+        api = Github()
+        self.assertEqual(self.gel(api, avis=0)["action"], "request")
+        self.assertEqual([p for p in api.paths if "contents/reviews" in p], [],
+                         "la garde du porteur ne concerne que --full")
 
 
 class ReservationTest(unittest.TestCase):
@@ -837,14 +1009,27 @@ class RequestTest(GelTestCase):
             self.on_note(text)
         return True
 
-    def run_cmd(self, api, gh, *, args=None):
-        """`cmd_ci_run` avec le `gh`, la base et la note remplacés."""
+    def run_cmd(self, api, gh, *, args=None, packet=True):
+        """`cmd_ci_run` avec le `gh`, la base et la note remplacés.
+
+        #2333 : la garde du paquet refuse tout `ci-lot` sans exception
+        déclarée entre deux paquets ; les témoins de mécanique de la demande
+        déclarent donc une exception `unblock` sur le gel, au journal du faux
+        `work`. Les témoins de refus passent `packet=False`."""
+        args = args or self.args
+        if packet and not args.exception and not any(
+                (e.get("note") or "").startswith("packet-exception")
+                for e in self.events):
+            frozen = (ci.frozen_of(self.db, self.item["id"]) or {}).get("sha") or GEL
+            self.events.append({"id": next(self.seq), "created_ts": time.time(),
+                                "note": "packet-exception unblock sha=%s reason=test"
+                                        % frozen})
         with mock.patch("ameesh.db.open_db", lambda cfg: self.db), \
                 mock.patch.object(plan_github, "Gh", lambda *a, **k: gh), \
                 mock.patch.object(plan_github, "_json",
                                   lambda g, argv, *a, **k: api(argv[-1])), \
                 contextlib.redirect_stdout(io.StringIO()):
-            code = ci.cmd_ci_run(None, args or self.args)
+            code = ci.cmd_ci_run(None, args)
         return code, self.notes
 
     def marques(self, state: str) -> list[str]:
@@ -866,6 +1051,51 @@ class RequestTest(GelTestCase):
         self.assertIn("base %s" % BASE, applied[0])
         self.assertEqual(len(self.marques("reserve")), 1, notes)
 
+    def test_l_avis_declare_est_trace_dans_les_marques(self):
+        # N2 #2240 : le nombre d'avis déclaré par l'appelant reste lisible
+        # dans les marques `reserve` et `applied`, `--avis 0` compris.
+        self.gele()
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 0)
+        for state in ("reserve", "applied"):
+            self.assertEqual(len(self.marques(state)), 1, notes)
+            self.assertIn(" avis=1", self.marques(state)[0])
+        parsed = ci.request_events(self.db, self.item["id"])
+        self.assertEqual([(e["state"], e["avis"]) for e in parsed],
+                         [("reserve", 1), ("applied", 1)])
+
+    def test_un_avis_zero_full_ne_passe_pas_sans_trace(self):
+        # N2 #2240 / N1 : un porteur `integration/**` en `--avis 0 --full`
+        # n'est plus muet — la marque dit avis=0 et `request_events` le relit.
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-20261017-0600")],
+                     manifest="integration-paquet-h-20261017-0600.md")
+        args = argparse.Namespace(**{**vars(self.args), "avis": 0, "full": True,
+                                     "reason": "porteur, unités relues au manifeste"})
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, args=args)
+        self.assertEqual(code, 0, notes)
+        self.assertIn("ci-full-%s" % GEL, gh.poses())
+        for state in ("reserve", "applied"):
+            self.assertEqual(len(self.marques(state)), 1, notes)
+            self.assertIn(" avis=0", self.marques(state)[0])
+        parsed = ci.request_events(self.db, self.item["id"])
+        self.assertEqual([(e["state"], e["avis"]) for e in parsed],
+                         [("reserve", 0), ("applied", 0)])
+
+    def test_un_avis_zero_full_hors_porteur_ne_pose_rien(self):
+        # N1 #2240 (b) : la garde ne touche que la demande de CI ; hors
+        # porteur, rien n'est annulé, posé ni noté.
+        self.gele()
+        gh = Gh()
+        args = argparse.Namespace(**{**vars(self.args), "avis": 0, "full": True,
+                                     "reason": "porteur, unités relues au manifeste"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(err):
+            code, notes = self.run_cmd(Github(), gh, args=args)
+        self.assertEqual(code, 1, notes)
+        self.assertEqual((gh.calls, notes, gh.poses()), ([], [], []))
+
     def test_dry_run_ne_pose_rien(self):
         self.gele()
         api = Github(runs=[label_run(4, statut="queued", conclusion=None, sha=TETE)])
@@ -873,6 +1103,59 @@ class RequestTest(GelTestCase):
         code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
             **{**vars(self.args), "dry_run": True}))
         self.assertEqual((code, gh.calls, notes), (0, [], []))
+
+    def test_la_garde_du_paquet_refuse_une_ci_lot_sans_exception(self):
+        """#2333 : aucune étiquette `ci-lot` entre deux paquets, même en dry-run."""
+        self.gele()
+        api = Github()
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, packet=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.calls, [], "ni annulation, ni étiquette, ni lecture GitHub")
+        self.assertEqual(notes, [], "un refus n'écrit rien")
+        self.assertEqual(api.paths, [])
+
+    def test_la_garde_du_paquet_refuse_aussi_en_dry_run(self):
+        self.gele()
+        gh = Gh()
+        code, _notes = self.run_cmd(Github(), gh, packet=False, args=argparse.Namespace(
+            **{**vars(self.args), "dry_run": True}))
+        self.assertEqual((code, gh.calls), (1, []))
+
+    def test_la_garde_du_paquet_accepte_et_journalise_l_exception(self):
+        """#2333 : l'exception motivée passe et laisse sa marque à la tête testée."""
+        self.gele()
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh, args=argparse.Namespace(
+            **{**vars(self.args), "exception": "incident", "reason": "cible rouge 18/10"}))
+        self.assertEqual(code, 0)
+        self.assertIn(LABEL, gh.poses())
+        packet = [n for n in notes if n.startswith("packet-exception")]
+        self.assertEqual(packet, ["packet-exception incident sha=%s reason=cible rouge 18/10"
+                                  % GEL])
+
+    def test_la_garde_du_paquet_laisse_passer_la_suite_complete(self):
+        """#2333 : `--full --reason` est la suite du paquet, pas une CI de lot."""
+        self.gele()
+        gh = Gh()
+        code, _notes = self.run_cmd(Github(), gh, packet=False, args=argparse.Namespace(
+            **{**vars(self.args), "full": True, "reason": "suite du paquet"}))
+        self.assertEqual(code, 0)
+        self.assertIn("ci-full-%s" % GEL, gh.poses())
+
+    def test_la_garde_du_paquet_accepte_une_exception_sans_gel_ni_sha(self):
+        """#2333 : sans gel ni `--sha`, nature et motif passent avant le plan,
+        et la note d'exception porte la tête que le plan a réellement testée."""
+        gh = Gh()
+        api = Github(head=TETE, pulls=[pull(head=TETE)])
+        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "exception": "incident",
+               "reason": "CI cassée sur main"}))
+        self.assertEqual(code, 0)
+        self.assertIn("ci-lot-%s" % TETE, gh.poses())
+        packet = [n for n in notes if n.startswith("packet-exception")]
+        self.assertEqual(packet, ["packet-exception incident sha=%s reason=CI cassée sur main"
+                                  % TETE])
 
     def test_un_jeton_actions_est_refuse_avant_toute_pose(self):
         # #1343 : l'événement d'un GITHUB_TOKEN d'Actions ne déclenche rien.
@@ -904,7 +1187,24 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(gh.removed, [LABEL])
         self.assertEqual(gh.poses(), [LABEL])
+        self.assertEqual(gh.posed_bases, [BASE])
         self.assertIn(LABEL, gh.repo_labels, "l'étiquette du dépôt n'est pas supprimée")
+
+    def test_la_base_actuelle_est_transmise_malgre_le_payload_perime(self):
+        self.gele()
+        gh = Gh()
+        code, notes = self.run_cmd(Github(base=AUTRE), gh)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.posed_bases, [AUTRE])
+        self.assertIn("base %s" % AUTRE, self.marques("applied")[0])
+
+    def test_un_refus_d_actualisation_de_base_ne_pose_pas_l_etiquette(self):
+        self.gele()
+        gh = Gh(repo_labels={LABEL}, refuse=("PATCH repos/%s/labels/" % DEPOT,))
+        code, notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertIn("cannot update the label", notes[-1])
 
     def test_les_etiquettes_perimees_sont_retirees_et_supprimees(self):
         self.gele()
@@ -932,6 +1232,7 @@ class RequestTest(GelTestCase):
         self.assertEqual(gh.repo_labels, set())
         self.run_cmd(Github(), gh)
         self.assertEqual(gh.repo_labels, {LABEL})
+        self.assertEqual(gh.posed_bases, [BASE])
 
     def test_une_demande_deja_reservee_recule(self):
         # P2 R1 : la marque fraîche d'un autre fait reculer le second dès la
@@ -983,7 +1284,8 @@ class RequestTest(GelTestCase):
 
     def test_la_base_bougee_sous_le_verrou_recule(self):
         self.gele()
-        api = Github(pulls=[pull(), pull(base=AUTRE)])
+        bases = iter((BASE, AUTRE))
+        api = Github(base=lambda: next(bases))
         gh = Gh()
         code, notes = self.run_cmd(api, gh)
         self.assertEqual(code, 1)
@@ -1028,6 +1330,21 @@ class RequestTest(GelTestCase):
         self.assertEqual(self.marques("applied"), [])
         self.assertIn("blocked", notes[-1])
         self.assertEqual(len(self.marques("reserve")), 1)
+
+    def test_un_full_relit_les_avis_sous_le_verrou(self):
+        # #2214 : le mode `full` ne dispense pas de la relecture sous le verrou ;
+        # un `ok` retiré pendant l'attente annule la demande, comme en mode lot.
+        self.gele()
+        self.on_note = lambda text: self.jalons.append(
+            jalon("verdict", sha=GEL, actor="relecteur", verdict="blocked"))
+        full = argparse.Namespace(**{**vars(self.args), "full": True,
+                                     "reason": "paquet §12"})
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh, args=full)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertIn("blocked", notes[-1])
+        self.assertEqual(self.marques("applied"), [])
 
     def test_un_gel_deplace_sous_le_verrou_recule(self):
         # P1 delta : un nouveau gel enregistré entre le plan et le verrou
@@ -1119,6 +1436,110 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(gh.poses(), [])
         self.assertTrue(any("already holds" in n for n in notes), notes)
+
+    def test_un_run_illisible_materialise_la_reservation_et_force_reprend(self):
+        # #2364 (run 39092741517) : la marque `applied` n'était jamais
+        # matérialisée par le run, faute de base lisible dans son titre ;
+        # `--force` répondait « already reserved ». La tête et le libellé
+        # suffisent à libérer la clé, sans verdir la composition.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", mode="full", token="4" * 16,
+                                  ts=t + 0.125, seen=0))
+        api = Github(runs=[unreadable_run(12, mode="full")])
+        self.assertIsNone(ci.pr_run(unreadable_run(12, mode="full")))
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+                **{**vars(self.args), "full": True, "reason": "paquet h-0500",
+                   "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL_FULL])
+        applied = self.marques("applied")
+        self.assertEqual(len(applied), 1, notes)
+        self.assertIn("seen=12", applied[0], "le run illisible entre dans le `seen`")
+
+    def test_un_run_illisible_sans_force_demande_la_reprise(self):
+        # la reprise reste un geste explicite : le run illisible ne vaut ni
+        # vert ni rouge applicable, il ne repose pas tout seul.
+        self.gele()
+        self.events.append(marque("applied", token="5" * 16, seen=0))
+        api = Github(runs=[unreadable_run(12)])
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api)
+        self.assertIn("run-name is unreadable", str(caught.exception))
+        self.assertIn("--force", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune lecture du workflow")
+        gh = Gh()
+        code, _notes = self.run_cmd(api, gh)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+
+    def test_un_run_illisible_en_vol_ne_repose_pas(self):
+        # un run illisible encore vivant se surveille, même avec --force.
+        self.gele()
+        api = Github(runs=[unreadable_run(12, statut="in_progress", conclusion=None)])
+        decision = self.gel(api, force=True)
+        self.assertEqual(decision["action"], "running")
+        self.assertIn("run-name is unreadable", decision["why"])
+        gh = Gh()
+        code, _notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [])
+        self.assertEqual(gh.annulations(), [])
+
+    def test_une_marque_posterieure_au_run_illisible_tient_la_cle(self):
+        # P2-3 conservé : une marque posée après le run (seen=12) n'est pas
+        # matérialisée par lui, même si ce run porte la tête et le libellé.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", token="6" * 16, ts=t + 0.125, seen=12))
+        api = Github(runs=[unreadable_run(12)])
+        # la réservation fraîche est dite avant toute suggestion de reprise :
+        # `--force` ne la lèverait pas non plus.
+        decision = self.gel(api)
+        self.assertEqual(decision["action"], "running")
+        self.assertIn("reserved", decision["why"])
+        decision = self.gel(api, force=True)
+        self.assertEqual(decision["action"], "running")
+        self.assertIn("reserved", decision["why"])
+        gh = Gh()
+        code, _notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [])
+
+    def test_un_run_illisible_full_libere_une_marque_lot(self):
+        # la couverture des modes reste celle de `_covers` : un run `full`
+        # illisible matérialise une marque `full`, qui couvre une demande lot.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", mode="full", token="7" * 16,
+                                  ts=t + 0.125, seen=0))
+        api = Github(runs=[unreadable_run(12, mode="full")])
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, _notes = self.run_cmd(api, gh, args=argparse.Namespace(
+                **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL])
+
+    def test_un_run_illisible_de_lot_ne_libere_pas_une_marque_full(self):
+        # P2-3 (cx2) conservé : le mode se lit dans le libellé ; un run de lot
+        # illisible ne matérialise pas une demande full encore invisible.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", mode="full", token="8" * 16,
+                                  ts=t + 0.125, seen=0))
+        api = Github(runs=[unreadable_run(12, mode="lot")])
+        full = argparse.Namespace(**{**vars(self.args), "full": True,
+                                     "reason": "paquet §12", "force": True})
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, _notes = self.run_cmd(api, gh, args=full)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [], "un run de lot ne libère pas le full")
 
     def test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas(self):
         # P2-3, garde de bout en bout : le premier `--force` repose sur le run
@@ -1231,6 +1652,31 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual((info["number"], info["mode"], info["sha"], info["base"]),
                          (PR, "full", GEL, AUTRE))
 
+    def test_carried_request_lit_un_titre_dont_la_base_est_illisible(self):
+        # #2364 : l'ancien run-name met la description de l'étiquette à la
+        # place de la base ; la composition reste illisible, mais la tête et
+        # le libellé restent corrélables.
+        row = unreadable_run(12, mode="full")
+        self.assertIsNone(ci.pr_run(row), "la base illisible ne prouve rien")
+        self.assertEqual(ci.carried_request(row, PR, GEL), "full")
+
+    def test_carried_request_exige_la_tete_et_le_libelle_de_la_demande(self):
+        for row in (unreadable_run(1, sha=TETE),
+                    unreadable_run(2, number=PR + 1),
+                    label_run(3, titre="tests [PR #%d base CI]" % PR),
+                    label_run(4, event="push",
+                              titre="tests [PR #%d ci-lot-%s]" % (PR, GEL))):
+            with self.subTest(row["id"]):
+                self.assertEqual(ci.carried_request(row, PR, GEL), "")
+
+    def test_carried_request_accepte_la_tete_du_payload_de_pr(self):
+        # même repli que `pr_run` : `head_sha` peut manquer, le payload de la
+        # PR liste alors la tête du libellé.
+        row = unreadable_run(5)
+        row["head_sha"] = TETE
+        row["pull_requests"] = [{"number": PR, "head": {"sha": GEL}}]
+        self.assertEqual(ci.carried_request(row, PR, GEL), "lot")
+
     def test_release_refs(self):
         self.assertTrue(ci.release_refs("release/1.10.0", "main"))
         self.assertTrue(ci.release_refs("lot/x", "integration/paquet"))
@@ -1245,6 +1691,21 @@ class ParsingTest(unittest.TestCase):
         args = parser.parse_args(["ci", "cancel", "1343", "--all", "--dry-run"])
         self.assertEqual(args.func.__name__, "cmd_ci")
         self.assertTrue(args.all and args.dry_run)
+
+    def test_la_marque_porte_l_avis_declare(self):
+        # N2 #2240 : la marque dit avis=N ; une marque d'avant #2240 (sans
+        # champ) reste lisible, avis absent.
+        note = ci._request_note("applied", PR, "ci-full-%s" % GEL, GEL, BASE,
+                                "full", "a" * 16, avis=0, seen=7)
+        found = ci.REQUEST_RE.match(note)
+        self.assertIsNotNone(found)
+        self.assertEqual((found.group("avis"), found.group("seen")), ("0", "7"))
+        legacy = ("ci-label applied pr=%d label=ci-lot-%s sha=%s base=%s "
+                  "mode=lot token=%s seen=3" % (PR, GEL, GEL, BASE, "b" * 16))
+        found = ci.REQUEST_RE.match(legacy)
+        self.assertIsNotNone(found)
+        self.assertIsNone(found.group("avis"))
+        self.assertEqual(found.group("seen"), "3")
 
 
 if __name__ == "__main__":

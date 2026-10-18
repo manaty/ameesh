@@ -37,9 +37,10 @@ def _fake_root(tmp: str, control: str, *, kill: bool = True, events: bool = True
 class TurnCgroupLinesTest(unittest.TestCase):
     def setUp(self):
         self.cfg = mock.Mock(host="hôte-de-test")
-        self.served = mock.patch.object(hostcheck, "served_agents",
-                                        return_value=[{"name": "anna"}]).start()
-        self.addCleanup(self.served.stop)
+        served = mock.patch.object(hostcheck, "served_agents",
+                                   return_value=[{"name": "anna"}])
+        served.start()
+        self.addCleanup(served.stop)
 
     def lines(self, run, root=None):
         patches = [mock.patch.object(hostcheck, "CGROUP_ROOT", root)] if root else []

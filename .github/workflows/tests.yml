@@ -8,9 +8,9 @@
 # propre Postgres :
 #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
 #               en une à quatre parts selon l'estimation ; la suite complète,
-#               en 4 parts, sur push vers main ou release/**, sur une PR de
-#               release (source ou cible release/** ou integration/**) et sur
-#               l'appel du portier de paquet (workflow_call, §12) ;
+#               en 6 parts (#2292), sur push vers main ou release/**, sur une
+#               PR de release (source ou cible release/** ou integration/**) et
+#               sur l'appel du portier de paquet (workflow_call, §12) ;
 #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
 #               et le contrat, plus la liste « always » déclenchée (#749), en
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
@@ -54,9 +54,11 @@
 # PR — `pull_request` `types: [labeled]` (un `workflow_dispatch` ne satisfait
 # pas un check requis de PR). Le job `plan` compare exactement le SHA de
 # l'étiquette à `pull_request.head.sha`, vérifie que le checkout est le
-# merge-ref composé de la base du payload et de cette tête (ses deux parents),
-# puis sélectionne contre la base du payload. Une étiquette étrangère, un SHA
-# qui ne nomme pas la tête, une composition qui a bougé ou un `ci-lot` sur
+# merge-ref composé de la pointe cible figée dans la description de l'étiquette
+# et de cette tête (ses deux parents), puis sélectionne contre cette base.
+# #2328 : `pull_request.base.sha` peut rester périmé après un mouvement de main.
+# Une étiquette étrangère, un SHA qui ne nomme pas la tête, une composition
+# qui a bougé ou un `ci-lot` sur
 # `release/**`/`integration/**` font rougir le check requis sans exécuter de
 # tests. Aucune voie version seule ou documentation seule : sur la tête gelée,
 # un check `tests` vert veut dire que des tests ont tourné. Exceptions
@@ -138,9 +140,9 @@
 name: tests
 
 # #1343 : le titre du run porte la demande de gel — PR, étiquette (mode et SHA
-# complet) et base du payload — pour que la commande et la preuve de fusion
+# complet) et pointe cible demandée — pour que la commande et la preuve de fusion
 # puissent la relire ; une poussée garde le nom de sa branche.
-run-name: "tests${{ github.event_name == 'pull_request' && format(' [PR #{0} {1} base {2}]', github.event.pull_request.number, github.event.label.name, github.event.pull_request.base.sha) || (github.event_name == 'push' && format(' [{0}]', github.ref_name) || '') }}"
+run-name: "tests${{ github.event_name == 'pull_request' && format(' [PR #{0} {1} base {2}]', github.event.pull_request.number, github.event.label.name, github.event.label.description) || (github.event_name == 'push' && format(' [{0}]', github.ref_name) || '') }}"
 
 on:
   # §12 : une poussée sur integration/** ne déclenche plus cette suite
@@ -244,10 +246,10 @@ jobs:
       # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
       # La référence distingue main (filtre doc) des branches release (suite
       # complète, quel que soit le contenu).
-      # #1343 : sur une PR, la base du diff est celle du payload
-      # (`pull_request.base.sha`), la composition même du merge-ref vérifié par
-      # la porte ci-dessous — jamais HEAD^1 deviné.
-      AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before || 'HEAD^1') }}
+      # #2328 : la commande fige la pointe cible actuelle dans la description
+      # de l'étiquette ; pulls.base.sha peut être périmé. Sans description,
+      # la porte refuse (pas de repli sur la base périmée ou sur HEAD^1).
+      AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && github.event.label.description || (github.event_name == 'push' && github.event.before || 'HEAD^1') }}
       AMEESH_CI_REF: ${{ github.ref }}
       # la tête demandée par l'étiquette (payload), tracée et comparée
       AMEESH_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -303,7 +305,7 @@ jobs:
       # avant tout plan et sans exécuter un test : l'étiquette (motif exact,
       # SHA complet), l'égalité exacte avec `pull_request.head.sha`, le mode
       # imposé par les refs (`release/**`/`integration/**` → full), et que le
-      # checkout est bien le merge-ref composé de la base du payload et de
+      # checkout est bien le merge-ref composé de la base de l'étiquette et de
       # cette tête (ses deux parents). Toute autre étiquette est refusée : le
       # check requis rougit, rien ne tourne.
       - name: gel (étiquette ci-lot/ci-full sur la tête gelée — #1343)
@@ -330,10 +332,10 @@ jobs:
           fi
           base="$AMEESH_CI_BASE"
           case "$base" in
-            *[!0-9a-f]*) echo "::error::unusable pull request base: '$base' (full 40-hex expected)"; exit 1 ;;
+            *[!0-9a-f]*) echo "::error::unusable requested base: '$base' (label description: full 40-hex expected)"; exit 1 ;;
           esac
           if [ "${#base}" != 40 ]; then
-            echo "::error::unusable pull request base: '$base' (${#base} characters, full 40-hex expected)"
+            echo "::error::unusable requested base: '$base' (${#base} characters, label description: full 40-hex expected)"
             exit 1
           fi
           release=0
@@ -351,7 +353,7 @@ jobs:
           p1="$(git rev-parse HEAD^1)"
           p2="$(git rev-parse HEAD^2)"
           if [ "$p1" != "$base" ]; then
-            echo "::error::the merge-ref base is $p1, the payload base is $base: the composition moved, refreeze the request, nothing run"
+            echo "::error::the merge-ref base is $p1, the requested base is $base: the composition moved, request CI again, nothing run"
             exit 1
           fi
           if [ "$p2" != "$head" ]; then
@@ -385,7 +387,7 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: carte/carte.json.gz
-          key: carte-${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+          key: carte-${{ steps.gel.outputs.base || github.event.before || github.sha }}
           restore-keys: carte-
       - id: plan
         name: plan of the run
@@ -430,7 +432,12 @@ jobs:
     needs: plan
     if: needs.plan.outputs.psycopg != '[]'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # #2292 : à 4 parts, 14,3-30,5 min sous saturation sur les cinq derniers
+    # paquets, et les parts 4/4 de h-1800 puis 1/4 de h-1900 ont été coupées à
+    # 30 min sans test en échec. La suite complète passe à 6 parts ; le plafond
+    # est relevé à 45 min (30,5 mesuré + marge, aligné sur « autre système de
+    # fichiers ») et reste tenu par le contrat test_899.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -454,8 +461,9 @@ jobs:
     env:
       AMEESH_DRIVER: psycopg
       FLUX_NOM: tests (flux) psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
-      # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899)
-      AMEESH_PLAFOND_MIN: "30"
+      # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899) ;
+      # 45 depuis #2292 (4 parts coupées à 30 min sur h-1800/h-1900).
+      AMEESH_PLAFOND_MIN: "45"
     steps:
       - &debut
         name: début du job (mesure du plafond, #899)
@@ -938,7 +946,7 @@ jobs:
           fetch-depth: 0  # the tags, and the range since the last one
       - name: number against content
         # #1343 : la porte `gel` du job plan vérifie que HEAD est le merge-ref
-        # composé de la base du payload (HEAD^1) et de la tête étiquetée (HEAD^2),
+        # composé de la base demandée (HEAD^1) et de la tête étiquetée (HEAD^2),
         # et refuse sinon ; `HEAD^1` est donc la base exacte, et la commande garde
         # la forme du contrat L158 (tests/test_l158_version_level.py).
         run: python3 scripts/version-level.py pr HEAD^1 HEAD

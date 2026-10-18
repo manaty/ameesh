@@ -1,0 +1,43 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- The example application of L92: a fictional organisation ("Acme") embeds
+     the interface of its mesh in a host page. Served by fixtures-server.mjs:
+       node ui/examples/acme-mesh/fixtures-server.mjs
+     No inline script or style: the page runs under a strict CSP, like a host
+     application would impose on itself. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Acme portal — ameesh</title>
+<link rel="stylesheet" href="/ui/ameesh-ui.css">
+<link rel="stylesheet" href="example.css">
+<script type="module" src="app.mjs"></script>
+</head>
+<body>
+<header class="bar">
+  <strong>Acme portal</strong>
+  <span class="muted">fictional organisation, fixtures only</span>
+  <label>Theme
+    <select id="theme">
+      <option value="auto" selected>auto</option>
+      <option value="light">light</option>
+      <option value="dark">dark</option>
+    </select>
+  </label>
+  <label>Language
+    <select id="language">
+      <option value="en" selected>English</option>
+      <option value="fr">Français</option>
+    </select>
+  </label>
+  <button id="notify" type="button">Notify the host</button>
+  <button id="approval" type="button">Request an approval</button>
+  <span id="status" role="status" aria-live="polite" class="muted"></span>
+</header>
+<ameesh-config>
+  <ameesh-app></ameesh-app>
+</ameesh-config>
+</body>
+</html>
