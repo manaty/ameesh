@@ -60,7 +60,9 @@ class MesuresTest(unittest.TestCase):
     def test_seuils_par_defaut(self):
         limits = resources.thresholds(None)
         self.assertEqual(limits["min_mem_available"], resources.DEFAULT_MIN_MEM_AVAILABLE)
-        self.assertEqual(limits["max_swap_used"], resources.DEFAULT_MAX_SWAP_USED)
+        # #2296: pas de plafond de swap par défaut (un stock n'est pas une
+        # pression ; le défaut de 8 Gio faisait un faux critique au démarrage)
+        self.assertIsNone(limits["max_swap_used"])
         self.assertEqual(limits["min_disk_free"], resources.DEFAULT_MIN_DISK_FREE)
         self.assertGreater(limits["max_load"], 0)
 

@@ -404,8 +404,14 @@ La commande vérifie l'`origin` du clone contre le dépôt de l'issue du lot
 Le commit doit désigner le lot par `ameesh-work: <id>`, le titre de fusion
 de sa branche, ou `#<id>` dans le titre si `ameesh.lotRef hash` est activé.
 Une déclaration partielle est refusée. Un numéro de PR homonyme ne suffit
-pas. Un refus affiche le projet et le titre du lot ; aucun état ni jalon
-n'est écrit. Le SHA abrégé accepté est conservé sous sa forme complète.
+pas. Depuis #1400, la branche enregistrée du lot est reconnue dans un vrai
+commit de fusion (forme GitHub `Merge pull request #N from
+<propriétaire>/<branche>` comprise ; le propriétaire doit être celui du
+dépôt canonique, la branche homonyme d'un fork ne prouve rien), et le
+constat — lot, projet, titre et sujet du commit — est affiché avant toute
+écriture ; aucun `--force`. Un refus affiche le projet et le titre du lot ;
+aucun état ni jalon n'est écrit. Le SHA abrégé accepté est conservé sous sa
+forme complète.
 Sans `--repo`, le clone configuré pour ce dépôt est utilisé, sinon le
 dossier courant. La lecture reste locale : récupérer la cible au préalable
 si nécessaire. Un commit sans rattachement ne ferme pas le lot.
@@ -685,9 +691,9 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
    carries these rules and the working rules of the canon — integration by
-   packages, review before CI and no CI per lot between cuts, sober proofs
-   (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only through a
-   reviewed commit.
+   hourly packages, review before CI and no CI per lot between packages, sober
+   proofs (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only
+   through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` arrête chaque
    exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
    Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance

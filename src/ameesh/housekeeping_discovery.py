@@ -106,7 +106,7 @@ def discover(db, host: str, agents: dict, roots, *, dry_run: bool) -> dict:
     for path, (row, repo, witness) in remaining[:DISCOVERY_LIMIT]:
         if time.monotonic() >= deadline:
             break
-        if _marker(path) != "linked" or hk.common_dir(path) != repo:
+        if _marker(path) != "linked" or not hk.same_repository(path, repo):
             signal(path, "linked worktree no longer matches its repository; kept")
             continue
         # A checkout or recreation can happen after the repository listing.
