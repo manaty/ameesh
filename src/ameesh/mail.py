@@ -373,6 +373,15 @@ def history(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     return storage.of(db).mailbox.history(recipient, limit)
 
 
+def delivered_for_lot(db: Db, recipient: str, lot, limit: int) -> list[dict]:
+    """#2539 : les derniers messages déjà remis de ce lot, filtrés dans la
+    requête (destinataire + lot), sans fenêtre de temps. Non admis en mode
+    médié (contrat fermé) : l'appelant retombe sur les non-lus."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.delivered_for_lot")
+    return storage.of(db).mailbox.delivered_for_lot(recipient, str(lot or "").strip(), limit)
+
+
 def pending_recipients(db: Db) -> list[str]:
     return storage.of(db).mailbox.pending_recipients()
 

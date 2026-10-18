@@ -4388,6 +4388,7 @@
    ],
    "mailbox": [
     "dead_letters",
+    "delivered_for_lot",
     "expire_dead_letters",
     "forward",
     "history",
