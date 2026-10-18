@@ -64,6 +64,10 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   sans équipe connue n'est pas pris ;
 * l'agent sait le faire : les capacités exigées sont les siennes, et
   `harness:<nom>` désigne son harnais ;
+* un lot de relecture après fusion (`issue_ref` = `review-after-merge:#<lot>`,
+  #2377) n'est pris que par un agent de la famille opposée à celle de l'auteur
+  au gel (`review_lot.reviewer_family`) ; famille d'auteur inconnue : le lot
+  n'est pas pris au repos, il attend une attribution explicite ;
 * un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
   sa date ;
 * un lot avec une dépendance explicite encore ouverte attend son amont ;
@@ -461,7 +465,6 @@ def _default_budget_check(cfg, db):
 
 
 def lot_take_message(item: dict, orchestras: list) -> str:
-    stack = (item.get("stack_on") or "").strip()
     return ("Lot #%d, taken on your own (L165): you were idle and this lot of your team "
             "had no taker: %s%s\n"
             "%s can reassign it; if they give you something else, that comes first. "
@@ -471,18 +474,11 @@ def lot_take_message(item: dict, orchestras: list) -> str:
             "server, committed spending): propose it to a human and stop there. "
             "If the lot is not for you (capability, context), say so right away "
             "(ameesh work note %d, and a message to %s) rather than keeping it."
-            "%s" % (
+            % (
                 int(item["id"]), item["title"],
                 "\n%s" % item["body"] if (item.get("body") or "").strip() else "",
                 ", ".join(orchestras) if orchestras else "The orchestrator",
-                int(item["id"]), ", ".join(orchestras) if orchestras else "the orchestrator",
-                # #1677 : le lot s'empile sur des bloqueurs encore en qa à
-                # verdict favorable ; leur branche et leur tête gelée sont la
-                # base de départ, le rebase suit leur fusion (file de fusion).
-                ("\nStacked on blocker(s) still in qa with a favourable verdict: %s. "
-                 "Start your branch from that frozen head (the branch above); once the "
-                 "blocker merges, rebase on the new main before landing." % stack)
-                if stack else ""))
+                int(item["id"]), ", ".join(orchestras) if orchestras else "the orchestrator"))
 
 
 def review_proposal_message(item: dict, agent: str, *, kind: str, family: str) -> str:
@@ -552,12 +548,15 @@ def _lot_project(item: dict) -> str:
 
 
 def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
-             others=None) -> bool:
+             others=None, db=None) -> bool:
     """Le lot vise-t-il un des projets de l'agent, et l'agent sait-il le faire ?
     Une capacité exigée `harness:<nom>` désigne le harnais de l'agent.
 
     `others` : les lignes du registre, pour la garde structurelle de classe
     (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
+    `db` : requis pour un lot de relecture après fusion (#2377) — sa famille
+    de preneur se relit sur le gel du lot d'origine ; sans base, un tel lot
+    n'est pas pris (doute -> refus).
     """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
@@ -570,7 +569,10 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
         have.add("%s%s" % (HARNESS_PREFIX, agent["harness"]))
     if not set(item.get("required_capabilities") or ()) <= have:
         return False
-    return not declared_class(item) or other_family_available(agent, others)
+    if declared_class(item) and not other_family_available(agent, others):
+        return False
+    from . import review_lot
+    return review_lot.may_take(db, item, agent)
 
 
 def _primary_project(agent: dict) -> str:
@@ -747,7 +749,7 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
             # B4 : la prise d'un lot exige son équipe, ses capacités et la
             # garde de classe (#803) ; une proposition suit la même règle.
             if not lot_fits(item, reg, auditor=name in auditors,
-                            card=auditors.get(name), others=listing):
+                            card=auditors.get(name), others=listing, db=db):
                 continue
             correction = (item.get("last_verdict") or "") == "blocked"
             family = ""
@@ -956,7 +958,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             auditors = auditor_mod.cards([agent], canons)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
-                                card=auditors.get(row["name"]), others=listing):
+                                card=auditors.get(row["name"]), others=listing, db=db):
                     continue
                 if not _directory_ready(cfg, db, agent, item, _lot_project(item),
                                         canons=canons, dry_run=dry_run, notes=dir_notes):
@@ -993,8 +995,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 lots.remove(item)
                 if done is None:
                     continue                # pris entre-temps : lot suivant
-                done = dict(done, lot_team=item["lot_team"],
-                            stack_on=item.get("stack_on"))
+                done = dict(done, lot_team=item["lot_team"])
                 payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
                                         "team": item["lot_team"]}}
                 message_id = mail.send(db, SENDER, check["assignee"],

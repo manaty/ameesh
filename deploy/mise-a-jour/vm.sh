@@ -268,11 +268,15 @@ unite_systemctl() {  # unité commande [arguments]
 # `drain_seconds`, sous `TimeoutStopSec`), plus aucun nouveau tour ne part. On
 # ne décide pas d'arrêter sur une lecture de statut — un tour peut partir juste
 # après elle — et on ne relance jamais au-dessus d'un processus vivant.
-# Seul `inactive` avec MainPID=0 prouve le point sûr ; `failed` est refusé :
-# après un stop il signifie que le drainage n'a pas abouti proprement (délai
-# dépassé puis SIGKILL, sortie en erreur) — on ne recouvre pas ça en silence.
+# Only inactive with MainPID=0 proves the safe point. Clear a preexisting
+# failure BEFORE stop (#1907), so a new failure during drainage stays visible.
 redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
   local u=$1 etat pid
+  etat=$(unite_systemctl "$u" show -p ActiveState --value) || return 1
+  if [ "$etat" = failed ]; then
+    unite_systemctl "$u" reset-failed \
+      || { echo "$u : reset-failed échoue — aucun démarrage" >&2; return 1; }
+  fi
   unite_systemctl "$u" stop \
     || { echo "$u : l'arrêt échoue" >&2; return 1; }
   etat=$(unite_systemctl "$u" show -p ActiveState --value) || return 1

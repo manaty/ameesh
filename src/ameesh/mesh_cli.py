@@ -550,14 +550,18 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             def tag(key: str) -> str:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
-            print("  thresholds memory ≥ %s%s; swap ≤ %s%s; load ≤ %.2f%s; disk ≥ %s%s"
-                  "; tmpfs ≤ %s%s"
+            print("  thresholds memory ≥ %s%s; swap ≤ %s%s (counts only under memory"
+                  " pressure); load ≤ %.2f%s; disk ≥ %s%s; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
                      _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
                      limits["max_load"], tag("max_load"),
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
                      tag("max_tmpfs_used")))
+            # #2296: the admission signal that follows the real pressure
+            print("  thresholds memory pressure ≤ %s%s"
+                  % (res.fmt_value("max_mem_pressure", limits["max_mem_pressure"]),
+                     tag("max_mem_pressure")))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -1529,6 +1533,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "dependencies":
             from . import work_dependencies
             return work_dependencies.run(db, args)
+        if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
+            from . import work_dependencies
+            return work_dependencies.run_landing(db, args)
         if args.work_command == "queue":   # merge queue per target (L160e)
             from . import merge_queue
             return merge_queue.run(cfg, db, args)
@@ -1924,9 +1931,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
+            def _declare_constat(constat: dict) -> None:
+                # #1400 : le constat (lot/app/titre + sujet du commit, et la
+                # forme de la preuve) est montré AVANT l'écriture ; l'état du
+                # lot ne change qu'après.
+                print("declaring merge: lot #%d (%s: %s)"
+                      % (constat["id"], constat["app"] or "?", constat["title"]))
+                print("commit %s (%s): %s"
+                      % (constat["sha"][:12], constat["how"], constat["subject"]))
+
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
                                actor=args.actor, repo=args.repo, migration_landed=args.migration_landed,
-                               cfg=cfg)
+                               cfg=cfg, announce=_declare_constat)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
             elif done["result"] == "landed":
@@ -2832,6 +2848,7 @@ def build_parser() -> argparse.ArgumentParser:
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
+    work_dependencies.add_landing_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")

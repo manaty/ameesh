@@ -26,6 +26,10 @@ CORRESPONDANCES = {
     },
     # états du journal qui marquent le premier passage « en cours »
     "etats_en_cours": ("build",),
+    # états où la date prévue reste pilotable par le porteur : la tâche est
+    # demandée ou en cours ; plus avancée (relecture, attente), elle ne l'est
+    # plus, et sa date ne déclenche donc pas d'alerte (#2342)
+    "etats_actifs": ("intake", "build"),
     # états d'une tâche livrée (l'effet a eu lieu) et d'une tâche abandonnée
     "etats_livres": tuple(work_mod.MERGED_STATES),
     "etats_abandonnes": ("closed",),
@@ -65,6 +69,12 @@ def in_progress(state: str | None) -> bool:
     return (state or "") in CORRESPONDANCES["etats_en_cours"]
 
 
+def active(state: str | None) -> bool:
+    """La date prévue reste pilotable par le porteur (tâche demandée ou en
+    cours) : plus avancée, elle attend un tiers et n'alerte pas (#2342)."""
+    return (state or "") in CORRESPONDANCES["etats_actifs"]
+
+
 def attend_decision(state: str | None) -> bool:
     return (state or "") in CORRESPONDANCES["etats_decision"]
 
@@ -79,4 +89,5 @@ jalon = milestone
 livree = delivered
 abandonnee = abandoned
 en_cours = in_progress
+actif = active
 etat_generique = generic_state

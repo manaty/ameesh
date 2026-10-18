@@ -50,6 +50,12 @@ l'idempotence reste celle de `open_after_merge`.
 avant toute lecture de classe, pour couper la récursion des fausses fusions
 d'avis. Le corps du lot de relecture dit aussi au lecteur de clore sa mission
 par `ameesh work close <id> --done` après avoir livré son verdict.
+
+#2377 : la famille écrite au corps n'était qu'une consigne — la prise au repos
+(L165) ouvrait le lot à toute l'équipe, et un agent de la famille de l'auteur
+pouvait le prendre (#2340). `required_family` relit la même preuve au moment
+de la prise et `may_take` n'ouvre le lot qu'à la famille opposée ; l'auteur
+inconnu ne se devine pas, et le lot attend alors une attribution explicite.
 """
 from __future__ import annotations
 
@@ -177,6 +183,19 @@ def _open(ops, ref: str) -> Optional[dict]:
         if rows:
             return rows[0]
     return None
+
+
+def _noted(ops, lot: int, prefix: str) -> list:
+    """Les notes du journal du lot `lot` qui commencent par `prefix`.
+
+    #1448 N2 : la lecture est bornée par le préfixe et le lot, jamais par les
+    200 derniers événements — une marque ancienne d'un lot très bavard reste
+    lue. Best effort : un journal illisible ne rend aucune trace."""
+    try:
+        rows = ops.events_noted(prefix, 0.0, ids=[int(lot)])
+        return list(rows or [])
+    except Exception:  # noqa: BLE001 - journal illisible : pas de trace
+        return []
 
 
 def _marked(ops, lot: int, ref: str) -> bool:
@@ -317,6 +336,51 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     except Exception:  # noqa: BLE001 - toute trace illisible : famille inconnue
         pass
     return out
+
+
+def required_family(db, item: dict) -> Optional[str]:
+    """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
+
+    `None` quand ce n'est pas un lot de relecture (`issue_ref` hors du préfixe
+    `review-after-merge:`) : aucune garde. Une chaîne vide quand la famille de
+    l'auteur au gel est inconnue, ou quand sa trace est illisible : le lot
+    n'est alors **pris par personne** au repos (doute -> non pris, canon §8) et
+    attend une attribution explicite. Sinon la famille opposée à celle de
+    l'auteur au gel (`reviewer_family`), celle que le canon §2 demande au
+    relecteur.
+
+    La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
+    qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
+    courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
+    ref = str((item or {}).get("issue_ref") or "").strip().lower()
+    if not ref.startswith(PREFIX):
+        return None
+    try:
+        lot = int(ref[len(PREFIX):].strip().lstrip("#"))
+        source = work.get(db, lot)
+        if source is None:
+            return ""
+        family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"))
+    except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
+        return ""
+    return "" if family == UNKNOWN_FAMILY else family
+
+
+def may_take(db, item: dict, agent: dict) -> bool:
+    """Un agent au repos peut-il prendre ce lot ? (#2377)
+
+    Hors lot de relecture, oui, sans autre condition. Pour un lot de
+    relecture, seule la famille opposée à celle de l'auteur au gel le prend ;
+    la session vivante du preneur fait foi (`registry.live_harness`, #1037),
+    et un harnais hors des familles connues (`family_of`) ne compte pas.
+    Famille de l'auteur inconnue ou famille du preneur inconnue : non — la
+    prise ne devine jamais une indépendance d'avis (#1374)."""
+    family = required_family(db, item)
+    if family is None:
+        return True
+    from . import registry
+    mine = family_of(registry.live_harness(agent or {}))
+    return bool(family) and family == mine
 
 
 def title_of(item: dict, lot: int) -> str:
@@ -660,13 +724,13 @@ def catch_up(db, *, repo: str = "", target: str = "",
             pass
 
     def attempts(lot):
-        """Le nombre de tentatives déjà marquées au journal du lot."""
-        try:
-            events = ops.events(int(lot), 200) or []
-        except Exception:  # noqa: BLE001 - journal illisible : compteur à zéro
-            return 0
+        """Le nombre de tentatives déjà marquées au journal du lot.
+
+        #1448 N2 : compté sur les seules notes de tentative du lot
+        (`_noted`), pas sur les 200 derniers événements — un lot bavard ne
+        remet pas son compteur à zéro et ne retente pas sans fin."""
         token = "%s%d" % (ATTEMPT_PREFIX, int(lot))
-        return sum(1 for e in events
+        return sum(1 for e in _noted(ops, lot, ATTEMPT_PREFIX)
                    if str(e.get("note") or "").split(" ")[0] == token)
 
     for row in rows:

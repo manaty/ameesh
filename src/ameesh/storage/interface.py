@@ -1769,13 +1769,14 @@ class WorkItems(Domain):
         (la prise automatique, `backlog.auto_take`) : même contrôle sous le
         même verrou, mais le lot reste où il est et `PendingLot` est levée.
         `ready_only` (L165) exige un lot intake sans assigné dont toutes les
-        dépendances sont satisfaites ; vérifié sous verrou dans la même
-        transaction que l'attribution. `current` doit alors être NULL : toute
-        autre valeur est une erreur d'appel (`ValueError` immédiate, avant le
-        verrou) et non un None silencieux (#1696). La réservation manuelle
-        garde son comportement par défaut. #705 : si le nouvel assigné est le
-        relecteur désigné, la désignation tombe dans la même écriture (le
-        journal la nomme) — un relecteur ne relit pas son propre travail."""
+        dépendances sont FUSIONNÉES (`merged`/`promoted`/`closed`, #2252) ;
+        vérifié sous verrou dans la même transaction que l'attribution.
+        `current` doit alors être NULL : toute autre valeur est une erreur
+        d'appel (`ValueError` immédiate, avant le verrou) et non un None
+        silencieux (#1696). La réservation manuelle garde son comportement par
+        défaut. #705 : si le nouvel assigné est le relecteur désigné, la
+        désignation tombe dans la même écriture (le journal la nomme) — un
+        relecteur ne relit pas son propre travail."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str | None, *, current: str, state: str,
@@ -1970,14 +1971,19 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def unassigned_lots(self, limit: int) -> list[dict]:
         """L165 : les lots du projet encore à confier (`intake`, sans assigné,
-        hors file d'amélioration, sans dépendance ouverte), dans l'ordre de
-        prise : priorité, puis dates prévues (début, fin, livraison ; sans date en dernier), puis
-        ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
-        fiche ou de la fiche parente, sinon son application),
-        `pending_decision` (une demande de décision attend sur le lot) et
-        `decision_milestone` (un jalon de décision ouvert y est rattaché).
+        hors file d'amélioration, sans dépendance non fusionnée), dans l'ordre
+        de prise : priorité, puis dates prévues (début, fin, livraison ; sans
+        date en dernier), puis ancienneté. Chaque ligne ajoute `lot_team`
+        (équipe du lot, sinon de sa fiche ou de la fiche parente, sinon son
+        application), `pending_decision` (une demande de décision attend sur
+        le lot) et `decision_milestone` (un jalon de décision ouvert y est
+        rattaché).
         #1193: a lot whose explicit prerequisite is not finished is excluded —
-        the ready intake never offers a lot that cannot be started."""
+        the ready intake never offers a lot that cannot be started.
+        #2252 : « finished » veut dire fusionné (`merged`/`promoted`/`closed`) :
+        un bloqueur en `qa`, même à verdict favorable, garde une tête qui peut
+        encore changer ; la règle est celle de `work show` et de
+        « planned: waiting on lots »."""
 
     @abc.abstractmethod
     def review_proposals(self, limit: int, *, proposal_prefix: str,

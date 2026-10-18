@@ -1920,13 +1920,14 @@ def quota_line(state_dir, *, now=None) -> str | None:
 #     + contrat) ou `ci-full-<S>` (suite complète), posée par la commande sur
 #     la PR (`pull_request` `types: [labeled]`). Le job `plan` compare
 #     exactement ce SHA à `pull_request.head.sha`, vérifie que le checkout est
-#     le merge-ref composé de la base du payload et de cette tête (ses deux
-#     parents), et sélectionne contre la base du payload ;
+#     le merge-ref composé de la pointe cible figée dans la description de
+#     l'étiquette et de cette tête (ses deux parents), puis sélectionne contre
+#     cette base (#2328 : `pull_request.base.sha` peut être périmé) ;
 #   * le jeton `gh` doit produire l'événement `pull_request: labeled` : un
 #     `GITHUB_TOKEN` d'Actions (acteur `github-actions[bot]`) ne déclenche
 #     aucun workflow et est refusé ;
 #   * idempotence bornée au parcours PR et à la composition courante (numéro
-#     de PR, tête gelée S, base du payload, mode) : un vert ou un run en vol de
+#     de PR, tête gelée S, pointe cible demandée, mode) : un vert ou un run en vol de
 #     cette composition rend la main sans rien toucher ; un push vert de la
 #     même tête ne remplace pas le check de la PR, pas plus qu'un ancien
 #     dispatch ; une base qui a bougé demande une nouvelle demande ;
@@ -1975,7 +1976,7 @@ MAX_AVIS = 2
 RESERVE_TTL_S = 15 * 60
 #: l'étiquette qui demande la CI d'un gel : mode et SHA complet (#1343)
 LABEL_RE = re.compile(r"^ci-(?P<mode>lot|full)-(?P<sha>[0-9a-f]{40})$")
-#: le titre du run (run-name de tests.yml) : PR, étiquette, base du payload
+#: le titre du run (run-name de tests.yml) : PR, étiquette, pointe cible demandée
 PR_RUN_RE = re.compile(
     r"\[PR #(?P<number>\d+) (?P<label>ci-(?:lot|full)-[0-9a-f]{40}) "
     r"base (?P<base>[0-9a-f]{40})\]")
@@ -1985,11 +1986,13 @@ PR_RUN_RE = re.compile(
 #: `seen=<id>` (P2-3) : le plus grand identifiant d'exécution connu avant sa
 #: pose, seule corrélation fiable avec le run qu'elle a produit (les horloges
 #: de la base et de GitHub ne se comparent pas : la seconde contre la fraction).
+#: `avis=<N>` (N2 #2240) garde le nombre d'avis déclaré par l'appelant, y
+#: compris 0 : `--avis 0 --full` reste lisible dans la trace du lot.
 REQUEST_RE = re.compile(
     r"^ci-label (?P<state>reserve|applied|released) pr=(?P<pr>\d+) "
     r"label=(?P<label>ci-(?:lot|full)-[0-9a-f]{40}) sha=(?P<sha>[0-9a-f]{40}) "
     r"base=(?P<base>[0-9a-f]{40}) mode=(?P<mode>lot|full) token=(?P<token>[0-9a-f]{16})"
-    r"(?: seen=(?P<seen>\d+))?\b")
+    r"(?: avis=(?P<avis>\d+))?(?: seen=(?P<seen>\d+))?\b")
 #: l'acteur du `GITHUB_TOKEN` d'Actions : ses étiquettes ne déclenchent rien
 ACTIONS_BOT = "github-actions[bot]"
 
@@ -2161,7 +2164,7 @@ def _current_run(row: dict, frozen: str, number: int, base: str) -> bool:
 
 
 def _pr_of(api, repo: str, branch: str) -> dict:
-    """La PR ouverte de la branche : numéro, tête, base, refs, étiquettes."""
+    """La PR ouverte : numéro, tête, pointe cible actuelle, refs, étiquettes."""
     owner = repo.split("/", 1)[0]
     rows = api("repos/%s/pulls?state=open&head=%s:%s&per_page=10"
                % (repo, _q(owner), _q(branch)))
@@ -2174,13 +2177,20 @@ def _pr_of(api, repo: str, branch: str) -> dict:
         raise GelError("branch %s has %d open pull requests in %s: one only"
                        % (branch, len(rows), repo))
     pr = rows[0]
+    base_ref = ((pr.get("base") or {}).get("ref") or "").strip()
+    if not base_ref:
+        raise GelError("pull request #%s: missing target branch, the composition "
+                       "cannot be checked" % pr.get("number"))
+    # #2328 : pulls.base.sha peut encore nommer la base du dernier push de
+    # tête, alors que le merge-ref utilise déjà la nouvelle pointe cible.
+    base = _head_of(api, repo, base_ref)
     labels = [(lab.get("name") if isinstance(lab, dict) else str(lab))
               for lab in pr.get("labels") or ()]
     return {"number": int(pr.get("number") or 0),
             "head": ((pr.get("head") or {}).get("sha") or "").strip().lower(),
-            "base": ((pr.get("base") or {}).get("sha") or "").strip().lower(),
+            "base": base,
             "head_ref": ((pr.get("head") or {}).get("ref") or ""),
-            "base_ref": ((pr.get("base") or {}).get("ref") or ""),
+            "base_ref": base_ref,
             "labels": [name for name in labels if name]}
 
 
@@ -2201,7 +2211,45 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
         text = base64.b64decode(content).decode("utf-8", "replace")
     except (ValueError, TypeError):
         return False
-    return "types: [labeled]" in text and "ci-(lot|full)-" in text
+    return ("types: [labeled]" in text and "ci-(lot|full)-" in text
+            and "github.event.label.description" in text)
+
+
+def _reviews_at(api, repo: str, ref: str) -> set[str] | None:
+    """Les fichiers du dossier `reviews/` à `ref`, ou None s'il est illisible."""
+    from . import plan_github
+    try:
+        data = api("repos/%s/contents/reviews?ref=%s" % (repo, _q(ref)))
+    except plan_github.GithubError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return {str(item.get("name") or "") for item in data
+            if isinstance(item, dict) and item.get("type") == "file"}
+
+
+def _manifest_name(head_ref: str) -> str:
+    """`integration/<nom>` → `integration-<nom>.md`, le nom que publient les porteurs."""
+    return "integration-%s.md" % head_ref[len("integration/"):].replace("/", "-")
+
+
+def _carrier_manifest(api, repo: str, head_ref: str, sha: str, base: str) -> str:
+    """Le manifeste de composition que publie le porteur à `sha`, ou "" (N1 #2240).
+
+    Un porteur `integration/<nom>` publie `reviews/integration-<nom>.md` :
+    c'est la revue unitaire du paquet qui tient lieu d'avis sur la tête
+    composée, pour la seule demande de CI (`--avis 0 --full`). Le manifeste
+    doit être le sien et absent de la base de la PR : `main` porte déjà ceux
+    des paquets fusionnés, qu'une branche `integration/**` hériterait sans rien
+    publier (R1 ameesh-dev1). Toute réponse illisible vaut « pas de manifeste » :
+    le refus est nommé, jamais un zéro avis supposé.
+    """
+    name = _manifest_name(head_ref)
+    at_head = _reviews_at(api, repo, sha)
+    at_base = _reviews_at(api, repo, base)
+    if at_head is None or at_base is None or name not in at_head or name in at_base:
+        return ""
+    return name
 
 
 def _short_run(row: dict) -> dict:
@@ -2241,9 +2289,13 @@ def _latest_check(api, repo: str, sha: str) -> dict | None:
 
 def _request_note(state: str, number: int, label: str, sha: str, base: str,
                   mode: str, token: str, text: str = "",
-                  seen: int | None = None) -> str:
+                  avis: int | None = None, seen: int | None = None) -> str:
     marker = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
               % (state, number, label, sha, base, mode, token))
+    if avis is not None:
+        #: N2 #2240 : le nombre d'avis déclaré par l'appelant reste lisible
+        #: dans la marque, `--avis 0 --full` compris (aucun passage muet).
+        marker += " avis=%d" % avis
     if seen is not None:
         marker += " seen=%d" % seen
     return "%s: %s" % (marker, text.strip()) if text.strip() else marker
@@ -2261,6 +2313,7 @@ def request_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
                     "pr": int(m.group("pr")), "label": m.group("label"),
                     "sha": m.group("sha"), "base": m.group("base"),
                     "mode": m.group("mode"), "token": m.group("token"),
+                    "avis": int(m.group("avis")) if m.group("avis") is not None else None,
                     "seen": int(m.group("seen")) if m.group("seen") is not None else None,
                     "ts": float(ev.get("created_ts") or 0.0)})
     return sorted(out, key=lambda e: e["id"])
@@ -2408,6 +2461,24 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     if not _sha_ok(pr["base"]):
         raise GelError("pull request #%d: unusable base commit (%r): the composition "
                        "cannot be checked" % (pr["number"], pr["base"]))
+    if full and avis == 0 and not exception:
+        # (b) §12 #2240 (pilote mesh-design, 17/10 13:22) : le zéro avis d'une
+        # suite complète est réservé à un porteur `integration/**` qui publie
+        # son manifeste ; hors de ce cas la relecture reste la règle (#2214).
+        # Cette garde ne touche que la demande de CI : checks requis,
+        # review_gate et porte de fusion du porteur restent inchangés.
+        head_ref = (pr["head_ref"] or "").strip()
+        if not head_ref.startswith("integration/"):
+            raise GelError("pull request #%d: --avis 0 --full is reserved to an "
+                           "integration/** carrier head (source %r); review the head "
+                           "and pass its required verdicts"
+                           % (pr["number"], head_ref or "—"))
+        manifest = _carrier_manifest(api, name, head_ref, frozen_sha, pr["base"])
+        if not manifest:
+            raise GelError("pull request #%d: --avis 0 --full needs the carrier's own "
+                           "manifest (reviews/%s) at %s, absent from the base; without "
+                           "it, review the head and pass its required verdicts"
+                           % (pr["number"], _manifest_name(head_ref), frozen_sha[:12]))
     if release_refs(pr["head_ref"], pr["base_ref"]) and mode == "lot":
         raise GelError("pull request #%d: source %s or target %s is release/** or "
                        "integration/**: request the full suite (--full --reason …); a lot "
@@ -2482,7 +2553,8 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                            "nothing posed" % held["token"]}
     if not _carries_freeze_request(api, name, frozen_sha):
         raise GelError("the workflow at %s does not carry the freeze request trigger "
-                       "(#1343, ci-lot/ci-full label): rebase the lot on main before "
+                       "with a pinned target base (#1343/#2328, ci-lot/ci-full label): "
+                       "rebase the lot on main before "
                        "requesting the CI" % frozen_sha[:12])
     return {**decision, "action": "request",
             "why": ("%s verdict(s) on %s" % (len(reviews), frozen_sha[:12])
@@ -2565,18 +2637,25 @@ def _label_exists(gh, repo: str, name: str) -> bool:
     return code == 0
 
 
-def _ensure_label(gh, repo: str, name: str, mode: str, sha: str) -> None:
-    """Crée l'étiquette du dépôt si elle manque (une par demande, #1343)."""
-    if _label_exists(gh, repo, name):
-        return
-    payload = json.dumps({"name": name,
-                          "color": "0e8a16" if mode == "lot" else "1d76db",
-                          "description": "CI #1343 %s sur %s" % (mode, sha[:12])})
-    code, out, err = gh.run(["api", "-X", "POST", "repos/%s/labels" % repo,
-                             "--input", "-"], payload)
+def _ensure_label(gh, repo: str, name: str, mode: str, base: str) -> None:
+    """Fige la pointe cible dans la description avant l'événement labeled.
+
+    L'événement conserve cette description : le titre du run, le plan et les
+    parents du merge-ref portent ainsi la même base, même si pulls.base.sha
+    est périmé. Une reprise actualise aussi une étiquette existante (#2328).
+    """
+    exists = _label_exists(gh, repo, name)
+    payload = {"description": base}
+    path = "repos/%s/labels" % repo
+    if exists:
+        path += "/%s" % _q(name)
+    else:
+        payload.update({"name": name, "color": "0e8a16" if mode == "lot" else "1d76db"})
+    code, out, err = gh.run(["api", "-X", "PATCH" if exists else "POST", path,
+                             "--input", "-"], json.dumps(payload))
     if code != 0:
-        raise GelError("cannot create the label %s in %s: %s"
-                       % (name, repo, _gh_error(out, err)))
+        raise GelError("cannot %s the label %s in %s: %s"
+                       % ("update" if exists else "create", name, repo, _gh_error(out, err)))
 
 
 def _drop_label(gh, repo: str, number: int, name: str, *, delete_label: bool) -> list[str]:
@@ -2594,7 +2673,7 @@ def _drop_label(gh, repo: str, number: int, name: str, *, delete_label: bool) ->
     return failed
 
 
-def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> dict:
+def _pose_request(gh, repo: str, pr: dict, label: str, mode: str) -> dict:
     """Retire les étiquettes de demande périmées de la PR, puis pose la nôtre.
 
     Rend `{ok, dropped, failed, error}` ; ne lève pas : un refus est dit. Une
@@ -2616,7 +2695,7 @@ def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> d
             return {"ok": False, "dropped": dropped, "failed": failed,
                     "error": "cannot remove the label %s before posing it again" % label}
     try:
-        _ensure_label(gh, repo, label, mode, sha)
+        _ensure_label(gh, repo, label, mode, pr["base"])
     except GelError as exc:
         return {"ok": False, "dropped": dropped, "failed": failed, "error": str(exc)}
     code, out, err = gh.run(["api", "-X", "POST",
@@ -2707,9 +2786,11 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
 
     def critical(tx) -> dict:
         def note(state: str, text: str = "", seen: int | None = None) -> None:
+            #: N2 #2240 : chaque marque porte le nombre d'avis déclaré, y
+            #: compris 0 (`--avis 0 --full` ne passe plus sans trace).
             work.note(tx, int(item_id),
                       _request_note(state, number, label, sha, base, mode, token, text,
-                                    seen=seen))
+                                    avis=int(decision.get("avis") or 0), seen=seen))
 
         note("reserve", "freeze CI requested")
         known = _pr_runs(api, decision["repo"], number, sha, decision["branch"])
@@ -2789,7 +2870,7 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                    "run `ameesh ci run %d` again" % (base[:12], pr["base"][:12], item_id))
             note("released", why)
             return {"requested": False, "action": "refuse", "why": why}
-        posed = _pose_request(gh, decision["repo"], pr, label, mode, sha)
+        posed = _pose_request(gh, decision["repo"], pr, label, mode)
         if not posed["ok"]:
             note("released", posed["error"])
             return {"requested": False, "action": "refuse", "why": posed["error"]}

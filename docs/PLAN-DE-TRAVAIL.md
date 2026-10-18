@@ -293,7 +293,11 @@ reality. Migration 0044.
   commitments, pending decisions, today line, delays, source of each
   item; plus "who is advancing on what".
 * **Alert** `engagement_overdue` (pushed by `ameesh notify`): a
-  commitment or planned date passed without the item being reached.
+  commitment or a date set by a person passed without the item being
+  reached. Dates computed by `work schedule` (source `reference p80…`) are
+  re-dated on its next pass, and a lot no longer driven by its holder
+  (blocked, under review, or held by a planned wait) raises no date alert;
+  a lot with both a date and an engagement gives one alert (the engagement).
 
 Project tracking is in the **generic core**: the roadmap code
 names no business state or milestone; the mapping to the

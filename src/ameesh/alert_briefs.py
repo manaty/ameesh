@@ -131,7 +131,9 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
     if alert.get("lot_state") == "qa" and alert.get("waiting_for") == "fusion":
         return ("this lot is frozen with its verdict acquired: it is a candidate for its "
                 "merge packet/queue — no author action, do not nudge its assignee or "
-                "reassign it; the composer/pilot carries the merge")
+                "reassign it; the composer/pilot carries the merge and can declare the "
+                "planned landing that stops the reminders: ameesh work landing %d "
+                "--vehicle <vehicle lot> --until <YYYY-MM-DD>" % lot)
     if who:
         # #2016 : la commande porte le titulaire lu ici (`--if-holder`) : un
         # second agent parti du même brief est refusé si le lot a changé de
@@ -176,7 +178,9 @@ def _stale_lot(alert: dict) -> str:
     # #1261 le disait déjà « the alert stops while the wait is planned ».
     hold = ("if the lot is parked on another open lot, declare the dependency that stops "
             "the reminders (the alert stops while the wait is planned): "
-            "ameesh work dependencies %d --add <blocker>" % lot)
+            "ameesh work dependencies %d --add <blocker>; if a package vehicle is to "
+            "carry it, declare the landing: ameesh work landing %d --vehicle "
+            "<vehicle lot> --until <YYYY-MM-DD>" % (lot, lot))
     # #1664 : une porte hors mesh (fenêtre opérateur, décision humaine sans
     # demande ouverte) n'est portée par aucun lot ; le pilote la consigne en
     # hold, qui éteint la relance comme une dépendance déclarée.
