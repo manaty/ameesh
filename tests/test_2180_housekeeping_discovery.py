@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Discovery uses real Git and disposable SQL, never a host cleanup."""
 import os
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
@@ -21,6 +22,34 @@ class RootsTest(unittest.TestCase):
         self.assertEqual(hk.effective([canon], "pc").worktree_roots,
                          ("/srv/nested", "/srv/work"))
         self.assertEqual(hk.effective([], "pc").worktree_roots, ())
+
+
+class SameRepositoryTest(unittest.TestCase):
+    def test_recorded_top_level_or_common_dir_through_a_symlink_match(self):
+        # registered rows keep `common_dir(cwd)` unresolved; older rows and
+        # fixtures keep the top level: both name the worktree's repository
+        for relative in (False, True):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as base:
+                main = _repo(base)
+                path = os.path.join(base, "wt")
+                _git("-c", "worktree.useRelativePaths=" + str(relative).lower(),
+                     "worktree", "add", "-q", path, "-b", "lot/1-x", cwd=main)
+                alias = os.path.join(base, "alias")
+                path_alias = os.path.join(base, "wt-alias")
+                os.symlink(main, alias)
+                os.symlink(path, path_alias)
+                for candidate in (path, path_alias):
+                    for repo in (main, os.path.join(main, ".git"), alias,
+                                 os.path.join(alias, ".git")):
+                        with self.subTest(path=candidate, repo=repo):
+                            self.assertTrue(hk.same_repository(candidate, repo))
+                plain = os.path.join(base, "plain")
+                os.mkdir(plain)
+                other = _repo(plain)
+                for repo in (other, "", plain, os.path.join(base, "absent")):
+                    with self.subTest(repo=repo):
+                        self.assertFalse(hk.same_repository(path, repo))
+                self.assertFalse(hk.same_repository(plain, main))
 
 
 class DiscoveryTest(PgTestCase):

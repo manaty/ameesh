@@ -570,6 +570,29 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual(len(terminals), 1, terminals)
         self.assertIn("doute", str(terminals[0].get("note") or ""))
 
+    def test_les_tentatives_anciennes_comptent_malgre_200_evenements(self):
+        """#1448 N2 : `attempts()` ne lisait que les 200 derniers événements ;
+        un lot très bavard remettait son compteur de tentatives à zéro et
+        retentait sans fin au lieu de devenir terminal. Le compteur porte sur
+        les seules notes de tentative du lot, aussi anciennes soient-elles."""
+        lot = self.merged_lot("doute bavard")
+        for _ in range(review_lot.CATCH_UP_MAX_ATTEMPTS - 1):
+            out = review_lot.catch_up(self.db, retry_s=0)
+            self.assertEqual((out["examined"], out["attempted"], out["terminal"]),
+                             (1, 1, 0), out)
+        # Bruit postérieur : sans la correction, les marques de tentative
+        # sortent de la fenêtre des 200 derniers événements.
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " SELECT %s, 'merged', 'bruit ' || g, 'témoin'"
+            "   FROM generate_series(1, 250) g", (lot,))
+        last = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual((last["examined"], last["attempted"], last["terminal"]),
+                         (1, 0, 1), last)
+        after = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual(after["examined"], 0, after)
+        self.assertEqual(self.review_lots(lot), [])
+
     def test_deux_executeurs_ne_doublent_pas_la_relecture(self):
         """Concurrence entre exécuteurs : l'autre exécuteur ouvre la relecture
         entre la sélection et le geste ; le second ne double pas le lot, ne

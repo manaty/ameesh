@@ -81,6 +81,14 @@ manifeste qui couvre ce membre, reste due avant promotion ; l'absence de CI
 individuelle n'est jamais exposée comme un statut vert. Le paquet 26 et la
 demande d'admission manuelle de codex3 à impl-02 restent hors de ce raccord.
 
+Le sous-ensemble médié de `work` ne retient que quatre opérations :
+`work.get`, `work.note`, `work.move` et `work.mark_delegate_turn`.
+`work.queue_add`, `work.queue_remove` et `work.queue_update` sont **refusés** :
+absents de la table du contrat, le client lève `NotSupportedRemotely` avant
+tout appel et le serveur répond `404 op_not_allowed`. `work.note` n'écrit que
+le journal libre : il ne peut produire ni reçu typé `packet`/`removed`, ni
+génération de file, quel que soit l'acteur du journal.
+
 ### Qualification préalable sans génération
 
 `Preparation` relie maintenant le candidat déclaré à la tête publiée, à la
