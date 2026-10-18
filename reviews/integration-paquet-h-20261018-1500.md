@@ -10,6 +10,21 @@ Demandes : liste calculée des lots prêts (#2404) sur la base `4c73962e6`
 véhicule) ; admissions du pilote 18/10 15:09Z (#2442, #2349, #377, #2359) ;
 #1955 signalé prêt par sa relecture dev2 15:36Z.
 
+## Mise à jour de base — incident #2483
+
+`main` a bougé pendant la CI initiale : l'incident #2483 est corrigé par
+`a7d19131e` (PR #1857 — le battement de bail renouvelle avant l'échéance d'un
+bail court ; `src/ameesh/runner.py`, `tests/test_runner.py`). Le run
+`39142437994` sur `2be8cbe1` (base `4c73962e6`) est annulé, périmé (§12).
+
+- `a7d19131e` fusionné dans le véhicule (`0b29e9a72`) : merge-tree rc 0,
+  **aucun conflit** ; recouvrement `runner.py` disjoint (battement de bail
+  ~L1300 contre les ajouts #2442/#2446 ~L6815-8631).
+- Delta unités contre la nouvelle base, manifeste exclu : **32 fichiers,
+  +3603/−95** — inchangé ; `git diff --check` rc 0 ; aucun `*.sql`.
+- Tête recomposée = ce commit de manifeste sur `0b29e9a72`, PR #1864 ; une
+  seule suite complète relancée sur cette tête.
+
 ## Admissions
 
 - Liste calculée 15:40Z : **#2446, #1057, #1819** ; #2483 (incident) est
