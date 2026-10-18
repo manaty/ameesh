@@ -26,11 +26,15 @@ _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
 _GATE = re.compile(r"^(?:gate|external):(\S+)$", re.I)
 
 #: #2335 : une PR de paquet est une branche `integration/**` ; son manifeste
-#: (corps du lot porteur) nomme les unités `#<lot>`. Une référence collée à un
-#: mot ou à un chemin (`manaty/ameesh#1697`, `#1321/#2021`) n'est pas une
-#: unité : elle est écartée plutôt que de taire l'alerte d'un lot étranger.
+#: (corps du lot porteur) nomme les unités avec leur tête gelée — `#1234 @
+#: abcdef0`, `#1234 abcdef0`, `#1234@abcdef0`, la forme des manifestes réels
+#: (#1342, #2085, #2270, #2277, #2347). Un `#N` cité en prose (« #2203
+#: exclu », « garder #1024 », « admis mais exclu ») n'est **pas** une unité :
+#: le taire masquerait justement l'alerte d'un lot qui attend son auteur.
+#: Une référence collée à un mot ou à un chemin (`manaty/ameesh#1697`) est
+#: écartée de même.
 _PACKET_BRANCH = "integration/"
-_REF = re.compile(r"(?<![\w/])#([0-9]{1,18})\b")
+_UNIT = re.compile(r"(?<![\w/])#([0-9]{1,18})\s*@?\s*([0-9a-fA-F]{7,40})\b")
 
 
 def hold_end(due_on):
@@ -194,14 +198,14 @@ def _packet_wait(carrier):
     return out
 
 
-def packet_waits(rows, open_items=None, *, contains=None):
-    """#2335 : `{lot: wait}` pour tout lot ouvert contenu dans un paquet.
+def packet_waits(rows, open_items=None):
+    """#2335 : `{lot: wait}` pour tout lot ouvert nommé par un paquet.
 
-    La preuve principale est le manifeste du porteur : les unités qu'il nomme
-    (`#<lot>`) et qui sont encore ouvertes. `contains(ancestor, descendant)`
-    est un crochet optionnel (git `merge-base --is-ancestor`) pour reconnaître
-    une tête gelée incluse sans être nommée : il n'est appelé que pour un lot
-    non déclaré, et une erreur de lecture ne retient pas le lot (aucun devine).
+    La seule preuve est le manifeste du porteur : une unité y est nommée avec
+    sa tête gelée (`#<lot> <hex>` / `#<lot> @ <hex>`), la forme des manifestes
+    réels. Un simple `#N` en prose est ignoré (B1 de la relecture dev7) : un
+    lot exclu du paquet doit continuer d'alerter, sinon son attente serait
+    tue par un porteur qui ne le transporte pas.
 
     Un lot inclus attend la **fusion du paquet**, pas un exécuteur : cette
     attente est planifiée et tait la stagnation comme le SLO (#2335/A1).
@@ -219,8 +223,8 @@ def packet_waits(rows, open_items=None, *, contains=None):
     declared: dict[int, dict] = {}
     for cid, carrier in carriers.items():
         text = "%s\n%s" % (carrier.get("title") or "", carrier.get("body") or "")
-        for reference in _REF.findall(text):
-            ident = int(reference)
+        for match in _UNIT.finditer(text):
+            ident = int(match.group(1))
             if ident in open_ids and ident != cid:
                 declared.setdefault(ident, carrier)
     out: dict[int, dict] = {}
@@ -229,21 +233,6 @@ def packet_waits(rows, open_items=None, *, contains=None):
         if row.get("state") in ("merged", "promoted", "closed"):
             continue
         carrier = declared.get(ident)
-        if carrier is None and contains is not None:
-            head = str(row.get("branch_head") or "").strip()
-            if head:
-                for cid, candidate in carriers.items():
-                    if cid == ident:
-                        continue
-                    target = str(candidate.get("branch_head") or "").strip()
-                    if not target:
-                        continue
-                    try:
-                        if contains(head, target):
-                            carrier = candidate
-                            break
-                    except Exception:   # noqa: BLE001 — lecture git illisible : pas de preuve
-                        continue
         if carrier is not None:
             out[ident] = _packet_wait(carrier)
     return out
@@ -363,7 +352,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
 
 
 def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=None,
-         holds=None, packets=True, contains=None):
+         holds=None, packets=None):
     """Grouped, unbounded truth reads; no query per candidate or dependency.
 
     `holds` peut être fourni par un appelant qui a déjà lu le flux ciblé
@@ -371,11 +360,11 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     ne transfère que les transitions et les notes hold/levée — jamais le
     journal entier ni le texte des notes ordinaires.
 
-    `packets` (#2335) : lire les porteurs `integration/**` ouverts et marquer
-    leurs unités en attente de paquet. `contains(ancestor, descendant)` est le
-    crochet optionnel de contenance de la tête gelée (voir `packet_waits`).
-    Le poser à False évite la lecture des lots ouverts quand l'appelant n'en
-    a pas besoin (fermeture de lot, `released_by`)."""
+    `packets` (#2335) : marquer les unités d'un porteur `integration/**`
+    ouvert comme attente de paquet. `None` (défaut) réutilise le census déjà
+    fourni (`open_items`) ou déjà lu pour les engagements ; `True` le force ;
+    `False` l'interdit. Un appelant qui n'a pas le census ne paie donc pas une
+    lecture `open_lots_activity(None)` en plus (N1 de la relecture dev7)."""
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
@@ -389,12 +378,15 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     commitments = st.roadmap.commitments(statuses=["open"])
     packages = (packages if packages is not None else
                 {p["id"]: p for p in st.packages.all(include_absent=True)})
+    supplied = open_items is not None
     if open_items is None:
-        open_items = st.operations.open_lots_activity(None) if (packets or any(
-            c.get("depends_on") for c in commitments)) else []
-    elif packets and not open_items:
+        if packets is True or any(c.get("depends_on") for c in commitments):
+            open_items = st.operations.open_lots_activity(None)
+        else:
+            open_items = []
+    elif packets is True and not open_items:
         open_items = st.operations.open_lots_activity(None)
-    packet = (packet_waits(rows, open_items, contains=contains)
-              if packets else {})
+    want_packets = bool(packets) if packets is not None else (supplied or bool(open_items))
+    packet = packet_waits(rows, open_items) if want_packets else {}
     return resolve(rows, dates, commitments, packages, open_items, now=now,
                    dependencies=dependencies, holds=holds, packets=packet)

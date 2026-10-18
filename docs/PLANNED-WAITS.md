@@ -110,13 +110,16 @@ or, for a lot carried by an open integration packet (#2335):
 ```
 
 A packet is a structured carrier, not prose: an open work item whose branch
-starts with `integration/`, whose body/manifest names the carried lots
-(`#<lot>`). The units declared there wait for the packet merge, not for a lot
-executor, so `stale` and `slo_breach` are silenced for them. The
+starts with `integration/`, whose body/manifest names each carried lot with
+its frozen head (`#<lot> @ <sha>` / `#<lot> <sha>`, at least 7 hex digits).
+A bare `#<lot>` in running text is **not** an inclusion — an excluded lot
+(« #2203 exclu », « garder #1024 ») must keep its `stale` and `slo_breach`
+alerts. The units declared with their head wait for the packet merge, not for
+a lot executor, so `stale` and `slo_breach` are silenced for them. The
 `verdict_merge` clock of a merge-ready lot starts at the first packet slot
-after its GO (`mechanics.next_packet` when the canon declares a cadence,
-otherwise the observed hourly UTC cut-off): the time before that slot is not
-a delay under canon §11 bis.
+after its GO (`mechanics.next_packet` as soon as the canon declares a cadence,
+even between two packets; otherwise the observed hourly UTC cut-off): the
+time before that slot is not a delay under canon §11 bis.
 
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its
@@ -129,4 +132,5 @@ Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
 by a planned date, commitment/plan dependency, direct prerequisite link, a
 dated external hold, an explicit `hold:` note or an open packet carrier
-declaring the lot. This preserves alerts for unexplained waits.
+naming the lot with its frozen head. This preserves alerts for unexplained
+waits and for lots a packet only mentions.

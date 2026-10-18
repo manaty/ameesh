@@ -388,8 +388,11 @@ class Operations(interface.Operations):
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
                    -- (`integration/**`), son manifeste (corps) et la tête gelée
-                   -- du lot, sans requête par lot.
-                   w.branch, w.branch_head, w.body,
+                   -- du lot, sans requête par lot. Le corps n'est transféré que
+                   -- pour un porteur : pas pour tous les lots ouverts (N2 de
+                   -- la relecture dev7).
+                   w.branch, w.branch_head,
+                   CASE WHEN left(btrim(w.branch), 12) = 'integration/' THEN w.body END AS body,
                    to_jsonb(w)->'reviewers' AS reviewers,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
