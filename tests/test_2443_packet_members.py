@@ -1,0 +1,253 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#2443 : composition de paquet — lier chaque unité au paquet (package_id).
+
+La composition est lue dans les commits de fusion (`ameesh-work:`), jamais
+dans le manifeste. Les appartenances écrites servent ensuite à `work show` et
+à `sync-merges`, y compris pour une unité sans jalon `frozen` (cas #2366).
+"""
+from __future__ import annotations
+
+import json
+import os
+import unittest
+
+from ameesh import packet_link, plan_git, work
+
+from .support import PgTestCase
+from .test_canon import _TmpMixin, git
+
+
+class PacketLinkTest(_TmpMixin, PgTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = os.path.join(self.make_tmp(), "depot")
+        os.makedirs(self.repo)
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "remote", "add", "origin", "https://github.com/acme/web")
+        self.base = self.commit("README", "acme\n", "initial")
+
+    # -- dépôt jetable ------------------------------------------------------
+    def commit(self, path: str, text: str, message: str) -> str:
+        full = os.path.join(self.repo, path)
+        os.makedirs(os.path.dirname(full) or self.repo, exist_ok=True)
+        with open(full, "a", encoding="utf-8") as fh:
+            fh.write(text)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def unit_branch(self, branch: str, path: str, text: str, message: str) -> str:
+        git(self.repo, "checkout", "-q", "-b", branch, self.base)
+        sha = self.commit(path, text, message)
+        git(self.repo, "checkout", "-q", "main")
+        return sha
+
+    def compose(self, branch: str, units: list[tuple[int, str]]) -> str:
+        """Compose `units` sur une branche de paquet ; rend la tête."""
+        git(self.repo, "checkout", "-q", "-b", branch, self.base)
+        for lot, sha in units:
+            git(self.repo, "merge", "-q", "--no-ff", "-m",
+                "vehicule : #%d %s\n\nameesh-work: %d" % (lot, sha[:12], lot), sha)
+        head = git(self.repo, "rev-parse", "HEAD")
+        return head
+
+    def lot(self, title: str) -> dict:
+        return work.add(self.db, title=title, issue_ref="acme/web#1", actor="pilote")
+
+    def freeze(self, item: dict, sha: str) -> None:
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="relecteur")
+
+    def verdict(self, item: dict, sha: str) -> None:
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "verdict", sha=sha, verdict="ok",
+                       actor="relecteur")
+
+    def carrier(self, branch: str = "integration/paquet-1", target: str = "main") -> dict:
+        return work.add(self.db, title="paquet", issue_ref="acme/web#1",
+                        branch=branch, branch_target=target, actor="pilote",
+                        source="composition")
+
+    def membership(self, lot: int) -> list[dict]:
+        return packet_link.for_item(self.db, lot)
+
+    # -- lecture de la composition -----------------------------------------
+    def test_record_reads_trailers_and_writes_membership(self):
+        first = self.unit_branch("lot/cinq", "src/un.py", "un\n", "un")
+        second = self.unit_branch("lot/six", "src/deux.py", "deux\n", "deux")
+        one = self.lot("un")
+        two = self.lot("deux")
+        self.freeze(one, first)
+        self.freeze(two, second)
+        head = self.compose("integration/paquet-1", [(one["id"], first), (two["id"], second)])
+        porteur = self.carrier()
+        report = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                    base=self.base, head=head, actor="pilote",
+                                    cfg=self.cfg)
+        self.assertTrue(report["recorded"])
+        self.assertEqual({u["work_item_id"] for u in report["units"]},
+                         {one["id"], two["id"]})
+        rows = self.membership(one["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["package_id"], porteur["id"])
+        self.assertEqual(rows[0]["package_branch"], "integration/paquet-1")
+        self.assertEqual(rows[0]["unit_sha"], report["units"][0]["unit_sha"])
+        self.assertEqual(rows[0]["frozen_sha"], first)
+        self.assertEqual(rows[0]["source_sha"], first)
+        self.assertEqual(rows[0]["package_state"], "intake")
+        # le journal du porteur dit ce qui a été lié
+        notes = [e["note"] for e in work.events(self.db, porteur["id"])]
+        self.assertTrue(any("packet composition recorded" in n for n in notes), notes)
+
+    def test_work_show_and_packet_show_read_the_link(self):
+        sha = self.unit_branch("lot/sept", "src/trois.py", "trois\n", "trois")
+        item = self.lot("trois")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo, base=self.base,
+                           head=head, actor="pilote", cfg=self.cfg)
+        out = self.mesh("work", "show", str(item["id"]))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("package  : #%d integration/paquet-1" % porteur["id"], out.stdout)
+        out = self.mesh("work", "packet", "show", str(item["id"]), "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        payload = json.loads(out.stdout)
+        self.assertEqual(payload["as_unit"][0]["package_id"], porteur["id"])
+        out = self.mesh("work", "packet", "show", str(porteur["id"]))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("unit #%d" % item["id"], out.stdout)
+
+    def test_record_cli_and_dry_run(self):
+        sha = self.unit_branch("lot/huit", "src/quatre.py", "quatre\n", "quatre")
+        item = self.lot("quatre")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        out = self.mesh("work", "packet", "record", str(porteur["id"]),
+                        "--repo", self.repo, "--base", self.base, "--head", head,
+                        "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("[dry run]", out.stdout)
+        self.assertEqual(self.membership(item["id"]), [])
+        out = self.mesh("work", "packet", "record", str(porteur["id"]),
+                        "--repo", self.repo, "--base", self.base, "--head", head)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("packet composition recorded", out.stdout)
+        self.assertEqual(self.membership(item["id"])[0]["package_id"], porteur["id"])
+
+    def test_record_reuses_the_recorded_base_after_a_target_update(self):
+        """Une mise à jour de la cible dans le paquet ne perd pas les unités."""
+        first = self.unit_branch("lot/treize", "src/neuf.py", "neuf\n", "neuf")
+        one = self.lot("un avant la mise à jour")
+        self.freeze(one, first)
+        head = self.compose("integration/paquet-1", [(one["id"], first)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        # la cible avance, puis le paquet la fusionne (commit sans trailer)
+        git(self.repo, "checkout", "-q", "main")
+        target_head = self.commit("MAJ", "mise à jour\n", "mise à jour de la cible")
+        git(self.repo, "checkout", "-q", "integration/paquet-1")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "mise à jour cible", target_head)
+        second = self.unit_branch("lot/quatorze", "src/dix.py", "dix\n", "dix")
+        two = self.lot("après la mise à jour")
+        self.freeze(two, second)
+        git(self.repo, "checkout", "-q", "integration/paquet-1")
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s\n\nameesh-work: %d" % (two["id"], second[:12], two["id"]),
+            second)
+        new_head = git(self.repo, "rev-parse", "HEAD")
+        report = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                    head=new_head, actor="pilote", cfg=self.cfg)
+        self.assertEqual(report["base"], self.base)
+        self.assertEqual({u["work_item_id"] for u in report["units"]},
+                         {one["id"], two["id"]})
+        self.assertEqual({m["work_item_id"] for m in
+                          packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+                         {one["id"], two["id"]})
+
+    def test_record_refuses_unknown_unit_and_foreign_repo(self):
+        sha = self.unit_branch("lot/neuf", "src/cinq.py", "cinq\n", "cinq")
+        item = self.lot("cinq")
+        self.freeze(item, sha)
+        git(self.repo, "checkout", "-q", "-b", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #999999\n\nameesh-work: 999999", sha)
+        head = git(self.repo, "rev-parse", "HEAD")
+        porteur = self.carrier()
+        with self.assertRaises(packet_link.PacketLinkError) as ctx:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        self.assertIn("does not exist", str(ctx.exception))
+        self.assertEqual(packet_link.memberships(self.db, package_ids=[porteur["id"]]), [])
+        # un dépôt qui n'est pas celui du porteur ne s'attache pas
+        foreign = os.path.join(self.make_tmp(), "autre")
+        os.makedirs(foreign)
+        git(foreign, "init", "-q", "-b", "main")
+        git(foreign, "remote", "add", "origin", "https://github.com/autre/depot")
+        with self.assertRaises(packet_link.PacketLinkError) as ctx:
+            packet_link.record(self.db, porteur["id"], repo=foreign,
+                               base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        self.assertIn("not of acme/web", str(ctx.exception))
+
+    # -- sync-merges --------------------------------------------------------
+    def test_sync_merges_closes_by_composition_without_freeze(self):
+        """Cas #2366 par la composition : aucun jalon `frozen` n'est requis."""
+        verdict_sha = self.unit_branch("lot/dix", "src/six.py", "six\n", "six")
+        plain_sha = self.unit_branch("lot/onze", "src/sept.py", "sept\n", "sept")
+        with_verdict = self.lot("verdict seul")
+        without_freeze = self.lot("sans gel")
+        self.verdict(with_verdict, verdict_sha)
+        head = self.compose("integration/paquet-1",
+                            [(with_verdict["id"], verdict_sha),
+                             (without_freeze["id"], plain_sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo, base=self.base,
+                           head=head, actor="pilote", cfg=self.cfg)
+        # le gel d'origine verdict est bien celui enregistré, sans jalon frozen
+        rows = self.membership(with_verdict["id"])
+        self.assertEqual(rows[0]["frozen_sha"], verdict_sha)
+        self.assertEqual(self.membership(without_freeze["id"])[0]["frozen_sha"], "")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion paquet",
+            "integration/paquet-1")
+        dry = plan_git.sync_merges(self.db, self.repo, target="main", dry_run=True)
+        dry_by_lot = {r["work_item"]: r for r in dry["results"]}
+        for item in (with_verdict, without_freeze):
+            self.assertEqual(dry_by_lot[item["id"]]["result"], "would-merge")
+        self.assertEqual(work.get(self.db, with_verdict["id"])["state"], "qa")
+        report = plan_git.sync_merges(self.db, self.repo, target="main")
+        by_lot = {r["work_item"]: r for r in report["results"]}
+        for item in (with_verdict, without_freeze):
+            result = by_lot[item["id"]]
+            self.assertEqual(result["result"], "merged", result)
+            self.assertEqual(result["how"], "composition", result)
+            self.assertEqual(result["composition"]["package"], porteur["id"])
+            self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+
+    def test_sync_merges_refuses_a_stale_composition(self):
+        """Un re-gel postérieur à la composition rend la preuve périmée."""
+        composed_sha = self.unit_branch("lot/douze", "src/huit.py", "huit\n", "huit")
+        newer_sha = self.unit_branch("lot/douze-v2", "src/huit.py", "huit v2\n", "huit v2")
+        item = self.lot("re-gelé")
+        self.freeze(item, composed_sha)
+        head = self.compose("integration/paquet-1", [(item["id"], composed_sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo, base=self.base,
+                           head=head, actor="pilote", cfg=self.cfg)
+        work.milestone(self.db, item["id"], "frozen", sha=newer_sha, actor="relecteur")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion paquet",
+            "integration/paquet-1")
+        report = plan_git.sync_merges(self.db, self.repo, target="main")
+        row = next(r for r in report["results"] if r["work_item"] == item["id"])
+        self.assertEqual(row["result"], "open", row)
+        self.assertNotEqual(row.get("how"), "composition")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+
+if __name__ == "__main__":
+    unittest.main()

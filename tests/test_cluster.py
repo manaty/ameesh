@@ -141,6 +141,13 @@ FERMEES = {
     "prevalidation_reports": {"work_item_id", "head_sha", "base_sha", "card_commit",
                               "schema", "outcome", "ok", "causes", "report",
                               "recorded_at"},
+    # #2443 (0465) : appartenance d'une unité à un paquet, écrite à la
+    # composition (porteur, commit de composition, gel effectif). État interne
+    # lu par `work show` et `sync-merges` ; fermé aux deux rôles superviseur,
+    # aucun GRANT modifié.
+    "work_packet_members": {"package_id", "work_item_id", "package_branch",
+                            "base_sha", "head_sha", "unit_sha", "source_sha",
+                            "frozen_sha", "recorded_by", "recorded_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

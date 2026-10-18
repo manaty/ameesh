@@ -38,6 +38,11 @@ donc les unités de fusion encore rattachées à un lot des lots portés (#2387)
 Ne réécrit aucun commit existant : la convention vaut pour les unités
 composées à partir de maintenant (un paquet déjà validé n'est pas refait pour
 ce seul métadonné).
+
+`--record-package <lot porteur>` enregistre en plus la liaison en base après
+le commit (#2443, `ameesh work packet record`) : `work show` et
+`sync-merges` retrouvent alors le paquet sans lire le manifeste. Un échec de
+la liaison ne défait pas le commit ; le message donne la commande à relancer.
 """
 
 from __future__ import annotations
@@ -214,6 +219,8 @@ def compose(args: argparse.Namespace) -> int:
         sha = out(repo, "rev-parse", "HEAD")
         print("unité composée : %s" % sha)
         print("lots portés : %s" % ", ".join("#%d" % lot for lot in lots))
+        if args.record_package:
+            record_package(repo, args.record_package)
         return 0
 
     if rev(repo, "MERGE_HEAD"):
@@ -232,6 +239,27 @@ def compose(args: argparse.Namespace) -> int:
 
     raise GitError("git merge: %s"
                    % proc.stderr.decode("utf-8", "replace").strip())
+
+
+def record_package(repo: Path, package: int) -> None:
+    """#2443 : après le commit, lier le paquet en base (jamais le manifeste).
+
+    Le commit de composition est déjà écrit : un refus de la liaison le dit
+    et donne la commande à relancer, sans défaire la composition.
+    """
+    command = ["ameesh", "work", "packet", "record", str(int(package)),
+               "--repo", str(repo)]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True)
+    except OSError as error:
+        raise InputError(
+            "composition commitée ; liaison au paquet non enregistrée (%s). "
+            "Relancer : %s" % (error, " ".join(command))) from error
+    if proc.returncode != 0:
+        raise InputError(
+            "composition commitée ; liaison au paquet refusée : %s. Relancer : %s"
+            % ((proc.stderr or proc.stdout).strip(), " ".join(command)))
+    print((proc.stdout or "").strip())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,6 +288,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="sujet complet, à la place du sujet par défaut")
     parser.add_argument("--body", action="append", default=[],
                         help="paragraphe de corps (répétable)")
+    parser.add_argument("--record-package", type=int, default=None, metavar="LOT",
+                        help="après le commit, enregistrer la liaison au lot "
+                             "porteur en base (#2443 : ameesh work packet record LOT)")
     args = parser.parse_args(argv)
 
     try:

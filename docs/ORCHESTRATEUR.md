@@ -504,6 +504,22 @@ Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
 un `#N` seul n'y déclare aucune unité (#2335).
 
+Après la composition — et après chaque recomposition — le composeur écrit la
+liaison en base, depuis le worktree du paquet :
+
+```sh
+ameesh work packet record <porteur> --repo <worktree du paquet>
+```
+
+La commande relit les commits de composition (`ameesh-work:`, jamais le
+manifeste), capture le gel effectif de chaque unité et remplace l'ensemble des
+appartenances du porteur (#2443). `ameesh work show <unité>` affiche alors
+`package : #<porteur> <branche>` sans lire aucun manifeste ; `ameesh work
+sync-merges` ferme une unité quand son commit de composition est entré dans la
+cible — y compris sans jalon `frozen`, ce qui couvre le cas #2366 — et refuse
+cette preuve si l'unité a été re-gelée depuis la composition. Une composition
+non enregistrée reste ouverte : le repli par le gel déclaré est inchangé.
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot

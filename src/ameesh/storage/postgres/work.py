@@ -2206,6 +2206,64 @@ class WorkItems(interface.WorkItems):
             "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % item_columns(self.db),
             (package_id,))
 
+    # -- paquet de composition (#2443) ---------------------------------------
+    #: la lecture commune aux deux méthodes : l'appartenance, le porteur et
+    #: son jalon de fusion, en une requête.
+    _PACKET_SELECT = (
+        "SELECT m.package_id, m.work_item_id, m.package_branch, m.base_sha,"
+        "       m.head_sha, m.unit_sha, m.source_sha, m.frozen_sha,"
+        "       m.recorded_by, extract(epoch from m.recorded_at)::float8 AS recorded_ts,"
+        "       p.state AS package_state, p.branch AS carrier_branch,"
+        "       p.branch_target AS package_target,"
+        "       (SELECT ms.sha FROM work_item_milestones ms"
+        "         WHERE ms.work_item_id = m.package_id AND ms.kind = 'merged'"
+        "           AND ms.sha <> ''"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha"
+        "  FROM work_packet_members m JOIN work_items p ON p.id = m.package_id"
+    )
+
+    def record_packet(self, package_id, *, branch, base_sha, head_sha, units, note,
+                      actor) -> list[dict]:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT id, state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                (int(package_id),))
+            if not rows:
+                raise DbError("packet #%s: no such work item" % package_id)
+            tx.execute("DELETE FROM work_packet_members WHERE package_id = %s",
+                       (int(package_id),))
+            for unit in units:
+                tx.execute(
+                    "INSERT INTO work_packet_members"
+                    " (package_id, work_item_id, package_branch, base_sha, head_sha,"
+                    "  unit_sha, source_sha, frozen_sha, recorded_by)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (int(package_id), int(unit["work_item_id"]), branch, base_sha,
+                     head_sha, unit["unit_sha"], unit.get("source_sha") or "",
+                     unit.get("frozen_sha") or "", actor or ""))
+            WorkItems(tx)._event(int(package_id), rows[0]["state"], note, actor)
+            return WorkItems(tx).packet_members(package_ids=[int(package_id)])
+
+    def packet_members(self, *, item_ids=None, package_ids=None) -> list[dict]:
+        where, params = [], []
+        if item_ids is not None:
+            ids = sorted({int(value) for value in item_ids})
+            if not ids:
+                return []
+            where.append("m.work_item_id IN (%s)" % ", ".join(["%s"] * len(ids)))
+            params.extend(ids)
+        if package_ids is not None:
+            ids = sorted({int(value) for value in package_ids})
+            if not ids:
+                return []
+            where.append("m.package_id IN (%s)" % ", ".join(["%s"] * len(ids)))
+            params.extend(ids)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        return self.db.query(
+            self._PACKET_SELECT + clause
+            + " ORDER BY m.recorded_at DESC, m.package_id DESC, m.work_item_id",
+            tuple(params))
+
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
                      frozen_id=None, landed=None) -> dict | None:
         """`current` → `merged` si le lot y est encore (sinon None, rien d'écrit),

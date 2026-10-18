@@ -1993,6 +1993,31 @@ class WorkItems(Domain):
         """Les lots rattachés à cette fiche, tous états confondus, par id."""
 
     @abc.abstractmethod
+    def record_packet(self, package_id: int, *, branch: str, base_sha: str,
+                      head_sha: str, units: Sequence[dict], note: str,
+                      actor: str) -> list[dict]:
+        """#2443 : enregistre la composition d'un paquet (lot porteur
+        `package_id`, branche `branch`), en remplaçant l'ensemble de ses
+        unités, en UNE transaction.
+
+        `units` : des dicts `work_item_id`, `unit_sha`, `source_sha`,
+        `frozen_sha`. Un lot porteur ou une unité inconnue annule tout
+        (l'intégrité référentielle tranche) ; l'événement `note` est écrit au
+        journal du porteur dans la même transaction. Rend les lignes relues
+        par `packet_members` (ordre de `recorded_at` décroissant).
+        """
+
+    @abc.abstractmethod
+    def packet_members(self, *, item_ids: Sequence[int] | None = None,
+                       package_ids: Sequence[int] | None = None) -> list[dict]:
+        """#2443 : les appartenances de paquet, filtrées par unités
+        (`item_ids`) ou par porteur (`package_ids`), les plus récentes
+        d'abord. Chaque ligne porte `package_id`, `work_item_id`,
+        `package_branch`, `base_sha`, `head_sha`, `unit_sha`, `source_sha`,
+        `frozen_sha`, `recorded_by`, `recorded_ts`, l'état du porteur
+        (`package_state`) et son jalon de fusion (`package_merged_sha`)."""
+
+    @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
                      landed: tuple[int, str] | None = None) -> dict | None:
