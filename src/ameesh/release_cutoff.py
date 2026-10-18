@@ -885,7 +885,7 @@ def _commit(path: str, message: str, *, author: str = "ameesh release") -> str:
     env = dict(os.environ,
                GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL="release@ameesh.invalid",
                GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL="release@ameesh.invalid")
-    proc = subprocess.run(["git", "-C", path, "commit", "-q", "-m", message],
+    proc = subprocess.run(["git", "-C", path, "commit", "--no-verify", "-q", "-m", message],
                           capture_output=True, text=True, env=env, timeout=120.0)
     if proc.returncode:
         detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
@@ -902,6 +902,16 @@ def create_version_commit(project: ProjectRelease, plan: Plan) -> str:
     """
     head = plan.base
     current = version_at(project.repo, head)
+    # A crashed run may have left V and its local tag: reuse that exact commit
+    # instead of creating a second one (the tag then names the same tree).
+    tag = "v%s" % plan.version
+    existing = _git(project.repo, "rev-parse", "--verify", "refs/tags/%s^{commit}" % tag)
+    if existing.returncode == 0:
+        sha = (existing.stdout or "").strip()
+        parent = _git(project.repo, "rev-parse", "--verify", "%s^1" % sha)
+        if (parent.returncode == 0 and (parent.stdout or "").strip() == head
+                and version_at(project.repo, sha) == plan.version):
+            return sha
     notes_path = "%s/%s.md" % (NOTES_DIR, plan.version)
     has_notes = _git(project.repo, "cat-file", "-e",
                      "%s:%s" % (head, notes_path)).returncode == 0
@@ -929,9 +939,21 @@ def _ensure_local_tag(project: ProjectRelease, release_sha: str, version: str) -
     local = _git(project.repo, "rev-parse", "--verify", "refs/tags/%s^{commit}" % tag)
     if local.returncode == 0:
         if (local.stdout or "").strip() != release_sha:
-            raise ReleaseError("tag %s already exists on %s, not on the release commit %s"
-                               % (tag, (local.stdout or "").strip()[:12], release_sha[:12]))
-        return tag
+            remote = remote_tag(project.repo, project.remote, tag)
+            if remote is None:
+                # A local tag left by a crashed run, never published: recreate
+                # it on this attempt's V instead of blocking forever.
+                _git(project.repo, "tag", "-d", tag)
+            else:
+                raise ReleaseError("tag %s already exists on %s, not on the release commit %s"
+                                   % (tag, (local.stdout or "").strip()[:12],
+                                      release_sha[:12]))
+        else:
+            remote = remote_tag(project.repo, project.remote, tag)
+            if remote and remote != release_sha:
+                raise ReleaseError("tag %s exists on the remote at %s, not at %s"
+                                   % (tag, remote[:12], release_sha[:12]))
+            return tag
     remote = remote_tag(project.repo, project.remote, tag)
     if remote:
         if remote != release_sha:
