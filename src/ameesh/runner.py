@@ -1300,11 +1300,17 @@ class AgentWorker(threading.Thread):
 
     def _heartbeat(self, stop_event: threading.Event) -> None:
         self.ensure_watchdog()
-        interval = max(3.0, self.runner.lease_ttl / 3.0)
+        # #2483 : le battement doit renouveler AVANT l'échéance. Un plancher de
+        # 3 s faisait dormir un bail de 3 s jusqu'à l'échéance même : le
+        # watchdog tuait alors un harnais pas encore publié sous charge CI
+        # (run 39133881211). Le plancher ne sert plus qu'à éviter un pas nul.
+        interval = max(0.05, self.runner.lease_ttl / 3.0)
         # L72 : après un échec, nouvel essai rapide (2 s, 4 s… jusqu'à
         # l'intervalle normal) — une base revenue doit prolonger le bail avant
-        # son échéance, pas un tiers de bail plus tard.
-        reprise = Reprise(maximum=interval)
+        # son échéance, pas un tiers de bail plus tard. Pour un bail court, la
+        # reprise ne peut pas attendre le minimum de 2 s : elle serait après
+        # l'échéance (#2483).
+        reprise = Reprise(maximum=interval, minimum=min(Reprise.MINIMUM, interval))
         attente = interval
         while not stop_event.wait(self.wait_timeout(attente)):
             if not self.renew():
