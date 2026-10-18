@@ -1073,7 +1073,7 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
         db, lot, sha=status.get("merge_commit") or "", actor=work.SYSTEM_SENDER,
         source="PR #%s" % status.get("number"),
         pr_ref="%s#%s" % (slug, status.get("number")),
-        frozen_id=int(freeze["id"]) if freeze else None,
+        frozen_id=int(freeze["id"]) if freeze else None, repo=repo,
         extra=("" if covered else "the PR merged %s, not the head the fire covered (%s): "
                "the fire did not cover this merge"
                % ((status.get("head") or "?")[:12], _norm((fire or {}).get("sha"))[:12])))
@@ -1086,17 +1086,10 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
                "" if covered else ". WARNING: the merged head is not the one the fire covered; "
                "the fire is to be given again on a new freeze")),
             {"project": row.get("app") or "", "pr": status.get("number"), "merged": True})
-        from . import review_lot
-        try:
-            out["review_lot"] = review_lot.open_after_merge(
-                db, lot=lot, item=row, merged_sha=status.get("merge_commit") or "",
-                pr=status.get("number"), target=target,
-                klass=lot_class.of_lot(db, lot, item=row, repo=repo, base=target or None,
-                                       head=merge_queue.pinned(repo, _norm((freeze or {}).get(
-                                           "sha"))) if repo else None))
-        except Exception as exc:  # noqa: BLE001 - la fusion est un fait
-            out["review_lot"] = {"id": None, "created": False,
-                                 "why": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+        # #2374 : la relecture est ouverte par `close_merged` (une seule fois,
+        # sur le diff que la fusion a fait entrer), pas recalculée ici sur
+        # `cible..gel` — vide après la fusion, donc faussement « light ».
+        out["review_lot"] = done.get("review_lot") or {}
     if not covered:
         _wake(db, row.get("assignee"), lot, (
             "Fire on lot #%d « %s »: PR #%s was merged at %s while the fire covered %s. "

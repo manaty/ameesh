@@ -109,7 +109,10 @@ CRITICAL_SCOPE = (
     re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
                r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
                r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
-               r"relocation|placement|merge_queue|land|fire)\.py$"),
+               r"relocation|placement|merge_queue|land|fire)\.py$|"
+               # la porte de fusion hors API, la classe du lot et son classement
+               # (#2249 ; ligne perdue dans une composition, restaurée #2374)
+               r"^src/ameesh/(merge_pr|lot_class|review)\.py$"),
 )
 #: le nombre d'avis d'un lot sensible hors de ces domaines
 SENSITIVE_REVIEWS = 1
