@@ -645,13 +645,14 @@ class OrphanGuardsTest(unittest.TestCase):
                         # git cherry / a squash can prove equivalent content
                         # on main while the original HEAD is still unpushed.
                         git.update(pushed=False, integrated=True, reason="")
+                    # Git is simulated here: the #2180 marker and repository
+                    # guards are too (their own witnesses use real worktrees)
                     with mock.patch.object(menage.storage, "of", return_value=store), \
                             mock.patch.object(menage, "worktree_state", return_value=git), \
                             mock.patch.object(menage, "worktree_in_use", return_value=False), \
                             mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
                             mock.patch.object(hd, "_marker", return_value="linked"), \
-                            mock.patch.object(menage, "common_dir",
-                                              return_value=os.path.realpath(root)), \
+                            mock.patch.object(menage, "same_repository", return_value=True), \
                             mock.patch.object(platform, "user_paths", return_value=platform.UserPaths()):
                         entries, plan = menage._worktree_pass(None, "pc", dry_run=True,
                                                              protected=set(), now=now)

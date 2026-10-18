@@ -56,6 +56,12 @@ SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM %I', :'schema', name, :'role')
   FROM unnest(ARRAY['host_release_operations','host_release_fences','host_release_fence_receipts']) name
  WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
+-- #1448: the post-merge catch-up activation bound (migration 0438) is
+-- read-only for the executors; only its owner (the pilot's decision) may
+-- move it, never a turn.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.review_catch_up FROM %I',
+              :'schema', :'role')
+ WHERE to_regclass(format('%I.review_catch_up', :'schema')) IS NOT NULL \gexec
 -- #326 r4: the key journal's order is the server's; no setval on its ids
 SELECT format('REVOKE UPDATE ON SEQUENCE %I.key_events_id_seq FROM %I', :'schema', :'role')
  WHERE to_regclass(format('%I.key_events_id_seq', :'schema')) IS NOT NULL \gexec
@@ -121,6 +127,37 @@ BEGIN
                 END IF;
             END LOOP;
         END LOOP;
+        -- B2 (R Codex cx2 sur #1448) : un parent qui porte INSERT/UPDATE/
+        -- DELETE sur une table en lecture seule reste effectif par SET ROLE,
+        -- même si le membre est accordé WITH INHERIT FALSE ;
+        -- has_table_privilege(r, …) ne le voit pas. B1 : un droit de colonne
+        -- (pg_attribute.attacl) est aussi un droit d'écriture effectif, que
+        -- le contrôle de table ignore. Les deux se vérifient sur chaque rôle
+        -- que r peut devenir, pas seulement sur r.
+        IF parent.rolname <> r THEN
+            FOR item IN SELECT c.oid, c.relname FROM pg_class c
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE n.nspname = s AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                           AND c.relname IN ('project_modules', 'host_release_operations',
+                                             'host_release_fences',
+                                             'host_release_fence_receipts',
+                                             'review_catch_up') LOOP
+                FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
+                    IF has_table_privilege(parent.oid, item.oid, privilege) THEN
+                        violations := violations || format('forbidden %s on %s through %s',
+                                                           privilege, item.relname,
+                                                           parent.rolname);
+                    END IF;
+                END LOOP;
+                FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE'] LOOP
+                    IF has_any_column_privilege(parent.oid, item.oid, privilege) THEN
+                        violations := violations || format(
+                            'forbidden %s on a column of %s through %s',
+                            privilege, item.relname, parent.rolname);
+                    END IF;
+                END LOOP;
+            END LOOP;
+        END IF;
         IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = s AND pg_has_role(parent.oid, c.relowner, 'MEMBER'))
            OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -160,13 +197,21 @@ BEGIN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
                 END IF;
             END LOOP;
-        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts') THEN
+        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts','review_catch_up') THEN
             IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
                 violations := violations || format('missing SELECT on %s', item.relname);
             END IF;
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
                 IF has_table_privilege(r, item.oid, privilege) THEN
                     violations := violations || format('forbidden %s on %s', privilege, item.relname);
+                END IF;
+            END LOOP;
+            -- B1 : un droit de colonne laissé au rôle nommé (le REVOKE de
+            -- table le nettoie normalement, mais l'audit reste fail-closed).
+            FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE'] LOOP
+                IF has_any_column_privilege(r, item.oid, privilege) THEN
+                    violations := violations || format('forbidden %s on a column of %s',
+                                                       privilege, item.relname);
                 END IF;
             END LOOP;
         ELSE
