@@ -71,6 +71,8 @@ create trigger ameesh_human_aliases_guard
 
 -- Volatile: audit the spelling before an authority check can consume it.
 -- A failed/rolled-back transaction leaves no successful resolution event.
+-- A read-only transaction (read API, serve.db_reader) grants no authority
+-- and cannot write: it resolves without an audit row.
 create or replace function ameesh_resolve_agent_name(supplied text, context text)
 returns text language plpgsql volatile as $$
 declare primary_name text;
@@ -78,7 +80,8 @@ begin
     select r.name into primary_name from agent_registry r
      where r.name = supplied or supplied = any(r.aliases);
     if primary_name is null then return supplied; end if;
-    if primary_name <> supplied then
+    if primary_name <> supplied
+       and current_setting('transaction_read_only') = 'off' then
         insert into agent_name_resolutions (supplied_name, primary_name, operation)
             values (supplied, primary_name, context);
     end if;

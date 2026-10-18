@@ -153,6 +153,13 @@ class AgentAliasTest(PgTestCase):
             with self.assertRaises(Exception):
                 self.db.execute(sql)
 
+    def test_alias_lookup_on_a_read_only_connection(self):
+        # GET /api/v1/agents/{a} reads through a read-only connection (serve.db_reader).
+        with self.db.transaction() as tx:
+            tx.execute('SET TRANSACTION READ ONLY')
+            self.assertEqual(registry.get(tx, 'old-worker')['name'], 'worker')
+        self.assertFalse(self.db.query('SELECT 1 FROM agent_name_resolutions'))
+
     def test_binding_resolves_alias_before_fencing(self):
         lease = registry.claim(self.db, 'worker', 'runner-test', 120)
         with mock.patch.dict(os.environ, {'AGENT_MAIL_NAME':'old-worker',
