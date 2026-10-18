@@ -9,28 +9,35 @@
 #     whole stays under 80 KB compressed (`npm run check`).
 # The Python side (the /ui/ page of `ameesh serve`, its CSP, the components'
 # contract on the sources, the theme's contrasts) is in tests/test_l88_ui.py.
+#
+# #2449 — canon §3/§11 bis : aucune suite sur une branche de lot. Le
+# déclencheur `pull_request` est retiré (une PR de lot touchant `ui/**` ne
+# lançait pas seulement ce job : elle le relançait à chaque poussée). Le
+# paquet (`integration/**`), `release/**` et `main` gardent le contrôle quand
+# les chemins changent ; un dispatch manuel reste possible, borné à une tête
+# admise par le pas ci-dessous. La porte de fusion de `main` exige `tests`
+# seul (protection de branche relue le 18/10/2026) : `ui` n'est pas un check
+# requis et son retrait ne laisse aucune validation requise sans porteur.
 name: ui
 
 on:
   push:
-    branches: [main, "release/**"]
-    paths: ["ui/**", "src/ameesh/ui/**", "docs/api/openapi-v1.json", ".github/workflows/ui.yml"]
-  pull_request:
+    branches: [main, "release/**", "integration/**"]
     paths: ["ui/**", "src/ameesh/ui/**", "docs/api/openapi-v1.json", ".github/workflows/ui.yml"]
   workflow_dispatch:
 
 concurrency:
-  group: ui-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ui-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/integration/') }}
 
 permissions:
   contents: read
 
 # Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
 # four runners): GitHub's free tier caps hosted jobs at 20 for the whole
-# organisation. A pull request from a fork never reaches that host (the
-# repository is public: its code would run on a shared, persistent machine);
-# it stays on ubuntu-latest, like the macOS job and the Pages deployment.
+# organisation. Without a `pull_request` trigger, only this repository's own
+# pushes and a manual dispatch reach the job (a fork has none of them): no
+# forked code runs on the shared, persistent host.
 #
 # Borrowed capacity (lot #1256, option A of the R2 B1 arbitration): a lending
 # host runs SINGLE-USE runners under the DISTINCT label `ameesh-lent`, never
@@ -44,7 +51,7 @@ permissions:
 # the fleet.
 jobs:
   ui:
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ fromJSON(vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') }}
     # Borrowed host: the run's runtime token must not be able to save cache
     # entries. `permissions:` does not bound that token; `cache-mode` does, in
     # the cache service (R1 Codex B3, #1256). `read` keeps setup-node's npm
@@ -55,6 +62,21 @@ jobs:
       run:
         working-directory: ui
     steps:
+      # #2449 : un dispatch manuel reste possible, jamais depuis une branche de
+      # lot (canon §3/§11 bis). Mêmes têtes admises que tests.yml ; la ref est
+      # refusée avant tout checkout, sans lancer Node.
+      - name: dispatch depuis une tête admise
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/main|refs/heads/release/*|refs/heads/integration/*|refs/heads/validation/*) ;;
+            *)
+              echo "::error::workflow_dispatch on '$GITHUB_REF': only main, release/**, integration/** and validation/** may be run by hand (#2449); a lot branch gets no suite"
+              exit 1
+              ;;
+          esac
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
