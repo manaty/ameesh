@@ -687,8 +687,10 @@ lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
     # était déjà levée. Dans les deux cas notre drain n'est plus en place, et
     # aucune pause étrangère n'a été touchée (R1 B1).
     if ! etat=$(pause_reelle "$1"); then
-      # #2184/N3 : garder l'intention pour une nouvelle tentative du trap ;
-      # rien n'a été levé, l'état ne prouve pas que la pause est partie.
+      # #2498 : l'intention est retirée. La reprise conditionnelle (motif
+      # identique, atomique) n'a rien levé : notre pause n'est plus en place,
+      # et l'échéance attendue plus haut exclut une pose tardive. Une nouvelle
+      # tentative du trap ne lèverait rien ; seul l'état reste à vérifier.
       echo "$1 : reprise conditionnelle sans effet et état illisible — vérifier « ameesh show $1 »" >&2
       drain_retire "$1"; return 1
     fi
@@ -746,6 +748,20 @@ lever_drains() {  # sortie du script : aucun drain ne survit à la commande
   return "$code"
 }
 trap 'lever_drains || true' EXIT
+drains_non_leves_relus() {  # #2498 : passe du trap avant le verdict
+  # Le message « NON levé(s) » précédait la seconde passe du trap et pouvait
+  # être périmé. La passe est faite ici ; ne restent signalés que les drains
+  # encore suivis (notre pause toujours en place ou état illisible).
+  [ "${#DRAINS_NON_LEVES[@]}" -gt 0 ] || return 0
+  lever_drains || true
+  local p e reste=()
+  for p in "${DRAINS_NON_LEVES[@]}"; do
+    for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+      [ "${e%%$'\t'*}" = "$p" ] && { reste+=("$p"); break; }
+    done
+  done
+  DRAINS_NON_LEVES=(${reste[@]+"${reste[@]}"})
+}
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes
@@ -862,6 +878,7 @@ redemarrer_agents() {
     etape "ERREUR: drain(s) indisponible(s) : ${DRAINS_INDISPONIBLES[*]} — agents laissés en l'état, balayage poursuivi"
     return 1
   fi
+  drains_non_leves_relus
   if [ "${#DRAINS_NON_LEVES[@]}" -gt 0 ]; then
     etape "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — lever à la main : ameesh resume <agent> --operator --reason …"
     return 1
@@ -1499,6 +1516,7 @@ redemarrer() {
     etape "ERREUR: drain(s) indisponible(s) : ${DRAINS_INDISPONIBLES[*]} — agents laissés en l'état, balayage poursuivi"
     exit 1
   fi
+  drains_non_leves_relus
   if [ ${#DRAINS_NON_LEVES[@]} -gt 0 ]; then
     etape "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — lever à la main : ameesh resume <agent> --operator --reason …"
     exit 1

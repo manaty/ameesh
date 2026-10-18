@@ -105,6 +105,17 @@ elif action == 'pause':
 elif action == 'resume':
     if (state / 'sans-expect-reason').exists() and '--expect-reason' in sys.argv[3:]:
         sys.exit(2)
+    echecs = state / 'reprises-en-echec'
+    if echecs.exists():
+        # #2498 : reprise sans réponse (transport coupé) ; le fichier compte
+        # les échecs restants, « toujours » ne s'épuise jamais.
+        reste = echecs.read_text().strip()
+        if reste != 'toujours':
+            if int(reste) <= 1:
+                echecs.unlink()
+            else:
+                echecs.write_text(str(int(reste) - 1))
+        sys.exit(1)
     attendu = opt('--expect-reason')
     raison = motif.read_text() if motif.exists() else ''
     if pause.exists() and attendu is not None and raison == attendu:
@@ -235,6 +246,32 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
                       (self.state / 'ssh.log').read_text())
         self.assertIn('systemctl start ameesh-runner@dev9',
                       (self.state / 'ssh.log').read_text())
+
+    def test_transient_resume_failure_is_not_reported_once_lifted(self):
+        """#2498 : une reprise en échec passager est rejouée (passe du trap)
+        avant le verdict ; levée, elle n'est plus signalée « NON levé(s) »."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'reprises-en-echec').write_text('1')
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn('drain(s) NON levé(s)', p.stdout + p.stderr)
+        self.assertIn('drain levé (sortie du script)', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_lasting_resume_failure_is_reported_after_the_retry(self):
+        """#2498 : le verdict « NON levé(s) » suit la nouvelle tentative et ne
+        nomme que les drains encore en place."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'reprises-en-echec').write_text('toujours')
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        sortie = p.stdout + p.stderr
+        self.assertIn('drain(s) NON levé(s) : dev9', sortie)
+        reprises = [l for l in self.poste().splitlines()
+                    if l.startswith('resume dev9 --operator')]
+        # Levée au redémarrage, puis les deux passes rejouées avant le verdict.
+        self.assertGreaterEqual(len(reprises), 3)
+        self.assertTrue((self.state / 'pause-dev9').exists())
 
 
 if __name__ == '__main__':
