@@ -671,11 +671,26 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     results: list[dict] = []
     for row in sorted(rows, key=lambda r: int(r["id"])):
         lot = int(row["id"])
-        freeze = latest_freeze(declared.get(lot, []))
+        marks = declared.get(lot, [])
+        freeze = latest_freeze(marks)
         sha = ((freeze or {}).get("sha") or "").strip()
+        frozen_id = int(freeze["id"]) if freeze else None
+        freeze_origin = "frozen" if sha else None
+        if not sha:
+            # #2399 (cas #2366) : un avis `ok` sur la tête publiée vaut gel
+            # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
+            # c'est le contenu relu qui entre dans la cible. Un avis sur une
+            # autre tête ne prouve rien : la branche a avancé depuis.
+            candidate = freeze_candidate(marks, repo_dir,
+                                         target or row.get("branch_target") or default)
+            reviewed = commit_id(candidate.get("sha"))
+            if candidate.get("origin") == "verdict" and reviewed:
+                head = _tip(repo_dir, row["branch"]) if row.get("branch") else None
+                if head is None or same_commit(reviewed, head):
+                    sha, freeze_origin = reviewed, "verdict"
         entry = {"work_item": lot, "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
-                 "target": None, "off_target": None,
+                 "target": None, "off_target": None, "freeze_origin": freeze_origin,
                  "detail": ("last freeze has no commit (milestone frozen --sha)" if freeze
                             else "no freeze declared (milestone frozen --sha)")}
         if not sha:
@@ -746,7 +761,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         else:
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
-                source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]),
+                source="content (%s)" % entry["how"], frozen_id=frozen_id,
                 repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
             entry["result"] = done["result"]
             detail = "%s — %s" % (entry["detail"], done["detail"])
@@ -1565,6 +1580,43 @@ def _content_carrier(repo: str, sha: str, target: str) -> tuple[dict | None, boo
     return carrier, False
 
 
+def _hash_ref_doubt(repo: str, lot: int, row: dict, branch: str | None, target: str,
+                    freeze_sha: str | None, found: dict | None) -> str | None:
+    """#2260 : une citation `#<id>` dans le titre d'une fusion tient-elle ?
+    None si oui ; sinon, en clair, les têtes du lot restées hors de `target`.
+
+    Preuve : le dernier gel ou, sans gel, la dernière tête vue en avance
+    (`branch_head`) est entré dans la cible (`probe` : ancêtre, patch-id,
+    squash). Une ancienne tête livrée ne prouve pas un nouveau gel. Démenti,
+    sans cette preuve : l'un d'eux n'y est pas, ou la branche du lot y a
+    encore du travail absent (une PR ouverte non fusionnée, Nexlink #598).
+    Un lot sans gel, sans tête vue ni branche en avance n'a rien qui démente
+    la citation : elle tient, comme avant."""
+    heads = []
+    if freeze_sha:
+        heads.append(("the last freeze", freeze_sha))
+    seen = (row.get("branch_head") or "").strip()
+    if seen and not freeze_sha:
+        heads.append(("the last head seen", seen))
+    for _label, sha in heads:
+        if probe(repo, sha, target, lot=lot)["merged"]:
+            return None
+    pending = ["%s %s" % (label, sha[:12]) for label, sha in heads]
+    tip = (found or {}).get("tip")
+    if tip:
+        ahead = bool(found.get("ahead"))
+    else:
+        # hors cible, la branche n'a pas été sondée (`_sweep_target`)
+        tip = _tip(repo, branch) if branch else None
+        ahead = bool(tip) and not probe(repo, tip, target, lot=lot)["merged"]
+    if tip and ahead and tip not in (sha for _label, sha in heads):
+        pending.append("the tip %s of %s" % (tip[:12], branch))
+    if not pending:
+        return None
+    return "%s %s not in %s" % (", ".join(pending), "is" if len(pending) == 1 else "are",
+                                target)
+
+
 def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: str, *,
                   st, since_all: float | None, hashes: dict, merges: dict, bodies: dict,
                   sweep: dict, pr_body, dry_run: bool, implicits: dict, tips: dict,
@@ -1583,7 +1635,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     PR porteuse quand la preuve ferme (B2, cherchée sur la chaîne
     première-parente de la cible) ; une fenêtre de lecture tronquée sans
     porteur connu laisse le lot ouvert. La fermeture est conditionnée à
-    ce gel (B1). Rend `{found, branch, implicit, row}` ; lève
+    ce gel (B1). #2260 : une citation `#<id>` démentie par une tête du lot
+    restée hors de la cible (`_hash_ref_doubt`) ne ferme pas : `unproven`.
+    Rend `{found, branch, implicit, row}` ; lève
     MergeProbeError/GitError comme l'examen d'origine."""
     freeze_sha = ((freeze or {}).get("sha") or "").strip() or None
     found = None
@@ -1651,7 +1705,21 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
             elif reverted_cite is None:
                 reverted_cite = dict(stopped, cite=merge["sha"])
         citing = gardees
+    unproven = None                  # #2260 : la citation `#<id>` démentie, et pourquoi
+    doubt: list | None = None
     for merge in citing:
+        if merge["how"] == "#id":
+            # #2260 : `#<id>` dans un titre n'est qu'une mention ; elle ne
+            # ferme pas un lot dont une tête connue reste hors de la cible
+            if doubt is None:
+                doubt = [_hash_ref_doubt(repo, lot, row, branch, target,
+                                         freeze_sha, found)]
+            if doubt[0]:
+                if unproven is None:
+                    unproven = (merge, "merge commit %s of %s cites #%d in its title, "
+                                "but %s: a mention is not a proof of delivery, lot "
+                                "kept open" % (merge["sha"][:12], target, lot, doubt[0]))
+                continue
         number = merge_pr_number(merge["message"])
         if not number:
             cited = merge
@@ -1751,6 +1819,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
                      how=cited["how"], ref=cited["sha"],
                      detail=_citation(cited, lot, target),
                      note=_citation(cited, lot, target, sha=False))
+        if cited["how"] == "#id" and freeze and freeze.get("id") is not None:
+            # #2260 : le gel qui prouve la citation doit encore être le dernier.
+            found["frozen_id"] = int(freeze["id"])
     elif content is not None:
         found = content
     elif reverted is not None:
@@ -1762,6 +1833,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
                      detail="merge commit %s of %s that names the lot was reverted (%s)"
                             % (reverted_cite["cite"][:12], target,
                                reverted_cite["ref"][:12]))
+    elif unproven is not None:
+        found = dict(found or {"tip": None, "ahead": False}, merged=False,
+                     how="unproven", ref=unproven[0]["sha"], detail=unproven[1])
     elif found is None:
         found = {"merged": False, "how": None, "ref": None, "tip": None,
                  "ahead": False,
@@ -2222,6 +2296,13 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 # #1825 : un contenu annulé hors cible ne ferme pas, mais se
                 # dit (le lot reste ouvert avec la raison)
                 entry.update(how="reverted", detail=reverted_off[1])
+            elif found["how"] == "unproven" and not dry_run:
+                # #2260 : le doute se trace, une fois par fusion citante
+                _signal_off_target(db, st, lot, assignee, reg,
+                                   "merge sweep: %s" % found["detail"],
+                                   "merge commit %s of %s cites #%d"
+                                   % (found["ref"][:12], target, lot),
+                                   actor=actor or "git:%s" % target)
             stale = row.get("branch_head_ts") is None or (
                 row.get("partial_merge") and (row.get("partial_seen_ts") is None
                                               or row["branch_head_ts"] <= row["partial_seen_ts"]))

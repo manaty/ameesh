@@ -120,6 +120,7 @@ class RetryLimitImportTest(unittest.TestCase):
         src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
         env = dict(os.environ,
                    PYTHONPATH=src + os.pathsep + (os.environ.get("PYTHONPATH") or ""),
+                   PYTHONWARNINGS="default",
                    AMEESH_LAND_TRANSIENT_RETRIES="not-a-number")
         proc = subprocess.run([sys.executable, "-c", "import ameesh.land"],
                               capture_output=True, text=True, env=env, timeout=60)

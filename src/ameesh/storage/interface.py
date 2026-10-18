@@ -161,6 +161,7 @@ from __future__ import annotations
 from .conversations import Conversations
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
+from .migration_reservations import MigrationReservations
 
 import abc
 import re
@@ -4038,6 +4039,7 @@ class Storage(abc.ABC):
     work: WorkItems
     work_dependencies: WorkDependencies
     provenance: Provenance
+    migration_reservations: MigrationReservations
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions

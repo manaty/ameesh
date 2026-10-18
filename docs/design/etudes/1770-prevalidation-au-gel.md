@@ -92,9 +92,11 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
   modification locale ne peuvent donc pas entrer dans la preuve (défaut trouvé
   par cx1 : `git status` les masquait alors que la photographie les
   embarquait). Le plan est un chemin **relatif** à cet arbre, refusé s'il en
-  sort (`selection-unsafe`), s'il est ignoré par git ou s'il remplacerait un
-  chemin du SHA candidat, même retiré de l'index local ; c'est le texte lu qui
-  est embarqué, pas une relecture du disque au moment du run ;
+  sort (`selection-unsafe`), s'il est ignoré par git, s'il remplacerait un
+  chemin du SHA candidat, même retiré de l'index local, ou si un parent de son
+  chemin y est un fichier (`plan-path-conflict`, conflit D/F : `update-index`
+  refuserait l'arbre construit, #1820) ; c'est le texte lu qui est embarqué,
+  pas une relecture du disque au moment du run ;
 - délai du run : `timeout_seconds` du canon ; exécution par
   `ameesh offload run --fallback none` uniquement. Sur la VM, ce chemin est
   celui du guest L159b (jetons de concurrence `flock`, scope cgroup plafonné par
@@ -138,10 +140,10 @@ garde le rapport entier (modules, parts, tests, hôte, durée).
 L'écriture a lieu **après** le run distant, en une instruction hors de toute
 transaction : aucun verrou de base n'est tenu pendant que la VM exécute la
 sélection. Un refus avant run (`block-missing`, `no-vm`,
-`selection-unsafe`) n'écrit rien ; un run rouge ou incomplet est un résultat et
-s'enregistre (`ok` faux). Le rapport n'est pas un verdict : il ne remplace ni
-#1617 (désignation au gel) ni #1756 (gel dérivé), et son écriture n'active
-aucune règle.
+`selection-unsafe`, `plan-path-conflict`) n'écrit rien ; un run rouge ou
+incomplet est un résultat et s'enregistre (`ok` faux). Le rapport n'est pas un
+verdict : il ne remplace ni #1617 (désignation au gel) ni #1756 (gel dérivé),
+et son écriture n'active aucune règle.
 
 Le rapport est **imprimé avant l'écriture** : tant que 0450 n'est pas déployée
 (cas de la preuve d'avant fusion), l'écriture échoue en `SchemaMissing`,
