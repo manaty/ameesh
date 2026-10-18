@@ -102,6 +102,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from . import work_lifecycle as lifecycle
 from . import build_artifacts
 from . import platform
 from . import resources as resources_mod
@@ -212,9 +213,9 @@ CACHES = (
 XDG_CACHE = ("xdg", ("XDG_CACHE_HOME",))
 
 #: états de lot qui terminent le cycle de vie des worktrees du lot
-LOT_ENDED = ("merged", "promoted", "closed")
+LOT_ENDED = lifecycle.COMPLETED
 #: L230: of those, the lot states where the work reached main
-LOT_MERGED = ("merged", "promoted")
+LOT_MERGED = lifecycle.DELIVERED
 #: L230: a worktree kept although its lot is merged is removed after this
 KEPT_MERGED_GRACE_S = 24 * 3600.0
 

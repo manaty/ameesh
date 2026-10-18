@@ -39,6 +39,7 @@ import re
 import time
 from typing import Iterable
 
+from . import work_lifecycle as lifecycle
 from . import storage
 
 #: seuil par défaut d'un lot stagnant (secondes)
@@ -53,10 +54,10 @@ _LEGACY = {"verdict": "verdict", "fix": "correction", "merge": "fusion",
            "decision": "decision_humaine", "merge-approval": "decision_humaine",
            "merge-outcome": "decision_humaine", "packet": "fusion"}
 #: états d'un lot qui n'attend plus rien
-DONE_STATES = ("merged", "promoted", "closed")
+DONE_STATES = lifecycle.COMPLETED
 #: états d'action qui attendent un humain
 _HUMAN_ACTION_STATES = ("proposed", "unknown")
-MERGE_CONNECTOR = "git-merge"
+MERGE_CONNECTOR = lifecycle.delivery_connector()
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdj]?)\s*$", re.I)
 _UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "j": 86400}
@@ -182,16 +183,16 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
                 return _waiting("merge-approval", approvers)
             return _waiting("merge-outcome", responsible)
         return _waiting("decision", approvers if act["state"] == "proposed" else responsible)
-    if state == "waiting_human":
+    if state == lifecycle.WAITING_HUMAN:
         return _waiting("decision", responsible)
     # 3. un verdict bloquant ne compte que s'il suit le dernier gel (L26)
     if jalons.get("verdict_kind") == "blocked" and jalons.get("verdict_current"):
         return _waiting("fix", assignee)
-    if state == "blocked":
+    if state == lifecycle.BLOCKED:
         return _waiting("unblock", responsible or assignee)
-    if state == "intake":
+    if state == lifecycle.REQUESTED:
         return _waiting("start", assignee)
-    if state == "build":
+    if state == lifecycle.IN_PROGRESS:
         return _waiting("build", assignee)
     # qa : en revue — approuvé par un verdict `ok` courant, ou dispensé de
     # re-verdict par le pilote (#1979 : résolution de composition mécanique,

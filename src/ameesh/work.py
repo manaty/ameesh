@@ -42,11 +42,12 @@ from .db import Db, DbError, is_unique_violation
 from .storage import interface
 from .storage.postgres import work as _pg
 
-STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
-          "closed")
-TERMINAL = ("promoted", "closed")
+# Public compatibility exports; the vocabulary is also usable without importing
+# storage or the command layer (housekeeping, progress and capacity readers).
+from .work_lifecycle import (ACTIVE, COMPLETED, DELIVERED, STATES, TERMINAL,
+                             TO_VALIDATE, WAITING, delivery_connector)
 #: déjà fusionnés : une fusion constatée n'y change rien
-MERGED_STATES = ("merged", "promoted")
+MERGED_STATES = DELIVERED
 #: raisons d'une fermeture explicite (`ameesh work close`) : abandonné,
 #: remplacé par un autre lot, livré hors cible avec sa tête relue (#988),
 #: ou livré sans fusion (`done`, #1280)
@@ -88,7 +89,6 @@ TRANSITIONS = {
     "blocked": {"intake", "build", "qa", "merged", "waiting_human"},
     "waiting_human": {"intake", "build", "qa", "merged", "blocked"},
 }
-WAITING = {"blocked", "waiting_human"}
 #: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
 #: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
 #: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
@@ -115,7 +115,7 @@ RETURN_NOTE = interface.RETURNED_NOTE
 #: §4 : états d'un lot que le geste `work return` rend à la file. Un lot en
 #: revue (`qa`), en attente d'un humain ou bloqué n'est pas de l'en-cours d'un
 #: agent : il ne se rend pas par ce geste.
-RETURN_STATES = ("intake", "build")
+RETURN_STATES = ACTIVE
 #: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
 UNKNOWN_ACTOR = "inconnu"
 #: un commit de fusion déclaré (`merged --sha`)

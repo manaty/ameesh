@@ -67,6 +67,7 @@ import textwrap
 import time
 from typing import Iterable
 
+from . import work_lifecycle as lifecycle
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -106,8 +107,8 @@ _FR_AGENT = {"working": "working", "idle": "idle", "paused": "paused",
              "stopped": "stopped"}
 
 #: connecteur de fusion (L5) : son approbation vaut verdict, sa confirmation fusion
-MERGE_CONNECTOR = "git-merge"
-_WAITING = ("blocked", "waiting_human")
+MERGE_CONNECTOR = lifecycle.delivery_connector()
+_WAITING = lifecycle.WAITING
 
 #: ce que la vue ne sait pas encore lire (dit dans le JSON, jamais deviné)
 MISSING = (
@@ -221,18 +222,19 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
             continue
         if state == prev:
             continue                      # une note, pas une transition
-        if state == "qa":
+        if state == lifecycle.TO_VALIDATE:
             ev_freezes.append(at)
-        if prev == "qa" and state in ("build", "merged"):
-            ev_verdicts.append((at, "ok" if state == "merged" else "blocked",
+        if prev == lifecycle.TO_VALIDATE and state in (
+                lifecycle.IN_PROGRESS, lifecycle.DELIVERY_RECORDED):
+            ev_verdicts.append((at, "ok" if state == lifecycle.DELIVERY_RECORDED else "blocked",
                                 ev.get("actor") or None))
-        if state == "merged" and merged is None:
+        if state == lifecycle.DELIVERY_RECORDED and merged is None:
             # #1693 (N4) : la première entrée en merged APRÈS la dernière
             # correction `merged → build` (qui remet `merged` à None) date la
             # livraison. Un retour depuis promoted, blocked ou waiting_human
             # conserve la fusion réelle.
             merged = at
-        elif prev == "merged" and state == "build":
+        elif prev == lifecycle.DELIVERY_RECORDED and state == lifecycle.IN_PROGRESS:
             # La correction annule aussi les replis depuis le journal et
             # l'action de fusion confirmée, pas seulement le jalon SQL.
             merge_corrected, merged = at, None
@@ -277,7 +279,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # `delivered` (sinon l'instant de fermeture) date la livraison, que `merged`
     # ne porte pas.
     delivered = auto.get("delivered")
-    if delivered is None and item.get("state") == "closed" \
+    if delivered is None and item.get("state") == lifecycle.CLOSED \
             and item.get("close_reason") == "delivered":
         delivered = item.get("closed_ts")
 
@@ -404,13 +406,13 @@ def lot_state(work_state: str, jalons: dict) -> str:
     que par un verdict `ok` qui porte sur le DERNIER gel (même SHA) — ou,
     #1979, par la marque « verdict non requis » du pilote (résolution de
     composition mécanique, canon §11 bis/#87)."""
-    if work_state in ("merged", "promoted"):
+    if work_state in lifecycle.DELIVERED:
         return "merged"
-    if work_state == "closed":
+    if work_state == lifecycle.CLOSED:
         return "closed"
     if work_state in _WAITING:
         return "blocked"
-    if work_state == "qa":
+    if work_state == lifecycle.TO_VALIDATE:
         current = jalons.get("verdict_current")
         if current is None:                 # jalons partiels : repli par les instants
             last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
@@ -503,7 +505,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "closed": ({"reason": item.get("close_reason"),
                     "superseded_by": item.get("superseded_by"),
                     "at_ts": _round(closed_at)}
-                   if item.get("state") == "closed" else None),
+                   if item.get("state") == lifecycle.CLOSED else None),
         "waiting_for": stagnation.with_availability(
             stagnation.waiting(item, jalons, actions,
                                responsible=(package or {}).get("responsible")),

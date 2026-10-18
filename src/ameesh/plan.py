@@ -20,10 +20,11 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from . import work_lifecycle as lifecycle
 from . import stagnation, storage
 from . import work as work_mod
 
-MERGE_CONNECTOR = "git-merge"
+MERGE_CONNECTOR = lifecycle.delivery_connector()
 
 
 # --------------------------------------------------------------------------
