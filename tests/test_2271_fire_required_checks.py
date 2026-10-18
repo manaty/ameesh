@@ -31,6 +31,13 @@ import unittest
 from ameesh import fire, land, radar
 
 SHA = "9e790414749cdb05e5c446a8e8291f26eaf039e7"
+
+#: #2306 : la classification passagère des lectures de la forge
+#: (`TransientLandError`) vient de la résolution 659bd757 (#2306 × #2285).
+#: Les deux témoins de l'union restent inactifs tant que #2306 n'est pas dans
+#: l'arbre, et s'activent dès son rejeu — sans quoi ils seraient rouges sur la
+#: seule branche #2285, qui n'a pas encore cette classe.
+TRANSIENT = getattr(land, "TransientLandError", None)
 #: le rollup exact de la PR #1638 : couverture verte, suite du paquet sautée,
 #: aucun check `tests`.
 INCIDENT = [
@@ -294,6 +301,17 @@ class RulesetTest(unittest.TestCase):
         project = _project(required_checks=("coverage",))
         self.assertEqual(self._required(gh, project=project),
                          (("tests", 15368), ("coverage", None)))
+
+    @unittest.skipUnless(TRANSIENT, "requires #2306 (TransientLandError)")
+    def test_a_transient_ruleset_read_is_not_replaced_by_the_declaration(self):
+        # #2306 x #2285 : le repli par source de #2285 ne vaut pas pour un
+        # échec passager ; la file réessaiera, la déclaration ne prouve pas
+        # les checks d'un ruleset qu'on n'a pas lu. Témoin de la résolution
+        # 659bd757, porté ici pour que le rejeu (qui ne transporte que
+        # fire.py) ne le perde pas.
+        gh = FakeGh(rules_error="gh: HTTP 502")
+        with self.assertRaises(TRANSIENT):
+            self._required(gh, project=_project(required_checks=("tests",)))
 
     def test_a_malformed_ruleset_page_is_refused(self):
         with self.assertRaises(land.LandError):
@@ -671,6 +689,24 @@ class ApiPagesTest(unittest.TestCase):
                                              stderr="gh: Not Found (HTTP 404)")
         with self.assertRaises(land.LandError):
             fire._head_check_runs("manaty/ameesh", SHA, gh=Broken([]))
+
+    @unittest.skipUnless(TRANSIENT, "requires #2306 (TransientLandError)")
+    def test_a_transient_failure_after_the_no_slurp_retry_is_retried(self):
+        # #2285 (gh 2.45) x #2306 : le second appel, sans --slurp, garde la
+        # classification passagère. Témoin de la résolution 659bd757, porté
+        # ici pour que le rejeu (qui ne transporte que fire.py) ne le perde
+        # pas.
+        class NoSlurpThenDown(NoSlurpGh):
+            def __call__(self, argv, **kwargs):
+                self.calls.append(list(argv))
+                if "--slurp" in argv:
+                    return types.SimpleNamespace(returncode=1, stdout="",
+                                                 stderr="unknown flag: --slurp")
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="gh: HTTP 502")
+
+        with self.assertRaises(TRANSIENT):
+            fire._head_check_runs("manaty/ameesh", SHA, gh=NoSlurpThenDown([]))
 
 
 if __name__ == "__main__":
