@@ -6703,6 +6703,11 @@ class Runner:
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self._runner_seen_next = 0.0
+        #: #2389 : dernier `no-land` journalisé, par lot et par feu (`fire_sha`).
+        #: Un projet sans voie d'atterrissage déclarée reste `no-land` à chaque
+        #: passage : le répéter à chaque tour noierait le journal, alors que
+        #: l'abstention ne change pas tant que le feu est le même.
+        self._fire_no_land: dict[int, str] = {}
         self.event_coalesce = max(0.0, cfg.event_coalesce)
         #: L125 : fenêtre de regroupement du courrier, défaut de l'hôte
         self.mail_batch = max(0.0, cfg.mail_batch)
@@ -8476,14 +8481,32 @@ class Runner:
         feu dont la tête a bougé, réconcilie une PR fusionnée. Ne lève jamais :
         un feu raté est retenté au passage suivant. #2212 : `radar` est relu à
         chaque passage, le mode du feu (file ou fusion directe) suit la
-        configuration de l'hôte, pas celle du démarrage."""
+        configuration de l'hôte, pas celle du démarrage.
+
+        #2389 : `no-land` n'est journalisé qu'une fois par lot et par feu.
+        L'abstention d'un hôte qui ne connaît pas la voie d'atterrissage est un
+        état stable, pas un événement : la redire à chaque passage ne dit rien
+        de neuf. Un feu invalidé, retiré ou fusionné oublie la marque, pour
+        qu'un nouveau feu parle de nouveau s'il retombe en `no-land`."""
         from . import fire
         try:
+            seen = getattr(self, "_fire_no_land", None)
+            if seen is None:
+                seen = self._fire_no_land = {}
             report = fire.run_pass(fresh_radar(self.cfg), db, dry_run=self.dry_run)
             for entry in report:
-                if entry.get("result") in fire.LOUD:
+                lot = entry.get("lot")
+                result = entry.get("result")
+                if result == "no-land":
+                    sha = str(entry.get("fire_sha") or "")
+                    if seen.get(lot) == sha:
+                        continue
+                    seen[lot] = sha
+                elif result in ("invalidated", "withdrawn", "merged"):
+                    seen.pop(lot, None)
+                if result in fire.LOUD:
                     log_async("fire: lot #%s %s%s" % (
-                        entry["lot"], entry["result"],
+                        lot, result,
                         " — %s" % (entry.get("detail") or entry.get("error"))
                         if entry.get("detail") or entry.get("error") else ""))
         except Exception as exc:  # jamais fatal pour l'exécuteur
