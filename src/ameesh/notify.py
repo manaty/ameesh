@@ -61,8 +61,14 @@ refused. See docs/EXPLOITATION.md, "Alertes poussées — ameesh notify".
 Reliability: the delivery state is kept in `<state>/notify/state.json` (a
 lasting alert is not resent after a restart; an alert resolved while
 stopped is sent on restart); rate limited per human (beyond that, a
-summary); a failing channel does not block the others and is retried on
-later passes, a bounded number of times.
+summary, whose members enter the `notified` ledger once the summary is
+delivered); a failing channel does not block the others and is retried on
+later passes, a bounded number of times. #2395: the state also keeps a
+persistent `notified` ledger — one notification per alert identity (same
+`since`, same severity) and per human, even if the alert resolves and comes
+back, and even after `ameesh notify` restarts; `slo_breach` is never pushed
+to the owner (canon §9, owner decision 18/10), including from an old
+persisted summary bucket.
 
 Channels: `desktop`, `ntfy`, `slack`, `app`. L66 — the `desktop` channel
 follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
@@ -171,6 +177,11 @@ DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_INTERVAL_S = 30.0
 #: fenêtre de la limite de débit, et intervalle minimal entre deux résumés
 RATE_WINDOW_S = 60.0
+#: #2395 : rétention du registre `notified` (une notification par identité
+#: d'alerte, sévérité et humain) — 30 jours, avec une borne dure pour que
+#: l'état reste petit même sur une longue série d'alertes.
+NOTIFIED_RETENTION_S = 30 * 24 * 3600.0
+NOTIFIED_MAX = 5000
 DEFAULT_SLACK_ENV = "AMEESH_SLACK_WEBHOOK"
 
 #: clés qui porteraient un secret EN CLAIR dans la configuration : refusées
@@ -612,15 +623,38 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     return Message(title, body, urgent=kind in URGENT_TYPES or bool(alert.get("urgent")))
 
 
+def _summary_raised_counts(raised) -> dict:
+    """Compte les membres levés d'un bucket (`{identité: membre}`) ; accepte
+    aussi l'ancien format `{type: compte}` d'un état persisté avant #2395."""
+    counts = {}
+    if not isinstance(raised, dict):
+        return counts
+    for identity, member in raised.items():
+        if isinstance(member, dict):
+            kind = member.get("type") or "?"
+            counts[kind] = counts.get(kind, 0) + 1
+        else:
+            kind = str(identity)
+            counts[kind] = counts.get(kind, 0) + int(member or 0)
+    return counts
+
+
+def _summary_resolved_count(resolved) -> int:
+    if isinstance(resolved, dict):
+        return len(resolved)
+    return int(resolved or 0)
+
+
 def render_summary(bucket: dict, host: str) -> Message:
-    raised = bucket.get("raised") or {}
-    total = sum(raised.values()) + int(bucket.get("resolved") or 0)
+    raised = _summary_raised_counts(bucket.get("raised"))
+    resolved = _summary_resolved_count(bucket.get("resolved"))
+    total = sum(raised.values()) + resolved
     parts = []
     if raised:
         parts.append("raised: " + ", ".join(
             "%d %s" % (n, kind) for kind, n in sorted(raised.items())))
-    if bucket.get("resolved"):
-        parts.append("resolved: %d" % int(bucket["resolved"]))
+    if resolved:
+        parts.append("resolved: %d" % resolved)
     title = "ameesh: %d alert(s) not detailed (rate limit)" % total
     # L94 : la sous-utilisation a sa ligne dans le résumé
     underuse = sum(n for kind, n in raised.items() if kind in sous_utilisation.UNDERUSE_TYPES)
@@ -912,12 +946,17 @@ class Router:
         return fiche.responsible if fiche is not None else None
 
     def resolve(self, alert: dict) -> tuple:
-        """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None)."""
-        if "owner" in (alert.get("targets") or ()):
-            # #789 t2 (canon §9) : un dépassement critique (P1) escalade au
-            # propriétaire — `notify.default_human`, comme le dit la
-            # documentation de ce module. La cible prime le `responsible` de
-            # l'agent, qui peut être un pilote : un P1 ne s'arrête pas à lui.
+        """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None).
+
+        #2395 (canon §9, owner 18/10) : un `slo_breach` n'est **jamais** poussé
+        à l'owner (`notify.default_human`), même si son type est configuré ou
+        si une cible `owner` traîne dans l'alerte. Ses destinataires sont les
+        rôles de `targets`, par courrier d'agent ; seul un `responsible`
+        explicitement nommé peut désigner un autre humain."""
+        if forces_owner(alert):
+            # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
+            # escalade au propriétaire — `notify.default_human`. La cible prime
+            # le `responsible` de l'agent, qui peut être un pilote.
             human = normalize_human(self.ncfg.default_human)
             if human:
                 return human, "defaut"
@@ -943,6 +982,11 @@ class Router:
         for source, value in steps:
             human = normalize_human(value())
             if human:
+                if (alert.get("type") == "slo_breach"
+                        and human == normalize_human(self.ncfg.default_human)):
+                    # #2395 : même explicitement configuré, un dépassement de
+                    # délai ne part pas sur le bureau de l'owner.
+                    return None, None
                 return human, source
         return None, None
 
@@ -957,7 +1001,7 @@ def state_path(cfg: Config) -> str:
 
 def empty_state() -> dict:
     return {"schema": STATE_SCHEMA, "active": {}, "resolved": {}, "rate": {},
-            "summary": {}, "last_summary": {}, "briefs": {}}
+            "summary": {}, "last_summary": {}, "briefs": {}, "notified": {}}
 
 
 def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
@@ -1006,6 +1050,47 @@ def key_of(alert: dict) -> str:
     if alert.get("type") == "orphan_lot" and alert.get("grouped"):
         key.append(alert.get("responsible"))
     return json.dumps(key, ensure_ascii=False)
+
+
+def _notification_id(key, severity, human, since=None) -> str:
+    """Identité du registre `notified` : clé, sévérité, humain, `since`. Les
+    résumés de débit s'en servent aussi pour leurs membres (#2395 B2), d'où la
+    fonction partagée : les deux chemins doivent produire exactement la même
+    clé. Le `since` y entre car certaines clés n'en ont pas (`ci_runner_stuck`,
+    #845) : un nouvel épisode reste une nouvelle notification."""
+    return json.dumps([key, severity, human, since], ensure_ascii=False)
+
+
+def _since_of(alert: dict):
+    """`since` de l'épisode, arrondi comme dans `exploitation.alert_key` ; None
+    si l'alerte n'en a pas (elle n'entre alors pas au registre `notified`)."""
+    since = (alert or {}).get("since")
+    try:
+        return round(float(since)) if since is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _entry_severity(entry: dict):
+    """Sévérité d'une entrée d'état ; les états antérieurs au lot ne la
+    persistaient pas : on la recalcule comme le fait le prochain relevé."""
+    severity = entry.get("severity")
+    if severity is not None:
+        return severity
+    alert = entry.get("alert")
+    if not isinstance(alert, dict):
+        return None
+    from . import alert_ack
+    return alert_ack.severity(alert)
+
+
+def forces_owner(alert: dict) -> bool:
+    """#789 t2, restreint par #2395 : une cible `owner` force la livraison à
+    l'humain même hors `notify.types`. Un `slo_breach` n'en bénéficie jamais :
+    aucun dépassement de délai n'est notifié à l'owner (canon §9, décision
+    owner 18/10)."""
+    return (alert.get("type") != "slo_breach"
+            and "owner" in (alert.get("targets") or ()))
 
 
 GROUPED_LOTS_SHOWN = 5
@@ -1154,15 +1239,12 @@ class Notifier:
             subjects_by_key.setdefault(key_of(group), []).append({
                 "key": alert_ack.key_of(subject), "severity": alert_ack.severity(subject)})
         # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
-        # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
-        # perd pas — elle atteint l'humain même si son type a été retiré de
-        # `notify.types` ; c'est le comportement par défaut qui tient le
-        # contrat « un P1 escalade au propriétaire ». Les dépassements
-        # ordinaires restent filtrables : `slo_breach` s'ajoute à
-        # `notify.types` pour les recevoir sur les canaux humains.
+        # (`targets` contient "owner") ne se perd pas — elle atteint l'humain
+        # même si son type a été retiré de `notify.types`. #2395 : sauf un
+        # `slo_breach`, jamais poussé à l'owner (décision owner 18/10) ; ses
+        # dépassements restent filtrables et partent aux rôles par courrier.
         wanted = {key_of(a): a for a in notifications
-                  if a.get("type") in self.ncfg.types
-                  or "owner" in (a.get("targets") or ())}
+                  if a.get("type") in self.ncfg.types or forces_owner(a)}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
         # Persisted deliveries from an older routing policy must not retry or
@@ -1189,11 +1271,16 @@ class Notifier:
                 # passe ; ni résolution ni acquittement invalidé sur une absence.
                 # L'état antérieur à #1901 ne gardait pas observation_host.
                 continue
+            if entry.get("status") == "resumee":
+                # #2395 : raccorder l'ancien compte de résumé pendant que
+                # l'entrée est encore visible dans `active`, avant qu'elle ne
+                # disparaisse.
+                self._adopt_summary_entry(entry)
             del active[key]
             if self._acknowledged(entry, acknowledgements):
                 self._mute(entry)
             if entry["alert"].get("type") not in self.ncfg.types \
-                    and "owner" not in (entry["alert"].get("targets") or ()):
+                    and not forces_owner(entry["alert"]):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
@@ -1208,6 +1295,14 @@ class Notifier:
             # A partial orphan group only mentions its unacknowledged members.
             alert = audible.get(key, alert)
             level = alert_ack.severity(alert)
+            if (entry is not None and alert.get("type") == "slo_breach"
+                    and entry.get("status") == "envoi" and entry.get("human")
+                    and entry.get("human") == normalize_human(self.ncfg.default_human)):
+                # #2395 : entrée persistée par l'ancienne politique, qui
+                # retentait une livraison SLO vers l'owner. On la remet en
+                # attente de destinataire : `_raise` applique les règles
+                # neuves (aucun envoi owner), sans retenter ni résoudre.
+                entry.update(status="sans_destinataire", channels={}, human=None)
             changed_ack_level = any(r["principal"] == human
                 and any(r["alert_key"] == a["key"] and r["severity"] != a["severity"]
                         for a in subjects)
@@ -1221,13 +1316,20 @@ class Notifier:
             if muted:
                 if entry is None:
                     entry = active[key] = {"alert": {k: alert.get(k) for k in _KEPT
-                        if alert.get(k) is not None}, "raised_ts": now, "channels": {}}
+                        if alert.get(k) is not None}, "key": key, "severity": level,
+                        "raised_ts": now, "channels": {}}
                 entry.update(human=human, severity=level, ack_subjects=subjects)
                 self._mute(entry)
                 continue
+            if entry is not None:
+                # #2395 : l'identité et la sévérité de l'alerte vivent dans
+                # l'entrée, pour le registre persistant `notified`.
+                entry["key"] = key
+                entry["severity"] = level
             if entry is None:
                 entry = active[key] = {
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                    "key": key, "severity": level,
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
                 if alert.get("type") in exploitation.ESCALATING:
@@ -1256,6 +1358,12 @@ class Notifier:
         self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
+            if (entry["alert"].get("type") == "slo_breach" and entry.get("human")
+                    and entry.get("human") == normalize_human(self.ncfg.default_human)):
+                # #2395 : une résolution SLO persistée par l'ancienne politique
+                # n'est pas renvoyée à l'owner ; elle s'arrête là.
+                del self.state["resolved"][key]
+                continue
             if self._acknowledged(entry, acknowledgements):
                 del self.state["resolved"][key]
                 continue
@@ -1277,6 +1385,7 @@ class Notifier:
                 self.state["rate"][human] = window
             else:
                 del self.state["rate"][human]
+        self._prune_notified(now)
         return records
 
     def run_local_pass(self, now: float | None = None) -> list:
@@ -1317,6 +1426,7 @@ class Notifier:
             else:
                 self._retry(entry, "raised", now)
         self._local_resolutions(wanted, now)
+        self._prune_notified(now)
         return records
 
     def _local_resolutions(self, wanted: dict, now: float) -> None:
@@ -1355,16 +1465,27 @@ class Notifier:
     def _forget_summary(self, entry: dict) -> None:
         if entry.get("status") != "resumee":
             return
-        bucket = self.state["summary"].get(entry.get("human"))
-        if bucket:
-            kind = entry["alert"]["type"]
-            remaining = bucket["raised"].get(kind, 0) - 1
-            if remaining > 0:
-                bucket["raised"][kind] = remaining
-            else:
-                bucket["raised"].pop(kind, None)
-            if not bucket["raised"] and not bucket["resolved"]:
-                self.state["summary"].pop(entry.get("human"), None)
+        human = entry.get("human")
+        bucket = self.state["summary"].get(human)
+        if not bucket:
+            return
+        bucket = self._normalize_summary_bucket(human, bucket)
+        member = self._summary_member(entry, human)
+        identity = self._summary_member_id(member)
+        members = bucket["raised"]
+        if identity in members:
+            del members[identity]
+        else:
+            # Bucket persisté avant #2395 : les identités n'y étaient pas
+            # gardées. On retire un membre du même type, comme l'ancien
+            # compteur, sans toucher aux identités réelles.
+            for old_id, old in list(members.items()):
+                if (old.get("type") == member.get("type")
+                        and str(old.get("key") or "").startswith("legacy:")):
+                    del members[old_id]
+                    break
+        if not members and not bucket["resolved"]:
+            self.state["summary"].pop(human, None)
 
     def _mute(self, entry: dict) -> None:
         self._forget_summary(entry)
@@ -1505,6 +1626,39 @@ class Notifier:
             self._record("budget_handoff", entry,
                          "a_blanc" if self.dry_run else ("rendu" if queued else "prise"), {})
 
+    # -- registre des notifications (#2395) ------------------------------------
+    @staticmethod
+    def _notified_id(entry: dict, human: str) -> str:
+        """Identité du registre : la clé de l'alerte (elle porte la raison,
+        donc le niveau), la sévérité, l'humain et le `since` de l'épisode (pas
+        toujours dans la clé, #845). Une même alerte
+        qui se résout puis revient ne repart pas ; une escalade de niveau a
+        une autre identité et part bien."""
+        key = entry.get("key") or key_of(entry["alert"])
+        return _notification_id(key, _entry_severity(entry), human,
+                                _since_of(entry["alert"]))
+
+    def _already_notified(self, entry: dict, human: str) -> bool:
+        return self._notified_id(entry, human) in (self.state.get("notified") or {})
+
+    def _mark_notified(self, entry: dict, now: float) -> None:
+        human = entry.get("human")
+        if not human or _since_of(entry["alert"]) is None:
+            # sans `since`, l'épisode n'a pas d'identité : un retour après
+            # résolution repart, comme avant #2395
+            return
+        self.state.setdefault("notified", {})[
+            self._notified_id(entry, human)] = round(float(now), 3)
+
+    def _prune_notified(self, now: float) -> None:
+        ledger = self.state.get("notified") or {}
+        kept = {key: ts for key, ts in ledger.items()
+                if now - float(ts) < NOTIFIED_RETENTION_S}
+        if len(kept) > NOTIFIED_MAX:
+            newest = sorted(kept.items(), key=lambda item: float(item[1]))[-NOTIFIED_MAX:]
+            kept = dict(newest)
+        self.state["notified"] = kept
+
     # -- levée ----------------------------------------------------------------
     def _event(self, db, kind: str, key: str, alert: dict) -> None:
         """L85: the alert in the event log (`GET /api/v1/events`); a base
@@ -1543,10 +1697,19 @@ class Notifier:
                 self._record("raised", entry, "sans_canal", {})
             entry["status"] = "sans_canal"
             return
+        if self._already_notified(entry, human):
+            # #2395 : une seule notification par alerte (même `since`), même
+            # sévérité et par humain — y compris si l'alerte se résout puis
+            # revient, et après un redémarrage d'`ameesh-notify` (registre
+            # persistant). Rien n'est renvoyé : seul le journal le dit.
+            entry["status"] = "notifiee"
+            entry["channels"] = {}
+            self.log("[%s] %s already notified to %s (same alert, same severity): "
+                     "not sent again" % (alert.get("type"), _subject(alert), human))
+            return
         if not self._allow(human, now):
             entry["status"] = "resumee"
-            bucket = self._bucket(human)
-            bucket["raised"][alert["type"]] = bucket["raised"].get(alert["type"], 0) + 1
+            self._summary_add(self._bucket(human), "raised", entry)
             self._record("raised", entry, "resumee", {})
             return
         entry["status"] = "envoi"
@@ -1738,7 +1901,16 @@ class Notifier:
             # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
             self._record("resolved", entry, "sans_envoi", {})
             return
-        if status == "acknowledged":
+        if (alert.get("type") == "slo_breach" and human
+                and human == normalize_human(self.ncfg.default_human)):
+            # #2395 : une résolution de dépassement ne part pas non plus sur le
+            # bureau de l'owner — y compris pour une entrée persistée par
+            # l'ancienne politique, ou si son type a été configuré.
+            self.log("alert resolved [%s] %s: owner notification suppressed (#2395)"
+                     % (alert.get("type"), _subject(alert)))
+            self._record("resolved", entry, "sans_envoi", {})
+            return
+        if status in ("acknowledged", "notifiee"):
             self._record("resolved", entry, "sans_envoi", {})
             return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
@@ -1747,7 +1919,9 @@ class Notifier:
             self._record("resolved", entry, status, {})
             return
         if status == "resumee":
-            self._bucket(human)["resolved"] += 1
+            bucket = self._bucket(human)
+            self._adopt_summary_entry(entry, bucket)
+            self._summary_add(bucket, "resolved", entry)
             return
         delivered = [name for name, st in entry["channels"].items() if st.get("ok")]
         if not delivered:
@@ -1761,7 +1935,7 @@ class Notifier:
                     "channels": {name: {"ok": False, "attempts": 0, "error": None}
                                  for name in delivered}}
         if not self._allow(human, now):
-            self._bucket(human)["resolved"] += 1
+            self._summary_add(self._bucket(human), "resolved", resolved)
             self._record("resolved", resolved, "resumee", {})
             return
         self._attempt(resolved, "resolved", now)
@@ -1806,6 +1980,12 @@ class Notifier:
         if results:
             delivery = ("a_blanc" if self.dry_run else
                         "envoyee" if any(v == "ok" for v in results.values()) else "echec")
+            if event == "raised" and any(v == "ok" for v in results.values()):
+                # #2395 : au moins un canal a livré — l'alerte est marquée au
+                # registre AVANT le journal, pour qu'un arrêt juste après ne la
+                # fasse pas repartir à la reprise. Un échec total n'est pas
+                # marqué : les canaux restent retentés comme avant.
+                self._mark_notified(entry, now)
             self._record(event, entry, delivery, results, message)
 
     def _send(self, channel: Channel, message: Message) -> tuple:
@@ -1831,13 +2011,224 @@ class Notifier:
         self.state["rate"][human] = window
         return True
 
+    # -- résumés de débit (#2395 : membres identifiés) -------------------------
+    @staticmethod
+    def _summary_member(entry: dict, human: str) -> dict:
+        alert = entry.get("alert") or {}
+        return {"key": entry.get("key") or key_of(alert),
+                "severity": _entry_severity(entry),
+                "type": alert.get("type"),
+                "since": _since_of(alert),
+                "human": human}
+
+    @staticmethod
+    def _summary_member_id(member: dict) -> str:
+        """Même identité que le registre `notified` : clé, sévérité, humain."""
+        return _notification_id(member.get("key"), member.get("severity"),
+                                member.get("human"), member.get("since"))
+
+    def _owner_human(self, human) -> bool:
+        owner = normalize_human(self.ncfg.default_human)
+        return bool(owner) and normalize_human(human) == owner
+
+    def _summary_forbidden(self, human, kind) -> bool:
+        return kind == "slo_breach" and self._owner_human(human)
+
+    def _legacy_summary_members(self, human, kind, count, exclude=()) -> list:
+        """Membres d'un ancien compte `{type: n}`.
+
+        Chaque compte est raccordé à une entrée active `resumee` du même
+        humain et du même type quand le raccord est identifiable (autant
+        d'entrées que de comptes) ; sinon l'identité reste synthétique : le
+        compte est rendu, sans prétendre dédoublonner une alerte précise."""
+        excluded = set(exclude)
+        candidates = []
+        for entry in (self.state.get("active") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("human") != human or entry.get("status") != "resumee":
+                continue
+            if (entry.get("alert") or {}).get("type") != kind:
+                continue
+            member = self._summary_member(entry, human)
+            if self._summary_member_id(member) not in excluded:
+                candidates.append(member)
+        candidates.sort(key=self._summary_member_id)
+        members = list(candidates) if len(candidates) <= count else []
+        for index in range(max(count - len(members), 0)):
+            members.append({"key": "legacy:%s:%s:%d" % (human, kind, index),
+                            "severity": None, "type": kind, "human": human})
+        return members
+
+    def _adopt_summary_entry(self, entry: dict, bucket: dict | None = None) -> None:
+        """Raccorde un ancien compte de résumé à l'entrée qui se résout.
+
+        L'entrée a déjà quitté `active` au moment de `_resolved` : ce raccord
+        remplace une identité synthétique du même type par la vraie identité
+        (clé, sévérité canonique, humain), pour que le résumé et le retour de
+        l'alerte partagent le registre (#2395 B2, reprise legacy)."""
+        human = entry.get("human")
+        if not human:
+            return
+        if bucket is None:
+            bucket = self._bucket(human)
+        member = self._summary_member(entry, human)
+        identity = self._summary_member_id(member)
+        raised = bucket.get("raised") or {}
+        if identity in raised:
+            return
+        kind = (entry.get("alert") or {}).get("type")
+        for old_id, old in list(raised.items()):
+            if (isinstance(old, dict) and old.get("type") == kind
+                    and str(old.get("key") or "").startswith("legacy:")):
+                del raised[old_id]
+                raised[identity] = member
+                return
+
+    def _normalize_summary_raised(self, human, raised) -> dict:
+        out = {}
+        if not isinstance(raised, dict):
+            return out
+        legacy = {}
+        for identity, member in raised.items():
+            if isinstance(member, dict):
+                normalized = {"key": member.get("key") or str(identity),
+                              "severity": member.get("severity"),
+                              "type": member.get("type"),
+                              "since": member.get("since"),
+                              "human": human}
+                if self._summary_forbidden(human, normalized["type"]):
+                    self.log("owner rate summary: slo_breach member filtered (#2395)")
+                    continue
+                out[self._summary_member_id(normalized)] = normalized
+                continue
+            # Ancien format `{type: compte}` : les identités n'étaient pas
+            # gardées. On tente de les raccorder aux entrées actives encore
+            # présentes (même humain, même type) avant de synthétiser.
+            kind = str(identity)
+            count = int(member or 0)
+            if self._summary_forbidden(human, kind):
+                if count:
+                    self.log("owner rate summary: %d slo_breach alert(s) filtered (#2395)"
+                             % count)
+                continue
+            legacy[kind] = legacy.get(kind, 0) + count
+        for kind, count in legacy.items():
+            for normalized in self._legacy_summary_members(human, kind, count,
+                                                           exclude=out):
+                out[self._summary_member_id(normalized)] = normalized
+        return out
+
+    def _normalize_summary_resolved(self, human, resolved) -> dict:
+        if isinstance(resolved, dict):
+            out = {}
+            for identity, member in resolved.items():
+                if not isinstance(member, dict):
+                    continue
+                normalized = {"key": member.get("key") or str(identity),
+                              "severity": member.get("severity"),
+                              "type": member.get("type"),
+                              "since": member.get("since"),
+                              "human": human}
+                if self._summary_forbidden(human, normalized["type"]):
+                    continue
+                out[self._summary_member_id(normalized)] = normalized
+            return out
+        count = int(resolved or 0)
+        if not count:
+            return {}
+        if self._owner_human(human):
+            # Un compte de l'ancien format ne dit pas le type : impossible de
+            # garantir qu'aucun slo_breach n'y figure (règle owner 18/10).
+            self.log("owner rate summary: %d untyped resolution(s) filtered (#2395)"
+                     % count)
+            return {}
+        out = {}
+        for index in range(max(count, 0)):
+            normalized = {"key": "legacy-resolved:%s:%d" % (human, index),
+                          "severity": None, "type": None, "human": human}
+            out[self._summary_member_id(normalized)] = normalized
+        return out
+
+    def _normalize_summary_bucket(self, human, bucket) -> dict:
+        if not isinstance(bucket, dict):
+            bucket = {}
+        bucket["raised"] = self._normalize_summary_raised(human, bucket.get("raised"))
+        bucket["resolved"] = self._normalize_summary_resolved(human, bucket.get("resolved"))
+        bucket["attempts"] = int(bucket.get("attempts") or 0)
+        return bucket
+
     def _bucket(self, human: str) -> dict:
-        return self.state["summary"].setdefault(
-            human, {"raised": {}, "resolved": 0, "attempts": 0})
+        bucket = self.state["summary"].get(human)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            self.state["summary"][human] = bucket
+        return self._normalize_summary_bucket(human, bucket)
+
+    def _summary_add(self, bucket: dict, event: str, entry: dict) -> None:
+        human = entry.get("human")
+        if not human:
+            return
+        member = self._summary_member(entry, human)
+        if self._summary_forbidden(human, member.get("type")):
+            self.log("[slo_breach] owner summary member refused (#2395)")
+            if not bucket.get("raised") and not bucket.get("resolved"):
+                self.state["summary"].pop(human, None)
+            return
+        bucket.setdefault(event, {})[self._summary_member_id(member)] = member
+
+    def _mark_member_notified(self, member: dict, now: float) -> None:
+        human = member.get("human")
+        if not human or member.get("since") is None:
+            return
+        self.state.setdefault("notified", {})[
+            self._summary_member_id(member)] = round(float(now), 3)
+
+    def _mark_summary_notified(self, bucket: dict, now: float) -> None:
+        for event in ("raised", "resolved"):
+            for member in (bucket.get(event) or {}).values():
+                if isinstance(member, dict):
+                    self._mark_member_notified(member, now)
+
+    def _member_already_notified(self, member: dict) -> bool:
+        return self._summary_member_id(member) in (self.state.get("notified") or {})
+
+    def _active_member_ids(self, human: str) -> set:
+        ids = set()
+        for entry in (self.state.get("active") or {}).values():
+            if not isinstance(entry, dict) or entry.get("human") != human:
+                continue
+            alert = entry.get("alert") or {}
+            member = {"key": entry.get("key") or key_of(alert),
+                      "severity": entry.get("severity"),
+                      "type": alert.get("type"), "since": _since_of(alert),
+                      "human": human}
+            ids.add(self._summary_member_id(member))
+        return ids
+
+    def _drop_notified_members(self, bucket: dict, human: str) -> None:
+        """Coordonne un résumé en attente avec le registre (#2395 B2, relecture
+        e828508e1) : un `raised` déjà livré — en direct dans cette passe ou par
+        un résumé précédent — ne repart pas ; une résolution dont l'alerte est
+        revenue (active) est dépassée et ne part pas non plus."""
+        active = self._active_member_ids(human)
+        raised = bucket.get("raised") or {}
+        for identity, member in list(raised.items()):
+            if isinstance(member, dict) and self._member_already_notified(member):
+                del raised[identity]
+        resolved = bucket.get("resolved") or {}
+        for identity in list(resolved):
+            if identity in active:
+                del resolved[identity]
 
     def _summaries(self, now: float) -> None:
         for human in list(self.state["summary"]):
-            bucket = self.state["summary"][human]
+            bucket = self._bucket(human)
+            self._drop_notified_members(bucket, human)
+            if not bucket["raised"] and not bucket["resolved"]:
+                # Stock entièrement filtré (ancien résumé SLO owner, #2395 B1).
+                del self.state["summary"][human]
+                continue
             last = self.state["last_summary"].get(human)
             if last is not None and now - float(last) < RATE_WINDOW_S:
                 continue
@@ -1859,6 +2250,11 @@ class Notifier:
             self.state["rate"].setdefault(human, []).append(now)
             entry = {"alert": {"type": "summary"}, "human": human, "source": "debit"}
             bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
+            if ok and not self.dry_run:
+                # #2395 B2 : les membres livrés par le résumé entrent au
+                # registre, sinon la même alerte repart en envoi direct après
+                # la fenêtre. Après succès seulement ; un échec reste retenté.
+                self._mark_summary_notified(bucket, now)
             if ok or bucket["attempts"] >= self.ncfg.max_attempts:
                 if not ok:
                     self.log("rate summary → %s: GIVING UP after %d attempt(s)"
