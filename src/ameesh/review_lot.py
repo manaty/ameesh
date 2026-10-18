@@ -807,7 +807,10 @@ def guard_delivery(db, item: dict) -> dict:
             continue
         if author and actor and actor.lower() == author.lower():
             continue                  # on ne relit pas son propre travail
-        family = merge_queue.actor_family(db, actor)
+        try:
+            family = merge_queue.actor_family(db, actor)
+        except merge_queue.RegistryReadError:
+            family = ""              # #2521 : lecture impossible, famille non prouvée
         if family and author_family and family == author_family:
             continue                  # la famille de l'auteur ne compte pas
         if required >= 2:
