@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
+from ameesh import (lot_class, mail, merge_queue, packet_guard, plan_git, plan_github, radar,
                     resolutions, storage, work)
 
 from .support import PgTestCase
@@ -124,7 +124,12 @@ class _Base(unittest.TestCase):
                                         side_effect=lambda db, n, *a: self.marks.get(n, [])),
                       mock.patch.object(merge_queue, "actor_family",
                                         side_effect=lambda db, n: self.FAMILIES.get(
-                                            str(n or "").strip(), ""))):
+                                            str(n or "").strip(), "")),
+                      # #2333 : ces bancs sans base simulent la mécanique de
+                      # file ; la garde du paquet est éprouvée avec une vraie
+                      # base dans test_1374_fire (land._fire_guard).
+                      mock.patch.object(packet_guard, "check_merge",
+                                        return_value={"allowed": True})):
             patch.start()
             self.addCleanup(patch.stop)
 

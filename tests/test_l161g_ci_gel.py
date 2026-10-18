@@ -1096,6 +1096,20 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertIn("ci-full-%s" % GEL, gh.poses())
 
+    def test_la_garde_du_paquet_accepte_une_exception_sans_gel_ni_sha(self):
+        """#2333 : sans gel ni `--sha`, nature et motif passent avant le plan,
+        et la note d'exception porte la tête que le plan a réellement testée."""
+        gh = Gh()
+        api = Github(head=TETE, pulls=[pull(head=TETE)])
+        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "exception": "incident",
+               "reason": "CI cassée sur main"}))
+        self.assertEqual(code, 0)
+        self.assertIn("ci-lot-%s" % TETE, gh.poses())
+        packet = [n for n in notes if n.startswith("packet-exception")]
+        self.assertEqual(packet, ["packet-exception incident sha=%s reason=CI cassée sur main"
+                                  % TETE])
+
     def test_un_jeton_actions_est_refuse_avant_toute_pose(self):
         # #1343 : l'événement d'un GITHUB_TOKEN d'Actions ne déclenche rien.
         self.gele()

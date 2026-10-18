@@ -818,6 +818,51 @@ class FireDbTest(PgTestCase):
         row = fire.give(self.db, lot, sha=A, actor="pilote")
         self.assertEqual(row["kind"], "fire")
 
+    def _landing(self, lot, *, branch="lot/1-un-lot", target="main", sha=A):
+        """Le dernier geste de `land` : une ligne de file et son éjection."""
+        ejected: dict = {}
+
+        def eject(reason, todo, **extra):
+            ejected.update(reason=reason, todo=todo)
+            return {"lot": lot, "result": "ejected", "reason": reason, "todo": todo}
+
+        landing = types.SimpleNamespace(
+            db=self.db, lot=lot,
+            row={"branch": branch, "target": target, "frozen_sha": sha},
+            project=types.SimpleNamespace(repo=".", name="ameesh"), eject=eject)
+        return landing, ejected
+
+    def test_land_guard_refuses_a_queued_lot_head_without_a_packet(self):
+        """#2333 : une ligne de file déjà posée ne contourne pas le paquet, sans feu."""
+        lot = self._bare_frozen_lot()
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+        self.assertIn("queue remove", ejected["todo"])
+
+    def test_land_guard_passes_a_declared_exception_on_that_head(self):
+        """#2333 : l'exception déclarée au journal vaut au dernier geste de land."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "cible rouge 18/10", A)
+        landing, _ejected = self._landing(lot)
+        self.assertIsNone(land._fire_guard(landing))
+
+    def test_land_guard_refuses_a_declaration_on_another_head(self):
+        """#2333 : une déclaration d'une autre tête ne couvre pas ce gel."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "ancienne tête", B)
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+
+    def test_land_guard_passes_an_integration_packet(self):
+        """#2333 : une ligne de file dont la tête est integration/** passe."""
+        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
+        landing, _ejected = self._landing(lot, branch="integration/paquet-2333")
+        self.assertIsNone(land._fire_guard(landing))
+
     def test_give_refuses_without_a_freeze(self):
         lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
         with self.assertRaises(fire.FireError) as caught:

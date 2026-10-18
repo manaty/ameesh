@@ -79,16 +79,27 @@ def is_integration_target(target) -> bool:
     return not name or plan_git.integration_branch(name)
 
 
-def marker(exception: str, sha: str, reason: str) -> str:
-    """La note-journal d'une exception (`packet-exception …`)."""
+def exception_of(exception: str, reason: str) -> tuple[str, str]:
+    """Valide la nature et le motif d'une exception, sans tête.
+
+    Sert à la CI : avant le plan, on ne connaît pas encore la tête que la
+    demande va tester (le gel peut manquer, `--sha` peut être absent) ; la
+    nature et le motif se vérifient là, la tête exacte est vérifiée et
+    journalisée après le plan (`declare`, qui exige le 40 hex)."""
     kind = (exception or "").strip().lower()
     if kind not in EXCEPTIONS:
         raise PacketGuardError("exception: %r (one of %s)"
                                % (exception, ", ".join(EXCEPTIONS)))
-    reason = " ".join(str(reason or "").split())
-    if not reason:
+    text = " ".join(str(reason or "").split())
+    if not text:
         raise PacketGuardError("exception %s requires a reason: the exception is marked "
                                "(canon §11 bis)" % kind)
+    return kind, text
+
+
+def marker(exception: str, sha: str, reason: str) -> str:
+    """La note-journal d'une exception (`packet-exception …`)."""
+    kind, reason = exception_of(exception, reason)
     digest = (sha or "").strip().lower()
     if not _SHA.fullmatch(digest):
         raise PacketGuardError("exception %s: the full 40-hex head is required, not %r"
@@ -208,19 +219,21 @@ def check_ci(db, lot, source, *, mode: str = "lot", sha: str = "",
     """Refuse une demande de CI de lot (`ci-lot`) hors paquet.
 
     Seul `mode == "lot"` est concerné : `--full` est la suite du paquet ou
-    d'une release. Une exception explicite est acceptée (elle sera écrite au
-    journal avec la tête réellement testée par `cmd_ci_run`) ; une exception
-    déjà déclarée pour `sha` est relue. Rend la déclaration retenue, ou lève
-    `PacketGuardError`."""
+    d'une release. Une exception explicite est acceptée : sa nature et son
+    motif sont validés ici, sa tête exacte est vérifiée et journalisée après
+    le plan, avec la tête que `cmd_ci_run` a retenue (elle peut manquer avant
+    le plan : ni gel ni `--sha`, la tête distante est lue par `gel_plan`).
+    Une exception déjà déclarée pour `sha` est relue. Rend la déclaration
+    retenue, ou lève `PacketGuardError`."""
     if (mode or "").strip() != "lot":
         return {"allowed": True, "why": "full suite, not a ci-lot request",
                 "exception": "", "journaled": False}
     if exception:
         # validation seule : la note est écrite par l'appelant avec la tête
-        # que le plan vient de retenir (elle peut différer du gel).
-        text = marker(exception, sha, reason)
-        return {"allowed": True, "exception": (exception or "").strip().lower(),
-                "reason": " ".join(str(reason or "").split()), "note": text,
+        # que le plan vient de retenir (elle peut différer du gel, ou n'être
+        # connue qu'après la lecture de la branche distante).
+        kind, text = exception_of(exception, reason)
+        return {"allowed": True, "exception": kind, "reason": text,
                 "journaled": False, "pending": True}
     found = declared(db, lot, sha)
     if found is not None:
