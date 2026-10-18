@@ -321,6 +321,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     frozen = str(frozen or "").strip().lower()
+    if klass.get("doubt"):
+        cls = lot_class.SENSITIVE
     # #1979/#2281 : la dispense de re-verdict du pilote (`-none`) lève la
     # porte, comme elle lève l'attente dans `progress` ; elle ne survit pas à
     # un nouveau gel (stockage `_lapse_waiver`) et ne lève jamais un blocage.

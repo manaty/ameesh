@@ -125,13 +125,16 @@ class GateTest(unittest.TestCase):
                                            item={"assignee": "author"})
 
     def test_a_doubt_accepts_one_independent_family(self):
-        klass = {"class": "sensitive", "doubt": True, "files": []}
-        self.assertEqual(self.gate(klass)["required"], 1)
-        one = self.gate(klass, "codex")
-        self.assertTrue(one["ok"], one["why"])
-        self.assertFalse(self.gate(klass, "same")["ok"])
-        self.assertFalse(self.gate(klass, "unknown")["ok"])
-        self.assertFalse(self.gate(klass, "author")["ok"])
+        for cls in ("sensitive", "light", "normal", "release"):
+            with self.subTest(cls=cls):
+                klass = {"class": cls, "doubt": True, "files": []}
+                self.assertEqual(self.gate(klass)["required"], 1)
+                one = self.gate(klass, "codex")
+                self.assertEqual(one["class"], "sensitive")
+                self.assertTrue(one["ok"], one["why"])
+                self.assertFalse(self.gate(klass, "same")["ok"])
+                self.assertFalse(self.gate(klass, "unknown")["ok"])
+                self.assertFalse(self.gate(klass, "author")["ok"])
 
     def test_the_merge_gate_keeps_two_distinct_families(self):
         klass = {"class": "sensitive",
