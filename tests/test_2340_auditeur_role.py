@@ -122,6 +122,7 @@ class AuditeurLoginRoleTest(PgTestCase):
     def test_role_login_lecture_seule_membre_des_deux_contrats(self):
         row = self.role()
         self.assertTrue(row["rolcanlogin"])
+        self.assertTrue(row["rolinherit"])
         for attribute in ("rolsuper", "rolcreatedb", "rolcreaterole",
                           "rolreplication", "rolbypassrls"):
             self.assertFalse(row[attribute], attribute)
@@ -147,6 +148,14 @@ class AuditeurLoginRoleTest(PgTestCase):
         proc = self.as_auditeur("CREATE TEMP TABLE t(x int)")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("read-only", proc.stderr)
+
+    def test_noinherit_remis_a_inherit(self):
+        self.db.execute("ALTER ROLE %s NOINHERIT" % db_mod.quote_ident(self.login))
+        self.apply_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                          contenus=self.contenus)
+        self.assertTrue(self.role()["rolinherit"])
+        etat = self.as_auditeur("SELECT count(id) FROM agent_mailbox")
+        self.assertEqual(etat.returncode, 0, etat.stderr)
 
     def test_une_appartenance_hors_contrat_fait_refuser(self):
         q = db_mod.quote_ident

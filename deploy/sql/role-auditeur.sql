@@ -19,10 +19,11 @@
 -- JAMAIS dans ce fichier : le propriétaire pose `\password <role>`, puis une
 -- ligne dans le `~/.pgpass` (0600) de l'hôte de l'auditeur.
 --
--- TRANSACTIONNEL ET IDEMPOTENT : une appartenance hors des deux contrats,
--- des rôles de base absents ou un attribut de superutilisateur font échouer
--- le script et annulent tout. Le relancer après une mise à jour ne change
--- rien. Il ne répare jamais des droits accordés par un autre : il refuse.
+-- TRANSACTIONNEL ET IDEMPOTENT : une appartenance hors des deux contrats
+-- ou des rôles de base absents font échouer le script et annulent tout. Le relancer après une mise à jour ne change
+-- rien. Il remet à zéro les attributs (LOGIN INHERIT, aucun privilège de
+-- rôle) et les droits directs du rôle sur le schéma ; il ne révoque jamais
+-- une appartenance accordée par un autre : il refuse.
 --
 -- Sans ce rôle (ou sans `AUDITEUR_DSN` dans le drop-in de l'exécuteur),
 -- l'analyse se contente des commandes `ameesh … --json` ; elle n'utilise
@@ -67,11 +68,11 @@ BEGIN
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
-        EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE '
-                       'NOREPLICATION NOBYPASSRLS', r);
+        EXECUTE format('CREATE ROLE %I LOGIN INHERIT NOSUPERUSER NOCREATEDB '
+                       'NOCREATEROLE NOREPLICATION NOBYPASSRLS', r);
     ELSE
-        EXECUTE format('ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE '
-                       'NOREPLICATION NOBYPASSRLS', r);
+        EXECUTE format('ALTER ROLE %I LOGIN INHERIT NOSUPERUSER NOCREATEDB '
+                       'NOCREATEROLE NOREPLICATION NOBYPASSRLS', r);
     END IF;
 
     -- Droits directs remis à zéro : seuls les contrats hérités comptent.
@@ -114,10 +115,10 @@ BEGIN
         RAISE EXCEPTION 'privilège interdit sur % ; transaction annulée', r;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles
-                    WHERE rolname = r AND rolcanlogin
+                    WHERE rolname = r AND rolcanlogin AND rolinherit
                       AND coalesce(rolconfig, '{}')
                           @> ARRAY['default_transaction_read_only=on']) THEN
-        RAISE EXCEPTION 'rôle % non LOGIN ou lecture seule non posée ; transaction annulée', r;
+        RAISE EXCEPTION 'rôle % non LOGIN, non INHERIT ou lecture seule non posée ; transaction annulée', r;
     END IF;
 END
 $auditeur$;
