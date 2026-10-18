@@ -248,7 +248,7 @@ class AdmissionTest(unittest.TestCase):
         captured = {}
 
         def fake_readiness(db, lot, repo, *, ci=None, clone=None, project=None,
-                           cfg=None):
+                           cfg=None, packet_exception=None):
             captured["ci"] = ci(view["headRefName"]) if ci else None
             if captured["ci"] and not captured["ci"]["green"]:
                 raise merge_queue.QueueError("the CI of PR #%s is not green"
