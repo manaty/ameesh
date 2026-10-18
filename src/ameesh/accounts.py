@@ -1229,7 +1229,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         result.reason = "unusable profile: %s" % "; ".join(result.problems)
         # #313 : le refus d'un compte partagé avec un autre mesh est une règle
         # absolue — la garde de budget désactivée ne le lève pas
-        result.hard = bool(profile.refused)
+        result.hard = bool(getattr(profile, "refused", ""))
         return result
     result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
     if result.gauges and record:
