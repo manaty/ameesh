@@ -294,10 +294,6 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     elif item.get("reviewers") is not None and reviewers and current:
         last = max(current.values(), key=lambda v: v["at_ts"])
         verdict_current = True
-    elif item.get("reviewers") is not None and not reviewers \
-            and last and last["kind"] == "blocked":
-        verdict_current = False
-        reviewer = designated
     if item.get("reviewers") is not None and reviewers:
         reviewer = last["actor"] if verdict_current and last else designated
     # #1979 : le pilote peut dispenser de re-verdict (résolution de composition

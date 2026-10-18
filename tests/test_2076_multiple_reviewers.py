@@ -83,11 +83,19 @@ class ReviewWaitingTest(unittest.TestCase):
                 self.assertEqual(progress.lot_state("qa", marks), "approved")
                 self.assertEqual(marks["pending_reviewers"], [])
 
-    def test_withdrawn_last_reviewer_does_not_keep_a_current_blocker(self):
-        item, marks = self.marks(("first", "blocked", "a" * 40), reviewers=[])
-        self.assertFalse(marks["verdict_current"])
-        self.assertIsNone(marks["reviewer"])
-        self.assertEqual(stagnation.waiting(item, marks)["what"], "verdict")
+    def test_no_designation_or_waiver_keeps_a_current_blocker(self):
+        # #1979 : sans relecteur désigné (ou avec la dispense `-none`), un
+        # verdict bloqué courant demande une correction, pas une dispense.
+        for reviewers in ([], ["-none"]):
+            with self.subTest(reviewers=reviewers):
+                item, marks = self.marks(("first", "blocked", "a" * 40),
+                                         reviewers=reviewers)
+                self.assertTrue(marks["verdict_current"])
+                self.assertEqual(marks["verdict_kind"], "blocked")
+                # `waiting` nomme la correction due ; `lot_state` laisse le
+                # lot « review » (un bloquant courant n'est jamais approuvé).
+                self.assertEqual(progress.lot_state("qa", marks), "review")
+                self.assertEqual(stagnation.waiting(item, marks)["what"], "fix")
 
     def test_human_prefixed_actor_matches_a_bare_designation(self):
         a = "a" * 40
