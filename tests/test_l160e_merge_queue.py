@@ -15,14 +15,15 @@ import shutil
 import subprocess
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
-from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
+from ameesh import (lot_class, mail, merge_queue, packet_guard, plan_git, plan_github, radar,
                     resolutions, storage, work)
 
 from .support import PgTestCase
-from .test_l160b_radar import LOTS, MIG, _git, git_env, make_repo
+from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
 from .test_l160d_resolutions import FakeWork, _commit_on, _identity, _manual_resolution
 
 
@@ -140,14 +141,21 @@ class _Base(unittest.TestCase):
         self.fake = FakeQueue(lots)
         self.marks: dict = {}
         store = mock.Mock(work=self.fake)
-        for patch in (mock.patch.object(storage, "of", return_value=store),
-                      mock.patch.object(work, "get",
-                                        side_effect=lambda db, n: self.fake.lots.get(n)),
-                      mock.patch.object(work, "milestones",
-                                        side_effect=lambda db, n, *a: self.marks.get(n, [])),
-                      mock.patch.object(merge_queue, "actor_family",
-                                        side_effect=lambda db, n: self.FAMILIES.get(
-                                            str(n or "").strip(), ""))):
+        patches = [mock.patch.object(storage, "of", return_value=store),
+                   mock.patch.object(work, "get",
+                                     side_effect=lambda db, n: self.fake.lots.get(n)),
+                   mock.patch.object(work, "milestones",
+                                     side_effect=lambda db, n, *a: self.marks.get(n, [])),
+                   mock.patch.object(merge_queue, "actor_family",
+                                     side_effect=lambda db, n: self.FAMILIES.get(
+                                         str(n or "").strip(), ""))]
+        if getattr(self, "PACKET_GUARD", True):
+            # #2333 : ces bancs sans base simulent la mécanique de file ; la
+            # garde du paquet y est simulée (les témoins de la garde elle-même
+            # sont dans PacketAdmissionTest et test_1374_fire).
+            patches.append(mock.patch.object(packet_guard, "check_merge",
+                                             return_value={"allowed": True}))
+        for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -410,6 +418,31 @@ class EntryTest(_Base):
             self.enter(1)
 
 
+class PacketAdmissionTest(_Base):
+    """#2333/canon §11 bis : la file refuse une tête de lot hors paquet, et
+    accepte le paquet (`integration/**`). La garde réelle est laissée active
+    (pas de simulation) ; la base est absente, donc aucune exception ne peut
+    être relue ici : les exceptions sont éprouvées sur Postgres dans
+    test_1374_fire (land._fire_guard) et test_l161g_ci_gel (ci run)."""
+
+    PACKET_GUARD = False
+
+    def test_queue_add_refuses_a_lot_head_outside_the_packet(self):
+        self.ready(1)
+        with self.assertRaisesRegex(merge_queue.QueueError, "§11 bis"):
+            self.enter(1)
+        self.assertEqual(self.fake.queue_rows, {}, "aucune ligne de file écrite")
+
+    def test_queue_add_accepts_an_integration_packet(self):
+        sha = self.tip(1)
+        _git(self.repo, "branch", "integration/paquet-2333", sha)
+        self.fake.lots[1]["branch"] = "integration/paquet-2333"
+        self.ready(1)
+        self.enter(1)
+        self.assertEqual(self.fake.queue_rows[1]["frozen_sha"], sha)
+        self.assertEqual(self.fake.queue_rows[1]["target"], "main")
+
+
 class LightClassTest(_Base):
     """L539 (§8): a light lot enters without a review verdict, but keeps every
     other gate — green CI on the frozen head, a non-draft PR, a target that is
@@ -579,9 +612,11 @@ class TargetResolutionTest(_Base):
 
 
 class ClassOfSourcesTest(unittest.TestCase):
-    """Revue #544 r1 : `_class_of` lit toutes les sources de la tête gelée et
-    garde la plus haute — une lecture calculée ne se rétrograde jamais, et un
-    doute ne se lit pas comme une classe sensible."""
+    """Revue #544 r1 : entre lectures de la même borne, `_class_of` garde la
+    plus haute — une lecture calculée ne se rétrograde jamais, et un doute ne
+    se lit pas comme une classe sensible. #2207 : les bornes des lectures
+    comparées et le choix de la cible fraîche sont couverts par le témoin Git
+    réel `ClassOfFreshTargetGitTest` (main et develop)."""
 
     def read(self, answers):
         calls = []
@@ -605,17 +640,17 @@ class ClassOfSourcesTest(unittest.TestCase):
         out, calls = self.class_of({
             merge_queue.QUEUE_REF + "main": {"class": "sensitive", "doubt": False,
                                              "why": "clone"},
-            "main": {"class": "light", "doubt": False, "why": "checkout auteur"}})
+            "origin/main": {"class": "light", "doubt": False, "why": "checkout auteur"}})
         self.assertEqual(out["class"], "sensitive")
         self.assertEqual(out["why"], "clone")
-        self.assertEqual(calls, [merge_queue.QUEUE_REF + "main", "main"])
+        self.assertEqual(calls, [merge_queue.QUEUE_REF + "main", "origin/main"])
 
     def test_un_doute_ne_se_lit_pas_comme_une_classe_sensible(self):
         # deux lectures sensibles : la calculée explique mieux que le doute
         out, _ = self.class_of({
             merge_queue.QUEUE_REF + "main": {"class": "sensitive", "doubt": True,
                                              "why": "diff illisible"},
-            "main": {"class": "sensitive", "doubt": False, "why": "policy"}})
+            "origin/main": {"class": "sensitive", "doubt": False, "why": "policy"}})
         self.assertEqual(out["class"], "sensitive")
         self.assertEqual(out["doubt"], False)
         self.assertEqual(out["why"], "policy")
@@ -624,10 +659,173 @@ class ClassOfSourcesTest(unittest.TestCase):
         out, _ = self.class_of({
             merge_queue.QUEUE_REF + "main": {"class": "light", "doubt": False,
                                              "why": "checkout"},
-            "main": {"class": "sensitive", "doubt": True, "why": "diff illisible"}})
+            "origin/main": {"class": "sensitive", "doubt": True, "why": "diff illisible"}})
         self.assertEqual(out["class"], "sensitive")
         self.assertEqual(out["doubt"], True)
         self.assertEqual(out["why"], "diff illisible")
+
+
+class ClassOfFreshTargetGitTest(unittest.TestCase):
+    """#2207, R1 : la classe de la file se lit entre la cible **fraîche** et la
+    tête gelée, jamais depuis le `main`/`develop` local du checkout des agents
+    ni depuis la copie que le clone `--shared` a prise de ce checkout.
+
+    Témoin Git réel : upstream à A, agents clonés à A ; upstream avance à B
+    avec une migration déjà fusionnée (chemin sensible), puis `lot/light` part
+    de B et ne change que `README.md`. La classe attendue est `light` : le
+    fichier sensible de B n'appartient pas au lot."""
+
+    def canon(self):
+        # Politique du projet : tout `.sql` est sensible, le reste léger.
+        return types.SimpleNamespace(
+            root="canon", sources=[],
+            federation={"review_policies": {"risk_classes": {
+                "projects": {"ameesh": {
+                    "default": "light",
+                    "rules": [{"paths": ["**/*.sql"], "class": "sensitive"}]}}}}})
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-2207-class-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.row, self.marks = {}, []
+        for obj, name, kwargs in (
+                (work, "configured_canons", {"return_value": [self.canon()]}),
+                (work, "get", {"side_effect": lambda db, n: self.row}),
+                (work, "milestones", {"side_effect": lambda db, n, *a: self.marks})):
+            patcher = mock.patch.object(obj, name, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def witness(self, target):
+        """(upstream, agents, A, B, C) pour une cible `main` ou `develop`."""
+        slug = target.replace("/", "-")
+        upstream = os.path.join(self.tmp, "upstream-" + slug)
+        os.makedirs(upstream)
+        _git(upstream, "init", "-q", "-b", target)
+        _write(upstream, "README.md", "A\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "A")
+        a = _git(upstream, "rev-parse", "HEAD")
+        agents = os.path.join(self.tmp, "agents-" + slug)
+        _git(self.tmp, "clone", "-q", "--branch", target, upstream, agents)
+        # B : un chemin sensible déjà fusionné dans la cible, hors du lot.
+        _write(upstream, "src/ameesh/migrations/9999_already_merged.sql", "-- merged\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "B, already merged")
+        b = _git(upstream, "rev-parse", "HEAD")
+        # C : le lot, qui ne touche que README.md depuis B.
+        _git(upstream, "checkout", "-q", "-b", "lot/light", b)
+        _write(upstream, "README.md", "C\n")
+        _git(upstream, "commit", "-qam", "C, light")
+        c = _git(upstream, "rev-parse", "HEAD")
+        _git(upstream, "checkout", "-q", target)
+        return upstream, agents, a, b, c
+
+    def lot(self, target):
+        self.row = {"id": 1, "app": "ameesh", "branch": "lot/light", "state": "qa",
+                    "assignee": "a1", "branch_target": target, "type": "evolution"}
+
+    def clone(self, agents, target):
+        return resolutions.Replayer(
+            agents, os.path.join(self.tmp, "clone-" + target.replace("/", "-")))
+
+    def test_admission_fetches_the_target_and_reads_the_fresh_class(self):
+        """P2-1 : le fetch d'admission doit ramener la cible (`QUEUE_REF`) ; les
+        agents n'ont jamais récupéré B ni C, seul le clone les a."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                self.lot(target)
+                self.marks = [{"id": 1, "kind": "frozen", "sha": c, "at_ts": 1.0}]
+                clone = self.clone(agents, target)
+                ready = merge_queue.readiness(
+                    None, 1, agents, clone=clone, cfg=None,
+                    # #2333 : ce témoin P2-1 vérifie la cible fraîche, pas la
+                    # garde « tout passe par paquet » ; l'exception de
+                    # simulation la neutralise sans écrire au journal.
+                    packet_exception=("unblock", "témoin P2-1 : garde paquet hors périmètre"),
+                    ci=lambda branch: {"number": 7, "green": True, "head": c,
+                                       "draft": False})
+                self.assertEqual(ready["class"], "light")
+                self.assertEqual(ready["frozen_sha"], c)
+                # la cible fraîche est dans le clone, pas la copie locale A
+                self.assertEqual(_git(clone.path, "rev-parse",
+                                      merge_queue.QUEUE_REF + target), b)
+                self.assertEqual(_git(agents, "rev-parse", target), a)
+                # le checkout des agents n'a été ni fetché ni écrit
+                self.assertNotEqual(_git(agents, "rev-parse",
+                                         "refs/remotes/origin/" + target), b)
+                self.assertEqual(_git(agents, "rev-parse", "HEAD"), a)
+
+    def test_the_clone_cached_target_is_not_a_base(self):
+        """P2-1 : la copie `origin/<cible>` du clone `--shared` vaut le local A
+        des agents ; elle ne doit pas expliquer la classe."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                # l'agent a récupéré son origin (B), son local reste en A
+                _git(agents, "fetch", "-q", "origin")
+                clone = self.clone(agents, target)
+                merge_queue.fetch_fresh(agents, ["lot/light"], clone)
+                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
+                self.lot(target)
+                out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                            target, c, cfg=None)
+                self.assertEqual(out["class"], "light")
+                self.assertFalse(out["doubt"])
+
+    def test_a_release_target_keeps_the_release_axis(self):
+        """Une borne de cible fraîche (commit ou `QUEUE_REF`) ne doit pas
+        effacer l'axe release de la cible résolue, absent de la ligne du lot."""
+        upstream = os.path.join(self.tmp, "upstream-release")
+        os.makedirs(upstream)
+        _git(upstream, "init", "-q", "-b", "main")
+        _write(upstream, "README.md", "A\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "A")
+        _git(upstream, "checkout", "-q", "-b", "release/1.10")
+        # les agents clonent la release à A : B et C ne vivront que dans le
+        # clone après le fetch d'admission
+        agents = os.path.join(self.tmp, "agents-release")
+        _git(self.tmp, "clone", "-q", "--branch", "release/1.10", upstream, agents)
+        _git(agents, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.assertEqual(_git(agents, "symbolic-ref", "--short",
+                              "refs/remotes/origin/HEAD"), "origin/main")
+        _write(upstream, "src/ameesh/migrations/9999_already_merged.sql", "-- merged\n")
+        _git(upstream, "add", "-A")
+        _git(upstream, "commit", "-qm", "B, already merged")
+        b = _git(upstream, "rev-parse", "HEAD")
+        _git(upstream, "checkout", "-q", "-b", "lot/light", b)
+        _write(upstream, "README.md", "C\n")
+        _git(upstream, "commit", "-qam", "C, light")
+        c = _git(upstream, "rev-parse", "HEAD")
+        _git(upstream, "checkout", "-q", "main")   # l'origin par défaut reste main
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "clone-release"))
+        merge_queue.fetch_fresh(agents, ["lot/light", "release/1.10"], clone)
+        self.row = {"id": 1, "app": "ameesh"}   # ni branche ni cible sur la ligne
+        out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                    "release/1.10", c, cfg=None)
+        self.assertEqual(out["class"], "release")
+        self.assertEqual(out["doubt"], False)
+
+    def test_a_stale_agent_target_does_not_overclassify_the_fresh_read(self):
+        """P2-2 : même avec `QUEUE_REF` frais, un `origin/<cible>` d'agent
+        remis en arrière (A) ne doit pas surclasser la lecture fraîche."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                _git(agents, "fetch", "-q", "origin")   # origin/<cible> = B
+                clone = self.clone(agents, target)
+                merge_queue.fetch_fresh(agents, ["lot/light", target], clone)
+                # la ref de l'agent redevient périmée, comme dans le témoin R1
+                _git(agents, "update-ref", "refs/remotes/origin/" + target, a)
+                self.assertEqual(_git(agents, "rev-parse",
+                                      "refs/remotes/origin/" + target), a)
+                self.lot(target)
+                out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                            target, c, cfg=None)
+                self.assertEqual(out["class"], "light")
+                self.assertFalse(out["doubt"])
 
 
 class OrderTest(unittest.TestCase):
@@ -1086,6 +1284,11 @@ class QueueWithoutRadarTest(PgTestCase):
         work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")
+        # #2333 : `queue add` refuse une tête de lot hors paquet ; ce banc
+        # éprouve le clone jetable et la tête fraîche, pas la garde : une
+        # exception déclarée sur cette tête exacte autorise l'admission.
+        packet_guard.declare(self.db, lot, "incident", "test: queue mechanics", fresh,
+                             actor="pilot")
         status = {"number": 7, "green": True, "head": fresh, "draft": False}
         made: list = []
         real = tempfile.mkdtemp

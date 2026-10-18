@@ -57,7 +57,7 @@ from . import persona_memory as memory_mod
 from . import train_events
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, NAME_RE, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
-from .config import load as load_config
+from .config import fresh_radar, load as load_config
 
 
 def log(message: str) -> None:
@@ -7391,8 +7391,8 @@ class Runner:
             try:
                 self.take_pass()
             except Exception as exc:
-                log_async("auto-take pass failed (%s): runner continues"
-                          % type(exc).__name__)
+                log_async("auto-take pass failed (%s): %s; runner continues"
+                          % (type(exc).__name__, db_mod.brief(exc)))
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -8473,10 +8473,12 @@ class Runner:
         """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
         couverts par le gel courant et dont les portes sont vertes, invalide un
         feu dont la tête a bougé, réconcilie une PR fusionnée. Ne lève jamais :
-        un feu raté est retenté au passage suivant."""
+        un feu raté est retenté au passage suivant. #2212 : `radar` est relu à
+        chaque passage, le mode du feu (file ou fusion directe) suit la
+        configuration de l'hôte, pas celle du démarrage."""
         from . import fire
         try:
-            report = fire.run_pass(self.cfg, db, dry_run=self.dry_run)
+            report = fire.run_pass(fresh_radar(self.cfg), db, dry_run=self.dry_run)
             for entry in report:
                 if entry.get("result") in fire.LOUD:
                     log_async("fire: lot #%s %s%s" % (
@@ -8506,13 +8508,15 @@ class Runner:
     def radar_once(self, db) -> None:
         """L160b : un passage du radar de conflits, après le relevé des
         branches, sur l'hôte qui déclare `radar.projects` : journal, et
-        courrier aux assignés sur conflit nouveau (L160c). Ne lève jamais."""
+        courrier aux assignés sur conflit nouveau (L160c). Ne lève jamais.
+        #2212 : `radar` relu à chaque passage, comme pour le feu."""
         from . import radar
         try:
             if getattr(self, "_radar_cache", None) is None:
                 self._radar_cache = radar.Cache()
             owner = getattr(self, "runner_id", None) or None
-            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache, owner=owner):
+            for line in radar.run_pass(fresh_radar(self.cfg), db, cache=self._radar_cache,
+                                       owner=owner):
                 if line.get("mail"):
                     log_async("radar %s: %d mail(s), including %d wake-up(s)" % (
                         line["project"], len(line["mail"]),
