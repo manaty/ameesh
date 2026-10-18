@@ -145,7 +145,8 @@ class PaquetInclusionTest(unittest.TestCase):
         )
 
     def namespace(self, expected=(), expected_file=(), excused=(),
-                  strict=False, head=None, manifest=None, no_expected=False):
+                  ready=(), ready_file=(), strict=False, head=None,
+                  manifest=None, no_expected=False, no_ready=True):
         return inclusion.argparse.Namespace(
             manifest=str(manifest or self.manifest),
             head=head or self.head,
@@ -154,9 +155,12 @@ class PaquetInclusionTest(unittest.TestCase):
             expected_file=list(expected_file),
             excused=list(excused),
             excused_file=[],
+            ready=list(ready),
+            ready_file=list(ready_file),
             json=False,
             strict=strict,
             no_expected=no_expected,
+            no_ready=no_ready,
         )
 
     def control(self, *extra: str):
@@ -164,6 +168,7 @@ class PaquetInclusionTest(unittest.TestCase):
             "--manifest", str(self.manifest),
             "--head", self.head,
             "--repo", str(self.repo),
+            "--no-ready",
             *extra,
         ]
         return inclusion.main(argv)
@@ -240,7 +245,7 @@ class PaquetInclusionTest(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
              "--manifest", str(self.manifest), "--head", self.head,
-             "--repo", str(self.repo), "--json"],
+             "--repo", str(self.repo), "--json", "--no-ready"],
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 1)
@@ -275,7 +280,7 @@ class PaquetInclusionTest(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
              "--manifest", str(self.manifest), "--head", self.head,
-             "--repo", str(self.repo)],
+             "--repo", str(self.repo), "--no-ready"],
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 2)
@@ -322,6 +327,114 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertEqual(payload["composed"], [100])  # 500 n'est pas composée
         self.assertEqual([item["lot"] for item in payload["omissions"]], [500])
         self.assertEqual(code, 1)
+
+    def test_ecartes_table_with_reason_explains_a_ready_lot(self) -> None:
+        # #2404 : « Écartés (ce véhicule) » est la forme que le composeur
+        # écrit ; un motif non vide est une explication forte.
+        manifest = pathlib.Path(self.tmp.name) / "manifeste-ecartes.md"
+        manifest.write_text(
+            self.manifest_simple(100, self.src100, self.c100).read_text(encoding="utf-8")
+            + textwrap.dedent(
+                """
+                ## Écartés (ce véhicule)
+
+                | lot | motif |
+                |---|---|
+                | #500 | conflit à préparer, paquet suivant |
+                """
+            ),
+            encoding="utf-8",
+        )
+        code, payload = inclusion.run(
+            self.namespace(expected=[100], ready=[500], manifest=manifest)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["ready_omissions"], [])
+        self.assertIn(500, {item["lot"] for item in payload["exclusions"]})
+        self.assertEqual(payload["ecartes"], {"500": "conflit à préparer, paquet suivant"})
+
+    def test_ecarte_without_reason_does_not_lift_omission(self) -> None:
+        manifest = pathlib.Path(self.tmp.name) / "manifeste-ecartes-vide.md"
+        manifest.write_text(
+            self.manifest_simple(100, self.src100, self.c100).read_text(encoding="utf-8")
+            + textwrap.dedent(
+                """
+                ## Écartés (ce véhicule)
+
+                | lot | motif |
+                |---|---|
+                | #500 |  |
+                """
+            ),
+            encoding="utf-8",
+        )
+        code, payload = inclusion.run(
+            self.namespace(expected=[100], ready=[500], manifest=manifest)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual([item["lot"] for item in payload["ready_omissions"]], [500])
+        self.assertIn("sans motif", payload["ready_omissions"][0]["reason"])
+
+    def test_ready_file_is_checked_without_admissions(self) -> None:
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        ready_file = pathlib.Path(self.tmp.name) / "prets.txt"
+        ready_file.write_text("# commentaire\n#100  prêt\n500\n#501\n", encoding="utf-8")
+        code, payload = inclusion.run(
+            self.namespace(ready_file=[str(ready_file)], manifest=manifest)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["expected_source"], None)
+        self.assertEqual(payload["ready_source"], "options")
+        self.assertEqual(payload["ready"], [100, 500, 501])
+        self.assertEqual([item["lot"] for item in payload["ready_omissions"]], [500, 501])
+        self.assertIn("#100", inclusion.render(payload))
+        self.assertIn("lot prêt ni composé ni écarté", payload["ready_omissions"][0]["reason"])
+
+    def test_ready_list_is_required_unless_no_ready(self) -> None:
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        with self.assertRaises(inclusion.InputError) as caught:
+            inclusion.run(self.namespace(expected=[100], manifest=manifest,
+                                         no_ready=False))
+        self.assertIn("--ready", str(caught.exception))
+        code, payload = inclusion.run(
+            self.namespace(expected=[100], manifest=manifest, no_ready=True)
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["no_ready"])
+        self.assertIn("--no-ready", inclusion.render(payload))
+
+    def test_ready_list_required_by_the_cli(self) -> None:
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        proc = subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
+             "--manifest", str(manifest), "--head", self.head,
+             "--repo", str(self.repo), "--expected", "100"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("aucune liste de lots prêts", proc.stderr)
+
+    def test_ready_lot_composed_is_not_an_omission(self) -> None:
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        code, payload = inclusion.run(
+            self.namespace(expected=[100], ready=[100], manifest=manifest)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["ready_omissions"], [])
+
+    def test_weak_prose_under_ecartes_stays_weak(self) -> None:
+        manifest = pathlib.Path(self.tmp.name) / "manifeste-ecartes-faible.md"
+        manifest.write_text(
+            self.manifest_simple(100, self.src100, self.c100).read_text(encoding="utf-8")
+            + "\n## Écartés\n\nLe lot #500 repassera au paquet suivant.\n",
+            encoding="utf-8",
+        )
+        code, payload = inclusion.run(
+            self.namespace(expected=[100], ready=[500], manifest=manifest)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual([item["lot"] for item in payload["ready_omissions"]], [500])
+        self.assertIn("mention faible", payload["ready_omissions"][0]["reason"])
 
     def test_commit_sans_delta_est_vide(self) -> None:
         # Remise fraîche sans delta : le paquet 11h réel en produit quatre.

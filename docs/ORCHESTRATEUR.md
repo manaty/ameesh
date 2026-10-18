@@ -454,23 +454,40 @@ rang 1.
 ## Intégration par paquets §12 : contrôle d'inclusion avant le feu
 
 Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
-lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
-et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
-à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+lots à verdicts complets (canon `processus/lots.md` §12).
+
+La composition **part d'une liste calculée**, jamais des seuls courriers
+(#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans
+filtre d'assigné), leur gel effectif confronté à la tête **publiée**, les
+verdicts requis sur cette tête et un essai de fusion propre contre la cible. Un
+lot prêt absent du paquet doit figurer dans la table « Écartés (ce véhicule) »
+du manifeste avec un motif ; sinon il n'est ni composé ni visible.
+
+Avant la CI complète et le feu, le contrôle d'inclusion confronte cette liste
+calculée, les admissions ou routages de la coupure, les lignes du manifeste
+**et** le contenu réel de l'arbre :
 
 ```sh
+scripts/paquet-candidats.py --repo . --ready-out "$TMPDIR/prets-0800.txt"
 scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
     --head origin/integration/paquet-23h-20261015 \
+    --ready-file "$TMPDIR/prets-0800.txt" \
     --expected-file "$TMPDIR/admissions-23h.txt"
 ```
 
-Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
-composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
-ne suffit pas après un revert (#1638). Sans liste attendue, il sort `2`, sauf
-`--no-expected` qui assume le contrôle partiel. Un contenu *partiel* ou *vide*
-est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
-bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
+Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
+ni « écarté » motivé), ou si le contenu d'un lot composé a disparu de la tête
+(revert non consigné) — l'ascendance d'une tête ne suffit pas après un revert
+(#1638). Sans liste attendue ni liste prête, il sort `2`, sauf `--no-expected`
+qui assume le contrôle partiel. Un contenu *partiel* ou *vide* est listé « à
+lire » (union, adaptation, remise fraîche) ; `--strict` le rend bloquant.
+Détail, format de la liste attendue et validation sur le paquet 11h :
 `docs/PAQUET-INCLUSION.md`.
+
+Un lot prêt que le paquet n'emporte pas ne disparaît pas : le manifeste
+l'écrit sous « Écartés (ce véhicule) » avec son motif (second avis dû, conflit
+à préparer, paquet complet, procédure de release…). Le contrôle d'inclusion
+lit cette table comme une explication forte, et refuse une ligne sans motif.
 
 Chaque commit de composition (une unité du paquet) porte un trailer
 `ameesh-work: <id>` par lot qu'il porte : il devient déclarable nativement

@@ -14,7 +14,10 @@ non plus, puisqu'un revert laisse la tête du lot ancêtre de la tête du paquet
 
 * la liste des lots **attendus** à la coupure (admissions et routages du
   pilote) : `--expected`, `--expected-file`, ou une section « admissions » du
-  manifeste (titre contenant « admission », liste ou tableau) ;
+  manifeste (titre contenant « admission », liste ou tableau) ; et la liste
+  **calculée** des lots prêts (#2404) : `--ready`, `--ready-file`, produite par
+  `scripts/paquet-candidats.py` (état qa, gel = tête publiée, verdicts requis
+  acquis, merge-tree propre) ;
 * les lignes de **composition du manifeste** (table dont l'en-tête porte une
   colonne « lot » et une colonne « commit »), et les **retraits** consignés
   (lignes de la table de composition dont la note dit retrait/revert/report,
@@ -35,11 +38,19 @@ consignée `retrait_consigné` : son effet se lit sur l'entrée de composition d
 lot (contenu absent), et un contenu qui réapparaît pour un lot pourtant retiré
 donne un avertissement.
 
+Un lot **prêt** (liste calculée) absent de la composition n'est pas une
+omission s'il figure dans une table « Écartés » avec un motif : c'est la forme
+que le composeur doit écrire, et le contrôle la lit comme une explication
+forte. Une ligne « écartée » sans motif ne lève pas l'omission (#2404).
+
 Sortie : un rapport lisible, ou `--json` (schéma `ameesh-paquet-inclusion/1`).
-Codes de retour : 0 si aucun défaut ; 1 si une inclusion manquante, un contenu
-absent non expliqué ou un commit introuvable, ou bien, sous `--strict`, un
-contenu partiel ou vide non expliqué ; 2 si l'entrée est invalide (manifeste ou
-tête introuvable, ou aucune liste attendue sans `--no-expected`).
+La liste des lots prêts est demandée : sans `--ready`/`--ready-file`, le
+contrôle s'arrête en 2, sauf `--no-ready` qui assume un contrôle partiel.
+Codes de retour : 0 si aucun défaut ; 1 si une inclusion manquante, un lot
+prêt ni composé ni écarté avec un motif, un contenu absent non expliqué ou un
+commit introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
+expliqué ; 2 si l'entrée est invalide (manifeste ou tête introuvable, aucune
+liste prête sans `--no-ready`, ou aucune liste attendue sans `--no-expected`).
 Le script est en lecture seule : aucun réseau, aucune écriture dans le dépôt.
 """
 
@@ -71,7 +82,8 @@ NO_ADMISSION_HEADING_RE = re.compile(
     r"(sans|aucun|aucune|pas de|pas d['’])\s*(section\s+)?(d['’]\s*)?admissions?",
     re.IGNORECASE,
 )
-RETRAIT_HEADING_RE = re.compile(r"retrait|report|exclusion", re.IGNORECASE)
+EXCLUSION_HEADING_RE = re.compile(
+    r"écart|ecart|retrait|retir|revert|report|exclu|différ", re.IGNORECASE)
 
 
 class GitError(RuntimeError):
@@ -162,6 +174,8 @@ class Manifest:
     explained: dict[int, str] = field(default_factory=dict)
     weak: dict[int, str] = field(default_factory=dict)
     admissions: list[int] = field(default_factory=list)
+    #: lots « écartés » au manifeste, ligne → motif ("" : sans motif)
+    ecartes: dict[int, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -220,6 +234,7 @@ def parse_manifest(path: Path) -> Manifest:
             and any("lot" in cell for cell in header)
             and any("commit" in cell for cell in header)
         )
+        is_ecarte = bool(EXCLUSION_HEADING_RE.search(heading))
         if is_compo:
             composed_found = True
             for line_no, line in block[2:]:
@@ -266,6 +281,28 @@ def parse_manifest(path: Path) -> Manifest:
                 for lot in lots:
                     manifest.explained[lot] = reason
                 seen_lines.add(line_no)
+        elif is_ecarte:
+            # La table « Écartés (ce véhicule) » du manifeste : chaque lot
+            # écarté y porte un motif. Une ligne sans motif ne lève pas
+            # l'omission d'un lot prêt (#2404) — elle reste visible à part.
+            lot_index = next(
+                (index for index, cell in enumerate(header) if "lot" in cell), 0
+            )
+            for line_no, line in block[2:]:
+                cells = split_row(line)
+                cell = cells[lot_index] if lot_index < len(cells) else cells[0]
+                lots = [int(found) for found in ID_RE.findall(cell)]
+                reason = " | ".join(
+                    value for index, value in enumerate(cells)
+                    if index != lot_index and value.strip()
+                ).strip(" —-?")
+                for lot in lots:
+                    manifest.ecartes[lot] = reason
+                    if reason:
+                        manifest.explained[lot] = (
+                            f"écarté au manifeste, ligne {line_no} : {reason}"
+                        )
+                seen_lines.add(line_no)
 
     if not composed_found:
         manifest.warnings.append(
@@ -297,16 +334,30 @@ def parse_manifest(path: Path) -> Manifest:
             # le sujet de la ligne (id en tête, après marqueurs de liste) :
             # « #987 × #1468 ... et retire celui de #1256 » ne retire pas #987.
             leading = bool(re.match(r"^[\s>*\-]*#\d+", line))
-            weak = not (leading and RETRAIT_HEADING_RE.search(heading))
+            weak = not (leading and EXCLUSION_HEADING_RE.search(heading))
             for lot in (int(found) for found in ID_RE.findall(line)):
                 if weak:
                     manifest.weak.setdefault(lot, reason)
                 else:
                     manifest.explained.setdefault(lot, reason)
-        elif RETRAIT_HEADING_RE.search(heading):
+        elif EXCLUSION_HEADING_RE.search(heading):
+            # Sous « Écartés »/« Retraits », le lot doit être le sujet de la
+            # ligne (id en tête) pour être écarté ; une phrase qui le cite au
+            # passage reste une mention faible. Un id seul n'est pas un motif
+            # et ne lève pas l'omission d'un lot prêt (#2404).
+            leading = bool(re.match(r"^[\s>*\-]*#?\d+", line))
+            rest = re.sub(r"^[\s>*\-]*(?:#\d+[\s/,]*)+", "", line).strip(" :—-\t")
             reason = f"sous « {heading} », ligne {line_no}"
+            if leading and rest:
+                reason = f"écarté sous « {heading} », ligne {line_no} : {rest[:160]}"
             for lot in (int(found) for found in ID_RE.findall(line)):
-                manifest.weak.setdefault(lot, reason)
+                if leading and rest:
+                    manifest.ecartes.setdefault(lot, rest)
+                    manifest.explained.setdefault(lot, reason)
+                elif leading:
+                    manifest.ecartes.setdefault(lot, "")
+                else:
+                    manifest.weak.setdefault(lot, reason)
     if admissions:
         # dédoublonner en gardant l'ordre
         manifest.admissions = list(dict.fromkeys(admissions))
@@ -576,14 +627,25 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     expected = collect_ids(args.expected, args.expected_file)
     if not expected and manifest.admissions:
         expected = list(manifest.admissions)
-    if not expected and not args.no_expected:
-        # Sans liste attendue, le contrôle « admissions × manifeste » ne peut
-        # pas conclure : une sortie 0 laisserait croire qu'il a eu lieu
-        # (#1655 N1). --no-expected l'assume explicitement.
+    ready = collect_ids(getattr(args, "ready", []), getattr(args, "ready_file", []))
+    no_ready = bool(getattr(args, "no_ready", False))
+    if not ready and not no_ready:
+        # La composition part de la liste calculée (#2404) : sans elle, le
+        # contrôle ne peut pas dire qu'un lot prêt a été oublié. L'assumer
+        # explicitly (--no-ready) est un contrôle partiel, jamais un défaut.
         raise InputError(
-            "aucun lot attendu : fournir --expected, --expected-file ou une "
-            "section « admissions » au manifeste, ou assumer le contrôle "
-            "partiel avec --no-expected"
+            "aucune liste de lots prêts : fournir --ready ou --ready-file "
+            "(sortie de scripts/paquet-candidats.py --ready-out), ou assumer "
+            "le contrôle partiel avec --no-ready"
+        )
+    if not expected and not ready and not args.no_expected:
+        # Sans liste attendue ni liste calculée, le contrôle ne peut pas
+        # conclure : une sortie 0 laisserait croire qu'il a eu lieu
+        # (#1655 N1, #2404). --no-expected l'assume explicitement.
+        raise InputError(
+            "aucun lot attendu ni prêt : fournir --expected, --expected-file, "
+            "--ready, --ready-file ou une section « admissions » au manifeste, "
+            "ou assumer le contrôle partiel avec --no-expected"
         )
     excused = {
         lot: "reporté (déclaré hors manifeste)"
@@ -630,11 +692,20 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
             return True
         return False
 
+    def ecarte_sans_motif(lot: int) -> bool:
+        """La ligne « écarté » existe-t-elle sans motif ? (#2404)"""
+        return (lot in manifest.ecartes and lot not in manifest.explained
+                and lot not in excused)
+
     # 1. Chaque lot attendu doit apparaître au manifeste (ou être expliqué).
     # Une mention faible (prose sans retrait du lot) ne lève pas l'omission :
     # « retour à l'état #1333 » sous « Retraits » ne dit pas que #1333 est exclu.
     for lot in expected:
         if lot in composed:
+            continue
+        if ecarte_sans_motif(lot):
+            omissions.append({"lot": lot, "reason": "écarté au manifeste sans "
+                              "motif", "ready": False})
             continue
         if lot in manifest.weak and lot not in explained and lot not in excused:
             omissions.append({"lot": lot, "reason": "absent du manifeste "
@@ -643,6 +714,31 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         if explain(lot, "absent"):
             continue
         omissions.append({"lot": lot, "reason": "absent du manifeste"})
+
+    # 1 bis. Tout lot **prêt** (liste calculée) doit être composé ou écarté
+    # avec un motif. C'est le défaut de #2404 : #2377, prêt, n'était ni dans
+    # le manifeste ni dans ses « écartés », donc invisible avant la CI.
+    omitted = {item["lot"] for item in omissions}
+    for lot in ready:
+        if lot in composed or lot in omitted:
+            continue
+        if ecarte_sans_motif(lot):
+            omissions.append({"lot": lot, "reason": "lot prêt écarté au "
+                              "manifeste sans motif", "ready": True})
+            omitted.add(lot)
+            continue
+        if lot in manifest.weak and lot not in explained and lot not in excused:
+            omissions.append({"lot": lot, "reason": "lot prêt absent du "
+                              "manifeste (mention faible seulement : "
+                              f"{manifest.weak[lot]})", "ready": True})
+            omitted.add(lot)
+            continue
+        if explain(lot, "prêt"):
+            exclusions[-1]["ready"] = True
+            continue
+        omissions.append({"lot": lot, "reason": "lot prêt ni composé ni "
+                          "écarté au manifeste", "ready": True})
+        omitted.add(lot)
 
     # 2. Contenu réel à la tête, pour chaque lot composé (attendu ou non).
     for lot in sorted(composed):
@@ -701,12 +797,20 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
             "section du manifeste" if manifest.admissions else None
         ),
         "expected": expected,
+        "ready": ready,
+        "ready_source": (
+            "options" if (getattr(args, "ready", None) or getattr(args, "ready_file", None))
+            else None
+        ),
+        "no_ready": no_ready,
+        "ecartes": {str(lot): reason for lot, reason in sorted(manifest.ecartes.items())},
         "excused": sorted(excused),
         "composed": sorted(composed),
         "explained": {str(lot): reason for lot, reason in sorted(explained.items())},
         "weak": {str(lot): reason for lot, reason in sorted(manifest.weak.items())},
         "entries": entry_results,
         "omissions": omissions,
+        "ready_omissions": [item for item in omissions if item.get("ready")],
         "removed": removed,
         "exclusions": exclusions,
         "contents": contents,
@@ -744,6 +848,18 @@ def render(payload: dict) -> str:
             "Attendus : aucun — contrôle « admissions × manifeste » NON effectué "
             "(--no-expected ; fournir --expected, --expected-file ou une section "
             "« admissions »)"
+        )
+    if payload.get("ready_source"):
+        liste = ", ".join(f"#{lot}" for lot in payload["ready"]) or "aucun"
+        out.append(
+            f"Prêts : {len(payload['ready'])} lots (liste calculée, "
+            f"{payload['ready_source']}) — {liste}"
+        )
+    elif payload.get("no_ready"):
+        out.append(
+            "Prêts : contrôle « prêts × manifeste » NON effectué (--no-ready ; "
+            "fournir --ready-file, sortie de scripts/paquet-candidats.py "
+            "--ready-out)"
         )
     out.append("")
 
@@ -868,6 +984,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="lots attendus à la coupure (ids, virgules ou espaces)")
     parser.add_argument("--expected-file", action="append", default=[],
                         help="fichier de lots attendus (un id par ligne)")
+    parser.add_argument("--ready", action="append", default=[],
+                        help="lots prêts calculés (#2404 : paquet-candidats.py), "
+                             "ids ou virgules")
+    parser.add_argument("--ready-file", action="append", default=[],
+                        help="fichier des lots prêts (paquet-candidats.py "
+                             "--ready-out), un id par ligne")
     parser.add_argument("--excused", action="append", default=[],
                         help="lots reportés/retirés hors manifeste (ids)")
     parser.add_argument("--excused-file", action="append", default=[],
@@ -879,6 +1001,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-expected", dest="no_expected", action="store_true",
                         help="assumer un contrôle sans liste attendue (admissions "
                              "non vérifiées)")
+    parser.add_argument("--no-ready", dest="no_ready", action="store_true",
+                        help="assumer un contrôle sans liste calculée des lots "
+                             "prêts (#2404)")
     args = parser.parse_args(argv)
 
     for value in args.expected:
@@ -887,6 +1012,9 @@ def main(argv: list[str] | None = None) -> int:
     for value in args.excused:
         if isinstance(value, str) and not parse_id_list(value):
             parser.error(f"--excused illisible : {value!r}")
+    for value in args.ready:
+        if isinstance(value, str) and not parse_id_list(value):
+            parser.error(f"--ready illisible : {value!r}")
 
     try:
         code, payload = run(args)
