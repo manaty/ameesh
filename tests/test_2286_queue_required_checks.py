@@ -12,6 +12,13 @@ quand elle se lit) et prouve chaque contexte **sur la tête exacte** : un check
 absent, sauté, en échec ou produit par une autre application ne passe pas.
 `fire.land_guard` l'appelle au dernier geste, pour tout atterrissage de la
 file, avec ou sans jalon de feu. Sans déclaration, rien ne change.
+
+#2306 : une lecture passagère des checks (HTTP 5xx, délai, coupure) ne prouve
+pas un manque — la ligne de file reste en place et repart au passage suivant,
+au lieu d'éjecter ; seuls un manque prouvé, un refus de droits (4xx) ou une
+réponse malformée éjectent. La cible vide, qui sautait la garde, est refusée,
+et les statuts sont paginés jusqu'au `total_count` annoncé (un total de 100
+n'est plus pris pour une troncature).
 """
 from __future__ import annotations
 
@@ -34,13 +41,16 @@ class FakeHeadGh:
     """Le peu de `gh` lu par la garde : protection, check runs, statuts."""
 
     def __init__(self, *, runs=(), statuses=(), protection=PROTECTED,
-                 runs_error="", statuses_error="", protection_error=""):
+                 runs_error="", statuses_error="", protection_error="",
+                 runs_body=None, statuses_total=None):
         self.runs = list(runs)
         self.statuses = list(statuses)
         self.protection = protection
         self.runs_error = runs_error
         self.statuses_error = statuses_error
         self.protection_error = protection_error
+        self.runs_body = runs_body
+        self.statuses_total = statuses_total
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -53,15 +63,22 @@ class FakeHeadGh:
         if path:
             if self.runs_error:
                 return subprocess.CompletedProcess(argv, 1, "", self.runs_error)
+            if self.runs_body is not None:
+                return subprocess.CompletedProcess(argv, 0, self.runs_body, "")
             page = {"total_count": len(self.runs), "check_runs": self.runs}
             return subprocess.CompletedProcess(argv, 0, json.dumps([page]), "")
         path = next((arg for arg in argv if "/commits/" in arg and "/status" in arg), "")
         if path:
             if self.statuses_error:
                 return subprocess.CompletedProcess(argv, 1, "", self.statuses_error)
-            body = {"sha": SHA, "total_count": len(self.statuses),
-                    "statuses": self.statuses}
-            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+            total = (len(self.statuses) if self.statuses_total is None
+                     else self.statuses_total)
+            pages = [{"sha": SHA, "total_count": total,
+                      "statuses": self.statuses[i:i + 100]}
+                     for i in range(0, len(self.statuses), 100)]
+            if not pages:
+                pages = [{"sha": SHA, "total_count": total, "statuses": []}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(pages), "")
         return subprocess.CompletedProcess(argv, 1, "", "unexpected gh %s" % " ".join(argv))
 
 
@@ -108,12 +125,23 @@ class RequiredOnHeadTest(unittest.TestCase):
         self.assertEqual(self._gaps(FakeHeadGh(statuses=[_status()])), [])
 
     def test_an_unreadable_check_source_fails_closed(self):
-        with self.assertRaises(land.LandError):
+        with self.assertRaises(land.TransientLandError):
             self._gaps(FakeHeadGh(runs_error="gh: HTTP 502"))
 
     def test_an_unreadable_status_source_fails_closed(self):
-        with self.assertRaises(land.LandError):
+        with self.assertRaises(land.TransientLandError):
             self._gaps(FakeHeadGh(statuses_error="gh: HTTP 502"))
+
+    def test_a_refusal_of_rights_is_not_retried(self):
+        # un 4xx ne dit pas « réessaie » : la source est refusée, pas passagère
+        with self.assertRaises(land.LandError) as raised:
+            self._gaps(FakeHeadGh(runs_error="gh: Not Found (404)"))
+        self.assertNotIsInstance(raised.exception, land.TransientLandError)
+
+    def test_a_malformed_check_source_is_not_a_transient_error(self):
+        with self.assertRaises(land.LandError) as raised:
+            self._gaps(FakeHeadGh(runs_body="not json"))
+        self.assertNotIsInstance(raised.exception, land.TransientLandError)
 
     def test_without_a_declaration_nothing_is_read_and_nothing_is_added(self):
         # la protection seule reste portée par la forge au moment de la
@@ -128,9 +156,17 @@ class RequiredOnHeadTest(unittest.TestCase):
                         runs=[_run()])
         self.assertEqual(self._gaps(gh), [])
 
-    def test_a_truncated_status_page_is_refused(self):
-        gh = FakeHeadGh()
-        gh.statuses = [_status()] * 100
+    def test_a_full_status_page_proves_the_context(self):
+        # #2306 N3 : un total_count de 100 n'est plus pris pour une troncature
+        gh = FakeHeadGh(statuses=[_status()] * 100)
+        self.assertEqual(self._gaps(gh), [])
+
+    def test_more_statuses_are_paginated(self):
+        gh = FakeHeadGh(statuses=[_status()] * 150)
+        self.assertEqual(self._gaps(gh), [])
+
+    def test_a_status_total_not_covered_by_the_pages_is_refused(self):
+        gh = FakeHeadGh(statuses=[_status()], statuses_total=101)
         with self.assertRaises(land.LandError):
             self._gaps(gh)
 
@@ -177,6 +213,19 @@ class LandGuardRequiredChecksTest(unittest.TestCase):
         # de projet : la garde du feu seule s'applique
         self.assertEqual(fire.land_guard(None, 7, SHA), (True, ""))
 
+    def test_an_empty_target_refuses_the_landing(self):
+        # #2306 N2 : la cible vide sautait la garde ; elle est refusée
+        ok, why = self._guard(FakeHeadGh(runs=[_run()]), target="")
+        self.assertFalse(ok)
+        self.assertIn("no target branch known", why)
+        self.assertIn("landing refused", why)
+
+    def test_a_transient_read_propagates_for_a_retry(self):
+        # #2306 N1 : la lecture passagère n'est pas convertie en refus prouvé ;
+        # `land` la traduit en nouvelle tentative sans éjecter
+        with self.assertRaises(land.TransientLandError):
+            self._guard(FakeHeadGh(runs_error="gh: HTTP 503"))
+
 
 class LocalLandingRequiredChecksTest(_Land):
     """Bout en bout de la voie file locale : ni poussée ni fusion sans preuve."""
@@ -200,11 +249,34 @@ class LocalLandingRequiredChecksTest(_Land):
         self.assertEqual(out["result"], "landed", out)
         self.assertIn("ameesh-work: 4", self.origin_log())
 
-    def test_an_unreadable_source_ejects_instead_of_merging(self):
+    def test_an_unreadable_source_keeps_the_line_for_retry(self):
+        # #2306 N1 : un 502 passager ne sort pas le lot de la file ; la raison
+        # est consignée, la ligne reste `queued` et repart au passage suivant
         self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
         out = self.land(4, gh=FakeHeadGh(runs_error="gh: HTTP 502"))
+        self.assertEqual(out["result"], "retry", out)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertIn("retried at the next pass", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertEqual(self.sent, [])
+
+    def test_a_refusal_of_rights_ejects_instead_of_merging(self):
+        # #2306 N1 : un 404 n'est pas passager — un manque de droits ou une
+        # source absente reste un refus prouvé, qui éjecte
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4, gh=FakeHeadGh(runs_error="gh: Not Found (404)"))
         self.assertEqual(out["result"], "ejected", out)
         self.assertIn("cannot be proven", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_a_malformed_response_ejects_instead_of_merging(self):
+        # #2306 N1 : une réponse malformée éjecte (elle ne prouve rien et ne
+        # guérira pas au passage suivant)
+        self.queued(4)
+        out = self.land(4, gh=FakeHeadGh(runs_body="not json"))
+        self.assertEqual(out["result"], "ejected", out)
 
 
 if __name__ == "__main__":
