@@ -546,6 +546,39 @@ def _previous_reviewers(db, lot: int, freeze_id: int) -> list:
     return names
 
 
+def _latest_freeze(db, lot: int) -> Optional[dict]:
+    """The latest `frozen` milestone of the lot, as `{id, sha}`, or None."""
+    row = plan_git.latest_freeze(
+        storage.of(db).work.milestones(int(lot), pg.MILESTONES))
+    if row is None:
+        return None
+    return {"id": int(row["id"]), "sha": str(row.get("sha") or "").strip()}
+
+
+def _lock_current_freeze(db, lot: int, freeze: Mapping) -> bool:
+    """Locks the lot row and says whether `freeze` is still the latest one.
+
+    `add_milestone` takes the same `FOR NO KEY UPDATE` lock of the lot row
+    before inserting a `frozen` milestone: under this lock no new freeze can
+    commit between the check and the writes that follow in the transaction.
+    A recovery of an old freeze mutates nothing, not even the reviewer column
+    of the newer head (B/P1 of the Codex review cx2 on #2447).
+    """
+    rows = db.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                    (int(lot),))
+    if not rows:
+        return False
+    last = _latest_freeze(db, int(lot))
+    if last is None:
+        return False
+    try:
+        return (int(last["id"]) == int(freeze.get("id") or 0)
+                and str(last.get("sha") or "").strip().lower()
+                == str(freeze.get("sha") or "").strip().lower())
+    except (TypeError, ValueError):
+        return False
+
+
 def _sync_reviewers(db, item: Mapping, freeze: Mapping, names) -> None:
     """Makes the automatic designation visible to the gate and to progress.
 
@@ -563,6 +596,10 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names) -> None:
         return
     lot = int((item or {}).get("id") or 0)
     freeze_id = int((freeze or {}).get("id") or 0)
+    if not _lock_current_freeze(db, lot, freeze):
+        # A stale replay never writes the column of the newer head (B/P1 of
+        # the Codex review cx2): no designation is recorded for this freeze.
+        return
     rows = db.query(
         "SELECT reviewers FROM work_items WHERE id = %s FOR NO KEY UPDATE",
         (lot,))
@@ -751,12 +788,23 @@ def _drain(db, threads: list) -> None:
         record(db.cfg, db)
 
 
+def _stale(freeze: Mapping, why: str = "") -> dict:
+    """A recovery of a freeze that is no longer the latest: nothing written."""
+    default = ("freeze #%s is no longer the latest: nothing written"
+               % (dict(freeze or {}).get("id"),))
+    return {"state": "stale", "reviewers": [], "freeze": dict(freeze or {}),
+            "why": str(why or default)}
+
+
 def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> dict:
     """Replays the latest freeze outside the hook (recovery, CLI).
 
-    Uses `PgPort(db)`, which owns its transaction and drains the readable
-    thread after its commit. A policy/evidence problem is journaled in its own
-    transaction; a selection refusal is returned, never raised to the caller.
+    The selection's mark, its mails and the reviewer column are written in ONE
+    transaction, under the lot row lock that `add_milestone` also takes: a new
+    freeze cannot slip between the designation and its column, and a replay of
+    an old freeze writes nothing at all (B/P1 of the Codex review cx2). A
+    policy/evidence problem is journaled in its own transaction; a selection
+    refusal is returned, never raised to the caller.
     """
     item = work.get(db, int(lot)) or {"id": int(lot), "state": "", "title": "",
                                       "app": ""}
@@ -774,6 +822,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> dict:
         return {"state": "manual", "reviewers": [], "freeze": freeze,
                 "why": "manual reviewer(s) designated: %s" % ", ".join(manual)}
     threads = _threads()
+    checkpoint = len(threads)
     try:
         inputs = prepare(cfg, db, int(lot), freeze=freeze)
         if isinstance(inputs, Unavailable):
@@ -781,6 +830,8 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> dict:
                 notify = _notify(cfg, db, str(item.get("app") or ""),
                                  registry.overview(db))
                 with db.transaction() as tx:
+                    if not _lock_current_freeze(tx, int(lot), freeze):
+                        return _stale(freeze)
                     _note_unavailable(tx, item, freeze, inputs.why, threads, notify)
                     _sync_reviewers(tx, item, freeze, [])
                 _drain(db, threads)
@@ -788,19 +839,31 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> dict:
                     "why": inputs.why}
         if not inputs.paths or inputs.policy.required == 0:
             with db.transaction() as tx:
+                if not _lock_current_freeze(tx, int(lot), freeze):
+                    return _stale(freeze)
                 _sync_reviewers(tx, item, freeze, [])
             return {"state": rd.NONE, "required": 0, "reviewers": [],
                     "freeze": freeze,
                     "why": "light lot: no review before merge" if inputs.paths
                     else "no changed path: no review due"}
-        out = _selection(inputs, pg.PgPort(db))
-        names = ([r.get("name") for r in out.get("reviewers") or ()]
-                 if out.get("state") == rd.DESIGNATED else [])
         with db.transaction() as tx:
+            out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
+                                                at_freeze=False))
+            names = ([r.get("name") for r in out.get("reviewers") or ()]
+                     if out.get("state") == rd.DESIGNATED else [])
             _sync_reviewers(tx, item, freeze, names)
+        _drain(db, threads)
         return out
-    except (rd.DesignationError, rd.StaleFreeze) as exc:
+    except rd.StaleFreeze as exc:
+        # The port or the column guard refused an old freeze before any
+        # write: never clear or re-register the newer head's reviewers.
+        del threads[checkpoint:]
+        return _stale(freeze, str(exc))
+    except rd.DesignationError as exc:
+        del threads[checkpoint:]
         with db.transaction() as tx:
+            if not _lock_current_freeze(tx, int(lot), freeze):
+                return _stale(freeze)
             _note_unavailable(tx, item, freeze, str(exc), threads,
                               _notify(cfg, db, str(item.get("app") or ""),
                                       registry.overview(db)))
@@ -808,6 +871,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> dict:
         _drain(db, threads)
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": str(exc)}
+    except BaseException:
+        del threads[checkpoint:]
+        raise
 
 
 def reviewers(cfg, db, lot: int, *, apply: bool = False) -> dict:

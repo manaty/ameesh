@@ -209,6 +209,15 @@ written. No first mail survives without its mark, and a replay mails no
 reviewer twice (B3 of the Codex review cx2). A failure to write the waiting
 note itself propagates: the milestone and its designation remain one fact.
 
+Outside the hook, the recovery (`designate`) writes the selection, its mails
+and the reviewer column in **one transaction**, under the same lot-row lock as
+`add_milestone`; the column write revalidates the latest freeze under that lock
+and writes nothing when a newer freeze exists (B/P1 of the Codex review cx2: a
+delayed recovery of F1 could re-register its reviewers on the head of F2, and
+the stale `catch` could clear the new head's column). The light and
+`unavailable` branches are gated by the same check and return `stale` without
+any note, mail or column mutation.
+
 A manual reviewer already designated makes the automatic path an explicit,
 journaled no-op: the manual exception stays available. An expected input
 problem (no repository, no policy, unreadable evidence) keeps the freeze and
@@ -250,14 +259,18 @@ trace before the external commit (and nothing survives its rollback); after the
 external commit, the caller flushes the list; the callback is rejected outside
 a `frozen`.
 
-`tests/test_2447_review_designation_activation.py` — 15 tests on a real
+`tests/test_2447_review_designation_activation.py` — 20 tests on a real
 database, both drivers: the freeze designates two independent families and
 writes them into `work_items.reviewers`; a new freeze clears only the previous
 automatic names; the last good canon commit wins when the current state is
 invalid; a manual reviewer stays the journaled exception; no reviewer free is a
 wait plus a pilot alert; an exception during the selection is rolled back by a
-savepoint (no first mail without its mark, no duplicate on replay); the CLI
-freeze and the recovery command.
+savepoint (no first mail without its mark, no duplicate on replay); a stale
+recovery — selection, light or unavailable — leaves the newer freeze's column,
+notes and mails untouched; the selection and the column commit together (a
+failure of the column write leaves neither a designated mark nor a reviewer
+mail); a recovery still refuses an undeliverable waiting designation while the
+hook turns it into a waiting mark; the CLI freeze and the recovery command.
 
 ## Remaining after activation (#2447)
 
@@ -294,6 +307,9 @@ freeze and the recovery command.
   family) → `f6abe89a`; R Codex cx2 (`f6abe89a`) returned `blocked` on B1
   (freeze moved) and B2 (external commit), fixed here; as dev1 is the author of
   its correction, the composition of the two families on the new head is to be
-  arbitrated by the pilot;
+  arbitrated by the pilot; cx2 on `f9d1164f8` lifted B1/B2/B3 and returned
+  `blocked` on B/P1 (recovery sync outside the designation transaction, stale
+  `catch` clearing the column), fixed in the next head with the stale guard on
+  every column write;
 - two independent reviews outside the author for this gate (security of the
   admission chain), then package at the cut-off.

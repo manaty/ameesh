@@ -253,6 +253,129 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertTrue([n for n in self.notes() if "designation of freeze" in n
                          and "cleared" in n])
 
+    def test_a_stale_selection_recovery_does_not_clear_the_new_freeze(self):
+        # B/P1 of the Codex review cx2: a recovery of F1 selected r1,r2 and
+        # committed them, then F2 (no capacity) was frozen and cleared the
+        # column; F1's delayed sync re-registered r1,r2 for the head of F2.
+        # A replay of a freeze that is no longer the latest writes nothing.
+        for name in ("r1", "r2"):
+            registry.upsert(self.db, name, harness="deepseek")
+        first_sha = self.frozen
+        first, waiting = self.freeze()
+        self.assertEqual(waiting["state"], rd.WAITING, waiting)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+        # capacity is back, but the head moves before the delayed recovery sync
+        for name, harness in (("r1", "claude"), ("r2", "codex")):
+            registry.upsert(self.db, name, harness=harness)
+        self.repo.write("src/ameesh/db.py", "new head\n")
+        self.frozen = self.repo.commit("new head")
+        self.receipts()
+        _, frozen_again = self.freeze()
+        self.assertEqual(frozen_again["state"], rd.DESIGNATED, frozen_again)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        before_mail = len(self.mailbox())
+        before_note = len(self.notes())
+        replay = act.designate(
+            self.cfg, self.db, self.lot,
+            freeze={"id": int(first["id"]), "sha": first_sha})
+        self.assertEqual(replay["state"], "stale", replay)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.notes()), before_note)
+
+    def test_a_stale_unavailable_freeze_does_not_clear_the_new_freeze(self):
+        # The paths that erase the column are gated too: an old freeze whose
+        # evidence is now unavailable must not clear the new head's reviewers.
+        for name in ("r1", "r2"):
+            registry.upsert(self.db, name, harness="deepseek")
+        first, waiting = self.freeze()
+        self.assertEqual(waiting["state"], rd.WAITING, waiting)
+        for name, harness in (("r1", "claude"), ("r2", "codex")):
+            registry.upsert(self.db, name, harness=harness)
+        self.repo.write("src/ameesh/db.py", "new head\n")
+        self.frozen = self.repo.commit("new head")
+        self.receipts()
+        _, frozen_again = self.freeze()
+        self.assertEqual(frozen_again["state"], rd.DESIGNATED, frozen_again)
+        before_mail = len(self.mailbox())
+        before_note = len(self.notes())
+        replay = act.designate(
+            self.cfg, self.db, self.lot,
+            freeze={"id": int(first["id"]), "sha": "f" * 40})
+        self.assertEqual(replay["state"], "stale", replay)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.notes()), before_note)
+
+    def test_a_stale_light_freeze_does_not_clear_the_new_freeze(self):
+        # Same guard on the light/no-path branch, which also writes the column.
+        lot_head = self.frozen
+        self.frozen = self.base
+        first, light = self.freeze()
+        self.assertEqual(light["state"], rd.NONE, light)
+        self.frozen = lot_head
+        self.repo.write("src/ameesh/db.py", "new head\n")
+        self.frozen = self.repo.commit("new head")
+        self.receipts()
+        _, frozen_again = self.freeze()
+        self.assertEqual(frozen_again["state"], rd.DESIGNATED, frozen_again)
+        before_mail = len(self.mailbox())
+        before_note = len(self.notes())
+        replay = act.designate(
+            self.cfg, self.db, self.lot,
+            freeze={"id": int(first["id"]), "sha": self.base})
+        self.assertEqual(replay["state"], "stale", replay)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.notes()), before_note)
+
+    def test_the_selection_and_the_reviewer_column_commit_together(self):
+        # The mark, the mails and the column are one transaction: a failure in
+        # the column write cannot leave a designation that is only half visible.
+        for name in ("r1", "r2"):
+            registry.upsert(self.db, name, harness="deepseek")
+        _, waiting = self.freeze()
+        self.assertEqual(waiting["state"], rd.WAITING, waiting)
+        for name, harness in (("r1", "claude"), ("r2", "codex")):
+            registry.upsert(self.db, name, harness=harness)
+        marked = len(self.marks())
+        mailed = len(self.mailbox())
+        with mock.patch.object(act, "_sync_reviewers",
+                               side_effect=RuntimeError("injected sync failure")):
+            with self.assertRaises(RuntimeError):
+                act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(len(self.marks()), marked)
+        self.assertEqual([pg.designation_of(mark)["state"] for mark in self.marks()],
+                         [rd.WAITING])
+        self.assertEqual(len(self.mailbox()), mailed)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+        # the clean replay finalizes the same freeze, mailing each reviewer once
+        again = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(again["state"], rd.DESIGNATED, again)
+        self.assertEqual([message["recipient"] for message in self.mailbox()],
+                         ["pilot", "r1", "r2"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+
+    def test_a_recovery_without_a_pilot_still_refuses_the_wait(self):
+        # Outside the hook an undeliverable capacity alert is still a refusal
+        # (`at_freeze=False`), as before the recovery moved into one
+        # transaction: only the freeze hook turns it into a waiting mark.
+        for name in ("r1", "r2"):
+            registry.upsert(self.db, name, harness="deepseek")
+        work.milestone(self.db, self.lot, "frozen", sha=self.frozen, actor="author",
+                       on_frozen=lambda tx, milestone, threads: None,
+                       after_commit=[])
+        self.db.execute("DELETE FROM agent_registry WHERE name = 'pilot'")
+        marked = len(self.marks())
+        mailed = len(self.mailbox())
+        noted = len(self.notes())
+        out = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(out["state"], "unavailable", out)
+        self.assertIn("recipient", out["why"])
+        self.assertEqual(len(self.marks()), marked)
+        self.assertEqual(len(self.mailbox()), mailed)
+        self.assertEqual(len(self.notes()), noted + 1)
+
     def test_the_last_good_commit_wins_when_the_state_is_invalid(self):
         # B2 of the Codex review cx2: a failed current pass (status invalid)
         # must not fall back to the non-audited ref. The policy was two
