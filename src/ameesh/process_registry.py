@@ -546,6 +546,7 @@ def _lock_lot(tx: Any, work_item_id: int) -> Mapping[str, Any]:
     rows = tx.query(
         "SELECT w.id, w.state, w.assignee, w.type, w.app, w.workstream, w.loops,"
         "       w.title, w.closed_at, w.migration, w.migration_repo,"
+        "       to_regclass('work_migration_reservations') IS NOT NULL AS migration_slots,"
         "       coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"
         "       w.workflow_ref, w.workflow_stage, w.workflow_version"
         "  FROM work_items w WHERE w.id = %s FOR UPDATE",
@@ -1036,17 +1037,33 @@ def _release_migration(tx: Any, command: Command, row: Mapping[str, Any],
     line, written before the receipt so that `Receipt.version` stays the last
     id of the lot journal.
     """
-    number = row.get("migration")
-    if number is None:
+    numbers = set()
+    if row.get("migration") is not None:
+        numbers.add(int(row["migration"]))
+    if row.get("migration_slots"):
+        numbers.update(int(slot["number"]) for slot in tx.query(
+            "SELECT number FROM work_migration_reservations"
+            " WHERE work_item_id = %s AND status = 'reserved' ORDER BY number",
+            (int(command.work_item_id),)))
+    if not numbers:
         return
+    if row.get("migration_slots"):
+        tx.execute(
+            "UPDATE work_migration_reservations SET status = 'released',"
+            "       updated_at = now()"
+            " WHERE work_item_id = %s AND status = 'reserved'",
+            (int(command.work_item_id),))
     tx.execute(
         "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
         "       updated_at = now() WHERE id = %s", (int(command.work_item_id),))
+    ordered = sorted(numbers)
+    what = ("migration %s" % ordered[0] if len(ordered) == 1
+            else "migrations %s" % ", ".join(str(number) for number in ordered))
     tx.execute(
         "INSERT INTO work_item_events (work_item_id, state, note, actor)"
         " VALUES (%s, %s, %s, %s)",
         (int(command.work_item_id), state,
-         "migration %s released (state %s, #956)" % (number, state),
+         "%s released (state %s, #956)" % (what, state),
          command.authority.actor))
 
 

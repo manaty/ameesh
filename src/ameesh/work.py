@@ -623,31 +623,73 @@ def lot_repository(item: dict, cfg=None) -> str:
                     "(`ameesh work link %s owner/repo#N`)" % (item["id"], item["id"]))
 
 
+def _short_repo(repo) -> str:
+    """#2481 : le dépôt d'un créneau est stocké `github.com/owner/repo` ; la
+    vue et `work.migration_line` gardent la forme `owner/repo` du scalaire."""
+    text = str(repo or "")
+    prefix = "github.com/"
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def reserved_migrations(item: dict) -> list[dict]:
+    """#2481 : les réservations d'un lot, liste ordonnée `{number, repo, slot}`.
+
+    `migrations` vient de `item_columns` (table `work_migration_reservations`) ;
+    une base d'avant 0419 ou un client ancien n'a que le scalaire, qui est
+    alors repris. La réservation principale reste le scalaire ; ce helper ne
+    déduplique que les doublons exacts (même numéro, même dépôt)."""
+    rows, seen = [], set()
+    for raw in item.get("migrations") or ():
+        if not isinstance(raw, dict):
+            continue
+        try:
+            number = int(raw.get("number"))
+        except (TypeError, ValueError):
+            continue
+        repo = _short_repo(raw.get("repo") or item.get("migration_repo"))
+        key = (number, repo)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"number": number, "repo": repo,
+                     "slot": str(raw.get("slot") or "default")})
+    if item.get("migration") is not None:
+        number = int(item["migration"])
+        repo = _short_repo(item.get("migration_repo"))
+        if (number, repo) not in seen:
+            rows.append({"number": number, "repo": repo, "slot": "default"})
+    rows.sort(key=lambda row: (row["number"], row["slot"]))
+    return rows
+
+
 def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
                       actor: str = "", cfg=None,
                       skip_branches: tuple[str, ...] = (),
                       skip_worktree: bool = False) -> dict:
-    """L122, #443 : réserve au lot le numéro de sa migration, avant d'écrire
-    le fichier, dans le dépôt du lot (`lot_repository`) : le dossier et la
-    numérotation sont les siens, jamais ceux d'ameesh pour un autre dépôt.
-    `repo` : un clone local de ce dépôt (défaut : celui que l'hôte déclare,
-    sinon le dépôt git courant) ; son `origin` doit être le dépôt du lot.
-    Sans `number` : le prochain libre, au-delà des numéros du dépôt (arbre,
-    toutes ses branches) et de ceux déjà réservés pour ce dépôt. `number` est
-    refusé s'il existe déjà dans le dépôt ou s'il est réservé par un autre lot
-    (index unique (dépôt, numéro) : la base tranche, même entre deux
-    réservations simultanées). Un lot qui a déjà sa réservation la garde
-    (idempotent). `release` la libère, y compris sur un lot déjà terminal
+    """L122, #443, #2481 : réserve au lot le numéro de sa migration, avant
+    d'écrire le fichier, dans le dépôt du lot (`lot_repository`) : le dossier
+    et la numérotation sont les siens, jamais ceux d'ameesh pour un autre
+    dépôt. `repo` : un clone local de ce dépôt (défaut : celui que l'hôte
+    déclare, sinon le dépôt git courant) ; son `origin` doit être le dépôt du
+    lot. Sans `number` : le prochain libre, au-delà des numéros du dépôt
+    (arbre, toutes ses branches) et de ceux déjà réservés pour ce dépôt.
+    `number` est refusé s'il existe déjà dans le dépôt ou s'il est réservé par
+    un autre lot (index uniques (dépôt, numéro) : la base tranche, même entre
+    deux réservations simultanées). Un lot qui a déjà une réservation garde
+    les précédentes : un second numéro s'ajoute (liste `migrations`), il ne
+    remplace plus la première (#2481). `release` libère toutes les
+    réservations, ou seulement `number`, y compris sur un lot déjà terminal
     (#956 : un lot fusionné gardait sa réservation et bloquait le numéro).
     `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
     en plus de celle du lot — la branche d'intégration d'un paquet en
     composition, dont les fichiers renumérotés ne doivent pas compter contre
     la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail du
     clone de lecture — le train y compose justement la migration à réserver.
-    Rend le lot, avec `migration_file`. Une correction
-    concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
-    `issue reference changed meanwhile, retry`), jamais écrite en silence."""
+    Rend le lot, avec `migration_file` et la liste `migrations`. Une
+    correction concurrente de `issue_ref` pendant le scan du dépôt est
+    refusée (#1830 : `issue reference changed meanwhile, retry`), jamais
+    écrite en silence."""
     from . import migrations
 
     item = get(db, item_id)
@@ -655,22 +697,45 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         raise WorkError("lot %s not found" % item_id)
     if item["state"] in ("merged", "promoted", "closed") and not release:
         raise WorkError("lot %s already %s: no reservation" % (item_id, item["state"]))
+    reservations = reserved_migrations(item)
     current = item.get("migration")
     if release:
-        if current is None:
-            return item
-        layout = migration_layout(item, cfg)
+        if not reservations:
+            return _with_file(item, cfg)
+        numbers = {row["number"] for row in reservations}
+        target = None if number is None else int(number)
+        if target is not None and target not in numbers:
+            raise WorkError("lot %s holds no migration %s (%s): nothing released" % (
+                item_id,
+                migration_layout(item, cfg, repo=reservations[0]["repo"]).label(target),
+                ", ".join(migration_layout(item, cfg, repo=row["repo"]).label(row["number"])
+                          for row in reservations)))
+        reserved_repo = reservations[0]["repo"] or item.get("migration_repo")
+        layout = migration_layout(item, cfg, repo=reserved_repo)
+        if target is not None:
+            note = "migration %s released (%s)" % (layout.label(target), layout.repo)
+        elif len(reservations) == 1:
+            note = "migration %s released (%s)" % (
+                layout.label(reservations[0]["number"]), layout.repo)
+        else:
+            note = "migrations %s released (%s)" % (
+                ", ".join(layout.label(row["number"]) for row in reservations), layout.repo)
         row = storage.of(db).work.reserve_migration(
-            item_id, item.get("migration_repo"), None, 0, actor=actor, release=True,
-            issue_ref=item.get("issue_ref"),
-            note="migration %s released (%s)" % (layout.label(current), layout.repo))
+            item_id, reserved_repo, None, 0, actor=actor, release=True,
+            release_number=target, issue_ref=item.get("issue_ref"), note=note)
         if row is None:
-            raise WorkError("lot %s is no longer open: no reservation" % item_id)
-        return row
+            raise WorkError("lot %s: migration reservation changed meanwhile, retry" % item_id)
+        return _with_file(row, cfg)
     if number is not None and not 1 <= int(number) <= 9999:
         raise WorkError("migration number outside 0001-9999: %s" % number)
-    if current is not None and (number is None or current == int(number)):
-        return _with_file(item, cfg)
+    held = {row["number"] for row in reservations}
+    if number is None:
+        if reservations:
+            return _with_file(item, cfg)
+    else:
+        number = int(number)
+        if number in held:
+            return _with_file(item, cfg)
     slug = lot_repository(item, cfg)
     layout = migrations.layout_for(slug, cfg)
     if layout is None:
@@ -689,7 +754,6 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         floor = max(present or [0]) + 1
         note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
     else:
-        number = int(number)
         if number in present:
             raise WorkError("migration %s already in %s (%s): choose another number" % (
                 layout.label(number), slug, ", ".join(sorted(present[number])[:3])))
@@ -708,7 +772,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     except DbError as exc:
         # une autre erreur qui nomme l'index (permission refusée) n'est pas
         # une réservation concurrente : elle remonte telle quelle (codex #478 r1)
-        if number is None or not is_unique_violation(exc, _pg.MIGRATION_INDEX):
+        indexes = (_pg.MIGRATION_INDEX, _pg.MIGRATION_SLOTS_INDEX)
+        if number is None or not any(is_unique_violation(exc, index)
+                                      for index in indexes):
             raise
         holder = storage.of(db).work.migration_holder(number, slug)
         raise WorkError("migration %s of %s already reserved by lot #%s (%s)" % (
@@ -737,11 +803,21 @@ def migration_layout(item: dict, cfg=None, repo: str | None = None):
 
 
 def _with_file(item: dict, cfg=None) -> dict:
+    """#2481 : ajoute les libellés et fichiers de toutes les réservations."""
+    reservations = reserved_migrations(item)
     if item.get("migration") is None:
-        return item
+        return dict(item, migrations=reservations)
     layout = migration_layout(item, cfg)
+    enriched = []
+    for row in reservations:
+        row_layout = migration_layout({}, cfg, repo=row["repo"])
+        enriched.append(dict(
+            row,
+            label=row_layout.label(row["number"]),
+            file=(row_layout.file(row["number"]) if row_layout.directory else None)))
     return dict(item, migration_label=layout.label(item["migration"]),
-                migration_file=layout.file(item["migration"]) if layout.directory else None)
+                migration_file=layout.file(item["migration"]) if layout.directory else None,
+                migrations=enriched)
 
 
 def _migration_file(number: int, repo: str, cfg=None) -> str:
@@ -753,26 +829,41 @@ def _migration_file(number: int, repo: str, cfg=None) -> str:
 
 
 def migration_line(item: dict, cfg=None) -> str | None:
-    """#1567 : la ligne `migration:` d'un lot. Le numéro **atterri** est nommé
-    quand il est enregistré (avec son fichier, et la réservation d'origine
-    quand elle en diffère) ; sinon la réservation seule, et pour un lot
-    terminal, « landed number not recorded » : la vue ne fait jamais passer la
+    """#1567, #2481 : la ligne `migration:` d'un lot. Le numéro **atterri** est
+    nommé quand il est enregistré (avec son fichier, et la ou les réservations
+    d'origine quand elles en diffèrent). Sinon la liste des réservations est
+    nommée (un lot peut en tenir plusieurs), et pour un lot terminal,
+    « landed number not recorded » : la vue ne fait jamais passer la
     réservation pour le fichier atterri."""
-    reserved, landed = item.get("migration"), item.get("migration_landed")
+    landed = item.get("migration_landed")
+    reservations = reserved_migrations(item)
     if landed is not None:
         repo = item.get("migration_landed_repo") or item.get("migration_repo")
         line = "%s landed in %s (L122) — file %s" % (
             migration_layout(item, cfg, repo=repo).label(landed), repo,
             _migration_file(landed, repo, cfg))
-        if reserved is not None and int(reserved) != int(landed):
-            line += " (reserved %s)" % migration_layout(item, cfg).label(reserved)
+        others = [row for row in reservations if row["number"] != int(landed)]
+        if others:
+            line += " (reserved %s)" % ", ".join(
+                migration_layout({}, cfg, repo=row["repo"]).label(row["number"])
+                for row in others)
         return line
-    if reserved is None:
+    if not reservations:
         return None
-    line = "%s reserved in %s (L122)" % (migration_layout(item, cfg).label(reserved),
-                                         item.get("migration_repo"))
+    if len(reservations) == 1:
+        row = reservations[0]
+        line = "%s reserved in %s (L122)" % (
+            migration_layout({}, cfg, repo=row["repo"]).label(row["number"]),
+            row["repo"] or item.get("migration_repo"))
+        if item.get("state") in MERGED_STATES:
+            line += " — landed number not recorded"
+        return line
+    labels = [migration_layout({}, cfg, repo=row["repo"]).label(row["number"])
+              for row in reservations]
+    repos = ", ".join(sorted({row["repo"] for row in reservations if row["repo"]}))
+    line = "migrations %s reserved in %s (L122)" % (", ".join(labels), repos)
     if item.get("state") in MERGED_STATES:
-        line += " — landed number not recorded"
+        line += " — landed numbers not recorded"
     return line
 
 
@@ -813,20 +904,27 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
     current = (item.get("issue_ref") or "").strip() or None
     if current == clean:
         return item
-    if item.get("migration") is not None:
-        # la réservation reste dans le dépôt où elle a été prise : la garder
-        # sous une issue d'un autre dépôt la rendrait fausse en silence
-        # (`work migration` est idempotent sur une réservation existante)
+    reservations = reserved_migrations(item)
+    if reservations:
+        # les réservations restent dans le dépôt où elles ont été prises : les
+        # garder sous une issue d'un autre dépôt les rendrait fausses en
+        # silence (`work migration` est idempotent sur une réservation
+        # existante)
         try:
             target = lot_repository(dict(item, issue_ref=clean), cfg)
         except WorkError:
             target = None
-        if target != item.get("migration_repo"):
-            raise WorkError("lot %s holds migration %s in %s: release it first "
+        if any(row["repo"] != target for row in reservations):
+            labels = ", ".join(
+                migration_layout({}, cfg, repo=row["repo"]).label(row["number"])
+                for row in reservations)
+            repos = ", ".join(sorted({row["repo"] for row in reservations}))
+            what = "migration" if len(reservations) == 1 else "migrations"
+            pronoun = "it" if len(reservations) == 1 else "them"
+            raise WorkError("lot %s holds %s %s in %s: release %s first "
                             "(`ameesh work migration %s --release`), then correct the "
                             "issue reference and reserve again" % (
-                                item_id, migration_layout(item, cfg).label(item["migration"]),
-                                item.get("migration_repo"), item_id))
+                                item_id, what, labels, repos, pronoun, item_id))
     if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref"),
                                              migration_repo=item.get("migration_repo")):
         # #1654 : le CAS couvre aussi la réservation lue ; si l'issue n'a pas
