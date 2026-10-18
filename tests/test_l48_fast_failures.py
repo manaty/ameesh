@@ -226,6 +226,43 @@ class EchecsRapidesTest(PgTestCase):
                   if c.args and "session lock held" in str(c.args[0])]
         self.assertEqual(lignes, [])
 
+    def test_grace_du_verrou_ne_compte_pas_les_reports_d_attach(self):
+        """#2160 : la grâce d'un verrou tenu par un tiers ne compte que ses
+        propres reports. Une série de reports d'attach (passation normale), qui
+        la précède, ne la consomme pas : la marque n'est posée qu'après 2 s de
+        verrou réellement tenu, pas dès le premier report de verrou."""
+        worker = self._worker(max_fast_failures=2)
+        worker.deferred_lock_grace = lambda: 2.0
+        horloge = Horloge()
+        worker.monotonic = horloge.maintenant
+        statuts = []
+        avance_reelle = horloge.avance
+
+        def avance(dt):
+            avance_reelle(dt)
+            statuts.append((registry.get(self.db, "rapide") or {}).get("status_text") or "")
+
+        horloge.avance = avance
+        with mock.patch("ameesh.runner.log") as journal:
+            # 8 reports d'attach (4 s simulées) puis 5 reports de verrou : sans
+            # le correctif, la grâce déjà consommée par l'attach fait poser la
+            # marque dès le premier report de verrou (index 8).
+            attentes = self._boucle(worker, ["differe"] * 8 + ["verrou"] * 5,
+                                    horloge=horloge)
+        self.assertEqual(len(statuts), 13, statuts)
+        self.assertEqual([s for s in statuts[:12]
+                          if s.startswith(worker.DEFERRED_STATUS)], [], statuts)
+        self.assertTrue(statuts[12].startswith(worker.DEFERRED_STATUS), statuts)
+        # la grâce repart du premier report de verrou : pas court pendant
+        # 2 s, puis espacement — l'attach, lui, n'a jamais espacé.
+        self.assertEqual(secondes(attentes), [0.5] * 12 + [1.0])
+        lignes = [c.args[0] for c in journal.call_args_list
+                  if c.args and "session lock held" in str(c.args[0])]
+        self.assertEqual(len(lignes), 1, lignes)
+        row = registry.get(self.db, "rapide")
+        self.assertFalse((row["status_text"] or "").startswith("session lock held"),
+                         row["status_text"])
+
     def test_verrou_ne_recouvre_pas_un_autre_blocage(self):
         """#1914 : un agent déjà bloqué pour une autre raison (budget, auth,
         hôte…) garde son motif : le verrou tenu est journalisé et les reprises
