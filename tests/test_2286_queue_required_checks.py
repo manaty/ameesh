@@ -165,9 +165,15 @@ class RequiredOnHeadTest(unittest.TestCase):
         self.assertEqual(gh.calls, [])
 
     def test_an_unreadable_protection_falls_back_to_the_declaration(self):
-        gh = FakeHeadGh(protection_error="gh: Resource not accessible by integration",
+        gh = FakeHeadGh(protection_error="gh: Resource not accessible by integration (HTTP 403)",
                         runs=[_run()])
         self.assertEqual(self._gaps(gh), [])
+
+    def test_a_transient_protection_error_does_not_fall_back_to_the_declaration(self):
+        gh = FakeHeadGh(protection_error="gh: Service Unavailable (HTTP 503)",
+                        runs=[_run()])
+        with self.assertRaises(land.TransientLandError):
+            self._gaps(gh)
 
     def test_a_full_status_page_proves_the_context(self):
         # #2306 N3 : un total_count de 100 n'est plus pris pour une troncature
@@ -299,6 +305,27 @@ class LocalLandingRequiredChecksTest(_Land):
         out = self.land(4, gh=FakeHeadGh(runs_error="gh: Not Found (404)"))
         self.assertEqual(out["result"], "ejected", out)
         self.assertIn("cannot be proven", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_a_transient_protection_read_retries_instead_of_landing(self):
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        gh = FakeHeadGh(protection_error="gh: Service Unavailable (HTTP 503)",
+                        runs=[_run(sha=self.tip(4))])
+        locks = {}
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(out["result"], "retry", out)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertEqual(locks, {})
+        self.assertIsNone(self.locks.held["p:main"][0])
+        self.assertEqual(self.sent, [])
+        # La protection retrouvée exige plus que la déclaration du projet.
+        gh.protection_error = ""
+        gh.protection = {"required_status_checks": {"contexts": ["tests", "security"]}}
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("security (absent)", self.fake.queue_rows[4]["reason"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
 
     def test_a_malformed_response_ejects_instead_of_merging(self):

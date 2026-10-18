@@ -732,10 +732,12 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     app_id)` : la protection lue à la forge, complétée par la déclaration
     `radar.projects.<p>.required_checks` (des noms, sans application imposée).
 
-    Quand la protection ne peut pas être lue (jeton sans droits, forge
-    muette), la déclaration du projet la remplace ; sans déclaration, la
-    lecture refuse. La déclaration ne peut jamais retirer un check que la
-    forge exige : elle s'ajoute. Les noms sont exacts de bout en bout :
+    Quand la protection ne peut durablement pas être lue (jeton sans droits),
+    la déclaration du projet la remplace ; sans déclaration, la lecture refuse.
+    Un échec passager lève `land.TransientLandError` : la lecture sera réessayée,
+    sans affaiblir la protection sur la seule déclaration. La déclaration ne
+    peut jamais retirer un check que la forge exige : elle s'ajoute.
+    Les noms sont exacts de bout en bout :
     la déclaration `tests ` ne vaut pas le contexte `tests`."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
@@ -746,6 +748,8 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
         raise land.LandError("no target branch known: its required checks cannot be read")
     try:
         forged = _protection_required(slug, target, gh=gh)
+    except land.TransientLandError:
+        raise
     except land.LandError:
         if declared:
             return declared
