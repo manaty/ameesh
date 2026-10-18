@@ -102,6 +102,22 @@ or, for an explicit pilot hold:
 {"what": "hold", "by": "mesh-design", "since": 1760544000.0}
 ```
 
+or, for a lot carried by an open integration packet (#2335):
+
+```json
+{"what": "packet", "vehicle": 2305,
+ "branch": "integration/paquet-h-20261017-2300", "head": "c186713d…"}
+```
+
+A packet is a structured carrier, not prose: an open work item whose branch
+starts with `integration/`, whose body/manifest names the carried lots
+(`#<lot>`). The units declared there wait for the packet merge, not for a lot
+executor, so `stale` and `slo_breach` are silenced for them. The
+`verdict_merge` clock of a merge-ready lot starts at the first packet slot
+after its GO (`mechanics.next_packet` when the canon declares a cadence,
+otherwise the observed hourly UTC cut-off): the time before that slot is not
+a delay under canon §11 bis.
+
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its
 six-hour reminder for that episode. The output limit is applied **after**
@@ -112,5 +128,5 @@ blockers outside the current project or progress window.
 Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
 by a planned date, commitment/plan dependency, direct prerequisite link, a
-dated external hold or an explicit `hold:` note. This preserves alerts for
-unexplained waits.
+dated external hold, an explicit `hold:` note or an open packet carrier
+declaring the lot. This preserves alerts for unexplained waits.

@@ -170,7 +170,7 @@ read without limit (full log, all its actions).
 | `package`, `epic` | (L29) WorkPackage card of the lot and its epic, or null |
 | `pr_ref` | (L29) PR whose merge closed the lot, or null |
 | `closed` | (L29) `{reason: abandoned\|superseded, superseded_by, at_ts}` for a closed lot, otherwise null |
-| `waiting_for` | (L29) what the lot is waiting for and from whom: `{what, who, label}` (`what`: start, build, verdict, fix, merge-approval, merge, merge-outcome, decision, unblock; `who` null when ameesh does not know); null for a merged or closed lot |
+| `waiting_for` | (L29) what the lot is waiting for and from whom: `{what, who, label}` (`what`: start, build, verdict, fix, merge-approval, merge, merge-outcome, decision, unblock, packet; `who` null when ameesh does not know); null for a merged or closed lot |
 | `last_activity_ts` | (L29) last transition, note, milestone or action |
 | `stale` | (L29) `{since_ts, idle_s, threshold_s}` if the unclosed lot has had no activity since the threshold, otherwise null; the page no longer draws it as active |
 | `delegation` | (L40, 0030) delegation with a deadline (`ameesh work delegate`): `{delegated_by, delegate, delegated_ts, due_ts, due_in_s, overdue, settled, label}` — `due_in_s` negative when overdue, `due_ts` null and `settled` true when the delegation is settled (the delegate has worked), `label`: "délégué par X, échéance dans 12 min" (delegated by X, due in 12 min) / "délégué par X, en retard de 5 min" (delegated by X, 5 min overdue); null outside delegation and for a merged or closed lot (see [EXPLOITATION.md](EXPLOITATION.md)) |

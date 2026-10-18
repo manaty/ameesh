@@ -9,14 +9,15 @@ retard : il est tu.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import time
 import unittest
 from unittest import mock
 
-from ameesh import (alert_briefs, exploitation, notify, registry, storage, work,
-                    work_dependencies)
+from ameesh import (alert_briefs, exploitation, notify, planned_waits, registry,
+                    stagnation, storage, work, work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -71,6 +72,35 @@ class _Base(PgTestCase):
             " VALUES (%s, 'verdict', now() - make_interval(secs => %s), 'rel', 'ok')",
             (self.lot["id"], float(verdict_s)))
         self.now = time.time()
+
+    def qa_at(self, verdict_ts, *, created_s=7200.0):
+        """qa avec un verdict `ok` à l'instant absolu `verdict_ts` (#2335).
+
+        Les autres étapes restent tenues : création `created_s` avant le
+        verdict, build 30 min après la création (cible 1 h)."""
+        work.move(self.db, self.lot["id"], "build")
+        work.move(self.db, self.lot["id"], "qa")
+        created = float(verdict_ts) - float(created_s)
+        self.db.execute("UPDATE work_items SET created_at = to_timestamp(%s)"
+                        " WHERE id = %s", (created, self.lot["id"]))
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = to_timestamp(%s)"
+            " WHERE work_item_id = %s AND state = 'build'",
+            (created + 1800.0, self.lot["id"]))
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, actor, verdict)"
+            " VALUES (%s, 'verdict', to_timestamp(%s), 'rel', 'ok')",
+            (self.lot["id"], float(verdict_ts)))
+        self.now = float(verdict_ts)
+
+    def packet(self, body="", *, branch="integration/paquet-test", head=None):
+        """Un porteur de paquet ouvert (#2335) : branche `integration/**`."""
+        carrier = work.add(self.db, title="porteur de paquet test", body=body,
+                           branch=branch, actor="test")
+        if head:
+            self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                            (head, carrier["id"]))
+        return carrier
 
     def briefs(self, alert):
         listing = [{"name": n, "team": ""} for n in ("dev1", "orch", "bureau", "auditeur")]
@@ -151,6 +181,66 @@ class AlerteTest(_Base):
             " VALUES (%s, 'verdict', now() - interval '5 minutes', 'rel', 'ok')",
             (self.lot["id"],))
         self.assertEqual(self.slo(), [])
+
+
+class PaquetTest(_Base):
+    """#2335 : un paquet en cours est une attente planifiée, et l'horloge
+    GO → fusion ne part qu'au premier créneau de paquet après le GO."""
+
+    GO = datetime.datetime(2026, 10, 17, 23, 5, tzinfo=datetime.timezone.utc).timestamp()
+
+    def test_lot_dans_un_paquet_ouvert_est_une_attente_planifiee(self):
+        self.qa_at(self.GO)
+        self.packet(body="unités : #%d #999999" % self.lot["id"])
+        self.now = self.GO + 75 * 60
+        self.assertEqual(self.slo(), [])
+        rows = storage.of(self.db).operations.open_lots_activity(None)
+        described = stagnation.describe(self.db, rows, now=self.now, open_items=rows)
+        info = described[self.lot["id"]]
+        self.assertEqual((info["planned_wait"] or {}).get("what"), "packet")
+        self.assertEqual((info["waiting"] or {}).get("what"), "packet")
+        self.assertIn("packet merge", info["waiting"]["label"])
+        self.assertIn("packet merge", work_dependencies.wait_label(info["planned_wait"]))
+        self.assertIsNone(info["stale"])
+
+    def test_non_inclus_avant_le_creneau_ne_signale_rien(self):
+        # GO 23:05, premier créneau 00:00 : à 00:20, 20 min < cible 30 min.
+        self.qa_at(self.GO)
+        self.packet(body="unités : #999999")
+        self.now = self.GO + 75 * 60          # 00:20
+        self.assertEqual(self.slo(), [])
+
+    def test_non_inclus_creneau_manque_signale_au_niveau_1(self):
+        # 01:10 : le créneau 00:00 est passé et la cible de 30 min est
+        # dépassée ; c'est le pilote qui porte la fusion dans le paquet.
+        self.qa_at(self.GO)
+        self.packet(body="unités : #999999")
+        self.now = self.GO + 125 * 60         # 01:10
+        alerts = self.slo()
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertEqual(alerts[0]["step"], "verdict_merge")
+        self.assertGreaterEqual(alerts[0]["level"], 1)
+        self.assertIn("pilot", alerts[0]["targets"])
+
+    def test_contenance_de_la_tete_gelee_est_un_crochet(self):
+        # Le manifeste reste la preuve principale ; `contains` reconnaît une
+        # tête incluse sans être nommée (git merge-base --is-ancestor).
+        head, target = "a" * 40, "b" * 40
+        row = {"id": 42, "state": "qa", "branch_head": head}
+        carrier = {"id": 9001, "state": "qa", "branch": "integration/paquet-test",
+                   "branch_head": target, "title": "", "body": ""}
+        waits = planned_waits.packet_waits(
+            [row], [row, carrier],
+            contains=lambda ancestor, descendant: (ancestor, descendant) == (head, target))
+        self.assertEqual(waits[42], {"what": "packet", "vehicle": 9001,
+                                     "branch": "integration/paquet-test",
+                                     "head": target})
+
+    def test_creneau_horaire_utc_seulement_si_paquet_observe(self):
+        self.assertEqual(exploitation._packet_slot(
+            None, self.GO, "ameesh", observed=True), self.GO + 55 * 60)
+        self.assertIsNone(exploitation._packet_slot(
+            None, self.GO, "ameesh", observed=False))
 
 
 class BriefsTest(_Base):

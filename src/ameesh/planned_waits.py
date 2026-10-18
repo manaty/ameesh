@@ -25,6 +25,13 @@ _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
 #: or `external:<name>`), and holds the lot until the end of its due day.
 _GATE = re.compile(r"^(?:gate|external):(\S+)$", re.I)
 
+#: #2335 : une PR de paquet est une branche `integration/**` ; son manifeste
+#: (corps du lot porteur) nomme les unités `#<lot>`. Une référence collée à un
+#: mot ou à un chemin (`manaty/ameesh#1697`, `#1321/#2021`) n'est pas une
+#: unité : elle est écartée plutôt que de taire l'alerte d'un lot étranger.
+_PACKET_BRANCH = "integration/"
+_REF = re.compile(r"(?<![\w/])#([0-9]{1,18})\b")
+
 
 def hold_end(due_on):
     """End of the due day (the day counts in full), or None without a date.
@@ -154,8 +161,96 @@ def ancestors(package_id, packages):
         package_id = package.get("parent")
 
 
+def packet_carriers(rows):
+    """#2335 : les porteurs de paquet ouverts, indexés par lot.
+
+    Un porteur est un lot ouvert dont la branche est `integration/**` : c'est
+    la PR que le composeur pousse et que le pilote fusionne. Le porteur ne
+    porte pas de code ; son corps est le manifeste des unités qu'il transporte.
+    """
+    out = {}
+    for row in rows or ():
+        if row.get("state") in ("merged", "promoted", "closed"):
+            continue
+        branch = str(row.get("branch") or "").strip()
+        if not branch.startswith(_PACKET_BRANCH):
+            continue
+        try:
+            out[int(row["id"])] = row
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _packet_wait(carrier):
+    """L'attente d'un lot inclus dans un paquet ouvert (forme `planned_wait`)."""
+    out = {"what": "packet", "vehicle": int(carrier["id"])}
+    branch = str(carrier.get("branch") or "").strip()
+    if branch:
+        out["branch"] = branch
+    head = str(carrier.get("branch_head") or "").strip()
+    if head:
+        out["head"] = head
+    return out
+
+
+def packet_waits(rows, open_items=None, *, contains=None):
+    """#2335 : `{lot: wait}` pour tout lot ouvert contenu dans un paquet.
+
+    La preuve principale est le manifeste du porteur : les unités qu'il nomme
+    (`#<lot>`) et qui sont encore ouvertes. `contains(ancestor, descendant)`
+    est un crochet optionnel (git `merge-base --is-ancestor`) pour reconnaître
+    une tête gelée incluse sans être nommée : il n'est appelé que pour un lot
+    non déclaré, et une erreur de lecture ne retient pas le lot (aucun devine).
+
+    Un lot inclus attend la **fusion du paquet**, pas un exécuteur : cette
+    attente est planifiée et tait la stagnation comme le SLO (#2335/A1).
+    """
+    universe: dict[int, dict] = {}
+    for row in open_items or ():
+        universe[int(row["id"])] = row
+    for row in rows or ():
+        universe.setdefault(int(row["id"]), row)
+    carriers = packet_carriers(universe.values())
+    if not carriers:
+        return {}
+    open_ids = {int(r["id"]) for r in universe.values()
+                if r.get("state") not in ("merged", "promoted", "closed")}
+    declared: dict[int, dict] = {}
+    for cid, carrier in carriers.items():
+        text = "%s\n%s" % (carrier.get("title") or "", carrier.get("body") or "")
+        for reference in _REF.findall(text):
+            ident = int(reference)
+            if ident in open_ids and ident != cid:
+                declared.setdefault(ident, carrier)
+    out: dict[int, dict] = {}
+    for row in rows or ():
+        ident = int(row["id"])
+        if row.get("state") in ("merged", "promoted", "closed"):
+            continue
+        carrier = declared.get(ident)
+        if carrier is None and contains is not None:
+            head = str(row.get("branch_head") or "").strip()
+            if head:
+                for cid, candidate in carriers.items():
+                    if cid == ident:
+                        continue
+                    target = str(candidate.get("branch_head") or "").strip()
+                    if not target:
+                        continue
+                    try:
+                        if contains(head, target):
+                            carrier = candidate
+                            break
+                    except Exception:   # noqa: BLE001 — lecture git illisible : pas de preuve
+                        continue
+        if carrier is not None:
+            out[ident] = _packet_wait(carrier)
+    return out
+
+
 def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=(),
-            holds=None):
+            holds=None, packets=None):
     """Pure resolver. Only an open execution lot can block another lot.
 
     Commitments apply to their explicit work item or to their plan package
@@ -170,6 +265,10 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
 
     `holds` (#1664, `pilot_holds`) est un hold déclaré, prioritaire sur une
     dépendance : le lot est parqué, pas en attente d'un lot.
+
+    `packets` (#2335, `packet_waits`) est l'appartenance à un paquet ouvert :
+    le lot attend la fusion du porteur, pas un exécuteur ; cette attente passe
+    avant une dépendance (le paquet est le véhicule réel).
     """
     open_ids = {int(r["id"]) for r in open_items
                 if r.get("state") not in ("merged", "promoted", "closed")}
@@ -220,6 +319,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     # #1664 : les holds du pilote (dict lot -> hold), distincts du `held` de
     # porte par lot utilisé plus bas (collision de noms à l'union avec main).
     pilot = holds or {}
+    packet = packets or {}
     for row in rows:
         ident = int(row["id"])
         if row.get("state") in ("merged", "promoted", "closed"):
@@ -241,6 +341,9 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         if ident in pilot:
             waits[ident] = dict(pilot[ident])
             continue
+        if ident in packet:
+            waits[ident] = dict(packet[ident])
+            continue
         blockers = set(direct.get(ident, ()))
         for package_id in ancestors(row.get("package_id"), packages):
             blockers.update(by_package.get(package_id, ()))
@@ -260,13 +363,19 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
 
 
 def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=None,
-         holds=None):
+         holds=None, packets=True, contains=None):
     """Grouped, unbounded truth reads; no query per candidate or dependency.
 
     `holds` peut être fourni par un appelant qui a déjà lu le flux ciblé
     (`pilot_holds`) : sinon il est lu ici, en une lecture groupée (#1664) qui
     ne transfère que les transitions et les notes hold/levée — jamais le
-    journal entier ni le texte des notes ordinaires."""
+    journal entier ni le texte des notes ordinaires.
+
+    `packets` (#2335) : lire les porteurs `integration/**` ouverts et marquer
+    leurs unités en attente de paquet. `contains(ancestor, descendant)` est le
+    crochet optionnel de contenance de la tête gelée (voir `packet_waits`).
+    Le poser à False évite la lecture des lots ouverts quand l'appelant n'en
+    a pas besoin (fermeture de lot, `released_by`)."""
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
@@ -281,7 +390,11 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     packages = (packages if packages is not None else
                 {p["id"]: p for p in st.packages.all(include_absent=True)})
     if open_items is None:
-        open_items = st.operations.open_lots_activity(None) if any(
-            c.get("depends_on") for c in commitments) else []
+        open_items = st.operations.open_lots_activity(None) if (packets or any(
+            c.get("depends_on") for c in commitments)) else []
+    elif packets and not open_items:
+        open_items = st.operations.open_lots_activity(None)
+    packet = (packet_waits(rows, open_items, contains=contains)
+              if packets else {})
     return resolve(rows, dates, commitments, packages, open_items, now=now,
-                   dependencies=dependencies, holds=holds)
+                   dependencies=dependencies, holds=holds, packets=packet)
