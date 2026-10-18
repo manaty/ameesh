@@ -83,6 +83,18 @@ def _repo(base: str) -> str:
     return main
 
 
+def _pose_system_tmp(test: unittest.TestCase, chemin: str) -> None:
+    """Pose `AMEESH_SYSTEM_TMP` pour un test et le rend tel qu'il l'a trouvé
+    au nettoyage : absent s'il l'était, au lieu de le laisser vide. Vide vaut
+    `/tmp` en produit (`resources.system_tmp`) mais une variable vide n'est
+    pas une variable absente et fausse l'isolation du run suivant (#2532)."""
+    old = os.environ.get("AMEESH_SYSTEM_TMP")
+    os.environ["AMEESH_SYSTEM_TMP"] = chemin
+    test.addCleanup(lambda: os.environ.pop("AMEESH_SYSTEM_TMP", None)
+                    if old is None
+                    else os.environ.__setitem__("AMEESH_SYSTEM_TMP", old))
+
+
 class _Tmp(unittest.TestCase):
     def setUp(self) -> None:
         self.base = tempfile.mkdtemp(prefix="ameesh-l73-")
@@ -614,6 +626,25 @@ class TmpfsTest(unittest.TestCase):
         self.assertIsNone(resources.fs_usage("/chemin/absent")["tmp_size_bytes"])
 
 
+class SystemTmpNettoyageTest(unittest.TestCase):
+    def test_une_variable_absente_redevient_absente_apres_nettoyage(self):
+        """#2532 : le nettoyage d'un test rend `AMEESH_SYSTEM_TMP` absente
+        quand elle l'était. Le `old or ""` d'avant la laissait vide — vide
+        vaut `/tmp` en produit, mais une variable vide n'est pas une variable
+        absente et fausse l'isolation du run suivant."""
+        original = os.environ.pop("AMEESH_SYSTEM_TMP", None)
+        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", original)
+                        if original is not None
+                        else os.environ.pop("AMEESH_SYSTEM_TMP", None))
+        # les nettoyages sont LIFO : la restauration part en dernier, la
+        # vérification juste après le nettoyage du helper
+        self.addCleanup(self.assertNotIn, "AMEESH_SYSTEM_TMP", os.environ)
+        self.assertNotIn("AMEESH_SYSTEM_TMP", os.environ)
+        _pose_system_tmp(self, "/tmp/autre")
+        self.assertEqual(os.environ["AMEESH_SYSTEM_TMP"], "/tmp/autre")
+        self.doCleanups()
+
+
 # ==========================================================================
 # avec la base : tour, passage, CLI, alertes
 # ==========================================================================
@@ -634,9 +665,7 @@ class MenageDbTest(PgTestCase):
         systeme = os.path.join(self.tmp, "tmp-systeme")
         os.makedirs(systeme)
         pol = menage.Policy(orphan_min_size=4000)
-        old = os.environ.get("AMEESH_SYSTEM_TMP")
-        os.environ["AMEESH_SYSTEM_TMP"] = systeme
-        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _pose_system_tmp(self, systeme)
         mine = menage.turn_env(self.cfgl, pol, "a1", {})["TMPDIR"]
         _write(os.path.join(mine, "de-la-session-precedente"), 100)
         tour = menage.Turn.begin(self.cfgl, pol, "a1", main, new_session=True, base_env={})
@@ -887,9 +916,7 @@ class MenageDbTest(PgTestCase):
         registry.upsert(self.db, "a1", harness="claude", host="pc")
         systeme = os.path.join(self.tmp, "tmp-systeme")
         os.makedirs(systeme)
-        old = os.environ.get("AMEESH_SYSTEM_TMP")
-        os.environ["AMEESH_SYSTEM_TMP"] = systeme
-        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _pose_system_tmp(self, systeme)
         _repo(self.tmp)
 
         def ignorer(copie: str) -> None:
@@ -935,9 +962,7 @@ class MenageDbTest(PgTestCase):
         registry.upsert(self.db, "a1", harness="claude", host="pc")
         systeme = os.path.join(self.tmp, "tmp-systeme")
         os.makedirs(systeme)
-        old = os.environ.get("AMEESH_SYSTEM_TMP")
-        os.environ["AMEESH_SYSTEM_TMP"] = systeme
-        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _pose_system_tmp(self, systeme)
         _repo(self.tmp)
         root = os.path.join(systeme, "artefact")
         os.makedirs(root)
