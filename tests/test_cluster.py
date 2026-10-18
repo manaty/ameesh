@@ -135,6 +135,12 @@ FERMEES = {
     # superviseur, aucun GRANT modifié.
     "work_landings": {"work_item_id", "vehicle_id", "pinned_sha", "until_on",
                       "created_by", "created_at"},
+    # #1770 (0450) : le rapport de prévalidation au gel (sélection, tests, hôte,
+    # chemin du plan) est une preuve interne lue par l'exécuteur, pas un état
+    # de supervision ; table fermée aux deux rôles, aucun GRANT modifié.
+    "prevalidation_reports": {"work_item_id", "head_sha", "base_sha", "card_commit",
+                              "schema", "outcome", "ok", "causes", "report",
+                              "recorded_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

@@ -4050,6 +4050,7 @@
    "packages": "canon et paquets : serveur seulement",
    "pending_spend": "usage résident : hôte local seulement (L80a), le chemin médié refuse le résident",
    "placements": "placement : serveur seulement",
+   "prevalidation": "hors du sous-ensemble de l'exécuteur médié",
    "progress": "vue des humains (/api/v1)",
    "projects": "vue des humains (/api/v1)",
    "roadmap": "feuille de route (L96) : serveur seulement",
@@ -4333,6 +4334,11 @@
    ],
    "placements": [
     "recorded"
+   ],
+   "prevalidation": [
+    "latest",
+    "record",
+    "report"
    ],
    "progress": [
     "actions",
