@@ -785,10 +785,18 @@ class CloseGuardWitnessTest(_Witness):
                 klass={"class": "light", "files": [
                     {"path": "src/ameesh/merge_pr.py", "class": "light"}]},
                 merged_sha=sha)
+        # #2384 : le corps annonce la route de sortie avant les verdicts
+        body = work.get(self.db, out["id"])["body"]
+        self.assertIn("Famille de l'auteur non tracée", body)
+        self.assertIn("--abandoned", body)
         self.verdict(lot, sha, "codex1")
         self.verdict(lot, sha, "claude2")
-        with self.assertRaisesRegex(work.WorkError, "famille de l'auteur inconnue"):
+        with self.assertRaises(work.WorkError) as caught:
             work.close(self.db, out["id"], delivered=True, sha=sha, actor="codex1")
+        text = str(caught.exception)
+        self.assertIn("famille de l'auteur inconnue", text)
+        self.assertIn("pilote", text)
+        self.assertIn("abandon/remplacement", text)
 
     def verdict(self, lot, sha, actor):
         work.milestone(self.db, lot, "verdict", sha=sha, actor=actor, verdict="ok")

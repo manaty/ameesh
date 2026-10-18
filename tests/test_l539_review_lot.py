@@ -152,6 +152,27 @@ class RuleTest(unittest.TestCase):
         self.assertIn("livrer un verdict par relecteur", body)
         self.assertIn("second avis avant la clôture", body)
         self.assertNotIn("§2, lot léger", body)
+        # #2384 : un auteur dont la famille est tracée n'a pas la route de sortie
+        self.assertNotIn("Famille de l'auteur non tracée", body)
+
+    def test_porte_de_fusion_sans_famille_auteur_explique_la_route(self):
+        """#2384 : quand la famille de l'auteur n'est pas tracée, le corps ne
+        peut pas promettre les deux avis sans dire que la garde refusera
+        `--done` ; la route (pilote : abandon/remplacement ou dispense) est
+        écrite avant les verdicts."""
+        self.ops.milestones_rows.pop(LOT)
+        out = self.open(self.gate_klass(), merged_sha="c" * 40)
+        self.assertTrue(out["created"], out)
+        body = self.ops.added[0]["body"]
+        self.assertIn("harnais non tracé au gel", body)
+        self.assertIn("**Famille de l'auteur non tracée**", body)
+        self.assertIn("--done", body)
+        self.assertIn("pilote", body)
+        self.assertIn("--abandoned", body)
+        self.assertIn("--superseded-by", body)
+        self.assertIn("dispense", body)
+        self.assertIn("route ci-dessus", body)
+        self.assertIn("deux familles distinctes", body)
 
     def test_un_light_hors_porte_de_fusion_reste_un_avis(self):
         """Le correctif ne transforme pas toute fusion light en relecture
