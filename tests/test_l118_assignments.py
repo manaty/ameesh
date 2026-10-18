@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -536,6 +537,26 @@ class BranchMergeTest(_Base):
             work.add(self.db, title="t", branch_target="develop")
         self.assertEqual(plan_git.cited_branch("agent/a puis agent/b"), None)
         self.assertEqual(plan_git.cited_branch("voir agent/a-b."), "agent/a-b")
+
+
+class CloneDiscoveryTest(unittest.TestCase):
+    def test_an_unreadable_clone_does_not_hide_other_local_clones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "unreadable")
+            good = os.path.join(tmp, "readable")
+            os.makedirs(bad)
+            os.makedirs(good)
+            agents = [{"cwd": bad, "host": "h"}, {"cwd": good, "host": "h"}]
+
+            def origin(repo, *args):
+                if repo == bad:
+                    raise plan_git.GitError("git remote: Permission denied")
+                return "git@github.com:manaty/ameesh.git"
+
+            with mock.patch.object(registry, "overview", return_value=agents), \
+                    mock.patch.object(plan_git, "_out", side_effect=origin):
+                self.assertEqual(plan_git._local_clones(None, "h"),
+                                 [(good, "manaty/ameesh", agents[1])])
 
 
 class CloneRefreshTest(_Base):

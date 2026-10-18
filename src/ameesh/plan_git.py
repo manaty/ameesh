@@ -1860,7 +1860,10 @@ def _repo_slug(repo: str) -> str | None:
 
     Sert à reconnaître qu'un dossier de travail est celui d'un AUTRE dépôt
     (#2302) ; une URL locale de la forme `…/<owner>/<repo>` marche aussi."""
-    url = _out(repo, "remote", "get-url", "origin")
+    try:
+        url = _out(repo, "remote", "get-url", "origin")
+    except GitError:
+        return None
     if not url:
         return None
     parts = [part for part in _norm_url(url).split("/") if part]
