@@ -49,6 +49,7 @@ MARKER = ".pret"                 # venv-<version> complet et contrôlé
 CURRENT = "venv-courant"         # lien : version vivante
 REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
+SHEBANG_MAX_LINE = 8192          # borne en octets, même pour un script malformé
 
 _LAUNCHER = """#!/bin/sh
 # #1969 : lanceur stable du venv d'ameesh. Il résout le venv versionné vivant
@@ -104,10 +105,16 @@ def _version_name(value):
 def _write(path, data, mode=0o755):
     """Écrit un fichier en une fois (temp + rename) : jamais lu à moitié."""
     tmp = "%s.tmp.%d" % (path, os.getpid())
-    with open(tmp, "w") as handle:
-        handle.write(data)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as handle:
+            handle.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass  # déjà renommé, ou nettoyage impossible : garder l'erreur initiale
 
 
 def _live_target(venv):
@@ -159,8 +166,8 @@ def _pip_install(directory, src):
     _run([pip, "install", "-q", src])
 
 
-def _shebang_valide(ameesh, python):
-    """Le script `ameesh` désigne-t-il l'interpréteur de CE venv ?
+def _verifier_shebang(ameesh, python):
+    """Refuse un préambule qui ne désigne pas l'interpréteur de CE venv.
 
     pip écrit `#!<venv>/bin/python3` quand le shebang tient dans 127 octets.
     Au-delà (ou si le chemin contient une espace), distlib écrit un préambule
@@ -173,39 +180,50 @@ def _shebang_valide(ameesh, python):
     La troisième ligne ferme la chaîne triple : le fichier reste un script
     Python valide, lancé par sh puis par l'interpréteur cible.
     """
-    with open(ameesh, "rb") as handle:
-        lignes = [handle.readline().decode("utf-8", "replace").rstrip("\r\n")
-                  for _ in range(3)]
-    lignes[0] = lignes[0].strip()
+    def refuser(message):
+        raise RuntimeError("préambule inattendu dans %s : %s" % (ameesh, message))
+
+    def lire_ligne(handle, numero):
+        ligne = handle.readline(SHEBANG_MAX_LINE + 1)
+        if len(ligne) > SHEBANG_MAX_LINE:
+            refuser("ligne %d : dépasse %d octets" % (numero, SHEBANG_MAX_LINE))
+        return ligne.decode("utf-8", "replace").rstrip("\r\n")
+
     # pip écrit le shebang de l'interpréteur qui l'exécute : `bin/python3`
     # (ou `bin/python3.X`) dans un venv réel, jamais `bin/python` seul ; on
     # exige seulement l'interpréteur de CE venv.
     motif = re.escape(python) + r"(?:[0-9]+(?:\.[0-9]+)*)?"
-    if re.fullmatch("#!" + motif, lignes[0]):
-        return True
+    with open(ameesh, "rb") as handle:
+        premiere = lire_ligne(handle, 1).strip()
+        if re.fullmatch("#!" + motif, premiere):
+            return  # aucune lecture du corps Python derrière un shebang direct
+        if premiere != "#!/bin/sh":
+            refuser("ligne 1 %r ; interpréteur attendu %r" % (premiere, python))
+        execution = lire_ligne(handle, 2)
+        fermeture = lire_ligne(handle, 3)
     prefixe = "'''exec' "
-    if (lignes[0] == "#!/bin/sh" and lignes[2] == "' '''"
-            and lignes[1].startswith(prefixe)):
-        try:
-            mots = shlex.split(lignes[1][len(prefixe):])
-        except ValueError:
-            return False
-        return (len(mots) == 3 and mots[1:] == ["$0", "$@"]
-                and re.fullmatch(motif, mots[0]) is not None)
-    return False
+    if not execution.startswith(prefixe):
+        refuser("ligne 2 %r : instruction exec de pip attendue" % execution)
+    if fermeture != "' '''":
+        refuser("ligne 3 %r : fermeture du préambule pip attendue" % fermeture)
+    try:
+        mots = shlex.split(execution[len(prefixe):])
+    except ValueError as exc:
+        refuser("ligne 2 %r : quotage shell invalide (%s)" % (execution, exc))
+    if len(mots) != 3 or mots[1:] != ["$0", "$@"]:
+        refuser('ligne 2 %r : arguments "$0" "$@" attendus' % execution)
+    if re.fullmatch(motif, mots[0]) is None:
+        refuser("ligne 2 %r : interpréteur attendu %r" % (execution, python))
 
 
 def _controles(directory):
     """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule."""
     python = os.path.join(directory, "bin", "python")
     ameesh = os.path.join(directory, "bin", "ameesh")
+    _verifier_shebang(ameesh, python)
     _run([python, "-c", "import psycopg, ameesh; print('imports ok')"],
          stdout=subprocess.DEVNULL)
     _run([ameesh, "--version"], stdout=subprocess.DEVNULL)
-    if not _shebang_valide(ameesh, python):
-        with open(ameesh, "rb") as handle:
-            shebang = handle.readline().decode("utf-8", "replace").strip()
-        raise RuntimeError("shebang inattendu dans %s : %r" % (ameesh, shebang))
 
 
 def preparer(args):
@@ -245,7 +263,7 @@ def _installer_lanceurs(venv, version):
     try:
         os.makedirs(bin_dir, exist_ok=True)
     except OSError as exc:
-        _die("bin/ inscriptible requis dans %s : %s" % (venv, exc))
+        raise OSError("bin/ inscriptible requis dans %s : %s" % (venv, exc))
     # Les scripts console installés par pip pointent souvent sur python3,
     # qui peut viser directement le binaire de base et contourner python.
     interpreteurs = {"python"} | {nom for nom in os.listdir(bin_dir)
@@ -265,26 +283,50 @@ def _installer_lanceurs(venv, version):
     # stable, qui résout la version vivante (témoin #1969 des alias).
     cible_bin = os.path.join(_version_dir(venv, version), "bin")
     scripts = _scripts_console(cible_bin)
-    anciens = set(_read_lanceurs(venv).get("console_scripts") or ())
     for nom in scripts:
         _write(os.path.join(bin_dir, nom), _LAUNCHER.format(lien=CURRENT, binaire=nom))
     _write(os.path.join(venv, LAUNCHERS),
            json.dumps({"format": 3, "at": time.time(), "console_scripts": scripts}),
            mode=0o644)
     # Les lanceurs d'une version quittée ne sont retirés qu'APRÈS la bascule
-    # (`_retirer_lanceurs`) : une activation qui échoue ne retire rien.
-    return sorted(anciens - set(scripts))
+    # (`_retirer_lanceurs`) : une activation qui échoue ne retire rien. Le
+    # ménage se recalcule depuis `bin/` (N1 #2230) : le marqueur peut déjà
+    # nommer la nouvelle version si l'activation s'interrompt après lui, et un
+    # lanceur orphelin ne doit pas sortir de tout suivi.
+    return scripts
 
 
-def _retirer_lanceurs(venv, noms):
+#: Noms qui ne sont jamais des scripts console : le lanceur générique de ces
+#: entrées (python, ameesh, pip) est légitime et ne doit pas être balayé.
+_LANCEURS_RESERVES = re.compile(r"(?:ameesh|python[0-9.]*|pip[0-9.]*)")
+
+
+def _lanceurs_perimes(venv, scripts):
+    """Lanceurs écrits par nous que la version vivante ne porte plus (N1 #2230).
+
+    On part du disque, pas de la liste du marqueur : si une activation a écrit
+    ses lanceurs puis échoué avant `_retirer_lanceurs`, les noms de la version
+    quittée ne sont plus dans le marqueur ; les retrouver ainsi évite qu'ils y
+    restent pour toujours (exit 127 avec message clair)."""
+    bin_dir = os.path.join(venv, "bin")
+    try:
+        noms = sorted(os.listdir(bin_dir))
+    except OSError:
+        return []
+    garder = set(scripts)
+    return [nom for nom in noms
+            if nom not in garder and not _LANCEURS_RESERVES.fullmatch(nom)
+            and _est_lanceur(os.path.join(bin_dir, nom))]
+
+
+def _retirer_lanceurs(venv, scripts):
     """Retire les lanceurs de scripts console absents de la version vivante."""
-    for nom in noms:
+    for nom in _lanceurs_perimes(venv, scripts):
         chemin = os.path.join(venv, "bin", nom)
-        if _est_lanceur(chemin):
-            try:
-                os.remove(chemin)
-            except OSError:
-                pass
+        try:
+            os.remove(chemin)
+        except OSError:
+            pass
 
 
 def _scripts_console(directory):
@@ -314,15 +356,6 @@ def _scripts_console(directory):
             continue
         scripts.append(nom)
     return scripts
-
-
-def _read_lanceurs(venv):
-    try:
-        with open(os.path.join(venv, LAUNCHERS)) as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
 
 
 def _est_lanceur(path):
@@ -441,15 +474,18 @@ def activer(args):
             _adopter(venv, nom)
         precedent = None if nom == version else nom
         _pointer(venv, nom)
-    perimes = _installer_lanceurs(venv, version)
+    try:
+        scripts = _installer_lanceurs(venv, version)
+    except OSError as exc:
+        _die(str(exc))
     if _live_target(venv) == version:
-        _retirer_lanceurs(venv, perimes)
+        _retirer_lanceurs(venv, scripts)
         print("bascule: venv-%s déjà actif" % version)
         return 0
     if precedent and precedent != version:
         _write_report(venv, precedent)
     _pointer(venv, version)
-    _retirer_lanceurs(venv, perimes)
+    _retirer_lanceurs(venv, scripts)
     print("bascule: venv-%s actif%s" % (version, "" if not precedent else " (avant : %s)" % precedent))
     return 0
 
@@ -474,11 +510,18 @@ def retour(args):
         return 0
     if not os.path.isfile(os.path.join(venv, LAUNCHERS)):
         _die("lanceurs absents de %s : activer une version d'abord" % venv)
-    # #2155 : le retour est un changement de version comme un autre ; les
-    # lanceurs de scripts console suivent la version vers laquelle on revient.
-    perimes = _installer_lanceurs(venv, precedent)
+    # #2230 N3 : le retour utile est le rename du lien. Réécrire les lanceurs
+    # est un confort, pas une condition : un disque plein ou un bin/ en
+    # lecture seule ne doit pas empêcher un retour manuel. On bascule d'abord,
+    # puis on réinstalle les lanceurs en best-effort.
     _pointer(venv, precedent)
-    _retirer_lanceurs(venv, perimes)
+    try:
+        scripts = _installer_lanceurs(venv, precedent)
+    except OSError as exc:
+        print("bascule: retour effectué, lanceurs non réécrits : %s" % exc,
+              file=sys.stderr)
+    else:
+        _retirer_lanceurs(venv, scripts)
     print("bascule: retour sur venv-%s (sans pip)" % precedent)
     return 0
 
