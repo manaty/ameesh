@@ -94,6 +94,8 @@ PREVALIDATION_CLASSES = frozenset({"P0", "P1", "P2", "P3"})
 CI_PACKETS = frozenset({"full", "impacted", "none"})
 _TIME = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 _HOURLY = re.compile(r"^(?:[01][0-9]|2[0-3]):00$")
+#: une coupure 11:00/23:00 recopiée dans une expression cron locale
+_CRON_CUTOFFS = re.compile(r"\b0\s+11\s*,\s*23\s+\*\s+\*\s+\*")
 _DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 #: noms de variable, paramètre ou argument qui portent une clé du schéma.
@@ -138,9 +140,9 @@ UPPER_BINDINGS = {
     "MECHANICS_PROJECTS": "projects",
 }
 
-#: clés de dictionnaire (configuration compilée recopiée en dur). Les clés
-#: génériques (`packet`, `schema`…) ne sont pas ici : elles se confondraient
-#: avec d'autres mappings.
+#: clés de dictionnaire (configuration compilée recopiée en dur). `packet` et
+#: `schema` y sont bornés par leur valeur (`full|impacted|none`, préfixe
+#: `ameesh-mechanics/`) pour ne pas confondre un mapping étranger.
 DICT_BINDINGS = {
     "max_in_build": "build.max_in_build",
     "packet": "ci.packet",
@@ -418,6 +420,33 @@ def _is_hourly(value) -> bool:
     return len(set(value)) >= 6
 
 
+def _is_cutoff_literal(value) -> bool:
+    """Une heure ou une liste d'heures de coupure, sous l'une de ses formes.
+
+    `11`, `"11:00"`, `(11, 23)` et `["11:00", "23:00"]` sont la même règle
+    recopiée : le nom (`CUTOFF…`, `cutoffs`) ne suffit pas, la valeur doit
+    être une heure 0..23 ou un `HH:MM`.
+    """
+    if isinstance(value, str):
+        return bool(_TIME.fullmatch(value))
+    if type(value) is int:
+        return 0 <= value <= 23
+    if isinstance(value, tuple) and value:
+        return all((isinstance(item, str) and _TIME.fullmatch(item))
+                   or (type(item) is int and 0 <= item <= 23)
+                   for item in value)
+    return False
+
+
+def _is_cutoff_pair(value) -> bool:
+    """La paire historique 11/23, même sans nom de variable parlant."""
+    if not isinstance(value, tuple) or len(value) < 2:
+        return False
+    if not all(type(item) is int and 0 <= item <= 23 for item in value):
+        return False
+    return 11 in value and 23 in value
+
+
 def _valid_binding(key: str, value, name: str, train_context: bool,
                    prevalidation_context: bool) -> bool:
     """La valeur porte-t-elle bien le paramètre nommé par le binding ?"""
@@ -437,10 +466,8 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "reviews.families":
         return (isinstance(value, tuple) and bool(value)
                 and bool(set(value) & FAMILY_NAMES))
-    if key == "cutoffs":
-        return (isinstance(value, tuple) and bool(value)
-                and all(isinstance(item, str) and _TIME.fullmatch(item)
-                        for item in value))
+    if key in ("cutoffs", "packets.cutoffs"):
+        return _is_cutoff_literal(value)
     if key == "timezone":
         return value == "Europe/Paris" and train_context
     if key == "schema":
@@ -479,6 +506,8 @@ def _binding_key(name: str, value, train_context: bool,
         key = "timezone"
     if key is None and (lower == "schema" or lower.endswith("_schema")):
         key = "schema"
+    if key is None and "cutoff" in lower:
+        key = "packets.cutoffs" if "packet" in lower else "cutoffs"
     if key is None and lower.endswith("project_overrides"):
         key = "projects"
     if key is None:
@@ -518,6 +547,8 @@ def inspect_source(path: str, text: str) -> list[Finding]:
                 add(node.lineno, "timezone", value)
             elif value.startswith("ameesh-mechanics/"):
                 add(node.lineno, "schema", value)
+            elif train_context and _CRON_CUTOFFS.search(value):
+                add(node.lineno, "cutoffs", "cron 11,23")
 
         # -- affectations : A = littéral, self.A = littéral ---------------
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -606,6 +637,8 @@ def inspect_source(path: str, text: str) -> list[Finding]:
             ok, value = _literal(node)
             if ok and _is_hourly(value):
                 add(node.lineno, "packets.cutoffs", "hourly")
+            if ok and train_context and _is_cutoff_pair(value):
+                add(node.lineno, "cutoffs", "hours 11/23")
 
         # -- `range(24)` : cadence horaire déduite d'une durée -------------
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)

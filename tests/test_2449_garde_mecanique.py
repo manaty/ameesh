@@ -154,6 +154,21 @@ class RulesTest(unittest.TestCase):
         self.assertIn("cutoffs", findings(
             'cutoffs = ["11:00", "23:00"]\n'))
 
+    def test_a_future_runner_hardcoded_cutoff_is_refused(self):
+        # le point de relecture #2448 : 11:00/23:00 peuvent être recopiés
+        # comme une paire d'heures, une constante `CUTOFF_*` ou un cron.
+        self.assertIn("cutoffs", findings("CUTOFF_HOURS = (11, 23)\n"))
+        self.assertIn("cutoffs", findings("CUTOFF_HOUR = 11\n"))
+        self.assertIn("cutoffs", findings("HOURS = [11, 23]  # train\n"))
+        self.assertIn("cutoffs", findings(
+            'SCHEDULE = "0 11,23 * * *"  # train\n'))
+        self.assertIn("packets.cutoffs", findings(
+            'PACKET_CUTOFFS = ["04:00", "05:00"]\n'))
+        # une paire d'heures étrangère ou une marge sans nom de coupure
+        # ne mord pas
+        self.assertEqual(findings("HOURS = [9, 17]\n"), [])
+        self.assertEqual(findings("MARGIN = 5\n"), [])
+
     def test_upper_case_constants_are_caught_too(self):
         self.assertIn("reviews.families", findings(
             'ALLOWED_FAMILIES = ("claude", "codex")\n'))
