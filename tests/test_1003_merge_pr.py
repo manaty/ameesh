@@ -107,6 +107,11 @@ class _Base(unittest.TestCase):
         self.lot_target = "main"
         self.lot_marks = []
         self.ready_marks()
+        # #2333 : le journal du lot (déclaration d'exception du paquet) est en
+        # mémoire ; `merge_queue.readiness` relit la déclaration écrite par la
+        # garde de `direct_merge` au dernier geste d'admission.
+        self.db = object()
+        self.journal: list[dict] = []
         # These Git/PR fixtures simulate storage. #1680's real shared-lease
         # exclusion and fencing are exercised by test_1680_packet_reservation.
         self.writer = mock.Mock()
@@ -115,11 +120,20 @@ class _Base(unittest.TestCase):
                 mock.patch.object(work, "get", side_effect=self._lot_row),
                 mock.patch.object(work, "milestones",
                                   side_effect=lambda db, n, *a, **kw: list(self.lot_marks)),
+                mock.patch.object(work, "note", side_effect=self._note),
+                mock.patch.object(work, "events", side_effect=self._events),
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=lambda db, n: self.FAMILIES.get(
                                       str(n or "").strip(), ""))):
             patch.start()
             self.addCleanup(patch.stop)
+
+    def _note(self, db, item_id, text, **kw):
+        self.journal.append({"id": len(self.journal) + 1, "note": text})
+        return True
+
+    def _events(self, db, item_id, limit=100):
+        return list(reversed(self.journal))
 
     def _lot_row(self, db, lot, *a, **kw):
         row = {"id": int(lot), "state": "build", "branch": self.lot_branch,
@@ -159,7 +173,7 @@ class _Base(unittest.TestCase):
         kw.setdefault("sleep", lambda s: None)
         kw.setdefault("lot", self.lot)
         kw.setdefault("repo", self.repo)
-        kw.setdefault("db", None)
+        kw.setdefault("db", self.db)
         kw.setdefault("cfg", None)
         # #2333 : ces bancs simulent la fusion d'un paquet ; une exception
         # incident est la déclaration qui autorise un lot hors paquet. Les

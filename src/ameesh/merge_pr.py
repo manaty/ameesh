@@ -276,7 +276,7 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
 
 def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
                slug: str = "", target: str = "", head: str = "",
-               gh=None) -> dict:
+               gh=None, packet_exception=None) -> dict:
     """The merge queue admission, replayed as is (#1003 B1): freeze, `ok`
     verdict on the head (class read from the frozen diff), non-protected
     target, green CI of the PR on that head, the project's `ci_required`. The
@@ -286,7 +286,9 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
     #2273 : la tête doit aussi prouver les checks requis de la cible (même
     lecture que `fire.ready_pr`) — ce chemin pousse hors API et ne peut donc
     pas s'en remettre à la protection qu'il contourne. `head` est le gel
-    relu ; à défaut, la tête de la vue (déjà contrôlée par `_pr_guards`)."""
+    relu ; à défaut, la tête de la vue (déjà contrôlée par `_pr_guards`).
+    `packet_exception` (nature, motif) porte l'exception déjà validée par un
+    `--dry-run` jusqu'à l'admission : elle autorise sans journaliser."""
     branch = (view.get("headRefName") or "").strip()
     rollup = view.get("statusCheckRollup") or []
     base = (view.get("baseRefName") or "").strip()
@@ -310,7 +312,8 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
     clone = resolutions.Replayer(repo, owner)
     try:
         ready = merge_queue.readiness(db, lot, repo, ci=ci_status, clone=clone,
-                                      project=project, cfg=cfg)
+                                      project=project, cfg=cfg,
+                                      packet_exception=packet_exception)
     except merge_queue.QueueError as exc:
         raise MergePrError("lot #%d is not admitted by the merge queue: %s" % (lot, exc)) \
             from exc
@@ -631,7 +634,9 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                     "it (gh pr merge --disable-auto %d) and retry" % (pr, error, pr))
         _pr_guards(view, pr, head, target)
         ready = _admission(db, cfg, lot, repo, project, owner, view,
-                           slug=slug, target=target, head=head, gh=gh)
+                           slug=slug, target=target, head=head, gh=gh,
+                           packet_exception=((exception, reason)
+                                             if dry_run and exception else None))
         if not _same(ready.get("frozen_sha"), head):
             raise MergePrError("lot #%d is admitted on %s, not on the freeze %s: refreeze and "
                                "re-review" % (lot, (ready.get("frozen_sha") or "?")[:12],
@@ -738,7 +743,9 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         fresh = pr_view(slug, pr, gh=gh)
         _pr_guards(fresh, pr, head, target)
         ready = _admission(db, cfg, lot, repo, project, owner, fresh,
-                           slug=slug, target=target, head=head, gh=gh)
+                           slug=slug, target=target, head=head, gh=gh,
+                           packet_exception=((exception, reason)
+                                             if dry_run and exception else None))
         if not _same(ready.get("frozen_sha"), head) \
                 or _branch_name(ready.get("target")) != _branch_name(target):
             raise MergePrError("lot #%d moved during the gesture (admission now %s on %s): "
