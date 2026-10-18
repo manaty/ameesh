@@ -1803,18 +1803,66 @@ def scan_activity(path: str, limit: int = WALK_LIMIT) -> dict:
     return out
 
 
-def _git_copies(path: str) -> list[str]:
-    """L'entrée et ses sous-dossiers directs qui sont des copies git (`.git`
-    dossier, ou fichier d'un worktree) : clone, worktree de relecture."""
+def _bare_git_copy(path: str) -> bool:
+    """Un dépôt nu : `HEAD`, `objects` et `refs`, sans `.git` (#2525).
+    Signature seule, sans lancer git : un faux positif garde l'entrée, jamais
+    l'inverse."""
+    return not os.path.lexists(os.path.join(path, ".git")) \
+        and os.path.isfile(os.path.join(path, "HEAD")) \
+        and os.path.isdir(os.path.join(path, "objects")) \
+        and os.path.isdir(os.path.join(path, "refs"))
+
+
+def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], str]:
+    """(copies git de l'entrée, doute). Une copie est reconnue par son `.git`
+    (dossier, ou fichier d'un worktree) ou sa signature de dépôt nu, à toute
+    profondeur ; un lien symbolique n'est ni suivi ni ouvert, et le dedans
+    d'un dépôt nu (aucun arbre de travail) n'est pas parcouru.
+
+    Parcours borné à `limit` dossiers ouverts (défaut `WALK_LIMIT`, comme les
+    autres parcours du ménage) et arrêté au premier doute — dossier ou entrée
+    illisible, budget épuisé — pour que l'appelant garde l'entrée au lieu de
+    conclure à tort qu'il n'y a rien. Les copies à arbre de travail passent
+    avant les dépôts nus : leurs gardes sont plus précises, un dépôt nu n'est
+    qu'un doute conservateur (#2525)."""
     if os.path.islink(path) or not os.path.isdir(path):
-        return []
-    candidates = [path]
-    try:
-        with os.scandir(path) as it:
-            candidates += [e.path for e in it if e.is_dir(follow_symlinks=False)]
-    except OSError:
-        pass
-    return [c for c in candidates if os.path.lexists(os.path.join(c, ".git"))]
+        return [], ""
+    limit = WALK_LIMIT if limit is None else limit
+    trees: list[str] = []
+    bare: list[str] = []
+    stack = [path]
+    walked = 0
+    while stack:
+        current = stack.pop()
+        walked += 1
+        if walked > limit:
+            return trees + bare, "more than %d directories: contents not verifiable" % limit
+        if _bare_git_copy(current):
+            bare.append(current)
+            continue          # le dedans d'un dépôt nu ne cache pas d'arbre de travail
+        if os.path.lexists(os.path.join(current, ".git")):
+            trees.append(current)
+        try:
+            with os.scandir(current) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            return trees + bare, "unreadable directory: %s" % current
+        for entry in reversed(entries):
+            if entry.name == ".git":
+                continue      # métadonnées d'une copie, pas une copie
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                return trees + bare, "unreadable entry: %s" % entry.path
+            if stat.S_ISDIR(st.st_mode):
+                stack.append(entry.path)
+    return trees + bare, ""
+
+
+def _git_copies(path: str) -> list[str]:
+    """Les copies git de l'entrée à toute profondeur, sans le doute
+    (`_git_copies_report`) : clone, worktree de relecture, dépôt nu."""
+    return _git_copies_report(path)[0]
 
 
 def unsaved_git_work(path: str, rules=()) -> str:
@@ -1823,11 +1871,15 @@ def unsaved_git_work(path: str, rules=()) -> str:
     fichiers ignorés hors artefacts de build, HEAD sur aucune branche
     distante (commits jamais poussés), et pour un clone ses branches locales,
     son stash, ses autres worktrees liés, un remote qui vit dans l'entrée ou
-    le dépôt commun d'un worktree lié qui y vit (#2493/#2512)."""
-    for copy in _git_copies(path):
+    le dépôt commun d'un worktree lié qui y vit ; un dépôt nu et un parcours
+    incomplet gardent l'entrée (#2493/#2512/#2525)."""
+    copies, doubt = _git_copies_report(path)
+    for copy in copies:
         work = _git_copy_work(copy, path, rules)
         if work:
             return work
+    if doubt:
+        return "copies not fully inspected (%s)" % doubt
     return ""
 
 
@@ -1840,6 +1892,10 @@ def tmp_recovery_command(path: str) -> str:
         return "ls -la -- %s" % shlex.quote(path)
     commands = []
     for copy in copies:
+        if _bare_git_copy(copy):
+            commands.append("git -C %s show-ref" % shlex.quote(copy))
+            commands.append("git -C %s log --all --not --remotes" % shlex.quote(copy))
+            continue
         commands.append("git -C %s status --short" % shlex.quote(copy))
         commands.append("git -C %s log --branches --not --remotes" % shlex.quote(copy))
     return " ; ".join(commands)
@@ -1889,7 +1945,10 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
     files, ignored files outside the build output `rules`, HEAD on no remote
     branch, for a CLONE its local branches, stash, other linked worktrees and
     a remote that lives inside `entry`, and no linked worktree whose common
-    repository lives inside `entry`."""
+    repository lives inside `entry`. A bare repository has no working tree to
+    prove its refs saved: it is a doubt and keeps the entry (#2525)."""
+    if _bare_git_copy(copy):
+        return "%s: bare repository (no working tree to prove its commits saved)" % copy
     st = worktree_state(copy)
     if not st["exists"]:
         return "%s: %s" % (copy, st["reason"] or "directory gone")
@@ -1949,23 +2008,33 @@ def tmp_git_work(path: str, rules=()) -> str:
     linked worktree nor remote inside the directory, and no linked worktree
     whose common repository is inside it) and no process inside.
     A directory is never deleted merely because its agent left the registry;
-    this check is the second condition."""
-    for copy in _git_copies(path):
+    this check is the second condition. A bare repository, or a directory
+    tree whose copies could not all be inspected (#2525), keeps it."""
+    copies, doubt = _git_copies_report(path)
+    for copy in copies:
         work = _git_copy_work(copy, path, rules)
         if work:
             return work
         if worktree_in_use(copy):
             return "%s: a process is working in it" % copy
+    if doubt:
+        return "copies not fully inspected (%s)" % doubt
     return ""
 
 
 def recover_tmp_git_copies(path: str) -> tuple[bool, str, list[str]]:
     """#2493 (N2) : remove the linked worktrees of `path` with `git worktree
     remove` (never `--force`, its own checks still apply), after `tmp_git_work`
-    proved them saved. Clones stay for `_safe_rmtree`; their content was
-    checked the same way. (ok, error, common repositories to prune)."""
+    proved them saved. Clones stay for `_safe_rmtree`; a bare repository is a
+    doubt and never gets here. An inspection cut short by a doubt removes
+    nothing (#2525). (ok, error, common repositories to prune)."""
     repos: list[str] = []
-    for copy in _git_copies(path):
+    copies, doubt = _git_copies_report(path)
+    if doubt:
+        return False, "git copies not fully inspected (%s)" % doubt, []
+    for copy in copies:
+        if _bare_git_copy(copy):
+            continue                     # no worktree to unlink: gone with the dir
         if not os.path.isfile(os.path.join(copy, ".git")):
             continue                     # a clone: clean and pushed, deleted with the dir
         repo = common_dir(copy)
@@ -2161,7 +2230,13 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
         if action != "suppression" or dry_run:
             present.append(item)
             continue
-        worktrees = [common_dir(c) for c in _git_copies(path)
+        copies, doubt = _git_copies_report(path)
+        if doubt:
+            item.update(status="garde",
+                        detail="git copies not fully inspected (%s)" % doubt)
+            present.append(item)
+            continue
+        worktrees = [common_dir(c) for c in copies
                      if os.path.isfile(os.path.join(c, ".git"))]
         try:
             freed = _remove_tmp_entry(path, base, data.get("ino"), data.get("dev"))
@@ -3726,7 +3801,12 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     # retirés par `git worktree remove`, jamais `--force`.
                     # Sinon il reste, avec la raison et la commande à lancer.
                     git_repos: list[str] = []
-                    if _git_copies(full):
+                    copies, doubt = _git_copies_report(full)
+                    if doubt:
+                        skipped.append("tmp %s kept: git copies not fully inspected "
+                                       "— %s" % (full, doubt))
+                        continue
+                    if copies:
                         work = tmp_git_work(
                             full, build_artifacts.rules_of(policy.artifacts))
                         if work:
