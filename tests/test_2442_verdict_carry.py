@@ -102,6 +102,42 @@ class CriterionTest(unittest.TestCase):
         _git(self.repo.root, "cherry-pick", self.repo.reviewed)
         self.assertTrue(self.check(_git(self.repo.root, "rev-parse", "HEAD"))[0])
 
+    def test_a_rebase_dropping_a_commit_already_in_the_target_is_a_realignment(self):
+        # N1 qa-01 #2486 : B0 ; R = A+B ; T1 = copie de A (+ Z) ; F = T1+B'.
+        # Le rebase abandonne A, déjà appliqué dans la cible : le delta propre
+        # du lot reste B. `rebase_identity` compte 1/2 patch-ids et refuse ; la
+        # preuve « chaque commit relu est rejoué ou déjà atterri » l'accepte.
+        _git(self.repo.root, "switch", "-q", "-c", "reviewed2", self.repo.b0)
+        a = _commit(self.repo.root, "a.txt", "a\n", "A")
+        b = _commit(self.repo.root, "b.txt", "b\n", "B")
+        reviewed = _git(self.repo.root, "rev-parse", "HEAD")
+        _git(self.repo.root, "switch", "-q", "main")
+        _git(self.repo.root, "cherry-pick", a)
+        _commit(self.repo.root, "z.txt", "z\n", "Z")
+        tip = _git(self.repo.root, "rev-parse", "HEAD")
+        _git(self.repo.root, "switch", "-q", "-c", "rebased2", tip)
+        _git(self.repo.root, "cherry-pick", b)
+        frozen = _git(self.repo.root, "rev-parse", "HEAD")
+        self.assertFalse(plan_git.rebase_identity(
+            self.repo.root, reviewed, frozen, tip)["mechanical"])
+        ok, why = verdict_carry.realigned(self.repo.root, reviewed, frozen, tip)
+        self.assertTrue(ok, why)
+        self.assertIn("already landed in the target", why)
+
+    def test_a_dropped_commit_not_landed_in_the_target_is_not_a_realignment(self):
+        # N1 qa-01 #2486 : A ajoute X, B le retire ; la cible ne porte pas X.
+        # L'atterrissage est le même (F = T), mais A n'est pas atterri : un
+        # abandon sans preuve de contenu dans la cible ne reporte rien.
+        _git(self.repo.root, "switch", "-q", "-c", "reviewed3", self.repo.b0)
+        _commit(self.repo.root, "x.txt", "x\n", "A")
+        _git(self.repo.root, "rm", "-q", "x.txt")
+        _git(self.repo.root, "commit", "-q", "-m", "B")
+        reviewed = _git(self.repo.root, "rev-parse", "HEAD")
+        frozen = self.repo.t1
+        ok, why = verdict_carry.realigned(self.repo.root, reviewed, frozen, self.repo.t1)
+        self.assertFalse(ok)
+        self.assertIn("neither replayed nor already landed", why)
+
     def test_an_author_commit_is_not_a_realignment(self):
         self.repo.merge_target()
         frozen = _commit(self.repo.root, "lot.txt", "lot, changed\n", "fix")
@@ -203,6 +239,21 @@ class CriterionTest(unittest.TestCase):
         self.assertTrue(verdict_carry.mechanical_history(
             self.repo.root, self.repo.reviewed, _git(self.repo.root, "rev-parse", "HEAD"),
             self.repo.t1)[0])
+
+    def test_a_shallow_clone_is_refused(self):
+        # N2 qa-01 #2486 : `mechanical_history` dépend de l'histoire complète ;
+        # un clone superficiel ferait passer un commit manquant pour neuf.
+        shallow = tempfile.mkdtemp(prefix="ameesh-2442-shallow-")
+        self.addCleanup(shutil.rmtree, shallow, ignore_errors=True)
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        "file://" + self.repo.root, shallow],
+                       check=True, env=ENV, capture_output=True)
+        self.assertEqual(
+            verdict_carry.mechanical_history(shallow, A, B, C),
+            (False, "complete Git history required; shallow clone refused"))
+        ok, why = verdict_carry.realigned(shallow, A, B, C)
+        self.assertFalse(ok)
+        self.assertIn("shallow clone refused", why)
 
     def test_the_same_head_carries_nothing(self):
         self.assertEqual(self.check(self.repo.reviewed), (False, "same head"))
