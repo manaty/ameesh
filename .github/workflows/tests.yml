@@ -8,9 +8,9 @@
 # propre Postgres :
 #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
 #               en une à quatre parts selon l'estimation ; la suite complète,
-#               en 4 parts, sur push vers main ou release/**, sur une PR de
-#               release (source ou cible release/** ou integration/**) et sur
-#               l'appel du portier de paquet (workflow_call, §12) ;
+#               en 6 parts (#2292), sur push vers main ou release/**, sur une
+#               PR de release (source ou cible release/** ou integration/**) et
+#               sur l'appel du portier de paquet (workflow_call, §12) ;
 #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
 #               et le contrat, plus la liste « always » déclenchée (#749), en
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
@@ -430,7 +430,12 @@ jobs:
     needs: plan
     if: needs.plan.outputs.psycopg != '[]'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # #2292 : à 4 parts, 14,3-30,5 min sous saturation sur les cinq derniers
+    # paquets, et les parts 4/4 de h-1800 puis 1/4 de h-1900 ont été coupées à
+    # 30 min sans test en échec. La suite complète passe à 6 parts ; le plafond
+    # est relevé à 45 min (30,5 mesuré + marge, aligné sur « autre système de
+    # fichiers ») et reste tenu par le contrat test_899.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -454,8 +459,9 @@ jobs:
     env:
       AMEESH_DRIVER: psycopg
       FLUX_NOM: tests (flux) psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
-      # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899)
-      AMEESH_PLAFOND_MIN: "30"
+      # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899) ;
+      # 45 depuis #2292 (4 parts coupées à 30 min sur h-1800/h-1900).
+      AMEESH_PLAFOND_MIN: "45"
     steps:
       - &debut
         name: début du job (mesure du plafond, #899)
