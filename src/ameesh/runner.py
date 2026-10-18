@@ -751,6 +751,53 @@ class AgentWorker(threading.Thread):
         except OSError:
             pass
 
+    def _note_session(self, session_new: str, session: str | None, harness: str,
+                      compte, cwd: str, resume: str, harnais_lance: str) -> None:
+        """Enregistre la session ouverte par le tour : fichier local, registre
+        et mémoire du worker. Le tour résident (L80a) comme le tour par
+        événement passent par ici : le premier ne voit sa session que dans son
+        `TurnResult`, jamais dans un événement du flux brut (Codex)."""
+        self.write_session_file(session_new)
+        if resume:
+            # #389 r2 : le résumé a ouvert une session connue
+            # (gardé jusque-là : un départ avorté le rejoue)
+            self._resume_drop()
+        # L242b (3) : le harnais de la session (rotation au changement de
+        # harnais, `account_turn.continuity`)
+        self._state_note("session_harness", harness)
+        # L39 (0030) : le compte d'origine de la session, en registre avec son
+        # id (le marqueur du flux reste la source des relevés du tour) ; #408 :
+        # et le harnais et le dossier de son ouverture, ceux du lancement,
+        # seulement si le tour l'OUVRE (une session reprise garde l'origine de
+        # son ouverture)
+        ouverte = session_new != session
+        origine = (harnais_lance if ouverte else None, cwd if ouverte else None)
+        try:
+            registry.set_session(
+                self.db, self.name, session_new,
+                compte.name if compte is not None else None,
+                harness=origine[0], cwd=origine[1])
+        except db_mod.DbError as exc:
+            # L72 : une panne de base ne tue pas le tour (le bail, lui, est
+            # défendu par le battement) ; l'enregistrement est rejoué après le
+            # tour.
+            self._session_en_attente = (
+                session_new, compte.name if compte is not None else None,
+                *origine)
+            log_async("[%s] session %s not recorded (%s): replayed "
+                      "after the turn" % (self.name, session_new,
+                                          db_mod.explain(exc)))
+        if self.agent is not None:
+            # #1898 N4 : le registre porte la session qui vient d'être
+            # ouverte ; la mémoire du worker suit, sinon `current_session`
+            # retombait sur le fichier local et sa comparaison d'horloges
+            # (marge de dérive) pour chaque tour de la même session.
+            self.agent["session_id"] = session_new
+            self.agent["session_account"] = (
+                compte.name if compte is not None else None)
+        if ouverte:
+            self._installe_hook_preuve(cwd)
+
     def _fil_note(self, text: str, *, meta: dict | None = None) -> None:
         """Trace d'audit dans le fil du projet de l'agent (R12) ; ne lève jamais."""
         try:
@@ -5040,25 +5087,35 @@ class AgentWorker(threading.Thread):
                 return
         self.stop_group_now(raison, group=False)
 
-    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None]:
-        """Code et erreur d'un tour résident fini (`voulu` : clos par
-        l'exécuteur, une interruption n'est pas un échec)."""
-        from . import resident
+    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None, str | None]:
+        """Code, erreur et session d'un tour résident fini (`voulu` : clos par
+        l'exécuteur, une interruption n'est pas un échec).
+
+        Le `TurnResult` est aussi la seule source d'usage du tour pour le grand
+        livre quand le flux brut ne la porte pas (Codex app-server, ACP) : il
+        est écrit une fois dans `events.jsonl` (L80a), avant la comptabilité,
+        pour que la réparation après panne retrouve la même mesure."""
+        from . import resident, resident_runner
         if tour is None:
-            return 1, None              # pas lancé : l'erreur est déjà notée
+            return 1, None, rp.session  # pas lancé : l'erreur est déjà notée
         fin = tour.wait(RESIDENT_END_WAIT_S)
         if fin is None:
-            return 1, "resident turn did not end"
+            return 1, "resident turn did not end", rp.session
         # L81 (étude §6.1) : la mesure continue d'un tour résident — contexte
         # courant, fenêtre, relu du tour et relu cumulé de la session.
         rp.record_turn(fin)
         self._resident_reread_keep(rp)
+        evenement = resident_runner.usage_event(
+            rp.driver.protocol, fin, turn=self._turn_id or "")
+        resident_runner.write_usage_event(self._path("events.jsonl"), evenement)
+        session = fin.session or rp.session
         if fin.status == resident.COMPLETED:
             self._resident_failures = 0     # T2 : la série d'échecs est close
-            return 0, None
+            return 0, None, session
         if fin.status == resident.INTERRUPTED:
-            return (0, None) if voulu else (1, "resident turn interrupted")
-        return 1, fin.error or "resident turn failed"
+            return ((0, None, session) if voulu
+                    else (1, "resident turn interrupted", session))
+        return 1, fin.error or "resident turn failed", session
 
     def _resident_turn_end(self, rp) -> None:
         """Fin d'un tour résident : dépublié ; le processus reste pour le tour
@@ -5764,49 +5821,8 @@ class AgentWorker(threading.Thread):
                             conversation_usage = parsed["usage"]
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
-                        self.write_session_file(session_new)
-                        if resume:
-                            # #389 r2 : le résumé a ouvert une session connue
-                            # (gardé jusque-là : un départ avorté le rejoue)
-                            self._resume_drop()
-                        # L242b (3) : le harnais de la session (rotation au
-                        # changement de harnais, `account_turn.continuity`)
-                        self._state_note("session_harness", harness)
-                        # L39 (0030) : le compte d'origine de la session, en
-                        # registre avec son id (le marqueur du flux reste la
-                        # source des relevés du tour) ; #408 : et le harnais
-                        # et le dossier de son ouverture, ceux du lancement,
-                        # seulement si le tour l'OUVRE (une session reprise
-                        # garde l'origine de son ouverture)
-                        ouverte = session_new != session
-                        origine = (harnais_lance if ouverte else None,
-                                   cwd if ouverte else None)
-                        try:
-                            registry.set_session(
-                                self.db, self.name, session_new,
-                                compte.name if compte is not None else None,
-                                harness=origine[0], cwd=origine[1])
-                        except db_mod.DbError as exc:
-                            # L72 : une panne de base ne tue pas le tour (le
-                            # bail, lui, est défendu par le battement) ;
-                            # l'enregistrement est rejoué après le tour.
-                            self._session_en_attente = (
-                                session_new, compte.name if compte is not None else None,
-                                *origine)
-                            log_async("[%s] session %s not recorded (%s): replayed "
-                                      "after the turn" % (self.name, session_new,
-                                                         db_mod.explain(exc)))
-                        if self.agent is not None:
-                            # #1898 N4 : le registre porte la session qui vient
-                            # d'être ouverte ; la mémoire du worker suit, sinon
-                            # `current_session` retombait sur le fichier local et
-                            # sa comparaison d'horloges (marge de dérive) pour
-                            # chaque tour de la même session.
-                            self.agent["session_id"] = session_new
-                            self.agent["session_account"] = (
-                                compte.name if compte is not None else None)
-                        if ouverte:
-                            self._installe_hook_preuve(cwd)
+                        self._note_session(session_new, session, harness, compte,
+                                           cwd, resume, harnais_lance)
                     if parsed.get("model") and parsed["model"] != modele_annonce:
                         modele_annonce = parsed["model"]  # source du tour (L13 B4)
                         self._compta_annonce(modele_annonce)  # persisté tout de suite
@@ -5895,9 +5911,17 @@ class AgentWorker(threading.Thread):
                             background_handles[pid] = handle
                 result_code = proc.wait()
             else:
-                result_code, erreur_resident = self._resident_result(
+                result_code, erreur_resident, session_resident = self._resident_result(
                     rp, tour_resident, clos or self.host_yield is not None)
                 error = error or erreur_resident
+                # L80a : un tour résident Codex/ACP n'annonce sa session que
+                # dans son `TurnResult` (le flux brut est du JSON-RPC) ; sans
+                # cet enregistrement, le tour suivant la verrait changée et
+                # relancerait le processus sur une session neuve.
+                if session_resident and not session_new:
+                    session_new = session_resident
+                    self._note_session(session_new, session, harness, compte,
+                                       cwd, resume, harnais_lance)
         except _LancementImpossible as exc:
             echec_lancement = str(exc)
             result_code = 127

@@ -20,7 +20,7 @@ from ameesh import runner as runner_mod
 from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
-from .test_l75_resident import claude_doc
+from .test_l75_resident import acp_doc, claude_doc, codex_doc
 
 
 def _group_gone(pgid: int, timeout: float = 5.0) -> bool:
@@ -188,6 +188,66 @@ class TurnFileTest(unittest.TestCase):
         self.assertEqual(resident_runner.current_turn({"AMEESH_TURN_ID": "t"}), "t")
 
 
+class UsageEventTest(unittest.TestCase):
+    """L80a: the event a resident Codex/ACP turn leaves for the ledger."""
+
+    def test_refusal_accepts_the_counted_protocols(self):
+        self.assertEqual(set(resident_runner.PROTOCOLS),
+                         {"claude-stream-json", "codex-app-server", "acp"})
+        for protocol in ("codex-app-server", "acp"):
+            adapter = mock.Mock()
+            adapter.descriptor.resident = {"protocol": protocol}
+            with mock.patch.object(resident_runner, "binary_version", return_value="9.9.9"), \
+                    mock.patch.object(resident_runner.resident, "availability", return_value=""):
+                self.assertEqual(resident_runner.refusal(adapter), "", protocol)
+        adapter = mock.Mock()
+        adapter.descriptor.resident = {"protocol": "telnet"}
+        self.assertIn("not counted", resident_runner.refusal(adapter))
+
+    def test_claude_stream_needs_no_event(self):
+        result = resident.TurnResult(status=resident.COMPLETED, session="s1",
+                                     usage={"input_tokens": 10})
+        self.assertIsNone(resident_runner.usage_event("claude-stream-json", result))
+
+    def test_codex_event_carries_the_turn_and_the_thread_total(self):
+        result = resident.TurnResult(
+            status=resident.COMPLETED, session="thr-1",
+            usage={"input_tokens": 100, "cache_read_input_tokens": 200,
+                   "output_tokens": 9},
+            usage_total={"input_tokens": 300, "cached_input_tokens": 200,
+                         "output_tokens": 9})
+        event = resident_runner.usage_event("codex-app-server", result, turn="t-1")
+        self.assertEqual(event, {
+            "type": resident.USAGE_EVENT, "protocol": "codex-app-server",
+            "usage": {"input_tokens": 100, "cache_read_input_tokens": 200,
+                      "output_tokens": 9},
+            "session": "thr-1", "turn": "t-1", "status": resident.COMPLETED,
+            "usage_total": {"input_tokens": 300, "cached_input_tokens": 200,
+                            "output_tokens": 9}})
+
+    def test_acp_event_carries_the_usd_cost(self):
+        result = resident.TurnResult(
+            status=resident.COMPLETED, session="sess-1",
+            usage={"input_tokens": 1234}, cost=0.02, cost_total=0.04)
+        event = resident_runner.usage_event("acp", result, turn="t-2")
+        self.assertEqual((event["cost"], event["cost_total"]), (0.02, 0.04))
+        self.assertNotIn("usage_total", event)
+
+    def test_write_appends_one_line_and_never_raises(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+        self.assertFalse(resident_runner.write_usage_event(path, None))
+        self.assertFalse(os.path.exists(path))
+        first = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 1}}
+        second = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 2}}
+        self.assertTrue(resident_runner.write_usage_event(path, first))
+        self.assertTrue(resident_runner.write_usage_event(path, second))
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual([json.loads(line) for line in fh], [first, second])
+        # an unwritable path is a lost event, never a failed turn
+        self.assertFalse(resident_runner.write_usage_event(tempfile.mkdtemp(), first))
+
+
 class ResidentRunnerTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -199,22 +259,32 @@ class ResidentRunnerTest(PgTestCase):
         self.adapter = adapters.HarnessAdapter(harnesses.load(path, source="test"),
                                                sys.executable)
         for patch in (mock.patch.dict(os.environ, {"FAKE_RESIDENT_LOG": self.log}),
+                      # permissive version: each case may load a Codex/ACP
+                      # descriptor with another pinned minimum
                       mock.patch.object(resident_runner, "binary_version",
-                                        return_value="2.1.286")):
+                                        return_value="99.0.0")):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def _worker(self, name: str = "res1", **local):
+    def _worker(self, name: str = "res1", doc: dict | None = None,
+                harness: str = "claude", **local):
         runner = Runner(self.cfg, self.db, once=False)
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "claude", cwd=cwd)
+        adapter = self.adapter
+        if doc is not None:
+            path = os.path.join(self.tmp, "fake-%s.json" % name)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            adapter = adapters.HarnessAdapter(harnesses.load(path, source="test"),
+                                              sys.executable)
+        self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         self.addCleanup(worker.watchdog_stop.set)
         self.addCleanup(worker._close_resident, "end of test")
-        worker._adapter = lambda: self.adapter
+        worker._adapter = lambda: adapter
         self._set(worker, resident="on", **local)
         return runner, worker
 
@@ -261,6 +331,75 @@ class ResidentRunnerTest(PgTestCase):
         # the hook: no turn between two turns
         with open(worker._path(resident_runner.TURN_FILE), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "")
+
+    def _usage_events(self, worker) -> list[dict]:
+        with open(worker._path("events.jsonl"), encoding="utf-8") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        return [e for e in events if e.get("type") == resident.USAGE_EVENT]
+
+    def test_codex_resident_usage_is_counted_once_per_turn(self):
+        # L80a: Codex reports usage in `thread/tokenUsage/updated`, which the
+        # raw JSON-RPC stream does not give the ledger. Each logical turn
+        # leaves one `resident.turn` event: the turn from `last`, the thread
+        # total for the next baseline. Two turns on one process must not
+        # count the same tokens twice.
+        _runner, worker = self._worker(doc=codex_doc(), harness="codex")
+        self.assertTrue(self._turn(worker, "premier"))
+        rp = worker.resident
+        self.assertIsNotNone(rp)
+        self.assertTrue(self._turn(worker, "second"))
+        self.assertIs(worker.resident, rp)
+        self.assertEqual(len(self._starts()), 1)
+        events = self._usage_events(worker)
+        self.assertEqual(len(events), 2)
+        for event in events:
+            self.assertEqual(
+                {key: event["usage"][key] for key in
+                 ("input_tokens", "cache_read_input_tokens",
+                  "cache_creation_input_tokens", "output_tokens")},
+                {"input_tokens": 100, "cache_read_input_tokens": 200,
+                 "cache_creation_input_tokens": 0, "output_tokens": 9})
+        self.assertEqual([e["usage_total"]["input_tokens"] for e in events],
+                         [300, 600])
+        self.assertEqual([e["usage_total"]["cached_input_tokens"] for e in events],
+                         [200, 400])
+        self.assertEqual([e["usage_total"]["output_tokens"] for e in events],
+                         [9, 18])
+        self.assertEqual(len({e["session"] for e in events}), 1)
+        self.assertTrue(all(e["session"] for e in events))
+        # the ledger: each turn's own measure, and the thread's cumulative
+        # reading as the next baseline (never the turn alone)
+        rows = self.db.query(
+            "SELECT input_tokens, cached_input_tokens, output_tokens, "
+            "cum_input_tokens, cum_cached_input_tokens, cum_output_tokens "
+            "FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual([(r["input_tokens"], r["cached_input_tokens"],
+                           r["output_tokens"]) for r in rows],
+                         [(300, 200, 9), (300, 200, 9)])
+        self.assertEqual([(r["cum_input_tokens"], r["cum_cached_input_tokens"],
+                           r["cum_output_tokens"]) for r in rows],
+                         [(300, 200, 9), (600, 400, 18)])
+
+    def test_acp_resident_usage_and_cost_are_counted_once_per_turn(self):
+        # L80a: ACP reports usage in `session/update`; its `TurnResult` also
+        # carries the USD delta when the harness publishes a cumulative cost.
+        # The event is the ledger's only source for the turn.
+        _runner, worker = self._worker(doc=acp_doc(), harness="deepseek")
+        with mock.patch.dict(os.environ, {"FAKE_ACP_MODE": "normal",
+                                          "FAKE_ACP_COST_STEP": "0.02"}):
+            self.assertTrue(self._turn(worker, "un"))
+            rp = worker.resident
+            self.assertIsNotNone(rp)
+            self.assertTrue(self._turn(worker, "deux"))
+        self.assertIs(worker.resident, rp)   # one ACP agent served both
+        events = self._usage_events(worker)
+        self.assertEqual(len(events), 2)
+        self.assertEqual([e["cost"] for e in events], [0.02, 0.02])
+        self.assertEqual([e["cost_total"] for e in events], [0.02, 0.04])
+        rows = self.db.query("SELECT usd::float8 AS usd, input_tokens "
+                             "FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual([round(r["usd"], 6) for r in rows], [0.02, 0.02])
+        self.assertEqual([r["input_tokens"] for r in rows], [1234, 1234])
 
     def test_changed_settings_restart_on_the_session(self):
         _runner, worker = self._worker()
