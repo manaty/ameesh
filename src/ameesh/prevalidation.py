@@ -26,8 +26,10 @@ travail mais l'arbre **construit** du SHA candidat plus le plan relu, figé par
 son identité et passé à l'offload (`--snapshot`) : ni fichier non suivi, ni
 flag `assume-unchanged`/`skip-worktree`, ni modification locale ne peut s'y
 glisser. Le plan est un chemin relatif, refusé hors de l'arbre ou ignoré par
-git. La tête est relue après le run, en local et, si `--published-ref` est
-nommée, au distant : un mouvement pendant la validation invalide le rapport.
+git, ou s'il ne peut pas entrer dans l'arbre du SHA (conflit fichier/répertoire,
+`plan-path-conflict`). La tête est relue après le run, en local et, si
+`--published-ref` est nommée, au distant : un mouvement pendant la validation
+invalide le rapport.
 Le rapport porte lot, SHA complet, base, commit de carte, identité de l'arbre
 envoyé, modules exécutés, hôte, résultat et durée ; il n'est pas un verdict et
 ne remplace aucune relecture (#1617, #1756).
@@ -64,6 +66,7 @@ CAUSES = (
     "card-missing",       # carte absente, illisible ou sans commit
     "card-stale",         # carte trop vieille ou sans ancêtre commun avec la tête
     "selection-unsafe",   # le plan n'est pas sûr (fondation, bloc inconnu, retrait…)
+    "plan-path-conflict",   # un parent du plan est un fichier au SHA (conflit D/F, #1820)
     "selection-full",     # le plan retombe sur la suite complète : refus, jamais de repli
     "head-moved",         # le plan ne porte pas la tête candidate exacte
     "no-vm",              # VM absente, injoignable, job refusé ou arrêté (offload 75)
@@ -455,12 +458,42 @@ def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
     photographie plus : il **construit** l'arbre voulu (arbre du SHA candidat
     plus le plan tel qu'il vient d'être lu), le fige par son identité et la
     passe à l'offload (`--snapshot`) : le contenu exécuté ne dépend plus de
-    l'état local, et le rapport peut nommer l'identité envoyée."""
+    l'état local, et le rapport peut nommer l'identité envoyée.
+
+    Un échec de construction est un refus `selection-unsafe` : `head-moved`
+    reste réservé à la tête qui a réellement bougé (`head_state`)."""
     try:
         return offload.snapshot_with(root, head, {plan_rel: plan})
     except offload.OffloadError as exc:
-        raise PrevalidationError("head-moved",
+        raise PrevalidationError("selection-unsafe",
                                  "arbre du SHA + plan non constructible: %s" % exc) from None
+
+
+def _tree_entries(root: str, head: str, paths: Sequence[str], *,
+                  runner=subprocess.run) -> list[tuple[str, str, str]]:
+    """Les entrées `(mode, type, chemin)` de `paths` dans l'arbre `head`.
+
+    `ls-tree -z` rend les chemins bruts, sans guillemets ; une lecture
+    impossible ou une sortie inattendue refuse (`selection-unsafe`) plutôt que
+    de supposer un chemin sûr."""
+    if not paths:
+        return []
+    proc = runner(["git", "-C", root, "--literal-pathspecs", "ls-tree", "-z",
+                   head, "--", *paths], capture_output=True, text=True)
+    if getattr(proc, "returncode", 1):
+        raise PrevalidationError("selection-unsafe",
+                                 "chemin du plan invérifiable au SHA candidat")
+    entries: list[tuple[str, str, str]] = []
+    for raw in (getattr(proc, "stdout", "") or "").split("\0"):
+        if not raw:
+            continue
+        meta, sep, path = raw.partition("\t")
+        fields = meta.split()
+        if not sep or len(fields) != 3:
+            raise PrevalidationError("selection-unsafe",
+                                     "sortie ls-tree illisible pour le chemin du plan")
+        entries.append((fields[0], fields[1], path))
+    return entries
 
 
 def remote_plan_path(plan_path: str, root: str, *, head: str = "",
@@ -468,8 +501,11 @@ def remote_plan_path(plan_path: str, root: str, *, head: str = "",
     """Le chemin du plan tel qu'il existe dans l'arbre envoyé à la VM.
 
     Le plan est un artefact relatif au dépôt, hors des chemins du SHA candidat :
-    il ne doit remplacer aucun fichier de ce SHA. Les chemins hors du dépôt ou
-    ignorés refusent aussi (`selection-unsafe`)."""
+    il ne doit remplacer aucun fichier de ce SHA, ni tomber sous un parent qui
+    y est un fichier — ce second cas est le conflit D/F que `update-index`
+    refuserait plus tard, nommé ici (`plan-path-conflict`) avant toute
+    construction. Les chemins hors du dépôt ou ignorés refusent aussi
+    (`selection-unsafe`)."""
     absolute = os.path.abspath(plan_path)
     relative = os.path.relpath(absolute, os.path.abspath(root))
     if relative == os.pardir or relative.startswith(os.pardir + os.sep):
@@ -477,13 +513,19 @@ def remote_plan_path(plan_path: str, root: str, *, head: str = "",
                                  "plan hors de l'arbre envoyé à la VM: %s" % plan_path)
     remote = relative.replace(os.sep, "/")
     if head:
-        proc = runner(["git", "-C", root, "--literal-pathspecs", "ls-tree", head,
-                       "--", remote], capture_output=True, text=True)
-        if getattr(proc, "returncode", 1):
-            raise PrevalidationError("selection-unsafe", "chemin du plan invérifiable au SHA candidat")
-        if (getattr(proc, "stdout", "") or "").strip():
+        if _tree_entries(root, head, [remote], runner=runner):
             raise PrevalidationError("selection-unsafe",
                                      "le plan remplacerait un chemin du SHA candidat: %s" % remote)
+        parts = remote.split("/")
+        parents = ["/".join(parts[:cut]) for cut in range(1, len(parts))]
+        for _mode, kind, path in _tree_entries(root, head, parents, runner=runner):
+            if kind != "tree":
+                qualifie = {"blob": "un fichier",
+                            "commit": "un sous-module"}.get(kind, "un objet " + kind)
+                raise PrevalidationError(
+                    "plan-path-conflict",
+                    "le plan %s tombe sous %s, %s au SHA candidat"
+                    " (conflit fichier/répertoire)" % (remote, path, qualifie))
     proc = runner(["git", "-C", root, "check-ignore", "-q", "--", remote],
                   capture_output=True, text=True)
     if getattr(proc, "returncode", 1) == 0:
