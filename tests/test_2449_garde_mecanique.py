@@ -164,6 +164,18 @@ class RulesTest(unittest.TestCase):
             'SCHEDULE = "0 11,23 * * *"  # train\n'))
         self.assertIn("packets.cutoffs", findings(
             'PACKET_CUTOFFS = ["04:00", "05:00"]\n'))
+        # un runner de release écrit en français (#2448) : ni `cutoff`, ni
+        # `packet`, ni `train`, et pourtant la règle recopiée
+        release = ('"""Runner de release : coupures de 11:00 et 23:00."""\n'
+                   "import datetime\n")
+        for body in ("RELEASE_HOURS = (11, 23)\n",
+                     "def due(now):\n    return now.hour in (11, 23)\n",
+                     'CRON = "0 11,23 * * *"\n',
+                     "AT = (datetime.time(11, 0), datetime.time(23, 0))\n",
+                     'AT = ("11:00:00", "23:00:00")\n'):
+            self.assertIn("cutoffs", findings(release + body), body)
+        self.assertIn("timezone", findings(
+            release + 'PARIS = ZoneInfo("Europe/Paris")\n'))
         # une paire d'heures étrangère ou une marge sans nom de coupure
         # ne mord pas
         self.assertEqual(findings("HOURS = [9, 17]\n"), [])

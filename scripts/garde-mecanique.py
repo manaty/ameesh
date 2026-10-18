@@ -527,8 +527,15 @@ def inspect_source(path: str, text: str) -> list[Finding]:
     except SyntaxError as exc:
         return [Finding(path, exc.lineno or 0, "source", "syntax-error")]
     docstrings = _docstrings(tree)
-    train_context = bool(re.search(r"\b(?:cutoffs?|packets?|train)\b",
+    # le dépôt s'écrit en français : un runner de release (#2448) parle de
+    # « coupures » sans jamais écrire `cutoff`
+    train_context = bool(re.search(r"\b(?:cutoffs?|coupures?|packets?|train)\b",
                                    text, re.IGNORECASE))
+    # heures de coupure (paire 11/23, cron, `time(11)`) : contexte plus large,
+    # une heure n'y a pas d'autre lecture ; le fuseau garde le contexte étroit
+    # (le jour budgétaire des comptes est aussi en Europe/Paris)
+    cutoff_context = train_context or bool(re.search(
+        r"\b(?:paquets?|releases?)\b", text, re.IGNORECASE))
     prevalidation_context = "prevalidation" in text.casefold()
     found: list[Finding] = []
 
@@ -540,14 +547,14 @@ def inspect_source(path: str, text: str) -> list[Finding]:
         if (isinstance(node, ast.Constant) and isinstance(node.value, str)
                 and id(node) not in docstrings):
             value = node.value
-            if value in ("11:00", "23:00"):
-                add(node.lineno, "cutoffs", value)
-                add(node.lineno, "packets.cutoffs", value)
+            if value in ("11:00", "23:00", "11:00:00", "23:00:00"):
+                add(node.lineno, "cutoffs", value[:5])
+                add(node.lineno, "packets.cutoffs", value[:5])
             elif value == "Europe/Paris" and train_context:
                 add(node.lineno, "timezone", value)
             elif value.startswith("ameesh-mechanics/"):
                 add(node.lineno, "schema", value)
-            elif train_context and _CRON_CUTOFFS.search(value):
+            elif cutoff_context and _CRON_CUTOFFS.search(value):
                 add(node.lineno, "cutoffs", "cron 11,23")
 
         # -- affectations : A = littéral, self.A = littéral ---------------
@@ -637,8 +644,16 @@ def inspect_source(path: str, text: str) -> list[Finding]:
             ok, value = _literal(node)
             if ok and _is_hourly(value):
                 add(node.lineno, "packets.cutoffs", "hourly")
-            if ok and train_context and _is_cutoff_pair(value):
+            if ok and cutoff_context and _is_cutoff_pair(value):
                 add(node.lineno, "cutoffs", "hours 11/23")
+
+        # -- `time(11, 0)` / `time(23)` : heure de coupure positionnelle ---
+        if (isinstance(node, ast.Call) and cutoff_context and node.args
+                and _target_name(node.func) == "time"
+                and isinstance(node.args[0], ast.Constant)
+                and type(node.args[0].value) is int
+                and node.args[0].value in (11, 23)):
+            add(node.lineno, "cutoffs", str(node.args[0].value))
 
         # -- `range(24)` : cadence horaire déduite d'une durée -------------
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
