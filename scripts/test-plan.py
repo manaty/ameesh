@@ -1382,6 +1382,19 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
                 table.setdefault(d, {})[module] = s
         if not table.get(driver):
             table = None
+    # #1476 : pour le découpage de la CI, la table statique (mesurée sur la
+    # suite complète, tous les modules) est la référence ; la carte ne fait que
+    # compléter les modules qu'elle connaît en plus. L'ordre inverse reste
+    # celui de la mesure (test-parts.py --map), où la carte est le dernier
+    # relevé sous couverture.
+    if table is not None and parts.TABLE.exists():
+        mesurees = json.loads(parts.TABLE.read_text(encoding="utf-8"))
+        complete = {d: dict(v) for d, v in table.items()}
+        for d, valeurs in mesurees.items():
+            if not isinstance(valeurs, dict):
+                continue  # `_source` et autres métadonnées de la table
+            complete.setdefault(d, {}).update(valeurs)
+        table = complete
     weighed, _ = parts.weight(modules, driver, table)
     return weighed
 

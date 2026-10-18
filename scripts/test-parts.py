@@ -170,9 +170,22 @@ def map_durations(chemin: str | os.PathLike) -> dict:
 
 def weight(mods: list[str], pilote: str, table: dict | None = None,
           tests: pathlib.Path = TESTS) -> tuple[dict[str, float], list[str]]:
-    """Poids de chaque module, et la liste de ceux pesés par le repli."""
+    """Poids de chaque module, et la liste de ceux pesés par le repli.
+
+    #1476 : la carte ne mesure pas tous les modules sous chaque pilote (le
+    psql complet n'est pas sous mesure). La table statique des durées comble
+    ces trous ; la carte reste prioritaire quand elle a une durée. Sans cela,
+    un module non mesuré était pesé par son nombre de tests — un module
+    d'intégration lourd (des dizaines de secondes par test) passait pour léger
+    et déséquilibrait une part.
+    """
     if table is None:
         table = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
+    else:
+        base = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
+        for driver, mesures in table.items():
+            base.setdefault(driver, {}).update(mesures)
+        table = base
     mesures = table.get(pilote, {})
     connus = [m for m in mesures if m in set(mods)]
     total_tests = sum(test_count(m, tests) for m in connus)
