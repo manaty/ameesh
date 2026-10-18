@@ -7,6 +7,11 @@ user, same state directory) deleted each other's `.menage/tmp/<agent>`
 every 10 min — the auditor's live session lost its command outputs —
 because `run_pass` deleted every directory whose name was missing from ITS
 registry, before looking at the agents in turn.
+
+#2326: a directory without an owner file of this mesh is never deleted
+either, however old: it may be a worktree an agent created at the shared
+root (`git worktree add $TMPDIR/../…`), which the pass used to take for
+the temporary directory of a missing agent.
 """
 from __future__ import annotations
 
@@ -86,17 +91,23 @@ class OrphanTmpTest(PgTestCase):
         self.assertEqual([e for e in report["entries"] if e["kind"] == "tmp"], [])
         self.assertEqual([p for p in report["plan"] if p["kind"] == "tmp"], [])
 
-    def test_directory_without_owner_is_kept_unless_idle_for_a_day(self):
-        # before L219, or created by another mesh's older version
+    def test_directory_without_owner_is_never_deleted(self):
+        # before L219, created by another mesh's older version, or a worktree
+        # created at the shared root with `git worktree add $TMPDIR/../…`
+        # (#2326): no owner file of this mesh proves the directory is ours,
+        # so it stays even after a day of inactivity.
         self._tmp(self.mine, "a1")                       # the managed root exists
         legacy = os.path.join(menage.tmp_root(self.mine, self.pol), "ancien")
         _write(os.path.join(legacy, "f"))
         _age(legacy, 23 * HOUR)
         report = self._pass()
         self.assertTrue(os.path.isdir(legacy))
-        self.assertTrue(any("no owner" in s for s in report["skipped"]))
+        self.assertIn("tmp %s kept: not owned by this mesh" % legacy,
+                      report["skipped"])
         self._pass(later=25 * HOUR)
-        self.assertFalse(os.path.exists(legacy))
+        self.assertTrue(os.path.exists(os.path.join(legacy, "f")))
+        self.assertFalse(os.path.exists(menage.owner_file(
+            menage.tmp_root(self.mine, self.pol), "ancien")))
 
     def test_unowned_directory_of_a_registered_name_is_not_evicted(self):
         # review of #176, point 4: `a1` exists here, but the directory has

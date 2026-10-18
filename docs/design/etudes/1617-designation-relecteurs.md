@@ -163,13 +163,66 @@ in place:
   review). An exception from the callback cancels the milestone with everything
   it carried; `on_frozen` on another kind is rejected.
 
-**Nothing is activated**: the default is `on_frozen=None`, the `work milestone`
-CLI provides no callback, and a freeze therefore designates no one. The wiring
-is proven by 6 real-database tests: the milestone and the designation are
-visible only within the transaction, the thread stays in `after_commit` and it
-is the caller that publishes it after its commit (root call as well as nested
-call), an exception cancels the milestone, the mark and the mails, and the
-callback is rejected outside a `frozen`.
+**Activation (#2447)**: the hook is now the default of a `frozen` milestone
+when the host reads a canon and the call owns its transaction.
+`work.milestone` installs `review_designation_activation.hook(cfg)` and drains
+the readable thread after its COMMIT; an explicit `on_frozen` still wins
+(tests, recovery), and a call made inside an already-open transaction keeps the
+#1617 contract (the caller owns the commit and its `after_commit` list). The
+`work milestone … frozen` CLI captures the outcome for its message, and
+`ameesh work reviewers <lot> [--apply]` reads or replays the latest freeze
+outside the hook.
+
+The activation adapter (`src/ameesh/review_designation_activation.py`) reads
+only machine sources:
+
+- the **audited canon policy**: `mechanics.load` at
+  `canon_state.last_good_commit` (the configured ref on a bench without state),
+  with `train_reviews` rules and `reviews.families`; a missing or malformed
+  policy is an explicit wait, journaled once per freeze, never a guessed
+  default;
+- the **frozen diff** `merge-base(target, frozen)..frozen` and the exact
+  provenance receipt (#1465) of each of its commits; an unknown commit or an
+  unknown author family waits instead of proving a false independence;
+- the **candidates** of the lot's project: real session family
+  (`registry.live_harness`), availability and open-lot load;
+- the project's `orchestrateur` in the canon as the **capacity-alert
+  recipient**; the pilot is not a reviewer candidate, so the two roles never
+  collapse into one mail.
+
+The **audited commit** is `canon_state.last_good_commit` whenever a state is
+recorded, even if the current pass is `invalid`: a failed pass must not fall
+back to the non-audited configured ref (B2 of the Codex review cx2). Only a
+host with no recorded state (bench, first start) reads the configured exact
+commit.
+
+The designation is also written into `work_items.reviewers`, the column read
+by the merge gate, `progress` and the stale-reviewer alert (`B1`): a new freeze
+first removes the names of the previous automatic marks, then appends the new
+ones, so the previous head stops being designated; a manual name (never in a
+mark) is preserved, and a manual waiver (`-none`) is never overridden.
+
+The selection and its reviewer sync run inside a **savepoint**: an exception
+while the second mail, the mark or the column is being written rolls the whole
+attempt back (and drops its deferred thread writes) before the waiting note is
+written. No first mail survives without its mark, and a replay mails no
+reviewer twice (B3 of the Codex review cx2). A failure to write the waiting
+note itself propagates: the milestone and its designation remain one fact.
+
+Outside the hook, the recovery (`designate`) writes the selection, its mails
+and the reviewer column in **one transaction**, under the same lot-row lock as
+`add_milestone`; the column write revalidates the latest freeze under that lock
+and writes nothing when a newer freeze exists (B/P1 of the Codex review cx2: a
+delayed recovery of F1 could re-register its reviewers on the head of F2, and
+the stale `catch` could clear the new head's column). The light and
+`unavailable` branches are gated by the same check and return `stale` without
+any note, mail or column mutation.
+
+A manual reviewer already designated makes the automatic path an explicit,
+journaled no-op: the manual exception stays available. An expected input
+problem (no repository, no policy, unreadable evidence) keeps the freeze and
+writes one note plus a capacity mail when a pilot is known; a database failure
+still rolls the milestone back with its transaction.
 
 ## Verification
 
@@ -206,30 +259,57 @@ trace before the external commit (and nothing survives its rollback); after the
 external commit, the caller flushes the list; the callback is rejected outside
 a `frozen`.
 
-## Remaining before activation
+`tests/test_2447_review_designation_activation.py` — 20 tests on a real
+database, both drivers: the freeze designates two independent families and
+writes them into `work_items.reviewers`; a new freeze clears only the previous
+automatic names; the last good canon commit wins when the current state is
+invalid; a manual reviewer stays the journaled exception; no reviewer free is a
+wait plus a pilot alert; an exception during the selection is rolled back by a
+savepoint (no first mail without its mark, no duplicate on replay); a stale
+recovery — selection, light or unavailable — leaves the newer freeze's column,
+notes and mails untouched; the selection and the column commit together (a
+failure of the column write leaves neither a designated mark nor a reviewer
+mail); a recovery still refuses an undeliverable waiting designation while the
+hook turns it into a waiting mark; the CLI freeze and the recovery command.
+
+## Remaining after activation (#2447)
 
 - port agreements secured: cx3 (#1467, 15/10 10:46) leaves the wiring of the
   narrow hook here and touches neither `work.py` nor `storage/postgres/work.py`;
-  impl07 (#1616) delivered `mechanics.load(repo, commit, project)` (head
-  `ddf1091d`); the canon adapter remains to be written;
-- the activation adapter: rules and families from `mechanics.load`, `required`
-  and `risk` from `reviews_for(paths)`, `policy_ref = rules.commit`, pilot to
-  notify (`notify`) — no single machine source of the project pilot exists
-  today; outside the hook, the port rejects an empty recipient or one outside
-  the registry without writing anything; **at the freeze (hook), #1634**: an
-  empty or out-of-registry recipient (pilot to notify or reviewer) no longer
-  cancels the freeze — no mail leaves, the freeze's mark is a waiting one
-  (`why` names the missing recipient, retryable by a recovery outside the hook)
-  and a readable note in the lot journal says so; the other failures of the
-  callback still cancel the freeze, a decision to take with the adapter;
-- the read / recovery command (`ameesh work reviewers <lot>` or equivalent) to
-  catch up a freeze left without a designation;
+  impl07 (#1616) delivered `mechanics.load(repo, commit, project)`; the canon
+  adapter is delivered by #2447 (`review_designation_activation.py`);
+- rules and families come from `mechanics.load`, `required` and `risk` from
+  `reviews_for(paths)`, `policy_ref = rules.commit`, the pilot from the canon
+  `orchestrateur` role; **at the freeze (hook), #1634**: an empty or
+  out-of-registry recipient no longer cancels the freeze — the mark is a
+  waiting one and a readable note names the missing recipient; the adapter
+  catches the expected input failures the same way, a database failure still
+  cancels the milestone with its transaction;
+- the read / recovery command is delivered: `ameesh work reviewers <lot>`
+  reads the recorded designation; `--apply` replays the latest freeze outside
+  the hook, so capacity or a canon policy coming back can designate the same
+  head;
+- **real proof is gated on the canon publication (#2452)**: at 18/10 the
+  audited canon `b726312` has no `processus/mecanique.yaml` and no
+  `review_policies.train_reviews`; the activation is wired and active, but
+  every freeze records an explicit wait until the audited commit carries the
+  policy. `manaty/home#111` (head `c27aa5e1`) is the pending publication; the
+  real measurement (delay freeze → designated reviewer, duplicates) is to be
+  taken after the canon sync, on the first real freezes;
+- **canon drift observed**: at `c27aa5e1`, `train_reviews` gives zero reviews
+  to `src/ameesh/review_designation*.py` and `src/ameesh/mesh_cli.py`, while
+  canon §8 declares the merge gate (`review*`) sensitive; #2447 touches
+  `work.py` (sensitive) but the new merge-gate paths are not covered by the
+  review policy. Reported to mesh-design; a canon lot should classify them;
 - delivery proof on a **real freeze**: designation without an agent, exact head
   handed over, duration and duplicates measured (the mail counter per freeze);
 - reviews: R Claude dev1 (head `d176acf2`) found and fixed B3 (unknown author
   family) → `f6abe89a`; R Codex cx2 (`f6abe89a`) returned `blocked` on B1
   (freeze moved) and B2 (external commit), fixed here; as dev1 is the author of
   its correction, the composition of the two families on the new head is to be
-  arbitrated by the pilot;
+  arbitrated by the pilot; cx2 on `f9d1164f8` lifted B1/B2/B3 and returned
+  `blocked` on B/P1 (recovery sync outside the designation transaction, stale
+  `catch` clearing the column), fixed in the next head with the stale guard on
+  every column write;
 - two independent reviews outside the author for this gate (security of the
   admission chain), then package at the cut-off.
