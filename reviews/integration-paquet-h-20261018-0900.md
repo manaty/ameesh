@@ -1,6 +1,6 @@
 # Paquet integration/paquet-h-20261018-0900 — composition
 
-Base : `main` **`8f413a8d259f`** (fusion de la PR #1783, paquet h-0800, 18/10 08:02Z ; arbre identique au gel `730bce8714f2`). Aucun paquet ouvert ; `main` n'a pas bougé pendant la composition.
+Base : `main` **`85fbc6421d2e`** (release 1.11.7, coupure de 11:00 du 18/10, commit du 09:09Z — paquets h-2300 à h-0800, 49 unités). La composition a d'abord été faite sur `8f413a8d259f` (fusion de la PR #1783, paquet h-0800, 08:02Z ; arbre identique au gel `730bce8714f2`) ; `main` a bougé pendant la CI avec la release `[skip ci]`, remise à jour par un merge sans conflit (`777768fa1`, delta `docs/versions/1.11.7.md` + `pyproject.toml`, aucun chevauchement avec les 77 fichiers du paquet). Aucun autre paquet ouvert.
 
 Demandes : **orchestrateur** 18/10 06:44Z (#2256), 06:47Z (#2254), 06:57Z (#2374), 07:21Z (#2334) ; **mesh-design** 07:03Z (#2278) et 07:21Z (#2334, report ok sur `9c0d9086`) ; **auditeur** 07:01Z (#1280, #2274), 07:05Z (#2282), 07:10Z (#2377), 07:13Z (#1272). **#2377**, admis au paquet h-0800 par mesh-design (05:37Z) mais omis du manifeste h-0800 sans motif, est rattrapé ici dans l'unité #1280+#2377.
 
@@ -12,7 +12,7 @@ Demandes : **orchestrateur** 18/10 06:44Z (#2256), 06:47Z (#2254), 06:57Z (#2374
 - #2400 : signalé SLO niveau 1 par l'orchestrateur 18/10 07:48Z ; tête `cb45dfcc` (verdict cx2 OK, B1/B2 corrigés), sensible SQL/concurrence ; merge-tree rc 0.
 - #2311 : relecture après fusion #2302, tête `43c56861` (verdict impl-02, famille opposée à l'auteur cx2), notée « prochain paquet » depuis 03:01 par le composeur puis signalée par l'auditeur 07:53Z ; merge-tree rc 0.
 
-## Composition (10 unités)
+## Composition (14 unités)
 
 | unité | lot(s) | source | commit | note |
 |---|---|---|---|---|
@@ -45,11 +45,16 @@ Chaque commit de composition a le lot en second parent, son sujet nomme le lot e
 ## Correctif de relecture du paquet
 
 - **ameesh-cx1**, verdict `blocked` sur #2402 (18/10 08:12Z, B1) : la clôture `work.close --done` d'une relecture après fusion contournait `guard_delivery` — un seul `ok` sur un autre sha, ou un `blocked` courant, fermait la mission en `done`. Correctif : la garde s'applique aussi à `done` (`src/ameesh/work.py`) ; la preuve du lecteur (`_parent_verdict`) reste due. Couverture : `tests/test_1104_review_lot_hors_file.py` (avis unique, verdict sur un sha étranger, blocage courant, relecture légère, mission manuelle bloquée inchangée). Tests : 48×2 sur ce fichier, 57×2 sur `test_1280_work_close_done` + `test_l539_review_lot` + `test_2377_revue_famille`.
+- **CI du paquet** : `test_l161e_map` refusait que `test_1272_rejeu_seul_affiche.py` importe au niveau module la classe concrète `WidgetUsageTest` (contrat #1632/#1944). Correctif test-only `52d8d14a76c1` : import du module sous alias (`_widgets.WidgetUsageTest.setUp`), aucun test perdu ; `test_l161e_map` 41 OK, `test_1272` 4 OK. Avis mesh-design et ameesh-cx1 `ok` sur cette tête. Le premier run sur la nouvelle tête a rougi au *gel* (ameesh 1.11.6 décrivait l'étiquette avec le sha au lieu de la base 40-hex) ; étiquette corrigée en base `8f413a8d` puis reposée, run complet relancé.
+
+## Remise à jour de la cible
+
+- `main` a reçu la release 1.11.7 (`85fbc6421d2e`, `[skip ci]`, 18/10 09:09Z) pendant la CI du paquet. Merge sans conflit de `origin/main` dans la branche : `777768fa1`, delta `docs/versions/1.11.7.md` + `pyproject.toml` (version), disjoint des 77 fichiers du paquet ; `git merge-tree` rc 0 avant le merge. Ancien run annulé ; une seule suite complète sur la tête finale.
 
 ## Preuves
 
-- `git diff --stat 8f413a8d259f..HEAD` : **76 fichiers, +6442/−378**, dont `src/ameesh/review_lot.py`, `src/ameesh/fire.py`, `src/ameesh/merge_queue.py`, `src/ameesh/radar.py`, `src/ameesh/wip.py`, `src/ameesh/accounts.py`, `scripts/paquet-compose.py`, `deploy/` le cas échéant.
-- `git diff --check 8f413a8d259f..HEAD` : rc 0, aucun marqueur de conflit ; arbre de la composition **identique** à celui composé sur `730bce8714f2` (contrôle `git diff` vide).
+- `git diff --stat 85fbc6421d2e..HEAD` : **77 fichiers, +6581/−378**, dont `src/ameesh/review_lot.py`, `src/ameesh/fire.py`, `src/ameesh/merge_queue.py`, `src/ameesh/radar.py`, `src/ameesh/wip.py`, `src/ameesh/accounts.py`, `scripts/paquet-compose.py`, `deploy/` le cas échéant.
+- `git diff --check 85fbc6421d2e..HEAD` : rc 0, aucun marqueur de conflit ; le merge de la release n'ajoute que `docs/versions/1.11.7.md` et `pyproject.toml` (version), déjà dans la base.
 - Tests ciblés locaux sur l'arbre composé (les deux pilotes psql et psycopg) : **350 tests OK par pilote** pour les 10 premières unités (#1359, #2254, #1374/#2256, #2282, #2334, #l160e, #1003, #l160g, #1272) ; `review_lot` (#1280/#2377/#2374) : 100 tests OK ; **#1738** (résolution propre `0bd629559`) : `test_l107_executor_contract` 22 OK ×2, 157 tests impactés verts (dev5) ; **#2378** : `test_789_slo_alerts` + `test_l368_planned_waits` 67 OK ×2 ; **#2400+#2311** : `test_2400_train_migrations`, `test_l122_numeros_de_migration`, `test_migrations`, `test_migrations_additives`, `test_l160g_migration_reservations`, `test_l118_assignments`, `test_1467_train` 169 OK ×2.
 - `scripts/paquet-inclusion.py --manifest reviews/integration-paquet-h-20261018-0900.md --head HEAD --expected 1280,2377,2256,2374,1359,2254,2278,2282,2332,2334,2274,1272,1738,2378,2400,2311` : rc 0, 16/16 présents.
 
