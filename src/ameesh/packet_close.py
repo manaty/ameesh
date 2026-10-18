@@ -215,13 +215,17 @@ def _delivering_unit(repo: str, target: str, units_rows: list[dict], lot: int) -
 # --------------------------------------------------------------------------
 
 def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
-         actor: str = "", limit: int = 1000) -> dict:
+         actor: str = "") -> dict:
     """Ferme les lots unitaires des manifestes de paquet présents sur la cible.
 
     Seuls les lots encore ouverts et cités par un manifeste sont examinés ;
     chacun par son **dernier gel** (`plan_git.latest_freeze`), comme
     `sync-merges` mais sans balayer les autres lots. La cible est lue telle
     que le clone la connaît (aucun fetch ici ; le CLI reste en lecture seule).
+
+    #2508 : les lots sont lus **par leur identifiant de manifeste**, jamais par
+    `items(limit=1000)` : la borne globale pouvait laisser une unité du paquet
+    au-delà de la limite, et la fermeture n'a besoin que des unités listées.
     """
     if target is None:
         try:
@@ -238,10 +242,13 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
         raise PacketError(str(exc)) from exc
     lots, manifests = units(repo_dir, target)
     st = storage.of(db)
-    rows = [row for row in st.work.items(state=None, assignee=None, limit=limit)
-            if row["state"] not in work.MERGED_STATES and row["state"] != "closed"]
-    open_rows = {int(row["id"]): row for row in rows}
-    examined = sorted(lot for lot in lots if lot in open_rows)
+    open_rows: dict[int, dict] = {}
+    for lot in lots:
+        row = st.work.get(lot)
+        if row is not None and row["state"] not in work.MERGED_STATES \
+                and row["state"] != "closed":
+            open_rows[int(row["id"])] = row
+    examined = sorted(open_rows)
     declared: dict = {}
     for milestone in st.progress.lot_milestones(examined):
         declared.setdefault(int(milestone["work_item_id"]), []).append(milestone)

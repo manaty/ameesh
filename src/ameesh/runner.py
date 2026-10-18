@@ -8678,6 +8678,7 @@ class Runner:
                     continue
             log_async(line)
         self._carry_errors = errors
+
     def packet_sweep_once(self, db) -> None:
         """#2426 : ferme les lots unitaires des paquets fusionnés.
 
