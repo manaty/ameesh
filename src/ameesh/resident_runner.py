@@ -136,8 +136,10 @@ def reread_max(value: str | None) -> float:
 
 
 def turn_reread(usage: dict | None) -> int:
-    """Tokens a turn re-read (sum of its model calls): the measure of the L60
-    context ceiling, carried by `TurnResult.usage`."""
+    """Tokens a turn re-read (sum of its model calls): the cost and alert
+    measure carried by `TurnResult.usage`. The L60 context ceiling is measured
+    on the context of the last call (`context_tokens`), not on this sum
+    (#2336): the sum grows with the number of steps, not with the session."""
     return sum(int((usage or {}).get(key) or 0) for key in
                ("input_tokens", "cache_read_input_tokens",
                 "cache_creation_input_tokens"))
@@ -149,16 +151,19 @@ def maintenance(*, context: int | None, window: int | None, reread: int,
                 compact_retry_s: float = 0.0) -> str:
     """What a finished resident session asks for (L81, study §6.2).
 
-    `ROTATE`: the per-agent L60 ceiling is reached on the turn's re-read — a
-    hard bound, acted on at the first passage between turns. `ALERT`: the
-    session's cumulative re-read passed `reread_max` (the study's alert
-    threshold) — acted on when quiet. `COMPACT`: the context fills `share` of
-    its window — acted on when quiet too, and not again within
-    `compact_retry_s` of the last request (`since_compact`), so that a
-    compaction which does not land never loops. Rotation wins over
-    compaction: a compaction would not bring the session back under a hard
-    bound."""
-    if cap and reread >= cap:
+    `ROTATE`: the per-agent L60 ceiling is reached on the session's context —
+    the context of the last call, `context`; when the harness does not publish
+    it, the turn's re-read (`reread`) remains the fallback measure, so a
+    harness without context reporting is not left unprotected — a hard bound,
+    acted on at the first passage between turns. `ALERT`: the session's
+    cumulative re-read passed `reread_max` (the study's alert threshold) —
+    acted on when quiet. `COMPACT`: the context fills `share` of its window —
+    acted on when quiet too, and not again within `compact_retry_s` of the
+    last request (`since_compact`), so that a compaction which does not land
+    never loops. Rotation wins over compaction: a compaction would not bring
+    the session back under a hard bound."""
+    mesure = context if context is not None else reread
+    if cap and mesure >= cap:
         return ROTATE
     if reread_max and session_reread >= reread_max:
         return ALERT
