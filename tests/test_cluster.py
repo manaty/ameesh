@@ -141,6 +141,10 @@ FERMEES = {
     "prevalidation_reports": {"work_item_id", "head_sha", "base_sha", "card_commit",
                               "schema", "outcome", "ok", "causes", "report",
                               "recorded_at"},
+    # #2421 (0464) : le payload d'usage résident d'un tour non réglé est un état
+    # interne borné au tour (réparation d'un worker mort), pas un état de
+    # supervision ; colonne fermée aux deux rôles, aucun GRANT modifié.
+    "spend_pending": {"resident_usage"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
