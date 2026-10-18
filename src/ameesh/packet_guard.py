@@ -13,9 +13,10 @@ la contourner :
 * `fire.give` / `fire._act` (`ameesh work fire`, auto-fusion) ;
 * `ci.cmd_ci_run` (`ameesh ci run --lot`, étiquette `ci-lot-<sha>`).
 
-Une PR dont la tête est `integration/**` est un paquet : elle passe. Les
-têtes de travail `lot/**`, `agent/**` et `review/**` vers la cible
-d'intégration sont refusées, sauf exception **déclarée dans la note du lot**
+Une PR dont la tête est `integration/**` est un paquet : elle passe ; une
+tête qui est elle-même une ref d'intégration (`release/*`) aussi. Toute
+autre tête vers la cible d'intégration (`lot/**`, `agent/**`, `review/**`,
+`fix/**`, `auditeur/**`…, tête illisible comprise) est refusée, sauf exception **déclarée dans la note du lot**
 (`incident` : cible rouge ; `unblock` : déblocage de la CI). La déclaration
 est un événement du journal, au format stable ::
 
@@ -35,8 +36,6 @@ import re
 
 from . import plan_git
 
-#: têtes d'un lot (canon §11 bis : `lot/**`, `agent/**`, `review/**`)
-WORK_PREFIXES = ("lot/", "agent/", "review/")
 #: tête d'un paquet : elle seule se fusionne hors paquet
 PACKET_PREFIX = "integration/"
 #: exceptions admises par le canon §11 bis (et §3)
@@ -59,11 +58,13 @@ def branch_of(value) -> str:
 
 
 def is_work_branch(branch) -> bool:
-    """La tête est-elle une branche de travail (`lot/**`, `agent/**`,
-    `review/**`) ? Une tête `integration/**` n'en est pas une : c'est le
-    paquet, qui a le droit de fusionner."""
+    """La tête est-elle une branche de travail ? Le doute refuse : toute tête
+    qui n'est ni un paquet (`integration/**`) ni elle-même une ref
+    d'intégration (`main`, `develop`, `release/*` : remontée d'une release)
+    en est une — `lot/**`, `agent/**`, `review/**`, mais aussi `fix/**`,
+    `auditeur/**`, `remise/**`… et une tête illisible (vide)."""
     name = branch_of(branch)
-    return bool(name) and any(name.startswith(prefix) for prefix in WORK_PREFIXES)
+    return not name or not (is_packet_branch(name) or plan_git.integration_branch(name))
 
 
 def is_packet_branch(branch) -> bool:
@@ -170,8 +171,8 @@ def declare(db, lot, exception: str, reason: str, sha: str, *, actor: str = "") 
 def _merge_refusal(source: str, target: str) -> str:
     return (
         "direct merge of %s into %s refused: canon §11 bis (manaty/home#107, owner "
-        "18/10/2026 « tout passe par paquet ») — no lot branch (lot/**, agent/**, "
-        "review/**) is merged directly on the integration target; it enters by the "
+        "18/10/2026 « tout passe par paquet ») — no lot branch (anything but "
+        "integration/**: lot/**, agent/**, review/**, fix/**…) is merged directly on the integration target; it enters by the "
         "packet (integration/**). If this lot fixes an incident (target red) or "
         "unblocks the CI, declare the exception in the lot's note: --exception "
         "incident|unblock --reason …"
@@ -200,7 +201,8 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     relue. Rend la déclaration retenue, ou lève `PacketGuardError`."""
     source_name, target_name = branch_of(source), branch_of(target)
     if not is_work_branch(source_name):
-        return {"allowed": True, "why": "source is not a lot branch",
+        return {"allowed": True, "why": "source %s is a packet or an integration ref"
+                % source_name,
                 "exception": "", "journaled": False}
     if not is_integration_target(target_name):
         return {"allowed": True, "why": "target %s is not an integration target"

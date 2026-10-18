@@ -598,8 +598,10 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
     # #2333 (canon §11 bis): the packet rule is checked before any scratch
     # clone, GitHub mutation or write — the `already MERGED` declaration too.
+    # N1 (#1003): `--dry-run` validates an exception but never journals it.
     try:
-        packet_guard.check_merge(db, lot, view.get("headRefName") or "", target, head,
+        packet_guard.check_merge(None if dry_run and exception else db, lot,
+                                 view.get("headRefName") or "", target, head,
                                  exception=exception, reason=reason, actor=actor)
     except packet_guard.PacketGuardError as exc:
         raise MergePrError(str(exc)) from exc

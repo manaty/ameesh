@@ -748,7 +748,8 @@ class LandGuardCallTest(unittest.TestCase):
             ejected.update(reason=reason, todo=todo)
             return {"lot": 7, "result": "ejected"}
 
-        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A},
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
                                         project=types.SimpleNamespace(repo="/r"), eject=eject)
         with mock.patch.object(fire, "land_guard", return_value=(False, "fire withdrawn")):
             out = land._fire_guard(landing)
@@ -757,7 +758,8 @@ class LandGuardCallTest(unittest.TestCase):
         self.assertIn("queue remove", ejected["todo"])
 
     def test_land_continues_without_fire_markers(self):
-        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A},
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
                                         project=types.SimpleNamespace(repo="/r"),
                                         eject=lambda *a, **k: {"result": "ejected"})
         with mock.patch.object(fire, "land_guard", return_value=(True, "")):

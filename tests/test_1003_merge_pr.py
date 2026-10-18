@@ -227,6 +227,37 @@ class PacketGuardTest(_Base):
         self.assertEqual(declared["note"][2], "human:pilote")
 
 
+    def test_any_head_but_a_packet_is_a_lot_branch(self):
+        """Relecture #2333 (B1) : le doute refuse. Une tête `fix/**`,
+        `auditeur/**`, `remise/**` ou illisible n'est pas un paquet ; seuls
+        `integration/**` et une ref d'intégration (`release/*`) passent."""
+        from ameesh import packet_guard
+        for source in ("fix/974-x", "auditeur/autoprise", "remise/1770-rebase", "canon/2329",
+                       "lot/7-work", "agent/a-1", "review/r-1", ""):
+            with self.subTest(source=source), self.assertRaises(packet_guard.PacketGuardError):
+                packet_guard.check_merge(None, self.lot, source, "main", self.head)
+        for source in ("integration/paquet-62", "origin/integration/p", "release/1.12.0"):
+            with self.subTest(source=source):
+                self.assertTrue(packet_guard.check_merge(None, self.lot, source, "main",
+                                                         self.head)["allowed"])
+
+    def test_a_dry_run_does_not_journal_the_exception(self):
+        """Relecture #2333 (N1 #1003) : `--dry-run` valide l'exception sans
+        l'écrire au journal du lot."""
+        from ameesh import packet_guard
+        db = mock.Mock()
+        with mock.patch.object(work, "note") as note, \
+                mock.patch.object(work, "events", return_value=[]):
+            out = self.merge(self.gh(), db=db, dry_run=True, exception="incident",
+                             reason="cible rouge")
+        self.assertEqual(out["state"], "dry-run")
+        note.assert_not_called()
+        with mock.patch.object(work, "note") as note:
+            packet_guard.check_merge(db, self.lot, "lot/7-work", "main", self.head.lower(),
+                                     exception="incident", reason="cible rouge")
+        note.assert_called_once()
+
+
 class GuardTest(_Base):
     def test_reserved_packet_target_prevents_merge_construction(self):
         from ameesh.packet_reservation import ReservationError
