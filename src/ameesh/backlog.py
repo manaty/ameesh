@@ -69,10 +69,11 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   sans équipe connue n'est pas pris ;
 * l'agent sait le faire : les capacités exigées sont les siennes, et
   `harness:<nom>` désigne son harnais ;
-* un lot de relecture après fusion (`issue_ref` = `review-after-merge:#<lot>`,
-  #2377) n'est pris que par un agent de la famille opposée à celle de l'auteur
-  au gel (`review_lot.reviewer_family`) ; famille d'auteur inconnue : le lot
-  n'est pas pris au repos, il attend une attribution explicite ;
+* un lot de relecture après fusion (`issue_ref` ou `source` =
+  `review-after-merge:#<lot>`, #2377/#2552) n'est pris que par un agent de la
+  famille opposée à celle de l'auteur au gel (`review_lot.reviewer_family`) ;
+  famille d'auteur inconnue : le lot n'est pas pris au repos, il attend une
+  attribution explicite ;
 * un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
   sa date ;
 * un lot avec une dépendance explicite encore ouverte attend son amont ;
@@ -581,9 +582,9 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
 
     `others` : les lignes du registre, pour la garde structurelle de classe
     (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
-    `db` : requis pour un lot de relecture après fusion (#2377) — sa famille
-    de preneur se relit sur le gel du lot d'origine ; sans base, un tel lot
-    n'est pas pris (doute -> refus).
+    `db` : requis pour un lot de relecture après fusion (#2377, #2552) — sa
+    famille de preneur se relit sur le gel du lot d'origine ; sans base, un tel
+    lot n'est pas pris (doute -> refus).
     """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
