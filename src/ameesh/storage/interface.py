@@ -2033,10 +2033,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
-                     landed: tuple[int, str] | None = None) -> dict | None:
+                     landed: tuple[int, str] | None = None,
+                     unfrozen: bool = False) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
-        dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
+        dernier gel du lot — `unfrozen` (#2444) : si le lot n'a toujours aucun
+        gel (sinon None, rien d'écrit) ; journal et jalon
         `merged` (commit, auteur de la fusion) dans la même transaction.
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la même transaction."""
