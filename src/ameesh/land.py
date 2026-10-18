@@ -1144,14 +1144,16 @@ def _after_merge(landing: _Landing, pr, after, unread, *, sha: str | None = None
 
 
 def _merged_sha(db, lot: int) -> str:
-    """Le sha de fusion déclaré au jalon `merged`, si connu (chemin « déjà
-    fusionné » de `_follow_pr`, L539)."""
+    """Le sha de fusion EFFECTIVE du lot, si connu (chemin « déjà fusionné »
+    de `_follow_pr`, L539). Un jalon `merged` annulé par une correction
+    `merged → build` est ignoré (#2317/N5) : sa fusion n'est pas la bonne."""
     try:
         rows = work.milestones(db, int(lot))
     except Exception:  # noqa: BLE001 - jalon illisible : sha inconnu
         return ""
     for row in rows or ():
-        if str(row.get("kind") or "") == "merged" and row.get("sha"):
+        if (str(row.get("kind") or "") == "merged" and row.get("sha")
+                and not row.get("annulled")):
             return str(row["sha"])
     return ""
 
