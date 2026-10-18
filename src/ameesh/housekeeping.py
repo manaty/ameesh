@@ -1817,18 +1817,17 @@ def _git_copies(path: str) -> list[str]:
     return [c for c in candidates if os.path.lexists(os.path.join(c, ".git"))]
 
 
-def unsaved_git_work(path: str) -> str:
+def unsaved_git_work(path: str, rules=()) -> str:
     """Pourquoi une copie git de l'entrée porte du travail à garder, vide
     sinon : verrouillée, modifications non commitées (ou état illisible),
-    HEAD sur aucune branche distante (commits jamais poussés)."""
+    fichiers ignorés hors artefacts de build, HEAD sur aucune branche
+    distante (commits jamais poussés), et pour un clone ses branches locales,
+    son stash, ses autres worktrees liés, un remote qui vit dans l'entrée ou
+    le dépôt commun d'un worktree lié qui y vit (#2493/#2512)."""
     for copy in _git_copies(path):
-        st = worktree_state(copy)
-        if st["locked"]:
-            return "%s locked (git worktree lock)" % copy
-        if not st["clean"]:
-            return "%s: %s" % (copy, st["reason"] or "uncommitted changes")
-        if not (st["pushed"] or st["integrated"]):
-            return "%s: HEAD %s on no remote branch" % (copy, st["head"][:12] or "?")
+        work = _git_copy_work(copy, path, rules)
+        if work:
+            return work
     return ""
 
 
@@ -1881,64 +1880,80 @@ def _clone_remote_inside(path: str, entry: str) -> str:
     return ""
 
 
+def _git_copy_work(copy: str, entry: str, rules=()) -> str:
+    """#2493/#2512 : why the Git copy `copy` of the temporary directory
+    `entry` holds work to keep, empty when it is safe to let go. One source
+    for both passes — the attributed /tmp entry of `unsaved_git_work` and the
+    agent directory of `tmp_git_work` — so a guard added for one never misses
+    the other: locked, unreadable metadata, submodules, modified or untracked
+    files, ignored files outside the build output `rules`, HEAD on no remote
+    branch, for a CLONE its local branches, stash, other linked worktrees and
+    a remote that lives inside `entry`, and no linked worktree whose common
+    repository lives inside `entry`."""
+    st = worktree_state(copy)
+    if not st["exists"]:
+        return "%s: %s" % (copy, st["reason"] or "directory gone")
+    if st["locked"]:
+        return "%s locked (git worktree lock)" % copy
+    if not st["gitdir"]:
+        return "%s: git metadata unreadable" % copy
+    if os.path.isfile(os.path.join(copy, ".git")) and _under(
+            _real(common_dir(copy)), _real(entry)):
+        return "%s: common repository lives inside the temporary directory" % copy
+    if st["submodules"]:
+        return "%s has submodules" % copy
+    if not st["clean"]:
+        return "%s: %s" % (copy, st["reason"] or "uncommitted changes")
+    if not (st["pushed"] or st["integrated"]):
+        return "%s: HEAD %s on no remote branch" % (copy, st["head"][:12] or "?")
+    # an ignored `.env` or dataset would go with the directory (relecture
+    # cx1 sur ab2a2c8c, #2512) ; only regenerable build output is exempt
+    leftovers = ignored_leftovers(copy, rules)
+    if leftovers is None:
+        return "%s: ignored files unreadable (git status --ignored)" % copy
+    if leftovers:
+        return "%s: %d ignored file(s) outside build artifacts (%s)" % (
+            copy, len(leftovers), leftovers[0])
+    if os.path.isdir(os.path.join(copy, ".git")):
+        linked = _git(["worktree", "list", "--porcelain"], copy)
+        if linked is None or linked.returncode != 0:
+            return "%s: linked worktrees unreadable" % copy
+        if sum(line.startswith("worktree ") for line in linked.stdout.splitlines()) > 1:
+            return "%s: the clone has other linked worktrees" % copy
+        # A clone takes its local branches and its stash with it (a linked
+        # worktree leaves them in its common repository): HEAD alone does
+        # not prove they are saved. Unreadable: a doubt, the copy stays.
+        local = _git(["log", "--branches", "--not", "--remotes", "--format=%H",
+                      "-1"], copy)
+        if local is None or local.returncode != 0:
+            return "%s: local branches unreadable" % copy
+        if local.stdout.strip():
+            return "%s: local branch commit %s on no remote branch" % (
+                copy, local.stdout.strip()[:12])
+        stash = _git(["rev-parse", "-q", "--verify", "refs/stash"], copy)
+        if stash is None or stash.returncode not in (0, 1):
+            return "%s: stash unreadable" % copy
+        if stash.returncode == 0:
+            return "%s: has a stash" % copy
+        remote = _clone_remote_inside(copy, entry)
+        if remote:
+            return "%s: %s" % (copy, remote)
+    return ""
+
+
 def tmp_git_work(path: str, rules=()) -> str:
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
-    empty when every copy is safe to recover: unlocked, readable, clean (no
-    modified or untracked file, no ignored file outside the build output
-    `rules`, like the worktree pass), pushed or integrated, for a clone also
-    no unpushed local branch, stash, other linked worktree nor remote inside
-    the directory, without submodules and with no process inside. A
-    directory is never deleted merely because its agent left the registry;
+    empty when every copy is safe to recover: the saved-work guards of
+    `_git_copy_work` (clean, pushed or integrated, no ignored file outside
+    the build output, for a clone no unpushed local branch, stash, other
+    linked worktree nor remote inside the directory, and no linked worktree
+    whose common repository is inside it) and no process inside.
+    A directory is never deleted merely because its agent left the registry;
     this check is the second condition."""
     for copy in _git_copies(path):
-        st = worktree_state(copy)
-        if not st["exists"]:
-            return "%s: %s" % (copy, st["reason"] or "directory gone")
-        if st["locked"]:
-            return "%s locked (git worktree lock)" % copy
-        if not st["gitdir"]:
-            return "%s: git metadata unreadable" % copy
-        if os.path.isfile(os.path.join(copy, ".git")) and _under(
-                _real(common_dir(copy)), _real(path)):
-            return "%s: common repository lives inside the temporary directory" % copy
-        if st["submodules"]:
-            return "%s has submodules" % copy
-        if not st["clean"]:
-            return "%s: %s" % (copy, st["reason"] or "uncommitted changes")
-        if not (st["pushed"] or st["integrated"]):
-            return "%s: HEAD %s on no remote branch" % (copy, st["head"][:12] or "?")
-        # an ignored `.env` or dataset would go with the directory (relecture
-        # cx1 sur ab2a2c8c) ; only regenerable build output is exempt
-        leftovers = ignored_leftovers(copy, rules)
-        if leftovers is None:
-            return "%s: ignored files unreadable (git status --ignored)" % copy
-        if leftovers:
-            return "%s: %d ignored file(s) outside build artifacts (%s)" % (
-                copy, len(leftovers), leftovers[0])
-        if os.path.isdir(os.path.join(copy, ".git")):
-            linked = _git(["worktree", "list", "--porcelain"], copy)
-            if linked is None or linked.returncode != 0:
-                return "%s: linked worktrees unreadable" % copy
-            if sum(line.startswith("worktree ") for line in linked.stdout.splitlines()) > 1:
-                return "%s: the clone has other linked worktrees" % copy
-            # A clone takes its local branches and its stash with it (a linked
-            # worktree leaves them in its common repository): HEAD alone does
-            # not prove they are saved. Unreadable: a doubt, the copy stays.
-            local = _git(["log", "--branches", "--not", "--remotes", "--format=%H",
-                          "-1"], copy)
-            if local is None or local.returncode != 0:
-                return "%s: local branches unreadable" % copy
-            if local.stdout.strip():
-                return "%s: local branch commit %s on no remote branch" % (
-                    copy, local.stdout.strip()[:12])
-            stash = _git(["rev-parse", "-q", "--verify", "refs/stash"], copy)
-            if stash is None or stash.returncode not in (0, 1):
-                return "%s: stash unreadable" % copy
-            if stash.returncode == 0:
-                return "%s: has a stash" % copy
-            remote = _clone_remote_inside(copy, path)
-            if remote:
-                return "%s: %s" % (copy, remote)
+        work = _git_copy_work(copy, path, rules)
+        if work:
+            return work
         if worktree_in_use(copy):
             return "%s: a process is working in it" % copy
     return ""
@@ -2083,7 +2098,10 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
         holder = tmp_holder(path, allow=policy.unreadable_ok)
     if holder:
         return "attend", holder
-    work = unsaved_git_work(path)
+    # #2512 : an attributed entry (before #222) gets the same saved-work
+    # guards as the agent directories, build artifacts exempted by the host's
+    # policy — an ignored `.env` or an unpushed local branch keeps it too.
+    work = unsaved_git_work(path, build_artifacts.rules_of(policy.artifacts))
     if work:
         return "garde", "git work to keep — %s" % work
     return "suppression", "left by turn %s of %s, unchanged for %s, held by no " \

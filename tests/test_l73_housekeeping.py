@@ -15,8 +15,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (canon, containers, exploitation, menage, platform, registry,
-                    resources, storage, work)
+from ameesh import (build_artifacts, canon, containers, exploitation, menage,
+                    platform, registry, resources, storage, work)
 
 from .support import PgTestCase
 from .test_l43_perimetre_hote import HOST, _Canons, codes, host
@@ -877,6 +877,91 @@ class MenageDbTest(PgTestCase):
                 if note.startswith("tmp %s kept: git work —" % root)]
         self.assertEqual(len(kept), 1, rapport["skipped"])
         self.assertIn("inside the temporary directory", kept[0])
+
+    def test_entree_tmp_attribuee_avec_copie_git_non_sauvee_est_gardee(self):
+        """#2512 : une entrée de /tmp attribuée d'avant #222 ne se supprime
+        qu'avec les mêmes preuves qu'un dossier d'agent. Un fichier ignoré
+        hors artefacts, puis une branche locale non poussée d'un clone, la
+        gardent au lieu de partir avec le travail qu'ils portent."""
+        _sans_processus(self)
+        registry.upsert(self.db, "a1", harness="claude", host="pc")
+        systeme = os.path.join(self.tmp, "tmp-systeme")
+        os.makedirs(systeme)
+        old = os.environ.get("AMEESH_SYSTEM_TMP")
+        os.environ["AMEESH_SYSTEM_TMP"] = systeme
+        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _repo(self.tmp)
+
+        def ignorer(copie: str) -> None:
+            with open(os.path.join(copie, ".git", "info", "exclude"), "w") as fh:
+                fh.write("*.env\n")
+            _write(os.path.join(copie, "private.env"), 10)
+
+        def branche_locale(copie: str) -> None:
+            _git("checkout", "-q", "-b", "travail", cwd=copie)
+            _git("commit", "-q", "--allow-empty", "-m", "jamais pousse", cwd=copie)
+            _git("checkout", "-q", "main", cwd=copie)
+
+        for nom, preparer in (("ignore", ignorer), ("branche", branche_locale)):
+            root = os.path.join(systeme, nom)
+            os.makedirs(root)
+            clone = os.path.join(root, "clone")
+            subprocess.run(["git", "clone", "-q",
+                            os.path.join(self.tmp, "origin.git"), clone],
+                           check=True, capture_output=True)
+            preparer(clone)
+            _age_tree(root, 3 * 3600)
+            self.assertTrue(menage.unsaved_git_work(root), nom)
+            st = os.lstat(root)
+            storage.of(self.db).housekeeping.log("pc", [{
+                "kind": "orphan", "action": "signaled", "path": root,
+                "bytes": menage.size_of(root), "agent": "a1",
+                "detail": "signalement attribué (avant #222)",
+                "data": {"ino": st.st_ino, "dev": st.st_dev}}], actor="test")
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(),
+                                      host="pc", actor="t",
+                                      now=time.time() + 3 * 3600)
+            self.assertTrue(os.path.isdir(clone), nom)
+            garde = [p for p in rapport["plan"]
+                     if p.get("path") == root and p.get("action") == "garde"]
+            self.assertEqual(len(garde), 1, (nom, rapport["plan"]))
+            self.assertIn("git work to keep", garde[0]["detail"], nom)
+
+    def test_entree_tmp_attribuee_avec_artefact_de_build_seul_est_supprimee(self):
+        """#2512 : les règles d'artefacts de l'hôte restent exemptées — un clone
+        propre et poussé qui ne porte qu'un `node_modules` ignoré part, sinon
+        le contrôle garderait toute copie git par prudence."""
+        _sans_processus(self)
+        registry.upsert(self.db, "a1", harness="claude", host="pc")
+        systeme = os.path.join(self.tmp, "tmp-systeme")
+        os.makedirs(systeme)
+        old = os.environ.get("AMEESH_SYSTEM_TMP")
+        os.environ["AMEESH_SYSTEM_TMP"] = systeme
+        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _repo(self.tmp)
+        root = os.path.join(systeme, "artefact")
+        os.makedirs(root)
+        clone = os.path.join(root, "clone")
+        subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                        clone], check=True, capture_output=True)
+        with open(os.path.join(clone, ".git", "info", "exclude"), "w") as fh:
+            fh.write("node_modules/\n")
+        _write(os.path.join(clone, "node_modules", "x", "f"), 10)
+        _age_tree(root, 3 * 3600)
+        # sans les règles de l'hôte, l'ignoré garderait ; avec elles, il part
+        self.assertTrue(menage.unsaved_git_work(root))
+        self.assertEqual(menage.unsaved_git_work(root, build_artifacts.rules_of(None)), "")
+        st = os.lstat(root)
+        storage.of(self.db).housekeeping.log("pc", [{
+            "kind": "orphan", "action": "signaled", "path": root,
+            "bytes": menage.size_of(root), "agent": "a1",
+            "detail": "signalement attribué (avant #222)",
+            "data": {"ino": st.st_ino, "dev": st.st_dev}}], actor="test")
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(),
+                                  host="pc", actor="t", now=time.time() + 3 * 3600)
+        self.assertFalse(os.path.exists(root))
+        self.assertIn(("orphan", "deleted"),
+                      {(e.get("kind"), e.get("action")) for e in rapport["entries"]})
 
     def _suivi(self, main: str, nom: str, lot: int | None) -> str:
         wt = os.path.join(self.tmp, nom)
