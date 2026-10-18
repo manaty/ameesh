@@ -989,9 +989,11 @@ CATCH_UP_LIMIT = 20
 
 
 def merged_sha(db, lot: int) -> str:
-    """Le commit du dernier jalon `merged` du lot, ou "" (best effort)."""
+    """Le commit du dernier jalon `merged` EFFECTIF du lot, ou "" (best effort).
+    Un jalon annulé par une correction `merged → build` est ignoré (#2317/N5)."""
     try:
-        rows = [m for m in work.milestones(db, int(lot)) if m.get("kind") == "merged"]
+        rows = [m for m in work.milestones(db, int(lot))
+                if m.get("kind") == "merged" and not m.get("annulled")]
     except Exception:  # noqa: BLE001 - pas de jalon lisible : pas de commit
         return ""
     if not rows:
