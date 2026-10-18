@@ -518,6 +518,49 @@ class LateCarryTest(_Fixture):
                          ["rev1", "rev2"])
 
 
+class LatePendingSeatTest(_Fixture):
+    """Report tardif : les sièges du gel précédent sans verdict restent (#2487)."""
+
+    def _rev1_only(self):
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.verdict("rev1", self.repo.reviewed)
+        self.db.execute("DELETE FROM agent_mailbox")
+
+    def test_a_late_carry_after_a_selection_keeps_the_pending_seat(self):
+        # Le gel réaligné a désigné rev1/rev2 faute de plan ; le report tardif
+        # ne reporte que rev1 : rev2 reste attendu, sinon `progress` n'attend
+        # personne et la porte reste fermée.
+        self._rev1_only()
+        frozen = self.repo.merge_target()
+        with mock.patch.object(act, "carried_plan", return_value=None):
+            _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual([e["actor"] for e in carried["carried"]], ["rev1"])
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
+                         ["rev1", "rev2"])
+        self.assertFalse(self.gate(frozen)["ok"])
+        self.verdict("rev2", frozen)
+        self.assertTrue(self.gate(frozen)["ok"], self.gate(frozen)["why"])
+
+    def test_a_carry_after_a_force_designation_keeps_the_pending_seat(self):
+        self._rev1_only()
+        frozen = self.repo.merge_target()
+        _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "carried", outcome)
+        self.alternate_reviewers()
+        act.designate(self.cfg, self.db, self.lot, force=True)
+        self.assertEqual(self.designated(), ["rev3", "rev4"])
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual([e["actor"] for e in carried["carried"]], ["rev1"])
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()

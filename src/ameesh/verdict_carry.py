@@ -748,8 +748,12 @@ def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict
     if effective is None or effective[1] != "carried":
         # #2487 : un report tardif qui aboutit après une vraie désignation
         # (repli `force`) écrit une marque plus récente ; la colonne et la
-        # lecture suivent alors le report, pas la sélection supplantée.
-        note = carried_mark_note(int(lot), freeze, payload)
+        # lecture suivent alors le report, pas la sélection supplantée. Les
+        # sièges du gel précédent sans verdict restent désignés, comme au gel ;
+        # la colonne a déjà suivi la sélection, elle ne filtre donc pas.
+        note = carried_mark_note(
+            int(lot), freeze, payload,
+            extra_reviewers=activation._previous_designees(tx, int(lot), freeze_id))
         storage.of(tx).work.note(int(lot), str(row.get("state") or ""), note,
                                  work.SYSTEM_SENDER)
     activation._sync_reviewers(
