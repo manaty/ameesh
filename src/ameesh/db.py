@@ -1282,8 +1282,38 @@ class _PsycopgListener:
             pass
 
 
+#: champs structurés qui suivent le message principal d'un rapport
+#: PostgreSQL : DETAIL, HINT et CONTEXT recopient des valeurs de ligne
+#: (#2358). Un journal ne garde que le message principal et le SQLSTATE.
+_DIAGNOSTIC_FIELD_RE = re.compile(
+    r"^\s*(?:DETAIL|DÉTAIL|HINT|INDICE|CONTEXT|CONTEXTE|QUERY|REQUÊTE|"
+    r"STATEMENT|INSTRUCTION)\s*:",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _primary(exc: BaseException) -> str:
+    """Le message principal d'une erreur de pilote, sans ses champs DETAIL,
+    HINT ni CONTEXT : psycopg les sépare dans `diag.message_primary`, sinon le
+    rapport est coupé avant son premier champ structuré (#2358)."""
+    diag = getattr(exc, "diag", None)
+    primary = getattr(diag, "message_primary", None) if diag is not None else None
+    if isinstance(primary, str) and primary.strip():
+        return primary
+    text = str(exc)
+    match = _DIAGNOSTIC_FIELD_RE.search(text)
+    return text[:match.start()] if match else text
+
+
 def _one_line(exc: BaseException) -> str:
-    return " ".join(str(exc).split())[:300]
+    return " ".join(_primary(exc).split())[:300]
+
+
+def brief(exc: BaseException, limit: int = 300) -> str:
+    """Diagnostic borné pour un journal : message principal et code SQLSTATE,
+    jamais les valeurs de ligne d'un DETAIL/HINT (#2358)."""
+    text = " ".join(_primary(exc).split())[:limit]
+    state = _sqlstate(exc) if isinstance(exc, Exception) else None
+    return "%s (SQLSTATE %s)" % (text, state) if state else text
 
 
 def _sqlstate(exc: Exception) -> str | None:

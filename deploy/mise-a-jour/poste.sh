@@ -7,14 +7,19 @@
 #   deploy/mise-a-jour/poste.sh <étape> [REF]
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
-#   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
+#   sauvegarder  dump de la base du mesh sur la VM (copie gardée), rapatrié
+#                compressé, puis pg_dump de l'ancienne base
 #   migrer [--additif-seulement] [REF]
 #                migrations de REF (défaut HEAD, comme installer), lancées
 #                depuis son instantané AVANT de l'installer : base du mesh
 #                (UNE fois), puis ancienne
 #                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
-#                installé (staging : des VM tournent encore le code précédent)
+#                installé (staging : des VM tournent encore le code précédent) ;
+#                si la sonde d'auto-prise du code installé échoue après la
+#                migration, installe REF et redémarre aussitôt (#2357) ;
+#                MIGRER_SANS_REDEMARRAGE=1 (staging) laisse la séquence par
+#                hôte faire cette installation/redémarrage, VM d'abord
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
 #                venv versionné préparé à l'écart (dépendance psycopg comprise)
 #                puis bascule atomique du venv (#1969) ; refusé tant qu'une
@@ -81,6 +86,12 @@ ROLE=${ROLE_SUPERVISEUR:-ameesh_superviseur}
 EXECUTOR_ROLE=${ROLE_EXECUTOR:-ameesh_executor}
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 SAUVEGARDES="$HOME/backups/ameesh"
+#: dumps produits sur la VM par ameesh-sauvegarde.service (0700, 0600)
+SAUVEGARDES_VM=${SAUVEGARDES_VM:-/home/ameesh/sauvegardes}
+SAUVEGARDES_VM=${SAUVEGARDES_VM%/}
+#: borne du rapatriement du dump serveur (secondes) ; la progression et les
+#: octets déjà écrits sont journalisés par le récepteur en cas d'échec
+RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT:-3600}
 case "${1:-}" in
   publier|rattraper) ;;
   *) mkdir -p "$TRAVAIL" "$SAUVEGARDES"; chmod 700 "$TRAVAIL" ;;
@@ -88,6 +99,12 @@ esac
 
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
+#: même canal, borné par un délai : la récupération d'un dump ne peut pas
+#: retenir le staging indéfiniment si le lien WireGuard se bloque.
+ssh_vm_borne() {
+  local delai=$1; shift
+  timeout --foreground "$delai" ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"
+}
 dsn_de() { python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["dsn"])' "$1"; }
 # #518: a DSN's password never goes on a command line, which every process of
 # the host can read (ps, /proc/<pid>/cmdline), nor in a trace (bash -x) or a
@@ -148,22 +165,96 @@ verifier() {
   ("$AMEESH" doctor || true) | tail -3
 }
 
-sauvegarder() {
-  local jour dsn; jour=$(date +%F-%H%M)
-  etape "base du mesh, vidée depuis le poste"
-  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
-  # d'ouvrir le canal privé de sauvegarde, comme pour « migrer ».
-  dsn_part dsn "$CONFIG" dsn || return
-  "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG" \
-    --output "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
-  ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
-  etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
-  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
-  # Un échec de backup/upload doit arrêter cette étape avant les migrations.
-  ssh_vm 'set -e
+# Démarre la sauvegarde serveur (copie gardée sur la VM) et atteste le dump
+# qu'elle vient de produire : chemin, taille et SHA-256, sur trois lignes.
+# Le service publie son fichier par lien dur : un dump visible est complet.
+# Aucun DSN ni secret ne traverse cette commande distante.
+sauvegarde_serveur() {
+  printf '%s\n' "$SAUVEGARDES_VM" | ssh_vm 'set -eu
+    IFS= read -r d
+    test -d "$d"
+    before=$(mktemp "$d/.liste-avant.XXXXXX")
+    after=$(mktemp "$d/.liste-apres.XXXXXX")
+    trap "rm -f -- \"$before\" \"$after\"" EXIT HUP INT TERM
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$before"
     systemctl start ameesh-sauvegarde.service
     test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
-    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
+    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$after"
+    new=$(comm -13 "$before" "$after" | tail -1)
+    if [ -z "$new" ]; then
+      echo "ameesh-sauvegarde : aucun nouveau dump dans $d" >&2
+      exit 1
+    fi
+    f="$d/$new"
+    test -f "$f"
+    printf "%s\n" "$f"
+    stat -c %s -- "$f"
+    sha256sum -- "$f" | cut -d" " -f1
+  '
+}
+
+sauvegarder() {
+  local jour sortie meta statut distant taille sha statuts dsn
+  jour=$(date +%F-%H%M)
+  sortie="$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  case "$RECUPERATION_TIMEOUT" in
+    ''|*[!0-9]*|0) echo "RECUPERATION_TIMEOUT doit être un entier positif" >&2; return 2 ;;
+  esac
+  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
+  # toute sauvegarde, comme pour « migrer ».
+  dsn_part dsn "$CONFIG" dsn || return
+  [ -n "$dsn" ] || { echo "DSN de la base du mesh illisible" >&2; return 1; }
+  etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
+  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
+  # Un échec de backup/upload doit arrêter cette étape avant les migrations ;
+  # son code de sortie est propagé tel quel (banc : BACKUP_START_STATUS).
+  if meta=$(sauvegarde_serveur); then :; else
+    statut=$?
+    echo "sauvegarde serveur en échec (statut $statut) : rien n'a été modifié" >&2
+    return "$statut"
+  fi
+  distant=$(sed -n '1p' <<<"$meta")
+  taille=$(sed -n '2p' <<<"$meta")
+  sha=$(sed -n '3p' <<<"$meta")
+  case "$distant" in
+    "$SAUVEGARDES_VM"/ameesh-*.dump) ;;
+    *) echo "sauvegarde serveur : chemin de dump inattendu" >&2; return 1 ;;
+  esac
+  case "$taille" in ''|*[!0-9]*|0) echo "sauvegarde serveur : taille invalide" >&2; return 1 ;; esac
+  case "$sha" in
+    ''|*[!0-9a-f]*) echo "sauvegarde serveur : empreinte invalide" >&2; return 1 ;;
+  esac
+  [ "${#sha}" -eq 64 ] || { echo "sauvegarde serveur : empreinte invalide" >&2; return 1; }
+  etape "rapatriement compressé du dump serveur ($taille octets)"
+  # Le dump est déjà sur la VM ; on ne fait plus traverser WireGuard à pg_dump.
+  # gzip borne le débit utile ; le récepteur vérifie taille et SHA-256 avant
+  # de publier le fichier par lien dur, et journalise les octets écrits.
+  set +e
+  printf '%s\n' "$distant" | ssh_vm_borne "$RECUPERATION_TIMEOUT" \
+      'IFS= read -r f; gzip -1 -c -- "$f"' \
+    | "$VENV/bin/python" "$ICI/sauvegarder-prive.py" pull --output "$sortie" \
+        --sha256 "$sha" --bytes "$taille" --timeout "$RECUPERATION_TIMEOUT"
+  statuts=("${PIPESTATUS[@]}")
+  set -e
+  # trois maillons : l'écriture du chemin, la source ssh bornée, le récepteur.
+  if [ "${statuts[2]}" != 0 ]; then
+    echo "rapatriement en échec : récepteur ${statuts[2]}, source ${statuts[1]}" >&2
+    return 1
+  fi
+  if [ "${statuts[1]}" != 0 ]; then
+    if [ "${statuts[1]}" = 124 ]; then
+      echo "rapatriement en échec : délai de ${RECUPERATION_TIMEOUT} s dépassé" >&2
+    else
+      echo "rapatriement en échec : source ${statuts[1]}" >&2
+    fi
+    return 1
+  fi
+  if [ "${statuts[0]}" != 0 ]; then
+    echo "rapatriement en échec : écriture du chemin ${statuts[0]}" >&2
+    return 1
+  fi
+  ls -l "$sortie"
   if ancienne; then
     etape "ancienne base"
     dsn_part dsn "$CONFIG_RESTE" dsn || return
@@ -231,11 +322,33 @@ installer() {
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
+# #2357: emergency restart after a failed compatibility probe. Launched from an
+# agent's own runner, a direct « redemarrer » would stop that runner before the
+# following units (docs/AUDITEUR.md): throw the restart into a transient unit
+# when the user manager accepts it, and only fall back to the direct call in a
+# plain shell or where systemd-run is unavailable (tests, CI).
+redemarrer_urgence() {
+  local unite="ameesh-maj-urgence-$$" env_args=()
+  [ -n "${BASCULE_ENV:-}" ] && env_args+=(--setenv=BASCULE_ENV="$BASCULE_ENV")
+  [ -n "${AMEESH_CONFIG:-}" ] && env_args+=(--setenv=AMEESH_CONFIG="$AMEESH_CONFIG")
+  if command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --collect --wait --unit "$unite" \
+          ${env_args[@]+"${env_args[@]}"} \
+          /bin/sh -c '"$0" redemarrer' "$ICI/poste.sh"; then
+    echo "redémarrage terminé dans l'unité transitoire $unite ; journalctl --user -u $unite" >&2
+    return 0
+  fi
+  echo "unité transitoire indisponible ou en échec : redémarrage direct (un agent lancé depuis son propre exécuteur serait interrompu)." >&2
+  # A fresh dispatcher preserves errexit even when this function is tested
+  # by `if ! redemarrer_urgence` (Bash disables it throughout that call).
+  "$ICI/poste.sh" redemarrer
+}
+
 # Migrations du commit REF (défaut HEAD, comme installer) : garde additive même
 # si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
 # migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref cible d garde=(--additive-only) sha
+  local ref cible d garde=(--additive-only) sha incompatible=0
   if [ "${1:-}" = "--additif-seulement" ]; then
     shift
   fi
@@ -247,36 +360,71 @@ migrer() {
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
   ameesh_de "$cible" migrate --dry-run --additive-only
-  migrer_base "$cible" ${garde[@]+"${garde[@]}"}
+  migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
     dsn_part d "$CONFIG_RESTE" dsn || return
     echo "base : $d"
-    AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"}
+    AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
+  fi
+  # #2357: after a failed compatibility probe the OLD code can no longer serve
+  # the migrated schema. The target snapshot already passed doctor --probe,
+  # so install it and restart at once instead of stopping and leaving the
+  # incident window open (72 min of DbError auto-take on 18/10).
+  if [ "$incompatible" = 1 ]; then
+    if [ "${MIGRER_SANS_REDEMARRAGE:-0}" = 1 ]; then
+      # staging.sh runs this step before its per-host sequence (VMs first,
+      # poste last, canon §14): it continues at once and does the installation
+      # and restart itself, in that order, instead of being stopped here.
+      echo "sonde d'auto-prise en échec : la séquence staging poursuit sans s'arrêter (installation/redémarrage des hôtes, VM d'abord, poste en dernier)." >&2
+      return 0
+    fi
+    etape "sonde d'auto-prise en échec : installation et redémarrage immédiats (base déjà migrée)"
+    if installe "$cible"; then
+      # The venv already holds REF (re-run, or MIGRER_APRES=1): do not touch
+      # the recorded previous version, only load REF into the runners.
+      echo "code de $cible déjà installé : redémarrage immédiat sans réinstallation." >&2
+    # Keep installer's fail-fast shell: a conditional function call disables
+    # errexit, allowing a failed venv preparation to reach activation.
+    elif ! "$ICI/poste.sh" installer "$sha"; then
+      echo "ÉCHEC de l'installation immédiate : l'ancien code sert encore le schéma migré." >&2
+      echo "Traiter tout de suite (installer/redémarrer à la main, correction compatible)." >&2
+      return 1
+    fi
+    if ! redemarrer_urgence; then
+      echo "ÉCHEC du redémarrage immédiat : l'ancien code tourne encore sur le schéma migré." >&2
+      echo "Redémarrer à la main sans délai, puis vérifier l'auto-prise." >&2
+      return 1
+    fi
+    echo "Code ${cible##*/src-} installé et exécuteurs du poste redémarrés sans attendre." >&2
+    echo "La base est migrée pour tout le mesh : installer et redémarrer les autres hôtes sans délai (vm.sh, ou la séquence staging)." >&2
   fi
 }
 migrer_base() {
-  local cible=$1 code=0; shift
+  local cible=$1 court code=0; shift
+  court=${cible##*/src-}
   ameesh_de "$cible" migrate "$@" || code=$?
   if [ "$code" = 3 ]; then
     echo "migration non additive : le code en place casserait sur la base migrée." >&2
     echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
   fi
   [ "$code" = 0 ] || exit "$code"
-  ameesh_de "$cible" doctor --probe
+  ameesh_de "$cible" doctor --probe || exit "$?"
   # #2339: run the INSTALLED code, not the migration snapshot, read-only.
-  # A failed compatibility check stops before installation on every host.
+  # #2357: a failure no longer stops the update; migrer installs the target
+  # code and restarts immediately (the database is already migrated).
   etape "auto-prise du code installé sur la base migrée (lecture seule)"
-  # #2359: exit 2 = the probe could not set up the installed runner.
+  # #2359: exit 2 = the probe could not set up the installed runner. Unknown
+  # compatibility is handled like a failure: installing REF is the safe move.
   local sonde=0
   "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || sonde=$?
   case "$sonde" in
-    0) ;;
-    2) echo "compatibilité de l'ancien code non vérifiée (sonde inutilisable) : arrêter la mise à jour ; vérifier l'auto-prise à la main avant de poursuivre (base déjà migrée)." >&2
-       return 1 ;;
-    *) echo "ancien code incompatible : arrêter la mise à jour ; préparer un correctif compatible avant de poursuivre (base déjà migrée)." >&2
-       return 1 ;;
+    0) return 0 ;;
+    2) echo "compatibilité de l'ancien code non vérifiée (sonde inutilisable) : traitée comme un échec." >&2 ;;
+    *) echo "ancien code incompatible avec le schéma migré (sonde en échec)." >&2 ;;
   esac
+  echo "La base est DÉJÀ migrée : la mise à jour doit enchaîner tout de suite sur l'installation et le redémarrage du code $court." >&2
+  return 1
 }
 
 # The remote administrator switches to the actual migration owner so future

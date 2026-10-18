@@ -28,18 +28,50 @@ class LogTest(unittest.TestCase):
         state.take_interval = 1
         state._take_next = 0
         state.take_pass.side_effect = db_mod.DbError(
-            'column x does not exist\nDETAIL: ' + 'x' * 500)
+            'column x does not exist\nDETAIL: ' + 'x' * 500, sqlstate='42P01')
         with mock.patch.object(runner, 'log_async') as log, \
                 mock.patch.object(runner.registry, 'reap', return_value=[]), \
                 mock.patch.object(runner.registry, 'claimable', return_value=[]) as claim:
             runner.Runner.sweep(state)
         message = log.call_args.args[0]
         self.assertIn('DbError', message)
-        self.assertIn('column x does not exist DETAIL:', message)
+        self.assertIn('column x does not exist', message)
+        self.assertIn('42P01', message)
+        self.assertNotIn('DETAIL', message)
+        self.assertNotIn('x' * 50, message)
         self.assertTrue(message.endswith('; runner continues'))
         self.assertNotIn('\n', message)
         self.assertLess(len(message), 380)
         claim.assert_called_once()
+
+
+class BriefTest(unittest.TestCase):
+    """#2358 : le journal garde le message principal, jamais le DETAIL."""
+
+    def test_psycopg_primary_message_wins_over_detail(self):
+        class Diagnostic:
+            message_primary = 'cached plan must not change result type'
+
+        class Failure(Exception):
+            diag = Diagnostic()
+            sqlstate = '0A000'
+
+            def __str__(self):
+                return ('cached plan must not change result type\n'
+                        'DETAIL: ' + 'x' * 500)
+
+        self.assertEqual(
+            db_mod.brief(Failure()),
+            'cached plan must not change result type (SQLSTATE 0A000)')
+        self.assertEqual(
+            db_mod._one_line(Failure()), 'cached plan must not change result type')
+
+    def test_detail_is_cut_without_driver_diagnostics(self):
+        exc = db_mod.DbError('column x does not exist\nDETAIL: secret value',
+                             sqlstate='42703')
+        self.assertEqual(db_mod.brief(exc),
+                         'column x does not exist (SQLSTATE 42703)')
+        self.assertNotIn('secret', db_mod.explain(exc, 300))
 
 
 class CompatibilityTest(PgTestCase):

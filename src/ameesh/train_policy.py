@@ -4,13 +4,16 @@
 The caller explicitly selects an audited canon commit. The checkout, registry
 and lot notes supply no policy. A separate per-project declaration of review
 counts is mandatory; the existing risk classification alone is insufficient.
-Importing this module installs no policy or runner.
+The classified exact diff then floors that count under the same critical-scope
+reading as the merge gate: SQL, security and production paths need two distinct
+model families even when their per-path rule says one. Importing this module
+installs no policy or runner.
 """
 from __future__ import annotations
 
 import re
 
-from . import canon, lot_class, resolutions, review
+from . import canon, lot_class, merge_queue, resolutions, review
 from .train import TrainError
 from .train_admissions import Requirement
 from .train_review import SHA
@@ -28,8 +31,10 @@ class Versioned:
 
     Each rule has nonempty ``paths`` and ``reviews`` (1 or 2). Every changed
     non-light path needs coverage. Overlapping rules use the largest count;
-    positive counts also raise an otherwise light path to sensitive. Rules
-    must be qualified by the pilot before selecting their canon commit.
+    positive counts also raise an otherwise light path to sensitive. The
+    frozen diff's class floors the count: a critical SQL/security/production
+    path takes two reviews (the merge gate's own requirement), never one.
+    Rules must be qualified by the pilot before selecting their canon commit.
     Unknown projects never borrow another project's policy or a fallback.
     """
 
@@ -91,11 +96,18 @@ class Versioned:
             if any(changed != review.normalize_path(changed) or "\ufffd" in changed
                    for changed in paths):
                 raise TrainError("Git path cannot be normalized without changing its identity")
-            review.classify(self.policy, paths)  # validates every Git path
+            classified = review.classify(self.policy, paths)  # validates every Git path
         except (canon.GitError, review.ReviewError) as exc:
             raise TrainError("cannot classify exact lot content: %s" % exc) from exc
         risk, reviews = self._need(paths)
-        requirement = Requirement(row["work_item_id"], base, head, risk, reviews, self.commit)
+        # The merge gate reads the frozen diff again and requires two distinct
+        # model families for SQL/security/prod paths, whatever a per-path rule
+        # says. Admission uses the same reading so a lot is never withdrawn
+        # after its freeze for a family/class check the gate already knew.
+        risk = max((risk, classified["class"]), key=review.RANK.__getitem__)
+        reviews = max(reviews, merge_queue.required_verdicts(classified))
+        requirement = Requirement(row["work_item_id"], base, head, risk, reviews, self.commit,
+                                  files=tuple(classified["files"]))
         requirement.check(row, base)
         return requirement
 
