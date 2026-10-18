@@ -776,6 +776,40 @@ class MenageDbTest(PgTestCase):
         self.assertIn("git -C", kept[0])
         self.assertNotIn(root, [p["path"] for p in rapport["plan"]
                                 if p.get("action") == "suppression"])
+
+    def test_clone_avec_branche_locale_non_poussee_est_garde(self):
+        """#2493 (relecture dev7) : un clone emporte ses branches locales et
+        son stash ; HEAD propre et poussé ne suffit pas — une autre branche
+        aux commits jamais poussés, ou un stash, garde le dossier."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        _repo(self.tmp)
+        for nom, preparer in (
+                ("a1+abcd9997", lambda c: (
+                    _git("checkout", "-q", "-b", "travail", cwd=c),
+                    _git("commit", "-q", "--allow-empty", "-m", "jamais pousse", cwd=c),
+                    _git("checkout", "-q", "main", cwd=c))),
+                ("a1+abcd9996", lambda c: (
+                    _write(os.path.join(c, "brouillon.txt"), 10),
+                    _git("stash", "push", "-q", "-u", cwd=c)))):
+            root = os.path.join(troot, nom)
+            os.makedirs(root)
+            menage._write_owner(troot, nom, menage.mesh_key(self.cfgl),
+                                menage.ORIGIN_CREATED)
+            clone = os.path.join(root, "clone")
+            subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                            clone], check=True, capture_output=True)
+            preparer(clone)
+            _age_tree(root, 3 * 3600)
+            rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                      now=time.time() + 3 * 3600)
+            self.assertTrue(os.path.isdir(clone), nom)
+            kept = [note for note in rapport["skipped"]
+                    if note.startswith("tmp %s kept: git work —" % root)]
+            self.assertEqual(len(kept), 1, rapport["skipped"])
+
     def _suivi(self, main: str, nom: str, lot: int | None) -> str:
         wt = os.path.join(self.tmp, nom)
         _git("worktree", "add", "-q", wt, "-b", nom, cwd=main)

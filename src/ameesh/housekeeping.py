@@ -1848,8 +1848,9 @@ def tmp_recovery_command(path: str) -> str:
 def tmp_git_work(path: str) -> str:
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
     empty when every copy is safe to recover: unlocked, readable, clean (no
-    untracked or ignored file), pushed or integrated, without submodules and
-    with no process inside. A directory is never deleted merely because its
+    modified or untracked file; ignored files go, as with `git worktree
+    remove`), pushed or integrated, for a clone also no unpushed local branch
+    nor stash, without submodules and with no process inside. A directory is never deleted merely because its
     agent left the registry; this check is the second condition."""
     for copy in _git_copies(path):
         st = worktree_state(copy)
@@ -1865,6 +1866,22 @@ def tmp_git_work(path: str) -> str:
             return "%s: %s" % (copy, st["reason"] or "uncommitted changes")
         if not (st["pushed"] or st["integrated"]):
             return "%s: HEAD %s on no remote branch" % (copy, st["head"][:12] or "?")
+        if os.path.isdir(os.path.join(copy, ".git")):
+            # A clone takes its local branches and its stash with it (a linked
+            # worktree leaves them in its common repository): HEAD alone does
+            # not prove they are saved. Unreadable: a doubt, the copy stays.
+            local = _git(["log", "--branches", "--not", "--remotes", "--format=%H",
+                          "-1"], copy)
+            if local is None or local.returncode != 0:
+                return "%s: local branches unreadable" % copy
+            if local.stdout.strip():
+                return "%s: local branch commit %s on no remote branch" % (
+                    copy, local.stdout.strip()[:12])
+            stash = _git(["rev-parse", "-q", "--verify", "refs/stash"], copy)
+            if stash is None or stash.returncode not in (0, 1):
+                return "%s: stash unreadable" % copy
+            if stash.returncode == 0:
+                return "%s: has a stash" % copy
         if worktree_in_use(copy):
             return "%s: a process is working in it" % copy
     return ""
