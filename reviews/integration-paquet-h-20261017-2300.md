@@ -1,6 +1,6 @@
 # Paquet integration/paquet-h-20261017-2300 — composition
 
-Base : `main` **`6e7115b47`** (main après la fusion de #1682 : #2292, parts psycopg à 6 et plafond du job à 45 min). La composition a d'abord été faite sur `734a0825b` (fusion de la PR #1690, paquet h-2000 ; parents `f8c8a4a08` × `f48593d8f`), puis la base a été mise à jour par un merge de `fde44e51c` (release 1.11.6, coupure de 23:00 du 17/10, commit `[skip ci]`). Pendant la première demande de gel, `main` a reçu #1682 (`6e7115b47`, 23:35Z) alors que la base de la PR était restée `fde44e51c` : le plan du run a refusé la composition déplacée et rien n'a été exécuté. La base est donc remise à jour par un merge de `6e7115b47` (aucun rebase, aucun conflit) ; le diff de la PR ne porte que les 9 unités ci-dessous et ce manifeste.
+Base : `main` **`d0196623`** (main après #1682/#2292 — parts psycopg 6, plafond 45 min — puis #1694/#2302 — relevé qui rafraîchit le clone). La composition a d'abord été faite sur `734a0825b` (fusion de la PR #1690, paquet h-2000 ; parents `f8c8a4a08` × `f48593d8f`), puis mise à jour par un merge de `fde44e51c` (release 1.11.6, `[skip ci]`). `main` a ensuite bougé deux fois pendant les demandes de gel : #1682 (`6e7115b47`, 23:35Z) a fait refuser au plan le premier run (base de PR restée `fde44e51c`, rien exécuté), puis #1694 (`d0196623`, 23:50:44Z) a rendu périmé le second run (psycopg 6/6 et macOS verts, psql interrompu ; run annulé). Chaque remise à jour est un merge de `main` (aucun rebase, aucun conflit) ; les deltas de `main` (#2292, #1694) sont disjoints des 36 fichiers du paquet. Le diff de la PR ne porte que les 9 unités ci-dessous et ce manifeste.
 
 Tête de composition (9 unités) : **`854ea1e2d40b`** ; la tête de branche au gel, qui
 porte ce manifeste, est le SHA exact communiqué au pilote et couvert par l'unique suite
@@ -42,8 +42,8 @@ prochain paquet par le pilote depuis 22:34Z.
 
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot et il
 porte le trailer `ameesh-work: #<lot>`. Aucun contenu nouveau : les 9 unités ajoutent
-**35 fichiers, +2033/−321** vs `734a0825b` ; avec ce manifeste, `6e7115b47..HEAD` fait
-**36 fichiers, +2135/−321**, dont la migration `0461_review_catch_up_acl.sql` et
+**35 fichiers, +2033/−321** vs `734a0825b` ; avec ce manifeste, `d0196623..HEAD` fait
+**36 fichiers, +2138/−321**, dont la migration `0461_review_catch_up_acl.sql` et
 `deploy/sql/role-executor.sql` (unité 2, SQL revisé deux familles), aucun `.github/**`.
 
 ## Conflits et résolution
@@ -71,9 +71,10 @@ automatique propre, sans commit de résolution. Aucune adaptation de contenu rel
 
 ## Preuves
 
-- `git diff --check` sur `6e7115b47..HEAD` : rc 0, aucun marqueur de conflit.
+- `git diff --check` sur `d0196623..HEAD` : rc 0, aucun marqueur de conflit.
 - Mise à jour de base après la coupure : merge `b0fc20ab1` de `fde44e51c` (release 1.11.6) dans la branche, rc 0, aucun conflit ; le différentiel des 9 unités est inchangé.
 - Remise à jour de base `fde44e51c` → `6e7115b47` : merge `90470fbf0` de `6e7115b47` (main après #1682) dans la branche, rc 0, aucun conflit (#2292 ne touche que `.github/**`, `scripts/test-plan.py`, `tests/test_l161f_plan.py`, hors des 36 fichiers du paquet) ; le différentiel des 9 unités reste inchangé.
+- Seconde remise à jour `6e7115b47` → `d0196623` : merge `fa233957e` de `d0196623` (#1694) dans la branche, rc 0, aucun conflit ; le delta de main (`src/ameesh/plan_git.py`, `tests/test_l118_assignments.py`) est disjoint des 36 fichiers du paquet ; le différentiel des 9 unités reste inchangé.
 - Seconds parents et trailers `ameesh-work` : 9/9 vérifiés.
 - `scripts/paquet-inclusion.py --manifest <ce fichier> --head <tête> --expected
   2261,1448,2253,2122,2252,2279,2240,1702,2182` : à rejouer sur la tête finale avant le
@@ -89,10 +90,12 @@ automatique propre, sans commit de résolution. Aucune adaptation de contenu rel
   `ci-full-<sha>` déclenche l'unique suite `tests.yml`. Aucune CI de lot, aucun rebase.
   La première demande (tête `dba51c5e`, base `fde44e51c`) a été refusée au plan
   (`the composition moved`, merge-ref sur `6e7115b47`) : rien n'a été exécuté. La
-  demande est refroidie sur la tête de la remise à jour, base `6e7115b47` ; une seule
-  suite effective, sur cette tête.
+  deuxième (tête `9b1d97e66`, base `6e7115b47`) a tourné avec psycopg 6/6 et macOS
+  verts, mais `main` a reçu #1694 (`d0196623`) pendant la suite psql : ce run est
+  périmé et a été annulé. La demande est refroidie sur la tête de la remise à jour à
+  `d0196623` ; une seule suite effective, sur cette tête.
 - Le check requis `tests` doit être `success` avec des tests réellement exécutés (pas
-  `skipped`/absent, #2271). La base `6e7115b47` porte #2292 (parts psycopg 6, plafond
+  `skipped`/absent, #2271). La base `d0196623` porte #2292 (parts psycopg 6, plafond
   45 min) : le run du paquet en bénéficie. Si une part est tout de même coupée au
   plafond, relancer les jobs en échec du même run, même tête.
 - Feu du pilote sur cette tête après `tests` vert (`gh pr merge --auto
