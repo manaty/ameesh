@@ -45,6 +45,9 @@ from . import review
 DESIGNATED = "designated"
 WAITING = "waiting"
 NONE = "none"
+#: the kind of a designation mail: a request linked to the lot wakes the
+#: reviewer's runner (#2478). The capacity notification stays a `notify`.
+REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
 #: fallback families as long as the compiled canon (#1616) does not declare
@@ -417,6 +420,63 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     return "\n".join(lines)
 
 
+def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
+                            actor: str = "") -> str:
+    """The request mail of a manual designation (#705, #2478).
+
+    Unlike the automatic mail, this designation can happen as soon as the lot
+    enters `qa`: the head may not be frozen yet. The mail names the latest
+    frozen head when one exists and says what to watch otherwise. It is sent as
+    a `request` linked to the lot, so the reviewer's runner opens a turn (#2478).
+    """
+    row = dict(lot or {})
+    freeze = dict(freeze or {})
+    sha = str(freeze.get("sha") or "")
+    fid = freeze.get("id")
+    lines = [
+        "Review request (#2076): you are the designated reviewer of lot #%s."
+        % row.get("id"),
+        "",
+        "Lot: #%s \"%s\"" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
+    ]
+    if row.get("app"):
+        lines.append("- Project: %s." % row["app"])
+    if sha:
+        lines += [
+            "- Latest frozen head: %s (frozen milestone #%s)."
+            % (sha, fid if fid is not None else "?"),
+            "- Review exactly this head and render your verdict:",
+            "  ameesh work milestone %s verdict ok|blocked --sha %s" % (row.get("id"), sha),
+        ]
+    else:
+        lines += [
+            "- No frozen head is recorded yet: the author declares it with",
+            "  ameesh work milestone %s frozen --sha <commit>." % row.get("id"),
+            "- Review exactly the frozen head and render your verdict:",
+            "  ameesh work milestone %s verdict ok|blocked --sha <frozen sha>"
+            % row.get("id"),
+        ]
+    lines.append("- This request is linked to lot #%s: your runner opens a turn on it."
+                 % row.get("id"))
+    if actor:
+        lines.append("- Designated by: %s." % actor)
+    lines += [
+        "",
+        "To do:",
+        "- read the diff of the frozen head and check the edge cases;",
+        "- a blocking defect: fix it yourself and push to the lot branch "
+        "(canon §2); a fix longer than ~50 lines, or a design change, goes back "
+        "to the author;",
+        "- a non-blocking defect goes to the backlog, it does not block the merge;",
+        "- do not rerun the suites: targeted tests are the author's job, CI runs "
+        "on the frozen head once the required opinions are acquired.",
+    ]
+    if sha:
+        lines += ["", "If the branch moves, a new freeze cancels this request and a "
+                  "new head will be handed to you."]
+    return "\n".join(lines)
+
+
 def capacity_message(lot: dict, *, freeze: Mapping, required: int, missing: int,
                      why: str, families: str = "") -> str:
     """The waiting notification: no independent reviewer can be designated.
@@ -571,6 +631,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             messages.append({
                 "to": reviewer["name"],
                 "family": reviewer["family"],
+                "kind": REQUEST_KIND,
                 "body": reviewer_message(item, freeze=freeze, required=required,
                                          rank=rank, reviewer=reviewer, authors=authors,
                                          base=base, risk=risk, policy_ref=policy_ref),
@@ -579,6 +640,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         messages.append({
             "to": notify,
             "family": "",
+            "kind": "notify",
             "body": capacity_message(item, freeze=freeze, required=required,
                                      missing=selection["missing"], why=selection["why"]),
             "capacity": True,
