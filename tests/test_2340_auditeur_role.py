@@ -167,7 +167,8 @@ class AuditeurLoginRoleTest(PgTestCase):
 
     def test_noinherit_avant_les_grants_est_repare(self):
         """B2 (#2340) : des GRANT posés sous NOINHERIT gardent inherit_option=false."""
-        version = int(self.db.query("SHOW server_version_num")[0]["server_version_num"])
+        version = int(self.db.query(
+            "SELECT current_setting('server_version_num') AS v")[0]["v"])
         if version < 160000:
             self.skipTest("options d'appartenance des rôles : PostgreSQL 16+")
         q = db_mod.quote_ident
