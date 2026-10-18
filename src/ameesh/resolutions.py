@@ -55,12 +55,16 @@ then the newer lot. The radar names the resolver in its mail.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 
 from . import plan_git, storage, work
 from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git,
@@ -97,6 +101,20 @@ _STATE_RANK = {"qa": 2, "build": 1}
 
 class ResolveError(RuntimeError):
     """A resolution that cannot be opened or recorded: actionable message."""
+
+
+class CloneBusy(GitError):
+    """The radar clone's worktree is held by another operation (#2428).
+
+    Nothing was read nor written: the caller defers to its next pass. A
+    stacked trial that finds the clone busy is not an ejection, and an
+    operation it could not run is never cached as a result."""
+
+
+#: how long an operation waits for the clone's worktree before deferring.
+#: A landing gate can hold it for a while; a radar pass or a turn that does
+#: not get it retries at its next pass (`CloneBusy`), never ejects a lot.
+CLONE_LOCK_WAIT_S = float(os.environ.get("AMEESH_CLONE_LOCK_WAIT", "60"))
 
 
 def ref_name(lot: int, other: int) -> str:
@@ -842,6 +860,74 @@ def show_lines(rows: list[dict], lot: int) -> list[str]:
 # radar side: replay in the private clone
 # --------------------------------------------------------------------------
 
+class _CloneLock:
+    """An exclusive flock on a clone's worktree, reentrant in one process.
+
+    The radar clone is shared by every operation of the host: the executor's
+    radar pass, a `work land` or `work queue add` started by a turn, the fire
+    passage. `flock` carries the exclusion across those processes; the
+    `RLock` serialises the threads of one process, which flock alone does not
+    do, and makes a nested operation (a trial that primes resolutions, a
+    landing that merges) cheap. The lock file sits beside the clone, never
+    inside it: `Replayer.ensure()` may remove the clone."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.mutex = threading.RLock()
+        self.depth = 0
+        self.handle = None
+
+    def acquire(self, wait: float) -> None:
+        deadline = time.monotonic() + max(0.0, wait)
+        if not self.mutex.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise CloneBusy("the radar clone's worktree is busy (%s)" % self.path)
+        if self.depth:
+            self.depth += 1
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            handle = open(self.path, "a+")
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        handle.close()
+                        raise CloneBusy("the radar clone's worktree is busy (%s)"
+                                        % self.path) from None
+                    time.sleep(min(0.1, remaining))
+            self.handle, self.depth = handle, 1
+        except BaseException:
+            self.mutex.release()
+            raise
+
+    def release(self) -> None:
+        self.depth -= 1
+        if not self.depth:
+            handle, self.handle = self.handle, None
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        self.mutex.release()
+
+
+#: one lock per clone path, shared by every Replayer of one process
+_CLONE_LOCKS: dict = {}
+_CLONE_LOCKS_MUTEX = threading.Lock()
+
+
+def _clone_lock(path: str) -> _CloneLock:
+    key = os.path.realpath(path)
+    with _CLONE_LOCKS_MUTEX:
+        lock = _CLONE_LOCKS.get(key)
+        if lock is None:
+            lock = _CLONE_LOCKS[key] = _CloneLock(key + ".worktree.lock")
+        return lock
+
+
 class Replayer:
     """The radar's private clone of a project. Objects come from the agents'
     repository (`--shared`); merges are replayed in the clone's worktree.
@@ -855,23 +941,42 @@ class Replayer:
         #: attribute keys already read, per target tree (`attributes_key`)
         self._attr_keys: dict = {}
 
+    @contextmanager
+    def locked(self, *, wait: float | None = None):
+        """Holds the clone's worktree lock while the block reads or writes it.
+
+        Every checkout, merge or reset in the clone's worktree — a stacked
+        trial, a landing and its gates, a prepared resolution's replay —
+        runs under this lock: a concurrent operation can no longer change the
+        tree under a gate (#2428). The wait is bounded
+        (`CLONE_LOCK_WAIT_S`); the caller then raises `CloneBusy` and retries
+        at its next pass, instead of acting on a tree someone else is using.
+        Reentrant in one thread."""
+        lock = _clone_lock(self.path)
+        lock.acquire(CLONE_LOCK_WAIT_S if wait is None else wait)
+        try:
+            yield
+        finally:
+            lock.release()
+
     def ensure(self) -> None:
-        if not os.path.isdir(os.path.join(self.path, ".git")):
-            shutil.rmtree(self.path, ignore_errors=True)
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            _check(_run(os.path.dirname(self.path), "clone", "--quiet", "--shared",
-                        "--no-checkout", self.repo, self.path, timeout=FETCH_TIMEOUT),
-                   "clone")
-            for key, value in (("user.name", "ameesh radar"),
-                               ("user.email", "radar@ameesh.invalid"),
-                               ("rerere.enabled", "true"), ("rerere.autoUpdate", "false"),
-                               ("gc.auto", "0"), ("core.hooksPath", os.devnull),
-                               ("advice.detachedHead", "false")):
-                _check(_run(self.path, "config", key, value), "config")
-            head = plan_git._out(self.repo, "rev-parse", "HEAD")
-            _check(_run(self.path, "checkout", "-q", "-f", "--detach", head), "checkout")
-        else:
-            _run(self.path, "reset", "-q", "--hard")
+        with self.locked():
+            if not os.path.isdir(os.path.join(self.path, ".git")):
+                shutil.rmtree(self.path, ignore_errors=True)
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                _check(_run(os.path.dirname(self.path), "clone", "--quiet", "--shared",
+                            "--no-checkout", self.repo, self.path, timeout=FETCH_TIMEOUT),
+                       "clone")
+                for key, value in (("user.name", "ameesh radar"),
+                                   ("user.email", "radar@ameesh.invalid"),
+                                   ("rerere.enabled", "true"), ("rerere.autoUpdate", "false"),
+                                   ("gc.auto", "0"), ("core.hooksPath", os.devnull),
+                                   ("advice.detachedHead", "false")):
+                    _check(_run(self.path, "config", key, value), "config")
+                head = plan_git._out(self.repo, "rev-parse", "HEAD")
+                _check(_run(self.path, "checkout", "-q", "-f", "--detach", head), "checkout")
+            else:
+                _run(self.path, "reset", "-q", "--hard")
 
     def _rr_cache(self) -> str:
         return os.path.join(self.path, ".git", "rr-cache")
@@ -945,6 +1050,10 @@ class Replayer:
         the commits still missing, or whose training failed. With
         `attributes_tree`, the trial merges read the target's attributes
         (#2189) and the cache lives apart from the branches' one."""
+        with self.locked():
+            return self._prime(commits, attributes_tree=attributes_tree)
+
+    def _prime(self, commits, *, attributes_tree: str | None = None) -> list[str]:
         commits = list(dict.fromkeys(commits))
         missing = [c for c in commits if not self.has(c)]
         if missing:
@@ -981,6 +1090,12 @@ class Replayer:
         paths that `land` regenerates — never left to rerere, never remaining.
         `attributes_tree`: read `.gitattributes` from that tree, as the radar's
         trial merge does (#2189), whichever tip is checked out."""
+        with self.locked():
+            return self._replay(a, b, commit, attributes_tree=attributes_tree,
+                                export=export, generated=generated)
+
+    def _replay(self, a: str, b: str, commit: str, *, attributes_tree: str | None = None,
+                export=None, generated=()) -> dict:
         self._empty_cache()
         if commit in self.trained(attributes_tree):
             shutil.rmtree(self._rr_cache())

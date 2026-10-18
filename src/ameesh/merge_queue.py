@@ -1118,7 +1118,18 @@ def stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *, gen
     resolutions (`rows`) of this lot with the lots already stacked. A lot
     that leaves a conflict is skipped. Returns `{lot: {state: clean|
     replayed|conflict|generated, files}}`. Generated conflicts are excluded
-    before rerere; each trial tree is regenerated and checked."""
+    before rerere; each trial tree is regenerated and checked.
+
+    #2428: the whole trial holds the radar clone's worktree lock. A landing
+    running in another process owns the same worktree: the trial waits for
+    it, and on timeout raises `resolutions.CloneBusy` instead of checking
+    out the target under the merge's gates."""
+    with replayer.locked():
+        return _stack(replayer, target_head, lots, rows, generated=generated)
+
+
+def _stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *,
+           generated=()) -> dict:
     from . import land, resolutions
     paths = {g.path for g in generated}
     latest: dict = {}
@@ -1403,13 +1414,22 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits,
                    generated)
             if key not in stacks:
+                busy = None
                 try:
                     replayer.ensure()
                     stacks[key] = stack(replayer, key[0], stacked, resolution_rows,
                                         generated=generated)
+                except resolutions.CloneBusy as exc:
+                    # #2428: another operation owns the clone's worktree (a
+                    # landing and its gates, another pass). Nothing was read,
+                    # so no lot is ejected and nothing is cached: the next
+                    # pass retries the trial.
+                    busy = "%s: %s" % (type(exc).__name__, exc)
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
-            result = stacks[key]
+                result = {"error": busy} if busy is not None else stacks[key]
+            else:
+                result = stacks[key]
         listed = [{"lot": int(r["work_item_id"]), "rank": 1, "state": "landing",
                    "reason": r.get("reason") or "", "stack": None}
                   for r in landing.get(target) or ()]
